@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
@@ -197,13 +198,7 @@ class PlannerStore(
                     if (it.id == id) it.copy(disposition = SuggestionDisposition.APPROVED_FOR_INBOX) else it
                 },
                 inbox = listOf(
-                    InboxItem(
-                        id = "proposal-${suggestion.id}",
-                        title = suggestion.title,
-                        source = InboxSource.EXTERNAL_PROPOSAL,
-                        detail = suggestion.summary,
-                        requiresReview = true,
-                    ),
+                    suggestion.toInboxDraft(),
                 ) + current.inbox,
                 scheduleMessage = "Accepted as an Inbox draft · review before scheduling",
             )
@@ -235,6 +230,58 @@ class PlannerStore(
                         it
                     }
                 },
+            )
+        }
+    }
+
+    /** Replaces only server-backed proposals; local drafts remain untouched. */
+    fun replaceRemoteSuggestions(suggestions: List<PlanningSuggestion>): Boolean {
+        require(suggestions.all { it.remoteRevision != null }) {
+            "Remote suggestions must include a server revision"
+        }
+        return mutate { current ->
+            val remoteIds = suggestions.asSequence().map(PlanningSuggestion::id).toHashSet()
+            val localSuggestions = current.suggestions.filter {
+                it.remoteRevision == null && it.id !in remoteIds
+            }
+            val drafts = missingAcceptedDrafts(current.inbox, suggestions)
+            current.copy(
+                suggestions = suggestions + localSuggestions,
+                inbox = drafts + current.inbox,
+            )
+        }
+    }
+
+    /** Reconciles a mutation response without ever applying its payload to the schedule. */
+    fun reconcileRemoteSuggestion(suggestion: PlanningSuggestion): Boolean {
+        require(suggestion.remoteRevision != null) {
+            "A reconciled remote suggestion must include a server revision"
+        }
+        return mutate { current ->
+            val replaced = current.suggestions.any {
+                it.id == suggestion.id && it.remoteRevision != null
+            }
+            val merged = if (replaced) {
+                current.suggestions.map {
+                    if (it.id == suggestion.id && it.remoteRevision != null) suggestion else it
+                }
+            } else {
+                listOf(suggestion) + current.suggestions
+            }
+            val drafts = missingAcceptedDrafts(current.inbox, listOf(suggestion))
+            val message = when (suggestion.disposition) {
+                SuggestionDisposition.APPROVED_FOR_INBOX ->
+                    "Accepted as an Inbox draft · review before scheduling"
+                SuggestionDisposition.REJECTED ->
+                    "Suggestion rejected · your plan was not changed"
+                SuggestionDisposition.EXPIRED ->
+                    "Suggestion expired · your plan was not changed"
+                SuggestionDisposition.PENDING -> current.scheduleMessage
+            }
+            current.copy(
+                suggestions = merged,
+                inbox = drafts + current.inbox,
+                scheduleMessage = message,
             )
         }
     }
@@ -335,5 +382,38 @@ class PlannerStore(
         LOADING,
         READY,
         FAILED,
+    }
+
+    private companion object {
+        fun missingAcceptedDrafts(
+            existing: List<InboxItem>,
+            suggestions: List<PlanningSuggestion>,
+        ): List<InboxItem> {
+            val existingIds = existing.asSequence().map(InboxItem::id).toHashSet()
+            return suggestions.asSequence()
+                .filter { it.disposition == SuggestionDisposition.APPROVED_FOR_INBOX }
+                .filter { "proposal-${it.id}" !in existingIds }
+                .map { it.toInboxDraft() }
+                .toList()
+        }
+
+        fun PlanningSuggestion.toInboxDraft(): InboxItem {
+            val detail = buildString {
+                append(summary)
+                remotePayloadJson
+                    ?.takeIf { it.isNotBlank() && it != "{}" }
+                    ?.let {
+                        append("\n\nProposed details: ")
+                        append(it)
+                    }
+            }
+            return InboxItem(
+                id = "proposal-$id",
+                title = title,
+                source = InboxSource.EXTERNAL_PROPOSAL,
+                detail = detail,
+                requiresReview = true,
+            )
+        }
     }
 }

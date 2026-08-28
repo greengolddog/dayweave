@@ -85,6 +85,7 @@ enum class SuggestionDisposition {
     PENDING,
     APPROVED_FOR_INBOX,
     REJECTED,
+    EXPIRED,
 }
 
 @Serializable
@@ -104,6 +105,10 @@ data class PlanningSuggestion(
     val kind: SuggestionKind,
     val expiresInDays: Int,
     val disposition: SuggestionDisposition = SuggestionDisposition.PENDING,
+    /** Present only for a server-backed proposal and used for optimistic concurrency. */
+    val remoteRevision: Long? = null,
+    /** Cached inside the encrypted planner snapshot so the offline draft remains reviewable. */
+    val remotePayloadJson: String? = null,
 )
 
 @Serializable

@@ -1,8 +1,10 @@
 # DayWeave for Android
 
-Native Jetpack Compose client for `com.greengolddog.dayweave`. The current foundation includes the Today timeline, five-destination navigation, quick capture, active-session controls, assistant chat, and a proposal-only Suggestions Inbox.
+Native Jetpack Compose client for `com.greengolddog.dayweave`. The current foundation includes the Today timeline, five-destination navigation, quick capture, active-session controls, assistant chat, and an authenticated proposal-only Suggestions Inbox.
 
-Planner state is stored offline in a Room database encrypted by SQLCipher. A random 256-bit database passphrase is AES-GCM wrapped by a non-exportable Android Keystore key; plaintext key material is never written to storage. Startup restores the last atomic snapshot, replays any input received during loading, and autosaves subsequent intents through one serialized writer.
+Planner state, including the last server proposal cache, is stored offline in a Room database encrypted by SQLCipher. A random 256-bit database passphrase is AES-GCM wrapped by a non-exportable Android Keystore key; plaintext key material is never written to storage. Startup restores the last atomic snapshot, blocks edits until restore finishes, and autosaves subsequent intents through one serialized writer.
+
+The Suggestions tab connects to the existing `/v1/suggestions` API with OkHttp and a bearer token. The token is separately AES-GCM wrapped with its own non-exportable Android Keystore key and is never placed in the Room planner snapshot or application logs. The connection preference and both encrypted databases are excluded from backup and device transfer.
 
 ## Build
 
@@ -17,10 +19,20 @@ On this Mac, the Homebrew SDK is at `/opt/homebrew/share/android-commandlinetool
 ```sh
 export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
 export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
-./gradlew testDebugUnitTest assembleDebug
+./gradlew testDebugUnitTest lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
 ```
 
 The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Suggestions API configuration
+
+The API base URL can be supplied at build time and must use HTTPS:
+
+```sh
+./gradlew -PdayweaveApiBaseUrl=https://api.example.com/ assembleDebug
+```
+
+It can also be set or replaced from **Inbox → Suggestions → Connection**. Enter the bearer token there; it is never accepted as a Gradle property or compiled into `BuildConfig`. A runtime URL overrides the optional build-time default. Cleartext traffic is disabled in the production manifest, and API redirects are rejected rather than replaying authentication. The Inbox reports missing configuration, authentication failures, network/offline failures, server errors, and the timestamp of the last successful sync without discarding the encrypted cached proposals.
 
 For the device smoke test, start an API 35 emulator or connect the Pixel with USB debugging enabled, then run:
 
@@ -30,7 +42,7 @@ For the device smoke test, start an API 35 emulator or connect the Pixel with US
 
 ## Safety boundary
 
-`PlannerStore.approveSuggestion` is intentionally proposal-only. Accepting a ChatGPT, Codex, or in-app assistant proposal creates a reviewable Inbox draft and does not mutate the schedule. Unit tests lock this behavior down before remote integrations are connected.
+Accepting a ChatGPT, Codex, or in-app assistant proposal first records the revision-aware API decision and then creates a reviewable Inbox draft. It never mutates the schedule. On the next refresh, any accepted server proposal is reconciled idempotently into a draft, so an interrupted client response cannot bypass review or lose the accepted proposal locally.
 
 ## Persistence safety
 
@@ -40,6 +52,6 @@ Room schema history is exported under `app/schemas`, and explicit migrations are
 
 ## Next integration gates
 
-- Connect the shared scheduler API and background sync worker.
+- Add an authenticated background sync worker; the current integration refreshes on app startup and explicit user actions.
 - Configure Google OAuth credentials and isolated Calendar/Tasks test resources.
 - Configure release signing outside version control before producing the direct-download APK.

@@ -2,9 +2,12 @@ package com.greengolddog.dayweave
 
 import android.app.Application
 import android.util.Log
+import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
+import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.state.PlannerStore
+import com.greengolddog.dayweave.sync.SuggestionSyncManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -23,6 +26,21 @@ class DayWeaveApplication : Application() {
                     "Encrypted planner persistence unavailable (${error.javaClass.simpleName})",
                 )
             },
+        )
+    }
+
+    private val apiCredentialStore by lazy {
+        KeystoreApiCredentialStore(
+            context = this,
+            configuredBaseUrl = BuildConfig.DAYWEAVE_API_BASE_URL,
+        )
+    }
+
+    val suggestionSyncManager: SuggestionSyncManager by lazy {
+        SuggestionSyncManager(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpSuggestionsTransport(),
         )
     }
 

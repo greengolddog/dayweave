@@ -3,6 +3,8 @@
     <cloud-backup>
         <exclude domain="sharedpref" path="auth.xml" />
         <exclude domain="sharedpref" path="auth.xml.bak" />
+        <exclude domain="sharedpref" path="dayweave_api_credentials.xml" />
+        <exclude domain="sharedpref" path="dayweave_api_credentials.xml.bak" />
         <exclude domain="database" path="encrypted.db" />
         <exclude domain="database" path="encrypted.db-journal" />
         <exclude domain="database" path="encrypted.db-wal" />
@@ -11,6 +13,8 @@
     <device-transfer>
         <exclude domain="sharedpref" path="auth.xml" />
         <exclude domain="sharedpref" path="auth.xml.bak" />
+        <exclude domain="sharedpref" path="dayweave_api_credentials.xml" />
+        <exclude domain="sharedpref" path="dayweave_api_credentials.xml.bak" />
         <exclude domain="database" path="encrypted.db" />
         <exclude domain="database" path="encrypted.db-journal" />
         <exclude domain="database" path="encrypted.db-wal" />

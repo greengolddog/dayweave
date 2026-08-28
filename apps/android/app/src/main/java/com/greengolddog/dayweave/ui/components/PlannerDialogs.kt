@@ -1,6 +1,7 @@
 package com.greengolddog.dayweave.ui.components
 
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -27,6 +28,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PlanningSuggestion
@@ -151,5 +154,89 @@ fun EditSuggestionDialog(
             ) { Text("Save draft") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+@Composable
+fun ApiConnectionDialog(
+    currentBaseUrl: String,
+    hasStoredToken: Boolean,
+    onDismiss: () -> Unit,
+    onSave: (baseUrl: String, bearerToken: String?) -> Unit,
+    onForget: () -> Unit,
+) {
+    var baseUrl by remember(currentBaseUrl) { mutableStateOf(currentBaseUrl) }
+    var bearerToken by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = {
+            bearerToken = ""
+            onDismiss()
+        },
+        title = { Text("DayWeave API connection") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "Only HTTPS endpoints are allowed. The bearer token is encrypted with an Android Keystore key and is never added to the planner database.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = baseUrl,
+                    onValueChange = { baseUrl = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("API base URL") },
+                    placeholder = { Text("https://api.example.com/") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Uri,
+                    ),
+                )
+                OutlinedTextField(
+                    value = bearerToken,
+                    onValueChange = { bearerToken = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(if (hasStoredToken) "Replacement bearer token" else "Bearer token") },
+                    supportingText = {
+                        if (hasStoredToken) Text("Leave blank to keep the encrypted token already on this device.")
+                    },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        autoCorrectEnabled = false,
+                        keyboardType = KeyboardType.Password,
+                    ),
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val submittedToken = bearerToken.takeIf(String::isNotBlank)
+                    bearerToken = ""
+                    onSave(baseUrl, submittedToken)
+                },
+                enabled = baseUrl.trim().startsWith("https://", ignoreCase = true) &&
+                    (hasStoredToken || bearerToken.isNotBlank()),
+            ) { Text("Save & refresh") }
+        },
+        dismissButton = {
+            Row {
+                if (hasStoredToken) {
+                    TextButton(
+                        onClick = {
+                            bearerToken = ""
+                            onForget()
+                        },
+                    ) { Text("Forget") }
+                }
+                TextButton(
+                    onClick = {
+                        bearerToken = ""
+                        onDismiss()
+                    },
+                ) { Text("Cancel") }
+            }
+        },
     )
 }

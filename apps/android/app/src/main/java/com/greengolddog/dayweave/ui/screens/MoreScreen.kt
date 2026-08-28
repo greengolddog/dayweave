@@ -12,6 +12,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronRight
+import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.HealthAndSafety
@@ -30,6 +31,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.sync.SuggestionSyncPhase
+import com.greengolddog.dayweave.sync.SuggestionSyncState
 
 @Composable
 fun MoreScreen(
@@ -37,6 +40,7 @@ fun MoreScreen(
     onToggleCompleted: () -> Unit,
     onToggleQuietSuggestions: () -> Unit,
     onToggleDynamicColor: () -> Unit,
+    suggestionSyncState: SuggestionSyncState,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -48,13 +52,40 @@ fun MoreScreen(
             Card {
                 ListItem(
                     headlineContent = { Text("Personal workspace") },
-                    supportingContent = { Text("Encrypted offline · server not connected") },
+                    supportingContent = {
+                        Text(
+                            when (suggestionSyncState.phase) {
+                                SuggestionSyncPhase.CONNECTED ->
+                                    "Encrypted offline · suggestions connected"
+                                SuggestionSyncPhase.SYNCING ->
+                                    "Encrypted offline · refreshing suggestions"
+                                SuggestionSyncPhase.AUTH_REQUIRED ->
+                                    "Encrypted offline · API authentication required"
+                                SuggestionSyncPhase.NOT_CONFIGURED ->
+                                    "Encrypted offline · API not configured"
+                                SuggestionSyncPhase.OFFLINE ->
+                                    "Encrypted offline · cached suggestions available"
+                                SuggestionSyncPhase.ERROR ->
+                                    "Encrypted offline · suggestion sync error"
+                                SuggestionSyncPhase.READY ->
+                                    "Encrypted offline · suggestion sync ready"
+                            },
+                        )
+                    },
                     leadingContent = { Icon(Icons.Outlined.AccountCircle, contentDescription = null) },
                     trailingContent = {
                         Icon(
-                            Icons.Outlined.CloudOff,
-                            contentDescription = "Server not connected",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                                Icons.Outlined.CloudDone
+                            } else {
+                                Icons.Outlined.CloudOff
+                            },
+                            contentDescription = suggestionSyncState.message,
+                            tint = if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
                         )
                     },
                 )

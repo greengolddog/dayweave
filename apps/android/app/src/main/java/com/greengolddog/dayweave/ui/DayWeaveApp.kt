@@ -8,7 +8,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.CircularProgressIndicator
@@ -34,6 +36,7 @@ import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.state.DayWeaveViewModel
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
+import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
 import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
@@ -44,6 +47,7 @@ import com.greengolddog.dayweave.ui.screens.InboxScreen
 import com.greengolddog.dayweave.ui.screens.MoreScreen
 import com.greengolddog.dayweave.ui.screens.TodayScreen
 import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
+import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 
 @Composable
 fun DayWeaveApp(viewModel: DayWeaveViewModel = viewModel()) {
@@ -96,8 +100,10 @@ private fun PlannerPersistenceFailureScreen() {
 @Composable
 private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
+    var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
 
     Scaffold(
@@ -123,10 +129,19 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                             Icon(Icons.Outlined.AutoAwesome, contentDescription = "Recompose schedule")
                         }
                     }
+                    val syncIcon = when (suggestionSyncState.phase) {
+                        SuggestionSyncPhase.CONNECTED -> Icons.Outlined.CloudDone
+                        SuggestionSyncPhase.SYNCING -> Icons.Outlined.Sync
+                        else -> Icons.Outlined.CloudOff
+                    }
                     Icon(
-                        Icons.Outlined.CloudOff,
-                        contentDescription = "Server not connected",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        syncIcon,
+                        contentDescription = suggestionSyncState.message,
+                        tint = if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -184,6 +199,9 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onApprove = viewModel::approveSuggestion,
                 onReject = viewModel::rejectSuggestion,
                 onEdit = { editingSuggestion = it },
+                syncState = suggestionSyncState,
+                onRefresh = viewModel::refreshSuggestions,
+                onConfigureConnection = { showApiConnection = true },
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.ASSISTANT -> AssistantScreen(
@@ -196,6 +214,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onToggleCompleted = viewModel::toggleCompleted,
                 onToggleQuietSuggestions = viewModel::toggleQuietSuggestions,
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
+                suggestionSyncState = suggestionSyncState,
                 modifier = Modifier.padding(innerPadding),
             )
         }
@@ -225,6 +244,22 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
             onSave = { title, summary ->
                 viewModel.updateSuggestion(suggestion.id, title, summary)
                 editingSuggestion = null
+            },
+        )
+    }
+
+    if (showApiConnection) {
+        ApiConnectionDialog(
+            currentBaseUrl = suggestionSyncState.baseUrl.orEmpty(),
+            hasStoredToken = suggestionSyncState.hasStoredToken,
+            onDismiss = { showApiConnection = false },
+            onSave = { baseUrl, bearerToken ->
+                viewModel.updateSuggestionConnection(baseUrl, bearerToken)
+                showApiConnection = false
+            },
+            onForget = {
+                viewModel.clearSuggestionConnection()
+                showApiConnection = false
             },
         )
     }

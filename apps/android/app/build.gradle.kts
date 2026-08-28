@@ -1,4 +1,26 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+import java.net.URI
+
+fun String.asBuildConfigString(): String =
+    "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
+
+val dayWeaveApiBaseUrl = providers.gradleProperty("dayweaveApiBaseUrl")
+    .orElse("")
+    .get()
+    .trim()
+
+if (dayWeaveApiBaseUrl.isNotEmpty()) {
+    val configuredUri = URI(dayWeaveApiBaseUrl)
+    require(
+        configuredUri.scheme.equals("https", ignoreCase = true) &&
+            !configuredUri.host.isNullOrBlank() &&
+            configuredUri.userInfo == null &&
+            configuredUri.query == null &&
+            configuredUri.fragment == null
+    ) {
+        "dayweaveApiBaseUrl must be an HTTPS origin or path without credentials, query, or fragment"
+    }
+}
 
 plugins {
     alias(libs.plugins.android.application)
@@ -19,6 +41,12 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
+
+        buildConfigField(
+            "String",
+            "DAYWEAVE_API_BASE_URL",
+            dayWeaveApiBaseUrl.asBuildConfigString(),
+        )
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -82,9 +110,12 @@ dependencies {
     implementation(libs.androidx.sqlite)
     implementation(libs.sqlcipher.android)
     implementation(libs.kotlinx.serialization.json)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.okhttp)
     ksp(libs.androidx.room.compiler)
 
     testImplementation(libs.junit)
+    testImplementation(libs.okhttp.mockwebserver)
 
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
