@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/dayweave-core",
+    "crates/dayweave-google",
     "server/dayweave-api",
 ]
 
@@ -18,4 +19,3 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
-
