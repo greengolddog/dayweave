@@ -1,0 +1,127 @@
+# DayWeave integration setup
+
+This document separates work Codex can perform automatically from browser
+consent that only the owner can complete. Never paste credentials into chat or
+commit them to this repository.
+
+## Current local access
+
+- GitHub CLI is authenticated as `greengolddog` and the repository is private.
+- Nebius CLI profile `lol` is active and can read the owner's non-suspended
+  tenant and its `eu-north1` project. The target project currently has a default
+  subnet and no VM or Object Storage bucket, so deployment can start cleanly.
+- Codex CLI 0.150.1 is installed. Its App Server was protocol-tested with
+  `initialize` and `account/read`, and managed ChatGPT authentication is already
+  available on this Mac.
+- No Android device is currently visible through ADB.
+- The Command Line Tools build the Swift package, but full Xcode is not selected;
+  widgets, extensions, UI automation, and release entitlements therefore remain
+  an explicit local-toolchain gate.
+
+## Google Cloud project
+
+Create one dedicated Google Cloud project for DayWeave rather than reusing an
+unrelated project.
+
+1. Enable Google Calendar API, Google Tasks API, and the Maps APIs selected by
+   the travel implementation.
+2. Configure the OAuth consent screen for the owner's account and add the owner
+   as a test user until the app is ready to move to production status.
+3. Create a Web application OAuth client for the private backend. Register the
+   exact HTTPS callback under the final Nebius Tunnel origin; redirects must
+   match exactly.
+4. Store the client ID and client secret in Nebius MysteryBox or the VM's
+   root-readable environment file, never in GitHub or client binaries.
+5. Request offline access and incremental authorization. The backend owns the
+   encrypted refresh token; macOS and Android receive only a DayWeave session.
+6. Start with Calendar read access during import/onboarding. Request write
+   access when the owner enables the dedicated DayWeave calendar, and request
+   Tasks write access only when Google Tasks sync is enabled.
+
+The complete product needs these effective capabilities:
+
+- read calendar lists, settings, event series, exceptions, attendees,
+  conference data, free/busy state, event types, and incremental sync tokens;
+- create the dedicated DayWeave calendar and manage DayWeave-owned events;
+- update or delete other writable events only through the product's explicit
+  preview/approval rules;
+- read and write the selected Google Tasks lists.
+
+Google documents `https://www.googleapis.com/auth/calendar` for complete
+calendar editing and `https://www.googleapis.com/auth/tasks` for complete Tasks
+sync. DayWeave should keep scope requests incremental and use narrower scopes
+when they still satisfy an enabled feature.
+
+Official references:
+
+- <https://developers.google.com/workspace/calendar/api/auth>
+- <https://developers.google.com/workspace/calendar/api/guides/create-events>
+- <https://developers.google.com/workspace/tasks/auth>
+- <https://developers.google.com/identity/protocols/oauth2/web-server>
+
+## Codex inside the macOS app
+
+The macOS client launches `codex app-server --stdio`, negotiates the stable
+protocol, and calls `account/read`. Login options are:
+
+1. managed ChatGPT browser login (`chatgpt`) — primary;
+2. managed device-code login (`chatgptDeviceCode`) — fallback for a browser
+   handoff that cannot return normally;
+3. API key (`apiKey`) — advanced fallback.
+
+Codex owns managed OAuth tokens and refreshes them. DayWeave must not extract or
+sync those tokens to its backend. Conversation history, model/reasoning choices,
+approvals, and streaming will be built on the same App Server process.
+
+Official reference: <https://developers.openai.com/codex/app-server/>.
+
+## DayWeave MCP and ChatGPT/Codex plugin
+
+The private MCP endpoint uses Streamable HTTP over the Nebius Tunnel HTTPS URL.
+Its external contract is intentionally asymmetric:
+
+- clients may read only the schedule detail permitted for that client;
+- clients may simulate plans;
+- `submit_proposal` may add a reviewable Suggestions Inbox proposal;
+- no external conversation can mutate canonical schedule/calendar/task state.
+
+After the deployed MCP server supports OAuth:
+
+1. enable ChatGPT Developer mode;
+2. register the MCP HTTPS URL and complete its OAuth connection;
+3. copy the resulting `plugin_asdk_app…` technical ID;
+4. add that ID to the plugin's `.app.json` and manifest using the plugin creator;
+5. validate, install from the private repository source, and test in a new chat.
+
+The repo plugin already contains its validated skill and local `.mcp.json`.
+Remote registration cannot be completed before the stable tunnel URL and OAuth
+metadata exist.
+
+Official references:
+
+- <https://developers.openai.com/codex/mcp/>
+- <https://developers.openai.com/plugins/build/plugins>
+
+## Nebius access and deployment identity
+
+The human `lol` profile is sufficient to bootstrap resources; it must not be
+copied to the VM or CI. Deployment creates separate least-privilege identities:
+
+- a runtime service account attached to the VM;
+- a tunnel-agent account with only `applicationtunnel.agent` on its tunnel;
+- a backup account restricted to the private Object Storage bucket;
+- an optional CI deployment account restricted to updating DayWeave resources.
+
+The selected instance is `cpu-e2/2vcpu-8gb` in `eu-north1` with a 32 GiB Network
+SSD. One VM runs API/worker/PostgreSQL. The account profile check is complete;
+there is no need to share a tenant token or credential file.
+
+Nebius Tunnel provides the generated DNS name and TLS while accepting only an
+outbound agent connection. It does not replace application authentication.
+
+Official references:
+
+- <https://docs.nebius.com/tunnels/overview>
+- <https://docs.nebius.com/tunnels/quickstart>
+- <https://docs.nebius.com/compute/virtual-machines/types>
+
