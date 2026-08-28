@@ -23,7 +23,6 @@ jobs:
 
   android:
     runs-on: ubuntu-latest
-    if: ${{ hashFiles('apps/android/gradlew') != '' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -37,4 +36,3 @@ jobs:
           name: DayWeave-Android-unsigned
           path: apps/android/app/build/outputs/apk/release/*.apk
           if-no-files-found: error
-
