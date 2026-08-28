@@ -3,26 +3,94 @@ import SwiftUI
 
 @MainActor
 final class PlannerStore: ObservableObject {
-    @Published var destination: SidebarDestination? = .today
-    @Published var selectedBlockID: UUID?
-    @Published var blocks: [ScheduleBlock]
-    @Published var suggestions: [PlanningSuggestion]
-    @Published var assistantMessages: [AssistantMessage]
+    @Published var destination: SidebarDestination? = .today {
+        didSet { scheduleAutosave() }
+    }
+    @Published var selectedBlockID: UUID? {
+        didSet { scheduleAutosave() }
+    }
+    @Published var blocks: [ScheduleBlock] {
+        didSet { scheduleAutosave() }
+    }
+    @Published var suggestions: [PlanningSuggestion] {
+        didSet { scheduleAutosave() }
+    }
+    @Published var assistantMessages: [AssistantMessage] {
+        didSet { scheduleAutosave() }
+    }
     @Published var isQuickAddPresented = false
-    @Published var lastScheduleMessage = "Schedule is balanced"
-    @Published var protectedFreeMinutes = 90
-    @Published var freezeHours = 2
-    @Published var showCompleted = true
+    @Published var lastScheduleMessage = "Schedule is balanced" {
+        didSet { scheduleAutosave() }
+    }
+    @Published var protectedFreeMinutes = 90 {
+        didSet { scheduleAutosave() }
+    }
+    @Published var freezeHours = 2 {
+        didSet { scheduleAutosave() }
+    }
+    @Published var showCompleted = true {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var persistenceError: PlannerPersistenceError?
+
+    private let persistence: EncryptedPlannerPersistence?
+    private let autosaveDelay: Duration
+    private var autosaveTask: Task<Void, Never>?
 
     init(
         blocks: [ScheduleBlock] = [],
         suggestions: [PlanningSuggestion] = [],
-        assistantMessages: [AssistantMessage] = []
+        assistantMessages: [AssistantMessage] = [],
+        persistence: EncryptedPlannerPersistence? = nil,
+        restoreFromPersistence: Bool = true,
+        autosaveDelay: Duration = .milliseconds(250)
     ) {
-        self.blocks = blocks
-        self.suggestions = suggestions
-        self.assistantMessages = assistantMessages
-        selectedBlockID = blocks.first?.id
+        self.persistence = persistence
+        self.autosaveDelay = autosaveDelay
+
+        var restoredSnapshot: PlannerSnapshot?
+        var restorationError: PlannerPersistenceError?
+        if restoreFromPersistence, let persistence {
+            do {
+                restoredSnapshot = try persistence.load()
+            } catch {
+                restorationError = error
+            }
+        }
+
+        let initialBlocks = restoredSnapshot?.blocks ?? blocks
+        self.blocks = initialBlocks
+        self.suggestions = restoredSnapshot?.suggestions ?? suggestions
+        self.assistantMessages = restoredSnapshot?.assistantMessages ?? assistantMessages
+        destination = restoredSnapshot?.destination ?? .today
+        if let restoredSelection = restoredSnapshot?.selectedBlockID,
+           initialBlocks.contains(where: { $0.id == restoredSelection }) {
+            selectedBlockID = restoredSelection
+        } else {
+            selectedBlockID = initialBlocks.first?.id
+        }
+        lastScheduleMessage = restoredSnapshot?.lastScheduleMessage ?? "Schedule is balanced"
+        protectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes ?? 90
+        freezeHours = restoredSnapshot?.freezeHours ?? 2
+        showCompleted = restoredSnapshot?.showCompleted ?? true
+        persistenceError = restorationError
+
+        if persistence != nil, restoreFromPersistence, restoredSnapshot == nil, restorationError == nil {
+            scheduleAutosave()
+        }
+    }
+
+    func flushPersistence() {
+        autosaveTask?.cancel()
+        autosaveTask = nil
+        guard let persistence else { return }
+
+        do {
+            try persistence.save(makeSnapshot())
+            persistenceError = nil
+        } catch {
+            persistenceError = error
+        }
     }
 
     var selectedBlock: ScheduleBlock? {
@@ -147,6 +215,50 @@ final class PlannerStore: ObservableObject {
     func rejectSuggestion(_ id: UUID) {
         guard let index = suggestions.firstIndex(where: { $0.id == id }) else { return }
         suggestions[index].state = .rejected
+    }
+
+    private func scheduleAutosave() {
+        guard persistence != nil else { return }
+        autosaveTask?.cancel()
+        let delay = autosaveDelay
+        autosaveTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.flushPersistence()
+        }
+    }
+
+    private func makeSnapshot() -> PlannerSnapshot {
+        PlannerSnapshot(
+            destination: destination,
+            selectedBlockID: selectedBlockID,
+            blocks: blocks,
+            suggestions: suggestions,
+            assistantMessages: assistantMessages,
+            lastScheduleMessage: lastScheduleMessage,
+            protectedFreeMinutes: protectedFreeMinutes,
+            freezeHours: freezeHours,
+            showCompleted: showCompleted
+        )
+    }
+
+    static func live(now: Date = Date()) -> PlannerStore {
+        let seed = preview(now: now)
+        do {
+            return PlannerStore(
+                blocks: seed.blocks,
+                suggestions: seed.suggestions,
+                assistantMessages: seed.assistantMessages,
+                persistence: try EncryptedPlannerPersistence.applicationDefault()
+            )
+        } catch {
+            seed.persistenceError = error
+            return seed
+        }
     }
 
     static func preview(now: Date = Date()) -> PlannerStore {

@@ -78,7 +78,7 @@ enum EnergyLevel: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String { rawValue.capitalized }
 }
 
-struct ScheduleBlock: Identifiable, Hashable, Sendable {
+struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
     let id: UUID
     var title: String
     var kind: PlannerItemKind
@@ -103,7 +103,7 @@ struct ScheduleBlock: Identifiable, Hashable, Sendable {
     }
 }
 
-enum SidebarDestination: String, CaseIterable, Identifiable {
+enum SidebarDestination: String, Codable, CaseIterable, Identifiable, Sendable {
     case today
     case calendar
     case inbox
@@ -139,8 +139,8 @@ enum SidebarDestination: String, CaseIterable, Identifiable {
     }
 }
 
-struct AssistantMessage: Identifiable, Hashable, Sendable {
-    enum Role: Sendable { case user, assistant }
+struct AssistantMessage: Identifiable, Hashable, Codable, Sendable {
+    enum Role: String, Codable, Sendable { case user, assistant }
 
     let id: UUID
     let role: Role
@@ -148,8 +148,8 @@ struct AssistantMessage: Identifiable, Hashable, Sendable {
     let createdAt: Date
 }
 
-struct PlanningSuggestion: Identifiable, Hashable, Sendable {
-    enum State: String, Sendable { case pending, accepted, rejected }
+struct PlanningSuggestion: Identifiable, Hashable, Codable, Sendable {
+    enum State: String, Codable, Sendable { case pending, accepted, rejected }
 
     let id: UUID
     var title: String
@@ -159,4 +159,3 @@ struct PlanningSuggestion: Identifiable, Hashable, Sendable {
     var expiresAt: Date
     var state: State
 }
-
