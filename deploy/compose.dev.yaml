@@ -1,0 +1,7 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    image: dayweave-api:dev
+

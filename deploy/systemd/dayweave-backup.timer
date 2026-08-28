@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the DayWeave encrypted backup every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+Unit=dayweave-backup.service
+
+[Install]
+WantedBy=timers.target
+

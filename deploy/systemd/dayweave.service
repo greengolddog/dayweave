@@ -1,0 +1,19 @@
+[Unit]
+Description=DayWeave private scheduling service
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/dayweave/deploy
+EnvironmentFile=/opt/dayweave/deploy/.env
+ExecStart=/usr/bin/docker compose --profile tunnel up --detach --remove-orphans
+ExecStartPost=/usr/bin/docker compose ps
+ExecStop=/usr/bin/docker compose --profile tunnel down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+

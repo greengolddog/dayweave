@@ -1,0 +1,84 @@
+name: dayweave
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dayweave}
+      POSTGRES_USER: ${POSTGRES_USER:-dayweave}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [private]
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  api:
+    image: ${DAYWEAVE_API_IMAGE:-ghcr.io/greengolddog/dayweave-api:latest}
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DAYWEAVE_BIND: 0.0.0.0:8787
+      DAYWEAVE_DATABASE_URL: postgres://${POSTGRES_USER:-dayweave}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-dayweave}
+      DAYWEAVE_API_TOKEN: ${DAYWEAVE_API_TOKEN:?DAYWEAVE_API_TOKEN is required}
+      DAYWEAVE_PUBLIC_BASE_URL: ${DAYWEAVE_PUBLIC_BASE_URL:-http://127.0.0.1:8787}
+      RUST_LOG: ${RUST_LOG:-dayweave_api=info,tower_http=info}
+    ports:
+      - 127.0.0.1:8787:8787
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks: [private]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/dayweave-api", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  tunnel:
+    image: cr.eu-north1.nebius.cloud/marketplace/docker/nebius-tunnel-agent:latest
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: ["-config", "/config/config.yaml"]
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./tunnel/config.yaml:/config/config.yaml:ro
+      - ./secrets/tunnel-private-key.pem:/config/private-key.pem:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks: [private]
+
+volumes:
+  postgres-data:
+
+networks:
+  private:
+    driver: bridge
+

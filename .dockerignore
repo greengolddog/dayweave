@@ -1,0 +1,15 @@
+.git
+.github
+.build
+target
+dist
+DerivedData
+**/build
+**/.gradle
+**/.idea
+**/.env
+**/secrets
+**/*.pem
+**/*.jks
+**/*.keystore
+

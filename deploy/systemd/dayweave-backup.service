@@ -1,0 +1,11 @@
+[Unit]
+Description=Create and upload an encrypted DayWeave backup
+After=dayweave.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dayweave/deploy
+EnvironmentFile=/opt/dayweave/deploy/.env
+ExecStart=/opt/dayweave/deploy/scripts/backup.sh
+User=root
+

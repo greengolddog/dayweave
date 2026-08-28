@@ -1,0 +1,13 @@
+tunnel_id: applicationtunnel-replace
+
+iam:
+  service_account:
+    service_account_id: serviceaccount-replace
+    public_key_id: authpublickey-replace
+    private_key_path: /config/private-key.pem
+
+services:
+  - name: dayweave
+    target: api:8787
+    type: http
+
