@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use crate::{
     AvailabilityWindow, ConstraintStrength, DayOfWeek, Dependency, DependencyRelation,
-    FixedBlockSource, ItemId, ItemKind, Minutes, PlanRequest, PreviousBlock, SchedulingConstraints,
-    SplitPolicy, WorkItem, roll_up_expected_durations,
+    FixedBlockSource, ItemId, ItemKind, MaterializedIdentity, Minutes, Occurrence, OccurrenceId,
+    PlanRequest, PreviousBlock, SchedulingConstraints, SplitPolicy, WorkItem,
+    materialize_recurrences, roll_up_expected_durations,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct SchedulePlan {
     pub decisions: Vec<PlanDecision>,
     pub violations: Vec<PlanViolation>,
     pub score: PlanScore,
+    #[serde(default)]
+    pub occurrences: Vec<Occurrence>,
 }
 
 impl SchedulePlan {
@@ -36,6 +39,8 @@ impl SchedulePlan {
 pub struct ScheduleBlock {
     pub id: Uuid,
     pub item_id: Option<ItemId>,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
     pub external_block_id: Option<Uuid>,
     pub title: String,
     pub start: OffsetDateTime,
@@ -81,6 +86,8 @@ pub enum ExplanationCode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnscheduledWork {
     pub item_id: ItemId,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
     pub remaining: Minutes,
     pub reason: UnscheduledReason,
     pub message: String,
@@ -101,6 +108,8 @@ pub enum UnscheduledReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanDecision {
     pub item_id: ItemId,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
     pub kind: DecisionKind,
     pub message: String,
 }
@@ -121,6 +130,8 @@ pub struct PlanViolation {
     pub kind: ViolationKind,
     pub severity: ViolationSeverity,
     pub item_ids: Vec<ItemId>,
+    #[serde(default)]
+    pub occurrence_ids: Vec<OccurrenceId>,
     pub start: Option<OffsetDateTime>,
     pub end: Option<OffsetDateTime>,
     pub penalty: u64,
@@ -170,6 +181,8 @@ pub enum ScheduleError {
     MissingPreviousItem(ItemId),
     #[error("invalid hierarchy: {0}")]
     InvalidHierarchy(String),
+    #[error("invalid recurrence: {0}")]
+    InvalidRecurrence(String),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -184,6 +197,16 @@ impl Scheduler {
     /// Capacity and constraint conflicts are represented in the returned plan,
     /// not as errors.
     pub fn plan(&self, request: &PlanRequest) -> Result<SchedulePlan, ScheduleError> {
+        validate_request(request)?;
+        let materialized = materialize_recurrences(request)
+            .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
+        let mut plan = Self::plan_materialized(&materialized.request)?;
+        remap_occurrence_outputs(&mut plan, &materialized.identities);
+        plan.occurrences = materialized.occurrences;
+        Ok(plan)
+    }
+
+    fn plan_materialized(request: &PlanRequest) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
 
         let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
@@ -203,6 +226,7 @@ impl Scheduler {
             if item.status.is_terminal() {
                 state.decisions.push(PlanDecision {
                     item_id: item.id,
+                    occurrence_id: None,
                     kind: DecisionKind::TerminalItemIgnored,
                     message: "Completed, skipped, or canceled work does not reserve future time."
                         .to_owned(),
@@ -212,6 +236,7 @@ impl Scheduler {
             if item.status == crate::WorkStatus::Blocked {
                 state.unscheduled.push(UnscheduledWork {
                     item_id: item.id,
+                    occurrence_id: None,
                     remaining: item
                         .duration
                         .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes),
@@ -227,6 +252,7 @@ impl Scheduler {
             if !item.occupies_time(has_children) {
                 state.decisions.push(PlanDecision {
                     item_id: item.id,
+                    occurrence_id: None,
                     kind: DecisionKind::ContainerRolledUp,
                     message: "This parent is represented by its schedulable leaf descendants."
                         .to_owned(),
@@ -249,6 +275,7 @@ impl Scheduler {
                     .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes);
                 state.unscheduled.push(UnscheduledWork {
                     item_id,
+                    occurrence_id: None,
                     remaining,
                     reason: UnscheduledReason::DependencyUnavailable,
                     message: "A hard predecessor could not be placed in this plan.".to_owned(),
@@ -268,6 +295,7 @@ impl Scheduler {
                 .map_or(Minutes::ZERO, crate::DurationEstimate::planning_minutes);
             state.unscheduled.push(UnscheduledWork {
                 item_id,
+                occurrence_id: None,
                 remaining,
                 reason: UnscheduledReason::DependencyCycle,
                 message: "Hard dependencies form a cycle; edit or soften one dependency."
@@ -276,6 +304,45 @@ impl Scheduler {
         }
 
         Ok(state.finish(request))
+    }
+}
+
+fn remap_occurrence_outputs(
+    plan: &mut SchedulePlan,
+    identities: &BTreeMap<ItemId, MaterializedIdentity>,
+) {
+    for block in &mut plan.blocks {
+        let Some(internal_id) = block.item_id else {
+            continue;
+        };
+        if let Some(identity) = identities.get(&internal_id) {
+            block.item_id = Some(identity.series_item_id);
+            block.occurrence_id = Some(identity.occurrence_id);
+        }
+    }
+    for work in &mut plan.unscheduled {
+        if let Some(identity) = identities.get(&work.item_id) {
+            work.item_id = identity.series_item_id;
+            work.occurrence_id = Some(identity.occurrence_id);
+        }
+    }
+    for decision in &mut plan.decisions {
+        if let Some(identity) = identities.get(&decision.item_id) {
+            decision.item_id = identity.series_item_id;
+            decision.occurrence_id = Some(identity.occurrence_id);
+        }
+    }
+    for violation in &mut plan.violations {
+        for item_id in &mut violation.item_ids {
+            if let Some(identity) = identities.get(item_id) {
+                *item_id = identity.series_item_id;
+                violation.occurrence_ids.push(identity.occurrence_id);
+            }
+        }
+        violation.item_ids.sort_unstable();
+        violation.item_ids.dedup();
+        violation.occurrence_ids.sort_unstable();
+        violation.occurrence_ids.dedup();
     }
 }
 
@@ -380,6 +447,7 @@ impl PlanningState {
             self.blocks.push(ScheduleBlock {
                 id: fixed.id,
                 item_id: None,
+                occurrence_id: None,
                 external_block_id: Some(fixed.id),
                 title: fixed.title.clone(),
                 start: fixed.start,
@@ -421,6 +489,7 @@ impl PlanningState {
             self.blocks.push(ScheduleBlock {
                 id: block_id(item.id, 0, event.start),
                 item_id: Some(item.id),
+                occurrence_id: None,
                 external_block_id: None,
                 title: item.title.clone(),
                 start: event.start,
@@ -435,6 +504,7 @@ impl PlanningState {
             });
             self.decisions.push(PlanDecision {
                 item_id: item.id,
+                occurrence_id: None,
                 kind: DecisionKind::FixedEventRetained,
                 message: "The calendar event remains at its source time.".to_owned(),
             });
@@ -480,6 +550,7 @@ impl PlanningState {
                 self.blocks.push(ScheduleBlock {
                     id: block_id(item.id, block.session_index, block.start),
                     item_id: Some(item.id),
+                    occurrence_id: None,
                     external_block_id: None,
                     title: item.title.clone(),
                     start: block.start,
@@ -494,6 +565,7 @@ impl PlanningState {
             }
             self.decisions.push(PlanDecision {
                 item_id: item.id,
+                occurrence_id: None,
                 kind: DecisionKind::KeptPinned,
                 message: "Pinned sessions were preserved exactly.".to_owned(),
             });
@@ -531,6 +603,7 @@ impl PlanningState {
                         },
                         severity: ViolationSeverity::Error,
                         item_ids,
+                        occurrence_ids: Vec::new(),
                         start: Some(left.interval.start.max(right.interval.start)),
                         end: Some(left.interval.end.min(right.interval.end)),
                         penalty: 0,
@@ -553,6 +626,7 @@ impl PlanningState {
         let Some(duration) = item.duration else {
             self.unscheduled.push(UnscheduledWork {
                 item_id: item.id,
+                occurrence_id: None,
                 remaining: Minutes::ZERO,
                 reason: UnscheduledReason::MissingDuration,
                 message: "Add or accept a duration estimate before scheduling.".to_owned(),
@@ -664,6 +738,7 @@ impl PlanningState {
         if remaining == 0 {
             self.decisions.push(PlanDecision {
                 item_id: item.id,
+                occurrence_id: None,
                 kind: DecisionKind::Scheduled,
                 message: format!("Reserved {required} minutes."),
             });
@@ -680,6 +755,7 @@ impl PlanningState {
                 self.score.unscheduled_minutes.saturating_add(remaining);
             self.unscheduled.push(UnscheduledWork {
                 item_id: item.id,
+                occurrence_id: None,
                 remaining: Minutes(remaining),
                 reason,
                 message: format!(
@@ -690,6 +766,7 @@ impl PlanningState {
                 kind: ViolationKind::Capacity,
                 severity: ViolationSeverity::Error,
                 item_ids: vec![item.id],
+                occurrence_ids: Vec::new(),
                 start: None,
                 end: None,
                 penalty: 0,
@@ -698,6 +775,7 @@ impl PlanningState {
             if scheduled_now > 0 {
                 self.decisions.push(PlanDecision {
                     item_id: item.id,
+                    occurrence_id: None,
                     kind: DecisionKind::PartiallyScheduled,
                     message: format!(
                         "Reserved {scheduled_now} of {required} minutes; overload remains visible."
@@ -803,6 +881,16 @@ impl PlanningState {
         let mut explanations = Vec::new();
         let constraints = &item.constraints;
 
+        if let Some(window) = constraints.occurrence_window {
+            let recurrence_window = Interval {
+                start: window.start,
+                end: window.end,
+            };
+            if !recurrence_window.contains(interval) {
+                return None;
+            }
+        }
+
         let mut test = |satisfied: bool,
                         strength: ConstraintStrength,
                         kind: ViolationKind,
@@ -822,6 +910,7 @@ impl PlanningState {
                 kind,
                 severity: ViolationSeverity::Warning,
                 item_ids: vec![item.id],
+                occurrence_ids: Vec::new(),
                 start: Some(interval.start),
                 end: Some(interval.end),
                 penalty: item_penalty,
@@ -1027,7 +1116,10 @@ impl PlanningState {
                 "Advances linked goal work.",
             ));
         }
-        if matches!(item.kind, ItemKind::Habit(_) | ItemKind::Routine(_)) {
+        if matches!(
+            item.kind,
+            ItemKind::Habit(_) | ItemKind::Routine(_) | ItemKind::RecurringTask(_)
+        ) {
             explanations.push(explanation(
                 ExplanationCode::HabitOrRoutine,
                 "Maintains a habit or routine cadence.",
@@ -1301,6 +1393,7 @@ impl PlanningState {
         self.blocks.push(ScheduleBlock {
             id: block_id(item.id, session_index, candidate.interval.start),
             item_id: Some(item.id),
+            occurrence_id: None,
             external_block_id: None,
             title: item.title.clone(),
             start: candidate.interval.start,
@@ -1344,6 +1437,7 @@ impl PlanningState {
             decisions: self.decisions,
             violations: self.violations,
             score: self.score,
+            occurrences: Vec::new(),
         }
     }
 }
@@ -1418,6 +1512,16 @@ fn validate_request(request: &PlanRequest) -> Result<(), ScheduleError> {
 }
 
 fn validate_constraints(item: &WorkItem) -> Result<(), ScheduleError> {
+    if item
+        .constraints
+        .occurrence_window
+        .is_some_and(|window| window.start >= window.end)
+    {
+        return Err(invalid_item(
+            item.id,
+            "recurrence occurrence window is empty",
+        ));
+    }
     for window in &item.constraints.preferred_absolute_windows {
         if window.value.start >= window.value.end {
             return Err(invalid_item(item.id, "preferred window is empty"));
@@ -1589,7 +1693,7 @@ fn kind_rank(item: &WorkItem) -> u8 {
         return 0;
     }
     match item.kind {
-        ItemKind::Habit(_) | ItemKind::Routine(_) => 1,
+        ItemKind::Habit(_) | ItemKind::Routine(_) | ItemKind::RecurringTask(_) => 1,
         ItemKind::Break(_) => 2,
         ItemKind::Task | ItemKind::Goal(_) => 3,
         ItemKind::CalendarEvent(_) => 4,
@@ -1774,6 +1878,7 @@ fn add_penalty_violation(
         kind,
         severity: ViolationSeverity::Warning,
         item_ids: vec![item_id],
+        occurrence_ids: Vec::new(),
         start: Some(interval.start),
         end: Some(interval.end),
         penalty: value,

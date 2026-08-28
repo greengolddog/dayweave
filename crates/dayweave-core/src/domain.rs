@@ -152,11 +152,17 @@ impl WorkStatus {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ItemKind {
     Task,
+    RecurringTask(RecurringTaskSpec),
     Habit(HabitSpec),
     Routine(RoutineSpec),
     Goal(GoalSpec),
     Break(BreakSpec),
     CalendarEvent(CalendarEventSpec),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurringTaskSpec {
+    pub recurrence: Recurrence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,10 +251,40 @@ pub enum Recurrence {
     AfterCompletion {
         interval: Minutes,
     },
+    /// General frequency form used when calendar-vs-rolling semantics and
+    /// minimum spacing must be explicit.
+    Frequency {
+        target: u16,
+        period: RecurrencePeriod,
+        semantics: RecurrenceSemantics,
+        #[serde(default)]
+        weekdays: BTreeSet<DayOfWeek>,
+        #[serde(default)]
+        minimum_spacing: Minutes,
+        #[serde(default)]
+        anchor: Option<OffsetDateTime>,
+    },
     Custom {
         /// RFC 5545 recurrence rule, retained losslessly for calendar parity.
         rrule: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecurrencePeriod {
+    Day,
+    Week,
+    Month,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecurrenceSemantics {
+    /// Counts reset at local day, week, or month boundaries.
+    Calendar,
+    /// Counts use intervals anchored to creation, completion, or an override.
+    Rolling,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -375,6 +411,10 @@ pub struct SchedulingConstraints {
     pub maximum_daily_work: Option<Qualified<Minutes>>,
     pub maximum_weekly_work: Option<Qualified<Minutes>>,
     pub buffers: BufferPolicy,
+    /// A system-generated hard window for one materialized recurrence. It is
+    /// independent from user-authored earliest/latest preferences.
+    #[serde(default)]
+    pub occurrence_window: Option<AbsoluteWindow>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -533,6 +573,8 @@ pub enum FixedBlockSource {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviousAssignment {
     pub item_id: ItemId,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
     pub blocks: Vec<PreviousBlock>,
     /// Pinned blocks are immutable inputs. Unpinned blocks are stability hints.
     pub pinned: bool,
@@ -573,6 +615,128 @@ pub struct PlanRequest {
     pub fixed_blocks: Vec<FixedBlock>,
     pub previous_assignments: Vec<PreviousAssignment>,
     pub config: SchedulerConfig,
+    /// Defaults preserve compatibility with requests written before recurrence
+    /// materialization was introduced.
+    #[serde(default)]
+    pub recurrence_context: RecurrenceContext,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RecurrenceContext {
+    /// Platform-resolved local days. Supplying these makes IANA timezone and
+    /// DST intent explicit without embedding a timezone database in the core.
+    #[serde(default)]
+    pub calendar: RecurrenceCalendar,
+    /// Last completion is the rolling anchor for `after_completion` rules.
+    #[serde(default)]
+    pub completion_anchors: BTreeMap<ItemId, OffsetDateTime>,
+    /// Optional anchor override for rolling frequency and interval rules.
+    #[serde(default)]
+    pub rolling_anchors: BTreeMap<ItemId, OffsetDateTime>,
+    /// Per-series spacing override, including legacy recurrence forms.
+    #[serde(default)]
+    pub minimum_spacing: BTreeMap<ItemId, Minutes>,
+    /// Stable IDs already satisfied in the current recurrence cycle. They stay
+    /// visible in expansion output but do not create schedule demand.
+    #[serde(default)]
+    pub completed_occurrence_ids: BTreeSet<OccurrenceId>,
+    #[serde(default)]
+    pub pauses: Vec<RecurrencePause>,
+    #[serde(default)]
+    pub exceptions: Vec<RecurrenceException>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrenceCalendar {
+    /// IANA identifier recorded for audit/display; day boundaries below are
+    /// authoritative for calculations.
+    pub time_zone_id: Option<String>,
+    pub week_starts_on: DayOfWeek,
+    pub days: Vec<ZonedDayBoundary>,
+}
+
+impl Default for RecurrenceCalendar {
+    fn default() -> Self {
+        Self {
+            time_zone_id: None,
+            week_starts_on: DayOfWeek::Monday,
+            days: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZonedDayBoundary {
+    pub local_date: time::Date,
+    /// Instant corresponding to local 00:00 at the start of the day.
+    pub start: OffsetDateTime,
+    /// Instant corresponding to the next local 00:00. A DST day may therefore
+    /// contain 23 or 25 elapsed hours.
+    pub end: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrencePause {
+    pub item_id: ItemId,
+    pub start: OffsetDateTime,
+    pub end: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecurrenceException {
+    pub item_id: ItemId,
+    pub selector: RecurrenceExceptionSelector,
+    pub action: RecurrenceExceptionAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecurrenceExceptionSelector {
+    Occurrence { id: OccurrenceId },
+    LocalDate { date: time::Date },
+    NominalStart { at: OffsetDateTime },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecurrenceExceptionAction {
+    Skip,
+    Move {
+        start: OffsetDateTime,
+        end: OffsetDateTime,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OccurrenceId(pub Uuid);
+
+impl std::fmt::Display for OccurrenceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Occurrence {
+    pub id: OccurrenceId,
+    pub series_item_id: ItemId,
+    pub nominal_start: OffsetDateTime,
+    pub nominal_end: OffsetDateTime,
+    pub window_start: OffsetDateTime,
+    pub window_end: OffsetDateTime,
+    pub local_date: Option<time::Date>,
+    pub ordinal: u32,
+    pub state: OccurrenceState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OccurrenceState {
+    Generated,
+    Completed,
+    Paused,
+    Skipped,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

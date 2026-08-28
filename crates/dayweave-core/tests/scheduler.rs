@@ -55,6 +55,7 @@ fn request(items: Vec<WorkItem>) -> PlanRequest {
         fixed_blocks: Vec::new(),
         previous_assignments: Vec::new(),
         config: SchedulerConfig::default(),
+        recurrence_context: RecurrenceContext::default(),
     }
 }
 
@@ -274,6 +275,7 @@ fn stability_hint_is_preserved_when_still_valid() {
     let mut input = request(vec![task.clone()]);
     input.previous_assignments = vec![PreviousAssignment {
         item_id: task.id,
+        occurrence_id: None,
         blocks: vec![PreviousBlock {
             start: old_start,
             end: old_start + Duration::hours(1),
@@ -343,15 +345,7 @@ fn hard_context_and_energy_rules_filter_availability() {
 fn habits_and_breaks_are_first_class_schedulable_work() {
     let mut habit = item(75, "Walk", 30);
     habit.kind = ItemKind::Habit(HabitSpec {
-        recurrence: Recurrence::Weekly {
-            times_per_week: 4,
-            weekdays: BTreeSet::from([
-                DayOfWeek::Monday,
-                DayOfWeek::Tuesday,
-                DayOfWeek::Thursday,
-                DayOfWeek::Saturday,
-            ]),
-        },
+        recurrence: Recurrence::Daily { times_per_day: 1 },
         target: Some(QuantityTarget {
             amount: 3_000,
             unit: "steps".to_owned(),
@@ -386,6 +380,7 @@ fn pinned_and_fixed_overlap_stays_visible_as_an_error() {
     let mut input = request(vec![task.clone()]);
     input.previous_assignments = vec![PreviousAssignment {
         item_id: task.id,
+        occurrence_id: None,
         blocks: vec![PreviousBlock {
             start: DAY + Duration::hours(9),
             end: DAY + Duration::hours(10),
