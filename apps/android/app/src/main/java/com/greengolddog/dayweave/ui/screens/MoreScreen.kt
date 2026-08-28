@@ -12,7 +12,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.CloudDone
+import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.HealthAndSafety
 import androidx.compose.material.icons.outlined.Notifications
@@ -48,13 +48,13 @@ fun MoreScreen(
             Card {
                 ListItem(
                     headlineContent = { Text("Personal workspace") },
-                    supportingContent = { Text("Offline ready · synced just now") },
+                    supportingContent = { Text("Encrypted offline · server not connected") },
                     leadingContent = { Icon(Icons.Outlined.AccountCircle, contentDescription = null) },
                     trailingContent = {
                         Icon(
-                            Icons.Outlined.CloudDone,
-                            contentDescription = "Synced",
-                            tint = MaterialTheme.colorScheme.secondary,
+                            Icons.Outlined.CloudOff,
+                            contentDescription = "Server not connected",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     },
                 )
@@ -101,7 +101,7 @@ fun MoreScreen(
 
         item {
             Text(
-                "DayWeave 0.1.0 · Local Android foundation",
+                "DayWeave 0.1.0 · Encrypted local plan",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(vertical = 10.dp),

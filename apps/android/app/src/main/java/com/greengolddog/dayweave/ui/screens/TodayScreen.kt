@@ -10,6 +10,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.AddTask
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -147,6 +148,27 @@ fun TodayScreen(
 
         items(state.visibleSchedule, key = { it.id }) { item ->
             ScheduleItemCard(item = item, onStart = { onStart(item.id) })
+        }
+
+        if (state.visibleSchedule.isEmpty()) {
+            item {
+                Card {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(18.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(Icons.Outlined.AddTask, contentDescription = null)
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("Your timeline is empty", style = MaterialTheme.typography.titleMedium)
+                            Text(
+                                "Use Quick capture to add a task, event, habit, routine, goal, or break. Nothing is scheduled until you review it.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }

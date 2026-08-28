@@ -8,7 +8,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
-import androidx.compose.material.icons.outlined.CloudDone
+import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.CircularProgressIndicator
@@ -124,9 +124,9 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                         }
                     }
                     Icon(
-                        Icons.Outlined.CloudDone,
-                        contentDescription = "Synced",
-                        tint = MaterialTheme.colorScheme.secondary,
+                        Icons.Outlined.CloudOff,
+                        contentDescription = "Server not connected",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 },
                 colors = TopAppBarDefaults.topAppBarColors(

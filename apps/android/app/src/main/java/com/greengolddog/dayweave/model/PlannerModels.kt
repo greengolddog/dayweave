@@ -140,9 +140,9 @@ data class DayWeaveUiState(
     val inbox: List<InboxItem> = emptyList(),
     val suggestions: List<PlanningSuggestion> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
-    val scheduleMessage: String = "Schedule is balanced",
+    val scheduleMessage: String = "Capture something to compose your first day",
     val protectedFreeMinutes: Int = 90,
-    val dayScore: Int = 82,
+    val dayScore: Int = 0,
     val showCompleted: Boolean = true,
     val quietSuggestions: Boolean = true,
     val useDynamicColor: Boolean = false,
@@ -294,6 +294,8 @@ data class DayWeaveUiState(
                     text = "Your hard commitments fit. The afternoon is intentionally lighter because the morning has two deep-focus blocks.",
                 ),
             ),
+            scheduleMessage = "Schedule is balanced",
+            dayScore = 82,
         )
     }
 }
