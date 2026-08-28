@@ -12,6 +12,82 @@ pub struct EventListOptions {
     pub max_results: Option<u16>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventInstanceListOptions {
+    pub page_token: Option<String>,
+    pub time_min: Option<String>,
+    pub time_max: Option<String>,
+    pub max_results: Option<u16>,
+}
+
+impl EventInstanceListOptions {
+    fn query(&self) -> Vec<(&'static str, String)> {
+        let mut query = vec![
+            ("showDeleted", "true".to_owned()),
+            (
+                "maxResults",
+                self.max_results.unwrap_or(2500).min(2500).to_string(),
+            ),
+        ];
+        if let Some(value) = &self.page_token {
+            query.push(("pageToken", value.clone()));
+        }
+        if let Some(value) = &self.time_min {
+            query.push(("timeMin", value.clone()));
+        }
+        if let Some(value) = &self.time_max {
+            query.push(("timeMax", value.clone()));
+        }
+        query
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoogleCalendar {
+    pub id: Option<String>,
+    pub etag: Option<String>,
+    pub summary: String,
+    pub description: Option<String>,
+    pub location: Option<String>,
+    pub time_zone: Option<String>,
+    pub conference_properties: Option<ConferenceProperties>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarWrite {
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConferenceProperties {
+    #[serde(default)]
+    pub allowed_conference_solution_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSetting {
+    pub id: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalendarSettingsPage {
+    #[serde(default)]
+    pub items: Vec<CalendarSetting>,
+    pub next_page_token: Option<String>,
+    pub next_sync_token: Option<String>,
+}
+
 impl EventListOptions {
     fn query(&self) -> Result<Vec<(&'static str, String)>, GoogleError> {
         if self.sync_token.is_some() && (self.time_min.is_some() || self.time_max.is_some()) {
@@ -80,6 +156,60 @@ pub struct EventListPage {
     pub next_page_token: Option<String>,
     pub next_sync_token: Option<String>,
     pub time_zone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeBusyRequest {
+    pub time_min: String,
+    pub time_max: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    pub items: Vec<FreeBusyRequestItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeBusyRequestItem {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeBusyResponse {
+    pub time_min: String,
+    pub time_max: String,
+    #[serde(default)]
+    pub calendars: std::collections::BTreeMap<String, FreeBusyCalendar>,
+    #[serde(default)]
+    pub groups: std::collections::BTreeMap<String, FreeBusyGroup>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeBusyCalendar {
+    #[serde(default)]
+    pub busy: Vec<FreeBusyInterval>,
+    #[serde(default)]
+    pub errors: Vec<FreeBusyError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeBusyGroup {
+    #[serde(default)]
+    pub calendars: Vec<String>,
+    #[serde(default)]
+    pub errors: Vec<FreeBusyError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeBusyInterval {
+    pub start: String,
+    pub end: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreeBusyError {
+    pub domain: Option<String>,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +339,92 @@ impl GoogleClient {
         self.json(request).await
     }
 
+    /// Reads a calendar's metadata and timezone.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn get_calendar(&self, calendar_id: &str) -> Result<GoogleCalendar, GoogleError> {
+        let url = self.endpoint(&["calendar", "v3", "calendars", calendar_id])?;
+        let request = self.request(Method::GET, url).await?;
+        self.json(request).await
+    }
+
+    /// Creates the dedicated private `DayWeave` calendar selected during
+    /// onboarding. This does not invite attendees or mutate an existing event.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn create_calendar(
+        &self,
+        calendar: &CalendarWrite,
+    ) -> Result<GoogleCalendar, GoogleError> {
+        if calendar.summary.trim().is_empty() {
+            return Err(GoogleError::InvalidSyncRequest(
+                "calendar summary cannot be empty",
+            ));
+        }
+        let url = self.endpoint(&["calendar", "v3", "calendars"])?;
+        let request = self.request(Method::POST, url).await?;
+        self.json(Self::body(request, calendar)).await
+    }
+
+    /// Lists Google Calendar account settings, including the account timezone.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn list_calendar_settings(
+        &self,
+        page_token: Option<&str>,
+        sync_token: Option<&str>,
+    ) -> Result<CalendarSettingsPage, GoogleError> {
+        let url = self.endpoint(&["calendar", "v3", "users", "me", "settings"])?;
+        let mut query = Vec::new();
+        if let Some(value) = page_token {
+            query.push(("pageToken", value));
+        }
+        if let Some(value) = sync_token {
+            query.push(("syncToken", value));
+        }
+        let request = self.request(Method::GET, url).await?.query(&query);
+        self.json(request).await
+    }
+
+    /// Queries provider free/busy intervals without importing event content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-request error for empty/reversed bounds or no
+    /// calendars, plus typed provider errors.
+    pub async fn query_free_busy(
+        &self,
+        request_body: &FreeBusyRequest,
+    ) -> Result<FreeBusyResponse, GoogleError> {
+        let time_min = time::OffsetDateTime::parse(
+            &request_body.time_min,
+            &time::format_description::well_known::Rfc3339,
+        );
+        let time_max = time::OffsetDateTime::parse(
+            &request_body.time_max,
+            &time::format_description::well_known::Rfc3339,
+        );
+        if !matches!((time_min, time_max), (Ok(start), Ok(end)) if start < end) {
+            return Err(GoogleError::InvalidSyncRequest(
+                "free/busy bounds must be valid increasing RFC 3339 timestamps",
+            ));
+        }
+        if request_body.items.is_empty() {
+            return Err(GoogleError::InvalidSyncRequest(
+                "free/busy query requires a calendar",
+            ));
+        }
+        let url = self.endpoint(&["calendar", "v3", "freeBusy"])?;
+        let request = self.request(Method::POST, url).await?;
+        self.json(Self::body(request, request_body)).await
+    }
+
     /// Lists complete event series and deletion tombstones for incremental sync.
     ///
     /// # Errors
@@ -228,6 +444,56 @@ impl GoogleClient {
         self.json(request).await
     }
 
+    /// Lists concrete instances from one recurring event series. This supports
+    /// occurrence editing while retaining the source `RRULE` on the series.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn list_event_instances(
+        &self,
+        calendar_id: &str,
+        recurring_event_id: &str,
+        options: &EventInstanceListOptions,
+    ) -> Result<EventListPage, GoogleError> {
+        let url = self.endpoint(&[
+            "calendar",
+            "v3",
+            "calendars",
+            calendar_id,
+            "events",
+            recurring_event_id,
+            "instances",
+        ])?;
+        let request = self
+            .request(Method::GET, url)
+            .await?
+            .query(&options.query());
+        self.json(request).await
+    }
+
+    /// Reads a single event or recurrence exception by remote ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn get_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+    ) -> Result<GoogleEvent, GoogleError> {
+        let url = self.endpoint(&[
+            "calendar",
+            "v3",
+            "calendars",
+            calendar_id,
+            "events",
+            event_id,
+        ])?;
+        let request = self.request(Method::GET, url).await?;
+        self.json(request).await
+    }
+
     /// Creates an event after enforcing the external-change approval boundary.
     ///
     /// # Errors
@@ -243,10 +509,11 @@ impl GoogleClient {
     ) -> Result<GoogleEvent, GoogleError> {
         approval.validate(Some(event))?;
         let url = self.endpoint(&["calendar", "v3", "calendars", calendar_id, "events"])?;
-        let request = self
-            .request(Method::POST, url)
-            .await?
-            .query(&[("sendUpdates", send_updates.as_str())]);
+        let request = self.request(Method::POST, url).await?.query(&[
+            ("sendUpdates", send_updates.as_str()),
+            ("conferenceDataVersion", "1"),
+            ("supportsAttachments", "true"),
+        ]);
         self.json(Self::body(request, event)).await
     }
 
@@ -271,10 +538,11 @@ impl GoogleClient {
             "events",
             &event.id,
         ])?;
-        let mut request = self
-            .request(Method::PUT, url)
-            .await?
-            .query(&[("sendUpdates", send_updates.as_str())]);
+        let mut request = self.request(Method::PUT, url).await?.query(&[
+            ("sendUpdates", send_updates.as_str()),
+            ("conferenceDataVersion", "1"),
+            ("supportsAttachments", "true"),
+        ]);
         if let Some(etag) = &event.etag {
             request = request.header(reqwest::header::IF_MATCH, etag);
         }

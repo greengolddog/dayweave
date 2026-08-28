@@ -46,6 +46,14 @@ pub struct GoogleTask {
     pub hidden: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskInsertOptions {
+    /// Creates a subtask under this remote task ID.
+    pub parent: Option<String>,
+    /// Places the task after this sibling remote task ID.
+    pub previous: Option<String>,
+}
+
 impl GoogleClient {
     /// Lists Google Tasks lists visible to the account.
     ///
@@ -103,8 +111,30 @@ impl GoogleClient {
         task_list_id: &str,
         task: &GoogleTask,
     ) -> Result<GoogleTask, GoogleError> {
+        self.insert_task_at(task_list_id, task, &TaskInsertOptions::default())
+            .await
+    }
+
+    /// Inserts and positions a top-level task or subtask.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn insert_task_at(
+        &self,
+        task_list_id: &str,
+        task: &GoogleTask,
+        options: &TaskInsertOptions,
+    ) -> Result<GoogleTask, GoogleError> {
         let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks"])?;
-        let request = self.request(Method::POST, url).await?;
+        let mut query = Vec::new();
+        if let Some(parent) = &options.parent {
+            query.push(("parent", parent));
+        }
+        if let Some(previous) = &options.previous {
+            query.push(("previous", previous));
+        }
+        let request = self.request(Method::POST, url).await?.query(&query);
         self.json(Self::body(request, task)).await
     }
 

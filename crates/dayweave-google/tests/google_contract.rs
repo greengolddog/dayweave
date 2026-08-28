@@ -3,9 +3,11 @@ use std::sync::Arc;
 use dayweave_google::{
     GoogleClient, GoogleError, StaticAccessToken,
     calendar::{
-        EventAttendee, EventDateTime, EventListOptions, EventWriteApproval, ExtendedProperties,
-        GoogleEvent, SendUpdates,
+        CalendarWrite, EventAttendee, EventDateTime, EventInstanceListOptions, EventListOptions,
+        EventWriteApproval, ExtendedProperties, FreeBusyRequest, FreeBusyRequestItem, GoogleEvent,
+        SendUpdates,
     },
+    tasks::{GoogleTask, TaskInsertOptions},
 };
 use serde_json::json;
 use wiremock::{
@@ -295,4 +297,167 @@ async fn exposes_numeric_retry_after_without_response_body() {
             retry_after_seconds: Some(17)
         }
     ));
+}
+
+#[tokio::test]
+async fn creates_dedicated_calendar_and_queries_free_busy_without_event_content() {
+    let server = MockServer::start().await;
+    let calendar = CalendarWrite {
+        summary: "DayWeave".to_owned(),
+        description: Some("Firm private schedule blocks".to_owned()),
+        location: None,
+        time_zone: Some("Europe/Madrid".to_owned()),
+    };
+    Mock::given(method("POST"))
+        .and(path("/calendar/v3/calendars"))
+        .and(body_json(&calendar))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "dayweave@example.test",
+            "etag": "calendar-etag",
+            "summary": "DayWeave",
+            "description": "Firm private schedule blocks",
+            "timeZone": "Europe/Madrid"
+        })))
+        .mount(&server)
+        .await;
+    let created = client(&server)
+        .create_calendar(&calendar)
+        .await
+        .expect("dedicated calendar is created");
+    assert_eq!(created.id.as_deref(), Some("dayweave@example.test"));
+
+    let free_busy = FreeBusyRequest {
+        time_min: "2026-08-30T00:00:00+02:00".to_owned(),
+        time_max: "2026-08-31T00:00:00+02:00".to_owned(),
+        time_zone: Some("Europe/Madrid".to_owned()),
+        items: vec![FreeBusyRequestItem {
+            id: "dayweave@example.test".to_owned(),
+        }],
+    };
+    Mock::given(method("POST"))
+        .and(path("/calendar/v3/freeBusy"))
+        .and(body_json(&free_busy))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "timeMin": "2026-08-29T22:00:00Z",
+            "timeMax": "2026-08-30T22:00:00Z",
+            "calendars": {
+                "dayweave@example.test": {
+                    "busy": [{
+                        "start": "2026-08-30T09:00:00+02:00",
+                        "end": "2026-08-30T10:00:00+02:00"
+                    }]
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    let availability = client(&server)
+        .query_free_busy(&free_busy)
+        .await
+        .expect("free/busy response parses");
+    assert_eq!(
+        availability.calendars["dayweave@example.test"].busy.len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn rejects_invalid_free_busy_range_without_network_access() {
+    let server = MockServer::start().await;
+    let error = client(&server)
+        .query_free_busy(&FreeBusyRequest {
+            time_min: "2026-08-31T00:00:00Z".to_owned(),
+            time_max: "2026-08-30T00:00:00Z".to_owned(),
+            time_zone: None,
+            items: vec![FreeBusyRequestItem {
+                id: "primary".to_owned(),
+            }],
+        })
+        .await
+        .expect_err("reversed range is invalid");
+    assert!(matches!(error, GoogleError::InvalidSyncRequest(_)));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn lists_recurring_instances_with_encoded_series_id() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/calendar/v3/calendars/team%2Fprimary/events/series%2Fone/instances",
+        ))
+        .and(query_param("showDeleted", "true"))
+        .and(query_param("timeMin", "2026-08-30T00:00:00Z"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "id": "instance-1",
+                "status": "confirmed",
+                "start": {"dateTime": "2026-08-30T09:00:00Z"},
+                "end": {"dateTime": "2026-08-30T09:30:00Z"},
+                "recurringEventId": "series/one"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let page = client(&server)
+        .list_event_instances(
+            "team/primary",
+            "series/one",
+            &EventInstanceListOptions {
+                time_min: Some("2026-08-30T00:00:00Z".to_owned()),
+                ..EventInstanceListOptions::default()
+            },
+        )
+        .await
+        .expect("instance page parses");
+    assert_eq!(
+        page.items[0].recurring_event_id.as_deref(),
+        Some("series/one")
+    );
+}
+
+#[tokio::test]
+async fn positions_google_subtask_with_encoded_task_list() {
+    let server = MockServer::start().await;
+    let task = GoogleTask {
+        id: "child".to_owned(),
+        etag: None,
+        title: "Pack charger".to_owned(),
+        notes: None,
+        status: Some("needsAction".to_owned()),
+        due: None,
+        completed: None,
+        updated: None,
+        parent: None,
+        position: None,
+        links: None,
+        deleted: false,
+        hidden: false,
+    };
+    Mock::given(method("POST"))
+        .and(path("/tasks/v1/lists/travel%2Flist/tasks"))
+        .and(query_param("parent", "parent-1"))
+        .and(query_param("previous", "sibling-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&task))
+        .mount(&server)
+        .await;
+    let created = client(&server)
+        .insert_task_at(
+            "travel/list",
+            &task,
+            &TaskInsertOptions {
+                parent: Some("parent-1".to_owned()),
+                previous: Some("sibling-1".to_owned()),
+            },
+        )
+        .await
+        .expect("positioned task is created");
+    assert_eq!(created.title, "Pack charger");
 }
