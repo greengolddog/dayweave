@@ -39,5 +39,24 @@ final class PlannerStoreTests: XCTestCase {
         XCTAssertEqual(store.blocks, snapshot)
         XCTAssertEqual(store.suggestions.first?.state, .accepted)
     }
+
+    func testProductionStartupWithoutSnapshotIsEmptyInsteadOfPreviewSeeded() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DayWeaveLiveStoreTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = try PlannerEncryptionKey(data: Data(repeating: 7, count: 32))
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: key
+        )
+
+        let store = PlannerStore.live(persistence: persistence)
+
+        XCTAssertTrue(store.blocks.isEmpty)
+        XCTAssertTrue(store.suggestions.isEmpty)
+        XCTAssertTrue(store.assistantMessages.isEmpty)
+        XCTAssertNil(store.selectedBlockID)
+        XCTAssertEqual(store.lastScheduleMessage, "No schedule yet — add an item when you’re ready")
+    }
 }
 #endif

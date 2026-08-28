@@ -1,6 +1,11 @@
 import Foundation
 import SwiftUI
 
+enum PlannerLoadState: Equatable, Sendable {
+    case ready
+    case persistenceFailed
+}
+
 @MainActor
 final class PlannerStore: ObservableObject {
     @Published var destination: SidebarDestination? = .today {
@@ -19,7 +24,7 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published var isQuickAddPresented = false
-    @Published var lastScheduleMessage = "Schedule is balanced" {
+    @Published var lastScheduleMessage: String {
         didSet { scheduleAutosave() }
     }
     @Published var protectedFreeMinutes = 90 {
@@ -32,6 +37,7 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var persistenceError: PlannerPersistenceError?
+    @Published private(set) var loadState: PlannerLoadState
 
     private let persistence: EncryptedPlannerPersistence?
     private let autosaveDelay: Duration
@@ -41,6 +47,7 @@ final class PlannerStore: ObservableObject {
         blocks: [ScheduleBlock] = [],
         suggestions: [PlanningSuggestion] = [],
         assistantMessages: [AssistantMessage] = [],
+        lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
         persistence: EncryptedPlannerPersistence? = nil,
         restoreFromPersistence: Bool = true,
         autosaveDelay: Duration = .milliseconds(250)
@@ -69,11 +76,12 @@ final class PlannerStore: ObservableObject {
         } else {
             selectedBlockID = initialBlocks.first?.id
         }
-        lastScheduleMessage = restoredSnapshot?.lastScheduleMessage ?? "Schedule is balanced"
+        self.lastScheduleMessage = restoredSnapshot?.lastScheduleMessage ?? lastScheduleMessage
         protectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes ?? 90
         freezeHours = restoredSnapshot?.freezeHours ?? 2
         showCompleted = restoredSnapshot?.showCompleted ?? true
         persistenceError = restorationError
+        loadState = restorationError == nil ? .ready : .persistenceFailed
 
         if persistence != nil, restoreFromPersistence, restoredSnapshot == nil, restorationError == nil {
             scheduleAutosave()
@@ -83,14 +91,19 @@ final class PlannerStore: ObservableObject {
     func flushPersistence() {
         autosaveTask?.cancel()
         autosaveTask = nil
-        guard let persistence else { return }
+        guard loadState == .ready, let persistence else { return }
 
         do {
             try persistence.save(makeSnapshot())
             persistenceError = nil
         } catch {
             persistenceError = error
+            loadState = .persistenceFailed
         }
+    }
+
+    var canMutatePlan: Bool {
+        loadState == .ready
     }
 
     var selectedBlock: ScheduleBlock? {
@@ -112,10 +125,12 @@ final class PlannerStore: ObservableObject {
     }
 
     func select(_ block: ScheduleBlock) {
+        guard canMutatePlan else { return }
         selectedBlockID = block.id
     }
 
     func start(_ id: UUID) {
+        guard canMutatePlan else { return }
         for index in blocks.indices {
             if blocks[index].status == .active {
                 blocks[index].status = .paused
@@ -128,12 +143,14 @@ final class PlannerStore: ObservableObject {
     }
 
     func pauseActive() {
+        guard canMutatePlan else { return }
         guard let index = blocks.firstIndex(where: { $0.status == .active }) else { return }
         blocks[index].status = .paused
         lastScheduleMessage = "Paused — remaining work is held tentatively"
     }
 
     func complete(_ id: UUID) {
+        guard canMutatePlan else { return }
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return }
         blocks[index].status = .completed
         blocks[index].actualMinutes = blocks[index].durationMinutes
@@ -141,12 +158,14 @@ final class PlannerStore: ObservableObject {
     }
 
     func skip(_ id: UUID) {
+        guard canMutatePlan else { return }
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return }
         blocks[index].status = .skipped
         lastScheduleMessage = "Skipped — recurrence policy will decide the next occurrence"
     }
 
     func doLater(_ id: UUID) {
+        guard canMutatePlan else { return }
         guard let index = blocks.firstIndex(where: { $0.id == id }) else { return }
         let delta: TimeInterval = 60 * 60
         blocks[index].start.addTimeInterval(delta)
@@ -156,6 +175,7 @@ final class PlannerStore: ObservableObject {
     }
 
     func recomposeSchedule() {
+        guard canMutatePlan else { return }
         let now = Date()
         let frozenUntil = now.addingTimeInterval(TimeInterval(freezeHours * 3_600))
         var cursor: Date?
@@ -173,6 +193,7 @@ final class PlannerStore: ObservableObject {
     }
 
     func quickAdd(title: String, kind: PlannerItemKind, minutes: Int) {
+        guard canMutatePlan else { return }
         let lastEnd = blocks.map(\.end).max() ?? Date()
         let start = max(lastEnd.addingTimeInterval(10 * 60), Date())
         let block = ScheduleBlock(
@@ -196,6 +217,7 @@ final class PlannerStore: ObservableObject {
     }
 
     func sendAssistantMessage(_ text: String) {
+        guard canMutatePlan else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         assistantMessages.append(.init(id: UUID(), role: .user, text: trimmed, createdAt: Date()))
@@ -208,17 +230,19 @@ final class PlannerStore: ObservableObject {
     }
 
     func acceptSuggestion(_ id: UUID) {
+        guard canMutatePlan else { return }
         guard let index = suggestions.firstIndex(where: { $0.id == id }) else { return }
         suggestions[index].state = .accepted
     }
 
     func rejectSuggestion(_ id: UUID) {
+        guard canMutatePlan else { return }
         guard let index = suggestions.firstIndex(where: { $0.id == id }) else { return }
         suggestions[index].state = .rejected
     }
 
     private func scheduleAutosave() {
-        guard persistence != nil else { return }
+        guard loadState == .ready, persistence != nil else { return }
         autosaveTask?.cancel()
         let delay = autosaveDelay
         autosaveTask = Task { @MainActor [weak self] in
@@ -246,19 +270,22 @@ final class PlannerStore: ObservableObject {
         )
     }
 
-    static func live(now: Date = Date()) -> PlannerStore {
-        let seed = preview(now: now)
+    static func live() -> PlannerStore {
         do {
-            return PlannerStore(
-                blocks: seed.blocks,
-                suggestions: seed.suggestions,
-                assistantMessages: seed.assistantMessages,
-                persistence: try EncryptedPlannerPersistence.applicationDefault()
-            )
+            return live(persistence: try EncryptedPlannerPersistence.applicationDefault())
         } catch {
-            seed.persistenceError = error
-            return seed
+            let store = PlannerStore()
+            store.persistenceError = error
+            store.loadState = .persistenceFailed
+            return store
         }
+    }
+
+    /// Production startup restores synchronously before the store is exposed.
+    /// With no snapshot, it starts empty rather than presenting preview data
+    /// that actions could accidentally target.
+    static func live(persistence: EncryptedPlannerPersistence) -> PlannerStore {
+        PlannerStore(persistence: persistence)
     }
 
     static func preview(now: Date = Date()) -> PlannerStore {
@@ -299,6 +326,11 @@ final class PlannerStore: ObservableObject {
                 createdAt: now
             )
         ]
-        return PlannerStore(blocks: blocks, suggestions: suggestions, assistantMessages: messages)
+        return PlannerStore(
+            blocks: blocks,
+            suggestions: suggestions,
+            assistantMessages: messages,
+            lastScheduleMessage: "Schedule is balanced"
+        )
     }
 }

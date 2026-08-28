@@ -7,11 +7,13 @@ struct DayWeaveMacApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store: PlannerStore
     @StateObject private var codex: CodexAppServerClient
+    @StateObject private var suggestionSync: SuggestionSyncStore
 
     init() {
         _store = StateObject(wrappedValue: PlannerStore.live())
         let codex = CodexAppServerClient()
         _codex = StateObject(wrappedValue: codex)
+        _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
         codex.startIfNeeded()
     }
 
@@ -20,6 +22,7 @@ struct DayWeaveMacApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(codex)
+                .environmentObject(suggestionSync)
                 .frame(minWidth: 1_080, minHeight: 720)
                 .onChange(of: scenePhase) { _, phase in
                     if phase != .active {
@@ -37,11 +40,13 @@ struct DayWeaveMacApp: App {
                     store.isQuickAddPresented = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(!store.canMutatePlan)
 
                 Button("Recompose Schedule") {
                     store.recomposeSchedule()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .option])
+                .disabled(!store.canMutatePlan)
             }
         }
 
@@ -55,7 +60,8 @@ struct DayWeaveMacApp: App {
             SettingsView()
                 .environmentObject(store)
                 .environmentObject(codex)
-                .frame(width: 620, height: 480)
+                .environmentObject(suggestionSync)
+                .frame(width: 660, height: 620)
         }
     }
 }

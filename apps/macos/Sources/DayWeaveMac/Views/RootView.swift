@@ -31,6 +31,7 @@ struct RootView: View {
                     Label("Recompose", systemImage: "wand.and.stars")
                 }
                 .help("Recompose around current constraints")
+                .disabled(!store.canMutatePlan)
 
                 Button {
                     store.isQuickAddPresented = true
@@ -38,6 +39,7 @@ struct RootView: View {
                     Label("Quick Add", systemImage: "plus")
                 }
                 .help("Quick Add (⇧⌘N)")
+                .disabled(!store.canMutatePlan)
             }
         }
     }
@@ -144,14 +146,27 @@ private struct TodayView: View {
         VStack(spacing: 0) {
             TodayHeader()
             Divider()
-            ScrollView {
-                LazyVStack(spacing: 10) {
-                    ForEach(store.visibleBlocks) { block in
-                        ScheduleBlockView(block: block)
-                            .onTapGesture { store.select(block) }
-                    }
+            if store.visibleBlocks.isEmpty {
+                ContentUnavailableView {
+                    Label("No plan yet", systemImage: "calendar.badge.plus")
+                } description: {
+                    Text("Start with Quick Add. Nothing is scheduled until you add it.")
+                } actions: {
+                    Button("Quick Add") { store.isQuickAddPresented = true }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!store.canMutatePlan)
                 }
-                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 10) {
+                        ForEach(store.visibleBlocks) { block in
+                            ScheduleBlockView(block: block)
+                                .onTapGesture { store.select(block) }
+                        }
+                    }
+                    .padding(20)
+                }
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
@@ -260,6 +275,7 @@ private struct ScheduleBlockView: View {
                         Button("Later") { store.doLater(block.id) }
                     }
                     .controlSize(.small)
+                    .disabled(!store.canMutatePlan)
                 }
             }
             .opacity(block.status == .completed ? 0.55 : 1)
@@ -360,6 +376,7 @@ private struct BlockInspector: View {
                         Button("Skip") { store.skip(block.id) }
                     }
                 }
+                .disabled(!store.canMutatePlan)
             }
             .padding(18)
         }
@@ -440,7 +457,10 @@ private struct AssistantView: View {
                         .font(.title2)
                 }
                 .buttonStyle(.plain)
-                .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || !store.canMutatePlan
+                )
             }
             .padding(12)
         }
@@ -469,31 +489,261 @@ private struct AssistantBubble: View {
 
 private struct SuggestionsInboxView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+    @State private var proposalBeingEdited: DayWeaveProposal?
+
+    private var pendingLocalSuggestions: [PlanningSuggestion] {
+        store.suggestions.filter { $0.state == .pending }
+    }
 
     var body: some View {
         List {
-            Section("Suggestions") {
-                ForEach(store.suggestions.filter { $0.state == .pending }) { suggestion in
+            Section {
+                Label {
+                    Text("External tools can submit proposals, but they cannot change this schedule directly. Approval records a server-side decision only.")
+                } icon: {
+                    Image(systemName: "shield.checkered")
+                        .foregroundStyle(.green)
+                }
+                .font(.subheadline)
+
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 8, height: 8)
+                    Text(suggestionSync.status.message)
+                        .font(.caption)
+                        .foregroundStyle(suggestionSync.status.isFailure ? .red : .secondary)
+                    Spacer()
+                    if suggestionSync.isRefreshing {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button("Refresh") {
+                        Task { await suggestionSync.refresh() }
+                    }
+                    .controlSize(.small)
+                    .disabled(
+                        !suggestionSync.isConfigured
+                            || suggestionSync.isRefreshing
+                            || !suggestionSync.activeProposalIDs.isEmpty
+                    )
+                }
+            }
+
+            if !pendingLocalSuggestions.isEmpty {
+                Section("On this Mac") {
+                    ForEach(pendingLocalSuggestions) { suggestion in
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Image(systemName: "sparkles").foregroundStyle(.purple)
+                                Text(suggestion.title).font(.headline)
+                                Spacer()
+                                Text(suggestion.source).font(.caption).foregroundStyle(.secondary)
+                            }
+                            Text(suggestion.summary).foregroundStyle(.secondary)
+                            HStack {
+                                Button("Review & accept") { store.acceptSuggestion(suggestion.id) }
+                                    .buttonStyle(.borderedProminent)
+                                Button("Reject") { store.rejectSuggestion(suggestion.id) }
+                            }
+                            .controlSize(.small)
+                        }
+                        .padding(.vertical, 8)
+                    }
+                }
+            }
+
+            Section("External proposals") {
+                if suggestionSync.proposals.isEmpty {
                     VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Image(systemName: "sparkles").foregroundStyle(.purple)
-                            Text(suggestion.title).font(.headline)
-                            Spacer()
-                            Text(suggestion.source).font(.caption).foregroundStyle(.secondary)
+                        Text(emptyExternalTitle)
+                            .font(.headline)
+                        Text(emptyExternalDetail)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        if !suggestionSync.isConfigured {
+                            SettingsLink {
+                                Label("Open API Settings", systemImage: "gearshape")
+                            }
                         }
-                        Text(suggestion.summary).foregroundStyle(.secondary)
-                        HStack {
-                            Button("Review & accept") { store.acceptSuggestion(suggestion.id) }
-                                .buttonStyle(.borderedProminent)
-                            Button("Reject") { store.rejectSuggestion(suggestion.id) }
-                        }
-                        .controlSize(.small)
                     }
                     .padding(.vertical, 8)
+                } else {
+                    ForEach(suggestionSync.proposals) { proposal in
+                        RemoteSuggestionRow(
+                            proposal: proposal,
+                            isWorking: suggestionSync.activeProposalIDs.contains(proposal.id),
+                            edit: { proposalBeingEdited = proposal }
+                        )
+                    }
                 }
             }
         }
         .navigationTitle("Inbox")
+        .task {
+            guard suggestionSync.isConfigured else { return }
+            await suggestionSync.refresh()
+        }
+        .sheet(item: $proposalBeingEdited) { proposal in
+            EditRemoteSuggestionView(proposal: proposal)
+                .environmentObject(suggestionSync)
+        }
+    }
+
+    private var statusColor: Color {
+        switch suggestionSync.status {
+        case .online: .green
+        case .refreshing: .blue
+        case .failed: .red
+        case .ready: .orange
+        case .configurationRequired: .secondary
+        }
+    }
+
+    private var emptyExternalTitle: String {
+        if suggestionSync.status.isFailure {
+            "External proposals are unavailable"
+        } else if suggestionSync.isConfigured {
+            "No pending external proposals"
+        } else {
+            "External proposals are not configured"
+        }
+    }
+
+    private var emptyExternalDetail: String {
+        if suggestionSync.status.isFailure {
+            "The last API request failed. Local suggestions and planning remain available."
+        } else if suggestionSync.isConfigured {
+            "Refresh to check the authenticated DayWeave API. Local planning remains available offline."
+        } else {
+            "Add an API URL and bearer token in Settings. Local suggestions continue to work without them."
+        }
+    }
+}
+
+private struct RemoteSuggestionRow: View {
+    @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+
+    let proposal: DayWeaveProposal
+    let isWorking: Bool
+    let edit: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Image(systemName: "network")
+                    .foregroundStyle(.blue)
+                Text(proposal.title)
+                    .font(.headline)
+                Spacer()
+                Text(proposal.source.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if let explanation = proposal.explanation, !explanation.isEmpty {
+                Text(explanation)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                Label(proposal.kind.title, systemImage: "doc.text")
+                Label(
+                    "Expires \(proposal.expiresAt.formatted(date: .abbreviated, time: .shortened))",
+                    systemImage: "clock"
+                )
+                Text("Revision \(proposal.revision)")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            HStack {
+                Button("Approve proposal") {
+                    Task { await suggestionSync.accept(proposal) }
+                }
+                .buttonStyle(.borderedProminent)
+                Button("Reject") {
+                    Task { await suggestionSync.reject(proposal) }
+                }
+                Button("Edit…", action: edit)
+                if isWorking {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            .controlSize(.small)
+            .disabled(isWorking || suggestionSync.isRefreshing)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+private struct EditRemoteSuggestionView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+
+    let proposal: DayWeaveProposal
+    @State private var title: String
+    @State private var explanation: String
+
+    init(proposal: DayWeaveProposal) {
+        self.proposal = proposal
+        _title = State(initialValue: proposal.title)
+        _explanation = State(initialValue: proposal.explanation ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                VStack(alignment: .leading) {
+                    Text("Edit external proposal")
+                        .font(.title2.weight(.semibold))
+                    Text("This edits the review proposal only; it does not change the schedule.")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+            }
+
+            TextField("Title", text: $title)
+                .textFieldStyle(.roundedBorder)
+            TextField("Explanation", text: $explanation, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(3...8)
+
+            if proposal.explanation != nil, explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text("The current API can replace an explanation but cannot clear it.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            HStack {
+                Spacer()
+                Button("Save proposal") {
+                    Task {
+                        if await suggestionSync.edit(
+                            proposal,
+                            title: title,
+                            explanation: explanation
+                        ) {
+                            dismiss()
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canSave || suggestionSync.activeProposalIDs.contains(proposal.id))
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+    }
+
+    private var canSave: Bool {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let explanation = explanation.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return false }
+        if proposal.explanation != nil, explanation.isEmpty { return false }
+        return title != proposal.title || explanation != (proposal.explanation ?? "")
     }
 }
 
@@ -536,7 +786,10 @@ private struct QuickAddView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
-                .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(
+                    title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        || !store.canMutatePlan
+                )
             }
         }
         .padding(24)
@@ -557,12 +810,15 @@ struct MenuBarView: View {
                     Button("Pause") { store.pauseActive() }
                     Button("Complete") { store.complete(active.id) }
                 }
+                .disabled(!store.canMutatePlan)
             } else {
                 ContentUnavailableView("Nothing active", systemImage: "checkmark.circle")
             }
             Divider()
             Button("Quick Add…") { store.isQuickAddPresented = true }
+                .disabled(!store.canMutatePlan)
             Button("Recompose") { store.recomposeSchedule() }
+                .disabled(!store.canMutatePlan)
         }
         .padding(14)
         .frame(width: 300)
@@ -572,7 +828,10 @@ struct MenuBarView: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
+    @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @State private var apiKey = ""
+    @State private var dayWeaveAPIBaseURL = ""
+    @State private var dayWeaveBearerToken = ""
 
     var body: some View {
         Form {
@@ -581,6 +840,7 @@ struct SettingsView: View {
                 Stepper("Protect \(store.protectedFreeMinutes) free minutes", value: $store.protectedFreeMinutes, in: 0...480, step: 15)
                 Toggle("Show completed blocks", isOn: $store.showCompleted)
             }
+            .disabled(!store.canMutatePlan)
             Section("Accounts") {
                 LabeledContent("Google", value: "Ready to connect")
                 LabeledContent("Codex", value: codex.state.title)
@@ -610,6 +870,47 @@ struct SettingsView: View {
                     }
                 }
             }
+            Section("DayWeave suggestions API") {
+                TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
+                    .textContentType(.URL)
+                SecureField(
+                    suggestionSync.tokenConfigured ? "New bearer token (leave blank to keep saved token)" : "Bearer token",
+                    text: $dayWeaveBearerToken
+                )
+
+                HStack {
+                    Button("Save API settings") {
+                        if suggestionSync.applyConfiguration(
+                            baseURL: dayWeaveAPIBaseURL,
+                            newToken: dayWeaveBearerToken
+                        ) {
+                            dayWeaveBearerToken = ""
+                            dayWeaveAPIBaseURL = suggestionSync.baseURLString
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        dayWeaveAPIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || (!suggestionSync.tokenConfigured
+                                && dayWeaveBearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    )
+
+                    if suggestionSync.tokenConfigured {
+                        Button("Remove saved token", role: .destructive) {
+                            suggestionSync.clearBearerToken()
+                            dayWeaveBearerToken = ""
+                        }
+                    }
+                }
+
+                LabeledContent("Credential", value: suggestionSync.tokenConfigured ? "Stored in Keychain" : "Not saved")
+                Text(suggestionSync.status.message)
+                    .font(.caption)
+                    .foregroundStyle(suggestionSync.status.isFailure ? .red : .secondary)
+                Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. The token is never saved in the planner snapshot.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("Local data") {
                 LabeledContent("Planner storage", value: store.persistenceError == nil ? "Encrypted" : "Needs attention")
                 if let error = store.persistenceError {
@@ -624,5 +925,8 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onAppear {
+            dayWeaveAPIBaseURL = suggestionSync.baseURLString
+        }
     }
 }
