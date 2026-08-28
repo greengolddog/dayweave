@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dayweave-core",
+    "server/dayweave-api",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-DayWeave-Proprietary"
+authors = ["greengolddog"]
+repository = "https://github.com/greengolddog/dayweave"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
