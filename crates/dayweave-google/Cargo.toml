@@ -12,14 +12,17 @@ workspace = true
 
 [dependencies]
 async-trait = "0.1"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "query", "rustls"] }
+base64 = "0.22"
+getrandom = "0.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["form", "json", "query", "rustls"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
 thiserror = "2"
 url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 wiremock = "0.6.5"
-

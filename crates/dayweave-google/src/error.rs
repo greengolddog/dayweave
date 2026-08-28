@@ -22,4 +22,12 @@ pub enum GoogleError {
     InvalidSyncRequest(&'static str),
     #[error("explicit approval is required for an external calendar mutation")]
     ApprovalRequired,
+    #[error("Google OAuth authorization state did not match")]
+    OAuthStateMismatch,
+    #[error("Google OAuth request is invalid: {0}")]
+    InvalidOAuthRequest(&'static str),
+    #[error("Google OAuth rejected the request ({code})")]
+    OAuthRejected { code: String },
+    #[error("secure random generation failed")]
+    Randomness,
 }

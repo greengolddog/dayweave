@@ -7,6 +7,7 @@
 mod auth;
 pub mod calendar;
 mod error;
+pub mod oauth;
 pub mod tasks;
 
 use std::sync::Arc;
