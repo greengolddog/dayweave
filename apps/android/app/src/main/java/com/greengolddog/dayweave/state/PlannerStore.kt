@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.state
 
+import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ChatMessage
@@ -11,26 +12,63 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import java.util.UUID
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+enum class PlannerLoadState {
+    LOADING,
+    READY,
+    PERSISTENCE_FAILED,
+}
 
 /**
- * Owns presentation state while repositories and sync adapters are still being connected.
- * All writes go through explicit intents so this class can later sit above the offline database.
+ * Owns presentation state and serializes it to an optional offline repository.
+ *
+ * Mutations remain synchronous after restore. While encrypted state is loading—or after a storage
+ * failure—writes are rejected so an action can never target preview or stale data.
  */
-class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
+class PlannerStore(
+    private val initialState: DayWeaveUiState = DayWeaveUiState.preview(),
+    private val repository: PlannerStateRepository? = null,
+    scope: CoroutineScope? = null,
+    private val onPersistenceError: (Throwable) -> Unit = {},
+) {
     private val mutableState = MutableStateFlow(initialState)
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
+    private val mutableLoadState = MutableStateFlow(
+        if (repository == null) PlannerLoadState.READY else PlannerLoadState.LOADING,
+    )
+    val loadState: StateFlow<PlannerLoadState> = mutableLoadState.asStateFlow()
+
+    private val persistenceLock = Any()
+    private val saveRequests = Channel<Unit>(Channel.CONFLATED)
+    private val persistenceReady = CompletableDeferred<Boolean>()
+    private var persistenceStatus = if (repository == null) {
+        PersistenceStatus.DISABLED
+    } else {
+        PersistenceStatus.LOADING
+    }
+
+    init {
+        if (repository != null) {
+            requireNotNull(scope) { "A CoroutineScope is required when persistence is enabled" }
+            scope.launch { restore(repository) }
+            scope.launch { autosave(repository) }
+        }
+    }
 
     fun navigate(destination: AppDestination) {
-        mutableState.update { it.copy(destination = destination) }
+        mutate { it.copy(destination = destination) }
     }
 
     fun startItem(id: String) {
-        mutableState.update { current ->
-            if (current.schedule.none { it.id == id }) return@update current
+        mutate { current ->
+            if (current.schedule.none { it.id == id }) return@mutate current
 
             val schedule = current.schedule.map { item ->
                 when {
@@ -48,8 +86,8 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun pauseActive(minutes: Int? = null) {
-        mutableState.update { current ->
-            val active = current.activeSession ?: return@update current
+        mutate { current ->
+            val active = current.activeSession ?: return@mutate current
             val pauseLabel = minutes?.let { "$it minute break" } ?: "Open-ended break"
             current.copy(
                 schedule = current.schedule.map {
@@ -62,8 +100,8 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun resumeActive() {
-        mutableState.update { current ->
-            val active = current.activeSession ?: return@update current
+        mutate { current ->
+            val active = current.activeSession ?: return@mutate current
             current.copy(
                 schedule = current.schedule.map {
                     if (it.id == active.itemId) it.copy(status = ItemStatus.ACTIVE) else it
@@ -75,8 +113,8 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun completeActive() {
-        mutableState.update { current ->
-            val active = current.activeSession ?: return@update current
+        mutate { current ->
+            val active = current.activeSession ?: return@mutate current
             current.copy(
                 schedule = current.schedule.map { item ->
                     if (item.id == active.itemId) {
@@ -95,8 +133,8 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun skipActive() {
-        mutableState.update { current ->
-            val active = current.activeSession ?: return@update current
+        mutate { current ->
+            val active = current.activeSession ?: return@mutate current
             current.copy(
                 schedule = current.schedule.map {
                     if (it.id == active.itemId) it.copy(status = ItemStatus.SKIPPED) else it
@@ -108,8 +146,8 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun doActiveLater() {
-        mutableState.update { current ->
-            val active = current.activeSession ?: return@update current
+        mutate { current ->
+            val active = current.activeSession ?: return@mutate current
             current.copy(
                 schedule = current.schedule.map {
                     if (it.id == active.itemId) {
@@ -127,12 +165,13 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     fun quickCapture(title: String, kind: ItemKind): Boolean {
         val trimmed = title.trim()
         if (trimmed.isEmpty()) return false
+        val captureId = UUID.randomUUID().toString()
 
-        mutableState.update { current ->
+        return mutate { current ->
             current.copy(
                 inbox = listOf(
                     InboxItem(
-                        id = UUID.randomUUID().toString(),
+                        id = captureId,
                         title = trimmed,
                         source = InboxSource.QUICK_CAPTURE,
                         detail = "${kind.label} · needs duration and constraints",
@@ -141,7 +180,6 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
                 scheduleMessage = "Captured to Inbox · nothing was scheduled yet",
             )
         }
-        return true
     }
 
     /**
@@ -149,10 +187,10 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
      * Approval stages a reviewable Inbox draft and intentionally never mutates [DayWeaveUiState.schedule].
      */
     fun approveSuggestion(id: String) {
-        mutableState.update { current ->
+        mutate { current ->
             val suggestion = current.suggestions.firstOrNull { it.id == id }
-                ?: return@update current
-            if (suggestion.disposition != SuggestionDisposition.PENDING) return@update current
+                ?: return@mutate current
+            if (suggestion.disposition != SuggestionDisposition.PENDING) return@mutate current
 
             current.copy(
                 suggestions = current.suggestions.map {
@@ -173,7 +211,7 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     }
 
     fun rejectSuggestion(id: String) {
-        mutableState.update { current ->
+        mutate { current ->
             current.copy(
                 suggestions = current.suggestions.map {
                     if (it.id == id) it.copy(disposition = SuggestionDisposition.REJECTED) else it
@@ -188,7 +226,7 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
         val safeSummary = summary.trim()
         if (safeTitle.isEmpty() || safeSummary.isEmpty()) return
 
-        mutableState.update { current ->
+        mutate { current ->
             current.copy(
                 suggestions = current.suggestions.map {
                     if (it.id == id && it.disposition == SuggestionDisposition.PENDING) {
@@ -204,36 +242,98 @@ class PlannerStore(initialState: DayWeaveUiState = DayWeaveUiState.preview()) {
     fun sendAssistantMessage(text: String): Boolean {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return false
-        mutableState.update { current ->
+        val userMessageId = UUID.randomUUID().toString()
+        val assistantMessageId = UUID.randomUUID().toString()
+        return mutate { current ->
             current.copy(
                 messages = current.messages + listOf(
-                    ChatMessage(UUID.randomUUID().toString(), ChatRole.USER, trimmed),
+                    ChatMessage(userMessageId, ChatRole.USER, trimmed),
                     ChatMessage(
-                        UUID.randomUUID().toString(),
+                        assistantMessageId,
                         ChatRole.ASSISTANT,
                         "I’ll check hard constraints, deadlines, energy, and protected free time. Any schedule change will arrive as a reviewable proposal.",
                     ),
                 ),
             )
         }
-        return true
     }
 
     fun toggleCompleted() {
-        mutableState.update { it.copy(showCompleted = !it.showCompleted) }
+        mutate { it.copy(showCompleted = !it.showCompleted) }
     }
 
     fun toggleQuietSuggestions() {
-        mutableState.update { it.copy(quietSuggestions = !it.quietSuggestions) }
+        mutate { it.copy(quietSuggestions = !it.quietSuggestions) }
     }
 
     fun toggleDynamicColor() {
-        mutableState.update { it.copy(useDynamicColor = !it.useDynamicColor) }
+        mutate { it.copy(useDynamicColor = !it.useDynamicColor) }
     }
 
     fun recompose() {
-        mutableState.update {
+        mutate {
             it.copy(scheduleMessage = "Recomposed · hard commitments and the focus horizon stayed fixed")
         }
+    }
+
+    private fun mutate(transform: (DayWeaveUiState) -> DayWeaveUiState): Boolean {
+        val shouldSave = synchronized(persistenceLock) {
+            if (
+                persistenceStatus == PersistenceStatus.LOADING ||
+                persistenceStatus == PersistenceStatus.FAILED
+            ) {
+                return@synchronized null
+            }
+            mutableState.value = transform(mutableState.value)
+            persistenceStatus == PersistenceStatus.READY
+        } ?: return false
+        if (shouldSave) saveRequests.trySend(Unit)
+        return true
+    }
+
+    private suspend fun restore(repository: PlannerStateRepository) {
+        val restored = runCatching { repository.load() }
+        if (restored.isFailure) {
+            markPersistenceFailed(restored.exceptionOrNull() ?: return)
+            persistenceReady.complete(false)
+            return
+        }
+
+        val persistedState = restored.getOrNull()
+        val shouldSaveInitialState = synchronized(persistenceLock) {
+            mutableState.value = persistedState ?: initialState
+            persistenceStatus = PersistenceStatus.READY
+            persistedState == null
+        }
+        persistenceReady.complete(true)
+        mutableLoadState.value = PlannerLoadState.READY
+        if (shouldSaveInitialState) saveRequests.trySend(Unit)
+    }
+
+    private suspend fun autosave(repository: PlannerStateRepository) {
+        if (!persistenceReady.await()) return
+        for (ignored in saveRequests) {
+            val snapshot = mutableState.value
+            val saved = runCatching { repository.save(snapshot) }
+            if (saved.isFailure) {
+                markPersistenceFailed(saved.exceptionOrNull() ?: return)
+                return
+            }
+        }
+    }
+
+    private fun markPersistenceFailed(error: Throwable) {
+        synchronized(persistenceLock) {
+            persistenceStatus = PersistenceStatus.FAILED
+        }
+        onPersistenceError(error)
+        mutableLoadState.value = PlannerLoadState.PERSISTENCE_FAILED
+    }
+
+    private enum class PersistenceStatus {
+        DISABLED,
+        LOADING,
+        READY,
+        FAILED,
     }
 }

@@ -2,6 +2,7 @@ package com.greengolddog.dayweave.ui
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
@@ -10,6 +11,7 @@ import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -23,11 +25,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.state.DayWeaveViewModel
+import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
@@ -43,8 +48,47 @@ import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 @Composable
 fun DayWeaveApp(viewModel: DayWeaveViewModel = viewModel()) {
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val loadState by viewModel.loadState.collectAsStateWithLifecycle()
     DayWeaveTheme(useDynamicColor = state.useDynamicColor) {
-        DayWeaveRoot(viewModel = viewModel)
+        when (loadState) {
+            PlannerLoadState.LOADING -> PlannerRestoreScreen()
+            PlannerLoadState.READY -> DayWeaveRoot(viewModel = viewModel)
+            PlannerLoadState.PERSISTENCE_FAILED -> PlannerPersistenceFailureScreen()
+        }
+    }
+}
+
+@Composable
+private fun PlannerRestoreScreen() {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        CircularProgressIndicator()
+        Text(
+            text = "Opening your encrypted plan…",
+            modifier = Modifier.padding(top = 16.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+@Composable
+private fun PlannerPersistenceFailureScreen() {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text("Encrypted plan unavailable", style = MaterialTheme.typography.headlineSmall)
+        Text(
+            text = "DayWeave kept the existing database unchanged and disabled editing. Close and reopen the app; if this continues, use an explicit recovery flow before resetting local data.",
+            modifier = Modifier.padding(top = 12.dp),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 

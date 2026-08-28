@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <full-backup-content>
     <exclude domain="sharedpref" path="auth.xml" />
+    <exclude domain="sharedpref" path="auth.xml.bak" />
     <exclude domain="database" path="encrypted.db" />
+    <exclude domain="database" path="encrypted.db-journal" />
+    <exclude domain="database" path="encrypted.db-wal" />
+    <exclude domain="database" path="encrypted.db-shm" />
 </full-backup-content>

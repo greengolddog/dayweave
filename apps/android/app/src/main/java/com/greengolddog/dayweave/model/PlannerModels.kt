@@ -2,7 +2,9 @@ package com.greengolddog.dayweave.model
 
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
+import kotlinx.serialization.Serializable
 
+@Serializable
 enum class AppDestination(val label: String) {
     TODAY("Today"),
     CALENDAR("Calendar"),
@@ -11,6 +13,7 @@ enum class AppDestination(val label: String) {
     MORE("More"),
 }
 
+@Serializable
 enum class ItemKind(val label: String) {
     EVENT("Event"),
     TASK("Task"),
@@ -20,6 +23,7 @@ enum class ItemKind(val label: String) {
     BREAK("Break"),
 }
 
+@Serializable
 enum class ItemStatus(val label: String) {
     NOT_STARTED("Not started"),
     SCHEDULED("Scheduled"),
@@ -31,12 +35,14 @@ enum class ItemStatus(val label: String) {
     BLOCKED("Blocked"),
 }
 
+@Serializable
 enum class EnergyLevel(val label: String) {
     LOW("Low"),
     MEDIUM("Medium"),
     DEEP("Deep"),
 }
 
+@Serializable
 data class ScheduleItem(
     val id: String,
     val title: String,
@@ -66,6 +72,7 @@ data class ScheduleItem(
     }
 }
 
+@Serializable
 data class ActiveSession(
     val itemId: String,
     val elapsedMinutes: Int,
@@ -73,12 +80,14 @@ data class ActiveSession(
     val pauseLabel: String? = null,
 )
 
+@Serializable
 enum class SuggestionDisposition {
     PENDING,
     APPROVED_FOR_INBOX,
     REJECTED,
 }
 
+@Serializable
 enum class SuggestionKind(val label: String) {
     SCHEDULE_CHANGE("Schedule change"),
     NEW_TASK("New task"),
@@ -86,6 +95,7 @@ enum class SuggestionKind(val label: String) {
     CONSTRAINT_CHANGE("Constraint change"),
 }
 
+@Serializable
 data class PlanningSuggestion(
     val id: String,
     val title: String,
@@ -96,12 +106,14 @@ data class PlanningSuggestion(
     val disposition: SuggestionDisposition = SuggestionDisposition.PENDING,
 )
 
+@Serializable
 enum class InboxSource(val label: String) {
     QUICK_CAPTURE("Quick capture"),
     EXTERNAL_PROPOSAL("External proposal"),
     GOOGLE_TASKS("Google Tasks"),
 }
 
+@Serializable
 data class InboxItem(
     val id: String,
     val title: String,
@@ -110,14 +122,17 @@ data class InboxItem(
     val requiresReview: Boolean = true,
 )
 
+@Serializable
 enum class ChatRole { USER, ASSISTANT }
 
+@Serializable
 data class ChatMessage(
     val id: String,
     val role: ChatRole,
     val text: String,
 )
 
+@Serializable
 data class DayWeaveUiState(
     val destination: AppDestination = AppDestination.TODAY,
     val schedule: List<ScheduleItem> = emptyList(),

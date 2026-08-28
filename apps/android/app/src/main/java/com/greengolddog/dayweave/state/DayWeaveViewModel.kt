@@ -1,16 +1,17 @@
 package com.greengolddog.dayweave.state
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import com.greengolddog.dayweave.DayWeaveApplication
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ItemKind
 import kotlinx.coroutines.flow.StateFlow
 
-class DayWeaveViewModel(
-    private val plannerStore: PlannerStore,
-) : ViewModel() {
-    constructor() : this(PlannerStore())
+class DayWeaveViewModel(application: Application) : AndroidViewModel(application) {
+    private val plannerStore = (application as DayWeaveApplication).plannerStore
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
+    val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
 
     fun navigate(destination: AppDestination) = plannerStore.navigate(destination)
     fun startItem(id: String) = plannerStore.startItem(id)

@@ -1,10 +1,20 @@
 package com.greengolddog.dayweave.state
 
+import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.SuggestionDisposition
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -12,6 +22,81 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlannerStoreTest {
+    @Test
+    fun restoreBlocksInputUntilPersistedStateIsReadyAndThenAutosaves() = runBlocking {
+        val restoredState = DayWeaveUiState.preview().copy(
+            protectedFreeMinutes = 37,
+            scheduleMessage = "Restored from disk",
+        )
+        val allowLoad = CompletableDeferred<Unit>()
+        val savedStates = Channel<DayWeaveUiState>(Channel.UNLIMITED)
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState {
+                allowLoad.await()
+                return restoredState
+            }
+
+            override suspend fun save(state: DayWeaveUiState) {
+                savedStates.send(state)
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        try {
+            val store = PlannerStore(
+                initialState = DayWeaveUiState.preview(),
+                repository = repository,
+                scope = scope,
+            )
+
+            assertEquals(PlannerLoadState.LOADING, store.loadState.value)
+            assertFalse(store.quickCapture("Capture during restore", ItemKind.TASK))
+            allowLoad.complete(Unit)
+
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            assertEquals(restoredState, store.state.value)
+            assertTrue(store.quickCapture("Capture after restore", ItemKind.TASK))
+            val savedState = withTimeout(3_000) { savedStates.receive() }
+
+            assertEquals(store.state.value, savedState)
+            assertEquals("Capture after restore", savedState.inbox.first().title)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun persistenceFailureBecomesReadOnlyWithoutReplacingVisibleState() = runBlocking {
+        val initial = DayWeaveUiState.preview()
+        val failure = IllegalStateException("synthetic encrypted storage failure")
+        val reported = CompletableDeferred<Throwable>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = throw failure
+
+            override suspend fun save(state: DayWeaveUiState) = Unit
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        try {
+            val store = PlannerStore(
+                initialState = initial,
+                repository = repository,
+                scope = scope,
+                onPersistenceError = { reported.complete(it) },
+            )
+
+            withTimeout(3_000) {
+                store.loadState.first { it == PlannerLoadState.PERSISTENCE_FAILED }
+            }
+            assertEquals(failure, reported.await())
+            assertEquals(initial, store.state.value)
+            assertFalse(store.quickCapture("Must not be accepted", ItemKind.TASK))
+            assertEquals(initial, store.state.value)
+        } finally {
+            scope.cancel()
+        }
+    }
+
     @Test
     fun blankQuickCaptureIsRejectedWithoutChangingInbox() {
         val store = PlannerStore(DayWeaveUiState.preview())

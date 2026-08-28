@@ -2,9 +2,18 @@
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="auth.xml" />
+        <exclude domain="sharedpref" path="auth.xml.bak" />
         <exclude domain="database" path="encrypted.db" />
+        <exclude domain="database" path="encrypted.db-journal" />
+        <exclude domain="database" path="encrypted.db-wal" />
+        <exclude domain="database" path="encrypted.db-shm" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="auth.xml" />
+        <exclude domain="sharedpref" path="auth.xml.bak" />
+        <exclude domain="database" path="encrypted.db" />
+        <exclude domain="database" path="encrypted.db-journal" />
+        <exclude domain="database" path="encrypted.db-wal" />
+        <exclude domain="database" path="encrypted.db-shm" />
     </device-transfer>
 </data-extraction-rules>

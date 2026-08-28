@@ -17,7 +17,8 @@ class DayWeaveSmokeTest {
 
     @Test
     fun todayAndPrimaryNavigationAreVisible() {
-        composeRule.onNodeWithText("DayWeave").assertIsDisplayed()
+        composeRule.onNodeWithText("Today").performClick()
+        composeRule.onAllNodesWithText("DayWeave")[0].assertIsDisplayed()
         composeRule.onNodeWithText("Your timeline").assertIsDisplayed()
         composeRule.onNodeWithText("Calendar").assertIsDisplayed()
         composeRule.onNodeWithText("Inbox").assertIsDisplayed()
