@@ -21,6 +21,8 @@ suggestions; it cannot bypass safety or external-change confirmation rules.
 
 The complete agreed product scope is preserved in
 [`docs/discovery-answers.md`](docs/discovery-answers.md).
+The implemented controls and explicit production security gates are documented
+in [`docs/security.md`](docs/security.md).
 
 ## Status
 

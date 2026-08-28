@@ -21,6 +21,12 @@ swift test --package-path apps/macos
 apps/android/gradlew --project-dir apps/android test lint assembleDebug
 ```
 
+The same checks run remotely with PostgreSQL integration coverage. The
+`Security` workflow additionally audits Rust advisories and scans repository
+dependencies, configuration, secrets, and the built API container. Do not
+silence a finding without documenting why it cannot affect this deployment and
+what compensating control remains.
+
 Build the direct macOS bundle with:
 
 ```sh
@@ -47,4 +53,3 @@ development.
 Each completed, independently verified slice receives its own conventional
 commit. Generated binaries, credentials, OAuth client files, signing keys,
 provider tokens, local databases, and deployment state never enter Git.
-
