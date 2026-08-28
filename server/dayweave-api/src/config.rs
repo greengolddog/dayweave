@@ -7,6 +7,7 @@ use std::{
 };
 
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::auth::{TokenHash, hash_token};
 
@@ -14,6 +15,11 @@ const DEFAULT_PORT: u16 = 8080;
 const DEFAULT_PROPOSAL_TTL_HOURS: u64 = 7 * 24;
 const MAX_PROPOSAL_TTL_HOURS: u64 = 365 * 24;
 const MINIMUM_TOKEN_LENGTH: usize = 24;
+const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+const DEFAULT_DATABASE_MIN_CONNECTIONS: u32 = 1;
+const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_SECONDS: u32 = 10;
+const DEFAULT_USER_ID: &str = "00000000-0000-4000-8000-000000000001";
+const DEFAULT_WORKSPACE_ID: &str = "00000000-0000-4000-8000-000000000002";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Environment {
@@ -37,6 +43,33 @@ impl FromStr for Environment {
     }
 }
 
+#[derive(Clone)]
+pub struct DatabaseUrl(String);
+
+impl DatabaseUrl {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DatabaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DatabaseUrl([REDACTED])")
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DatabaseConfig {
+    pub url: DatabaseUrl,
+    pub max_connections: u32,
+    pub min_connections: u32,
+    pub acquire_timeout: Duration,
+    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+    pub owner_subject: String,
+    pub timezone_name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub bind_address: SocketAddr,
@@ -44,6 +77,7 @@ pub struct Config {
     pub api_token_hashes: Arc<Vec<TokenHash>>,
     pub proposal_ttl: Duration,
     pub mcp_allowed_origins: Arc<Vec<String>>,
+    pub database: Option<DatabaseConfig>,
     pub log_filter: String,
     pub json_logs: bool,
 }
@@ -143,6 +177,12 @@ impl Config {
                     .collect::<Result<Vec<_>, _>>()
             },
         )?);
+        let database = database_config(values)?;
+        if matches!(environment, Environment::Staging | Environment::Production)
+            && database.is_none()
+        {
+            return Err(ConfigError::MissingDatabaseUrl);
+        }
 
         Ok(Self {
             bind_address,
@@ -150,6 +190,7 @@ impl Config {
             api_token_hashes,
             proposal_ttl: Duration::from_secs(ttl_seconds),
             mcp_allowed_origins,
+            database,
             log_filter,
             json_logs,
         })
@@ -170,6 +211,107 @@ pub enum ConfigError {
     InvalidProposalTtl(String),
     #[error("invalid DAYWEAVE_MCP_ALLOWED_ORIGINS entry: {0}")]
     InvalidMcpOrigin(String),
+    #[error("DAYWEAVE_DATABASE_URL is required in staging and production")]
+    MissingDatabaseUrl,
+    #[error("DAYWEAVE_DATABASE_URL must be a non-empty PostgreSQL URL")]
+    InvalidDatabaseUrl,
+    #[error("invalid database pool configuration")]
+    InvalidDatabasePool,
+    #[error("invalid DAYWEAVE_DEFAULT_USER_ID or DAYWEAVE_DEFAULT_WORKSPACE_ID")]
+    InvalidDatabaseScope,
+    #[error("invalid DAYWEAVE_DEFAULT_TIMEZONE")]
+    InvalidTimezone,
+    #[error("invalid DAYWEAVE_OWNER_SUBJECT")]
+    InvalidOwnerSubject,
+}
+
+fn database_config(
+    values: &HashMap<String, String>,
+) -> Result<Option<DatabaseConfig>, ConfigError> {
+    let Some(raw_url) = values.get("DAYWEAVE_DATABASE_URL") else {
+        return Ok(None);
+    };
+    if raw_url.trim().is_empty()
+        || !(raw_url.starts_with("postgres://") || raw_url.starts_with("postgresql://"))
+    {
+        return Err(ConfigError::InvalidDatabaseUrl);
+    }
+    let max_connections = parse_database_value(
+        values,
+        "DAYWEAVE_DATABASE_MAX_CONNECTIONS",
+        DEFAULT_DATABASE_MAX_CONNECTIONS,
+    )?;
+    let min_connections = parse_database_value(
+        values,
+        "DAYWEAVE_DATABASE_MIN_CONNECTIONS",
+        DEFAULT_DATABASE_MIN_CONNECTIONS,
+    )?;
+    let acquire_timeout_seconds = parse_database_value(
+        values,
+        "DAYWEAVE_DATABASE_ACQUIRE_TIMEOUT_SECONDS",
+        DEFAULT_DATABASE_ACQUIRE_TIMEOUT_SECONDS,
+    )?;
+    if max_connections == 0
+        || max_connections > 100
+        || min_connections > max_connections
+        || acquire_timeout_seconds == 0
+        || acquire_timeout_seconds > 300
+    {
+        return Err(ConfigError::InvalidDatabasePool);
+    }
+
+    let user_id = parse_uuid(values, "DAYWEAVE_DEFAULT_USER_ID", DEFAULT_USER_ID)?;
+    let workspace_id = parse_uuid(
+        values,
+        "DAYWEAVE_DEFAULT_WORKSPACE_ID",
+        DEFAULT_WORKSPACE_ID,
+    )?;
+    if user_id == workspace_id {
+        return Err(ConfigError::InvalidDatabaseScope);
+    }
+    let timezone_name = values
+        .get("DAYWEAVE_DEFAULT_TIMEZONE")
+        .map_or("UTC", String::as_str);
+    timezone_name
+        .parse::<chrono_tz::Tz>()
+        .map_err(|_| ConfigError::InvalidTimezone)?;
+    let owner_subject = values
+        .get("DAYWEAVE_OWNER_SUBJECT")
+        .map_or("personal-owner", String::as_str)
+        .trim();
+    if owner_subject.is_empty() || owner_subject.chars().count() > 500 {
+        return Err(ConfigError::InvalidOwnerSubject);
+    }
+
+    Ok(Some(DatabaseConfig {
+        url: DatabaseUrl(raw_url.clone()),
+        max_connections,
+        min_connections,
+        acquire_timeout: Duration::from_secs(u64::from(acquire_timeout_seconds)),
+        user_id,
+        workspace_id,
+        owner_subject: owner_subject.to_owned(),
+        timezone_name: timezone_name.to_owned(),
+    }))
+}
+
+fn parse_database_value(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    values.get(key).map_or(Ok(default), |value| {
+        value.parse().map_err(|_| ConfigError::InvalidDatabasePool)
+    })
+}
+
+fn parse_uuid(
+    values: &HashMap<String, String>,
+    key: &str,
+    default: &str,
+) -> Result<Uuid, ConfigError> {
+    Uuid::parse_str(values.get(key).map_or(default, String::as_str))
+        .map_err(|_| ConfigError::InvalidDatabaseScope)
 }
 
 fn validate_origin(origin: &str) -> Result<String, ConfigError> {
@@ -229,6 +371,10 @@ mod tests {
         let mut values = valid_values();
         values.insert("DAYWEAVE_ENVIRONMENT".to_owned(), "production".to_owned());
         values.insert(
+            "DAYWEAVE_DATABASE_URL".to_owned(),
+            "postgres://dayweave:secret@database/dayweave".to_owned(),
+        );
+        values.insert(
             "DAYWEAVE_BIND_ADDRESS".to_owned(),
             "127.0.0.1:9123".to_owned(),
         );
@@ -251,6 +397,10 @@ mod tests {
         assert_eq!(config.proposal_ttl, Duration::from_hours(24));
         assert!(config.json_logs);
         assert_eq!(config.mcp_allowed_origins.len(), 2);
+        let database = config.database.expect("database config");
+        assert_eq!(database.max_connections, 10);
+        assert_eq!(database.timezone_name, "UTC");
+        assert!(!format!("{database:?}").contains("secret"));
     }
 
     #[test]
@@ -274,5 +424,37 @@ mod tests {
             Config::from_map(&invalid),
             Err(ConfigError::InvalidProposalTtl(_))
         ));
+    }
+
+    #[test]
+    fn requires_database_in_deployed_environments_and_validates_scope() {
+        let mut production = valid_values();
+        production.insert("DAYWEAVE_ENVIRONMENT".to_owned(), "production".to_owned());
+        assert_eq!(
+            Config::from_map(&production).expect_err("database is mandatory"),
+            ConfigError::MissingDatabaseUrl
+        );
+
+        production.insert(
+            "DAYWEAVE_DATABASE_URL".to_owned(),
+            "postgres://dayweave:do-not-print@database/dayweave".to_owned(),
+        );
+        production.insert(
+            "DAYWEAVE_DEFAULT_TIMEZONE".to_owned(),
+            "Europe/Madrid".to_owned(),
+        );
+        let config = Config::from_map(&production).expect("valid database config");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("do-not-print"));
+        assert_eq!(config.database.unwrap().timezone_name, "Europe/Madrid");
+
+        production.insert(
+            "DAYWEAVE_DEFAULT_TIMEZONE".to_owned(),
+            "not/a/timezone".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&production).expect_err("invalid timezone"),
+            ConfigError::InvalidTimezone
+        );
     }
 }

@@ -39,7 +39,13 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let state = AppState::from_config(&config);
+    let state = match AppState::from_config(&config).await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::error!(%error, "failed to initialize persistent application state");
+            return ExitCode::FAILURE;
+        }
+    };
     state.readiness.set_ready(true);
     tracing::info!(address = %config.bind_address, "DayWeave API listening");
 

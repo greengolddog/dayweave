@@ -158,7 +158,7 @@ async fn health() -> Json<HealthResponse> {
     )
 )]
 async fn readiness(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
-    if state.readiness.is_ready() {
+    if state.readiness.check().await {
         Ok(Json(HealthResponse { status: "ready" }))
     } else {
         Err(ApiError::unavailable("DayWeave API is not ready"))

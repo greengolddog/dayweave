@@ -2,8 +2,8 @@
 //!
 //! The crate deliberately separates HTTP, application services, repositories,
 //! and external-service ports. The first milestone uses an in-memory proposal
-//! repository; a durable `PostgreSQL` adapter can replace it without changing the
-//! HTTP contract.
+//! repository for isolated tests and a durable `PostgreSQL` adapter in deployed
+//! environments without changing the HTTP contract.
 
 pub mod auth;
 pub mod config;
@@ -12,6 +12,7 @@ pub mod healthcheck;
 pub mod http;
 pub mod integrations;
 pub mod mcp;
+pub mod persistence;
 pub mod proposals;
 pub mod readiness;
 pub mod scheduling;
@@ -21,6 +22,7 @@ use std::sync::Arc;
 use auth::{Authenticator, StaticTokenAuthenticator};
 use config::Config;
 use mcp::McpService;
+use persistence::{Database, PersistenceError, PostgresProposalRepository};
 use proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock};
 use readiness::Readiness;
 use scheduling::{
@@ -40,12 +42,30 @@ pub struct AppState {
 impl AppState {
     /// Builds the current production dependency graph.
     ///
-    /// The in-memory repository is intentionally temporary. Durable adapters
-    /// will be selected here once `PostgreSQL` configuration is introduced.
-    #[must_use]
-    pub fn from_config(config: &Config) -> Self {
-        let repository: Arc<dyn ProposalRepository> =
-            Arc::new(InMemoryProposalRepository::default());
+    /// `PostgreSQL` is mandatory in deployed environments and optional for local
+    /// development. The in-memory adapter remains available for isolated tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted persistence error if the configured database cannot
+    /// connect, migrate, or initialize its personal workspace scope.
+    pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
+        let (repository, readiness): (Arc<dyn ProposalRepository>, Readiness) =
+            if let Some(database_config) = &config.database {
+                let database = Database::connect(database_config).await?;
+                (
+                    Arc::new(PostgresProposalRepository::new(
+                        database.pool().clone(),
+                        database.scope(),
+                    )),
+                    Readiness::with_database(database.pool().clone()),
+                )
+            } else {
+                (
+                    Arc::new(InMemoryProposalRepository::default()),
+                    Readiness::default(),
+                )
+            };
         let clock = Arc::new(SystemClock);
         let proposals = Arc::new(ProposalService::new(repository, clock, config.proposal_ttl));
         let authenticator = Arc::new(StaticTokenAuthenticator::from_hashes(
@@ -58,12 +78,12 @@ impl AppState {
             config.mcp_allowed_origins.clone(),
         ));
 
-        Self {
+        Ok(Self {
             proposals,
             authenticator,
-            readiness: Readiness::default(),
+            readiness,
             mcp,
-        }
+        })
     }
 
     #[must_use]
