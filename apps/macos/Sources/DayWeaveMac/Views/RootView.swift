@@ -47,10 +47,18 @@ struct RootView: View {
         switch store.destination ?? .today {
         case .today:
             TodayView()
+        case .calendar:
+            CalendarDestinationView()
         case .inbox:
             SuggestionsInboxView()
-        default:
-            PlaceholderDestinationView(destination: store.destination ?? .today)
+        case .habits:
+            HabitsDestinationView()
+        case .projects:
+            ProjectsDestinationView()
+        case .goals:
+            GoalsDestinationView()
+        case .statistics:
+            StatisticsDestinationView()
         }
     }
 }
@@ -77,13 +85,14 @@ private struct SidebarView: View {
             Section("Status") {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(.green)
+                        .fill(store.persistenceError == nil ? .green : .red)
                         .frame(width: 8, height: 8)
-                    Text("Synced just now")
+                    Text(store.persistenceError == nil ? "Encrypted local plan" : "Local save needs attention")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Label("Google Calendar", systemImage: "checkmark.circle.fill")
+                .help(store.persistenceError?.localizedDescription ?? "Planner state is encrypted on this Mac")
+                Label("Google Calendar · not connected", systemImage: "circle.dashed")
                     .foregroundStyle(.secondary)
             }
         }
@@ -488,19 +497,6 @@ private struct SuggestionsInboxView: View {
     }
 }
 
-private struct PlaceholderDestinationView: View {
-    let destination: SidebarDestination
-
-    var body: some View {
-        ContentUnavailableView(
-            destination.title,
-            systemImage: destination.symbol,
-            description: Text("This native surface is connected to the shared DayWeave model as its implementation lands.")
-        )
-        .navigationTitle(destination.title)
-    }
-}
-
 private struct QuickAddView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var store: PlannerStore
@@ -612,6 +608,17 @@ struct SettingsView: View {
                         }
                         .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
+                }
+            }
+            Section("Local data") {
+                LabeledContent("Planner storage", value: store.persistenceError == nil ? "Encrypted" : "Needs attention")
+                if let error = store.persistenceError {
+                    Text(error.localizedDescription)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                } else {
+                    Text("Schedule content is sealed with AES-GCM. Its device key is stored in this Mac’s Keychain.")
+                        .foregroundStyle(.secondary)
                 }
             }
         }
