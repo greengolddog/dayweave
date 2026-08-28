@@ -4,11 +4,19 @@ import SwiftUI
 @MainActor
 struct DayWeaveMacApp: App {
     @StateObject private var store = PlannerStore.preview()
+    @StateObject private var codex: CodexAppServerClient
+
+    init() {
+        let codex = CodexAppServerClient()
+        _codex = StateObject(wrappedValue: codex)
+        codex.startIfNeeded()
+    }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
+                .environmentObject(codex)
                 .frame(minWidth: 1_080, minHeight: 720)
         }
         .defaultSize(width: 1_420, height: 900)
@@ -35,8 +43,8 @@ struct DayWeaveMacApp: App {
         Settings {
             SettingsView()
                 .environmentObject(store)
+                .environmentObject(codex)
                 .frame(width: 620, height: 480)
         }
     }
 }
-

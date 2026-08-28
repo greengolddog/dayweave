@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RootView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var codex: CodexAppServerClient
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -18,6 +19,9 @@ struct RootView: View {
         .sheet(isPresented: $store.isQuickAddPresented) {
             QuickAddView()
                 .environmentObject(store)
+        }
+        .onAppear {
+            codex.startIfNeeded()
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -376,10 +380,29 @@ private struct InspectorSection<Content: View>: View {
 
 private struct AssistantView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var codex: CodexAppServerClient
     @State private var draft = ""
 
     var body: some View {
         VStack(spacing: 0) {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(codex.state.isConnected ? Color.green : Color.orange)
+                    .frame(width: 7, height: 7)
+                Text(codex.state.title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !codex.state.isConnected {
+                    Button("Connect") { codex.signInWithBrowser() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            Divider()
+
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
@@ -552,6 +575,8 @@ struct MenuBarView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var codex: CodexAppServerClient
+    @State private var apiKey = ""
 
     var body: some View {
         Form {
@@ -562,11 +587,35 @@ struct SettingsView: View {
             }
             Section("Accounts") {
                 LabeledContent("Google", value: "Ready to connect")
-                LabeledContent("Codex", value: "Ready to sign in")
+                LabeledContent("Codex", value: codex.state.title)
+
+                if case let .signedIn(email, _) = codex.state {
+                    if let email { Text(email).foregroundStyle(.secondary) }
+                    Button("Sign out of Codex", role: .destructive) { codex.signOut() }
+                } else {
+                    HStack {
+                        Button("Sign in with ChatGPT") { codex.signInWithBrowser() }
+                            .buttonStyle(.borderedProminent)
+                        Button("Use device code") { codex.signInWithDeviceCode() }
+                    }
+
+                    if let code = codex.deviceCode {
+                        LabeledContent("Device code", value: code)
+                            .textSelection(.enabled)
+                    }
+
+                    DisclosureGroup("API key fallback") {
+                        SecureField("OpenAI API key", text: $apiKey)
+                        Button("Connect with API key") {
+                            codex.signInWithAPIKey(apiKey)
+                            apiKey = ""
+                        }
+                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
             }
         }
         .formStyle(.grouped)
         .padding()
     }
 }
-
