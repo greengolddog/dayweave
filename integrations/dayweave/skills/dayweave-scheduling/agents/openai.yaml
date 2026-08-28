@@ -1,0 +1,4 @@
+interface:
+  display_name: "DayWeave Scheduling"
+  short_description: "Review schedules and submit safe planning proposals."
+  default_prompt: "Use DayWeave to inspect my schedule or draft a proposal for my Suggestions Inbox."

@@ -1,0 +1,19 @@
+{
+  "name": "dayweave",
+  "version": "0.1.0",
+  "description": "Safely inspect a DayWeave schedule and submit planning proposals for review.",
+  "author": {
+    "name": "greengolddog"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DayWeave",
+    "shortDescription": "Review schedules and draft safe planning proposals.",
+    "longDescription": "Read your DayWeave schedule, explore what-if plans, and send proposed tasks, habits, routines, goals, constraints, events, or schedules to the Suggestions Inbox. The plugin never applies changes directly.",
+    "developerName": "greengolddog",
+    "category": "Productivity",
+    "capabilities": ["schedule-reading", "what-if-planning", "proposal-drafting"],
+    "defaultPrompt": "Review my DayWeave schedule and help me draft a proposal for the Suggestions Inbox."
+  },
+  "mcpServers": "./.mcp.json"
+}
