@@ -1,6 +1,6 @@
 use axum::{
     Extension, Json, Router,
-    extract::{Path, Query, State, rejection::JsonRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
     http::{HeaderName, StatusCode},
     middleware,
     response::IntoResponse,
@@ -109,6 +109,7 @@ pub fn router(state: AppState) -> Router {
         .route("/ready", get(readiness))
         .route("/version", get(version))
         .route("/openapi.json", get(openapi))
+        .route("/mcp", post(crate::mcp::handle_post))
         .nest("/v1", protected)
         .fallback(not_found)
         .with_state(state)
@@ -129,6 +130,7 @@ pub fn router(state: AppState) -> Router {
                 )
                 .layer(PropagateRequestIdLayer::new(request_id_header)),
         )
+        .layer(DefaultBodyLimit::max(1024 * 1024))
 }
 
 #[derive(Serialize, ToSchema)]

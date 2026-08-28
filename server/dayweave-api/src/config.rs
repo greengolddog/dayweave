@@ -43,6 +43,7 @@ pub struct Config {
     pub environment: Environment,
     pub api_token_hashes: Arc<Vec<TokenHash>>,
     pub proposal_ttl: Duration,
+    pub mcp_allowed_origins: Arc<Vec<String>>,
     pub log_filter: String,
     pub json_logs: bool,
 }
@@ -131,12 +132,24 @@ impl Config {
         let json_logs = values
             .get("DAYWEAVE_JSON_LOGS")
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+        let mcp_allowed_origins = Arc::new(values.get("DAYWEAVE_MCP_ALLOWED_ORIGINS").map_or(
+            Ok(Vec::new()),
+            |value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|origin| !origin.is_empty())
+                    .map(validate_origin)
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )?);
 
         Ok(Self {
             bind_address,
             environment,
             api_token_hashes,
             proposal_ttl: Duration::from_secs(ttl_seconds),
+            mcp_allowed_origins,
             log_filter,
             json_logs,
         })
@@ -155,6 +168,22 @@ pub enum ConfigError {
     InvalidEnvironment(String),
     #[error("invalid DAYWEAVE_PROPOSAL_TTL_HOURS: {0}")]
     InvalidProposalTtl(String),
+    #[error("invalid DAYWEAVE_MCP_ALLOWED_ORIGINS entry: {0}")]
+    InvalidMcpOrigin(String),
+}
+
+fn validate_origin(origin: &str) -> Result<String, ConfigError> {
+    let valid = origin.split_once("://").is_some_and(|(scheme, authority)| {
+        matches!(scheme, "http" | "https")
+            && !authority.is_empty()
+            && !authority.contains('/')
+            && !authority.chars().any(char::is_whitespace)
+    });
+    if valid {
+        Ok(origin.to_owned())
+    } else {
+        Err(ConfigError::InvalidMcpOrigin(origin.to_owned()))
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +205,7 @@ mod tests {
         assert_eq!(config.environment, Environment::Development);
         assert_eq!(config.proposal_ttl, Duration::from_hours(7 * 24));
         assert_eq!(config.api_token_hashes.len(), 1);
+        assert!(config.mcp_allowed_origins.is_empty());
     }
 
     #[test]
@@ -208,6 +238,10 @@ mod tests {
         );
         values.insert("DAYWEAVE_PROPOSAL_TTL_HOURS".to_owned(), "24".to_owned());
         values.insert("DAYWEAVE_JSON_LOGS".to_owned(), "true".to_owned());
+        values.insert(
+            "DAYWEAVE_MCP_ALLOWED_ORIGINS".to_owned(),
+            "https://chatgpt.com,https://example.test:8443".to_owned(),
+        );
 
         let config = Config::from_map(&values).expect("valid config");
 
@@ -216,6 +250,7 @@ mod tests {
         assert_eq!(config.api_token_hashes.len(), 2);
         assert_eq!(config.proposal_ttl, Duration::from_hours(24));
         assert!(config.json_logs);
+        assert_eq!(config.mcp_allowed_origins.len(), 2);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::{fmt::Write, sync::Arc};
 use async_trait::async_trait;
 use axum::{
     extract::{Request, State},
-    http::header::AUTHORIZATION,
+    http::{HeaderMap, header::AUTHORIZATION},
     middleware::Next,
     response::Response,
 };
@@ -16,17 +16,27 @@ use crate::{AppState, error::ApiError};
 
 pub type TokenHash = [u8; 32];
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     SuggestionsRead,
     SuggestionsWrite,
+    ScheduleRead,
+    ScheduleSimulate,
+    SuggestionsSubmit,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Principal {
     pub subject: String,
     pub scopes: Vec<Scope>,
+}
+
+impl Principal {
+    #[must_use]
+    pub fn has_scope(&self, scope: Scope) -> bool {
+        self.scopes.contains(&scope)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -73,7 +83,13 @@ impl Authenticator for StaticTokenAuthenticator {
 
         Ok(Principal {
             subject: token_fingerprint(&candidate),
-            scopes: vec![Scope::SuggestionsRead, Scope::SuggestionsWrite],
+            scopes: vec![
+                Scope::SuggestionsRead,
+                Scope::SuggestionsWrite,
+                Scope::ScheduleRead,
+                Scope::ScheduleSimulate,
+                Scope::SuggestionsSubmit,
+            ],
         })
     }
 }
@@ -104,12 +120,7 @@ pub async fn require_authentication(
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let token = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(parse_bearer_token)
-        .ok_or_else(ApiError::unauthorized)?;
+    let token = bearer_token_from_headers(request.headers()).ok_or_else(ApiError::unauthorized)?;
 
     let principal = state
         .authenticator
@@ -129,6 +140,14 @@ fn parse_bearer_token(value: &str) -> Option<&str> {
     Some(token)
 }
 
+#[must_use]
+pub fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_bearer_token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +162,10 @@ mod tests {
             .expect("known token");
 
         assert!(principal.subject.starts_with("token:"));
-        assert_eq!(principal.scopes.len(), 2);
+        assert_eq!(principal.scopes.len(), 5);
+        assert!(principal.has_scope(Scope::ScheduleRead));
+        assert!(principal.has_scope(Scope::ScheduleSimulate));
+        assert!(principal.has_scope(Scope::SuggestionsSubmit));
         assert!(authenticator.authenticate("wrong-secret").await.is_err());
     }
 
