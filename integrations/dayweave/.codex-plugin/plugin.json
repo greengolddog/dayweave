@@ -1,10 +1,14 @@
 {
   "name": "dayweave",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Safely inspect a DayWeave schedule and submit planning proposals for review.",
   "author": {
-    "name": "greengolddog"
+    "name": "greengolddog",
+    "url": "https://github.com/greengolddog"
   },
+  "homepage": "https://github.com/greengolddog/dayweave",
+  "repository": "https://github.com/greengolddog/dayweave",
+  "keywords": ["calendar", "planning", "scheduling", "productivity"],
   "skills": "./skills/",
   "interface": {
     "displayName": "DayWeave",
@@ -13,7 +17,12 @@
     "developerName": "greengolddog",
     "category": "Productivity",
     "capabilities": ["schedule-reading", "what-if-planning", "proposal-drafting"],
-    "defaultPrompt": "Review my DayWeave schedule and help me draft a proposal for the Suggestions Inbox."
+    "defaultPrompt": [
+      "Review today's DayWeave schedule and explain the main conflicts.",
+      "Simulate a realistic plan for my unfinished work without changing anything.",
+      "Draft a DayWeave Suggestions Inbox proposal for the plan we agree on."
+    ],
+    "brandColor": "#4F46E5"
   },
   "mcpServers": "./.mcp.json"
 }

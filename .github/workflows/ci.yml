@@ -67,15 +67,4 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Validate checked-in plugin contracts
-        run: |
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          root = Path("integrations/dayweave")
-          manifest = json.loads((root / ".codex-plugin/plugin.json").read_text())
-          mcp = json.loads((root / ".mcp.json").read_text())
-          assert manifest["name"] == "dayweave"
-          assert (root / manifest["skills"]).is_dir()
-          assert "dayweave" in mcp["mcpServers"]
-          assert "[TODO" not in (root / "skills/dayweave-scheduling/SKILL.md").read_text()
-          PY
+        run: python3 integrations/dayweave/scripts/validate_contract.py

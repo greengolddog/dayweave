@@ -309,7 +309,14 @@ Official reference: <https://learn.chatgpt.com/docs/app-server>.
 
 ## DayWeave MCP and ChatGPT/Codex plugin
 
-The private MCP endpoint uses Streamable HTTP over the Nebius Tunnel HTTPS URL.
+The private MCP endpoint uses Streamable HTTP. The checked-in development plugin
+targets loopback and reads a separately scoped MCP bearer credential only from
+the `DAYWEAVE_MCP_TOKEN` process environment. Never put its value in the repo,
+the plugin manifest, an `.env` file, shell history, or chat. That bearer path is
+for local Codex/ChatGPT desktop development only; it is not ChatGPT web account
+linking.
+
+The deployed endpoint will use the Nebius Tunnel HTTPS URL.
 Its external contract is intentionally asymmetric:
 
 - clients may read only the schedule detail permitted for that client;
@@ -317,7 +324,8 @@ Its external contract is intentionally asymmetric:
 - `submit_proposal` may add a reviewable Suggestions Inbox proposal;
 - no external conversation can mutate canonical schedule/calendar/task state.
 
-After the deployed MCP server supports OAuth:
+ChatGPT web does not accept a custom DayWeave API key. After the deployed MCP
+server supports the complete OAuth 2.1 MCP authorization contract:
 
 1. enable ChatGPT Developer mode;
 2. register the MCP HTTPS URL and complete its OAuth connection;
@@ -331,7 +339,8 @@ metadata exist.
 
 Official references:
 
-- <https://developers.openai.com/codex/mcp/>
+- <https://learn.chatgpt.com/docs/extend/mcp>
+- <https://developers.openai.com/plugins/build/auth>
 - <https://developers.openai.com/plugins/build/plugins>
 
 ## Nebius access and deployment identity
