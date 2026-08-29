@@ -12,6 +12,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
     @StateObject private var appLock: AppLockController
+    @StateObject private var appearance: AppearanceController
     @State private var activationTask: Task<Void, Never>?
     @State private var servicesAreActive = false
 
@@ -29,6 +30,7 @@ struct DayWeaveMacApp: App {
         _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
         _executionSync = StateObject(wrappedValue: ExecutionSyncStore(planner: store))
         _appLock = StateObject(wrappedValue: AppLockController.live())
+        _appearance = StateObject(wrappedValue: AppearanceController.live())
     }
 
     var body: some Scene {
@@ -47,6 +49,9 @@ struct DayWeaveMacApp: App {
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
                 .environmentObject(appLock)
+                .environmentObject(appearance)
+                .preferredColorScheme(appearance.preferredColorScheme)
+                .tint(appearance.accentColor)
                 .frame(minWidth: 1_080, minHeight: 720)
                 .onAppear {
                     updateAppLock(for: scenePhase)
@@ -136,6 +141,9 @@ struct DayWeaveMacApp: App {
                 }
             }
             .environmentObject(appLock)
+            .environmentObject(appearance)
+            .preferredColorScheme(appearance.preferredColorScheme)
+            .tint(appearance.accentColor)
         }
         .menuBarExtraStyle(.window)
 
@@ -153,6 +161,9 @@ struct DayWeaveMacApp: App {
                 }
             }
             .environmentObject(appLock)
+            .environmentObject(appearance)
+            .preferredColorScheme(appearance.preferredColorScheme)
+            .tint(appearance.accentColor)
             .frame(width: 660, height: 620)
         }
     }

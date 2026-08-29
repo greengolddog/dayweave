@@ -1920,6 +1920,7 @@ struct SettingsView: View {
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
     @EnvironmentObject private var appLock: AppLockController
+    @EnvironmentObject private var appearance: AppearanceController
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
     @State private var isCanonicalResetConfirmationPresented = false
@@ -1936,6 +1937,46 @@ struct SettingsView: View {
             Section("Accounts") {
                 LabeledContent("Google", value: "Not connected")
                 codexAccountControls
+            }
+            Section("Appearance") {
+                Picker("Theme", selection: appearanceModeBinding) {
+                    ForEach(DayWeaveAppearanceMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                LabeledContent("Accent") {
+                    HStack(spacing: 12) {
+                        ForEach(DayWeaveAccent.allCases) { accent in
+                            Button {
+                                _ = appearance.setAccent(accent)
+                            } label: {
+                                Circle()
+                                    .fill(accent.color)
+                                    .frame(width: 22, height: 22)
+                                    .overlay {
+                                        if appearance.preferences.accent == accent {
+                                            Image(systemName: "checkmark")
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.white)
+                                        }
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(accent.title) accent")
+                            .accessibilityValue(
+                                appearance.preferences.accent == accent ? "Selected" : ""
+                            )
+                        }
+                    }
+                }
+
+                if let message = appearance.statusMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
             Section("Privacy & app lock") {
                 Toggle("Require authentication to open DayWeave", isOn: appLockEnabledBinding)
@@ -2092,6 +2133,15 @@ struct SettingsView: View {
             get: { appLock.preferences.isEnabled },
             set: { enabled in
                 Task { await appLock.setEnabled(enabled) }
+            }
+        )
+    }
+
+    private var appearanceModeBinding: Binding<DayWeaveAppearanceMode> {
+        Binding(
+            get: { appearance.preferences.mode },
+            set: { mode in
+                _ = appearance.setMode(mode)
             }
         )
     }

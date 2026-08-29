@@ -5,6 +5,14 @@ new production profile starts with an empty plan and restores the encrypted
 snapshot synchronously before exposing actions; preview fixtures are used only
 by `PlannerStore.preview` and tests.
 
+## Appearance
+
+**Settings → Appearance** supports the system theme plus explicit light and
+dark modes, with blue, indigo, purple, pink, orange, green, and teal accents.
+The versioned preference is applied consistently to the main window, Settings,
+menu-bar surface, and locked screen. An invalid preference resets only the
+appearance; it cannot replace or modify the encrypted planner snapshot.
+
 ## App lock
 
 **Settings → Privacy & app lock** can require Touch ID or the Mac login
