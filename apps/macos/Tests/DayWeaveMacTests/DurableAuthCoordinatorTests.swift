@@ -14,6 +14,33 @@ struct DurableAuthCoordinatorTests {
     )
     private let instant = Date(timeIntervalSince1970: 1_788_000_000)
 
+    @Test("contract v2 requires REST schedule publication authority and rejects v1 sessions")
+    func schedulePublicationScopeRequiresReenrollment() {
+        #expect(DurableAuthClientDescriptor.contractVersion == 2)
+        #expect(DayWeaveAuthScope.deviceDefaults.contains(.schedulePublish))
+        #expect(descriptor.isValid)
+        let current = makeActive(issuedAt: instant, accessMarker: 201, refreshMarker: 202)
+        #expect(DurableAuthCoordinator.isStoredSessionValid(current.session))
+        let legacy = DurableDeviceSessionMetadata(
+            id: current.session.id,
+            clientInstanceID: current.session.clientInstanceID,
+            clientKind: current.session.clientKind,
+            deviceLabel: current.session.deviceLabel,
+            scopes: current.session.scopes.filter { $0 != .schedulePublish },
+            clientContractVersion: 1,
+            clientVersion: current.session.clientVersion,
+            clientCapabilities: current.session.clientCapabilities,
+            createdAt: current.session.createdAt,
+            lastSeenAt: current.session.lastSeenAt,
+            credentialIssuedAt: current.session.credentialIssuedAt,
+            accessExpiresAt: current.session.accessExpiresAt,
+            refreshIdleExpiresAt: current.session.refreshIdleExpiresAt,
+            absoluteExpiresAt: current.session.absoluteExpiresAt,
+            revision: current.session.revision
+        )
+        #expect(!DurableAuthCoordinator.isStoredSessionValid(legacy))
+    }
+
     @Test("hybrid upgrade journals enrollment tuple before send and retries exact bytes after restart")
     func hybridEnrollmentExactRetry() async throws {
         let clientID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
@@ -670,7 +697,7 @@ struct DurableAuthCoordinatorTests {
         #expect(await transport.records().count == 1)
     }
 
-    @Test("401 refresh replays the pristine API mutation with identical body bytes")
+    @Test("401 refresh replays the exact prepared schedule publication body")
     @MainActor
     func unauthorizedRequestRefreshesAndReplaysExactly() async throws {
         let active = makeActive(issuedAt: instant, accessMarker: 51, refreshMarker: 52)
@@ -695,7 +722,7 @@ struct DurableAuthCoordinatorTests {
         )
         URLProtocolStub.storage.reset(key: active.credentials.accessToken)
         URLProtocolStub.storage.reset(key: nextAccess)
-        URLProtocolStub.storage.enqueue(
+        URLProtocolStub.storage.enqueueSchedulePublication(
             key: active.credentials.accessToken,
             .init(
                 statusCode: 401,
@@ -703,28 +730,43 @@ struct DurableAuthCoordinatorTests {
                 body: Data(#"{"error":{"code":"unauthorized","message":"rejected"}}"#.utf8)
             )
         )
-        URLProtocolStub.storage.enqueue(
-            key: nextAccess,
-            .init(
-                statusCode: 200,
-                body: DayWeaveAPIClientTests.proposalEnvelope(status: "accepted", revision: 5)
-            )
-        )
         let client = DayWeaveAPIClient(
             baseURL: baseURL,
             session: URLProtocolStub.makeSession(),
             authCoordinator: coordinator
         )
-        _ = try await client.acceptSuggestion(
-            id: DayWeaveAPIClientTests.proposalID,
-            expectedRevision: 4,
-            note: "synthetic approval"
+        let schedule = DayWeaveSchedulePreviewRequest(
+            asOf: instant,
+            horizonStart: instant,
+            horizonEnd: instant.addingTimeInterval(86_400),
+            timezoneName: "UTC",
+            availability: [],
+            fixedBlocks: [],
+            previousAssignments: [],
+            config: .init(
+                slotGranularityMinutes: 5,
+                stabilityWeight: 4,
+                defaultSoftWeight: 100
+            ),
+            recurrenceContext: [:]
         )
+        let prepared = try client.prepareSchedulePublication(.init(
+            idempotencyKey: UUID(uuidString: "51515151-5151-4151-8151-515151515151")!,
+            expectedInputDigest: "sha256:5151515151515151515151515151515151515151515151515151515151515151",
+            schedule: schedule
+        ))
+        _ = try await client.publishSchedule(prepared)
 
         let first = try #require(
-            URLProtocolStub.storage.requests(for: active.credentials.accessToken).first
+            URLProtocolStub.storage.requests(
+                for: active.credentials.accessToken,
+                includingSchedulePublication: true
+            ).first
         )
-        let replay = try #require(URLProtocolStub.storage.requests(for: nextAccess).first)
+        let replay = try #require(URLProtocolStub.storage.requests(
+            for: nextAccess,
+            includingSchedulePublication: true
+        ).first)
         #expect(first.method == replay.method)
         #expect(first.url == replay.url)
         #expect(first.body == replay.body)

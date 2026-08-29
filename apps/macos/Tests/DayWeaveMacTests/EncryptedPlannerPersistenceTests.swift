@@ -648,6 +648,45 @@ private enum EncryptedPlannerPersistenceScenarios {
         try require(restored.followUpIsSensitive == nil, "Migration invented a follow-up edit")
     }
 
+    static func schemaSevenAddsNoPublicationIntent() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 7,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: base.canonicalItems,
+            canonicalDeltaCursor: base.canonicalDeltaCursor,
+            canonicalTombstoneRevisions: base.canonicalTombstoneRevisions,
+            completedOccurrenceIDs: base.completedOccurrenceIDs,
+            pendingCanonicalMutations: base.pendingCanonicalMutations,
+            pendingCanonicalSensitivityMutations: [],
+            recurrenceSessionOutcomes: base.recurrenceSessionOutcomes,
+            canonicalConfigurationIdentifier: base.canonicalConfigurationIdentifier,
+            schedulePreviewProvenance: base.schedulePreviewProvenance,
+            localCaptureDiagnostics: base.localCaptureDiagnostics,
+            executionState: .empty
+        )
+
+        let migrated = try legacy.migratedToCurrentSchema()
+
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema-7 snapshot did not migrate to the current schema"
+        )
+        try require(
+            migrated.pendingSchedulePublication == nil,
+            "Schema-7 migration invented a schedule publication"
+        )
+    }
+
     private static func require(
         _ condition: @autoclosure () -> Bool,
         _ message: String
@@ -824,6 +863,10 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
     func testSchemaSixPrivacyAttemptMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaSixPrivacyIntentMigratesAsAmbiguouslySubmitted()
     }
+
+    func testSchemaSevenPublicationMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSevenAddsNoPublicationIntent()
+    }
 }
 #elseif canImport(Testing)
 @Suite("Encrypted planner persistence")
@@ -897,6 +940,11 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Schema 6 privacy intent migrates as ambiguously submitted")
     func schemaSixPrivacyAttemptMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaSixPrivacyIntentMigratesAsAmbiguouslySubmitted()
+    }
+
+    @Test("Schema 7 migrates without inventing a schedule publication")
+    func schemaSevenPublicationMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSevenAddsNoPublicationIntent()
     }
 }
 #endif

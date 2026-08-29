@@ -8,6 +8,7 @@ enum DayWeaveAuthScope: String, Codable, CaseIterable, Sendable {
     case suggestionsWrite = "suggestions_write"
     case scheduleRead = "schedule_read"
     case scheduleSimulate = "schedule_simulate"
+    case schedulePublish = "schedule_publish"
     case itemsRead = "items_read"
     case itemsWrite = "items_write"
     case executionRead = "execution_read"
@@ -24,6 +25,7 @@ enum DayWeaveAuthScope: String, Codable, CaseIterable, Sendable {
         .suggestionsWrite,
         .scheduleRead,
         .scheduleSimulate,
+        .schedulePublish,
         .itemsRead,
         .itemsWrite,
         .executionRead,
@@ -38,7 +40,7 @@ enum DayWeaveAuthScope: String, Codable, CaseIterable, Sendable {
 }
 
 struct DurableAuthClientDescriptor: Codable, Equatable, Sendable {
-    static let contractVersion = 1
+    static let contractVersion = 2
     static let capabilities = [
         "durable_auth_v1",
         "exact_retry_v1",

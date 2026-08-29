@@ -82,6 +82,11 @@ It retains a no-secret tombstone that records the local-only decision and warns
 that server session or bootstrap authority may still exist. Same-origin
 re-enrollment is also available after a definitive expired/rejected state;
 cross-origin replacement requires the explicit local-only tombstone.
+The current device contract is v2 and adds the REST-only `schedule_publish`
+scope. A stored v1 session is deliberately not upgraded in place because the
+server never granted it that authority; it is quarantined and requires the
+existing explicit local-forget warning plus re-enrollment before schedule
+publication can run.
 
 Suggestions, canonical cache/cursors/mutations, and execution recovery are
 fenced to the authentication binding as well as the URL. Replacing a session at
@@ -103,16 +108,24 @@ The same authenticated configuration powers canonical planner sync. A sync:
 2. publishes local Quick Add captures with stable idempotency keys;
 3. sends revision-guarded privacy and status replacements only when every
    canonical field can be round-tripped without loss; and
-4. requests the side-effect-free `/v1/schedule/preview` composition.
+4. requests and fully validates the side-effect-free
+   `/v1/schedule/preview` composition; and
+5. journals the exact canonical publish body and its SHA-256 digest in the
+   encrypted snapshot, then sends `POST /v1/schedule/publish` before marking
+   that preview current locally. Publication accepts exactly HTTP `200` for
+   both the first result and an idempotent replay.
 
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
-live in the schema-v7 AES-GCM encrypted planner snapshot. Schema-v1 through v4
+live in the schema-v8 AES-GCM encrypted planner snapshot. Schema-v1 through v4
 snapshots are migrated once with explicit legacy sensitivity defaults; schema
 v5 remains sensitivity-strict and migrates with no invented privacy edit.
 Schema-v6 retained privacy edits migrate as conservatively submitted because an
-older snapshot cannot prove that no request bytes were sent. Older binaries
-reject schema v7 instead of rewriting away new state. A sibling-file
+older snapshot cannot prove that no request bytes were sent. Schema v7 adds no
+invented publication when it migrates; schema v8 retains the bounded exact
+publication body, accepted preview, configuration binding, and idempotency
+UUID needed after a crash. Older binaries reject schema v8 instead of
+rewriting away new state. A sibling-file
 lock and ciphertext compare-and-swap revision stop a second app process from
 silently overwriting a newer snapshot. Unknown future
 item fields and nested split-policy fields are
@@ -132,6 +145,25 @@ trimmed deterministically to the API's assignment and block-count limits.
 Status publication for an item waits behind that item's complete privacy-edit
 chain, so a bounded privacy run cannot strand the final choice on a stale
 revision.
+
+Schedule publication is a local two-phase boundary. Validation and rendering
+happen in memory first; the exact request is durably flushed before its first
+byte is sent. A timeout, cancellation, process death after remote commit, or
+lost response leaves that journal intact. The next planner sync replays the
+same body and UUID before pulling or mutating anything else, validates the
+published revision/digest/horizon/timezone response, and atomically clears the
+journal. A non-replayed result installs the candidate in that same local
+commit. An idempotent replay can name a remotely superseded revision, so it
+never installs the retained candidate: the client keeps the prior plan
+non-current and makes exactly one fresh composition/publication attempt in the
+same sync. Only the server's exact JSON `schedule_publication_stale` conflict
+envelope proves that a candidate was not published; it is cleared atomically
+and permits only one fresh retry. A second stale result is cleared and surfaced
+without an unbounded loop. Configuration replacement and local cache reset
+remain blocked
+while an exact result is ambiguous, with Settings directing the user to restore
+the original configuration and authentication and run Planner sync. A failed
+publication never marks the candidate preview current.
 
 Quick Add and local-capture recovery expose an own-item **Sensitive** marker.
 For canonical items, the inspector distinguishes a marker set on that item from
@@ -214,4 +246,6 @@ migration, revision-map retries, and preview rendering.
 Additional regressions cover scoped IPv6 configuration, full base-path binding,
 invalid-capture recovery, mutation/assignment caps, malformed mutation results,
 preview overlap and score validation, overnight blocks, recurrence-history
-pruning, and stale multi-process snapshot writers.
+pruning, stale multi-process snapshot writers, exact schedule-publication
+replay after restart, publication-response rejection, and auth-v2 scope
+re-enrollment fencing.

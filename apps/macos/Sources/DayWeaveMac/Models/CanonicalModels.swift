@@ -539,8 +539,8 @@ struct DayWeaveItemDeltaPage: Equatable, Sendable {
     let hasMore: Bool
 }
 
-struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
-    struct Availability: Encodable, Equatable, Sendable {
+struct DayWeaveSchedulePreviewRequest: Codable, Equatable, Sendable {
+    struct Availability: Codable, Equatable, Sendable {
         let start: Date
         let end: Date
         let contexts: [String]
@@ -548,7 +548,7 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
         let energy: String
     }
 
-    struct Configuration: Encodable, Equatable, Sendable {
+    struct Configuration: Codable, Equatable, Sendable {
         let slotGranularityMinutes: UInt32
         let stabilityWeight: UInt32
         let defaultSoftWeight: UInt32
@@ -560,7 +560,7 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
         }
     }
 
-    struct FixedBlock: Encodable, Equatable, Sendable {
+    struct FixedBlock: Codable, Equatable, Sendable {
         let id: UUID
         let isSensitive: Bool
         let title: String
@@ -574,8 +574,8 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
         }
     }
 
-    struct PreviousAssignment: Encodable, Equatable, Sendable {
-        struct Block: Encodable, Equatable, Sendable {
+    struct PreviousAssignment: Codable, Equatable, Sendable {
+        struct Block: Codable, Equatable, Sendable {
             let start: Date
             let end: Date
             let sessionIndex: UInt16
@@ -621,8 +621,8 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
     }
 }
 
-struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
-    struct RejectedItem: Decodable, Equatable, Sendable {
+struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
+    struct RejectedItem: Codable, Equatable, Sendable {
         let itemID: UUID
         let isSensitive: Bool
         let title: String
@@ -634,7 +634,7 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
         }
     }
 
-    struct IgnoredAssignment: Decodable, Equatable, Sendable {
+    struct IgnoredAssignment: Codable, Equatable, Sendable {
         let itemID: UUID
         let requestedRevision: UInt64
         let currentRevision: UInt64?
@@ -647,9 +647,9 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
         }
     }
 
-    struct Plan: Decodable, Equatable, Sendable {
-        struct Block: Decodable, Equatable, Identifiable, Sendable {
-            struct Explanation: Decodable, Equatable, Sendable {
+    struct Plan: Codable, Equatable, Sendable {
+        struct Block: Codable, Equatable, Identifiable, Sendable {
+            struct Explanation: Codable, Equatable, Sendable {
                 let code: String
                 let message: String
             }
@@ -674,7 +674,7 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
             }
         }
 
-        struct Unscheduled: Decodable, Equatable, Sendable {
+        struct Unscheduled: Codable, Equatable, Sendable {
             let itemID: UUID
             let occurrenceID: UUID?
             let remaining: UInt32
@@ -687,7 +687,7 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
             }
         }
 
-        struct Score: Decodable, Equatable, Sendable {
+        struct Score: Codable, Equatable, Sendable {
             let scheduledMinutes: UInt32
             let unscheduledMinutes: UInt32
             let softPenalty: UInt64
@@ -771,6 +771,112 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
             revisions[id] = revision
         }
         sourceItemRevisions = revisions
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(inputDigest, forKey: .inputDigest)
+        try container.encode(sourceItemCount, forKey: .sourceItemCount)
+        try container.encode(acceptedItemCount, forKey: .acceptedItemCount)
+        try container.encode(rejectedItems, forKey: .rejectedItems)
+        try container.encode(ignoredPreviousAssignments, forKey: .ignoredPreviousAssignments)
+        try container.encode(plan, forKey: .plan)
+        let revisions = Dictionary(uniqueKeysWithValues: sourceItemRevisions.map {
+            ($0.key.uuidString.lowercased(), $0.value)
+        })
+        try container.encode(revisions, forKey: .sourceItemRevisions)
+    }
+}
+
+struct DayWeaveSchedulePublishRequest: Codable, Equatable, Sendable {
+    let idempotencyKey: UUID
+    let expectedInputDigest: String
+    let schedule: DayWeaveSchedulePreviewRequest
+
+    private enum CodingKeys: String, CodingKey {
+        case schedule
+        case idempotencyKey = "idempotency_key"
+        case expectedInputDigest = "expected_input_digest"
+    }
+}
+
+struct DayWeavePreparedSchedulePublication: Codable, Equatable, Sendable {
+    let request: DayWeaveSchedulePublishRequest
+    let body: Data
+    let bodySHA256: String
+
+    private enum CodingKeys: String, CodingKey {
+        case request, body
+        case bodySHA256 = "body_sha256"
+    }
+}
+
+struct DayWeavePublishedScheduleRevision: Decodable, Equatable, Sendable {
+    let id: UUID
+    let revision: String
+    let revisionNumber: UInt64
+    let inputDigest: String
+    let horizonStart: Date
+    let horizonEnd: Date
+    let timezoneName: String
+    let publishedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id, revision
+        case revisionNumber = "revision_number"
+        case inputDigest = "input_digest"
+        case horizonStart = "horizon_start"
+        case horizonEnd = "horizon_end"
+        case timezoneName = "timezone_name"
+        case publishedAt = "published_at"
+    }
+}
+
+struct DayWeaveSchedulePublishResponse: Decodable, Equatable, Sendable {
+    let revision: DayWeavePublishedScheduleRevision
+    let replayed: Bool
+}
+
+/// Encrypted with the planner snapshot before the first publication request is
+/// sent. Retaining both the exact compose input and its accepted preview lets a
+/// restart replay one idempotency tuple and finish the local commit without
+/// inventing a new schedule.
+struct PendingSchedulePublication: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+    static let maximumEncodedBytes = 8 * 1_048_576
+    static let maximumMessageBytes = 8 * 1_024
+
+    let version: Int
+    let configurationIdentifier: String
+    let preparedRequest: DayWeavePreparedSchedulePublication
+    let preview: DayWeaveSchedulePreview
+    let message: String
+    let provenance: SchedulePreviewProvenance
+    let preparedAt: Date
+
+    init(
+        version: Int = Self.currentVersion,
+        configurationIdentifier: String,
+        preparedRequest: DayWeavePreparedSchedulePublication,
+        preview: DayWeaveSchedulePreview,
+        message: String,
+        provenance: SchedulePreviewProvenance,
+        preparedAt: Date
+    ) {
+        self.version = version
+        self.configurationIdentifier = configurationIdentifier
+        self.preparedRequest = preparedRequest
+        self.preview = preview
+        self.message = message
+        self.provenance = provenance
+        self.preparedAt = preparedAt
+    }
+
+    var isWithinEncodedSizeLimit: Bool {
+        guard message.utf8.count <= Self.maximumMessageBytes else { return false }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        return (try? encoder.encode(self).count).map { $0 <= Self.maximumEncodedBytes } ?? false
     }
 }
 

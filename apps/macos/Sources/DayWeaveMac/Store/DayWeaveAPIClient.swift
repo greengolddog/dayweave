@@ -500,6 +500,9 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     case transport(URLError.Code)
     case nonHTTPResponse
     case responseTooLarge(limitBytes: Int)
+    /// Emitted only for the exact, endpoint-bound stale-publication contract.
+    /// Generic 409 errors never become a destructive local-state signal.
+    case trustedSchedulePublicationStale
     case server(statusCode: Int, code: String?, message: String?, requestID: String?)
     case responseDecodingFailed
 }
@@ -529,6 +532,8 @@ extension DayWeaveAPIError: LocalizedError {
             return "The DayWeave API returned an invalid response."
         case let .responseTooLarge(limitBytes):
             return "The DayWeave API response exceeded the safe \(limitBytes / 1_048_576) MiB limit."
+        case .trustedSchedulePublicationStale:
+            return "Canonical items changed before this schedule could be published."
         case let .server(statusCode, code, message, requestID):
             let safeCode = DayWeaveDiagnosticSanitizer.code(code, secrets: [])
             let safeMessage = DayWeaveDiagnosticSanitizer.text(
@@ -950,6 +955,53 @@ struct DayWeaveAPIClient: Sendable {
         )
     }
 
+    func prepareSchedulePublication(
+        _ request: DayWeaveSchedulePublishRequest
+    ) throws -> DayWeavePreparedSchedulePublication {
+        let body = try encode(request)
+        guard body.count <= Self.maximumRequestBytes,
+              let canonicalRequest = try? makeDecoder().decode(
+                  DayWeaveSchedulePublishRequest.self,
+                  from: body
+              ) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        return .init(
+            // RFC 3339 carries millisecond precision on the wire. Keep the
+            // semantic copy decoded from the exact bytes so ordinary Date()
+            // sub-milliseconds cannot make a valid journal fail equality after
+            // persistence or restart.
+            request: canonicalRequest,
+            body: body,
+            bodySHA256: Self.sha256(body)
+        )
+    }
+
+    func publishSchedule(
+        _ prepared: DayWeavePreparedSchedulePublication
+    ) async throws -> DayWeaveSchedulePublishResponse {
+        try validatePreparedSchedulePublication(prepared)
+        return try await send(
+            method: "POST",
+            pathComponents: ["v1", "schedule", "publish"],
+            body: prepared.body,
+            requiredStatusCode: 200
+        )
+    }
+
+    func validatePreparedSchedulePublication(
+        _ prepared: DayWeavePreparedSchedulePublication
+    ) throws {
+        guard prepared.body.count <= Self.maximumRequestBytes,
+              prepared.bodySHA256 == Self.sha256(prepared.body),
+              (try? makeDecoder().decode(
+                  DayWeaveSchedulePublishRequest.self,
+                  from: prepared.body
+              )) == prepared.request else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
     private func encode(_ value: some Encodable) throws -> Data {
         do {
             let encoder = JSONEncoder()
@@ -969,7 +1021,8 @@ struct DayWeaveAPIClient: Sendable {
         pathComponents: [String],
         queryItems: [URLQueryItem] = [],
         headers: [String: String] = [:],
-        body: Data? = nil
+        body: Data? = nil,
+        requiredStatusCode: Int? = nil
     ) async throws -> Response {
         if let body, body.count > Self.maximumRequestBytes {
             throw DayWeaveAPIError.requestEncodingFailed
@@ -1079,7 +1132,18 @@ struct DayWeaveAPIClient: Sendable {
 
         let data = result.data
         let httpResponse = result.response
-        guard (200..<300).contains(httpResponse.statusCode) else {
+        let hasAcceptedStatus = requiredStatusCode.map {
+            httpResponse.statusCode == $0
+        } ?? (200..<300).contains(httpResponse.statusCode)
+        guard hasAcceptedStatus else {
+            if pathComponents == ["v1", "schedule", "publish"],
+               Self.isTrustedSchedulePublicationStale(
+                   statusCode: httpResponse.statusCode,
+                   contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                   body: data
+               ) {
+                throw DayWeaveAPIError.trustedSchedulePublicationStale
+            }
             let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
             throw DayWeaveAPIError.server(
                 statusCode: httpResponse.statusCode,
@@ -1103,6 +1167,57 @@ struct DayWeaveAPIClient: Sendable {
             return try makeDecoder().decode(Response.self, from: data)
         } catch {
             throw DayWeaveAPIError.responseDecodingFailed
+        }
+    }
+
+    private static func isTrustedSchedulePublicationStale(
+        statusCode: Int,
+        contentType: String?,
+        body: Data
+    ) -> Bool {
+        guard statusCode == 409,
+              body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              Set(error.keys) == ["code", "message"],
+              let code = error["code"] as? String,
+              let message = error["message"] as? String,
+              code == "schedule_publication_stale",
+              !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              message.utf16.count <= 500,
+              !message.unicodeScalars.contains(
+                  where: CharacterSet.controlCharacters.contains
+              ) else {
+            return false
+        }
+        return true
+    }
+
+    private static func isStrictJSONMediaType(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let components = value.split(separator: ";", omittingEmptySubsequences: false)
+        guard let mediaType = components.first?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(), mediaType == "application/json" else {
+            return false
+        }
+        switch components.count {
+        case 1:
+            return true
+        case 2:
+            let parameter = components[1].split(
+                separator: "=",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            return parameter.count == 2
+                && parameter[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "charset"
+                && parameter[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "utf-8"
+        default:
+            return false
         }
     }
 
@@ -1208,6 +1323,10 @@ struct DayWeaveAPIClient: Sendable {
             .map { String(format: "%02x", $0) }
             .joined()
         return "static-v1:\(digest)"
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func configurationIdentifier(

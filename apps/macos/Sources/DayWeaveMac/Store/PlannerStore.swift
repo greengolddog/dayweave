@@ -35,7 +35,24 @@ enum PlannerExecutionStateError: LocalizedError, Equatable, Sendable {
         case .configurationMismatch:
             "Execution recovery state belongs to another API credential binding."
         case .credentialReplacementBlocked:
-            "Reconcile the pending execution or canonical projection before replacing credentials."
+            "Reconcile the pending execution, canonical projection, or exact schedule publication before replacing credentials."
+        }
+    }
+}
+
+enum PlannerSchedulePublicationError: LocalizedError, Equatable, Sendable {
+    case invalidJournal
+    case publicationAlreadyPending
+    case publicationDoesNotMatchJournal
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidJournal:
+            "The exact schedule publication journal is invalid or exceeds its encrypted size limit."
+        case .publicationAlreadyPending:
+            "An earlier schedule publication has an ambiguous result. Restore its API configuration and sync to recover it exactly."
+        case .publicationDoesNotMatchJournal:
+            "The schedule publication response does not match the encrypted request awaiting recovery."
         }
     }
 }
@@ -105,6 +122,9 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var schedulePreviewProvenance: SchedulePreviewProvenance? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var pendingSchedulePublication: PendingSchedulePublication? {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localCaptureDiagnostics: [UUID: String] {
         didSet { scheduleAutosave() }
     }
@@ -148,6 +168,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
+        pendingSchedulePublication: PendingSchedulePublication? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
         previewValidatedForCurrentLaunch: Bool = false,
@@ -190,6 +211,8 @@ final class PlannerStore: ObservableObject {
             ?? canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = restoredSnapshot?.schedulePreviewProvenance
             ?? schedulePreviewProvenance
+        self.pendingSchedulePublication = restoredSnapshot?.pendingSchedulePublication
+            ?? pendingSchedulePublication
         self.localCaptureDiagnostics = restoredSnapshot?.localCaptureDiagnostics
             ?? localCaptureDiagnostics
         let initialExecutionState = restoredSnapshot?.executionState ?? executionState
@@ -323,6 +346,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
+        pendingSchedulePublication = nil
         localCaptureDiagnostics = localCaptureDiagnostics.filter { id, _ in
             blocks.contains { $0.id == id && $0.isLocallyAuthored && $0.sourceItemID == nil }
         }
@@ -400,6 +424,7 @@ final class PlannerStore: ObservableObject {
             || !pendingCanonicalSensitivityMutations.isEmpty
             || !recurrenceSessionOutcomes.isEmpty
             || schedulePreviewProvenance != nil
+            || pendingSchedulePublication != nil
             || blocks.contains {
                 $0.syncOrigin == .canonicalPreview
                     || $0.syncOrigin == .externalPreview
@@ -644,7 +669,83 @@ final class PlannerStore: ObservableObject {
         upsertCanonicalItem(item)
     }
 
-    func applySchedulePreview(
+    func persistPendingSchedulePublication(
+        _ publication: PendingSchedulePublication
+    ) throws {
+        guard canPersistPlan,
+              publication.version == PendingSchedulePublication.currentVersion,
+              publication.isWithinEncodedSizeLimit,
+              publication.configurationIdentifier == canonicalConfigurationIdentifier,
+              publication.provenance.configurationIdentifier
+                == publication.configurationIdentifier else {
+            throw PlannerSchedulePublicationError.invalidJournal
+        }
+        guard pendingSchedulePublication == nil else {
+            throw PlannerSchedulePublicationError.publicationAlreadyPending
+        }
+        pendingSchedulePublication = publication
+        flushPersistence()
+        if let persistenceError { throw persistenceError }
+    }
+
+    func commitPendingSchedulePublication(
+        _ publication: PendingSchedulePublication,
+        blocks newBlocks: [ScheduleBlock]
+    ) throws {
+        guard pendingSchedulePublication == publication else {
+            throw PlannerSchedulePublicationError.publicationDoesNotMatchJournal
+        }
+        let priorBlocks = blocks
+        let priorSelection = selectedBlockID
+        let priorProvenance = schedulePreviewProvenance
+        let priorExecutionState = executionState
+        let priorMessage = lastScheduleMessage
+
+        applySchedulePreviewInMemory(
+            blocks: newBlocks,
+            message: publication.message,
+            provenance: publication.provenance
+        )
+        pendingSchedulePublication = nil
+        flushPersistence()
+        if let persistenceError {
+            blocks = priorBlocks
+            selectedBlockID = priorSelection
+            schedulePreviewProvenance = priorProvenance
+            executionState = priorExecutionState
+            lastScheduleMessage = priorMessage
+            pendingSchedulePublication = publication
+            // A failed atomic local commit must never leave either the prior
+            // or newly published projection actionable in this process.
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            throw persistenceError
+        }
+    }
+
+    /// Resolves an exact publication journal after a response proves that its
+    /// candidate must not become the actionable local plan. This is used for a
+    /// possibly-superseded idempotent receipt and for the server's explicit
+    /// no-side-effect stale-composition result. The prior projection remains
+    /// visible but launch-invalid until a fresh publication succeeds.
+    func clearPendingSchedulePublicationWithoutApplying(
+        _ publication: PendingSchedulePublication
+    ) throws {
+        guard pendingSchedulePublication == publication else {
+            throw PlannerSchedulePublicationError.publicationDoesNotMatchJournal
+        }
+        pendingSchedulePublication = nil
+        isCanonicalPreviewValidatedForCurrentLaunch = false
+        flushPersistence()
+        if let persistenceError {
+            pendingSchedulePublication = publication
+            // Never make the prior or candidate projection actionable when the
+            // atomic acknowledgement could not be persisted.
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            throw persistenceError
+        }
+    }
+
+    private func applySchedulePreviewInMemory(
         blocks newBlocks: [ScheduleBlock],
         message: String,
         provenance: SchedulePreviewProvenance
@@ -1220,6 +1321,7 @@ final class PlannerStore: ObservableObject {
         executionState.hasCredentialReplacementBlocker
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
+            || pendingSchedulePublication != nil
     }
 
     /// Binds the encrypted execution cache to an opaque URL+credential digest.
@@ -1350,6 +1452,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
+        pendingSchedulePublication = nil
         isCanonicalPreviewValidatedForCurrentLaunch = false
         var empty = DayWeaveExecutionDurableState.empty
         empty.deviceID = deviceID
@@ -1931,6 +2034,7 @@ final class PlannerStore: ObservableObject {
             recurrenceSessionOutcomes: recurrenceSessionOutcomes,
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
+            pendingSchedulePublication: pendingSchedulePublication,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )

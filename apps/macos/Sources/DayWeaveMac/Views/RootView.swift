@@ -2389,7 +2389,9 @@ struct SettingsView: View {
                         .textSelection(.enabled)
                 }
                 if executionSync.credentialReplacementIsBlocked {
-                    Text("Reconcile the exact execution command or resolve pending canonical outcome choices before replacing this credential.")
+                    Text(store.pendingSchedulePublication == nil
+                        ? "Reconcile the exact execution command or resolve pending canonical outcome choices before replacing this credential."
+                        : "An exact schedule publication may already exist remotely. Restore the original API configuration and authentication, then run Planner sync to recover it before replacing credentials or resetting the cache.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }

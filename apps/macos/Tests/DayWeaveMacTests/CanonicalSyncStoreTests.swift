@@ -8,7 +8,7 @@ import Testing
 @Suite("Canonical planner sync", .serialized)
 @MainActor
 struct CanonicalSyncStoreTests {
-    @Test("sync publishes a local capture and renders a side-effect-free preview")
+    @Test("sync publishes a local capture, previews without side effects, then publishes the schedule")
     func testSyncVerticalSlice() async throws {
         let token = "canonical-sync-test-token"
         let itemID = UUID(uuidString: "deaddead-2222-4333-8444-beefbeefbeef")!
@@ -71,15 +71,19 @@ struct CanonicalSyncStoreTests {
         #expect(planner.blocks[0].isSensitive)
         #expect(planner.canonicalItems[0].isSensitive)
         #expect(planner.blocks[0].placementReason == "Placed in the earliest matching opening.")
-        #expect(sync.lastPreview?.inputDigest == "sha256:test")
+        #expect(sync.lastPreview?.inputDigest == "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         if case .online = sync.status {} else { Issue.record("Expected online sync status") }
 
-        let requests = URLProtocolStub.storage.requests(for: token)
-        #expect(requests.map(\.method) == ["GET", "POST", "POST"])
+        let requests = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        )
+        #expect(requests.map(\.method) == ["GET", "POST", "POST", "POST"])
         #expect(requests.map(\.url.path) == [
             "/gateway/v1/items/delta",
             "/gateway/v1/items",
             "/gateway/v1/schedule/preview",
+            "/gateway/v1/schedule/publish",
         ])
         #expect(requests[1].headers["Idempotency-Key"] == "mac-create-\(itemID.uuidString.lowercased())")
         #expect(requests[1].jsonBody?["is_sensitive"] as? Bool == true)
@@ -87,6 +91,10 @@ struct CanonicalSyncStoreTests {
         let previous = try #require(previewBody["previous_assignments"] as? [[String: Any]])
         // A locally guessed placement is not a server-authored stability hint.
         #expect(previous.isEmpty)
+        let publicationBody = try #require(requests[3].jsonBody)
+        #expect(publicationBody["expected_input_digest"] as? String == sync.lastPreview?.inputDigest)
+        #expect(publicationBody["schedule"] as? [String: Any] != nil)
+        #expect(UUID(uuidString: try #require(publicationBody["idempotency_key"] as? String)) != nil)
 
         URLProtocolStub.storage.enqueue(
             key: token,
@@ -107,8 +115,11 @@ struct CanonicalSyncStoreTests {
         if case .online = sync.status {} else {
             Issue.record("An unchanged terminal delta cursor must remain a successful no-op")
         }
-        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == [
-            "GET", "POST", "POST", "GET", "POST",
+        #expect(URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).map(\.method) == [
+            "GET", "POST", "POST", "POST", "GET", "POST", "POST",
         ])
     }
 
@@ -1111,6 +1122,713 @@ struct CanonicalSyncStoreTests {
         #expect(newRequests.allSatisfy { $0.url.host == "new.example" })
     }
 
+    @Test("publication failure keeps the prior plan non-current and retains exact recovery")
+    func testPublicationFailureRetainsJournalAndPriorPlan() async throws {
+        let token = "canonical-publication-failure-token"
+        let itemID = UUID(uuidString: "26800000-2222-4333-8444-200000000000")!
+        let priorBlock = Self.block(
+            itemID: itemID,
+            revision: 1,
+            start: Date(timeIntervalSince1970: 1_787_994_000)
+        )
+        let newBlockID = UUID(uuidString: "26800000-2222-4333-8444-200000000001")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+        let priorProvenance = Self.provenance(now: now, token: token)
+        let planner = PlannerStore(
+            blocks: [priorBlock],
+            canonicalItems: [item],
+            canonicalDeltaCursor: "publication-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: priorProvenance,
+            previewValidatedForCurrentLaunch: true,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"publication-after","has_more":false}"#.utf8)),
+            .init(statusCode: 200, body: Data(Self.previewObject(itemID: itemID, blockID: newBlockID).utf8))
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    now: now,
+                    replayed: false
+                )
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(sync.status.isFailure)
+        #expect(sync.lastPreview == nil)
+        #expect(planner.blocks == [priorBlock])
+        #expect(planner.schedulePreviewProvenance == priorProvenance)
+        #expect(planner.pendingSchedulePublication != nil)
+        #expect(planner.canonicalPreviewFreshnessIssue != nil)
+        let retained = planner.pendingSchedulePublication
+        sync.resetCanonicalSyncState()
+        #expect(planner.pendingSchedulePublication == retained)
+        #expect(sync.status.message.contains("recover"))
+    }
+
+    @Test("publication rejects every non-200 success status and durably retains recovery")
+    func testPublicationRequiresExactSuccessStatus() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-status-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        for statusCode in [201, 202, 204] {
+            let token = "canonical-publication-status-\(statusCode)-token"
+            let persistence = EncryptedPlannerPersistence(
+                fileURL: directory
+                    .appendingPathComponent("\(statusCode)", isDirectory: true)
+                    .appendingPathComponent("planner.snapshot.encrypted"),
+                key: PlannerEncryptionKey.random()
+            )
+            let planner = PlannerStore(
+                persistence: persistence,
+                restoreFromPersistence: true,
+                autosaveDelay: .seconds(60),
+                now: { now }
+            )
+            URLProtocolStub.storage.reset(key: token)
+            URLProtocolStub.storage.enqueue(
+                key: token,
+                .init(
+                    statusCode: 200,
+                    body: Data(#"{"changes":[],"next_cursor":"status-cursor","has_more":false}"#.utf8)
+                ),
+                .init(
+                    statusCode: 200,
+                    body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+                )
+            )
+            URLProtocolStub.storage.enqueueSchedulePublication(
+                key: token,
+                .init(
+                    statusCode: statusCode,
+                    body: statusCode == 204 ? Data() : Self.publicationResponse(
+                        inputDigest: Self.emptyInputDigest,
+                        now: now,
+                        replayed: false
+                    )
+                )
+            )
+            let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+            await sync.sync()
+
+            let pending = try #require(planner.pendingSchedulePublication)
+            #expect(sync.status.isFailure)
+            #expect(sync.status.message.contains("\(statusCode)"))
+            #expect(sync.lastPreview == nil)
+            #expect(planner.schedulePreviewProvenance == nil)
+            #expect(planner.canonicalPreviewFreshnessIssue != nil)
+            #expect(planner.persistenceError == nil)
+            #expect(try persistence.load()?.pendingSchedulePublication == pending)
+        }
+    }
+
+    @Test("a fresh key accepts an identical current revision with an old publication time")
+    func testCurrentRevisionDedupeAcceptsOldPublishedAt() async throws {
+        let token = "canonical-publication-current-dedupe-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let planner = PlannerStore(restoreFromPersistence: false, now: { now })
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"dedupe-current","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: Self.emptyInputDigest,
+                    now: now,
+                    replayed: false,
+                    publishedAt: now.addingTimeInterval(-30 * 86_400)
+                )
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        if case .online = sync.status {} else {
+            Issue.record("A fresh key bound to the identical current revision should be accepted")
+        }
+        #expect(sync.lastPreview?.inputDigest == Self.emptyInputDigest)
+        #expect(planner.pendingSchedulePublication == nil)
+        #expect(planner.canonicalPreviewFreshnessIssue == nil)
+    }
+
+    @Test("one explicit stale publication is cleared and recomposed exactly once")
+    func testStalePublicationGetsOneBoundedRetry() async throws {
+        let token = "canonical-publication-stale-retry-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let planner = PlannerStore(restoreFromPersistence: false, now: { now })
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"stale-before","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"stale-after","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: Self.stalePublicationResponse
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let publications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        #expect(publications.count == 2)
+        if publications.count == 2 {
+            #expect(publications[0].body != publications[1].body)
+            #expect(
+                publications[0].jsonBody?["idempotency_key"] as? String
+                    != publications[1].jsonBody?["idempotency_key"] as? String
+            )
+        }
+        #expect(planner.pendingSchedulePublication == nil)
+        #expect(sync.lastPreview?.inputDigest == Self.emptyInputDigest)
+        #expect(sync.warnings.contains { $0.contains("recomposed once") })
+        if case .online = sync.status {} else {
+            Issue.record("The single bounded stale retry should publish the fresh candidate")
+        }
+    }
+
+    @Test("only the exact typed stale envelope may abandon a publication journal")
+    func testUntrustedStaleLookalikesRetainJournal() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-untrusted-stale-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stale = Self.stalePublicationResponse
+        let cases: [(statusCode: Int, headers: [String: String], body: Data)] = [
+            (409, [:], stale),
+            (409, ["Content-Type": "text/plain"], stale),
+            (409, ["Content-Type": "application/json"], Data(#"{"error":"#.utf8)),
+            (409, ["Content-Type": "application/json"], Data(#"{"error":{}}"#.utf8)),
+            (
+                409,
+                ["Content-Type": "application/json"],
+                Data(#"{"error":{"code":"conflict","message":"Generic conflict"}}"#.utf8)
+            ),
+            (
+                409,
+                ["Content-Type": "application/json"],
+                Data(#"{"error":{"code":"schedule_publication_idempotency_conflict","message":"Tuple conflict"}}"#.utf8)
+            ),
+            (
+                409,
+                ["Content-Type": "application/json"],
+                Data(#"{"error":{"code":"schedule_publication_stale","message":"Changed","future":true}}"#.utf8)
+            ),
+            (
+                409,
+                ["Content-Type": "application/json"],
+                Data(#"{"error":{"code":"schedule_publication_stale","message":"Changed"},"future":true}"#.utf8)
+            ),
+            (422, ["Content-Type": "application/json"], stale),
+        ]
+
+        for (index, response) in cases.enumerated() {
+            let token = "canonical-untrusted-stale-\(index)-token"
+            let persistence = EncryptedPlannerPersistence(
+                fileURL: directory
+                    .appendingPathComponent(String(index), isDirectory: true)
+                    .appendingPathComponent("planner.snapshot.encrypted"),
+                key: PlannerEncryptionKey.random()
+            )
+            let planner = PlannerStore(
+                persistence: persistence,
+                restoreFromPersistence: true,
+                autosaveDelay: .seconds(60),
+                now: { now }
+            )
+            URLProtocolStub.storage.reset(key: token)
+            URLProtocolStub.storage.enqueue(
+                key: token,
+                .init(
+                    statusCode: 200,
+                    body: Data(#"{"changes":[],"next_cursor":"untrusted-stale","has_more":false}"#.utf8)
+                ),
+                .init(
+                    statusCode: 200,
+                    body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+                )
+            )
+            URLProtocolStub.storage.enqueueSchedulePublication(
+                key: token,
+                .init(
+                    statusCode: response.statusCode,
+                    headers: response.headers,
+                    body: response.body
+                )
+            )
+            let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+            await sync.sync()
+
+            let retained = try #require(planner.pendingSchedulePublication)
+            #expect(sync.status.isFailure)
+            #expect(sync.lastPreview == nil)
+            #expect(planner.canonicalPreviewFreshnessIssue != nil)
+            #expect(try persistence.load()?.pendingSchedulePublication == retained)
+            let publications = URLProtocolStub.storage.requests(
+                for: token,
+                includingSchedulePublication: true
+            ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+            #expect(publications.count == 1)
+            #expect(URLProtocolStub.storage.requests(for: token).count == 2)
+        }
+    }
+
+    @Test("a second stale publication clears its journal and surfaces a bounded failure")
+    func testSecondStalePublicationClearsAndStops() async throws {
+        let token = "canonical-publication-second-stale-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-second-stale-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: PlannerEncryptionKey.random()
+        )
+        let planner = PlannerStore(
+            persistence: persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"twice-before","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"twice-after","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: Self.stalePublicationResponse
+            ),
+            .init(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: Self.stalePublicationResponse
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(sync.status.isFailure)
+        #expect(sync.status.message.contains("both bounded publication attempts"))
+        #expect(sync.lastPreview == nil)
+        #expect(planner.pendingSchedulePublication == nil)
+        #expect(planner.canonicalPreviewFreshnessIssue != nil)
+        #expect(try persistence.load()?.pendingSchedulePublication == nil)
+        let publications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        #expect(publications.count == 2)
+    }
+
+    @Test("a recent replay stays non-current until one fresh publication succeeds")
+    func testRecentReplayClearsWithoutInstallingBeforeFreshPublication() async throws {
+        let token = "canonical-publication-recent-replay-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-recent-replay-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: PlannerEncryptionKey.random()
+        )
+        let priorBlock = ScheduleBlock(
+            id: UUID(uuidString: "26900000-2222-4333-8444-200000000000")!,
+            title: "Prior external hold",
+            kind: .breakTime,
+            start: now.addingTimeInterval(1_800),
+            end: now.addingTimeInterval(2_700),
+            status: .scheduled,
+            project: nil,
+            notes: "",
+            energy: .low,
+            isFlexible: false,
+            isHardConstraint: true,
+            actualMinutes: nil,
+            syncOrigin: .externalPreview,
+            previewKind: "external_fixed"
+        )
+        let planner = PlannerStore(
+            blocks: [priorBlock],
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
+            previewValidatedForCurrentLaunch: true,
+            persistence: persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"recent-before","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    now: now,
+                    replayed: false
+                )
+            )
+        )
+        let firstSync = Self.makeSync(planner: planner, token: token, now: now)
+        await firstSync.sync()
+        let pending = try #require(planner.pendingSchedulePublication)
+        #expect(planner.blocks == [priorBlock])
+
+        let replayNow = now.addingTimeInterval(60)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"recent-fresh","has_more":false}"#.utf8),
+                delay: 0.25
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(
+                    sourceRevisions: [:],
+                    asOf: replayNow
+                ).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: Self.emptyInputDigest,
+                    now: now,
+                    replayed: true
+                )
+            )
+        )
+        let replaySync = Self.makeSync(planner: planner, token: token, now: replayNow)
+        let run = Task { await replaySync.sync() }
+        for _ in 0..<100 {
+            let deltaCount = URLProtocolStub.storage.requests(for: token)
+                .count { $0.url.path.hasSuffix("/v1/items/delta") }
+            if deltaCount >= 2, planner.pendingSchedulePublication == nil { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+
+        #expect(planner.pendingSchedulePublication == nil)
+        #expect(planner.blocks == [priorBlock])
+        #expect(planner.canonicalPreviewFreshnessIssue != nil)
+        let acknowledgedSnapshot = try #require(try persistence.load())
+        #expect(acknowledgedSnapshot.pendingSchedulePublication == nil)
+        #expect(acknowledgedSnapshot.blocks == [priorBlock])
+        let acknowledgedPublications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        let replayRequest = try #require(acknowledgedPublications.dropFirst().first)
+        #expect(pending.preparedRequest.body == replayRequest.body)
+
+        await run.value
+
+        #expect(planner.blocks.isEmpty)
+        #expect(planner.pendingSchedulePublication == nil)
+        #expect(planner.canonicalPreviewFreshnessIssue == nil)
+        #expect(replaySync.lastPreview?.inputDigest == Self.emptyInputDigest)
+        if case .online = replaySync.status {} else {
+            Issue.record("One fresh publication should make the recomposed plan current")
+        }
+        let publications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        #expect(publications.count == 3)
+        if publications.count == 3 {
+            #expect(publications[0].body == publications[1].body)
+            #expect(publications[2].body != publications[1].body)
+        }
+    }
+
+    @Test("persistence failure restores the exact journal before any stale retry")
+    func testStaleJournalClearRollsBackOnPersistenceFailure() async throws {
+        let token = "canonical-publication-clear-failure-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-clear-failure-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: PlannerEncryptionKey.random()
+        )
+        let planner = PlannerStore(
+            persistence: persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"clear-failure","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                    now: now,
+                    replayed: false
+                )
+            )
+        )
+        let firstSync = Self.makeSync(planner: planner, token: token, now: now)
+        await firstSync.sync()
+        let pending = try #require(planner.pendingSchedulePublication)
+
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json"],
+                body: Self.stalePublicationResponse,
+                delay: 0.25
+            )
+        )
+        let recovery = Self.makeSync(planner: planner, token: token, now: now)
+        let run = Task { await recovery.sync() }
+        for _ in 0..<100 {
+            let publicationCount = URLProtocolStub.storage.requests(
+                for: token,
+                includingSchedulePublication: true
+            ).count { $0.url.path.hasSuffix("/v1/schedule/publish") }
+            if publicationCount >= 2 { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        let external = try persistence.loadRevisioned()
+        let externalSnapshot = try #require(external.snapshot)
+        _ = try persistence.save(externalSnapshot, expectedRevision: external.revision)
+        await run.value
+
+        #expect(recovery.status.isFailure)
+        #expect(planner.persistenceError == .concurrentModification)
+        #expect(planner.pendingSchedulePublication == pending)
+        #expect(try persistence.load()?.pendingSchedulePublication == pending)
+        let publications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        #expect(publications.count == 2)
+        #expect(URLProtocolStub.storage.requests(for: token).count == 2)
+    }
+
+    @Test("a cancelled post-send publication replays exact encrypted bytes after restart")
+    func testPublicationJournalReplaysExactBytesAfterRestart() async throws {
+        let token = "canonical-publication-restart-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dayweave-publication-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let persistence = EncryptedPlannerPersistence(
+            fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+            key: PlannerEncryptionKey.random()
+        )
+        let planner = PlannerStore(
+            persistence: persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"restart-cursor","has_more":false}"#.utf8)),
+            .init(statusCode: 200, body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8))
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: Self.emptyInputDigest,
+                    now: now,
+                    replayed: false
+                ),
+                delay: 0.25
+            )
+        )
+        let firstSync = Self.makeSync(planner: planner, token: token, now: now)
+        let firstRun = Task { await firstSync.sync() }
+        for _ in 0..<100 {
+            if URLProtocolStub.storage.requests(
+                for: token,
+                includingSchedulePublication: true
+            ).contains(where: { $0.url.path.hasSuffix("/v1/schedule/publish") }) {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        firstSync.configurationDidChange()
+        await firstRun.value
+        #expect(firstSync.status.isFailure)
+        #expect(firstSync.status.message.contains("recovery"))
+        let pending = try #require(planner.pendingSchedulePublication)
+        #expect(planner.persistenceError == nil)
+        let pendingEncoder = JSONEncoder()
+        pendingEncoder.dateEncodingStrategy = .millisecondsSince1970
+        let pendingDecoder = JSONDecoder()
+        pendingDecoder.dateDecodingStrategy = .millisecondsSince1970
+        _ = try pendingDecoder.decode(
+            PendingSchedulePublication.self,
+            from: pendingEncoder.encode(pending)
+        )
+        let persistedBeforeRestart = try #require(try persistence.load())
+        #expect(persistedBeforeRestart.pendingSchedulePublication == pending)
+        let firstPublication = try #require(URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).last(where: { $0.url.path.hasSuffix("/v1/schedule/publish") }))
+        #expect(firstPublication.body == pending.preparedRequest.body)
+
+        let replayNow = now.addingTimeInterval(2 * 86_400)
+        let restored = PlannerStore(
+            persistence: persistence,
+            restoreFromPersistence: true,
+            autosaveDelay: .seconds(60),
+            now: { replayNow }
+        )
+        #expect(restored.persistenceError == nil)
+        #expect(restored.pendingSchedulePublication == pending)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"restart-fresh","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(
+                    sourceRevisions: [:],
+                    asOf: replayNow
+                ).utf8)
+            )
+        )
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Self.publicationResponse(
+                    inputDigest: Self.emptyInputDigest,
+                    now: now,
+                    replayed: true
+                )
+            )
+        )
+        let recoveredSync = Self.makeSync(planner: restored, token: token, now: replayNow)
+
+        await recoveredSync.sync()
+
+        let publications = URLProtocolStub.storage.requests(
+            for: token,
+            includingSchedulePublication: true
+        ).filter { $0.url.path.hasSuffix("/v1/schedule/publish") }
+        #expect(publications.count == 3)
+        if publications.count == 3 {
+            #expect(publications[0].body == publications[1].body)
+            #expect(publications[2].body != publications[1].body)
+        }
+        #expect(restored.pendingSchedulePublication == nil)
+        #expect(recoveredSync.lastPreview?.inputDigest == Self.emptyInputDigest)
+        #expect(restored.canonicalPreviewFreshnessIssue == nil)
+        if case .online = recoveredSync.status {} else {
+            Issue.record("An exact replay should finish the local schedule commit")
+        }
+        let nonPublicationAfterRestart = URLProtocolStub.storage.requests(for: token)
+            .filter { $0.url.path.hasSuffix("/v1/items/delta") }
+        #expect(nonPublicationAfterRestart.count == 2)
+    }
+
     @Test("canonical cache cannot cross API configurations")
     func testCanonicalCacheConfigurationBinding() async throws {
         let token = "canonical-configuration-binding-token"
@@ -1479,7 +2197,7 @@ struct CanonicalSyncStoreTests {
         let blockStart = asOf.addingTimeInterval(3_600)
         let blockEnd = blockStart.addingTimeInterval(2_700)
         return """
-        {"input_digest":"sha256:test","source_item_count":1,"accepted_item_count":1,
+        {"input_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_item_count":1,"accepted_item_count":1,
          "source_item_revisions":{"\(itemID.uuidString.lowercased())":1},
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
            "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
@@ -1495,8 +2213,10 @@ struct CanonicalSyncStoreTests {
         """
     }
 
-    private static func emptyPreviewObject(sourceRevisions: [UUID: UInt64]) -> String {
-        let asOf = Date(timeIntervalSince1970: 1_787_990_400)
+    private static func emptyPreviewObject(
+        sourceRevisions: [UUID: UInt64],
+        asOf: Date = Date(timeIntervalSince1970: 1_787_990_400)
+    ) -> String {
         let calendar = Calendar.autoupdatingCurrent
         let horizonStart = calendar.startOfDay(for: asOf)
         let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
@@ -1506,7 +2226,7 @@ struct CanonicalSyncStoreTests {
             .map { "\"\($0.key.uuidString.lowercased())\":\($0.value)" }
             .joined(separator: ",")
         return """
-        {"input_digest":"sha256:empty","source_item_count":\(sourceRevisions.count),
+        {"input_digest":"\(emptyInputDigest)","source_item_count":\(sourceRevisions.count),
          "accepted_item_count":\(sourceRevisions.count),"source_item_revisions":{\(revisions)},
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
            "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
@@ -1515,6 +2235,36 @@ struct CanonicalSyncStoreTests {
            "unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}
         """
     }
+
+    private static let emptyInputDigest =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    private static func publicationResponse(
+        inputDigest: String,
+        now: Date,
+        replayed: Bool,
+        publishedAt: Date? = nil
+    ) -> Data {
+        let calendar = Calendar.autoupdatingCurrent
+        let horizonStart = calendar.startOfDay(for: now)
+        let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
+            ?? horizonStart.addingTimeInterval(7 * 86_400)
+        let timezoneName = TimeZone.autoupdatingCurrent.identifier == "GMT"
+            ? "UTC"
+            : TimeZone.autoupdatingCurrent.identifier
+        let revisionID = "abababab-abab-4bab-8bab-abababababab"
+        return Data("""
+        {"revision":{"id":"\(revisionID)","revision":"1:\(revisionID)",
+        "revision_number":1,"input_digest":"\(inputDigest)",
+        "horizon_start":"\(wireTimestamp(horizonStart))",
+        "horizon_end":"\(wireTimestamp(horizonEnd))","timezone_name":"\(timezoneName)",
+        "published_at":"\(wireTimestamp(publishedAt ?? now))"},"replayed":\(replayed)}
+        """.utf8)
+    }
+
+    private static let stalePublicationResponse = Data(
+        #"{"error":{"code":"schedule_publication_stale","message":"Canonical items changed during publication; preview again"}}"#.utf8
+    )
 
     private static func wireTimestamp(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()

@@ -187,10 +187,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// capture quarantine diagnostics, version 4 added the encrypted execution
     /// replay fence and immutable terminal ledger, version 5 adds explicit
     /// sensitivity to canonical items and derived schedule blocks, version 6
-    /// adds durable, revision-bound sensitivity edits, and version 7 adds the
-    /// submitted-request and follow-up fence. Older binaries reject the newer
+    /// adds durable, revision-bound sensitivity edits, version 7 adds the
+    /// submitted-request and follow-up fence, and version 8 adds the exact
+    /// schedule-publication replay journal. Older binaries reject the newer
     /// schema instead of rewriting fields they do not understand.
-    static let currentSchemaVersion = 7
+    static let currentSchemaVersion = 8
 
     let schemaVersion: Int
     let savedAt: Date
@@ -212,6 +213,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]?
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
+    let pendingSchedulePublication: PendingSchedulePublication?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
 
@@ -236,6 +238,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
+        pendingSchedulePublication: PendingSchedulePublication? = nil,
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty
     ) {
@@ -259,6 +262,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.recurrenceSessionOutcomes = recurrenceSessionOutcomes
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
+        self.pendingSchedulePublication = pendingSchedulePublication
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
     }
@@ -271,6 +275,34 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 7:
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil else {
+                throw .snapshotDecodingFailed
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                pendingSchedulePublication: nil,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 6:
             guard executionState != nil,
                   let pendingCanonicalSensitivityMutations else {

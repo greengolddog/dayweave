@@ -463,6 +463,79 @@ struct DayWeaveAPIClientTests {
         }
     }
 
+    @Test("schedule publication prepares one canonical body and sends those exact bytes")
+    func testSchedulePublicationUsesExactPreparedBody() async throws {
+        let instant = Self.date("2026-08-29T09:00:00Z")
+            .addingTimeInterval(0.000_451)
+        let horizonEnd = instant.addingTimeInterval(86_400)
+        let inputDigest = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        let idempotencyKey = UUID(uuidString: "dddddddd-dddd-4ddd-8ddd-dddddddddddd")!
+        let schedule = DayWeaveSchedulePreviewRequest(
+            asOf: instant,
+            horizonStart: instant,
+            horizonEnd: horizonEnd,
+            timezoneName: "Europe/Madrid",
+            availability: [],
+            fixedBlocks: [],
+            previousAssignments: [],
+            config: .init(
+                slotGranularityMinutes: 5,
+                stabilityWeight: 4,
+                defaultSoftWeight: 100
+            ),
+            recurrenceContext: [:]
+        )
+        let request = DayWeaveSchedulePublishRequest(
+            idempotencyKey: idempotencyKey,
+            expectedInputDigest: inputDigest,
+            schedule: schedule
+        )
+        let client = makeClient(token: Self.apiToken)
+        let prepared = try client.prepareSchedulePublication(request)
+        #expect(prepared.request.schedule.asOf != request.schedule.asOf)
+        #expect(abs(prepared.request.schedule.asOf.timeIntervalSince(request.schedule.asOf)) < 0.001)
+        try client.validatePreparedSchedulePublication(prepared)
+        URLProtocolStub.storage.enqueueSchedulePublication(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data("""
+            {"revision":{"id":"eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "revision":"7:eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee","revision_number":7,
+            "input_digest":"\(inputDigest)","horizon_start":"2026-08-29T09:00:00Z",
+            "horizon_end":"2026-08-30T09:00:00Z","timezone_name":"Europe/Madrid",
+            "published_at":"2026-08-29T09:00:01Z"},"replayed":false}
+            """.utf8))
+        )
+
+        let response = try await client.publishSchedule(prepared)
+
+        #expect(response.revision.revisionNumber == 7)
+        #expect(!response.replayed)
+        let publication = try #require(URLProtocolStub.storage.requests(
+            for: Self.apiToken,
+            includingSchedulePublication: true
+        ).last)
+        #expect(publication.url.path == "/gateway/v1/schedule/publish")
+        #expect(publication.body == prepared.body)
+        #expect(prepared.bodySHA256.count == 64)
+        #expect(publication.jsonBody?["expected_input_digest"] as? String == inputDigest)
+
+        let corrupt = DayWeavePreparedSchedulePublication(
+            request: prepared.request,
+            body: prepared.body,
+            bodySHA256: String(repeating: "0", count: 64)
+        )
+        do {
+            _ = try await client.publishSchedule(corrupt)
+            Issue.record("A corrupt exact-body journal must fail before transport")
+        } catch {
+            #expect(error as? DayWeaveAPIError == .requestEncodingFailed)
+        }
+        #expect(URLProtocolStub.storage.requests(
+            for: Self.apiToken,
+            includingSchedulePublication: true
+        ).count == 1)
+    }
+
     private func makeClient(token: String?) -> DayWeaveAPIClient {
         DayWeaveAPIClient(
             baseURL: try! DayWeaveAPIBaseURL("https://api.example.com/gateway"),
@@ -640,21 +713,38 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     final class Storage: @unchecked Sendable {
         private let lock = NSLock()
         private var queuedResponses: [String: [Response]] = [:]
+        private var queuedSchedulePublicationResponses: [String: [Response]] = [:]
         private var recordedRequests: [String: [RecordedRequest]] = [:]
+        private var observedSchedulePublicationKeys: [String: Set<String>] = [:]
 
-        func requests(for key: String) -> [RecordedRequest] {
-            lock.withLock { recordedRequests[key] ?? [] }
+        func requests(
+            for key: String,
+            includingSchedulePublication: Bool = false
+        ) -> [RecordedRequest] {
+            lock.withLock {
+                let requests = recordedRequests[key] ?? []
+                guard !includingSchedulePublication else { return requests }
+                return requests.filter { !$0.url.path.hasSuffix("/v1/schedule/publish") }
+            }
         }
 
         func reset(key: String) {
             lock.withLock {
                 queuedResponses[key] = []
+                queuedSchedulePublicationResponses[key] = []
                 recordedRequests[key] = []
+                observedSchedulePublicationKeys[key] = []
             }
         }
 
         func enqueue(key: String, _ responses: Response...) {
             lock.withLock { queuedResponses[key, default: []].append(contentsOf: responses) }
+        }
+
+        func enqueueSchedulePublication(key: String, _ responses: Response...) {
+            lock.withLock {
+                queuedSchedulePublicationResponses[key, default: []].append(contentsOf: responses)
+            }
         }
 
         func takeResponse(for request: URLRequest, key: String) -> Response? {
@@ -666,6 +756,45 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
                     headers: request.allHTTPHeaderFields ?? [:],
                     body: Self.readBody(from: request)
                 ))
+                if url.path.hasSuffix("/v1/schedule/publish") {
+                    if var responses = queuedSchedulePublicationResponses[key],
+                       !responses.isEmpty {
+                        let response = responses.removeFirst()
+                        queuedSchedulePublicationResponses[key] = responses
+                        return response
+                    }
+                    guard let body = Self.readBody(from: request),
+                          let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+                          let idempotencyKey = object["idempotency_key"] as? String,
+                          let expectedDigest = object["expected_input_digest"] as? String,
+                          let schedule = object["schedule"] as? [String: Any],
+                          let horizonStart = schedule["horizon_start"] as? String,
+                          let horizonEnd = schedule["horizon_end"] as? String,
+                          let timezoneName = schedule["timezone_name"] as? String,
+                          let publishedAt = schedule["as_of"] as? String else { return nil }
+                    let replayed = observedSchedulePublicationKeys[key, default: []]
+                        .contains(idempotencyKey)
+                    observedSchedulePublicationKeys[key, default: []].insert(idempotencyKey)
+                    let revisionID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+                    let responseObject: [String: Any] = [
+                        "revision": [
+                            "id": revisionID,
+                            "revision": "1:\(revisionID)",
+                            "revision_number": 1,
+                            "input_digest": expectedDigest,
+                            "horizon_start": horizonStart,
+                            "horizon_end": horizonEnd,
+                            "timezone_name": timezoneName,
+                            "published_at": publishedAt,
+                        ],
+                        "replayed": replayed,
+                    ]
+                    guard let responseBody = try? JSONSerialization.data(
+                        withJSONObject: responseObject,
+                        options: [.sortedKeys]
+                    ) else { return nil }
+                    return Response(statusCode: 200, body: responseBody)
+                }
                 guard var responses = queuedResponses[key], !responses.isEmpty else { return nil }
                 let response = responses.removeFirst()
                 queuedResponses[key] = responses

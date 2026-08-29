@@ -87,10 +87,21 @@ final class CanonicalSyncStore: ObservableObject {
         lastPreview = nil
         warnings = []
         reloadConfigurationStatus()
+        if planner.pendingSchedulePublication != nil {
+            status = .failed(
+                "A schedule publication is awaiting exact recovery. Restore its original API configuration and authentication, then sync before replacing or resetting this connection."
+            )
+        }
     }
 
     func resetCanonicalSyncState() {
         guard activeSyncID == nil else { return }
+        guard planner.pendingSchedulePublication == nil else {
+            status = .failed(
+                "An exact schedule publication may already be committed remotely. Restore its original API configuration and authentication, then sync to recover it before resetting local state."
+            )
+            return
+        }
         planner.resetCanonicalSyncState()
         lastPreview = nil
         warnings = []
@@ -107,6 +118,14 @@ final class CanonicalSyncStore: ObservableObject {
         warnings = []
         guard let client = makeClient(reportFailure: true) else {
             planner.endCanonicalSync()
+            return
+        }
+        if let pending = planner.pendingSchedulePublication,
+           pending.configurationIdentifier != client.configurationIdentifier {
+            planner.endCanonicalSync()
+            status = .failed(
+                "The exact schedule publication belongs to another API URL or credential session. Restore that original configuration and authentication, then sync to recover it; it was not discarded."
+            )
             return
         }
         do {
@@ -147,11 +166,43 @@ final class CanonicalSyncStore: ObservableObject {
                 activeSyncID = nil
                 isSyncing = false
                 planner.endCanonicalSync()
-                if generation != configurationGeneration { reloadConfigurationStatus() }
+                if generation != configurationGeneration {
+                    reloadConfigurationStatus()
+                    if planner.pendingSchedulePublication != nil {
+                        status = .failed(
+                            "A schedule publication is awaiting exact recovery. Restore its original API configuration and authentication, then sync before replacing or resetting this connection."
+                        )
+                    }
+                }
             }
         }
 
         do {
+            var freshPublicationRetryBudget = 1
+            if let pending = planner.pendingSchedulePublication {
+                status = .syncing("Recovering an exact schedule publication…")
+                let recovery = try await recoverPendingSchedulePublication(
+                    pending,
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+                switch recovery {
+                case let .installed(revisionNumber, blockCount):
+                    lastPreview = pending.preview
+                    status = .online(
+                        updatedAt: now(),
+                        message: "Recovered published revision \(revisionNumber); composed \(blockCount) blocks"
+                    )
+                    return
+                case .requiresFreshComposition:
+                    // The recovered receipt may name a superseded revision, or
+                    // the server proved that the old composition was never
+                    // published. Permit exactly one newly composed attempt in
+                    // this sync; it must not recursively retry again.
+                    freshPublicationRetryBudget = 0
+                }
+            }
             planner.capturePendingCanonicalMutations()
             planner.flushPersistence()
             if let persistenceError = planner.persistenceError { throw persistenceError }
@@ -187,41 +238,19 @@ final class CanonicalSyncStore: ObservableObject {
                 operationID: operationID,
                 generation: generation
             )
-            status = .syncing("Composing a read-only schedule preview…")
-            let consistentPreview = try await loadConsistentPreview(
+            let installed = try await composeAndPublishFreshSchedule(
                 client: client,
                 operationID: operationID,
-                generation: generation
+                generation: generation,
+                created: created,
+                privacyUpdated: privacyUpdated,
+                updated: updated,
+                retryBudget: freshPublicationRetryBudget
             )
-            let preview = consistentPreview.preview
-            try ensureOperationCurrent(operationID: operationID, generation: generation)
-            warnings.append(contentsOf: preview.rejectedItems.map {
-                "“\($0.title)” was excluded from the preview: \($0.reason)"
-            })
-            let rendered = render(preview)
-            planner.applySchedulePreview(
-                blocks: rendered,
-                message: previewMessage(
-                    preview,
-                    created: created,
-                    privacyUpdated: privacyUpdated,
-                    updated: updated
-                ),
-                provenance: .init(
-                    configurationIdentifier: client.configurationIdentifier,
-                    generatedAt: now(),
-                    asOf: preview.plan.asOf,
-                    horizonStart: preview.plan.horizonStart,
-                    horizonEnd: preview.plan.horizonEnd,
-                    timezoneName: consistentPreview.request.timezoneName
-                )
-            )
-            planner.flushPersistence()
-            if let persistenceError = planner.persistenceError { throw persistenceError }
-            lastPreview = preview
+            lastPreview = installed.preview
             status = .online(
                 updatedAt: now(),
-                message: "Synced \(planner.canonicalItems.count) items; composed \(rendered.count) blocks"
+                message: "Synced \(planner.canonicalItems.count) items; composed \(installed.blockCount) blocks"
             )
         } catch {
             planner.flushPersistence()
@@ -332,6 +361,229 @@ final class CanonicalSyncStore: ObservableObject {
             )
         }
         throw CanonicalSyncError.sourceRevisionMismatch
+    }
+
+    private func recoverPendingSchedulePublication(
+        _ publication: PendingSchedulePublication,
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> PendingSchedulePublicationRecovery {
+        try ensureOperationCurrent(operationID: operationID, generation: generation)
+        try validatePublicationJournal(publication, client: client)
+        let rendered = render(publication.preview)
+        let published: DayWeaveSchedulePublishResponse
+        do {
+            published = try await client.publishSchedule(publication.preparedRequest)
+        } catch {
+            guard Self.isStaleSchedulePublication(error) else { throw error }
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            try planner.clearPendingSchedulePublicationWithoutApplying(publication)
+            warnings.append(
+                "The server proved that the retained schedule was stale before publication; it was cleared safely and will be composed once from current items."
+            )
+            return .requiresFreshComposition
+        }
+        try ensureOperationCurrent(operationID: operationID, generation: generation)
+        try validatePublicationResponse(published, for: publication)
+        if published.replayed {
+            // An exact receipt can identify a revision that another device has
+            // already superseded. Clear the now-acknowledged write boundary but
+            // leave the prior local plan invalid until one fresh composition.
+            try planner.clearPendingSchedulePublicationWithoutApplying(publication)
+            warnings.append(
+                "Recovered the exact publication receipt; recomposing once before making any schedule actionable because that receipt may be superseded."
+            )
+            return .requiresFreshComposition
+        }
+        try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+        return .installed(
+            revisionNumber: published.revision.revisionNumber,
+            blockCount: rendered.count
+        )
+    }
+
+    private func composeAndPublishFreshSchedule(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64,
+        created: Int,
+        privacyUpdated: Int,
+        updated: Int,
+        retryBudget: Int
+    ) async throws -> InstalledSchedulePublication {
+        var retriesRemaining = max(0, retryBudget)
+        while true {
+            status = .syncing("Composing a read-only schedule preview…")
+            let consistentPreview = try await loadConsistentPreview(
+                client: client,
+                operationID: operationID,
+                generation: generation
+            )
+            let preview = consistentPreview.preview
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            warnings.append(contentsOf: preview.rejectedItems.map {
+                "“\($0.title)” was excluded from the preview: \($0.reason)"
+            })
+            let rendered = render(preview)
+            let preparedAt = now()
+            let provenance = SchedulePreviewProvenance(
+                configurationIdentifier: client.configurationIdentifier,
+                generatedAt: preparedAt,
+                asOf: preview.plan.asOf,
+                horizonStart: preview.plan.horizonStart,
+                horizonEnd: preview.plan.horizonEnd,
+                timezoneName: consistentPreview.request.timezoneName
+            )
+            let publicationRequest = DayWeaveSchedulePublishRequest(
+                idempotencyKey: UUID(),
+                expectedInputDigest: preview.inputDigest,
+                schedule: consistentPreview.request
+            )
+            let publication = PendingSchedulePublication(
+                configurationIdentifier: client.configurationIdentifier,
+                preparedRequest: try client.prepareSchedulePublication(publicationRequest),
+                preview: preview,
+                message: previewMessage(
+                    preview,
+                    created: created,
+                    privacyUpdated: privacyUpdated,
+                    updated: updated
+                ),
+                provenance: provenance,
+                preparedAt: preparedAt
+            )
+            try validatePublicationJournal(publication, client: client)
+            try planner.persistPendingSchedulePublication(publication)
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            status = .syncing("Publishing the validated schedule…")
+
+            let published: DayWeaveSchedulePublishResponse
+            do {
+                published = try await client.publishSchedule(publication.preparedRequest)
+            } catch {
+                guard Self.isStaleSchedulePublication(error) else { throw error }
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                try planner.clearPendingSchedulePublicationWithoutApplying(publication)
+                guard retriesRemaining > 0 else {
+                    throw CanonicalSyncError.schedulePublicationStayedStale
+                }
+                retriesRemaining -= 1
+                warnings.append(
+                    "Canonical items changed during publication; discarded that non-published candidate and recomposed once."
+                )
+                status = .syncing("Refreshing canonical items after a publication race…")
+                try await pullCanonicalItems(
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+                continue
+            }
+
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            try validatePublicationResponse(published, for: publication)
+            if published.replayed {
+                try planner.clearPendingSchedulePublicationWithoutApplying(publication)
+                guard retriesRemaining > 0 else {
+                    throw CanonicalSyncError.schedulePublicationReplayNeedsFreshComposition
+                }
+                retriesRemaining -= 1
+                warnings.append(
+                    "The publication returned an existing exact receipt; recomposed once before making a schedule actionable."
+                )
+                status = .syncing("Refreshing canonical items after an exact receipt…")
+                try await pullCanonicalItems(
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+                continue
+            }
+
+            try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+            return .init(preview: preview, blockCount: rendered.count)
+        }
+    }
+
+    private static func isStaleSchedulePublication(_ error: any Error) -> Bool {
+        (error as? DayWeaveAPIError) == .trustedSchedulePublicationStale
+    }
+
+    private func validatePublicationJournal(
+        _ publication: PendingSchedulePublication,
+        client: DayWeaveAPIClient
+    ) throws {
+        let request = publication.preparedRequest.request
+        guard publication.version == PendingSchedulePublication.currentVersion,
+              publication.isWithinEncodedSizeLimit,
+              publication.configurationIdentifier == client.configurationIdentifier,
+              publication.configurationIdentifier == planner.canonicalConfigurationIdentifier,
+              publication.provenance.configurationIdentifier == publication.configurationIdentifier,
+              Self.isValidInputDigest(request.expectedInputDigest),
+              request.expectedInputDigest == publication.preview.inputDigest,
+              sameInstant(publication.provenance.asOf, request.schedule.asOf),
+              sameInstant(publication.provenance.horizonStart, request.schedule.horizonStart),
+              sameInstant(publication.provenance.horizonEnd, request.schedule.horizonEnd),
+              publication.provenance.timezoneName == request.schedule.timezoneName,
+              publication.preparedAt.timeIntervalSinceReferenceDate.isFinite,
+              publication.provenance.generatedAt.timeIntervalSinceReferenceDate.isFinite,
+              publication.provenance.generatedAt >= publication.preparedAt.addingTimeInterval(-0.002),
+              publication.provenance.generatedAt <= publication.preparedAt.addingTimeInterval(0.002),
+              publication.message.utf8.count <= PendingSchedulePublication.maximumMessageBytes,
+              !publication.message.unicodeScalars.contains(
+                  where: CharacterSet.controlCharacters.contains
+              ) else {
+            throw CanonicalSyncError.invalidSchedulePublication
+        }
+        try client.validatePreparedSchedulePublication(publication.preparedRequest)
+        let localRevisions = Dictionary(
+            uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
+        )
+        guard publication.preview.sourceItemRevisions == localRevisions else {
+            throw CanonicalSyncError.sourceRevisionMismatch
+        }
+        try validate(preview: publication.preview, against: request.schedule)
+    }
+
+    private func validatePublicationResponse(
+        _ response: DayWeaveSchedulePublishResponse,
+        for publication: PendingSchedulePublication
+    ) throws {
+        let revision = response.revision
+        let request = publication.preparedRequest.request
+        let components = revision.revision.split(
+            separator: ":",
+            maxSplits: 1,
+            omittingEmptySubsequences: false
+        )
+        let currentTime = now()
+        guard components.count == 2,
+              revision.revisionNumber > 0,
+              components[0] == Substring(String(revision.revisionNumber)),
+              components[1] == Substring(revision.id.uuidString.lowercased()),
+              revision.inputDigest == request.expectedInputDigest,
+              sameInstant(revision.horizonStart, request.schedule.horizonStart),
+              sameInstant(revision.horizonEnd, request.schedule.horizonEnd),
+              revision.timezoneName == request.schedule.timezoneName,
+              revision.publishedAt.timeIntervalSinceReferenceDate.isFinite,
+              revision.publishedAt <= currentTime.addingTimeInterval(5 * 60) else {
+            throw CanonicalSyncError.invalidSchedulePublication
+        }
+    }
+
+    private func sameInstant(_ left: Date, _ right: Date) -> Bool {
+        abs(left.timeIntervalSince(right)) <= 0.002
+    }
+
+    private static func isValidInputDigest(_ value: String) -> Bool {
+        let prefix = "sha256:"
+        guard value.hasPrefix(prefix), value.utf8.count == prefix.utf8.count + 64 else {
+            return false
+        }
+        return value.utf8.dropFirst(prefix.utf8.count).allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
     }
 
     private func validate(
@@ -1273,6 +1525,16 @@ final class CanonicalSyncStore: ObservableObject {
     }
 }
 
+private enum PendingSchedulePublicationRecovery {
+    case installed(revisionNumber: UInt64, blockCount: Int)
+    case requiresFreshComposition
+}
+
+private struct InstalledSchedulePublication {
+    let preview: DayWeaveSchedulePreview
+    let blockCount: Int
+}
+
 private struct PreviewSessionIdentity: Hashable {
     let itemID: UUID
     let occurrenceID: UUID?
@@ -1291,6 +1553,9 @@ private enum CanonicalSyncError: LocalizedError {
     case operationSuperseded
     case sourceRevisionMismatch
     case invalidPreview(String)
+    case invalidSchedulePublication
+    case schedulePublicationStayedStale
+    case schedulePublicationReplayNeedsFreshComposition
     case deltaResourceLimit
     case invalidMutationResponse
 
@@ -1302,6 +1567,9 @@ private enum CanonicalSyncError: LocalizedError {
         case .operationSuperseded: "Canonical sync was cancelled because its configuration changed."
         case .sourceRevisionMismatch: "The scheduler preview never matched the local canonical revision map after three bounded retries."
         case let .invalidPreview(diagnostic): "The scheduler preview was rejected safely: \(diagnostic)"
+        case .invalidSchedulePublication: "The schedule publication journal or server acknowledgment was rejected safely. The exact request remains available for recovery."
+        case .schedulePublicationStayedStale: "Canonical items changed during both bounded publication attempts. No candidate was applied or left pending; sync again to retry."
+        case .schedulePublicationReplayNeedsFreshComposition: "The bounded fresh publication also returned an older exact receipt. No candidate was applied or left pending; sync again to recompose."
         case .deltaResourceLimit: "Canonical sync exceeded the safe 20,000-change or 32 MiB retained-delta limit."
         case .invalidMutationResponse: "The canonical API returned a mutation result with the wrong identity, status, or revision. Local state was not changed."
         }
