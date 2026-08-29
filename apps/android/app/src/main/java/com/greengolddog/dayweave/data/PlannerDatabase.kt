@@ -38,11 +38,12 @@ private object PlannerSnapshotEntityIds {
 object PlannerSnapshotFormats {
     const val JSON_V1 = "json-v1"
     const val JSON_V2 = "json-v2-canonical-execution"
+    const val JSON_V3 = "json-v3-sensitive-items"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -64,6 +65,14 @@ object PlannerDatabaseMigrations {
      * repository migrates each encrypted JSON payload from v1 to the strict v2 contract.
      */
     val MIGRATION_2_3 = object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
+
+    /**
+     * No columns change. The version fence prevents rollback while each encrypted JSON payload is
+     * rewritten from v2 with explicit non-sensitive legacy values into the strict v3 contract.
+     */
+    val MIGRATION_3_4 = object : Migration(3, 4) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
 }
@@ -108,6 +117,7 @@ object PlannerDatabaseFactory {
             .addMigrations(
                 PlannerDatabaseMigrations.MIGRATION_1_2,
                 PlannerDatabaseMigrations.MIGRATION_2_3,
+                PlannerDatabaseMigrations.MIGRATION_3_4,
             )
             .build()
     }

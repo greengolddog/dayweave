@@ -69,6 +69,7 @@ pub enum SplitPolicy {
 #[serde(deny_unknown_fields)]
 pub struct NewItem {
     pub id: Uuid,
+    pub is_sensitive: bool,
     pub kind: ItemKind,
     #[serde(default = "default_status")]
     pub status: ItemStatus,
@@ -97,6 +98,7 @@ pub struct NewItem {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReplaceItem {
+    pub is_sensitive: bool,
     pub kind: ItemKind,
     pub status: ItemStatus,
     pub title: String,
@@ -121,6 +123,7 @@ pub struct ReplaceItem {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 pub struct Item {
     pub id: Uuid,
+    pub is_sensitive: bool,
     pub kind: ItemKind,
     pub status: ItemStatus,
     pub title: String,
@@ -157,6 +160,7 @@ impl Item {
         let input = ItemFields::from(input).validate()?;
         Ok(Self {
             id,
+            is_sensitive: input.is_sensitive,
             kind: input.kind,
             status: input.status,
             title: input.title,
@@ -193,6 +197,7 @@ impl Item {
             .ok_or(ItemDomainError::RevisionOverflow)?;
         Ok(Self {
             id: self.id,
+            is_sensitive: input.is_sensitive,
             kind: input.kind,
             status: input.status,
             title: input.title,
@@ -289,6 +294,7 @@ pub enum ItemDomainError {
 }
 
 struct ItemFields {
+    is_sensitive: bool,
     kind: ItemKind,
     status: ItemStatus,
     title: String,
@@ -382,6 +388,7 @@ impl ItemFields {
 impl From<NewItem> for ItemFields {
     fn from(value: NewItem) -> Self {
         Self {
+            is_sensitive: value.is_sensitive,
             kind: value.kind,
             status: value.status,
             title: value.title,
@@ -404,6 +411,7 @@ impl From<NewItem> for ItemFields {
 impl From<ReplaceItem> for ItemFields {
     fn from(value: ReplaceItem) -> Self {
         Self {
+            is_sensitive: value.is_sensitive,
             kind: value.kind,
             status: value.status,
             title: value.title,

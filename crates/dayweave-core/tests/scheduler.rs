@@ -13,6 +13,7 @@ fn id(value: u128) -> ItemId {
 fn item(value: u128, title: &str, minutes: u32) -> WorkItem {
     WorkItem {
         id: id(value),
+        is_sensitive: false,
         revision: 1,
         title: title.to_owned(),
         kind: ItemKind::Task,
@@ -66,6 +67,25 @@ fn planned<'a>(plan: &'a SchedulePlan, item: &WorkItem) -> Vec<&'a ScheduleBlock
 }
 
 #[test]
+fn sensitivity_is_output_metadata_and_never_changes_placement() {
+    let ordinary = item(9_001, "SYNTHETIC-SENSITIVE-SCHEDULER-CANARY", 60);
+    let mut sensitive = ordinary.clone();
+    sensitive.is_sensitive = true;
+
+    let ordinary_plan = Scheduler.plan(&request(vec![ordinary])).unwrap();
+    let sensitive_plan = Scheduler.plan(&request(vec![sensitive])).unwrap();
+    assert_eq!(ordinary_plan.blocks.len(), 1);
+    assert_eq!(sensitive_plan.blocks.len(), 1);
+    assert_eq!(
+        ordinary_plan.blocks[0].start,
+        sensitive_plan.blocks[0].start
+    );
+    assert_eq!(ordinary_plan.blocks[0].end, sensitive_plan.blocks[0].end);
+    assert!(!ordinary_plan.blocks[0].is_sensitive);
+    assert!(sensitive_plan.blocks[0].is_sensitive);
+}
+
+#[test]
 fn hard_deadline_precedes_higher_priority_work_when_capacity_is_tight() {
     let mut important = item(1, "Important but later", 60);
     important.priority = Priority {
@@ -106,6 +126,7 @@ fn fixed_meeting_splits_flexible_work_into_valid_sessions() {
     };
     let meeting = WorkItem {
         id: id(11),
+        is_sensitive: false,
         revision: 1,
         title: "Meeting".to_owned(),
         kind: ItemKind::CalendarEvent(CalendarEventSpec {
@@ -390,7 +411,8 @@ fn pinned_and_fixed_overlap_stays_visible_as_an_error() {
     }];
     input.fixed_blocks = vec![FixedBlock {
         id: Uuid::from_u128(81),
-        title: "Fixed meeting".to_owned(),
+        is_sensitive: true,
+        title: "SYNTHETIC-SENSITIVE-FIXED-BLOCK".to_owned(),
         start: DAY + Duration::hours(9) + Duration::minutes(30),
         end: DAY + Duration::hours(10) + Duration::minutes(30),
         source: FixedBlockSource::GoogleCalendar,
@@ -410,6 +432,13 @@ fn pinned_and_fixed_overlap_stays_visible_as_an_error() {
         plan.blocks
             .iter()
             .any(|block| block.kind == ScheduleBlockKind::ExternalFixed)
+    );
+    assert!(
+        plan.blocks
+            .iter()
+            .find(|block| block.kind == ScheduleBlockKind::ExternalFixed)
+            .expect("external fixed block")
+            .is_sensitive
     );
 }
 

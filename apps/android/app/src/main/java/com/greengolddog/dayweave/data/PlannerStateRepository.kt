@@ -2,7 +2,14 @@ package com.greengolddog.dayweave.data
 
 import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 interface PlannerStateRepository {
     suspend fun load(): DayWeaveUiState?
@@ -28,7 +35,12 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V2 -> SNAPSHOT_JSON.decodeFromString(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V3 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V2 -> {
+                val migrated = LEGACY_SNAPSHOT_JSON.decodeFromString<DayWeaveUiState>(snapshot.payload)
+                save(migrated)
+                migrated
+            }
             PlannerSnapshotFormats.JSON_V1 -> {
                 val migrated = LEGACY_SNAPSHOT_JSON.decodeFromString<DayWeaveUiState>(snapshot.payload)
                 save(migrated)
@@ -44,9 +56,28 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(state),
                 updatedAtEpochMillis = nowEpochMillis(),
-                payloadFormat = PlannerSnapshotFormats.JSON_V2,
+                payloadFormat = PlannerSnapshotFormats.JSON_V3,
             ),
         )
+    }
+
+    private fun decodeCurrentSnapshot(payload: String): DayWeaveUiState {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        requireExplicitSensitivity(root, "schedule")
+        requireExplicitSensitivity(root, "canonicalItems")
+        return SNAPSHOT_JSON.decodeFromJsonElement(root)
+    }
+
+    private fun requireExplicitSensitivity(root: JsonObject, collection: String) {
+        val entries = root[collection]?.jsonArray ?: return
+        entries.forEachIndexed { index, entry ->
+            val value = entry.jsonObject["isSensitive"]?.jsonPrimitive?.booleanOrNull
+            if (value == null) {
+                throw SerializationException(
+                    "$collection[$index].isSensitive is required by the current snapshot contract",
+                )
+            }
+        }
     }
 
     private companion object {

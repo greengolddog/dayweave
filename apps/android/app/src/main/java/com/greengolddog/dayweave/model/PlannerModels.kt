@@ -88,6 +88,8 @@ data class EffectiveEnergySignal(
 @Serializable
 data class ScheduleItem(
     val id: String,
+    /** Effective sensitivity after canonical ancestor propagation. */
+    val isSensitive: Boolean = false,
     val title: String,
     val kind: ItemKind,
     val startMinute: Int,
@@ -158,6 +160,8 @@ data class ScheduleItem(
 @Serializable
 data class CanonicalItemSnapshot(
     val id: String,
+    /** Own sensitivity from the canonical item wire contract. */
+    val isSensitive: Boolean = false,
     val kind: String,
     val status: String,
     val title: String,

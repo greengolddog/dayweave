@@ -83,6 +83,7 @@ pub enum EnergyInput {
 #[serde(deny_unknown_fields)]
 pub struct FixedBlockInput {
     pub id: Uuid,
+    pub is_sensitive: bool,
     pub title: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
@@ -230,6 +231,7 @@ struct SchedulePlanOutput<'a> {
 #[derive(Serialize)]
 struct ScheduleBlockOutput<'a> {
     id: Uuid,
+    is_sensitive: bool,
     item_id: Option<ItemId>,
     occurrence_id: Option<OccurrenceId>,
     external_block_id: Option<Uuid>,
@@ -247,6 +249,7 @@ impl<'a> TryFrom<&'a dayweave_core::ScheduleBlock> for ScheduleBlockOutput<'a> {
     fn try_from(block: &'a dayweave_core::ScheduleBlock) -> Result<Self, Self::Error> {
         Ok(Self {
             id: block.id,
+            is_sensitive: block.is_sensitive,
             item_id: block.item_id,
             occurrence_id: block.occurrence_id,
             external_block_id: block.external_block_id,
@@ -323,6 +326,7 @@ impl TryFrom<&dayweave_core::Occurrence> for OccurrenceOutput {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, ToSchema)]
 pub struct RejectedScheduleItem {
     pub item_id: Uuid,
+    pub is_sensitive: bool,
     pub title: String,
     pub reason: String,
 }
@@ -397,13 +401,16 @@ fn compose_items(
         .iter()
         .map(|item| (item.id, item.revision))
         .collect();
+    let effective_sensitivity = effective_sensitivity_by_item(&source_items);
     let mut rejected_items = Vec::new();
     let mut accepted = Vec::with_capacity(source_items.len());
     for item in source_items {
-        match map_item(&item) {
+        let is_sensitive = effective_sensitivity.get(&item.id).copied().unwrap_or(true);
+        match map_item(&item, is_sensitive) {
             Ok(mapped) => accepted.push(mapped),
             Err(reason) => rejected_items.push(RejectedScheduleItem {
                 item_id: item.id,
+                is_sensitive,
                 title: item.title,
                 reason,
             }),
@@ -468,6 +475,42 @@ fn compose_items(
         ignored_previous_assignments,
         plan: Rfc3339SchedulePlan(plan),
     })
+}
+
+/// Resolves effective sensitivity over the already-validated canonical tree.
+/// Missing ancestors or a corrupted cycle fail closed without affecting the
+/// scheduler's placement inputs.
+fn effective_sensitivity_by_item(items: &[Item]) -> BTreeMap<Uuid, bool> {
+    fn resolve(
+        id: Uuid,
+        items: &BTreeMap<Uuid, &Item>,
+        resolved: &mut BTreeMap<Uuid, bool>,
+        visiting: &mut BTreeSet<Uuid>,
+    ) -> bool {
+        if let Some(value) = resolved.get(&id) {
+            return *value;
+        }
+        let Some(item) = items.get(&id) else {
+            return true;
+        };
+        if !visiting.insert(id) {
+            return true;
+        }
+        let inherited = item
+            .parent_id
+            .is_some_and(|parent_id| resolve(parent_id, items, resolved, visiting));
+        visiting.remove(&id);
+        let value = item.is_sensitive || inherited;
+        resolved.insert(id, value);
+        value
+    }
+
+    let by_id: BTreeMap<_, _> = items.iter().map(|item| (item.id, item)).collect();
+    let mut resolved = BTreeMap::new();
+    for id in by_id.keys().copied() {
+        resolve(id, &by_id, &mut resolved, &mut BTreeSet::new());
+    }
+    resolved
 }
 
 fn validate_request_shape(request: &ComposeScheduleRequest) -> Result<(), ComposeScheduleError> {
@@ -559,7 +602,7 @@ fn validate_recurrence_context_references(
     Ok(())
 }
 
-fn map_item(item: &Item) -> Result<WorkItem, String> {
+fn map_item(item: &Item, is_sensitive: bool) -> Result<WorkItem, String> {
     let item_timezone: Tz = item
         .timezone_name
         .parse()
@@ -600,6 +643,7 @@ fn map_item(item: &Item) -> Result<WorkItem, String> {
     let split_policy = map_split_policy(&item.split_policy, &metadata);
     Ok(WorkItem {
         id: ItemId(item.id),
+        is_sensitive,
         revision: item.revision,
         title: item.title.clone(),
         kind,
@@ -810,6 +854,7 @@ fn prune_orphaned_items(items: &mut Vec<WorkItem>, rejected: &mut Vec<RejectedSc
             }
             rejected.push(RejectedScheduleItem {
                 item_id: item.id.0,
+                is_sensitive: item.is_sensitive,
                 title: item.title.clone(),
                 reason: format!("parent {parent_id} is unavailable for scheduling"),
             });
@@ -896,6 +941,7 @@ fn map_fixed_block(
 ) -> Result<FixedBlock, ComposeScheduleError> {
     Ok(FixedBlock {
         id: input.id,
+        is_sensitive: input.is_sensitive,
         title: input.title,
         start: to_time_in_timezone(input.start, timezone)?,
         end: to_time_in_timezone(input.end, timezone)?,
@@ -1113,6 +1159,7 @@ mod tests {
     fn canonical_item(id: Uuid) -> Item {
         Item {
             id,
+            is_sensitive: false,
             kind: ItemKind::Task,
             status: ItemStatus::Planned,
             title: "Write schedule bridge".into(),
@@ -1237,7 +1284,7 @@ mod tests {
                 "source_calendar_id": "primary"
             }
         });
-        let mapped = map_item(&item).unwrap();
+        let mapped = map_item(&item, item.is_sensitive).unwrap();
         let PlanningItemKind::CalendarEvent(event) = mapped.kind else {
             panic!("expected calendar event");
         };
@@ -1263,7 +1310,7 @@ mod tests {
                 }]
             }
         });
-        let mapped = map_item(&item).unwrap();
+        let mapped = map_item(&item, item.is_sensitive).unwrap();
         assert_eq!(mapped.constraints.earliest_start.unwrap().value.hour(), 8);
 
         let item_id = item.id.to_string();
@@ -1287,6 +1334,7 @@ mod tests {
                 }]
             }
         });
-        assert!(map_item(&invalid).is_err());
+        let sensitivity = invalid.is_sensitive;
+        assert!(map_item(&invalid, sensitivity).is_err());
     }
 }

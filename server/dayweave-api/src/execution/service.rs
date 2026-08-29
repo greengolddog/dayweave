@@ -251,6 +251,7 @@ mod tests {
             .create(
                 NewItem {
                     id: item_id,
+                    is_sensitive: false,
                     kind: ItemKind::Task,
                     status: ItemStatus::Planned,
                     title: "Write".to_owned(),

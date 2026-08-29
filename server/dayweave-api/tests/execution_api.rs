@@ -62,6 +62,7 @@ async fn body_json(response: Response<Body>) -> Value {
 fn item(id: Uuid) -> Value {
     json!({
         "id": id,
+        "is_sensitive": false,
         "kind": "task",
         "status": "planned",
         "title": "Canonical timer task",

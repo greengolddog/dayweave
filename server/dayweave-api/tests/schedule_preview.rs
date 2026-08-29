@@ -62,6 +62,7 @@ async fn body_json(response: Response<Body>) -> Value {
 fn task(id: Uuid, constraints: &Value) -> Value {
     json!({
         "id": id,
+        "is_sensitive": false,
         "kind": "task",
         "status": "planned",
         "title": "Compose the day",
@@ -221,4 +222,101 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn sensitive_ancestor_marks_child_preview_blocks_without_moving_them() {
+    let app = test_app();
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let mut parent = task(parent_id, &json!({}));
+    parent["kind"] = json!("goal");
+    parent["title"] = json!("SYNTHETIC-SENSITIVE-PARENT-CANARY");
+    parent["duration_seconds"] = Value::Null;
+    parent["deadline_at"] = Value::Null;
+    parent["is_sensitive"] = json!(true);
+    let mut child = task(
+        child_id,
+        &json!({"energy": "deep", "preferred_start_minute": 540}),
+    );
+    child["title"] = json!("SYNTHETIC-SENSITIVE-CHILD-CANARY");
+    child["parent_id"] = json!(parent_id);
+
+    for (body, key) in [
+        (parent, "sensitive-preview-parent"),
+        (child, "sensitive-preview-child"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request("POST", "/v1/items", Some(body), true, Some(key)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(preview(child_id, 1)),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    let block = &response["plan"]["blocks"][0];
+    assert_eq!(block["item_id"], child_id.to_string());
+    assert_eq!(block["is_sensitive"], true);
+    assert_eq!(block["start"], "2026-09-01T09:00:00+02:00");
+}
+
+#[tokio::test]
+async fn sensitive_fixed_block_is_required_and_preserved_in_preview() {
+    let app = test_app();
+    let canary_id = Uuid::new_v4();
+    let mut body = preview(Uuid::new_v4(), 1);
+    body["previous_assignments"] = json!([]);
+    body["fixed_blocks"] = json!([{
+        "id": canary_id,
+        "is_sensitive": true,
+        "title": "SYNTHETIC-SENSITIVE-FIXED-PREVIEW-CANARY",
+        "start": "2026-09-01T08:00:00Z",
+        "end": "2026-09-01T09:00:00Z",
+        "source": "google_calendar"
+    }]);
+
+    let response = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(body.clone()),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = body_json(response).await;
+    let block = &response["plan"]["blocks"][0];
+    assert_eq!(block["external_block_id"], canary_id.to_string());
+    assert_eq!(block["is_sensitive"], true);
+
+    body["fixed_blocks"][0]
+        .as_object_mut()
+        .expect("fixed block object")
+        .remove("is_sensitive");
+    let missing = app
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(body),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
 }

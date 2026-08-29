@@ -240,6 +240,138 @@ async fn postgres_items_are_atomic_isolated_hierarchical_and_delta_synced() {
     test_database.destroy().await;
 }
 
+#[tokio::test]
+async fn sensitive_item_migration_backfills_historical_json_contracts() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; sensitivity migration test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 9) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-sensitivity migration applies");
+    }
+    let scope = seed_scope(pool, "sensitivity-migration-owner", "sensitivity-migration").await;
+    let item_id = Uuid::new_v4();
+    let historical_canary = "SYNTHETIC-SENSITIVE-MIGRATION-CANARY";
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, title, sibling_order) \
+         VALUES ($1, $2, $3, 'task', $4, 0)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(historical_canary)
+    .execute(pool)
+    .await
+    .unwrap();
+    let historical_response = json!({
+        "id": item_id,
+        "title": historical_canary,
+        "revision": 1,
+    });
+    sqlx::query(
+        "INSERT INTO item_changes (workspace_id, item_id, item_revision, change_kind, payload) \
+         VALUES ($1, $2, 1, 'upsert', $3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(&historical_response)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO idempotency_keys (workspace_id, namespace, key_hash, request_fingerprint, \
+         state, resource_type, resource_id, response_json, expires_at) \
+         VALUES ($1, 'items.create', $2, $3, 'completed', 'item', $4, $5, \
+         clock_timestamp() + interval '1 hour')",
+    )
+    .bind(scope.workspace_id)
+    .bind([7_u8; 32].as_slice())
+    .bind([8_u8; 32].as_slice())
+    .bind(item_id)
+    .bind(&historical_response)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 9)
+        .expect("sensitivity migration is embedded");
+    pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect("sensitivity migration applies");
+
+    let stored_flag: bool = sqlx::query_scalar("SELECT is_sensitive FROM items WHERE id = $1")
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let change_flag: bool = sqlx::query_scalar(
+        "SELECT (payload ->> 'is_sensitive')::boolean FROM item_changes WHERE item_id = $1",
+    )
+    .bind(item_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let replay_flag: bool = sqlx::query_scalar(
+        "SELECT (response_json ->> 'is_sensitive')::boolean FROM idempotency_keys \
+         WHERE workspace_id = $1 AND namespace = 'items.create'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!stored_flag && !change_flag && !replay_flag);
+    assert_sensitive_json_constraints(pool, scope, item_id).await;
+
+    test_database.destroy().await;
+}
+
+async fn assert_sensitive_json_constraints(pool: &PgPool, scope: DatabaseScope, item_id: Uuid) {
+    let change_error = sqlx::query(
+        "INSERT INTO item_changes (workspace_id, item_id, item_revision, change_kind, payload) \
+         VALUES ($1, $2, 2, 'upsert', $3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(json!({"id": item_id, "title": "SYNTHETIC-MISSING-SENSITIVITY-CANARY"}))
+    .execute(pool)
+    .await
+    .expect_err("a current upsert snapshot without sensitivity must fail closed");
+    assert_eq!(
+        change_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("item_changes_upsert_sensitivity_check")
+    );
+
+    let replay_error = sqlx::query(
+        "INSERT INTO idempotency_keys (workspace_id, namespace, key_hash, request_fingerprint, \
+         state, resource_type, resource_id, response_json, expires_at) \
+         VALUES ($1, 'items.replace', $2, $3, 'completed', 'item', $4, $5, \
+         clock_timestamp() + interval '1 hour')",
+    )
+    .bind(scope.workspace_id)
+    .bind([9_u8; 32].as_slice())
+    .bind([10_u8; 32].as_slice())
+    .bind(item_id)
+    .bind(json!({"id": item_id, "title": "SYNTHETIC-MISSING-REPLAY-SENSITIVITY-CANARY"}))
+    .execute(pool)
+    .await
+    .expect_err("a completed current item replay without sensitivity must fail closed");
+    assert_eq!(
+        replay_error
+            .as_database_error()
+            .and_then(|error| error.constraint()),
+        Some("idempotency_item_response_sensitivity_check")
+    );
+}
+
 fn new_item(
     id: Uuid,
     title: &str,
@@ -249,6 +381,7 @@ fn new_item(
 ) -> NewItem {
     NewItem {
         id,
+        is_sensitive: false,
         kind,
         status: ItemStatus::Planned,
         title: title.to_owned(),
@@ -276,6 +409,7 @@ fn replacement(
     status: ItemStatus,
 ) -> ReplaceItem {
     ReplaceItem {
+        is_sensitive: item.is_sensitive,
         kind: item.kind,
         status,
         title: item.title.clone(),

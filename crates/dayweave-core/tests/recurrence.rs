@@ -13,6 +13,7 @@ fn id(value: u128) -> ItemId {
 fn recurring_item(value: u128, recurrence: Recurrence) -> WorkItem {
     WorkItem {
         id: id(value),
+        is_sensitive: false,
         revision: 1,
         title: format!("Recurring {value}"),
         kind: ItemKind::RecurringTask(RecurringTaskSpec { recurrence }),

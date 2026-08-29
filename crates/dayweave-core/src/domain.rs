@@ -412,6 +412,9 @@ pub enum RecurrenceSemantics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: ItemId,
+    /// Effective sensitivity after ancestor propagation. It is metadata only
+    /// and must never influence placement or scoring.
+    pub is_sensitive: bool,
     /// Monotonic entity revision used by offline sync conflict handling.
     pub revision: u64,
     pub title: String,
@@ -690,6 +693,8 @@ pub struct AvailabilityWindow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FixedBlock {
     pub id: Uuid,
+    /// Privacy classification supplied by the fixed block's owning source.
+    pub is_sensitive: bool,
     pub title: String,
     #[serde(with = "time::serde::rfc3339")]
     pub start: OffsetDateTime,

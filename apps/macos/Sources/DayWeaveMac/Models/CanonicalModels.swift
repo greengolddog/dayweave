@@ -1,5 +1,12 @@
 import Foundation
 
+extension CodingUserInfoKey {
+    /// Used only while decoding authenticated planner snapshots from schemas 1...4.
+    static let dayWeaveAllowsMissingSensitivity = CodingUserInfoKey(
+        rawValue: "com.greengolddog.dayweave.allows-missing-sensitivity"
+    )!
+}
+
 enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {
     case event, task, habit, routine, goal, breakTime
     case unknown(String)
@@ -140,6 +147,7 @@ enum DayWeaveSplitPolicy: Codable, Equatable, Sendable {
 
 struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     let id: UUID
+    var isSensitive: Bool
     var kind: DayWeaveCanonicalItemKind
     var status: DayWeaveCanonicalItemStatus
     var title: String
@@ -172,6 +180,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case id, kind, status, title, notes, recurrence, importance, urgency, revision
+        case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
         case durationSeconds = "duration_seconds"
         case deadlineAt = "deadline_at"
@@ -191,6 +200,11 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
+        if decoder.userInfo[.dayWeaveAllowsMissingSensitivity] as? Bool == true {
+            isSensitive = try container.decodeIfPresent(Bool.self, forKey: .isSensitive) ?? false
+        } else {
+            isSensitive = try container.decode(Bool.self, forKey: .isSensitive)
+        }
         kind = try container.decode(DayWeaveCanonicalItemKind.self, forKey: .kind)
         status = try container.decode(DayWeaveCanonicalItemStatus.self, forKey: .status)
         title = try container.decode(String.self, forKey: .title)
@@ -241,6 +255,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     func encode(to encoder: any Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(id, forKey: .id)
+        try container.encode(isSensitive, forKey: .isSensitive)
         try container.encode(kind, forKey: .kind)
         try container.encode(status, forKey: .status)
         try container.encode(title, forKey: .title)
@@ -288,6 +303,7 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
 }
 
 struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
+    var isSensitive: Bool
     var kind: DayWeaveCanonicalItemKind
     var status: DayWeaveCanonicalItemStatus
     var title: String
@@ -307,6 +323,7 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case kind, status, title, notes, recurrence, importance, urgency
+        case isSensitive = "is_sensitive"
         case timezoneName = "timezone_name"
         case durationSeconds = "duration_seconds"
         case deadlineAt = "deadline_at"
@@ -318,6 +335,7 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
     }
 
     init(item: DayWeaveCanonicalItem, status: DayWeaveCanonicalItemStatus? = nil) {
+        isSensitive = item.isSensitive
         kind = item.kind
         self.status = status ?? item.status
         title = item.title
@@ -337,6 +355,7 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
     }
 
     init(
+        isSensitive: Bool = false,
         kind: DayWeaveCanonicalItemKind,
         status: DayWeaveCanonicalItemStatus,
         title: String,
@@ -353,6 +372,7 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         parentID: UUID? = nil,
         siblingOrder: UInt32 = 0
     ) {
+        self.isSensitive = isSensitive
         self.kind = kind
         self.status = status
         self.title = title
@@ -390,6 +410,7 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
             )
         }
         var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(isSensitive, forKey: .isSensitive)
         try container.encode(kind, forKey: .kind)
         try container.encode(status, forKey: .status)
         try container.encode(title, forKey: .title)
@@ -539,6 +560,20 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
         }
     }
 
+    struct FixedBlock: Encodable, Equatable, Sendable {
+        let id: UUID
+        let isSensitive: Bool
+        let title: String
+        let start: Date
+        let end: Date
+        let source: String
+
+        private enum CodingKeys: String, CodingKey {
+            case id, title, start, end, source
+            case isSensitive = "is_sensitive"
+        }
+    }
+
     struct PreviousAssignment: Encodable, Equatable, Sendable {
         struct Block: Encodable, Equatable, Sendable {
             let start: Date
@@ -569,6 +604,7 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
     let horizonEnd: Date
     let timezoneName: String
     let availability: [Availability]
+    let fixedBlocks: [FixedBlock]
     let previousAssignments: [PreviousAssignment]
     let config: Configuration
     let recurrenceContext: [String: JSONValue]
@@ -579,6 +615,7 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
         case horizonStart = "horizon_start"
         case horizonEnd = "horizon_end"
         case timezoneName = "timezone_name"
+        case fixedBlocks = "fixed_blocks"
         case previousAssignments = "previous_assignments"
         case recurrenceContext = "recurrence_context"
     }
@@ -587,11 +624,13 @@ struct DayWeaveSchedulePreviewRequest: Encodable, Equatable, Sendable {
 struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
     struct RejectedItem: Decodable, Equatable, Sendable {
         let itemID: UUID
+        let isSensitive: Bool
         let title: String
         let reason: String
         private enum CodingKeys: String, CodingKey {
             case title, reason
             case itemID = "item_id"
+            case isSensitive = "is_sensitive"
         }
     }
 
@@ -615,6 +654,7 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
                 let message: String
             }
             let id: UUID
+            let isSensitive: Bool
             let itemID: UUID?
             let occurrenceID: UUID?
             let externalBlockID: UUID?
@@ -626,6 +666,7 @@ struct DayWeaveSchedulePreview: Decodable, Equatable, Sendable {
             let explanations: [Explanation]
             private enum CodingKeys: String, CodingKey {
                 case id, title, start, end, kind, explanations
+                case isSensitive = "is_sensitive"
                 case itemID = "item_id"
                 case occurrenceID = "occurrence_id"
                 case externalBlockID = "external_block_id"

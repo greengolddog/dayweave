@@ -12,7 +12,7 @@ use crate::items::{
 
 use super::DatabaseScope;
 
-const ITEM_SELECT: &str = "SELECT item.id, item.kind, item.status, item.title, item.notes, item.timezone_name, \
+const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
      item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
      item.scheduling_constraints, item.split_allowed, item.minimum_chunk_seconds, \
      item.maximum_chunk_seconds, item.importance, item.urgency, item.revision, \
@@ -411,16 +411,17 @@ async fn insert_item(
 ) -> Result<(), ItemRepositoryError> {
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
     let result = sqlx::query(
-        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, notes, \
+        "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
          timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, \
          scheduling_constraints, split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, \
          importance, urgency, revision, created_at, updated_at, completed_at, trashed_at, \
          tombstoned_at, sibling_order) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
-         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $23, $24)",
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $24, $25)",
     )
     .bind(item.id)
     .bind(scope.workspace_id)
     .bind(scope.user_id)
+    .bind(item.is_sensitive)
     .bind(kind_name(item.kind))
     .bind(status_name(item.status))
     .bind(&item.title)
@@ -461,15 +462,16 @@ async fn update_item(
 ) -> Result<(), ItemRepositoryError> {
     let (split_allowed, minimum_chunk, maximum_chunk) = split_columns(&item.split_policy);
     sqlx::query(
-        "UPDATE items SET kind = $3, status = $4, title = $5, notes = $6, timezone_name = $7, \
-         duration_seconds = $8, deadline_at = $9, earliest_start_at = $10, recurrence = $11, \
-         scheduling_constraints = $12, split_allowed = $13, minimum_chunk_seconds = $14, \
-         maximum_chunk_seconds = $15, importance = $16, urgency = $17, revision = $18, \
-         updated_at = $19, completed_at = $20, trashed_at = $21, tombstoned_at = $21, \
-         sibling_order = $22 WHERE workspace_id = $1 AND id = $2",
+        "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
+         duration_seconds = $9, deadline_at = $10, earliest_start_at = $11, recurrence = $12, \
+         scheduling_constraints = $13, split_allowed = $14, minimum_chunk_seconds = $15, \
+         maximum_chunk_seconds = $16, importance = $17, urgency = $18, revision = $19, \
+         updated_at = $20, completed_at = $21, trashed_at = $22, tombstoned_at = $22, \
+         sibling_order = $23 WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
     .bind(item.id)
+    .bind(item.is_sensitive)
     .bind(kind_name(item.kind))
     .bind(status_name(item.status))
     .bind(&item.title)
@@ -862,6 +864,7 @@ fn item_from_row(row: &PgRow) -> Result<Item, ItemRepositoryError> {
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
     Ok(Item {
         id: row.try_get("id").map_err(internal)?,
+        is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
         kind: parse_kind(&row.try_get::<String, _>("kind").map_err(internal)?)?,
         status: parse_status(&row.try_get::<String, _>("status").map_err(internal)?)?,
         title: row.try_get("title").map_err(internal)?,

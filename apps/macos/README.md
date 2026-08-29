@@ -67,10 +67,11 @@ The same authenticated configuration powers canonical planner sync. A sync:
 
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
-live in the schema-v3 AES-GCM encrypted planner snapshot. Schema-v1/v2 snapshots
-are migrated once; older binaries reject schema v3 instead of rewriting away
-new state. A sibling-file lock and ciphertext compare-and-swap revision stop a
-second app process from silently overwriting a newer snapshot. Unknown future
+live in the schema-v5 AES-GCM encrypted planner snapshot. Schema-v1 through v4
+snapshots are migrated once with explicit legacy sensitivity defaults; older
+binaries reject schema v5 instead of rewriting away new state. A sibling-file
+lock and ciphertext compare-and-swap revision stop a second app process from
+silently overwriting a newer snapshot. Unknown future
 item fields and nested split-policy fields are
 retained and make that item read-only instead of being silently discarded.
 Decoded arbitrary JSON numbers are conservatively marked as server-originated,

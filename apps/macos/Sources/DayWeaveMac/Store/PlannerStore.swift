@@ -647,6 +647,20 @@ final class PlannerStore: ObservableObject {
         canonicalItems.first(where: { $0.id == id })
     }
 
+    /// Resolves inherited sensitivity and fails closed for a missing or cyclic ancestor.
+    private func effectiveSensitivity(itemID: UUID) -> Bool {
+        let items = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        var visited = Set<UUID>()
+        var currentID: UUID? = itemID
+        var sensitive = false
+        while let id = currentID {
+            guard visited.insert(id).inserted, let item = items[id] else { return true }
+            sensitive = sensitive || item.isSensitive
+            currentID = item.parentID
+        }
+        return sensitive
+    }
+
     @discardableResult
     func quickAdd(title: String, kind: PlannerItemKind, minutes: Int) -> Bool {
         guard canMutatePlan,
@@ -1105,6 +1119,7 @@ final class PlannerStore: ObservableObject {
                     let duration = max(60, TimeInterval(item?.durationSeconds ?? 60))
                     let placeholder = ScheduleBlock(
                         id: active.id,
+                        isSensitive: item.map { effectiveSensitivity(itemID: $0.id) } ?? true,
                         title: item?.title ?? "Remote focus session",
                         kind: item.map { Self.plannerKind(for: $0.kind) } ?? .task,
                         start: active.startedAt,

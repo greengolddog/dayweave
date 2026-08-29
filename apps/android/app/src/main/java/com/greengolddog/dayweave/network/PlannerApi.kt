@@ -24,6 +24,7 @@ import okhttp3.Response
 @Serializable
 data class RemoteCanonicalItem(
     val id: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
     val kind: String,
     val status: String,
     val title: String,
@@ -71,6 +72,7 @@ data class RemoteItemDeltaPage(
 
 @Serializable
 data class CanonicalItemReplacement(
+    @SerialName("is_sensitive") val isSensitive: Boolean,
     val kind: String,
     val status: String,
     val title: String,
@@ -130,13 +132,24 @@ data class ScheduleConfigRequest(
 )
 
 @Serializable
+data class FixedScheduleBlockRequest(
+    val id: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
+    val title: String,
+    val start: String,
+    val end: String,
+    val source: String,
+)
+
+@Serializable
 data class SchedulePreviewRequest(
     @SerialName("as_of") val asOf: String,
     @SerialName("horizon_start") val horizonStart: String,
     @SerialName("horizon_end") val horizonEnd: String,
     @SerialName("timezone_name") val timezoneName: String,
     val availability: List<ScheduleAvailabilityRequest>,
-    @SerialName("fixed_blocks") val fixedBlocks: List<JsonObject> = emptyList(),
+    @SerialName("fixed_blocks")
+    val fixedBlocks: List<FixedScheduleBlockRequest> = emptyList(),
     @SerialName("previous_assignments")
     val previousAssignments: List<PreviousScheduleAssignmentRequest> = emptyList(),
     val config: ScheduleConfigRequest = ScheduleConfigRequest(),
@@ -146,6 +159,7 @@ data class SchedulePreviewRequest(
 @Serializable
 data class RemoteRejectedScheduleItem(
     @SerialName("item_id") val itemId: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
     val title: String,
     val reason: String,
 )
@@ -153,6 +167,7 @@ data class RemoteRejectedScheduleItem(
 @Serializable
 data class RemoteScheduleBlock(
     val id: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
     @SerialName("item_id") val itemId: String? = null,
     @SerialName("occurrence_id") val occurrenceId: String? = null,
     @SerialName("external_block_id") val externalBlockId: String? = null,

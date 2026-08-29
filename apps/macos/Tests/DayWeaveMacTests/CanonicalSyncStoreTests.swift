@@ -475,6 +475,127 @@ struct CanonicalSyncStoreTests {
         #expect(!planner.canMutate(staleBlock))
     }
 
+    @Test("preview sensitivity downgrade fails closed without replacing the prior plan")
+    func testPreviewSensitivityDowngradeKeepsPriorPlan() async throws {
+        let token = "canonical-sensitivity-downgrade-token"
+        let itemID = UUID(uuidString: "24600000-2222-4333-8444-200000000000")!
+        let blockID = UUID(uuidString: "24600000-2222-4333-8444-200000000001")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(
+            Self.itemObject(id: itemID, revision: 1, isSensitive: true)
+        )
+        var priorBlock = Self.block(
+            itemID: itemID,
+            revision: 1,
+            start: now.addingTimeInterval(3_600)
+        )
+        priorBlock.isSensitive = true
+        priorBlock.title = "SYNTHETIC-SENSITIVE-PRIOR-PLAN-MACOS"
+        let planner = PlannerStore(
+            blocks: [priorBlock],
+            canonicalItems: [item],
+            canonicalDeltaCursor: "sensitivity-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            schedulePreviewProvenance: Self.provenance(now: now),
+            previewValidatedForCurrentLaunch: true,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"sensitivity-after","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(
+                    Self.previewObject(
+                        itemID: itemID,
+                        blockID: blockID,
+                        itemIsSensitive: false
+                    ).utf8
+                )
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(sync.status.isFailure)
+        #expect(sync.lastPreview == nil)
+        #expect(planner.blocks == [priorBlock])
+        #expect(planner.blocks[0].isSensitive)
+    }
+
+    @Test("preview must return every intersecting fixed block")
+    func testPreviewRequiresCompleteFixedBlockCoverage() throws {
+        let horizonStart = Date(timeIntervalSince1970: 1_788_033_600)
+        let intersectingID = UUID(uuidString: "24600000-2222-4333-8444-200000000010")!
+        let outsideID = UUID(uuidString: "24600000-2222-4333-8444-200000000011")!
+        let request = DayWeaveSchedulePreviewRequest(
+            asOf: horizonStart,
+            horizonStart: horizonStart,
+            horizonEnd: horizonStart.addingTimeInterval(3_600),
+            timezoneName: "UTC",
+            availability: [],
+            fixedBlocks: [
+                .init(
+                    id: intersectingID,
+                    isSensitive: true,
+                    title: "SYNTHETIC-INTERSECTING-FIXED-CANARY",
+                    start: horizonStart.addingTimeInterval(600),
+                    end: horizonStart.addingTimeInterval(1_200),
+                    source: "google_calendar"
+                ),
+                .init(
+                    id: outsideID,
+                    isSensitive: false,
+                    title: "SYNTHETIC-OUTSIDE-FIXED-CANARY",
+                    start: horizonStart.addingTimeInterval(7_200),
+                    end: horizonStart.addingTimeInterval(7_800),
+                    source: "manual"
+                ),
+            ],
+            previousAssignments: [],
+            config: .init(
+                slotGranularityMinutes: 5,
+                stabilityWeight: 4,
+                defaultSoftWeight: 100
+            ),
+            recurrenceContext: [:]
+        )
+
+        #expect(throws: (any Error).self) {
+            try CanonicalSyncStore.validateFixedBlockCoverage(
+                returnedExternalBlockIDs: [],
+                request: request
+            )
+        }
+        try CanonicalSyncStore.validateFixedBlockCoverage(
+            returnedExternalBlockIDs: [intersectingID],
+            request: request
+        )
+        let duplicateRequest = DayWeaveSchedulePreviewRequest(
+            asOf: request.asOf,
+            horizonStart: request.horizonStart,
+            horizonEnd: request.horizonEnd,
+            timezoneName: request.timezoneName,
+            availability: request.availability,
+            fixedBlocks: [request.fixedBlocks[0], request.fixedBlocks[0]],
+            previousAssignments: request.previousAssignments,
+            config: request.config,
+            recurrenceContext: request.recurrenceContext
+        )
+        #expect(throws: (any Error).self) {
+            try CanonicalSyncStore.validateFixedBlockCoverage(
+                returnedExternalBlockIDs: [intersectingID],
+                request: duplicateRequest
+            )
+        }
+    }
+
     @Test("canonical hierarchy order is transitive and deterministic")
     func testHierarchyOrdering() throws {
         let parentID = UUID(uuidString: "25000000-2222-4333-8444-200000000000")!
@@ -890,11 +1011,12 @@ struct CanonicalSyncStoreTests {
         status: String = "scheduled",
         parentID: UUID? = nil,
         siblingOrder: UInt32 = 0,
+        isSensitive: Bool = false,
         splitPolicy: String = #"{"type":"indivisible"}"#
     ) -> String {
         let parent = parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"
         return """
-        {"id":"\(id.uuidString.lowercased())","kind":"task","status":"\(status)",
+        {"id":"\(id.uuidString.lowercased())","is_sensitive":\(isSensitive),"kind":"task","status":"\(status)",
          "title":"Write launch plan","notes":"Private local notes","timezone_name":"Europe/Madrid",
          "duration_seconds":2700,"deadline_at":null,"earliest_start_at":null,"recurrence":null,
          "flexible_constraints":{"energy":"deep"},"split_policy":\(splitPolicy),
@@ -904,7 +1026,11 @@ struct CanonicalSyncStoreTests {
         """
     }
 
-    private static func previewObject(itemID: UUID, blockID: UUID) -> String {
+    private static func previewObject(
+        itemID: UUID,
+        blockID: UUID,
+        itemIsSensitive: Bool = false
+    ) -> String {
         let asOf = Date(timeIntervalSince1970: 1_787_990_400)
         let calendar = Calendar.autoupdatingCurrent
         let horizonStart = calendar.startOfDay(for: asOf)
@@ -918,7 +1044,7 @@ struct CanonicalSyncStoreTests {
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
            "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
            "horizon_end":"\(wireTimestamp(horizonEnd))","blocks":[{
-             "id":"\(blockID.uuidString.lowercased())","item_id":"\(itemID.uuidString.lowercased())",
+             "id":"\(blockID.uuidString.lowercased())","is_sensitive":\(itemIsSensitive),"item_id":"\(itemID.uuidString.lowercased())",
              "occurrence_id":null,"external_block_id":null,"title":"Write launch plan",
              "start":"\(wireTimestamp(blockStart))","end":"\(wireTimestamp(blockEnd))",
              "session_index":0,"kind":"planned","explanations":[

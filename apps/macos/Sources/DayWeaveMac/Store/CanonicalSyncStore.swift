@@ -330,6 +330,18 @@ final class CanonicalSyncStore: ObservableObject {
         func sameInstant(_ left: Date, _ right: Date) -> Bool {
             abs(left.timeIntervalSince(right)) <= 0.002
         }
+        func effectiveSensitivity(for itemID: UUID) -> Bool {
+            var currentID: UUID? = itemID
+            var visited = Set<UUID>()
+            while let identifier = currentID {
+                guard visited.insert(identifier).inserted,
+                      let item = itemByID[identifier] else { return true }
+                if item.isSensitive { return true }
+                currentID = item.parentID
+            }
+            return false
+        }
+        let fixedByID = try Self.validatedFixedBlocksByID(request.fixedBlocks)
         guard !preview.inputDigest.isEmpty,
               sameInstant(preview.plan.asOf, request.asOf),
               sameInstant(preview.plan.horizonStart, request.horizonStart),
@@ -338,6 +350,15 @@ final class CanonicalSyncStore: ObservableObject {
             throw CanonicalSyncError.invalidPreview(
                 "The response clock or horizon does not match the preview request."
             )
+        }
+        for rejected in preview.rejectedItems {
+            guard let item = itemByID[rejected.itemID],
+                  item.title == rejected.title,
+                  rejected.isSensitive == effectiveSensitivity(for: rejected.itemID) else {
+                throw CanonicalSyncError.invalidPreview(
+                    "A rejected item has inconsistent canonical sensitivity or identity."
+                )
+            }
         }
 
         var blockIDs = Set<UUID>()
@@ -361,6 +382,14 @@ final class CanonicalSyncStore: ObservableObject {
                 throw CanonicalSyncError.invalidPreview(
                     "A response block has an empty interval or does not intersect the response horizon."
                 )
+            }
+            if let itemID = block.itemID {
+                guard itemByID[itemID] != nil,
+                      block.isSensitive == effectiveSensitivity(for: itemID) else {
+                    throw CanonicalSyncError.invalidPreview(
+                        "A canonical block has inconsistent effective sensitivity."
+                    )
+                }
             }
             switch block.kind {
             case "planned", "pinned":
@@ -441,6 +470,11 @@ final class CanonicalSyncStore: ObservableObject {
                 guard block.itemID == nil,
                       block.occurrenceID == nil,
                       let externalBlockID = block.externalBlockID,
+                      let fixed = fixedByID[externalBlockID],
+                      fixed.title == block.title,
+                      fixed.isSensitive == block.isSensitive,
+                      sameInstant(fixed.start, block.start),
+                      sameInstant(fixed.end, block.end),
                       externalBlockIDs.insert(externalBlockID).inserted else {
                     throw CanonicalSyncError.invalidPreview(
                         "An external fixed block has an invalid or duplicate source identity."
@@ -459,6 +493,10 @@ final class CanonicalSyncStore: ObservableObject {
                 latestPlannableEnd = block.end
             }
         }
+        try Self.validateFixedBlockCoverage(
+            returnedExternalBlockIDs: externalBlockIDs,
+            request: request
+        )
         var unscheduledMinutes: UInt32 = 0
         var unscheduledIdentities = Set<PreviewOccurrenceIdentity>()
         for unscheduled in preview.plan.unscheduled {
@@ -481,6 +519,36 @@ final class CanonicalSyncStore: ObservableObject {
                 "The response score does not match its scheduled and unscheduled work."
             )
         }
+    }
+
+    static func validateFixedBlockCoverage(
+        returnedExternalBlockIDs: Set<UUID>,
+        request: DayWeaveSchedulePreviewRequest
+    ) throws {
+        let fixedByID = try validatedFixedBlocksByID(request.fixedBlocks)
+        let expectedExternalBlockIDs = Set(fixedByID.values.compactMap { fixed in
+            fixed.end > request.horizonStart && fixed.start < request.horizonEnd ? fixed.id : nil
+        })
+        guard returnedExternalBlockIDs == expectedExternalBlockIDs else {
+            throw CanonicalSyncError.invalidPreview(
+                "The response omitted or invented an intersecting external fixed block."
+            )
+        }
+    }
+
+    private static func validatedFixedBlocksByID(
+        _ fixedBlocks: [DayWeaveSchedulePreviewRequest.FixedBlock]
+    ) throws -> [UUID: DayWeaveSchedulePreviewRequest.FixedBlock] {
+        var fixedByID: [UUID: DayWeaveSchedulePreviewRequest.FixedBlock] = [:]
+        for fixed in fixedBlocks {
+            guard fixedByID[fixed.id] == nil else {
+                throw CanonicalSyncError.invalidPreview(
+                    "The preview request contains a duplicate external fixed-block identifier."
+                )
+            }
+            fixedByID[fixed.id] = fixed
+        }
+        return fixedByID
     }
 
     private func publishLocalCaptures(
@@ -643,6 +711,7 @@ final class CanonicalSyncStore: ObservableObject {
                 try ensureOperationCurrent(operationID: operationID, generation: generation)
                 guard updated.id == item.id,
                       updated.revision > item.revision,
+                      updated.isSensitive == item.isSensitive,
                       updated.status == desiredStatus,
                       updated.deletedAt == nil else {
                     throw CanonicalSyncError.invalidMutationResponse
@@ -782,6 +851,7 @@ final class CanonicalSyncStore: ObservableObject {
             horizonEnd: end,
             timezoneName: planningTimezone,
             availability: availability,
+            fixedBlocks: [],
             previousAssignments: previousAssignments(stabilityStart: asOf, horizonEnd: end),
             config: .init(slotGranularityMinutes: 5, stabilityWeight: 4, defaultSoftWeight: 100),
             recurrenceContext: [
@@ -933,6 +1003,7 @@ final class CanonicalSyncStore: ObservableObject {
             let isPlannable = block.kind == "planned" || block.kind == "pinned"
             return ScheduleBlock(
                 id: block.id,
+                isSensitive: block.isSensitive,
                 title: block.title,
                 kind: item.map { plannerKind($0.kind) } ?? (block.kind == "calendar_event" ? .event : .breakTime),
                 start: block.start,

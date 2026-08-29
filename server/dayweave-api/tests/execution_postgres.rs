@@ -354,6 +354,7 @@ async fn create_item(service: &ItemService, id: Uuid, title: &str, marker: u8) {
         .create(
             NewItem {
                 id,
+                is_sensitive: false,
                 kind: ItemKind::Task,
                 status: ItemStatus::Planned,
                 title: title.to_owned(),

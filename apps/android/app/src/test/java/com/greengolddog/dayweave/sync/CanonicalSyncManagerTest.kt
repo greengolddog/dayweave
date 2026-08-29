@@ -100,6 +100,84 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun sensitivitySurvivesWireCachePreviewAndFullReplacement() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val sensitiveItem = remoteItem(split = false, isSensitive = true).copy(
+            title = "SYNTHETIC-ANDROID-SENSITIVE-CANARY",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = sensitiveItem)),
+                nextCursor = "sensitive-cursor-1",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = true).copy(
+                plan = preview(isSensitive = true).plan.copy(
+                    blocks = listOf(
+                        preview(isSensitive = true).plan.blocks.single().copy(
+                            title = sensitiveItem.title,
+                        ),
+                    ),
+                ),
+            )
+        }
+        val manager = manager(plannerStore, transport)
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
+
+        transport.replacementResult = sensitiveItem.copy(
+            status = "in_progress",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.start(BLOCK_ID))
+        assertTrue(requireNotNull(transport.replacementRequest).item.isSensitive)
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+    }
+
+    @Test
+    fun previewSensitivityDowngradeIsRejectedWithoutReplacingEncryptedPlan() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem(false))),
+                nextCursor = "sensitivity-baseline-cursor",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = false)
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val baseline = plannerStore.state.value
+
+        val promoted = remoteItem(split = false, isSensitive = true).copy(
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+            title = "SYNTHETIC-SENSITIVITY-DOWNGRADE-ANDROID",
+        )
+        transport.pages["sensitivity-baseline-cursor"] = RemoteItemDeltaPage(
+            changes = listOf(RemoteItemDeltaChange(type = "upsert", item = promoted)),
+            nextCursor = "sensitivity-promoted-cursor",
+            hasMore = false,
+        )
+        transport.previewResult = preview(isSensitive = false).copy(
+            sourceItemRevisions = mapOf(TASK_ID to 8L),
+            plan = preview(isSensitive = false).plan.copy(
+                blocks = listOf(
+                    preview(isSensitive = false).plan.blocks.single().copy(title = promoted.title),
+                ),
+            ),
+        )
+
+        assertEquals(CanonicalRefreshOutcome.PROTOCOL_FAILURE, manager.refreshAndCompose())
+        assertEquals(baseline.schedule, plannerStore.state.value.schedule)
+        assertEquals(baseline.canonicalItems, plannerStore.state.value.canonicalItems)
+        assertEquals("sensitivity-baseline-cursor", plannerStore.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
     fun credentialRotationQuarantinesCanonicalTenantCacheBeforeChange() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {
@@ -1533,8 +1611,12 @@ class CanonicalSyncManagerTest {
         )
     }
 
-    private fun remoteItem(split: Boolean = true) = RemoteCanonicalItem(
+    private fun remoteItem(
+        split: Boolean = true,
+        isSensitive: Boolean = false,
+    ) = RemoteCanonicalItem(
         id = TASK_ID,
+        isSensitive = isSensitive,
         kind = "task",
         status = "planned",
         title = "Compose Android timeline",
@@ -1572,7 +1654,7 @@ class CanonicalSyncManagerTest {
         updatedAt = "2026-08-29T10:00:00Z",
     )
 
-    private fun preview() = RemoteSchedulePreview(
+    private fun preview(isSensitive: Boolean = false) = RemoteSchedulePreview(
         inputDigest = "sha256:${"a".repeat(64)}",
         sourceItemCount = 1,
         sourceItemRevisions = mapOf(TASK_ID to 7),
@@ -1586,6 +1668,7 @@ class CanonicalSyncManagerTest {
             blocks = listOf(
                 RemoteScheduleBlock(
                     id = BLOCK_ID,
+                    isSensitive = isSensitive,
                     itemId = TASK_ID,
                     title = "Compose Android timeline",
                     start = "2026-09-01T09:00:00+02:00",

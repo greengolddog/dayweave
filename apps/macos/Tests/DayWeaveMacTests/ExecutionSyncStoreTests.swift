@@ -567,7 +567,7 @@ struct ExecutionSyncStoreTests {
             : #"{"type":"indivisible"}"#
         let json = #"""
         {
-          "id":"\#(itemID.uuidString.lowercased())","kind":"task","status":"scheduled",
+          "id":"\#(itemID.uuidString.lowercased())","is_sensitive":false,"kind":"task","status":"scheduled",
           "title":"Write plan","notes":null,"timezone_name":"UTC","duration_seconds":1800,
           "deadline_at":null,"earliest_start_at":null,"recurrence":null,
           "flexible_constraints":{},"split_policy":\#(split),"importance":50,"urgency":50,

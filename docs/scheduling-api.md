@@ -16,6 +16,19 @@ All timestamps at the HTTP boundary are RFC 3339. The API resolves local day
 boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
 
+Every current canonical item carries a required `is_sensitive` boolean. It is
+the item's own classification; preview blocks and rejected-item entries carry
+the effective value after cycle-safe ancestor propagation. Missing ancestors
+and malformed hierarchy cycles fail closed as sensitive. The flag is output
+metadata only and does not influence placement or scoring. Clients must compare
+each canonical preview block with the effective value computed from the exact
+delta snapshot and reject the complete preview on any mismatch.
+
+Deployment must fence the contract before sensitive classification is enabled:
+reject client versions that predate the required field and expire their active
+sessions. Unknown-field tolerance in an older client is not a privacy boundary;
+such a client could otherwise treat sensitive content as ordinary planner data.
+
 ```json
 {
   "as_of": "2026-09-01T07:00:00Z",
@@ -31,7 +44,16 @@ must be positive and no longer than 90 days.
       "energy": "deep"
     }
   ],
-  "fixed_blocks": [],
+  "fixed_blocks": [
+    {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "is_sensitive": true,
+      "title": "Private appointment",
+      "start": "2026-09-01T08:00:00Z",
+      "end": "2026-09-01T08:30:00Z",
+      "source": "google_calendar"
+    }
+  ],
   "previous_assignments": [],
   "config": {
     "slot_granularity_minutes": 5,
@@ -46,6 +68,12 @@ Previous assignments are stability hints, not authoritative schedule state.
 Each carries `item_id`, `item_revision`, optional `occurrence_id`, `pinned`, and
 `blocks`. A missing or changed canonical revision is returned under
 `ignored_previous_assignments` and never pinned accidentally.
+
+Fixed-block objects also require `is_sensitive`; the same value is copied to
+their `external_fixed` output blocks. A client must bind returned external
+blocks to the exact fixed-block identifiers and classifications it submitted,
+and must reject a preview unless every submitted block intersecting the horizon
+is returned exactly once.
 
 ## Canonical scheduling metadata
 

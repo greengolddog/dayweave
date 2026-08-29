@@ -178,12 +178,17 @@ struct KeychainPlannerKeyProvider: PlannerEncryptionKeyProviding {
     }
 }
 
+private struct PlannerSnapshotSchemaProbe: Decodable {
+    let schemaVersion: Int
+}
+
 struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Version 2 added canonical sync state, version 3 added persistent local
-    /// capture quarantine diagnostics, and version 4 adds the encrypted
-    /// execution replay fence and immutable terminal ledger. Older binaries
+    /// capture quarantine diagnostics, version 4 added the encrypted execution
+    /// replay fence and immutable terminal ledger, and version 5 adds explicit
+    /// sensitivity to canonical items and derived schedule blocks. Older binaries
     /// reject the newer schema instead of rewriting fields they do not understand.
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
 
     let schemaVersion: Int
     let savedAt: Date
@@ -258,6 +263,28 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         case Self.currentSchemaVersion:
             guard executionState != nil else { throw .snapshotDecodingFailed }
             return self
+        case 4:
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 3:
             return PlannerSnapshot(
                 destination: destination,
@@ -443,8 +470,12 @@ struct EncryptedPlannerPersistence: Sendable {
 
         let snapshot: PlannerSnapshot
         do {
+            let probe = try JSONDecoder().decode(PlannerSnapshotSchemaProbe.self, from: plaintext)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
+            if (1..<PlannerSnapshot.currentSchemaVersion).contains(probe.schemaVersion) {
+                decoder.userInfo[.dayWeaveAllowsMissingSensitivity] = true
+            }
             snapshot = try decoder.decode(PlannerSnapshot.self, from: plaintext)
         } catch {
             throw .snapshotDecodingFailed

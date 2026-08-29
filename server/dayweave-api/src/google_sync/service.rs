@@ -1469,6 +1469,10 @@ fn normalize_event(
         collection.sync_role,
         GoogleSyncRole::Blocking | GoogleSyncRole::Writable
     ) && busy;
+    let provider_private = event
+        .visibility
+        .as_deref()
+        .is_some_and(|visibility| visibility.eq_ignore_ascii_case("private"));
     let fallback_title = if blocking {
         "Busy"
     } else {
@@ -1517,6 +1521,7 @@ fn normalize_event(
             "location": collection.visible.then_some(event.location).flatten(),
             "content_truncated": title_truncated || notes_truncated,
             "provider_sequence": event.sequence,
+            "visibility": event.visibility,
         }
     });
     let item_id = Uuid::new_v4();
@@ -1526,6 +1531,7 @@ fn normalize_event(
         .to_owned();
     let item = NewItem {
         id: item_id,
+        is_sensitive: !collection.visible || provider_private,
         kind: ItemKind::Event,
         status: ItemStatus::Scheduled,
         title,
@@ -1614,6 +1620,7 @@ fn normalize_task(
         .to_owned();
     let item = NewItem {
         id: Uuid::new_v4(),
+        is_sensitive: !collection.visible,
         kind: ItemKind::Task,
         status: if completed {
             ItemStatus::Completed
@@ -2385,11 +2392,31 @@ mod tests {
         let hidden = normalize_event(&collection(GoogleSyncRole::Blocking, false), "UTC", event())
             .expect("hidden blocking projection");
 
+        assert!(!visible.item.as_ref().expect("visible item").is_sensitive);
+        assert!(hidden.item.as_ref().expect("hidden item").is_sensitive);
         assert_eq!(visible.remote_payload_hash, hidden.remote_payload_hash);
         assert_ne!(
             visible.remote_projection_hash,
             hidden.remote_projection_hash
         );
+    }
+
+    #[test]
+    fn private_event_in_visible_collection_is_sensitive() {
+        let mut private_event = event();
+        private_event.summary = Some("SYNTHETIC-PRIVATE-GOOGLE-EVENT-CANARY".to_owned());
+        private_event.visibility = Some("private".to_owned());
+
+        let item = normalize_event(
+            &collection(GoogleSyncRole::ReadOnly, true),
+            "UTC",
+            private_event,
+        )
+        .expect("private event projection")
+        .item
+        .expect("private event upsert");
+
+        assert!(item.is_sensitive);
     }
 
     #[test]
@@ -2443,8 +2470,17 @@ mod tests {
             deleted: false,
             hidden: true,
         };
+        let mut hidden_tasks_collection = tasks_collection.clone();
+        hidden_tasks_collection.visible = false;
+        let hidden = normalize_task(&hidden_tasks_collection, task.clone())
+            .expect("hidden task")
+            .item
+            .expect("hidden upsert");
+        assert!(hidden.is_sensitive);
+
         let change = normalize_task(&tasks_collection, task).expect("task");
         let item = change.item.expect("upsert");
+        assert!(!item.is_sensitive);
         assert_eq!(item.status, ItemStatus::Completed);
         assert_eq!(change.remote_parent_id.as_deref(), Some("parent-1"));
         assert_eq!(item.flexible_constraints["google_sync"]["hidden"], true);
@@ -2460,6 +2496,7 @@ mod tests {
         let now = Utc::now();
         let input = NewItem {
             id: Uuid::from_u128(44),
+            is_sensitive: false,
             kind: ItemKind::Event,
             status: ItemStatus::Scheduled,
             title: "Focus".to_owned(),

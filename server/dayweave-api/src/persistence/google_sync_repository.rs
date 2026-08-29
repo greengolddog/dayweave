@@ -2155,6 +2155,9 @@ async fn apply_remote_upsert(
         return Ok(ImportOutcome::Conflict);
     }
     let replacement = ReplaceItem {
+        // Provider refreshes may promote privacy but never declassify an item. Only an explicit
+        // first-party edit can clear the canonical flag.
+        is_sensitive: current.is_sensitive || candidate.is_sensitive,
         kind: candidate.kind,
         status: candidate.status,
         title: candidate.title,
@@ -2529,16 +2532,17 @@ async fn insert_imported_item(
 ) -> Result<(), GoogleSyncRepositoryError> {
     let (split, minimum, maximum) = split_columns(&item.split_policy);
     sqlx::query(
-        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, notes, \
+        "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, status, title, notes, \
          timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, \
          scheduling_constraints, split_allowed, minimum_chunk_seconds, maximum_chunk_seconds, \
          importance, urgency, sibling_order, revision, created_at, updated_at, completed_at, trashed_at) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
-         $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+         $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
     )
     .bind(item.id)
     .bind(scope.workspace_id)
     .bind(scope.user_id)
+    .bind(item.is_sensitive)
     .bind(kind_name(item))
     .bind(status_name(item.status))
     .bind(&item.title)
@@ -2573,15 +2577,16 @@ async fn update_imported_item(
 ) -> Result<(), GoogleSyncRepositoryError> {
     let (split, minimum, maximum) = split_columns(&item.split_policy);
     sqlx::query(
-        "UPDATE items SET kind = $3, status = $4, title = $5, notes = $6, timezone_name = $7, \
-         duration_seconds = $8, deadline_at = $9, earliest_start_at = $10, recurrence = $11, \
-         scheduling_constraints = $12, split_allowed = $13, minimum_chunk_seconds = $14, \
-         maximum_chunk_seconds = $15, importance = $16, urgency = $17, revision = $18, \
-         updated_at = $19, completed_at = $20, trashed_at = $21 \
+        "UPDATE items SET is_sensitive = $3, kind = $4, status = $5, title = $6, notes = $7, timezone_name = $8, \
+         duration_seconds = $9, deadline_at = $10, earliest_start_at = $11, recurrence = $12, \
+         scheduling_constraints = $13, split_allowed = $14, minimum_chunk_seconds = $15, \
+         maximum_chunk_seconds = $16, importance = $17, urgency = $18, revision = $19, \
+         updated_at = $20, completed_at = $21, trashed_at = $22 \
          WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
     .bind(item.id)
+    .bind(item.is_sensitive)
     .bind(kind_name(item))
     .bind(status_name(item.status))
     .bind(&item.title)
@@ -2673,7 +2678,7 @@ async fn fetch_import_item(
     item_id: Uuid,
 ) -> Result<Item, GoogleSyncRepositoryError> {
     let row = sqlx::query(
-        "SELECT item.id, item.kind, item.status, item.title, item.notes, item.timezone_name, \
+        "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
          item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
          item.scheduling_constraints, item.split_allowed, item.minimum_chunk_seconds, \
          item.maximum_chunk_seconds, item.importance, item.urgency, item.revision, item.created_at, \
@@ -2709,6 +2714,7 @@ fn item_from_row(row: &PgRow) -> Result<Item, GoogleSyncRepositoryError> {
     let deleted_at: Option<DateTime<Utc>> = row.try_get("trashed_at").map_err(internal)?;
     Ok(Item {
         id: row.try_get("id").map_err(internal)?,
+        is_sensitive: row.try_get("is_sensitive").map_err(internal)?,
         kind: match row.try_get::<String, _>("kind").map_err(internal)?.as_str() {
             "event" => crate::items::ItemKind::Event,
             "task" => crate::items::ItemKind::Task,
@@ -3053,6 +3059,7 @@ mod tests {
         Item::new(
             NewItem {
                 id,
+                is_sensitive: false,
                 kind: ItemKind::Event,
                 status: ItemStatus::Scheduled,
                 title: title.to_owned(),
@@ -4064,13 +4071,64 @@ mod tests {
             ImportOutcome::Created
         );
         reprojection.item.as_mut().expect("projected item").title = "Redacted title".to_owned();
+        reprojection
+            .item
+            .as_mut()
+            .expect("projected item")
+            .is_sensitive = true;
         reprojection.remote_projection_hash = [7; 32];
         assert_eq!(
             repository
-                .apply_remote_item(&claim, reprojection, now + Duration::minutes(5))
+                .apply_remote_item(&claim, reprojection.clone(), now + Duration::minutes(5))
                 .await
                 .expect("unchanged provider payload re-projected"),
             ImportOutcome::Updated
+        );
+        let promoted: bool = sqlx::query_scalar(
+            "SELECT item.is_sensitive FROM items item \
+             JOIN provider_sync_mappings mapping ON mapping.local_entity_id = item.id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.remote_resource_id = 'remote-3'",
+        )
+        .bind(scope.workspace_id)
+        .bind(collection.id)
+        .fetch_one(&database.pool)
+        .await
+        .expect("promoted imported sensitivity");
+        assert!(
+            promoted,
+            "visible-to-private replay must promote sensitivity"
+        );
+
+        reprojection.item.as_mut().expect("projected item").title =
+            "SYNTHETIC-VISIBLE-REPLAY-CANARY".to_owned();
+        reprojection
+            .item
+            .as_mut()
+            .expect("projected item")
+            .is_sensitive = false;
+        reprojection.remote_projection_hash = [8; 32];
+        assert_eq!(
+            repository
+                .apply_remote_item(&claim, reprojection, now + Duration::minutes(6))
+                .await
+                .expect("visible replay after private import"),
+            ImportOutcome::Updated
+        );
+        let retained: bool = sqlx::query_scalar(
+            "SELECT item.is_sensitive FROM items item \
+             JOIN provider_sync_mappings mapping ON mapping.local_entity_id = item.id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.remote_resource_id = 'remote-3'",
+        )
+        .bind(scope.workspace_id)
+        .bind(collection.id)
+        .fetch_one(&database.pool)
+        .await
+        .expect("retained imported sensitivity");
+        assert!(
+            retained,
+            "provider replay must not declassify a sensitive item"
         );
 
         let collection_key = format!("calendar:{}", collection.id);
@@ -4154,6 +4212,7 @@ mod tests {
         let local = crate::items::Item::new(
             NewItem {
                 id: Uuid::new_v4(),
+                is_sensitive: false,
                 kind: ItemKind::Event,
                 status: ItemStatus::Scheduled,
                 title: "DayWeave firm block".to_owned(),
@@ -4488,6 +4547,7 @@ mod tests {
         let stale_local = crate::items::Item::new(
             NewItem {
                 id: Uuid::new_v4(),
+                is_sensitive: false,
                 kind: ItemKind::Event,
                 status: ItemStatus::Scheduled,
                 title: "Stale queued block".to_owned(),
@@ -4694,6 +4754,7 @@ mod tests {
             remote_projection_hash: hash,
             item: Some(NewItem {
                 id: Uuid::new_v4(),
+                is_sensitive: false,
                 kind: ItemKind::Event,
                 status: ItemStatus::Scheduled,
                 title: title.to_owned(),

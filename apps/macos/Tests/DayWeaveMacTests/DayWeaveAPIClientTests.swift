@@ -218,6 +218,46 @@ struct DayWeaveAPIClientTests {
         #expect(session.configuration.requestCachePolicy == .reloadIgnoringLocalAndRemoteCacheData)
     }
 
+    @Test("fixed preview inputs encode an explicit sensitivity classification")
+    func testFixedPreviewInputEncodesSensitivity() throws {
+        let canaryID = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
+        let instant = Date(timeIntervalSince1970: 1_787_993_600)
+        let request = DayWeaveSchedulePreviewRequest(
+            asOf: instant,
+            horizonStart: instant,
+            horizonEnd: instant.addingTimeInterval(3_600),
+            timezoneName: "UTC",
+            availability: [],
+            fixedBlocks: [
+                .init(
+                    id: canaryID,
+                    isSensitive: true,
+                    title: "SYNTHETIC-SENSITIVE-FIXED-MACOS",
+                    start: instant,
+                    end: instant.addingTimeInterval(1_800),
+                    source: "google_calendar"
+                )
+            ],
+            previousAssignments: [],
+            config: .init(
+                slotGranularityMinutes: 5,
+                stabilityWeight: 4,
+                defaultSoftWeight: 100
+            ),
+            recurrenceContext: [:]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let object = try #require(
+            JSONSerialization.jsonObject(with: encoder.encode(request)) as? [String: Any]
+        )
+        let fixed = try #require((object["fixed_blocks"] as? [[String: Any]])?.first)
+
+        #expect(fixed["id"] as? String == canaryID.uuidString.uppercased())
+        #expect(fixed["is_sensitive"] as? Bool == true)
+        #expect(fixed["title"] as? String == "SYNTHETIC-SENSITIVE-FIXED-MACOS")
+    }
+
     @Test("canonical delta preserves scheduling fields and cursor semantics")
     func testCanonicalDeltaPreservesSchedulingFields() async throws {
         URLProtocolStub.storage.enqueue(
@@ -244,6 +284,7 @@ struct DayWeaveAPIClientTests {
             return
         }
         #expect(item.id == Self.itemID)
+        #expect(!item.isSensitive)
         #expect(item.revision == 7)
         #expect(item.deadlineAt != nil)
         #expect(item.parentID == Self.parentID)
@@ -321,6 +362,7 @@ struct DayWeaveAPIClientTests {
         #expect(requests[1].headers["Idempotency-Key"] == "mac-replace-stable")
         let create = try #require(requests[0].jsonBody)
         #expect((create["id"] as? String)?.lowercased() == Self.itemID.uuidString.lowercased())
+        #expect(create["is_sensitive"] as? Bool == false)
         #expect(create["fields"] == nil)
         #expect((create["duration_seconds"] as? NSNumber)?.uint32Value == 3_600)
         #expect((create["recurrence"] as? [String: Any])?["type"] as? String == "weekly")
@@ -328,6 +370,23 @@ struct DayWeaveAPIClientTests {
         let replace = try #require(requests[1].jsonBody)
         #expect((replace["expected_revision"] as? NSNumber)?.uint64Value == 1)
         #expect((replace["item"] as? [String: Any])?["status"] as? String == "paused")
+        #expect((replace["item"] as? [String: Any])?["is_sensitive"] as? Bool == false)
+    }
+
+    @Test("canonical sensitivity is required on current wire payloads")
+    func testCanonicalSensitivityCannotBeOmitted() throws {
+        var object = try #require(
+            JSONSerialization.jsonObject(
+                with: Data(Self.canonicalItemObject(revision: 1).utf8)
+            ) as? [String: Any]
+        )
+        object.removeValue(forKey: "is_sensitive")
+        let missing = try JSONSerialization.data(withJSONObject: object)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        #expect(throws: DecodingError.self) {
+            try decoder.decode(DayWeaveCanonicalItem.self, from: missing)
+        }
     }
 
     @Test("an operation keeps its immutable credential snapshot")
@@ -434,6 +493,7 @@ struct DayWeaveAPIClientTests {
         return """
         {
           "id":"\(itemID.uuidString.lowercased())",
+          "is_sensitive":false,
           "kind":"task",
           "status":"\(status)",
           "title":"Canonical deep work",

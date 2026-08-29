@@ -26,7 +26,7 @@ struct CodexConversationControllerTests {
             sourceItemRevision: 91,
             occurrenceID: UUID(),
             sessionIndex: 2,
-            syncOrigin: .canonicalPreview,
+            syncOrigin: .local,
             placementReason: "PRIVATE-PLACEMENT-DIAGNOSTIC",
             previewKind: "planned",
             occurrenceFullyScheduled: false
@@ -49,6 +49,171 @@ struct CodexConversationControllerTests {
         #expect(!input.localizedCaseInsensitiveContains(sourceID.uuidString))
         #expect(!input.contains("\"sourceItemRevision\""))
         #expect(input.utf8.count < 96 * 1_024)
+    }
+
+    @Test("sensitive canonical content becomes only an unreferenced busy span")
+    func testSensitivePlannerContextIsOccupancyOnly() throws {
+        let parentID = UUID(uuidString: "90000000-0000-4000-8000-000000000001")!
+        let childID = UUID(uuidString: "90000000-0000-4000-8000-000000000002")!
+        let privateTitle = "SYNTHETIC-CODEX-SENSITIVE-CANARY"
+        let parent = try Self.canonicalItem(
+            id: parentID,
+            parentID: nil,
+            isSensitive: true,
+            title: "SYNTHETIC-PRIVATE-PARENT-CANARY",
+            kind: "goal",
+            isExecutable: false
+        )
+        let child = try Self.canonicalItem(
+            id: childID,
+            parentID: parentID,
+            isSensitive: false,
+            title: privateTitle,
+            kind: "task",
+            isExecutable: true
+        )
+        let block = ScheduleBlock(
+            id: UUID(uuidString: "90000000-0000-4000-8000-000000000003")!,
+            isSensitive: true,
+            title: privateTitle,
+            kind: .task,
+            start: Date(timeIntervalSince1970: 1_787_980_000),
+            end: Date(timeIntervalSince1970: 1_787_983_600),
+            status: .scheduled,
+            project: "SYNTHETIC-PRIVATE-PROJECT-CANARY",
+            notes: "SYNTHETIC-PRIVATE-NOTES-CANARY",
+            energy: .deep,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: childID,
+            sourceItemRevision: 1,
+            syncOrigin: .canonicalPreview,
+            placementReason: "SYNTHETIC-PRIVATE-EXPLANATION-CANARY",
+            previewKind: "planned"
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [parent, child],
+            restoreFromPersistence: false
+        )
+        let snapshot = store.codexPlannerContextSnapshot()
+        #expect(snapshot.scheduledBlocks.isEmpty)
+        #expect(snapshot.plannerItems.isEmpty)
+        #expect(snapshot.totalPlannerItemCount == 0)
+        #expect(snapshot.privateBusySpans.count == 1)
+        #expect(snapshot.privateBusySpans[0].startsAt == block.start)
+        #expect(snapshot.privateBusySpans[0].endsAt == block.end)
+
+        let input = try CodexPlannerContextSerializer.turnInput(
+            snapshot: snapshot,
+            userMessage: "Where is my free time?"
+        )
+        for forbidden in [
+            privateTitle,
+            "SYNTHETIC-PRIVATE-PARENT-CANARY",
+            "SYNTHETIC-PRIVATE-PROJECT-CANARY",
+            "SYNTHETIC-PRIVATE-NOTES-CANARY",
+            "SYNTHETIC-PRIVATE-EXPLANATION-CANARY",
+            parentID.uuidString,
+            childID.uuidString,
+            "block-1",
+        ] {
+            #expect(!input.localizedCaseInsensitiveContains(forbidden))
+        }
+        #expect(input.contains("\"privateBusySpans\""))
+    }
+
+    @Test("private block metadata cannot perturb public references or serialized context")
+    func testSensitiveMetadataHasNoObservableOrderingSideChannel() throws {
+        let instant = Date(timeIntervalSince1970: 1_788_033_600)
+        let publicBlock = ScheduleBlock(
+            id: UUID(uuidString: "91000000-0000-4000-8000-000000000001")!,
+            isSensitive: false,
+            title: "MIDDLE-PUBLIC-CANARY",
+            kind: .task,
+            start: instant,
+            end: instant.addingTimeInterval(1_800),
+            status: .scheduled,
+            project: "Public project",
+            notes: "",
+            energy: .medium,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            syncOrigin: .local
+        )
+        func privateBlock(
+            id: UUID,
+            title: String,
+            kind: PlannerItemKind,
+            status: PlannerItemStatus,
+            project: String,
+            explanation: String
+        ) -> ScheduleBlock {
+            ScheduleBlock(
+                id: id,
+                isSensitive: true,
+                title: title,
+                kind: kind,
+                start: instant,
+                end: instant.addingTimeInterval(1_800),
+                status: status,
+                project: project,
+                notes: "SYNTHETIC-PRIVATE-INVARIANCE-NOTES",
+                energy: .deep,
+                isFlexible: false,
+                isHardConstraint: true,
+                actualMinutes: 17,
+                syncOrigin: .local,
+                placementReason: explanation,
+                previewKind: "SYNTHETIC-PRIVATE-KIND"
+            )
+        }
+        let firstPrivate = privateBlock(
+            id: UUID(uuidString: "91000000-0000-4000-8000-000000000002")!,
+            title: "AAA-SYNTHETIC-PRIVATE-ORDER-CANARY",
+            kind: .event,
+            status: .active,
+            project: "SYNTHETIC-PRIVATE-PROJECT-A",
+            explanation: "SYNTHETIC-PRIVATE-EXPLANATION-A"
+        )
+        let secondPrivate = privateBlock(
+            id: UUID(uuidString: "91000000-0000-4000-8000-000000000003")!,
+            title: "ZZZ-SYNTHETIC-PRIVATE-ORDER-CANARY",
+            kind: .breakTime,
+            status: .paused,
+            project: "SYNTHETIC-PRIVATE-PROJECT-Z",
+            explanation: "SYNTHETIC-PRIVATE-EXPLANATION-Z"
+        )
+        let first = PlannerStore(
+            blocks: [publicBlock, firstPrivate],
+            restoreFromPersistence: false
+        ).codexPlannerContextSnapshot()
+        let second = PlannerStore(
+            blocks: [publicBlock, secondPrivate],
+            restoreFromPersistence: false
+        ).codexPlannerContextSnapshot()
+        func stableTimestamp(_ snapshot: CodexPlannerContextSnapshot) -> CodexPlannerContextSnapshot {
+            CodexPlannerContextSnapshot(
+                generatedAt: Date(timeIntervalSince1970: 0),
+                timezone: snapshot.timezone,
+                scheduledBlocks: snapshot.scheduledBlocks,
+                privateBusySpans: snapshot.privateBusySpans,
+                totalScheduledBlockCount: snapshot.totalScheduledBlockCount,
+                plannerItems: snapshot.plannerItems,
+                totalPlannerItemCount: snapshot.totalPlannerItemCount,
+                pendingSuggestionCount: snapshot.pendingSuggestionCount,
+                omittedFields: snapshot.omittedFields
+            )
+        }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+
+        #expect(first.scheduledBlocks.map(\.reference) == ["block-1"])
+        #expect(first.privateBusySpans.count == 1)
+        #expect(try encoder.encode(stableTimestamp(first)) == encoder.encode(stableTimestamp(second)))
     }
 
     @Test("oversized user messages never cross the app-server boundary")
@@ -126,6 +291,30 @@ struct CodexConversationControllerTests {
         #expect(parsed.containedInvalidEnvelope)
 
         #expect(CodexProposalEnvelopeParser.visibleStreamingText("Reply<dayweave-prop") == "Reply")
+    }
+
+    private static func canonicalItem(
+        id: UUID,
+        parentID: UUID?,
+        isSensitive: Bool,
+        title: String,
+        kind: String,
+        isExecutable: Bool
+    ) throws -> DayWeaveCanonicalItem {
+        let parent = parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"
+        let json = """
+        {"id":"\(id.uuidString.lowercased())","is_sensitive":\(isSensitive),
+         "kind":"\(kind)","status":"planned","title":"\(title)","notes":null,
+         "timezone_name":"UTC","duration_seconds":3600,"deadline_at":null,
+         "earliest_start_at":null,"recurrence":null,"flexible_constraints":{},
+         "split_policy":{"type":"indivisible"},"importance":50,"urgency":50,
+         "parent_id":\(parent),"sibling_order":0,"is_executable":\(isExecutable),
+         "revision":1,"created_at":"2026-08-29T08:00:00Z",
+         "updated_at":"2026-08-29T08:00:00Z","completed_at":null,"deleted_at":null}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(DayWeaveCanonicalItem.self, from: Data(json.utf8))
     }
 }
 #endif

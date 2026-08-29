@@ -555,6 +555,7 @@ mod tests {
         Item::new(
             NewItem {
                 id,
+                is_sensitive: false,
                 kind: ItemKind::Task,
                 status: ItemStatus::Planned,
                 title: title.to_owned(),
@@ -587,6 +588,7 @@ mod tests {
 
     fn replacement(item: &Item, parent_id: Option<Uuid>, status: ItemStatus) -> ReplaceItem {
         ReplaceItem {
+            is_sensitive: item.is_sensitive,
             kind: item.kind,
             status,
             title: item.title.clone(),

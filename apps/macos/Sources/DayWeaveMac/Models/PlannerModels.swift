@@ -87,6 +87,8 @@ enum ScheduleBlockOrigin: String, Codable, Sendable {
 
 struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
     let id: UUID
+    /// Effective sensitivity after canonical ancestor propagation.
+    var isSensitive: Bool = false
     var title: String
     var kind: PlannerItemKind
     var start: Date
@@ -146,6 +148,7 @@ struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
 extension ScheduleBlock {
     private enum CodingKeys: String, CodingKey {
         case id, title, kind, start, end, status, project, notes, energy
+        case isSensitive
         case isFlexible, isHardConstraint, actualMinutes
         case sourceItemID, sourceItemRevision, occurrenceID, sessionIndex
         case syncOrigin, placementReason, previewKind, occurrenceFullyScheduled
@@ -154,6 +157,11 @@ extension ScheduleBlock {
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
+        if decoder.userInfo[.dayWeaveAllowsMissingSensitivity] as? Bool == true {
+            isSensitive = try container.decodeIfPresent(Bool.self, forKey: .isSensitive) ?? false
+        } else {
+            isSensitive = try container.decode(Bool.self, forKey: .isSensitive)
+        }
         title = try container.decode(String.self, forKey: .title)
         kind = try container.decode(PlannerItemKind.self, forKey: .kind)
         start = try container.decode(Date.self, forKey: .start)

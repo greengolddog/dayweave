@@ -250,6 +250,7 @@ private enum EncryptedPlannerPersistenceScenarios {
         try context.persistence.save(snapshot)
         let restored = try requireValue(context.persistence.load(), "Canonical snapshot was not restored")
         try require(restored.canonicalItems == [item], "Canonical item fields were not restored exactly")
+        try require(restored.canonicalItems?.first?.isSensitive == true, "Sensitivity was not restored")
         try require(restored.canonicalDeltaCursor == "opaque-encrypted-cursor", "Delta cursor was not restored")
         try require(restored.completedOccurrenceIDs == snapshot.completedOccurrenceIDs, "Occurrence state was not restored")
         try require(restored.canonicalTombstoneRevisions == snapshot.canonicalTombstoneRevisions, "Tombstone revisions were not restored")
@@ -458,6 +459,62 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func schemaFourAddsExplicitSensitivityDefaults() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 4,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [try canonicalItem()],
+            executionState: .empty
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var object = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema-4 snapshot was not an object"
+        )
+        var blocks = try requireValue(object["blocks"] as? [[String: Any]], "Missing blocks")
+        for index in blocks.indices { blocks[index].removeValue(forKey: "isSensitive") }
+        object["blocks"] = blocks
+        var items = try requireValue(
+            object["canonicalItems"] as? [[String: Any]],
+            "Missing canonical items"
+        )
+        for index in items.indices { items[index].removeValue(forKey: "is_sensitive") }
+        object["canonicalItems"] = items
+        let payload = try JSONSerialization.data(withJSONObject: object)
+
+        let strict = JSONDecoder()
+        strict.dateDecodingStrategy = .millisecondsSince1970
+        do {
+            _ = try strict.decode(PlannerSnapshot.self, from: payload)
+            throw PersistenceScenarioFailure(description: "Current decoding accepted missing sensitivity")
+        } catch is DecodingError {
+            // Only the authenticated legacy snapshot path may supply the migration default.
+        }
+
+        let legacyDecoder = JSONDecoder()
+        legacyDecoder.dateDecodingStrategy = .millisecondsSince1970
+        legacyDecoder.userInfo[.dayWeaveAllowsMissingSensitivity] = true
+        let decoded = try legacyDecoder.decode(PlannerSnapshot.self, from: payload)
+        let migrated = try decoded.migratedToCurrentSchema()
+        try require(migrated.schemaVersion == 5, "Schema 4 did not migrate to schema 5")
+        try require(migrated.blocks.allSatisfy { !$0.isSensitive }, "Legacy block invented sensitivity")
+        try require(
+            migrated.canonicalItems?.allSatisfy { !$0.isSensitive } == true,
+            "Legacy canonical item invented sensitivity"
+        )
+    }
+
     private static func require(
         _ condition: @autoclosure () -> Bool,
         _ message: String
@@ -542,7 +599,7 @@ private enum EncryptedPlannerPersistenceScenarios {
     private static func canonicalItem() throws -> DayWeaveCanonicalItem {
         let data = Data(#"""
         {
-          "id":"50000000-0000-4000-8000-000000000005","kind":"task","status":"planned",
+          "id":"50000000-0000-4000-8000-000000000005","is_sensitive":true,"kind":"task","status":"planned",
           "title":"Encrypted canonical item","notes":"CANONICAL-PRIVATE-NOTES","timezone_name":"Europe/Madrid",
           "duration_seconds":3600,"deadline_at":"2026-09-01T17:00:00Z","earliest_start_at":null,
           "recurrence":{"type":"weekly","times_per_week":2},"flexible_constraints":{"energy":"deep"},
@@ -560,7 +617,7 @@ private enum EncryptedPlannerPersistenceScenarios {
     private static func decimalCanonicalItem() throws -> DayWeaveCanonicalItem {
         let data = Data(#"""
         {
-          "id":"51000000-0000-4000-8000-000000000005","kind":"task","status":"planned",
+          "id":"51000000-0000-4000-8000-000000000005","is_sensitive":false,"kind":"task","status":"planned",
           "title":"Read-only decimal item","notes":null,"timezone_name":"Europe/Madrid",
           "duration_seconds":3600,"deadline_at":null,"earliest_start_at":null,
           "recurrence":null,"flexible_constraints":{"future_ratio":1.0},
@@ -680,6 +737,11 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Encrypted schema 1 is atomically rewritten")
     func encryptedSchemaOneMigration() throws {
         try EncryptedPlannerPersistenceScenarios.encryptedSchemaOneIsAtomicallyRewritten()
+    }
+
+    @Test("Schema 4 receives explicit non-sensitive migration defaults")
+    func schemaFourSensitivityMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaFourAddsExplicitSensitivityDefaults()
     }
 }
 #endif

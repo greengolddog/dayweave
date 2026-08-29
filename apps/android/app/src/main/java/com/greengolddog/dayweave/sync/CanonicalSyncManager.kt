@@ -894,6 +894,7 @@ class CanonicalSyncManager(
             if (existing != null && existing >= threshold) item.earliestStartAt else threshold.toString()
         } ?: item.earliestStartAt
         val replacement = CanonicalItemReplacement(
+            isSensitive = item.isSensitive,
             kind = item.kind,
             status = targetStatus,
             title = item.title,
@@ -1337,7 +1338,8 @@ class CanonicalSyncManager(
         previous: CanonicalItemSnapshot,
         replacement: CanonicalItemReplacement,
     ): Boolean =
-        actual.kind == replacement.kind &&
+        actual.isSensitive == replacement.isSensitive &&
+            actual.kind == replacement.kind &&
             actual.title == replacement.title &&
             actual.notes == replacement.notes &&
             actual.timezoneName == replacement.timezoneName &&
@@ -1734,9 +1736,11 @@ class CanonicalSyncManager(
         }
         val rejectedIds = preview.rejectedItems.map { rejected ->
             validateUuid(rejected.itemId)
+            val item = items[rejected.itemId]
             if (
                 rejected.title.isBlank() || rejected.reason.isBlank() || rejected.itemId !in items ||
-                items[rejected.itemId]?.title != rejected.title
+                item?.title != rejected.title ||
+                rejected.isSensitive != effectiveSensitivity(item, items)
             ) {
                 throw RemotePlannerMappingException()
             }
@@ -1998,7 +2002,10 @@ class CanonicalSyncManager(
             validateUuid(itemId)
             items[itemId] ?: throw RemotePlannerMappingException()
         } ?: throw RemotePlannerMappingException()
-        if (!canonical.isExecutable || block.title != canonical.title) {
+        if (
+            !canonical.isExecutable || block.title != canonical.title ||
+            block.isSensitive != effectiveSensitivity(canonical, items)
+        ) {
             throw RemotePlannerMappingException()
         }
         val itemKind = mapItemKind(canonical.kind)
@@ -2013,6 +2020,7 @@ class CanonicalSyncManager(
         val hard = block.kind in setOf("pinned", "calendar_event", "external_fixed")
         return ScheduleItem(
             id = block.id,
+            isSensitive = block.isSensitive,
             title = block.title,
             kind = itemKind,
             startMinute = start.hour * 60 + start.minute,
@@ -2039,6 +2047,21 @@ class CanonicalSyncManager(
             planningZoneId = planningZone.id,
             canonicalBlockKind = block.kind,
         )
+    }
+
+    /** Mirrors the server's cycle-safe ancestor propagation and fails closed on partial trees. */
+    private fun effectiveSensitivity(
+        item: CanonicalItemSnapshot?,
+        items: Map<String, CanonicalItemSnapshot>,
+    ): Boolean {
+        var current = item ?: return true
+        val visited = mutableSetOf<String>()
+        while (true) {
+            if (!visited.add(current.id)) return true
+            if (current.isSensitive) return true
+            val parentId = current.parentId ?: return false
+            current = items[parentId] ?: return true
+        }
     }
 
     private fun preserveLocalSessionState(
@@ -2565,6 +2588,7 @@ class CanonicalSyncManager(
             }
             return CanonicalItemSnapshot(
                 id = remote.id,
+                isSensitive = remote.isSensitive,
                 kind = remote.kind,
                 status = remote.status,
                 title = remote.title,

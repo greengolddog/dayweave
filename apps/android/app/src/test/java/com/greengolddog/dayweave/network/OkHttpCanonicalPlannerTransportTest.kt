@@ -11,6 +11,7 @@ import mockwebserver3.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Before
 import org.junit.Test
@@ -43,6 +44,7 @@ class OkHttpCanonicalPlannerTransportTest {
 
         assertEquals("opaque+/=", page.nextCursor)
         assertEquals("Compose Android timeline", page.changes.single().item?.title)
+        assertTrue(page.changes.single().item?.isSensitive == true)
         assertEquals(7L, page.changes.single().item?.revision)
         val request = server.takeRequest()
         assertEquals("GET", request.method)
@@ -65,12 +67,23 @@ class OkHttpCanonicalPlannerTransportTest {
                     end = "2026-09-01T20:00:00Z",
                 ),
             ),
+            fixedBlocks = listOf(
+                FixedScheduleBlockRequest(
+                    id = "44444444-4444-4444-8444-444444444444",
+                    isSensitive = true,
+                    title = "SYNTHETIC-SENSITIVE-FIXED-ANDROID",
+                    start = "2026-09-01T08:00:00Z",
+                    end = "2026-09-01T08:30:00Z",
+                    source = "google_calendar",
+                ),
+            ),
         )
 
         val preview = transport.preview(configuration(), request)
 
         assertEquals("sha256:${"a".repeat(64)}", preview.inputDigest)
         assertEquals(BLOCK_ID, preview.plan.blocks.single().id)
+        assertTrue(preview.plan.blocks.single().isSensitive)
         assertEquals(60L, preview.plan.score.scheduledMinutes)
         val recorded = server.takeRequest()
         assertEquals("POST", recorded.method)
@@ -79,6 +92,10 @@ class OkHttpCanonicalPlannerTransportTest {
         assertEquals("Bearer unit-test-secret", recorded.headers["Authorization"])
         val body = Json.parseToJsonElement(requireNotNull(recorded.body).utf8()) as JsonObject
         assertEquals("Europe/Madrid", body["timezone_name"]?.jsonPrimitive?.content)
+        val fixedBlock = body["fixed_blocks"]
+            ?.let { it as kotlinx.serialization.json.JsonArray }
+            ?.single() as JsonObject
+        assertEquals("true", fixedBlock["is_sensitive"]?.jsonPrimitive?.content)
         assertEquals(JsonObject(emptyMap()), body["recurrence_context"])
     }
 
@@ -114,6 +131,7 @@ class OkHttpCanonicalPlannerTransportTest {
             )
         server.enqueue(jsonResponse("""{"item":$replaced}"""))
         val replacement = CanonicalItemReplacement(
+            isSensitive = false,
             kind = "task",
             status = "in_progress",
             title = "Compose Android timeline",
@@ -150,6 +168,25 @@ class OkHttpCanonicalPlannerTransportTest {
             "in_progress",
             (body["item"] as JsonObject)["status"]?.jsonPrimitive?.content,
         )
+        assertEquals(
+            "false",
+            (body["item"] as JsonObject)["is_sensitive"]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun missingCurrentSensitivityFieldFailsClosed() {
+        val current = Json.parseToJsonElement(itemJson()) as JsonObject
+        val missing = JsonObject(current - "is_sensitive").toString()
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[{"type":"upsert","item":$missing}],"next_cursor":"cursor","has_more":false}""",
+            ),
+        )
+
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.itemDelta(configuration(), null) }
+        }
     }
 
     @Test
@@ -180,6 +217,7 @@ class OkHttpCanonicalPlannerTransportTest {
     private fun itemJson(): String = """
         {
           "id":"$TASK_ID",
+          "is_sensitive":true,
           "kind":"task",
           "status":"planned",
           "title":"Compose Android timeline",
@@ -218,6 +256,7 @@ class OkHttpCanonicalPlannerTransportTest {
             "horizon_end":"2026-09-01T22:00:00Z",
             "blocks":[{
               "id":"$BLOCK_ID",
+              "is_sensitive":true,
               "item_id":"$TASK_ID",
               "occurrence_id":null,
               "external_block_id":null,

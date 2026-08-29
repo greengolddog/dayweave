@@ -37,9 +37,19 @@ struct CodexPlannerContextSnapshot: Equatable, Encodable, Sendable {
         let isExecutable: Bool
     }
 
+    /// Occupancy-only representation for a sensitive scheduled block. It has
+    /// deliberately no reference, title, item identity, kind, status, project,
+    /// explanation, or other correlatable planner metadata.
+    struct PrivateBusySpan: Equatable, Encodable, Sendable {
+        let startsAt: Date
+        let endsAt: Date
+        let durationMinutes: Int
+    }
+
     let generatedAt: Date
     let timezone: String
     let scheduledBlocks: [ScheduledBlock]
+    let privateBusySpans: [PrivateBusySpan]
     let totalScheduledBlockCount: Int
     let plannerItems: [PlannerItem]
     let totalPlannerItemCount: Int
@@ -526,13 +536,40 @@ final class CodexConversationController: ObservableObject {
 extension PlannerStore: CodexPlannerContextProviding {
     func codexPlannerContextSnapshot() -> CodexPlannerContextSnapshot {
         let generatedAt = Date()
-        let sortedBlocks = Array(blocks.prefix(256)).sorted { lhs, rhs in
-            if lhs.start != rhs.start { return lhs.start < rhs.start }
-            return lhs.title < rhs.title
+        let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        func effectivelySensitive(_ itemID: UUID) -> Bool {
+            var visited = Set<UUID>()
+            var currentID: UUID? = itemID
+            var sensitive = false
+            while let id = currentID {
+                guard visited.insert(id).inserted, let item = canonicalByID[id] else { return true }
+                sensitive = sensitive || item.isSensitive
+                currentID = item.parentID
+            }
+            return sensitive
         }
-        let includedBlocks = Array(sortedBlocks.prefix(48))
-        let scheduledBlocks = includedBlocks.enumerated().map { offset, block in
-            CodexPlannerContextSnapshot.ScheduledBlock(
+        func blockIsSensitive(_ block: ScheduleBlock) -> Bool {
+            if block.isSensitive { return true }
+            guard let itemID = block.sourceItemID else { return false }
+            if canonicalByID[itemID] != nil { return effectivelySensitive(itemID) }
+            return block.syncOrigin == .canonicalPreview || block.syncOrigin == .remoteExecutionLease
+        }
+
+        let classifiedBlocks = Array(blocks.prefix(256)).map { block in
+            (block: block, isSensitive: blockIsSensitive(block))
+        }
+        let includedPublicBlocks = classifiedBlocks
+            .filter { !$0.isSensitive }
+            .map { $0.block }
+            .sorted { lhs, rhs in
+                if lhs.start != rhs.start { return lhs.start < rhs.start }
+                if lhs.end != rhs.end { return lhs.end < rhs.end }
+                return lhs.title < rhs.title
+            }
+            .prefix(48)
+        let scheduledBlocks: [CodexPlannerContextSnapshot.ScheduledBlock] =
+            includedPublicBlocks.enumerated().map { offset, block in
+            return CodexPlannerContextSnapshot.ScheduledBlock(
                 reference: "block-\(offset + 1)",
                 title: Self.codexSafeText(block.title, maximumBytes: 160),
                 kind: block.kind.rawValue,
@@ -548,8 +585,25 @@ extension PlannerStore: CodexPlannerContextProviding {
                 isHardConstraint: block.isHardConstraint
             )
         }
+        let includedPrivateBlocks = classifiedBlocks
+            .filter { $0.isSensitive }
+            .map { $0.block }
+            .sorted { lhs, rhs in
+                if lhs.start != rhs.start { return lhs.start < rhs.start }
+                return lhs.end < rhs.end
+            }
+            .prefix(48)
+        let privateBusySpans: [CodexPlannerContextSnapshot.PrivateBusySpan] =
+            includedPrivateBlocks.map { block in
+            return CodexPlannerContextSnapshot.PrivateBusySpan(
+                startsAt: block.start,
+                endsAt: block.end,
+                durationMinutes: block.durationMinutes
+            )
+        }
 
-        let includedItems = Array(canonicalItems.prefix(64))
+        let nonSensitiveItems = canonicalItems.filter { !effectivelySensitive($0.id) }
+        let includedItems = Array(nonSensitiveItems.prefix(64))
         let itemReferences = Dictionary(uniqueKeysWithValues: includedItems.enumerated().map {
             ($0.element.id, "item-\($0.offset + 1)")
         })
@@ -576,9 +630,10 @@ extension PlannerStore: CodexPlannerContextProviding {
             generatedAt: generatedAt,
             timezone: TimeZone.autoupdatingCurrent.identifier,
             scheduledBlocks: scheduledBlocks,
+            privateBusySpans: privateBusySpans,
             totalScheduledBlockCount: blocks.count,
             plannerItems: plannerItems,
-            totalPlannerItemCount: canonicalItems.count,
+            totalPlannerItemCount: nonSensitiveItems.count,
             pendingSuggestionCount: suggestions.count { $0.state == .pending },
             omittedFields: [
                 "account identity and credentials",
@@ -586,6 +641,7 @@ extension PlannerStore: CodexPlannerContextProviding {
                 "notes and placement diagnostics",
                 "raw recurrence and flexible-constraint payloads",
                 "stable item, occurrence, and revision identifiers",
+                "sensitive item content; occupancy is represented only as generic busy spans",
             ]
         )
     }

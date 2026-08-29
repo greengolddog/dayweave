@@ -62,6 +62,7 @@ async fn body_json(response: Response<Body>) -> Value {
 fn item_body(id: Uuid, kind: &str, title: &str, parent_id: Option<Uuid>, order: u32) -> Value {
     json!({
         "id": id,
+        "is_sensitive": false,
         "kind": kind,
         "status": "planned",
         "title": title,
@@ -115,7 +116,8 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
     let leaf_id = Uuid::new_v4();
     let root = item_body(root_id, "goal", "Ship canonical sync", None, 0);
     let child = item_body(child_id, "routine", "Implementation", Some(root_id), 1);
-    let leaf = item_body(leaf_id, "task", "Write contract tests", Some(child_id), 0);
+    let mut leaf = item_body(leaf_id, "task", "Write contract tests", Some(child_id), 0);
+    leaf["is_sensitive"] = json!(true);
 
     let unauthorized = app
         .clone()
@@ -223,6 +225,44 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
         .unwrap();
     let second_delta = body_json(second_delta).await;
     assert_eq!(second_delta["changes"].as_array().unwrap().len(), 3);
+    assert!(
+        second_delta["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| {
+                change["type"] == "upsert"
+                    && change["item"]["id"] == leaf_id.to_string()
+                    && change["item"]["is_sensitive"] == true
+            })
+    );
+
+    let mut stale_clear = replacement(&leaf, 2, "planned", Some(child_id));
+    stale_clear["item"]["is_sensitive"] = json!(false);
+    let stale_clear = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{leaf_id}"),
+            Some(stale_clear),
+            true,
+            Some("stale-sensitive-clear-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_clear.status(), StatusCode::CONFLICT);
+    let retained = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/v1/items/{leaf_id}"),
+            None,
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_json(retained).await["item"]["is_sensitive"], true);
 
     let deleted = app
         .clone()
@@ -277,6 +317,7 @@ async fn item_contract_is_authenticated_idempotent_hierarchical_and_delta_synced
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end strict JSON/idempotency boundary scenario.
 async fn strict_item_json_and_idempotency_conflicts_are_structured() {
     let app = test_app();
     let id = Uuid::new_v4();
@@ -307,6 +348,42 @@ async fn strict_item_json_and_idempotency_conflicts_are_structured() {
         .await
         .unwrap();
     assert_eq!(created.status(), StatusCode::CREATED);
+
+    let mut missing_sensitive = item_body(Uuid::new_v4(), "task", "Missing privacy flag", None, 0);
+    missing_sensitive
+        .as_object_mut()
+        .unwrap()
+        .remove("is_sensitive");
+    let missing_sensitive = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(missing_sensitive),
+            true,
+            Some("strict-sensitive-required-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_sensitive.status(), StatusCode::BAD_REQUEST);
+
+    let mut missing_replacement = replacement(&valid, 1, "scheduled", None);
+    missing_replacement["item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("is_sensitive");
+    let missing_replacement = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{id}"),
+            Some(missing_replacement),
+            true,
+            Some("strict-replace-sensitive-required-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing_replacement.status(), StatusCode::BAD_REQUEST);
 
     let mut different = valid;
     different["title"] = json!("Different content");

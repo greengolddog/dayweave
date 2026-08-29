@@ -38,6 +38,8 @@ impl SchedulePlan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleBlock {
     pub id: Uuid,
+    /// Effective source sensitivity. This is output metadata only.
+    pub is_sensitive: bool,
     pub item_id: Option<ItemId>,
     #[serde(default)]
     pub occurrence_id: Option<OccurrenceId>,
@@ -446,6 +448,7 @@ impl PlanningState {
             });
             self.blocks.push(ScheduleBlock {
                 id: fixed.id,
+                is_sensitive: fixed.is_sensitive,
                 item_id: None,
                 occurrence_id: None,
                 external_block_id: Some(fixed.id),
@@ -488,6 +491,7 @@ impl PlanningState {
             });
             self.blocks.push(ScheduleBlock {
                 id: block_id(item.id, 0, event.start),
+                is_sensitive: item.is_sensitive,
                 item_id: Some(item.id),
                 occurrence_id: None,
                 external_block_id: None,
@@ -549,6 +553,7 @@ impl PlanningState {
                 });
                 self.blocks.push(ScheduleBlock {
                     id: block_id(item.id, block.session_index, block.start),
+                    is_sensitive: item.is_sensitive,
                     item_id: Some(item.id),
                     occurrence_id: None,
                     external_block_id: None,
@@ -1392,6 +1397,7 @@ impl PlanningState {
         });
         self.blocks.push(ScheduleBlock {
             id: block_id(item.id, session_index, candidate.interval.start),
+            is_sensitive: item.is_sensitive,
             item_id: Some(item.id),
             occurrence_id: None,
             external_block_id: None,

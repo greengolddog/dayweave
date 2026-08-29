@@ -2072,6 +2072,9 @@ class PlannerStore(
         }
         return ScheduleItem(
             id = session.id,
+            isSensitive = item?.let { canonical ->
+                effectiveSensitivity(state.canonicalItems, canonical.id)
+            } ?: true,
             title = item?.title ?: "Remote focus session",
             kind = kind,
             startMinute = localStart.hour * 60 + localStart.minute,
@@ -2402,6 +2405,21 @@ class PlannerStore(
             } else {
                 left.startMinute.compareTo(right.startMinute)
             }
+        }
+
+        /** Resolves inherited sensitivity and fails closed on a missing or cyclic ancestor. */
+        fun effectiveSensitivity(items: List<CanonicalItemSnapshot>, itemId: String): Boolean {
+            val byId = items.associateBy(CanonicalItemSnapshot::id)
+            val visited = mutableSetOf<String>()
+            var currentId: String? = itemId
+            var sensitive = false
+            while (currentId != null) {
+                if (!visited.add(currentId)) return true
+                val item = byId[currentId] ?: return true
+                sensitive = sensitive || item.isSensitive
+                currentId = item.parentId
+            }
+            return sensitive
         }
 
         fun missingAcceptedDrafts(
