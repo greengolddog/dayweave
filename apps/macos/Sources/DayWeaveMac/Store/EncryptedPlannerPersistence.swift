@@ -179,10 +179,11 @@ struct KeychainPlannerKeyProvider: PlannerEncryptionKeyProviding {
 }
 
 struct PlannerSnapshot: Codable, Equatable, Sendable {
-    /// Version 2 added canonical sync state. Version 3 adds persistent local
-    /// capture quarantine diagnostics. Older binaries reject the newer schema
-    /// instead of rewriting fields they do not understand.
-    static let currentSchemaVersion = 3
+    /// Version 2 added canonical sync state, version 3 added persistent local
+    /// capture quarantine diagnostics, and version 4 adds the encrypted
+    /// execution replay fence and immutable terminal ledger. Older binaries
+    /// reject the newer schema instead of rewriting fields they do not understand.
+    static let currentSchemaVersion = 4
 
     let schemaVersion: Int
     let savedAt: Date
@@ -204,6 +205,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
     let localCaptureDiagnostics: [UUID: String]?
+    let executionState: DayWeaveExecutionDurableState?
 
     init(
         schemaVersion: Int = Self.currentSchemaVersion,
@@ -225,7 +227,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
-        localCaptureDiagnostics: [UUID: String]? = nil
+        localCaptureDiagnostics: [UUID: String]? = nil,
+        executionState: DayWeaveExecutionDurableState? = .empty
     ) {
         self.schemaVersion = schemaVersion
         self.savedAt = savedAt
@@ -247,12 +250,36 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
         self.localCaptureDiagnostics = localCaptureDiagnostics
+        self.executionState = executionState
     }
 
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         switch schemaVersion {
         case Self.currentSchemaVersion:
+            guard executionState != nil else { throw .snapshotDecodingFailed }
             return self
+        case 3:
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: .empty
+            )
         case 2:
             return PlannerSnapshot(
                 destination: destination,

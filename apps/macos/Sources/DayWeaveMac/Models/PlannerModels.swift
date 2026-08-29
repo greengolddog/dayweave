@@ -82,6 +82,7 @@ enum ScheduleBlockOrigin: String, Codable, Sendable {
     case local
     case canonicalPreview
     case externalPreview
+    case remoteExecutionLease
 }
 
 struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
@@ -196,6 +197,9 @@ struct PendingCanonicalMutation: Identifiable, Hashable, Codable, Sendable {
     let createdAt: Date
     var disposition: CanonicalMutationDisposition
     var diagnostic: String?
+    /// Links an approval-gated canonical status projection to the immutable
+    /// execution outcome that requested it. Older snapshots decode this as nil.
+    var executionSessionID: UUID? = nil
 }
 
 enum RecurrenceSessionDisposition: String, Codable, Hashable, Sendable {

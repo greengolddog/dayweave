@@ -372,7 +372,14 @@ private enum EncryptedPlannerPersistenceScenarios {
 
         let migrated = try legacy.migratedToCurrentSchema()
 
-        try require(migrated.schemaVersion == 3, "Legacy snapshot did not migrate to schema 3")
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Legacy snapshot did not migrate to the current schema"
+        )
+        try require(
+            migrated.executionState == .empty,
+            "Legacy snapshot invented execution recovery state"
+        )
         try require(migrated.pendingCanonicalMutations == [], "Migration invented pending mutations")
         try require(migrated.recurrenceSessionOutcomes == [], "Migration invented recurrence outcomes")
         try require(migrated.canonicalTombstoneRevisions == [:], "Migration invented tombstones")
@@ -432,13 +439,23 @@ private enum EncryptedPlannerPersistenceScenarios {
         try JSONSerialization.data(withJSONObject: envelope).write(to: context.fileURL)
 
         let migrated = try requireValue(context.persistence.load(), "Legacy snapshot did not load")
-        try require(migrated.schemaVersion == 3, "Encrypted legacy snapshot did not migrate")
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Encrypted legacy snapshot did not migrate"
+        )
+        try require(
+            migrated.executionState == .empty,
+            "Encrypted legacy migration invented execution recovery state"
+        )
         try require(
             migrated.blocks.first?.occurrenceFullyScheduled == true,
             "A genuine pre-field block did not receive its safe legacy default"
         )
         let secondLoad = try requireValue(context.persistence.load(), "Migrated snapshot was not rewritten")
-        try require(secondLoad.schemaVersion == 3, "Migrated file was not durable")
+        try require(
+            secondLoad.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Migrated file was not durable"
+        )
     }
 
     private static func require(

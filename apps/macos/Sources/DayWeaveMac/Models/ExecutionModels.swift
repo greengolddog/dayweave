@@ -81,6 +81,30 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
         try validateExecutionSession(self, codingPath: decoder.codingPath)
     }
+
+    func encode(to encoder: any Encoder) throws {
+        try validateExecutionSession(self, codingPath: encoder.codingPath, encoding: true)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(itemRevision, forKey: .itemRevision)
+        try encodeExecutionNullable(occurrenceID, forKey: .occurrenceID, into: &container)
+        try container.encode(sessionIndex, forKey: .sessionIndex)
+        try encodeExecutionNullable(plannedBlockID, forKey: .plannedBlockID, into: &container)
+        try container.encode(sourceDeviceID, forKey: .sourceDeviceID)
+        try container.encode(status, forKey: .status)
+        try container.encode(revision, forKey: .revision)
+        try container.encode(accumulatedSeconds, forKey: .accumulatedSeconds)
+        try encodeExecutionNullable(actualSeconds, forKey: .actualSeconds, into: &container)
+        try container.encode(startedAt, forKey: .startedAt)
+        try encodeExecutionNullable(runningSince, forKey: .runningSince, into: &container)
+        try encodeExecutionNullable(pausedAt, forKey: .pausedAt, into: &container)
+        try encodeExecutionNullable(pauseUntil, forKey: .pauseUntil, into: &container)
+        try encodeExecutionNullable(pauseReason, forKey: .pauseReason, into: &container)
+        try encodeExecutionNullable(endedAt, forKey: .endedAt, into: &container)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
 }
 
 struct DayWeaveExecutionSnapshot: Codable, Equatable, Sendable {
@@ -117,6 +141,23 @@ struct DayWeaveExecutionSnapshot: Codable, Equatable, Sendable {
                 "Execution snapshot revision is outside the supported state"
             )
         }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard revision <= UInt64(Int64.max),
+              activeSession.map({
+                  revision > 0
+                      && $0.revision <= revision
+                      && ($0.status == .active || $0.status == .paused)
+              }) ?? true else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Execution snapshot revision is outside the supported state"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(revision, forKey: .revision)
+        try encodeExecutionNullable(activeSession, forKey: .activeSession, into: &container)
     }
 }
 
@@ -166,6 +207,30 @@ struct DayWeaveExecutionMutation: Codable, Equatable, Sendable {
                 "Execution mutation state is internally inconsistent"
             )
         }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        let activeMutationIsCoherent = if changedSession.status == .active
+            || changedSession.status == .paused
+        {
+            activeSession == changedSession
+        } else {
+            activeSession == nil
+        }
+        guard revision > 0,
+              revision <= UInt64(Int64.max),
+              changedSession.revision <= revision,
+              activeMutationIsCoherent else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Execution mutation state is internally inconsistent"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(revision, forKey: .revision)
+        try encodeExecutionNullable(activeSession, forKey: .activeSession, into: &container)
+        try container.encode(changedSession, forKey: .changedSession)
+        try container.encode(replayed, forKey: .replayed)
     }
 }
 
@@ -452,6 +517,191 @@ struct DayWeaveExecutionCommandRequest: Codable, Equatable, Sendable {
     }
 }
 
+struct DayWeaveExecutionIdentity: Codable, Equatable, Hashable, Sendable {
+    let sessionID: UUID
+    let itemID: UUID
+    let itemRevision: UInt64
+    let occurrenceID: UUID?
+    let sessionIndex: UInt16
+    let plannedBlockID: UUID?
+    let sourceDeviceID: UUID
+
+    init(session: DayWeaveExecutionSession) {
+        sessionID = session.id
+        itemID = session.itemID
+        itemRevision = session.itemRevision
+        occurrenceID = session.occurrenceID
+        sessionIndex = session.sessionIndex
+        plannedBlockID = session.plannedBlockID
+        sourceDeviceID = session.sourceDeviceID
+    }
+
+    init(
+        sessionID: UUID,
+        itemID: UUID,
+        itemRevision: UInt64,
+        occurrenceID: UUID?,
+        sessionIndex: UInt16,
+        plannedBlockID: UUID?,
+        sourceDeviceID: UUID
+    ) {
+        self.sessionID = sessionID
+        self.itemID = itemID
+        self.itemRevision = itemRevision
+        self.occurrenceID = occurrenceID
+        self.sessionIndex = sessionIndex
+        self.plannedBlockID = plannedBlockID
+        self.sourceDeviceID = sourceDeviceID
+    }
+
+    func matches(_ session: DayWeaveExecutionSession) -> Bool {
+        self == Self(session: session)
+    }
+}
+
+struct DayWeavePendingExecutionCommand: Codable, Equatable, Sendable {
+    let idempotencyKey: String
+    let bindingIdentifier: String
+    let expectedRevision: UInt64
+    let identity: DayWeaveExecutionIdentity
+    let command: DayWeaveExecutionCommand
+    let encodedRequest: Data
+    let priorSession: DayWeaveExecutionSession?
+    let focusedBlockID: UUID
+    let canonicalProjectionEligibleAtLeaseStart: Bool
+    let stagedAt: Date
+}
+
+enum DayWeaveTerminalProjectionState: Codable, Equatable, Sendable {
+    case notRequired
+    case pending
+    case conflicted(String)
+    case retryAuthorized
+    case applied(revision: UInt64)
+    case keptLatest
+
+    var blocksCredentialReplacement: Bool {
+        switch self {
+        case .pending, .retryAuthorized: true
+        case .notRequired, .conflicted, .applied, .keptLatest: false
+        }
+    }
+}
+
+struct DayWeaveTerminalExecutionOutcome: Codable, Equatable, Sendable {
+    let session: DayWeaveExecutionSession
+    let recordedAt: Date
+    var projection: DayWeaveTerminalProjectionState
+}
+
+struct DayWeaveExecutionSessionVersion: Codable, Equatable, Sendable {
+    let sessionID: UUID
+    let revision: UInt64
+}
+
+/// Encrypted crash-recovery state for the one server-authoritative execution
+/// lease. Terminal rows are a lifetime ledger for this credential binding and
+/// intentionally have no age/count eviction policy.
+struct DayWeaveExecutionDurableState: Codable, Equatable, Sendable {
+    var deviceID: UUID?
+    var bindingIdentifier: String?
+    var revision: UInt64
+    var activeSession: DayWeaveExecutionSession?
+    var historyWindow: [DayWeaveExecutionSession]
+    var historyWindowRevision: UInt64?
+    var historyContinuityEstablished: Bool
+    var historyVerified: Bool
+    var pendingCommand: DayWeavePendingExecutionCommand?
+    var terminalOutcomes: [UUID: DayWeaveTerminalExecutionOutcome]
+    var leaseProjectionEligibility: [UUID: Bool]
+    var presentedBlockIDs: Set<UUID>
+    var acknowledgedExpiredPause: DayWeaveExecutionSessionVersion?
+
+    static let empty = Self(
+        deviceID: nil,
+        bindingIdentifier: nil,
+        revision: 0,
+        activeSession: nil,
+        historyWindow: [],
+        historyWindowRevision: nil,
+        historyContinuityEstablished: false,
+        historyVerified: false,
+        pendingCommand: nil,
+        terminalOutcomes: [:],
+        leaseProjectionEligibility: [:],
+        presentedBlockIDs: [],
+        acknowledgedExpiredPause: nil
+    )
+
+    var hasCredentialBoundState: Bool {
+        bindingIdentifier != nil
+            || revision != 0
+            || activeSession != nil
+            || !historyWindow.isEmpty
+            || historyWindowRevision != nil
+            || historyContinuityEstablished
+            || historyVerified
+            || pendingCommand != nil
+            || !terminalOutcomes.isEmpty
+            || !leaseProjectionEligibility.isEmpty
+            || !presentedBlockIDs.isEmpty
+            || acknowledgedExpiredPause != nil
+    }
+
+    var hasCredentialReplacementBlocker: Bool {
+        pendingCommand != nil
+            || terminalOutcomes.values.contains(where: { $0.projection.blocksCredentialReplacement })
+    }
+}
+
+struct DayWeaveExecutionHistoryPage: Equatable, Sendable {
+    let sessions: [DayWeaveExecutionSession]
+    let nextOffset: Int?
+}
+
+enum DayWeaveExecutionWireCodec {
+    static func encode(_ request: DayWeaveExecutionCommandRequest) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .custom { date, encoder in
+            var container = encoder.singleValueContainer()
+            try container.encode(format(date))
+        }
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(request)
+    }
+
+    static func decode(_ data: Data) throws -> DayWeaveExecutionCommandRequest {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let value = try container.decode(String.self)
+            guard let date = parse(value) else {
+                throw DecodingError.dataCorruptedError(
+                    in: container,
+                    debugDescription: "Expected an RFC 3339 timestamp"
+                )
+            }
+            return date
+        }
+        return try decoder.decode(DayWeaveExecutionCommandRequest.self, from: data)
+    }
+
+    private static func parse(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) { return date }
+        let whole = ISO8601DateFormatter()
+        whole.formatOptions = [.withInternetDateTime]
+        return whole.date(from: value)
+    }
+
+    private static func format(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+}
+
 struct DayWeaveExecutionSnapshotEnvelope: Decodable, Sendable {
     let execution: DayWeaveExecutionSnapshot
 
@@ -526,9 +776,22 @@ private func requireExecutionKeyShape(
     }
 }
 
+private func encodeExecutionNullable<Value: Encodable, Key: CodingKey>(
+    _ value: Value?,
+    forKey key: Key,
+    into container: inout KeyedEncodingContainer<Key>
+) throws {
+    if let value {
+        try container.encode(value, forKey: key)
+    } else {
+        try container.encodeNil(forKey: key)
+    }
+}
+
 private func validateExecutionSession(
     _ session: DayWeaveExecutionSession,
-    codingPath: [any CodingKey]
+    codingPath: [any CodingKey],
+    encoding: Bool = false
 ) throws {
     let identifiersAreValid = !session.id.isDayWeaveNil
         && !session.itemID.isDayWeaveNil
@@ -582,11 +845,22 @@ private func validateExecutionSession(
             && $0.unicodeScalars.count <= 500
     } ?? true
     guard commonStateIsValid, initialRevisionIsValid, statusStateIsValid, reasonIsValid else {
-        throw executionDecodingError(
-            codingPath: codingPath,
-            "Execution session violates the supported state invariants"
-        )
+        let description = "Execution session violates the supported state invariants"
+        if encoding {
+            throw executionEncodingError(codingPath: codingPath, description)
+        }
+        throw executionDecodingError(codingPath: codingPath, description)
     }
+}
+
+private func executionEncodingError(
+    codingPath: [any CodingKey],
+    _ description: String
+) -> EncodingError {
+    .invalidValue(
+        description,
+        .init(codingPath: codingPath, debugDescription: description)
+    )
 }
 
 private func executionDecodingError(

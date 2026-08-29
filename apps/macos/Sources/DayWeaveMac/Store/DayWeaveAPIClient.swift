@@ -687,14 +687,29 @@ struct DayWeaveAPIClient: Sendable {
     func executionHistory(limit: Int = Self.maximumExecutionHistoryLimit) async throws
         -> [DayWeaveExecutionSession]
     {
+        (try await executionHistoryPage(limit: limit, offset: 0)).sessions
+    }
+
+    func executionHistoryPage(
+        limit: Int = Self.maximumExecutionHistoryLimit,
+        offset: Int
+    ) async throws -> DayWeaveExecutionHistoryPage {
         guard (1...Self.maximumExecutionHistoryLimit).contains(limit) else {
             throw DayWeaveAPIError.requestEncodingFailed
+        }
+        guard offset >= 0 else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if offset > 0 {
+            queryItems.append(URLQueryItem(name: "offset", value: String(offset)))
         }
         let envelope: DayWeaveExecutionHistoryEnvelope = try await send(
             method: "GET",
             pathComponents: ["v1", "execution", "history"],
-            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+            queryItems: queryItems
         )
+        let expectedNext = offset.addingReportingOverflow(envelope.sessions.count)
         guard envelope.sessions.count <= limit,
               Set(envelope.sessions.map(\.id)).count == envelope.sessions.count,
               envelope.sessions.count(where: { $0.status.isOpen }) <= 1,
@@ -703,16 +718,26 @@ struct DayWeaveAPIClient: Sendable {
                       || (newer.updatedAt == older.updatedAt
                           && newer.id.uuidString.lowercased()
                               > older.id.uuidString.lowercased())
-              }) else {
+              }),
+              !expectedNext.overflow,
+              (envelope.nextOffset.map {
+                  envelope.sessions.count == limit
+                      && $0 == expectedNext.partialValue
+                      && $0 > offset
+              } ?? true) else {
             throw DayWeaveAPIError.responseDecodingFailed
         }
-        return envelope.sessions
+        return .init(sessions: envelope.sessions, nextOffset: envelope.nextOffset)
     }
 
     /// Produces the deterministic body that the caller must durably retain
     /// together with its idempotency key before the first network attempt.
     func encodedExecutionCommand(_ request: DayWeaveExecutionCommandRequest) throws -> Data {
-        try encode(request)
+        do {
+            return try DayWeaveExecutionWireCodec.encode(request)
+        } catch {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
     }
 
     func applyExecutionCommand(
@@ -735,10 +760,7 @@ struct DayWeaveAPIClient: Sendable {
             guard encodedRequest.count <= Self.maximumRequestBytes else {
                 throw DayWeaveAPIError.requestEncodingFailed
             }
-            persistedRequest = try makeDecoder().decode(
-                DayWeaveExecutionCommandRequest.self,
-                from: encodedRequest
-            )
+            persistedRequest = try DayWeaveExecutionWireCodec.decode(encodedRequest)
         } catch let error as DayWeaveAPIError {
             throw error
         } catch {
