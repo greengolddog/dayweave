@@ -319,3 +319,13 @@ The conversation briefly reused question numbers 164 and 165 before returning to
 - **Performance targets:** cold launch under 2 seconds on target hardware; smooth 60 fps interaction; typical day recomposition under 1 second; complex 90-day recomposition under 10 seconds; online changes visible across devices within 10 seconds under normal connectivity.
 - **Documentation:** architecture, setup, operations, recovery, security, and user documentation are part of the product—not optional handoff work.
 - **Definition of complete:** backend, polished macOS and Android clients, deterministic scheduler, Google Calendar and Tasks, embedded Codex assistant, external MCP/skill integration, deployment, automated tests, documentation, and the seven-day trial. WHOOP is explicitly deferred; Android Health Connect is not.
+
+## Post-discovery repository update
+
+239. **What is the repository visibility now?** The owner changed the DayWeave
+     GitHub repository from private to public. This supersedes only the earlier
+     visibility choice; the product remains publicly visible and proprietary.
+     No private credential, secret, token, key, signed credential bundle, or
+     real-account fixture may ever be committed or pushed. Runtime and CI
+     credentials must remain externally injected, project-scoped, and
+     revocable.
