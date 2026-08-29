@@ -3,6 +3,74 @@ import Darwin
 import Foundation
 import os
 
+enum CodexConversationClientError: LocalizedError, Equatable, Sendable {
+    case notSignedIn
+    case unavailable(String)
+    case busy
+    case invalidInput
+    case requestFailed(String)
+    case connectionClosed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notSignedIn:
+            "Sign in with ChatGPT before starting a conversation."
+        case let .unavailable(message), let .requestFailed(message), let .connectionClosed(message):
+            message
+        case .busy:
+            "Wait for the current Codex request to finish."
+        case .invalidInput:
+            "The conversation request was empty, oversized, or otherwise invalid."
+        }
+    }
+}
+
+struct CodexConversationThread: Equatable, Sendable {
+    let id: String
+}
+
+struct CodexConversationTurn: Equatable, Sendable {
+    let id: String
+    let threadID: String
+}
+
+enum CodexAgentMessagePhase: Equatable, Sendable {
+    case commentary
+    case finalAnswer
+    case unspecified
+}
+
+enum CodexConversationTurnOutcome: Equatable, Sendable {
+    case completed
+    case interrupted
+    case failed(String)
+}
+
+enum CodexConversationEvent: Equatable, Sendable {
+    case threadStarted(threadID: String)
+    case turnStarted(threadID: String, turnID: String)
+    case agentMessageDelta(
+        threadID: String,
+        turnID: String,
+        itemID: String,
+        phase: CodexAgentMessagePhase,
+        delta: String
+    )
+    case agentMessageCompleted(
+        threadID: String,
+        turnID: String,
+        itemID: String,
+        phase: CodexAgentMessagePhase,
+        text: String
+    )
+    case turnCompleted(
+        threadID: String,
+        turnID: String,
+        outcome: CodexConversationTurnOutcome
+    )
+    case connectionClosed(String)
+}
+
 @MainActor
 final class CodexAppServerClient: ObservableObject {
     private static let logger = Logger(subsystem: "com.greengolddog.dayweave", category: "Codex")
@@ -14,6 +82,13 @@ final class CodexAppServerClient: ObservableObject {
     private static let maximumBufferedBytes = 2 * maximumLineBytes
     private static let maximumPendingRequests = 32
     private static let maximumRequestID = 1_000_000_000
+    private static let maximumConversationThreads = 8
+    private static let maximumConversationSubscribers = 4
+    private static let maximumConversationInputBytes = 96 * 1_024
+    private static let maximumDeveloperInstructionBytes = 16 * 1_024
+    private static let maximumAgentDeltaBytes = 32 * 1_024
+    private static let maximumAgentMessageBytes = 128 * 1_024
+    private static let maximumAgentMessagesPerTurn = 16
     private static let allowedPlanTypes: Set<String> = [
         "free", "go", "plus", "pro", "prolite", "team",
         "self_serve_business_prolite", "self_serve_business_usage_based", "business",
@@ -82,6 +157,9 @@ final class CodexAppServerClient: ObservableObject {
         case deviceCodeLogin
         case cancelLogin(loginID: String)
         case logout
+        case threadStart
+        case turnStart(threadID: String)
+        case interrupt(threadID: String, turnID: String)
 
         var failureDescription: String {
             switch self {
@@ -90,15 +168,44 @@ final class CodexAppServerClient: ObservableObject {
             case .deviceCodeLogin: "ChatGPT sign-in could not be started"
             case .cancelLogin: "ChatGPT sign-in could not be canceled"
             case .logout: "Codex sign-out could not be completed"
+            case .threadStart: "Codex could not start a private conversation"
+            case .turnStart: "Codex could not start the response"
+            case .interrupt: "Codex could not stop the response"
             }
         }
 
         var timeoutSeconds: UInt64 {
             switch self {
-            case .initialize, .account, .cancelLogin, .logout: 10
-            case .deviceCodeLogin: 20
+            case .initialize, .account, .cancelLogin, .logout, .interrupt: 10
+            case .deviceCodeLogin, .threadStart, .turnStart: 20
             }
         }
+
+        var isConversationRequest: Bool {
+            switch self {
+            case .threadStart, .turnStart, .interrupt: true
+            default: false
+            }
+        }
+    }
+
+    private enum ConversationRequestCompletion {
+        case thread(CheckedContinuation<CodexConversationThread, any Error>)
+        case turn(CheckedContinuation<CodexConversationTurn, any Error>)
+        case interrupt(CheckedContinuation<Void, any Error>)
+    }
+
+    private struct AgentMessageIdentity: Equatable {
+        let threadID: String
+        let turnID: String
+        let phase: CodexAgentMessagePhase
+    }
+
+    private enum ParsedTurnStatus: Equatable {
+        case inProgress
+        case completed
+        case interrupted
+        case failed(String)
     }
 
     @Published private(set) var state: ConnectionState = .stopped
@@ -112,6 +219,14 @@ final class CodexAppServerClient: ObservableObject {
     private var nextRequestID = 1
     private var pending: [Int: RequestKind] = [:]
     private var requestTimeouts: [Int: Task<Void, Never>] = [:]
+    private var conversationRequestCompletions: [Int: ConversationRequestCompletion] = [:]
+    private var conversationEventContinuations: [
+        UUID: AsyncStream<CodexConversationEvent>.Continuation
+    ] = [:]
+    private var knownConversationThreadIDs: Set<String> = []
+    private var activeConversationTurns: [String: String] = [:]
+    private var agentMessageIdentities: [String: AgentMessageIdentity] = [:]
+    private var completedAgentMessageIDs: Set<String> = []
     private var pendingLoginID: String?
     private var retiredLoginIDs: Set<String> = []
     private var isInitialized = false
@@ -133,6 +248,201 @@ final class CodexAppServerClient: ObservableObject {
     ) {
         self.launcher = launcher
         self.verificationPageOpener = verificationPageOpener
+    }
+
+    func conversationEvents() -> AsyncStream<CodexConversationEvent> {
+        let subscriberID = UUID()
+        return AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
+            guard conversationEventContinuations.count < Self.maximumConversationSubscribers else {
+                continuation.finish()
+                return
+            }
+            conversationEventContinuations[subscriberID] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.conversationEventContinuations.removeValue(forKey: subscriberID)
+                }
+            }
+        }
+    }
+
+    private func handleThreadStart(_ result: [String: Any], requestID: Int) {
+        let allowedKeys: Set<String> = [
+            "approvalPolicy", "approvalsReviewer", "cwd", "instructionSources", "model",
+            "modelProvider", "reasoningEffort", "sandbox", "serviceTier", "thread",
+        ]
+        guard Set(result.keys).isSubset(of: allowedKeys),
+              result["approvalPolicy"] as? String == "never",
+              let reviewer = result["approvalsReviewer"] as? String,
+              ["user", "auto_review", "guardian_subagent"].contains(reviewer),
+              let runtime,
+              let cwd = result["cwd"] as? String,
+              URL(fileURLWithPath: cwd).standardizedFileURL
+                == runtime.codexHome.standardizedFileURL,
+              let model = result["model"] as? String,
+              !model.isEmpty,
+              model.utf8.count <= 256,
+              result["modelProvider"] as? String == "openai",
+              isReadOnlySandbox(result["sandbox"]),
+              areEmptyInstructionSources(result["instructionSources"]),
+              let thread = result["thread"] as? [String: Any],
+              let threadID = validatedConversationThreadID(thread, requireEphemeral: true),
+              knownConversationThreadIDs.count < Self.maximumConversationThreads,
+              let completion = conversationRequestCompletions.removeValue(forKey: requestID),
+              case let .thread(continuation) = completion else {
+            stopForProtocolFailure("Codex returned an invalid private-thread response")
+            return
+        }
+        knownConversationThreadIDs.insert(threadID)
+        continuation.resume(returning: CodexConversationThread(id: threadID))
+    }
+
+    private func handleTurnStart(
+        _ result: [String: Any],
+        requestID: Int,
+        expectedThreadID: String
+    ) {
+        guard Set(result.keys) == ["turn"],
+              knownConversationThreadIDs.contains(expectedThreadID),
+              activeConversationTurns[expectedThreadID] == nil,
+              let turn = result["turn"] as? [String: Any],
+              let parsed = validatedTurn(turn),
+              case .inProgress = parsed.status,
+              let completion = conversationRequestCompletions.removeValue(forKey: requestID),
+              case let .turn(continuation) = completion else {
+            stopForProtocolFailure("Codex returned an invalid turn-start response")
+            return
+        }
+        activeConversationTurns[expectedThreadID] = parsed.id
+        emitConversationEvent(.turnStarted(
+            threadID: expectedThreadID,
+            turnID: parsed.id
+        ))
+        continuation.resume(returning: CodexConversationTurn(
+            id: parsed.id,
+            threadID: expectedThreadID
+        ))
+    }
+
+    private func handleTurnInterrupt(
+        _ result: [String: Any],
+        requestID: Int,
+        expectedThreadID: String,
+        expectedTurnID: String
+    ) {
+        guard result.isEmpty,
+              knownConversationThreadIDs.contains(expectedThreadID),
+              activeConversationTurns[expectedThreadID] == expectedTurnID
+                || activeConversationTurns[expectedThreadID] == nil,
+              let completion = conversationRequestCompletions.removeValue(forKey: requestID),
+              case let .interrupt(continuation) = completion else {
+            stopForProtocolFailure("Codex returned an invalid turn-interrupt response")
+            return
+        }
+        continuation.resume(returning: ())
+    }
+
+    func startConversationThread(
+        developerInstructions: String
+    ) async throws -> CodexConversationThread {
+        guard case .signedIn = state else { throw CodexConversationClientError.notSignedIn }
+        guard let runtime, isInitialized else {
+            throw CodexConversationClientError.unavailable("Codex App Server is not ready")
+        }
+        guard !developerInstructions.isEmpty,
+              developerInstructions.utf8.count <= Self.maximumDeveloperInstructionBytes else {
+            throw CodexConversationClientError.invalidInput
+        }
+        guard knownConversationThreadIDs.count < Self.maximumConversationThreads,
+              !pending.values.contains(.threadStart) else {
+            throw CodexConversationClientError.busy
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            _ = send(
+                method: "thread/start",
+                params: [
+                    "approvalPolicy": "never",
+                    "cwd": runtime.codexHome.path,
+                    "developerInstructions": developerInstructions,
+                    "ephemeral": true,
+                    "personality": "friendly",
+                    "sandbox": "read-only",
+                    "serviceName": "dayweave",
+                ],
+                kind: .threadStart,
+                conversationCompletion: .thread(continuation)
+            )
+        }
+    }
+
+    func startConversationTurn(
+        threadID: String,
+        input: String
+    ) async throws -> CodexConversationTurn {
+        guard case .signedIn = state else { throw CodexConversationClientError.notSignedIn }
+        guard runtime != nil, isInitialized else {
+            throw CodexConversationClientError.unavailable("Codex App Server is not ready")
+        }
+        guard isValidOpaqueIdentifier(threadID),
+              knownConversationThreadIDs.contains(threadID),
+              input.utf8.count <= Self.maximumConversationInputBytes,
+              !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CodexConversationClientError.invalidInput
+        }
+        guard activeConversationTurns[threadID] == nil,
+              !pending.values.contains(where: {
+                  if case let .turnStart(candidate) = $0 { return candidate == threadID }
+                  return false
+              }) else {
+            throw CodexConversationClientError.busy
+        }
+
+        return try await withCheckedThrowingContinuation { continuation in
+            _ = send(
+                method: "turn/start",
+                params: [
+                    "threadId": threadID,
+                    "clientUserMessageId": UUID().uuidString.lowercased(),
+                    "input": [["type": "text", "text": input]],
+                ],
+                kind: .turnStart(threadID: threadID),
+                conversationCompletion: .turn(continuation)
+            )
+        }
+    }
+
+    func interruptConversationTurn(
+        threadID: String,
+        turnID: String
+    ) async throws {
+        guard case .signedIn = state else { throw CodexConversationClientError.notSignedIn }
+        guard runtime != nil, isInitialized else {
+            throw CodexConversationClientError.unavailable("Codex App Server is not ready")
+        }
+        guard isValidOpaqueIdentifier(threadID),
+              isValidOpaqueIdentifier(turnID),
+              knownConversationThreadIDs.contains(threadID),
+              activeConversationTurns[threadID] == turnID else {
+            throw CodexConversationClientError.invalidInput
+        }
+        guard !pending.values.contains(where: {
+            if case let .interrupt(candidateThread, candidateTurn) = $0 {
+                return candidateThread == threadID && candidateTurn == turnID
+            }
+            return false
+        }) else {
+            throw CodexConversationClientError.busy
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            _ = send(
+                method: "turn/interrupt",
+                params: ["threadId": threadID, "turnId": turnID],
+                kind: .interrupt(threadID: threadID, turnID: turnID),
+                conversationCompletion: .interrupt(continuation)
+            )
+        }
     }
 
     func startIfNeeded() {
@@ -299,13 +609,29 @@ final class CodexAppServerClient: ObservableObject {
         )
     }
 
-    private func send(method: String, params: [String: Any]?, kind: RequestKind) -> Bool {
+    private func send(
+        method: String,
+        params: [String: Any]?,
+        kind: RequestKind,
+        conversationCompletion: ConversationRequestCompletion? = nil
+    ) -> Bool {
         guard let runtime else {
+            if let conversationCompletion {
+                resume(
+                    conversationCompletion,
+                    throwing: CodexConversationClientError.unavailable(
+                        "Codex App Server is not running"
+                    )
+                )
+            }
             state = .unavailable("Codex App Server is not running")
             return false
         }
         guard pending.count < Self.maximumPendingRequests,
               nextRequestID <= Self.maximumRequestID else {
+            if let conversationCompletion {
+                resume(conversationCompletion, throwing: CodexConversationClientError.busy)
+            }
             stopForProtocolFailure("Codex request capacity was exceeded")
             return false
         }
@@ -321,6 +647,9 @@ final class CodexAppServerClient: ObservableObject {
             }
             data.append(0x0A)
             pending[id] = kind
+            if let conversationCompletion {
+                conversationRequestCompletions[id] = conversationCompletion
+            }
             requestTimeouts[id] = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .seconds(kind.timeoutSeconds))
                 guard !Task.isCancelled else { return }
@@ -331,6 +660,14 @@ final class CodexAppServerClient: ObservableObject {
         } catch {
             pending.removeValue(forKey: id)
             requestTimeouts.removeValue(forKey: id)?.cancel()
+            if let completion = conversationRequestCompletions.removeValue(forKey: id) {
+                resume(
+                    completion,
+                    throwing: CodexConversationClientError.connectionClosed(
+                        "Could not communicate with Codex App Server"
+                    )
+                )
+            }
             stopForProtocolFailure("Could not communicate with Codex App Server")
             return false
         }
@@ -370,6 +707,7 @@ final class CodexAppServerClient: ObservableObject {
     }
 
     private func receive(_ data: Data) {
+        guard runtime != nil, !isStopping else { return }
         guard data.count <= Self.maximumBufferedBytes,
               receiveBuffer.count <= Self.maximumBufferedBytes - data.count else {
             stopForProtocolFailure("Codex App Server output exceeded its safety bound")
@@ -386,7 +724,10 @@ final class CodexAppServerClient: ObservableObject {
                 return
             }
             handle(message)
-            guard runtime != nil else { return }
+            // A fatal protocol decision starts asynchronous process teardown. Do not
+            // keep interpreting lines that were already present in the same read,
+            // because they could overwrite the first (authoritative) failure state.
+            guard runtime != nil, !isStopping else { return }
         }
         if receiveBuffer.count > Self.maximumLineBytes {
             stopForProtocolFailure("Codex App Server emitted an oversized protocol line")
@@ -444,6 +785,18 @@ final class CodexAppServerClient: ObservableObject {
                 stopForProtocolFailure("Codex App Server emitted an invalid error response")
                 return
             }
+            if kind.isConversationRequest {
+                let detail = (message["error"] as? [String: Any])?["message"] as? String
+                let failure = detail.map { "\(kind.failureDescription): \($0)" }
+                    ?? kind.failureDescription
+                if let completion = conversationRequestCompletions.removeValue(forKey: id) {
+                    resume(
+                        completion,
+                        throwing: CodexConversationClientError.requestFailed(failure)
+                    )
+                }
+                return
+            }
             stopForProtocolFailure(kind.failureDescription)
             return
         }
@@ -485,7 +838,19 @@ final class CodexAppServerClient: ObservableObject {
             pendingLoginID = nil
             queuedDeviceCodeSignIn = false
             cancelRequested = false
+            invalidateConversationState(message: "ChatGPT signed out")
             state = .signedOut
+        case .threadStart:
+            handleThreadStart(result, requestID: id)
+        case let .turnStart(threadID):
+            handleTurnStart(result, requestID: id, expectedThreadID: threadID)
+        case let .interrupt(threadID, turnID):
+            handleTurnInterrupt(
+                result,
+                requestID: id,
+                expectedThreadID: threadID,
+                expectedTurnID: turnID
+            )
         }
     }
 
@@ -574,8 +939,377 @@ final class CodexAppServerClient: ObservableObject {
                 return
             }
             refreshAccount()
+        case "thread/started":
+            handleThreadStartedNotification(params)
+        case "turn/started":
+            handleTurnStartedNotification(params)
+        case "item/started":
+            handleItemStartedNotification(params)
+        case "item/agentMessage/delta":
+            handleAgentMessageDeltaNotification(params)
+        case "item/completed":
+            handleItemCompletedNotification(params)
+        case "turn/completed":
+            handleTurnCompletedNotification(params)
         default:
             break
+        }
+    }
+
+    private func handleThreadStartedNotification(_ params: [String: Any]?) {
+        guard let params,
+              Set(params.keys) == ["thread"],
+              let thread = params["thread"] as? [String: Any],
+              let threadID = validatedConversationThreadID(thread, requireEphemeral: true),
+              knownConversationThreadIDs.contains(threadID) else {
+            stopForProtocolFailure("Codex emitted an invalid thread-started notification")
+            return
+        }
+        emitConversationEvent(.threadStarted(threadID: threadID))
+    }
+
+    private func handleTurnStartedNotification(_ params: [String: Any]?) {
+        guard let params,
+              Set(params.keys) == ["threadId", "turn"],
+              let threadID = params["threadId"] as? String,
+              knownConversationThreadIDs.contains(threadID),
+              let turn = params["turn"] as? [String: Any],
+              let parsed = validatedTurn(turn),
+              case .inProgress = parsed.status,
+              activeConversationTurns[threadID] == parsed.id else {
+            stopForProtocolFailure("Codex emitted an invalid turn-started notification")
+            return
+        }
+        emitConversationEvent(.turnStarted(threadID: threadID, turnID: parsed.id))
+    }
+
+    private func handleItemStartedNotification(_ params: [String: Any]?) {
+        guard let envelope = validatedItemEnvelope(params, timestampKey: "startedAtMs") else {
+            stopForProtocolFailure("Codex emitted an invalid item-started notification")
+            return
+        }
+        guard envelope.type == "agentMessage" else { return }
+        guard let message = validatedAgentMessage(envelope.item) else {
+            stopForProtocolFailure("Codex emitted an invalid agent-message item")
+            return
+        }
+        let identity = AgentMessageIdentity(
+            threadID: envelope.threadID,
+            turnID: envelope.turnID,
+            phase: message.phase
+        )
+        guard !completedAgentMessageIDs.contains(message.id) else {
+            stopForProtocolFailure("Codex restarted a completed agent message")
+            return
+        }
+        if let existing = agentMessageIdentities[message.id] {
+            guard existing == identity else {
+                stopForProtocolFailure("Codex reused an agent-message identifier")
+                return
+            }
+        } else {
+            guard agentMessageIdentities.values.count(where: {
+                $0.threadID == envelope.threadID && $0.turnID == envelope.turnID
+            }) < Self.maximumAgentMessagesPerTurn else {
+                stopForProtocolFailure("Codex exceeded the agent-message safety bound")
+                return
+            }
+            agentMessageIdentities[message.id] = identity
+        }
+    }
+
+    private func handleAgentMessageDeltaNotification(_ params: [String: Any]?) {
+        guard let params,
+              Set(params.keys) == ["delta", "itemId", "threadId", "turnId"],
+              let threadID = params["threadId"] as? String,
+              let turnID = params["turnId"] as? String,
+              let itemID = params["itemId"] as? String,
+              isValidOpaqueIdentifier(itemID),
+              activeConversationTurns[threadID] == turnID,
+              let identity = agentMessageIdentities[itemID],
+              identity.threadID == threadID,
+              identity.turnID == turnID,
+              !completedAgentMessageIDs.contains(itemID),
+              let delta = params["delta"] as? String,
+              delta.utf8.count <= Self.maximumAgentDeltaBytes else {
+            stopForProtocolFailure("Codex emitted an invalid agent-message delta")
+            return
+        }
+        emitConversationEvent(.agentMessageDelta(
+            threadID: threadID,
+            turnID: turnID,
+            itemID: itemID,
+            phase: identity.phase,
+            delta: delta
+        ))
+    }
+
+    private func handleItemCompletedNotification(_ params: [String: Any]?) {
+        guard let envelope = validatedItemEnvelope(params, timestampKey: "completedAtMs") else {
+            stopForProtocolFailure("Codex emitted an invalid item-completed notification")
+            return
+        }
+        guard envelope.type == "agentMessage" else { return }
+        guard let message = validatedAgentMessage(envelope.item) else {
+            stopForProtocolFailure("Codex emitted an invalid completed agent message")
+            return
+        }
+        let identity = AgentMessageIdentity(
+            threadID: envelope.threadID,
+            turnID: envelope.turnID,
+            phase: message.phase
+        )
+        guard !completedAgentMessageIDs.contains(message.id) else {
+            stopForProtocolFailure("Codex completed an agent message more than once")
+            return
+        }
+        if let existing = agentMessageIdentities[message.id] {
+            guard existing.threadID == identity.threadID,
+                  existing.turnID == identity.turnID else {
+                stopForProtocolFailure("Codex completed an agent message on the wrong turn")
+                return
+            }
+        } else {
+            guard agentMessageIdentities.values.count(where: {
+                $0.threadID == envelope.threadID && $0.turnID == envelope.turnID
+            }) < Self.maximumAgentMessagesPerTurn else {
+                stopForProtocolFailure("Codex exceeded the agent-message safety bound")
+                return
+            }
+        }
+        agentMessageIdentities[message.id] = identity
+        completedAgentMessageIDs.insert(message.id)
+        emitConversationEvent(.agentMessageCompleted(
+            threadID: envelope.threadID,
+            turnID: envelope.turnID,
+            itemID: message.id,
+            phase: message.phase,
+            text: message.text
+        ))
+    }
+
+    private func handleTurnCompletedNotification(_ params: [String: Any]?) {
+        guard let params,
+              Set(params.keys) == ["threadId", "turn"],
+              let threadID = params["threadId"] as? String,
+              knownConversationThreadIDs.contains(threadID),
+              let turn = params["turn"] as? [String: Any],
+              let parsed = validatedTurn(turn),
+              activeConversationTurns[threadID] == parsed.id else {
+            stopForProtocolFailure("Codex emitted an invalid turn-completed notification")
+            return
+        }
+        let outcome: CodexConversationTurnOutcome
+        switch parsed.status {
+        case .completed:
+            outcome = .completed
+        case .interrupted:
+            outcome = .interrupted
+        case let .failed(message):
+            outcome = .failed(message)
+        case .inProgress:
+            stopForProtocolFailure("Codex completed a turn with an in-progress status")
+            return
+        }
+        activeConversationTurns.removeValue(forKey: threadID)
+        agentMessageIdentities = agentMessageIdentities.filter {
+            $0.value.threadID != threadID || $0.value.turnID != parsed.id
+        }
+        completedAgentMessageIDs = completedAgentMessageIDs.filter {
+            agentMessageIdentities[$0] != nil
+        }
+        emitConversationEvent(.turnCompleted(
+            threadID: threadID,
+            turnID: parsed.id,
+            outcome: outcome
+        ))
+    }
+
+    private func validatedConversationThreadID(
+        _ thread: [String: Any],
+        requireEphemeral: Bool
+    ) -> String? {
+        let allowedKeys: Set<String> = [
+            "agentNickname", "agentRole", "cliVersion", "createdAt", "cwd", "ephemeral",
+            "forkedFromId", "gitInfo", "id", "modelProvider", "name", "parentThreadId",
+            "path", "preview", "projectId", "recencyAt", "section", "sectionEnteredAt",
+            "sessionId", "source", "status", "threadSource", "turns", "updatedAt",
+        ]
+        guard Set(thread.keys).isSubset(of: allowedKeys),
+              let id = thread["id"] as? String,
+              isValidOpaqueIdentifier(id),
+              let sessionID = thread["sessionId"] as? String,
+              sessionID == id,
+              thread["modelProvider"] as? String == "openai",
+              let ephemeral = thread["ephemeral"] as? Bool,
+              !requireEphemeral || ephemeral,
+              let cliVersion = thread["cliVersion"] as? String,
+              !cliVersion.isEmpty,
+              cliVersion.utf8.count <= 128,
+              let runtime,
+              let cwd = thread["cwd"] as? String,
+              URL(fileURLWithPath: cwd).standardizedFileURL
+                == runtime.codexHome.standardizedFileURL,
+              let createdAt = exactSignedInteger(thread["createdAt"]),
+              createdAt >= 0,
+              let updatedAt = exactSignedInteger(thread["updatedAt"]),
+              updatedAt >= 0,
+              let preview = thread["preview"] as? String,
+              preview.utf8.count <= 8 * 1_024,
+              thread.keys.contains("projectId"),
+              isNullOrBoundedString(thread["projectId"], maximumBytes: 128),
+              let turns = thread["turns"] as? [Any],
+              turns.isEmpty,
+              isValidThreadSource(thread["source"]),
+              isValidThreadStatus(thread["status"]),
+              isNullOrBoundedString(thread["path"], maximumBytes: 4 * 1_024),
+              !requireEphemeral || thread["path"] == nil || thread["path"] is NSNull else {
+            return nil
+        }
+        return id
+    }
+
+    private func validatedTurn(
+        _ turn: [String: Any]
+    ) -> (id: String, status: ParsedTurnStatus)? {
+        let allowedKeys: Set<String> = [
+            "completedAt", "durationMs", "error", "id", "items", "itemsView", "startedAt",
+            "status",
+        ]
+        guard Set(turn.keys).isSubset(of: allowedKeys),
+              let id = turn["id"] as? String,
+              isValidOpaqueIdentifier(id),
+              let items = turn["items"] as? [Any],
+              items.count <= 2_048,
+              turn["itemsView"] == nil
+                || (turn["itemsView"] as? String).map({
+                    ["full", "notLoaded", "summary"].contains($0)
+                }) == true,
+              isNullOrNonnegativeInteger(turn["startedAt"]),
+              isNullOrNonnegativeInteger(turn["completedAt"]),
+              isNullOrNonnegativeInteger(turn["durationMs"]),
+              let rawStatus = turn["status"] as? String else { return nil }
+
+        let status: ParsedTurnStatus
+        switch rawStatus {
+        case "inProgress":
+            guard turn["error"] == nil || turn["error"] is NSNull else { return nil }
+            status = .inProgress
+        case "completed":
+            guard turn["error"] == nil || turn["error"] is NSNull else { return nil }
+            status = .completed
+        case "interrupted":
+            guard turn["error"] == nil || turn["error"] is NSNull else { return nil }
+            status = .interrupted
+        case "failed":
+            guard let error = turn["error"] as? [String: Any],
+                  Set(error.keys).isSubset(of: ["additionalDetails", "codexErrorInfo", "message"]),
+                  let message = error["message"] as? String,
+                  !message.isEmpty,
+                  message.utf8.count <= 2_048 else { return nil }
+            status = .failed(message)
+        default:
+            return nil
+        }
+        return (id, status)
+    }
+
+    private func validatedItemEnvelope(
+        _ params: [String: Any]?,
+        timestampKey: String
+    ) -> (threadID: String, turnID: String, type: String, item: [String: Any])? {
+        guard let params,
+              Set(params.keys) == ["item", timestampKey, "threadId", "turnId"],
+              let timestamp = exactSignedInteger(params[timestampKey]),
+              timestamp >= 0,
+              let threadID = params["threadId"] as? String,
+              let turnID = params["turnId"] as? String,
+              knownConversationThreadIDs.contains(threadID),
+              activeConversationTurns[threadID] == turnID,
+              let item = params["item"] as? [String: Any],
+              let itemID = item["id"] as? String,
+              isValidOpaqueIdentifier(itemID),
+              let type = item["type"] as? String,
+              !type.isEmpty,
+              type.utf8.count <= 64 else { return nil }
+        return (threadID, turnID, type, item)
+    }
+
+    private func validatedAgentMessage(
+        _ item: [String: Any]
+    ) -> (id: String, phase: CodexAgentMessagePhase, text: String)? {
+        let allowedKeys: Set<String> = [
+            "delivery", "id", "memoryCitation", "phase", "text", "type",
+        ]
+        guard Set(item.keys).isSubset(of: allowedKeys),
+              item["type"] as? String == "agentMessage",
+              let id = item["id"] as? String,
+              isValidOpaqueIdentifier(id),
+              let text = item["text"] as? String,
+              text.utf8.count <= Self.maximumAgentMessageBytes,
+              item["delivery"] == nil || item["delivery"] is NSNull
+                || item["delivery"] as? String == "async",
+              item["memoryCitation"] == nil || item["memoryCitation"] is NSNull
+                || item["memoryCitation"] is [String: Any] else { return nil }
+
+        let phase: CodexAgentMessagePhase
+        if item["phase"] == nil || item["phase"] is NSNull {
+            phase = .unspecified
+        } else {
+            switch item["phase"] as? String {
+            case "commentary": phase = .commentary
+            case "final_answer": phase = .finalAnswer
+            default: return nil
+            }
+        }
+        return (id, phase, text)
+    }
+
+    private func isReadOnlySandbox(_ value: Any?) -> Bool {
+        guard let sandbox = value as? [String: Any],
+              Set(sandbox.keys).isSubset(of: ["networkAccess", "type"]),
+              sandbox["type"] as? String == "readOnly" else { return false }
+        return sandbox["networkAccess"] == nil || sandbox["networkAccess"] as? Bool == false
+    }
+
+    private func areEmptyInstructionSources(_ value: Any?) -> Bool {
+        guard value != nil else { return true }
+        guard let sources = value as? [Any] else { return false }
+        return sources.isEmpty
+    }
+
+    private func isNullOrBoundedString(_ value: Any?, maximumBytes: Int) -> Bool {
+        if value == nil || value is NSNull { return true }
+        guard let value = value as? String else { return false }
+        return value.utf8.count <= maximumBytes
+    }
+
+    private func isNullOrNonnegativeInteger(_ value: Any?) -> Bool {
+        if value == nil || value is NSNull { return true }
+        return exactSignedInteger(value).map { $0 >= 0 } == true
+    }
+
+    private func isValidThreadSource(_ value: Any?) -> Bool {
+        if let source = value as? String {
+            return ["appServer", "unknown"].contains(source)
+        }
+        guard let source = value as? [String: Any],
+              Set(source.keys) == ["custom"],
+              let custom = source["custom"] as? String else { return false }
+        return !custom.isEmpty && custom.utf8.count <= 128
+    }
+
+    private func isValidThreadStatus(_ value: Any?) -> Bool {
+        guard let status = value as? [String: Any],
+              let type = status["type"] as? String else { return false }
+        switch type {
+        case "notLoaded", "idle", "systemError":
+            return Set(status.keys) == ["type"]
+        case "active":
+            return Set(status.keys) == ["activeFlags", "type"]
+                && status["activeFlags"] is [Any]
+        default:
+            return false
         }
     }
 
@@ -587,6 +1321,7 @@ final class CodexAppServerClient: ObservableObject {
         guard let rawAccount = result["account"], !(rawAccount is NSNull) else {
             deviceCode = nil
             verificationURL = nil
+            invalidateConversationState(message: "ChatGPT sign-in is required")
             state = .signedOut
             beginQueuedDeviceCodeSignInIfReady()
             return
@@ -625,8 +1360,16 @@ final class CodexAppServerClient: ObservableObject {
     }
 
     private func requestTimedOut(id: Int) {
-        guard pending.removeValue(forKey: id) != nil else { return }
+        guard let kind = pending.removeValue(forKey: id) else { return }
         requestTimeouts.removeValue(forKey: id)?.cancel()
+        if let completion = conversationRequestCompletions.removeValue(forKey: id) {
+            resume(
+                completion,
+                throwing: CodexConversationClientError.connectionClosed(
+                    "\(kind.failureDescription): Codex App Server did not respond in time"
+                )
+            )
+        }
         stopForProtocolFailure("Codex App Server did not respond in time")
     }
 
@@ -665,6 +1408,9 @@ final class CodexAppServerClient: ObservableObject {
     }
 
     private func resetProtocolState(keepingQueuedSignIn: Bool) {
+        failAllConversationRequests(
+            with: CodexConversationClientError.connectionClosed("Codex connection was reset")
+        )
         deviceCode = nil
         verificationURL = nil
         receiveBuffer.removeAll(keepingCapacity: false)
@@ -673,9 +1419,81 @@ final class CodexAppServerClient: ObservableObject {
         requestTimeouts.removeAll()
         pendingLoginID = nil
         retiredLoginIDs.removeAll()
+        knownConversationThreadIDs.removeAll()
+        activeConversationTurns.removeAll()
+        agentMessageIdentities.removeAll()
+        completedAgentMessageIDs.removeAll()
         isInitialized = false
         cancelRequested = false
         if !keepingQueuedSignIn { queuedDeviceCodeSignIn = false }
+    }
+
+    private func invalidateConversationState(message: String) {
+        let requestIDs = Array(conversationRequestCompletions.keys)
+        for id in requestIDs {
+            pending.removeValue(forKey: id)
+            requestTimeouts.removeValue(forKey: id)?.cancel()
+        }
+        failAllConversationRequests(
+            with: CodexConversationClientError.connectionClosed(message)
+        )
+        let hadConversation = !knownConversationThreadIDs.isEmpty
+            || !activeConversationTurns.isEmpty
+            || !agentMessageIdentities.isEmpty
+            || !completedAgentMessageIDs.isEmpty
+        knownConversationThreadIDs.removeAll()
+        activeConversationTurns.removeAll()
+        agentMessageIdentities.removeAll()
+        completedAgentMessageIDs.removeAll()
+        if hadConversation {
+            emitConversationEvent(.connectionClosed(message))
+        }
+    }
+
+    private func failAllConversationRequests(with error: CodexConversationClientError) {
+        let completions = Array(conversationRequestCompletions.values)
+        conversationRequestCompletions.removeAll()
+        for completion in completions {
+            resume(completion, throwing: error)
+        }
+    }
+
+    private func resume(
+        _ completion: ConversationRequestCompletion,
+        throwing error: CodexConversationClientError
+    ) {
+        switch completion {
+        case let .thread(continuation): continuation.resume(throwing: error)
+        case let .turn(continuation): continuation.resume(throwing: error)
+        case let .interrupt(continuation): continuation.resume(throwing: error)
+        }
+    }
+
+    private func emitConversationEvent(_ event: CodexConversationEvent) {
+        var terminatedSubscriberIDs: [UUID] = []
+        var didDrop = false
+        for (subscriberID, continuation) in conversationEventContinuations {
+            switch continuation.yield(event) {
+            case .enqueued:
+                break
+            case .dropped:
+                didDrop = true
+                continuation.finish()
+                terminatedSubscriberIDs.append(subscriberID)
+            case .terminated:
+                terminatedSubscriberIDs.append(subscriberID)
+            @unknown default:
+                didDrop = true
+                continuation.finish()
+                terminatedSubscriberIDs.append(subscriberID)
+            }
+        }
+        for subscriberID in terminatedSubscriberIDs {
+            conversationEventContinuations.removeValue(forKey: subscriberID)
+        }
+        if didDrop, runtime != nil {
+            stopForProtocolFailure("The Codex conversation event consumer fell behind")
+        }
     }
 
     private func stopForProtocolFailure(_ message: String) {
@@ -692,6 +1510,7 @@ final class CodexAppServerClient: ObservableObject {
         cancelRequested = false
         isInitialized = false
         state = .unavailable(message)
+        invalidateConversationState(message: message)
         pending.removeAll()
         for task in requestTimeouts.values { task.cancel() }
         requestTimeouts.removeAll()
@@ -718,6 +1537,10 @@ final class CodexAppServerClient: ObservableObject {
     private func handleTermination(exitCode: Int32? = nil) {
         guard let runtime else { return }
         let wasShuttingDown = isShuttingDown
+        if !wasShuttingDown {
+            let detail = exitCode.map { " (exit \($0))" } ?? ""
+            invalidateConversationState(message: "Codex App Server stopped\(detail)")
+        }
         runtime.output.readabilityHandler = nil
         self.runtime = nil
         isStopping = false
@@ -750,6 +1573,13 @@ final class CodexAppServerClient: ObservableObject {
         let integer = number.int64Value
         guard number.doubleValue == Double(integer) else { return nil }
         return integer
+    }
+
+    private func isValidOpaqueIdentifier(_ value: String) -> Bool {
+        guard (1...128).contains(value.utf8.count) else { return false }
+        return value.utf8.allSatisfy {
+            $0.isASCIIAlphaNumeric || $0 == 45 || $0 == 46 || $0 == 58 || $0 == 95
+        }
     }
 
     private func incomingRequestID(_ value: Any?) -> IncomingRequestID? {

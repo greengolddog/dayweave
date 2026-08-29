@@ -7,6 +7,7 @@ struct DayWeaveMacApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var store: PlannerStore
     @StateObject private var codex: CodexAppServerClient
+    @StateObject private var codexConversation: CodexConversationController
     @StateObject private var suggestionSync: SuggestionSyncStore
     @StateObject private var canonicalSync: CanonicalSyncStore
 
@@ -15,6 +16,11 @@ struct DayWeaveMacApp: App {
         _store = StateObject(wrappedValue: store)
         let codex = CodexAppServerClient()
         _codex = StateObject(wrappedValue: codex)
+        _codexConversation = StateObject(wrappedValue: CodexConversationController(
+            client: codex,
+            contextProvider: store,
+            suggestionRouter: CodexSuggestionInboxRouter(planner: store)
+        ))
         _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
         _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
         codex.startIfNeeded()
@@ -25,6 +31,7 @@ struct DayWeaveMacApp: App {
             RootView()
                 .environmentObject(store)
                 .environmentObject(codex)
+                .environmentObject(codexConversation)
                 .environmentObject(suggestionSync)
                 .environmentObject(canonicalSync)
                 .frame(minWidth: 1_080, minHeight: 720)
@@ -35,6 +42,7 @@ struct DayWeaveMacApp: App {
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     store.flushPersistence()
+                    codexConversation.shutDown()
                     codex.shutDown()
                 }
         }

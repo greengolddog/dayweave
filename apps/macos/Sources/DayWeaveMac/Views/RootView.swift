@@ -687,6 +687,7 @@ private struct InspectorSection<Content: View>: View {
 private struct AssistantView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
+    @EnvironmentObject private var conversation: CodexConversationController
     @State private var draft = ""
 
     var body: some View {
@@ -715,51 +716,174 @@ private struct AssistantView: View {
                 default:
                     EmptyView()
                 }
+                if case .signedIn = codex.state, conversation.isTurnActive {
+                    Button("Stop") { conversation.stopResponse() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                        .disabled(conversation.activity == .stopping)
+                }
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             Divider()
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(store.assistantMessages) { message in
-                            AssistantBubble(message: message)
-                                .id(message.id)
+            if conversation.messages.isEmpty {
+                assistantEmptyState
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 12) {
+                            ForEach(conversation.messages) { message in
+                                AssistantBubble(message: message)
+                                    .id(message.id)
+                            }
                         }
+                        .padding(16)
                     }
-                    .padding(16)
-                }
-                .onChange(of: store.assistantMessages.count) {
-                    if let last = store.assistantMessages.last {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+                    .onChange(of: conversation.messages) {
+                        if let last = conversation.messages.last {
+                            withAnimation(.easeOut(duration: 0.16)) {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
                     }
                 }
             }
 
+            if let progress = conversation.progressText, !progress.isEmpty {
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.mini)
+                    Text(progress)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(Color(nsColor: .controlBackgroundColor))
+            }
+
+            if case let .failed(message) = conversation.activity {
+                Label(message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .background(Color.red.opacity(0.08))
+            } else if conversation.lastProposalCount > 0 {
+                Button {
+                    store.destination = .inbox
+                } label: {
+                    Label(
+                        "\(conversation.lastProposalCount) proposal\(conversation.lastProposalCount == 1 ? "" : "s") sent to Inbox for review",
+                        systemImage: "tray.and.arrow.down.fill"
+                    )
+                    .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.purple)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(Color.purple.opacity(0.08))
+            }
+
             Divider()
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Save a local planner note…", text: $draft, axis: .vertical)
+                TextField(composerPlaceholder, text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...5)
                     .onSubmit(send)
-                Button(action: send) {
-                    Image(systemName: "arrow.up.circle.fill")
+                    .disabled(!isSignedIn || conversation.activity.isBusy)
+                Button(action: primaryComposerAction) {
+                    Image(systemName: conversation.isTurnActive ? "stop.circle.fill" : "arrow.up.circle.fill")
                         .font(.title2)
                 }
                 .buttonStyle(.plain)
-                .disabled(
-                    draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || !store.canMutatePlan
-                )
+                .disabled(conversation.isTurnActive ? conversation.activity == .stopping : !canSend)
+                .help(conversation.isTurnActive ? "Stop response" : "Send to Codex")
             }
             .padding(12)
         }
     }
 
     private func send() {
-        store.sendAssistantMessage(draft)
+        guard canSend else { return }
+        conversation.send(draft)
         draft = ""
+    }
+
+    private func primaryComposerAction() {
+        if conversation.isTurnActive {
+            conversation.stopResponse()
+        } else {
+            send()
+        }
+    }
+
+    @ViewBuilder
+    private var assistantEmptyState: some View {
+        switch codex.state {
+        case .signedIn:
+            ContentUnavailableView {
+                Label("Plan with Codex", systemImage: "sparkles")
+            } description: {
+                Text("Ask about today, tradeoffs, habits, or deadlines. Codex receives a redacted, read-only planner snapshot and can only propose changes for your approval.")
+            }
+        case .signedOut:
+            ContentUnavailableView {
+                Label("Connect ChatGPT", systemImage: "person.crop.circle.badge.plus")
+            } description: {
+                Text("Use device-code sign-in to start a private in-app planning conversation.")
+            } actions: {
+                Button("Sign in") { codex.signInWithDeviceCode() }
+                    .buttonStyle(.borderedProminent)
+            }
+        case .signingIn, .cancellingSignIn:
+            ContentUnavailableView {
+                Label("Finish ChatGPT sign-in", systemImage: "hourglass")
+            } description: {
+                Text("Return here after completing the device-code ceremony.")
+            }
+        case let .unavailable(message):
+            ContentUnavailableView {
+                Label("Codex is offline", systemImage: "bolt.slash")
+            } description: {
+                Text(message)
+            } actions: {
+                Button("Retry") { codex.retry() }
+            }
+        case .starting:
+            ContentUnavailableView {
+                Label("Starting Codex", systemImage: "ellipsis")
+            } description: {
+                Text("Verifying the contained runtime and checking ChatGPT sign-in.")
+            }
+        case .stopped:
+            ContentUnavailableView("Codex is stopped", systemImage: "stop.circle")
+        }
+    }
+
+    private var canSend: Bool {
+        isSignedIn
+            && !conversation.activity.isBusy
+            && !conversation.isTurnActive
+            && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && draft.utf8.count <= CodexPlannerContextSerializer.maximumUserMessageBytes
+    }
+
+    private var isSignedIn: Bool {
+        if case .signedIn = codex.state { return true }
+        return false
+    }
+
+    private var composerPlaceholder: String {
+        if !isSignedIn { return "Sign in to chat with Codex…" }
+        if conversation.activity.isBusy { return "Codex is responding…" }
+        return "Ask about your plan…"
     }
 
     private var codexStatusColor: Color {
@@ -773,17 +897,36 @@ private struct AssistantView: View {
 }
 
 private struct AssistantBubble: View {
-    let message: AssistantMessage
+    let message: CodexConversationMessage
 
     var body: some View {
-        Text(message.text)
-            .font(.subheadline)
-            .padding(11)
-            .background(
-                message.role == .assistant ? Color(nsColor: .controlBackgroundColor) : Color.accentColor.opacity(0.16),
-                in: RoundedRectangle(cornerRadius: 12)
-            )
-            .frame(maxWidth: .infinity, alignment: message.role == .assistant ? .leading : .trailing)
+        VStack(alignment: message.role == .assistant ? .leading : .trailing, spacing: 5) {
+            if message.text.isEmpty && message.delivery == .streaming {
+                ProgressView().controlSize(.small)
+                    .padding(.horizontal, 5)
+            } else {
+                Text(message.text)
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            }
+            if message.delivery == .interrupted {
+                Label("Stopped", systemImage: "stop.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if message.delivery == .failed {
+                Label("Not delivered", systemImage: "exclamationmark.circle")
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(11)
+        .background(
+            message.role == .assistant
+                ? Color(nsColor: .controlBackgroundColor)
+                : Color.accentColor.opacity(0.16),
+            in: RoundedRectangle(cornerRadius: 12)
+        )
+        .frame(maxWidth: .infinity, alignment: message.role == .assistant ? .leading : .trailing)
     }
 }
 

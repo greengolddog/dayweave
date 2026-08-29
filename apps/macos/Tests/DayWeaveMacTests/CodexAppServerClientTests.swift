@@ -284,6 +284,319 @@ struct CodexAppServerClientTests {
         #expect(client.verificationURL == nil)
     }
 
+    @Test("planner conversations use contained read-only turns and stream bounded typed events")
+    func testConversationLifecycleAndInterruptAreBoundToExactIdentifiers() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        let recorder = CodexConversationEventRecorder()
+        let eventTask = Task { @MainActor in
+            for await event in client.conversationEvents() {
+                recorder.events.append(event)
+            }
+        }
+        defer {
+            eventTask.cancel()
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+
+        let threadTask = Task {
+            try await client.startConversationThread(developerInstructions: "Planner only")
+        }
+        let threadRequest = try await harness.nextClientMessage()
+        #expect(threadRequest["method"] as? String == "thread/start")
+        let threadParams = try #require(threadRequest["params"] as? [String: Any])
+        #expect(Set(threadParams.keys) == [
+            "approvalPolicy", "cwd", "developerInstructions", "ephemeral", "personality",
+            "sandbox", "serviceName",
+        ])
+        #expect(threadParams["approvalPolicy"] as? String == "never")
+        #expect(threadParams["sandbox"] as? String == "read-only")
+        #expect(threadParams["ephemeral"] as? Bool == true)
+        #expect(threadParams["cwd"] as? String == harness.codexHome.path)
+        let threadID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(threadRequest),
+            "result": conversationThreadStartResult(
+                home: harness.codexHome,
+                threadID: threadID
+            ),
+        ])
+        #expect(try await threadTask.value == CodexConversationThread(id: threadID))
+
+        let turnTask = Task {
+            try await client.startConversationTurn(
+                threadID: threadID,
+                input: "redacted context and user message"
+            )
+        }
+        let turnRequest = try await harness.nextClientMessage()
+        #expect(turnRequest["method"] as? String == "turn/start")
+        let turnParams = try #require(turnRequest["params"] as? [String: Any])
+        #expect(Set(turnParams.keys) == ["clientUserMessageId", "input", "threadId"])
+        #expect(turnParams["threadId"] as? String == threadID)
+        let input = try #require(turnParams["input"] as? [[String: Any]])
+        #expect(input.count == 1)
+        #expect(input[0]["type"] as? String == "text")
+        #expect(input[0]["text"] as? String == "redacted context and user message")
+
+        let turnID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(turnRequest),
+            "result": ["turn": conversationTurn(id: turnID, status: "inProgress")],
+        ])
+        #expect(try await turnTask.value == CodexConversationTurn(id: turnID, threadID: threadID))
+
+        try harness.sendServerMessage([
+            "method": "turn/started",
+            "params": [
+                "threadId": threadID,
+                "turn": conversationTurn(id: turnID, status: "inProgress"),
+            ],
+        ])
+        let itemID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "method": "item/started",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "startedAtMs": 1_787_986_845_132 as Int64,
+                "item": agentMessage(id: itemID, text: "", phase: "final_answer"),
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "item/agentMessage/delta",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "itemId": itemID,
+                "delta": "A safer plan",
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "item/completed",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "completedAtMs": 1_787_986_845_232 as Int64,
+                "item": agentMessage(id: itemID, text: "A safer plan", phase: "final_answer"),
+            ],
+        ])
+
+        let interruptTask = Task {
+            try await client.interruptConversationTurn(threadID: threadID, turnID: turnID)
+        }
+        let interrupt = try await harness.nextClientMessage()
+        #expect(interrupt["method"] as? String == "turn/interrupt")
+        let interruptParams = try #require(interrupt["params"] as? [String: Any])
+        #expect(interruptParams["threadId"] as? String == threadID)
+        #expect(interruptParams["turnId"] as? String == turnID)
+        try harness.sendServerMessage([
+            "id": try requestID(interrupt),
+            "result": [String: Any](),
+        ])
+        try await interruptTask.value
+        try harness.sendServerMessage([
+            "method": "turn/completed",
+            "params": [
+                "threadId": threadID,
+                "turn": conversationTurn(id: turnID, status: "interrupted"),
+            ],
+        ])
+
+        #expect(await eventually {
+            recorder.events.contains(.agentMessageDelta(
+                threadID: threadID,
+                turnID: turnID,
+                itemID: itemID,
+                phase: .finalAnswer,
+                delta: "A safer plan"
+            )) && recorder.events.contains(.turnCompleted(
+                threadID: threadID,
+                turnID: turnID,
+                outcome: .interrupted
+            ))
+        })
+        #expect(client.state == .signedIn(email: "person@example.com", plan: "plus"))
+    }
+
+    @Test("conversation events with an unbound item identity stop the runtime")
+    func testUnboundAgentDeltaFailsClosed() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        defer {
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+        let identifiers = try await startConversation(client, harness: harness)
+
+        try harness.sendServerMessage([
+            "method": "item/agentMessage/delta",
+            "params": [
+                "threadId": identifiers.threadID,
+                "turnId": identifiers.turnID,
+                "itemId": UUID().uuidString.lowercased(),
+                "delta": "unbound",
+            ],
+        ])
+
+        #expect(await eventually {
+            client.state == .unavailable("Codex emitted an invalid agent-message delta")
+        })
+        #expect(await eventually { !harness.process.isRunning })
+    }
+
+    @Test("the session controller streams replies and routes proposals without changing the plan")
+    func testConversationControllerRoutesOnlyReviewableProposals() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        let block = ScheduleBlock(
+            id: UUID(),
+            title: "Deep work",
+            kind: .task,
+            start: Date(timeIntervalSince1970: 1_787_980_000),
+            end: Date(timeIntervalSince1970: 1_787_983_600),
+            status: .scheduled,
+            project: nil,
+            notes: "NEVER-SEND-THIS-NOTE",
+            energy: .deep,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            placementReason: "NEVER-SEND-THIS-DIAGNOSTIC"
+        )
+        let store = PlannerStore(blocks: [block], restoreFromPersistence: false)
+        let controller = CodexConversationController(
+            client: client,
+            contextProvider: store,
+            suggestionRouter: CodexSuggestionInboxRouter(planner: store),
+            now: { Date(timeIntervalSince1970: 1_787_986_845) }
+        )
+        defer {
+            controller.shutDown()
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+
+        controller.send("Protect my focus time")
+        let threadRequest = try await harness.nextClientMessage()
+        let threadID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(threadRequest),
+            "result": conversationThreadStartResult(
+                home: harness.codexHome,
+                threadID: threadID
+            ),
+        ])
+        let turnRequest = try await harness.nextClientMessage()
+        let turnParams = try #require(turnRequest["params"] as? [String: Any])
+        let inputs = try #require(turnParams["input"] as? [[String: Any]])
+        let transported = try #require(inputs.first?["text"] as? String)
+        #expect(transported.contains("Deep work"))
+        #expect(transported.contains("Protect my focus time"))
+        #expect(!transported.contains("NEVER-SEND-THIS-NOTE"))
+        #expect(!transported.contains("NEVER-SEND-THIS-DIAGNOSTIC"))
+
+        let turnID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(turnRequest),
+            "result": ["turn": conversationTurn(id: turnID, status: "inProgress")],
+        ])
+        #expect(await eventually { controller.isTurnActive })
+
+        let itemID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "method": "item/started",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "startedAtMs": 1_787_986_845_132 as Int64,
+                "item": agentMessage(id: itemID, text: "", phase: "final_answer"),
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "item/agentMessage/delta",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "itemId": itemID,
+                "delta": "Keep the morning block intact.",
+            ],
+        ])
+        let completedText = """
+        Keep the morning block intact.
+        <dayweave-proposals-v1>{"suggestions":[{"title":"Protect focus block","summary":"Keep the deep-work block fixed in the morning."}]}</dayweave-proposals-v1>
+        """
+        try harness.sendServerMessage([
+            "method": "item/completed",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "completedAtMs": 1_787_986_845_232 as Int64,
+                "item": agentMessage(id: itemID, text: completedText, phase: "final_answer"),
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "turn/completed",
+            "params": [
+                "threadId": threadID,
+                "turn": conversationTurn(id: turnID, status: "completed"),
+            ],
+        ])
+
+        #expect(await eventually {
+            controller.activity == .idle && controller.lastProposalCount == 1
+        })
+        #expect(controller.messages.last?.text == "Keep the morning block intact.")
+        #expect(controller.messages.last?.delivery == .complete)
+        #expect(store.suggestions.count == 1)
+        #expect(store.suggestions[0].state == .pending)
+        #expect(store.blocks == [block])
+    }
+
+    @Test("a stalled conversation event consumer cannot create an unbounded queue")
+    func testConversationEventBufferOverflowFailsClosed() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        let stalledStream = client.conversationEvents()
+        defer {
+            withExtendedLifetime(stalledStream) {}
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+        let identifiers = try await startConversation(client, harness: harness)
+        let itemID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "method": "item/started",
+            "params": [
+                "threadId": identifiers.threadID,
+                "turnId": identifiers.turnID,
+                "startedAtMs": 1_787_986_845_132 as Int64,
+                "item": agentMessage(id: itemID, text: "", phase: "final_answer"),
+            ],
+        ])
+        for _ in 0..<65 {
+            try harness.sendServerMessage([
+                "method": "item/agentMessage/delta",
+                "params": [
+                    "threadId": identifiers.threadID,
+                    "turnId": identifiers.turnID,
+                    "itemId": itemID,
+                    "delta": "x",
+                ],
+            ])
+        }
+
+        #expect(await eventually {
+            client.state == .unavailable("The Codex conversation event consumer fell behind")
+        })
+        #expect(await eventually { !harness.process.isRunning })
+    }
+
     private func initializeSignedOut(
         _ client: CodexAppServerClient,
         harness: CodexProtocolHarness
@@ -304,6 +617,103 @@ struct CodexAppServerClientTests {
             "result": ["account": NSNull(), "requiresOpenaiAuth": true],
         ])
         #expect(await eventually { client.state == .signedOut })
+    }
+
+    private func initializeSignedIn(
+        _ client: CodexAppServerClient,
+        harness: CodexProtocolHarness
+    ) async throws {
+        client.startIfNeeded()
+        let initialize = try await harness.nextClientMessage()
+        try harness.sendServerMessage([
+            "id": try requestID(initialize),
+            "result": initializeResult(home: harness.codexHome),
+        ])
+        _ = try await harness.nextClientMessage() // initialized
+        let account = try await harness.nextClientMessage()
+        try harness.sendServerMessage([
+            "id": try requestID(account),
+            "result": [
+                "account": [
+                    "type": "chatgpt",
+                    "email": "person@example.com",
+                    "planType": "plus",
+                ],
+                "requiresOpenaiAuth": true,
+            ],
+        ])
+        #expect(await eventually {
+            client.state == .signedIn(email: "person@example.com", plan: "plus")
+        })
+    }
+
+    private func startConversation(
+        _ client: CodexAppServerClient,
+        harness: CodexProtocolHarness
+    ) async throws -> (threadID: String, turnID: String) {
+        let threadTask = Task {
+            try await client.startConversationThread(developerInstructions: "Planner only")
+        }
+        let threadRequest = try await harness.nextClientMessage()
+        let threadID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(threadRequest),
+            "result": conversationThreadStartResult(
+                home: harness.codexHome,
+                threadID: threadID
+            ),
+        ])
+        _ = try await threadTask.value
+
+        let turnTask = Task {
+            try await client.startConversationTurn(threadID: threadID, input: "context")
+        }
+        let turnRequest = try await harness.nextClientMessage()
+        let turnID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(turnRequest),
+            "result": ["turn": conversationTurn(id: turnID, status: "inProgress")],
+        ])
+        _ = try await turnTask.value
+        return (threadID, turnID)
+    }
+
+    private func conversationThreadStartResult(home: URL, threadID: String) -> [String: Any] {
+        [
+            "approvalPolicy": "never",
+            "approvalsReviewer": "user",
+            "cwd": home.path,
+            "instructionSources": [],
+            "model": "gpt-test",
+            "modelProvider": "openai",
+            "reasoningEffort": NSNull(),
+            "sandbox": ["type": "readOnly", "networkAccess": false],
+            "serviceTier": NSNull(),
+            "thread": [
+                "cliVersion": "0.150.1",
+                "createdAt": 1_787_986_845 as Int64,
+                "cwd": home.path,
+                "ephemeral": true,
+                "id": threadID,
+                "modelProvider": "openai",
+                "path": NSNull(),
+                "preview": "",
+                "projectId": NSNull(),
+                "sessionId": threadID,
+                "source": "appServer",
+                "status": ["type": "idle"],
+                "turns": [],
+                "updatedAt": 1_787_986_845 as Int64,
+            ],
+        ]
+    }
+
+    private func conversationTurn(id: String, status: String) -> [String: Any] {
+        ["id": id, "items": [], "status": status]
+    }
+
+    private func agentMessage(id: String, text: String, phase: String) -> [String: Any] {
+        ["id": id, "type": "agentMessage", "text": text, "phase": phase]
     }
 
     private func initializeResult(home: URL) -> [String: Any] {
@@ -340,6 +750,11 @@ struct CodexAppServerClientTests {
 @MainActor
 private final class OpenedURLRecorder {
     var urls: [URL] = []
+}
+
+@MainActor
+private final class CodexConversationEventRecorder {
+    var events: [CodexConversationEvent] = []
 }
 
 @MainActor
