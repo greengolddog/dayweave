@@ -32,12 +32,23 @@ class OkHttpGoogleAccountsTransportTest {
                 runBlocking { transport().accounts(configuration(server)) }
             }
 
-            server.enqueue(
-                jsonResponse(
-                    200,
-                    accountsJson().replace(",\"last_failure_at\":null", ""),
-                ),
-            )
+            listOf(
+                ",\"token_expires_at\":\"2026-09-01T08:00:00Z\"",
+                ",\"next_attempt_at\":null",
+                ",\"last_failure_at\":null",
+            ).forEach { requiredNullableMember ->
+                server.enqueue(
+                    jsonResponse(
+                        200,
+                        accountsJson().replace(requiredNullableMember, ""),
+                    ),
+                )
+                assertThrows(GoogleAccountsApiException.InvalidResponse::class.java) {
+                    runBlocking { transport().accounts(configuration(server)) }
+                }
+            }
+
+            server.enqueue(jsonResponse(200, "x".repeat(2 * 1024 * 1024 + 1)))
             assertThrows(GoogleAccountsApiException.InvalidResponse::class.java) {
                 runBlocking { transport().accounts(configuration(server)) }
             }
@@ -110,16 +121,19 @@ class OkHttpGoogleAccountsTransportTest {
             val pause = server.takeRequest()
             assertEquals("/v1/integrations/google/accounts/$ACCOUNT_ID/pause", pause.url.encodedPath)
             assertEquals("POST", pause.method)
+            assertEquals(IDEMPOTENCY_KEY, pause.headers["Idempotency-Key"])
             assertEquals("7", Json.parseToJsonElement(requireNotNull(pause.body).utf8()).jsonObject
                 .getValue("expected_revision").jsonPrimitive.content)
             val resume = server.takeRequest()
             assertEquals("/v1/integrations/google/accounts/$ACCOUNT_ID/resume", resume.url.encodedPath)
+            assertEquals(IDEMPOTENCY_KEY, resume.headers["Idempotency-Key"])
             val disconnect = server.takeRequest()
             assertEquals(
                 "/v1/integrations/google/accounts/$ACCOUNT_ID?expected_revision=7",
                 "${disconnect.url.encodedPath}?${disconnect.url.encodedQuery}",
             )
             assertEquals("DELETE", disconnect.method)
+            assertEquals(IDEMPOTENCY_KEY, disconnect.headers["Idempotency-Key"])
         } finally {
             server.close()
         }

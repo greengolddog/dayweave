@@ -167,12 +167,20 @@ class GoogleAccountManager(
     ): Boolean = operationMutex.withLock {
         val current = mutableState.value
         val binding = credentialStore.snapshot()
+        val configuration = try {
+            credentialStore.authenticatedConfiguration()
+        } catch (_: RuntimeException) {
+            null
+        }
+        val currentBinding = credentialStore.snapshot()
         val authorization = current.authorization
         val trusted =
-            current.configurationId == binding.configurationId &&
+            sameBinding(binding, currentBinding) && binding.hasBearerToken &&
+                configuration != null && configurationMatchesBindingValue(configuration, binding) &&
+                current.configurationId == binding.configurationId &&
                 authorization?.url == candidate && authorization.expiresAt > now()
         if (!trusted) {
-            mutableState.value = initialState(binding)
+            mutableState.value = initialState(currentBinding)
             return@withLock false
         }
         consumer(candidate)
@@ -182,12 +190,12 @@ class GoogleAccountManager(
     /** Serializes the only credential update/clear path with all Google requests and URL use. */
     suspend fun <T> withConfigurationChangeLock(change: suspend () -> T): T =
         operationMutex.withLock {
-            val before = credentialStore.snapshot().configurationId
+            val before = credentialStore.snapshot()
             try {
                 change()
             } finally {
                 val after = credentialStore.snapshot()
-                if (after.configurationId != before) {
+                if (!sameBinding(before, after)) {
                     mutableState.value = initialState(after)
                 }
             }
@@ -196,7 +204,7 @@ class GoogleAccountManager(
     suspend fun browserOpenFailed() = operationMutex.withLock {
         val current = mutableState.value
         val binding = credentialStore.snapshot()
-        if (current.configurationId != binding.configurationId) {
+        if (!binding.hasBearerToken || current.configurationId != binding.configurationId) {
             mutableState.value = initialState(binding)
         } else if (current.authorization != null) {
             mutableState.value = current.copy(
@@ -240,10 +248,9 @@ class GoogleAccountManager(
                 previous.accounts.firstOrNull { it.id == requestedId }
             }
             if (accountId != null && account == null) {
-                mutableState.value = previous.copy(
-                    phase = GoogleAccountPhase.ERROR,
-                    authorization = null,
-                    message = "That Google account belongs to an older API connection · refresh status",
+                mutableState.value = operationFailureStatePreservingRecovery(
+                    previous,
+                    "That Google account belongs to an older API connection · refresh status",
                 )
                 return@withLock
             }
@@ -317,10 +324,9 @@ class GoogleAccountManager(
         val previous = stateForBinding(binding)
         val account = previous.accounts.firstOrNull { it.id == accountId }
         if (account == null) {
-            mutableState.value = previous.copy(
-                phase = GoogleAccountPhase.ERROR,
-                authorization = null,
-                message = "That Google account belongs to an older API connection · refresh status",
+            mutableState.value = operationFailureStatePreservingRecovery(
+                previous,
+                "That Google account belongs to an older API connection · refresh status",
             )
             return@withLock
         }
@@ -364,10 +370,9 @@ class GoogleAccountManager(
                 )
             } catch (refreshError: CancellationException) {
                 if (bindingStillCurrent(binding)) {
-                    mutableState.value = previous.copy(
-                        phase = GoogleAccountPhase.ERROR,
-                        isBusy = false,
-                        message = "Google account reconciliation was interrupted · refresh status",
+                    mutableState.value = operationFailureStatePreservingRecovery(
+                        previous,
+                        "Google account reconciliation was interrupted · refresh status",
                     )
                 }
                 throw refreshError
@@ -390,10 +395,9 @@ class GoogleAccountManager(
             }
         } catch (error: CancellationException) {
             if (bindingStillCurrent(binding)) {
-                mutableState.value = previous.copy(
-                    phase = GoogleAccountPhase.ERROR,
-                    isBusy = false,
-                    message = "Google update outcome is unknown · refresh status before retrying",
+                mutableState.value = operationFailureStatePreservingRecovery(
+                    previous,
+                    "Google update outcome is unknown · refresh status before retrying",
                 )
             }
             throw error
@@ -418,7 +422,9 @@ class GoogleAccountManager(
                 authorization = null,
                 configurationId = binding.configurationId,
             )
-            mutableState.value = if (mapped.accounts.any { it.id == accountId }) {
+            mutableState.value = if (mapped.phase == GoogleAccountPhase.RECOVERY_REQUIRED) {
+                mapped
+            } else if (mapped.accounts.any { it.id == accountId }) {
                 mapped.copy(
                     phase = GoogleAccountPhase.ERROR,
                     message = if (unavailable) {
@@ -431,15 +437,34 @@ class GoogleAccountManager(
                 mapped
             }
         } catch (error: CancellationException) {
+            if (bindingStillCurrent(binding)) {
+                mutableState.value = operationFailureStatePreservingRecovery(
+                    previous,
+                    "Google disconnect outcome is unknown · refresh status before retrying",
+                )
+            }
             throw error
         } catch (_: Exception) {
-            mutableState.value = previous.copy(
-                phase = GoogleAccountPhase.ERROR,
-                authorization = null,
-                isBusy = false,
-                message = "Google access was not confirmed revoked · refresh status before retrying",
+            if (!bindingStillCurrent(binding)) return
+            mutableState.value = operationFailureStatePreservingRecovery(
+                previous,
+                "Google access was not confirmed revoked · refresh status before retrying",
             )
         }
+    }
+
+    private fun operationFailureStatePreservingRecovery(
+        previous: GoogleAccountState,
+        message: String,
+    ): GoogleAccountState = if (previous.phase == GoogleAccountPhase.RECOVERY_REQUIRED) {
+        previous.copy(authorization = null, isBusy = false)
+    } else {
+        previous.copy(
+            phase = GoogleAccountPhase.ERROR,
+            authorization = null,
+            isBusy = false,
+            message = message,
+        )
     }
 
     private fun mapState(
@@ -551,6 +576,12 @@ class GoogleAccountManager(
     }
 
     private fun failureState(error: Exception, previous: GoogleAccountState): GoogleAccountState {
+        if (
+            previous.phase == GoogleAccountPhase.RECOVERY_REQUIRED &&
+            error !is GoogleAccountsApiException.Authentication
+        ) {
+            return previous.copy(authorization = null, isBusy = false)
+        }
         val (phase, message) = when (error) {
             is GoogleAccountsApiException.Authentication ->
                 GoogleAccountPhase.AUTH_REQUIRED to "Planner API authentication is required"
@@ -615,19 +646,25 @@ class GoogleAccountManager(
         configuration: com.greengolddog.dayweave.network.AuthenticatedApiConfiguration,
         binding: ApiConnectionSnapshot,
     ): Boolean {
-        if (
-            binding.configurationId != null &&
-            configuration.configurationId == binding.configurationId
-        ) {
+        if (configurationMatchesBindingValue(configuration, binding)) {
             return true
         }
         mutableState.value = initialState(credentialStore.snapshot())
         return false
     }
 
+    private fun configurationMatchesBindingValue(
+        configuration: com.greengolddog.dayweave.network.AuthenticatedApiConfiguration,
+        binding: ApiConnectionSnapshot,
+    ): Boolean =
+        binding.hasBearerToken && binding.configurationId != null &&
+            configuration.configurationId == binding.configurationId &&
+            configuration.baseUrl.toString() == binding.baseUrl
+
     private fun stateForBinding(binding: ApiConnectionSnapshot): GoogleAccountState =
         mutableState.value.takeIf { state ->
-            state.configurationId != null && state.configurationId == binding.configurationId
+            binding.hasBearerToken && state.configurationId != null &&
+                state.configurationId == binding.configurationId
         } ?: initialState(binding)
 
     private data class RestartAuthorization(

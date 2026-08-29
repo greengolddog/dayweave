@@ -10,8 +10,15 @@ import com.greengolddog.dayweave.network.RemoteGoogleAccounts
 import com.greengolddog.dayweave.network.RemoteGoogleAuthorization
 import com.greengolddog.dayweave.network.RemoteGoogleCleanupStatus
 import com.greengolddog.dayweave.network.StartGoogleAuthorizationRequest
+import java.io.IOException
 import java.time.Instant
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -177,6 +184,61 @@ class GoogleAccountManagerTest {
     }
 
     @Test
+    fun partialCredentialClearWithSameGenerationRejectsCachedAuthorizationUrl() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+        manager.connectNew()
+        val oldUrl = requireNotNull(manager.state.value.authorization).url
+
+        manager.withConfigurationChangeLock {
+            // Models Keystore deletion followed by a failed preference clear.
+            credentials.hasBearerToken = false
+        }
+
+        assertEquals("configuration-a", manager.state.value.configurationId)
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+        assertNull(manager.state.value.authorization)
+        assertFalse(manager.useAuthorizationUrlIfCurrent(oldUrl) { error("must not open") })
+    }
+
+    @Test
+    fun browserHandoffWaitsForCredentialReplacementAndThenRejectsOldUrl() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+        manager.connectNew()
+        val oldUrl = requireNotNull(manager.state.value.authorization).url
+        val replacementEntered = CountDownLatch(1)
+        val allowReplacement = CountDownLatch(1)
+        val replacement = async(Dispatchers.Default) {
+            manager.withConfigurationChangeLock {
+                replacementEntered.countDown()
+                check(allowReplacement.await(2, TimeUnit.SECONDS))
+                credentials.configurationId = "configuration-b"
+            }
+        }
+        assertTrue(replacementEntered.await(2, TimeUnit.SECONDS))
+        // UNDISPATCHED reaches the already-held mutex before returning, proving this handoff is
+        // actually queued behind the credential replacement rather than merely scheduled later.
+        val browserUse = async(start = CoroutineStart.UNDISPATCHED) {
+            manager.useAuthorizationUrlIfCurrent(oldUrl) { error("must not open") }
+        }
+
+        allowReplacement.countDown()
+        replacement.await()
+
+        assertFalse(browserUse.await())
+        assertEquals("configuration-b", manager.state.value.configurationId)
+    }
+
+    @Test
     fun staleAccountActionNeverLeavesUnderReplacementCredential() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
@@ -273,6 +335,42 @@ class GoogleAccountManagerTest {
     }
 
     @Test
+    fun browserOpenFailureRemainsRecoverableWithoutTrustingCompletion() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+        manager.connectNew()
+
+        manager.browserOpenFailed()
+
+        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertNotNull(manager.state.value.authorization)
+        manager.restartAuthorization()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertEquals(2, transport.authorizationRequests.size)
+    }
+
+    @Test
+    fun expiredAuthorizationResponseNeverCreatesAnOpenableBrowserUrl() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            authorizationResult = RemoteGoogleAuthorization(
+                "https://accounts.google.com/o/oauth2/v2/auth?state=expired",
+                NOW.minusSeconds(1).toString(),
+            )
+        }
+        val manager = manager(credentials, transport)
+
+        manager.connectNew()
+
+        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertNull(manager.state.value.authorization)
+    }
+
+    @Test
     fun failedDisconnectReconcilesAndNeverClaimsAccessWasRevoked() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
@@ -291,6 +389,139 @@ class GoogleAccountManagerTest {
         assertTrue(manager.state.value.message.contains("not confirmed revoked"))
         assertEquals("revocation_failed", manager.state.value.accounts.single().status)
         assertEquals(2, transport.accountsCalls)
+    }
+
+    @Test
+    fun cancelledAmbiguousDisconnectAlwaysLeavesRefreshableNonBusyState() = runBlocking {
+        listOf<Exception>(
+            GoogleAccountsApiException.Unavailable(),
+            GoogleAccountsApiException.Http(404),
+        ).forEach { disconnectFailure ->
+            val credentials = FakeGoogleCredentials()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account())
+            }
+            val manager = manager(credentials, transport)
+            manager.refresh()
+            transport.disconnectError = disconnectFailure
+            transport.accountsError = CancellationException("cancel reconciliation")
+
+            try {
+                manager.disconnect(ACCOUNT_ID)
+                error("cancellation must propagate")
+            } catch (_: CancellationException) {
+                // Expected: cancellation stays structured, while durable UI state is repaired.
+            }
+
+            assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+            assertFalse(manager.state.value.isBusy)
+            assertTrue(manager.state.value.message.contains("outcome is unknown"))
+        }
+    }
+
+    @Test
+    fun ambiguousDisconnectPreservesMandatoryOperatorRecovery() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+        transport.disconnectError = GoogleAccountsApiException.Unavailable()
+        transport.accountsResult = accounts(account()).copy(
+            cleanup = cleanup().copy(operatorRecoveryRequired = true),
+        )
+
+        manager.disconnect(ACCOUNT_ID)
+
+        assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+        assertTrue(manager.state.value.message.contains("owner attention"))
+        assertFalse(manager.state.value.isBusy)
+    }
+
+    @Test
+    fun failedOrCancelledDisconnectReconciliationCannotHideExistingRecoveryFence() = runBlocking {
+        listOf(
+            CancellationException("synthetic cancellation") to true,
+            IOException("synthetic reconciliation failure") to false,
+        ).forEach { (reconciliationFailure, shouldCancel) ->
+            val credentials = FakeGoogleCredentials()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account()).copy(
+                    cleanup = cleanup().copy(operatorRecoveryRequired = true),
+                )
+            }
+            val manager = manager(credentials, transport)
+            manager.refresh()
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+            transport.disconnectError = GoogleAccountsApiException.Unavailable()
+            transport.accountsError = reconciliationFailure
+
+            val result = runCatching { manager.disconnect(ACCOUNT_ID) }
+
+            assertEquals(shouldCancel, result.exceptionOrNull() is CancellationException)
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+            assertTrue(manager.state.value.message.contains("owner attention"))
+            assertFalse(manager.state.value.isBusy)
+        }
+    }
+
+    @Test
+    fun directOrConflictDisconnectFailureCannotHideExistingRecoveryFence() = runBlocking {
+        listOf(
+            Triple(CancellationException("synthetic direct cancellation"), null, true),
+            Triple(IOException("synthetic direct failure"), null, false),
+            Triple(
+                GoogleAccountsApiException.Conflict(),
+                CancellationException("synthetic conflict refresh cancellation"),
+                true,
+            ),
+            Triple(
+                GoogleAccountsApiException.Conflict(),
+                IOException("synthetic conflict refresh failure"),
+                false,
+            ),
+        ).forEach { (disconnectFailure, refreshFailure, shouldCancel) ->
+            val credentials = FakeGoogleCredentials()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account()).copy(
+                    cleanup = cleanup().copy(operatorRecoveryRequired = true),
+                )
+            }
+            val manager = manager(credentials, transport)
+            manager.refresh()
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+            transport.disconnectError = disconnectFailure
+            transport.accountsError = refreshFailure
+
+            val result = runCatching { manager.disconnect(ACCOUNT_ID) }
+
+            assertEquals(shouldCancel, result.exceptionOrNull() is CancellationException)
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+            assertTrue(manager.state.value.message.contains("owner attention"))
+            assertFalse(manager.state.value.isBusy)
+        }
+    }
+
+    @Test
+    fun failedDisconnectReconciliationNeverRestoresStateFromReplacedCredentials() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+        transport.disconnectError = GoogleAccountsApiException.Unavailable()
+        transport.accountsError = IOException("synthetic reconciliation failure")
+        transport.accountsHook = { credentials.configurationId = "configuration-b" }
+
+        manager.disconnect(ACCOUNT_ID)
+
+        assertEquals("configuration-b", manager.state.value.configurationId)
+        assertEquals(GoogleAccountPhase.DISCONNECTED, manager.state.value.phase)
+        assertTrue(manager.state.value.accounts.isEmpty())
+        assertNull(manager.state.value.authorization)
+        assertFalse(manager.state.value.isBusy)
     }
 
     private fun manager(
@@ -358,17 +589,19 @@ class GoogleAccountManagerTest {
 
 private class FakeGoogleCredentials : ApiCredentialStore {
     var configurationId = "configuration-a"
+    var hasBearerToken = true
     var configurationHook: (() -> Unit)? = null
 
     override fun snapshot() = ApiConnectionSnapshot(
         baseUrl = "https://api.example.test/",
-        hasBearerToken = true,
+        hasBearerToken = hasBearerToken,
         lastSuccessfulSyncEpochMillis = null,
         configurationId = configurationId,
     )
 
-    override fun authenticatedConfiguration(): AuthenticatedApiConfiguration {
+    override fun authenticatedConfiguration(): AuthenticatedApiConfiguration? {
         configurationHook?.also { configurationHook = null }?.invoke()
+        if (!hasBearerToken) return null
         return AuthenticatedApiConfiguration.createBound(
             "https://api.example.test/",
             "test-secret",
