@@ -265,7 +265,7 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **SEC-002** Persistent disks, object storage, backups, and sensitive local databases shall be encrypted at rest.
 - **SEC-003** Especially sensitive fields shall have application-level encryption with keys separated from the database backup.
 - **SEC-004** Stable credentials, private keys, tokens, and OAuth secrets shall never be committed to Git.
-- **SEC-005** Deployment and runtime shall use separate project-scoped Nebius service accounts bootstrapped through the owner's `lol` profile.
+- **SEC-005** Deployment and runtime shall use separate project-scoped Nebius service accounts bootstrapped through a locally authenticated owner profile.
 - **SEC-006** App lock shall support platform biometrics and a configurable auto-lock timeout.
 - **SEC-007** A sensitive item shall be excluded by default from lock-screen detail, widgets while locked, external MCP access, proactive assistant context, and attachment analysis.
 - **SEC-008** External clients shall receive the minimum configured resource and field scope. Revocation shall take effect without redeployment.
