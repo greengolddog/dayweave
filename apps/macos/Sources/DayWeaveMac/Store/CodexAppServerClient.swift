@@ -231,6 +231,7 @@ final class CodexAppServerClient: ObservableObject {
     private var retiredLoginIDs: Set<String> = []
     private var isInitialized = false
     private var queuedDeviceCodeSignIn = false
+    private var restartWhenStopped = false
     private var cancelRequested = false
     private var isStopping = false
     private var isShuttingDown = false
@@ -446,7 +447,13 @@ final class CodexAppServerClient: ObservableObject {
     }
 
     func startIfNeeded() {
-        guard runtime == nil, !isStopping else { return }
+        guard runtime == nil, !isStopping else {
+            if isStopping, isShuttingDown {
+                restartWhenStopped = true
+            }
+            return
+        }
+        restartWhenStopped = false
         resetProtocolState(keepingQueuedSignIn: true)
         state = .starting
 
@@ -540,6 +547,7 @@ final class CodexAppServerClient: ObservableObject {
     }
 
     func shutDown() {
+        restartWhenStopped = false
         guard let runtime else {
             resetProtocolState(keepingQueuedSignIn: false)
             state = .stopped
@@ -551,6 +559,30 @@ final class CodexAppServerClient: ObservableObject {
         runtime.output.readabilityHandler = nil
         resetProtocolState(keepingQueuedSignIn: false)
         terminate(runtime)
+    }
+
+    /// Best-effort interrupts every turn whose identity was attested on this
+    /// connection, then tears down the authenticated runtime. `CodexRuntimeSession`
+    /// cleanup removes only the private executable copy; the device-local
+    /// `CODEX_HOME` containing managed login state remains in place.
+    func suspendForPrivacyBoundary() {
+        let turns = activeConversationTurns.sorted { lhs, rhs in
+            if lhs.key != rhs.key { return lhs.key < rhs.key }
+            return lhs.value < rhs.value
+        }
+        for (threadID, turnID) in turns where !pending.values.contains(where: {
+            if case let .interrupt(candidateThreadID, candidateTurnID) = $0 {
+                return candidateThreadID == threadID && candidateTurnID == turnID
+            }
+            return false
+        }) {
+            _ = send(
+                method: "turn/interrupt",
+                params: ["threadId": threadID, "turnId": turnID],
+                kind: .interrupt(threadID: threadID, turnID: turnID)
+            )
+        }
+        shutDown()
     }
 
     func signOut() {
@@ -1537,6 +1569,8 @@ final class CodexAppServerClient: ObservableObject {
     private func handleTermination(exitCode: Int32? = nil) {
         guard let runtime else { return }
         let wasShuttingDown = isShuttingDown
+        let shouldRestart = wasShuttingDown && restartWhenStopped
+        restartWhenStopped = false
         if !wasShuttingDown {
             let detail = exitCode.map { " (exit \($0))" } ?? ""
             invalidateConversationState(message: "Codex App Server stopped\(detail)")
@@ -1549,6 +1583,9 @@ final class CodexAppServerClient: ObservableObject {
         runtime.cleanUpAfterTermination()
         if wasShuttingDown {
             state = .stopped
+            if shouldRestart {
+                startIfNeeded()
+            }
             return
         }
         if case .unavailable = state { return }

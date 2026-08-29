@@ -205,6 +205,7 @@ struct DayWeaveMacApp: App {
         activationTask?.cancel()
         activationTask = nil
         executionSync.stopForegroundPolling()
+        codexConversation.suspendForPrivacyBoundary()
     }
 
     private func updateAppLock(for phase: ScenePhase) {

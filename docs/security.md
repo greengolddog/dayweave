@@ -36,9 +36,12 @@ effects must flow through an auditable proposal or outbox boundary.
 - macOS has an opt-in app-wide presentation lock backed by device-owner
   authentication (Touch ID or the Mac login password). It fails closed on cold
   start, supports immediate or configured inactivity timeouts, gates the main,
-  Settings, and menu-bar scenes plus keyboard commands, and pauses Codex and
-  sync presentation while locked. Its versioned preferences contain no user
-  content and malformed settings fail closed.
+  Settings, and menu-bar scenes plus keyboard commands. Every lock, background,
+  sleep, or other service deactivation invalidates the active conversation,
+  best-effort interrupts its turn, and terminates the contained Codex runtime;
+  the private device-local `CODEX_HOME` remains available for managed sign-in on
+  the next activation. Sync presentation is paused while locked. Its versioned
+  preferences contain no user content and malformed settings fail closed.
 - Android planner state is held in a SQLCipher Room database. A random database
   passphrase is wrapped by a non-exportable Android Keystore AES-GCM key.
 - First-party API bearer credentials use Keychain on macOS and a

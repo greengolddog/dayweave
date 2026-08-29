@@ -557,6 +557,161 @@ struct CodexAppServerClientTests {
         #expect(store.blocks == [block])
     }
 
+    @Test("privacy suspension interrupts the active turn, terminates Codex, and preserves its home")
+    func testPrivacySuspensionInterruptsAndTerminatesWithoutDeletingCodexHome() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        defer {
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+        let identifiers = try await startConversation(client, harness: harness)
+        let retainedLoginState = harness.codexHome.appendingPathComponent("retained-login-state")
+        try Data("device-local managed login state".utf8).write(to: retainedLoginState)
+
+        client.suspendForPrivacyBoundary()
+
+        let interrupt = try await harness.nextClientMessage()
+        #expect(interrupt["method"] as? String == "turn/interrupt")
+        let parameters = try #require(interrupt["params"] as? [String: Any])
+        #expect(parameters["threadId"] as? String == identifiers.threadID)
+        #expect(parameters["turnId"] as? String == identifiers.turnID)
+        #expect(client.state == .stopped)
+        #expect(await eventually { !harness.process.isRunning })
+        #expect(FileManager.default.fileExists(atPath: retainedLoginState.path))
+    }
+
+    @Test("reactivation queued during privacy teardown starts a fresh contained runtime")
+    func testPrivacySuspensionSupportsImmediateReactivation() async throws {
+        let launcher = RestartingCodexProtocolLauncher()
+        let client = CodexAppServerClient(launcher: launcher, verificationPageOpener: { _ in true })
+        defer {
+            client.shutDown()
+            launcher.cleanUp()
+        }
+
+        client.startIfNeeded()
+        let firstHarness = try #require(launcher.harnesses.first)
+        let initialize = try await firstHarness.nextClientMessage()
+        try firstHarness.sendServerMessage([
+            "id": try requestID(initialize),
+            "result": initializeResult(home: firstHarness.codexHome),
+        ])
+        _ = try await firstHarness.nextClientMessage() // initialized
+        let account = try await firstHarness.nextClientMessage()
+        try firstHarness.sendServerMessage([
+            "id": try requestID(account),
+            "result": ["account": NSNull(), "requiresOpenaiAuth": true],
+        ])
+        #expect(await eventually { client.state == .signedOut })
+
+        client.suspendForPrivacyBoundary()
+        client.startIfNeeded()
+
+        #expect(await eventually { launcher.harnesses.count == 2 })
+        let secondHarness = try #require(launcher.harnesses.last)
+        #expect(secondHarness !== firstHarness)
+        let secondInitialize = try await secondHarness.nextClientMessage()
+        #expect(secondInitialize["method"] as? String == "initialize")
+        #expect(client.state == .starting)
+    }
+
+    @Test("queued Codex completion cannot mutate transcript or Inbox after privacy suspension")
+    func testPrivacySuspensionInvalidatesLateConversationEvents() async throws {
+        let harness = try CodexProtocolHarness()
+        let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        let store = PlannerStore(restoreFromPersistence: false)
+        let controller = CodexConversationController(
+            client: client,
+            contextProvider: store,
+            suggestionRouter: CodexSuggestionInboxRouter(planner: store)
+        )
+        defer {
+            controller.shutDown()
+            client.shutDown()
+            harness.cleanUp()
+        }
+        try await initializeSignedIn(client, harness: harness)
+
+        controller.send("Protect this plan")
+        let threadRequest = try await harness.nextClientMessage()
+        let threadID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(threadRequest),
+            "result": conversationThreadStartResult(home: harness.codexHome, threadID: threadID),
+        ])
+        let turnRequest = try await harness.nextClientMessage()
+        let turnID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "id": try requestID(turnRequest),
+            "result": ["turn": conversationTurn(id: turnID, status: "inProgress")],
+        ])
+        #expect(await eventually { controller.isTurnActive })
+
+        let itemID = UUID().uuidString.lowercased()
+        try harness.sendServerMessage([
+            "method": "item/started",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "startedAtMs": 1_787_986_845_132 as Int64,
+                "item": agentMessage(id: itemID, text: "", phase: "final_answer"),
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "item/agentMessage/delta",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "itemId": itemID,
+                "delta": "Partial private response",
+            ],
+        ])
+        #expect(await eventually { controller.messages.last?.text == "Partial private response" })
+
+        let completedText = """
+        This must never land.
+        <dayweave-proposals-v1>{"suggestions":[{"title":"Late proposal","summary":"Must not reach the Inbox."}]}</dayweave-proposals-v1>
+        """
+        // Keep these bytes queued while the main actor crosses the privacy
+        // boundary. A previously scheduled receive callback must fail closed.
+        try harness.sendServerMessage([
+            "method": "item/completed",
+            "params": [
+                "threadId": threadID,
+                "turnId": turnID,
+                "completedAtMs": 1_787_986_845_232 as Int64,
+                "item": agentMessage(id: itemID, text: completedText, phase: "final_answer"),
+            ],
+        ])
+        try harness.sendServerMessage([
+            "method": "turn/completed",
+            "params": [
+                "threadId": threadID,
+                "turn": conversationTurn(id: turnID, status: "completed"),
+            ],
+        ])
+
+        controller.suspendForPrivacyBoundary()
+        let messagesAfterSuspension = controller.messages
+        #expect(controller.messages.last?.text == "Partial private response")
+        #expect(controller.messages.last?.delivery == .interrupted)
+        #expect(controller.activity == .idle)
+        #expect(!controller.isTurnActive)
+        #expect(store.suggestions.isEmpty)
+
+        let interrupt = try await harness.nextClientMessage()
+        #expect(interrupt["method"] as? String == "turn/interrupt")
+        #expect(await eventually { !harness.process.isRunning })
+        try? await Task.sleep(for: .milliseconds(50))
+
+        #expect(controller.messages == messagesAfterSuspension)
+        #expect(store.suggestions.isEmpty)
+        #expect(controller.lastProposalCount == 0)
+        #expect(client.state == .stopped)
+    }
+
     @Test("a stalled conversation event consumer cannot create an unbounded queue")
     func testConversationEventBufferOverflowFailsClosed() async throws {
         let harness = try CodexProtocolHarness()
@@ -755,6 +910,23 @@ private final class OpenedURLRecorder {
 @MainActor
 private final class CodexConversationEventRecorder {
     var events: [CodexConversationEvent] = []
+}
+
+@MainActor
+private final class RestartingCodexProtocolLauncher: CodexRuntimeLaunching {
+    private(set) var harnesses: [CodexProtocolHarness] = []
+
+    func launch() throws -> CodexRuntimeSession {
+        let harness = try CodexProtocolHarness()
+        harnesses.append(harness)
+        return try harness.launch()
+    }
+
+    func cleanUp() {
+        for harness in harnesses {
+            harness.cleanUp()
+        }
+    }
 }
 
 @MainActor

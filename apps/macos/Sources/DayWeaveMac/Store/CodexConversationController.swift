@@ -279,6 +279,8 @@ final class CodexConversationController: ObservableObject {
     private var eventTask: Task<Void, Never>?
     private var requestTask: Task<Void, Never>?
     private var cancellationTask: Task<Void, Never>?
+    private var conversationGeneration: UInt64 = 0
+    private var activeResponseGeneration: UInt64?
     private var threadID: String?
     private var activeTurnID: String?
     private var activeAssistantMessageID: UUID?
@@ -333,6 +335,8 @@ final class CodexConversationController: ObservableObject {
             delivery: .streaming
         ))
         activeAssistantMessageID = assistantMessageID
+        let generation = conversationGeneration
+        activeResponseGeneration = generation
         rawAssistantText = ""
         completedAssistantText = nil
         lastProposalCount = 0
@@ -342,8 +346,13 @@ final class CodexConversationController: ObservableObject {
         let snapshot = contextProvider.codexPlannerContextSnapshot()
         requestTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { requestTask = nil }
+            defer {
+                if conversationGeneration == generation {
+                    requestTask = nil
+                }
+            }
             do {
+                guard isCurrentResponse(generation) else { return }
                 let input = try CodexPlannerContextSerializer.turnInput(
                     snapshot: snapshot,
                     userMessage: message
@@ -355,17 +364,20 @@ final class CodexConversationController: ObservableObject {
                     thread = try await client.startConversationThread(
                         developerInstructions: Self.developerInstructions
                     )
+                    guard isCurrentResponse(generation) else { return }
                     threadID = thread.id
                 }
                 let turn = try await client.startConversationTurn(
                     threadID: thread.id,
                     input: input
                 )
+                guard isCurrentResponse(generation) else { return }
                 if activeAssistantMessageID != nil {
                     activeTurnID = turn.id
                     activity = .responding
                 }
             } catch {
+                guard isCurrentResponse(generation) else { return }
                 failActiveResponse(error.localizedDescription)
             }
         }
@@ -374,20 +386,58 @@ final class CodexConversationController: ObservableObject {
     func stopResponse() {
         guard cancellationTask == nil,
               let threadID,
-              let activeTurnID else { return }
+              let activeTurnID,
+              let generation = activeResponseGeneration,
+              generation == conversationGeneration else { return }
         activity = .stopping
         cancellationTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            defer { cancellationTask = nil }
+            defer {
+                if conversationGeneration == generation {
+                    cancellationTask = nil
+                }
+            }
             do {
                 try await client.interruptConversationTurn(
                     threadID: threadID,
                     turnID: activeTurnID
                 )
             } catch {
+                guard isCurrentResponse(generation) else { return }
                 activity = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Invalidates every in-flight conversation callback before terminating the
+    /// contained runtime. The persistent, private `CODEX_HOME` is owned by the
+    /// launcher and deliberately survives this process-level privacy boundary.
+    func suspendForPrivacyBoundary() {
+        conversationGeneration &+= 1
+        requestTask?.cancel()
+        cancellationTask?.cancel()
+        requestTask = nil
+        cancellationTask = nil
+
+        if activeAssistantMessageID != nil {
+            let visible = CodexProposalEnvelopeParser.visibleStreamingText(rawAssistantText)
+            updateActiveAssistant(
+                text: visible.isEmpty ? "Response stopped for privacy." : visible,
+                delivery: .interrupted
+            )
+        }
+
+        activeResponseGeneration = nil
+        threadID = nil
+        activeTurnID = nil
+        activeAssistantMessageID = nil
+        rawAssistantText = ""
+        completedAssistantText = nil
+        progressText = nil
+        lastProposalCount = 0
+        activity = .idle
+
+        client.suspendForPrivacyBoundary()
     }
 
     func shutDown() {
@@ -400,6 +450,8 @@ final class CodexConversationController: ObservableObject {
     }
 
     private func handle(_ event: CodexConversationEvent) {
+        guard let generation = activeResponseGeneration,
+              generation == conversationGeneration else { return }
         switch event {
         case .threadStarted:
             break
@@ -496,6 +548,7 @@ final class CodexConversationController: ObservableObject {
         }
         activeTurnID = nil
         activeAssistantMessageID = nil
+        activeResponseGeneration = nil
         rawAssistantText = ""
         completedAssistantText = nil
     }
@@ -508,10 +561,17 @@ final class CodexConversationController: ObservableObject {
         )
         activeTurnID = nil
         activeAssistantMessageID = nil
+        activeResponseGeneration = nil
         rawAssistantText = ""
         completedAssistantText = nil
         progressText = nil
         activity = .failed(message.isEmpty ? "Codex could not finish this response." : message)
+    }
+
+    private func isCurrentResponse(_ generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && conversationGeneration == generation
+            && activeResponseGeneration == generation
     }
 
     private func updateActiveAssistant(
