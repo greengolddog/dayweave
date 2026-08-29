@@ -402,7 +402,10 @@ Its external contract is intentionally asymmetric:
 
 - clients may read only the schedule detail permitted for that client;
 - clients may simulate plans;
-- `submit_proposal` may add a reviewable Suggestions Inbox proposal;
+- `submit_proposal` requires and atomically consumes the exact simulation token,
+  then may add either a typed application-ready or advisory Suggestions Inbox
+  proposal;
+- only an authorized DayWeave device can preview or apply a typed proposal;
 - no external conversation can mutate canonical schedule/calendar/task state.
 
 ChatGPT web does not accept a custom DayWeave API key. Remote activation still

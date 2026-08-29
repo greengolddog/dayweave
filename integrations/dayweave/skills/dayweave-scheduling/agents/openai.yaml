@@ -1,13 +1,13 @@
 interface:
   display_name: "DayWeave Scheduling"
-  short_description: "Review schedules and submit safe planning proposals."
+  short_description: "Simulate plans and submit proposals for device review."
   brand_color: "#4F46E5"
-  default_prompt: "Use $dayweave-scheduling to review today's plan and draft a safe Suggestions Inbox proposal."
+  default_prompt: "Use $dayweave-scheduling to simulate this plan and submit a Suggestions Inbox proposal for device review."
 dependencies:
   tools:
     - type: "mcp"
       value: "dayweave"
-      description: "DayWeave schedule reading, simulation, and proposal tools"
+      description: "DayWeave schedule reading, exact simulation, and proposal-only submission tools"
       transport: "streamable_http"
       url: "http://127.0.0.1:8787/mcp"
 policy:

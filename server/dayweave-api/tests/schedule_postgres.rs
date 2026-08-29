@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use dayweave_api::{
     AppState,
@@ -15,14 +16,13 @@ use dayweave_api::{
         DeviceEnrollmentSpec, GeneratedCredential,
     },
     http::router,
-    items::{IdempotencyKey, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy},
-    persistence::{
-        DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresItemRepository,
-        PostgresProposalRepository,
+    items::{
+        IdempotencyKey, Item, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
     },
+    persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresItemRepository},
     proposals::{
-        InMemoryProposalRepository, NewProposal, Proposal, ProposalKind, ProposalRepository,
-        ProposalService, ProposalSource, SystemClock,
+        InMemoryProposalRepository, Proposal, ProposalChangeSet, ProposalCommand, ProposalKind,
+        ProposalRepository, ProposalService, ProposalSource, SystemClock,
     },
     readiness::Readiness,
     scheduling::{
@@ -31,7 +31,7 @@ use dayweave_api::{
         ProposalSubmissionPort, ProposalSubmissionSpec, PublishScheduleSpec, ScheduleAccess,
         ScheduleDetail, SchedulePublicationError, ScheduleQuery, ScheduleQueryPort,
         SchedulingPortError, SimulationRequest, compose_canonical_schedule,
-        simulation_request_digest,
+        simulation_request_digest, simulation_request_hash,
     },
 };
 use http_body_util::BodyExt as _;
@@ -43,6 +43,26 @@ use sqlx::{
 };
 use tower::ServiceExt as _;
 use uuid::Uuid;
+
+type StoredSimulationEvidenceRow = (
+    bool,
+    bool,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    String,
+    Option<Vec<u8>>,
+);
+type SubmissionProofRow = (
+    Vec<u8>,
+    Vec<u8>,
+    i16,
+    Vec<u8>,
+    String,
+    Option<Vec<u8>>,
+    Vec<u8>,
+    bool,
+);
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
@@ -1039,7 +1059,11 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             &access,
             SimulationRequest {
                 base_revision: pre_update_schedule.revision,
-                operations: vec![operation(PlanOperationKind::CreateItem, None, json!({}))],
+                operations: vec![operation(
+                    PlanOperationKind::CreateItem,
+                    None,
+                    create_task_parameters("Stale simulation proposal"),
+                )],
                 assumptions: Vec::new(),
             },
         )
@@ -1362,7 +1386,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             .iter()
             .filter(|warning| warning.code == "not_modeled")
             .count(),
-        8
+        4
     );
     assert!(
         simulated
@@ -1383,8 +1407,22 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             .is_none(),
         "typed privacy evidence is server-internal and never appears in the MCP result"
     );
-    let stored_privacy_evidence: bool = sqlx::query_scalar(
-        "SELECT result_snapshot ? 'privacy_evidence' FROM schedule_simulations \
+    assert!(!simulated.application_ready);
+    assert!(simulated.change_set_schema.is_none());
+    let public_simulation = serde_json::to_value(&simulated).unwrap();
+    assert!(public_simulation.get("proposal_evidence").is_none());
+    let (
+        stored_privacy_evidence,
+        stored_proposal_evidence,
+        stored_request_hash,
+        stored_request_digest,
+        stored_evidence_hash,
+        compilation_outcome,
+        compiled_payload_hash,
+    ): StoredSimulationEvidenceRow = sqlx::query_as(
+        "SELECT result_snapshot ? 'privacy_evidence', result_snapshot ? 'proposal_evidence', \
+           request_hash, request_digest, evidence_hash, compilation_outcome, compiled_payload_hash \
+         FROM schedule_simulations \
          WHERE workspace_id = $1 AND user_id = $2 AND consumed_at IS NULL \
          ORDER BY created_at DESC LIMIT 1",
     )
@@ -1394,6 +1432,27 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     .await
     .unwrap();
     assert!(stored_privacy_evidence);
+    assert!(stored_proposal_evidence);
+    let expected_request_hash = simulation_request_hash(&simulation_request).unwrap();
+    assert_eq!(stored_request_hash, expected_request_hash);
+    assert_eq!(stored_request_digest, expected_request_hash[..16]);
+    assert_eq!(stored_evidence_hash.len(), 32);
+    assert_ne!(stored_evidence_hash, stored_request_hash);
+    assert_eq!(compilation_outcome, "manual_review");
+    assert!(compiled_payload_hash.is_none());
+    assert!(
+        sqlx::query(
+            "UPDATE schedule_simulations SET evidence_hash = $3 \
+             WHERE workspace_id = $1 AND user_id = $2 AND consumed_at IS NULL",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(vec![0_u8; 32])
+        .execute(&test_database.pool)
+        .await
+        .is_err(),
+        "the hidden request and compilation commitment is immutable"
+    );
     let stored_token_leaks: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM schedule_simulations WHERE result_snapshot::text LIKE $1",
     )
@@ -1428,11 +1487,9 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         submission_key,
         [81; 32],
         &simulation_request,
-        Some(simulated.simulation_token.clone()),
+        simulated.simulation_token.clone(),
     );
-    first_submission.proposal.created_at = "2099-01-01T00:00:00.123456789Z".parse().unwrap();
-    first_submission.proposal.updated_at = first_submission.proposal.created_at;
-    first_submission.proposal.expires_at = "2099-01-02T00:00:00.987654321Z".parse().unwrap();
+    first_submission.expires_at = "2099-01-02T00:00:00.987654321Z".parse().unwrap();
     let submitted = restarted
         .submit_proposal(&access, first_submission)
         .await
@@ -1452,6 +1509,24 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             .timestamp_subsec_nanos()
             .is_multiple_of(1_000)
     );
+    assert_eq!(submitted.proposal.kind, ProposalKind::SchedulePlan);
+    assert_eq!(
+        submitted.proposal.payload["safety"]["application_ready"],
+        false
+    );
+    assert_eq!(
+        submitted.proposal.payload["safety"]["manual_review_reasons"],
+        json!(["mixed_operation_kinds"])
+    );
+    assert!(ProposalChangeSet::from_payload(&submitted.proposal.payload).is_err());
+    assert_submission_proof(
+        &test_database.pool,
+        scope,
+        submitted.proposal.id,
+        &simulation_request,
+        "manual_review",
+    )
+    .await;
     let after_restart = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let replayed = after_restart
         .submit_proposal(
@@ -1461,7 +1536,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 submission_key,
                 [81; 32],
                 &simulation_request,
-                Some(simulated.simulation_token.clone()),
+                simulated.simulation_token.clone(),
             ),
         )
         .await
@@ -1481,7 +1556,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                     submission_key,
                     [82; 32],
                     &simulation_request,
-                    Some(simulated.simulation_token.clone()),
+                    simulated.simulation_token.clone(),
                 ),
             )
             .await,
@@ -1551,6 +1626,17 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             .contains(submission_key)
     );
 
+    assert_actionable_proposal_bridge(
+        &test_database.pool,
+        scope,
+        &items,
+        &restarted,
+        &access,
+        &latest_schedule.revision,
+        public_task,
+    )
+    .await;
+
     let concurrent_simulation = restarted
         .simulate(&access, simulation_request.clone())
         .await
@@ -1560,7 +1646,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         "durable-proposal-race",
         [83; 32],
         &simulation_request,
-        Some(concurrent_simulation.simulation_token.clone()),
+        concurrent_simulation.simulation_token.clone(),
     );
     let left_repository = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let right_repository = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
@@ -1611,7 +1697,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                     "durable-proposal-token-reuse",
                     [84; 32],
                     &simulation_request,
-                    Some(concurrent_simulation.simulation_token),
+                    concurrent_simulation.simulation_token,
                 ),
             )
             .await,
@@ -1626,31 +1712,41 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         .simulate(&access, simulation_request.clone())
         .await
         .unwrap();
-    let mut before_insert_spec = proposal_submission(
+    let before_insert_spec = proposal_submission(
         &access.subject,
         "durable-proposal-before-insert",
         [85; 32],
         &simulation_request,
-        Some(before_insert_simulation.simulation_token.clone()),
+        before_insert_simulation.simulation_token.clone(),
     );
-    let proposal_repository = PostgresProposalRepository::new(test_database.pool.clone(), scope);
-    proposal_repository
-        .insert(before_insert_spec.proposal.clone())
-        .await
-        .unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION fail_test_mcp_proposal_insert() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'synthetic proposal insert failure'; END $$; \
+         CREATE TRIGGER fail_test_mcp_proposal_insert BEFORE INSERT ON proposals \
+         FOR EACH ROW EXECUTE FUNCTION fail_test_mcp_proposal_insert();",
+    )
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
     assert!(matches!(
         restarted
             .submit_proposal(&access, before_insert_spec.clone())
             .await,
         Err(ProposalSubmissionError::Unavailable)
     ));
+    sqlx::raw_sql(
+        "DROP TRIGGER fail_test_mcp_proposal_insert ON proposals; \
+         DROP FUNCTION fail_test_mcp_proposal_insert();",
+    )
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
     assert_simulation_unconsumed(
         &test_database.pool,
         scope,
         &before_insert_simulation.simulation_token,
     )
     .await;
-    before_insert_spec.proposal.id = Uuid::new_v4();
     assert!(
         restarted
             .submit_proposal(&access, before_insert_spec)
@@ -1670,8 +1766,9 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         "durable-proposal-after-insert",
         [86; 32],
         &simulation_request,
-        Some(after_insert_simulation.simulation_token.clone()),
+        after_insert_simulation.simulation_token.clone(),
     );
+    let before_failed_submission = proposal_artifact_counts(&test_database.pool, scope).await;
     sqlx::raw_sql(
         "CREATE FUNCTION fail_test_mcp_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN RAISE EXCEPTION 'synthetic receipt failure'; END $$; \
@@ -1700,18 +1797,11 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         &after_insert_simulation.simulation_token,
     )
     .await;
-    let rolled_back_evidence: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT \
-           (SELECT COUNT(*) FROM proposals WHERE id = $1), \
-           (SELECT COUNT(*) FROM outbox_messages WHERE aggregate_id = $1), \
-           (SELECT COUNT(*) FROM audit_operations WHERE entity_id = $1), \
-           (SELECT COUNT(*) FROM mcp_proposal_submissions WHERE proposal_id = $1)",
-    )
-    .bind(after_insert_spec.proposal.id)
-    .fetch_one(&test_database.pool)
-    .await
-    .unwrap();
-    assert_eq!(rolled_back_evidence, (0, 0, 0, 0));
+    assert_eq!(
+        proposal_artifact_counts(&test_database.pool, scope).await,
+        before_failed_submission,
+        "receipt failure rolls back the generated proposal, outbox, audit, and receipt rows"
+    );
     assert!(
         restarted
             .submit_proposal(&access, after_insert_spec)
@@ -1733,7 +1823,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                     "durable-proposal-wrong-subject",
                     [87; 32],
                     &simulation_request,
-                    Some(subject_simulation.simulation_token.clone()),
+                    subject_simulation.simulation_token.clone(),
                 ),
             )
             .await,
@@ -1748,21 +1838,85 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     )
     .await;
 
-    let expired_simulation = restarted
-        .simulate(&access, simulation_request.clone())
-        .await
-        .unwrap();
+    let expired_token = format!("sim_{}", "A".repeat(43));
     let mut expired_hash = Sha256::new();
     expired_hash.update(b"dayweave.schedule-simulation-token.v1\0");
-    expired_hash.update(expired_simulation.simulation_token.as_bytes());
-    sqlx::query(
-        "UPDATE schedule_simulations SET created_at = clock_timestamp() - interval '16 minutes', \
-         expires_at = clock_timestamp() - interval '2 minutes' \
-         WHERE workspace_id = $1 AND user_id = $2 AND token_hash = $3",
+    expired_hash.update(expired_token.as_bytes());
+    let expired_token_hash: [u8; 32] = expired_hash.finalize().into();
+    let mut expired_subject_hash = Sha256::new();
+    expired_subject_hash.update(b"dayweave.schedule-simulation-subject.v1\0");
+    expired_subject_hash.update(access.subject.as_bytes());
+    let expired_subject_hash: [u8; 32] = expired_subject_hash.finalize().into();
+    let expired_request_hash = simulation_request_hash(&simulation_request).unwrap();
+    let expired_request_digest = simulation_request_digest(&simulation_request).unwrap();
+    let expired_base_revision_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM schedule_revisions WHERE workspace_id = $1 AND state = 'published'",
     )
     .bind(scope.workspace_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    let expired_simulation_id = Uuid::new_v4();
+    let expired_created_at: chrono::DateTime<Utc> = "2000-01-01T00:00:00Z".parse().unwrap();
+    let expired_expires_at: chrono::DateTime<Utc> = "2000-01-01T00:14:00Z".parse().unwrap();
+    let expired_snapshot = json!({
+        "request_digest": expired_request_digest,
+        "base_revision": simulation_request.base_revision,
+        "application_ready": false,
+        "change_set_schema": null,
+        "moved_blocks": [],
+        "unscheduled_item_ids": [],
+        "violations": [],
+        "warnings": [],
+        "privacy_evidence": {
+            "schema_version": 1,
+            "item_ids": [],
+            "block_ids": [],
+            "sensitive_at_simulation": false
+        },
+        "proposal_evidence": {
+            "schema_version": 1,
+            "proposal_kind": null,
+            "change_set": null,
+            "manual_review_reasons": ["expired_fixture"]
+        }
+    });
+    let expired_commitment = json!({
+        "workspace_id": scope.workspace_id,
+        "user_id": scope.user_id,
+        "simulation_id": expired_simulation_id,
+        "subject_hash": URL_SAFE_NO_PAD.encode(expired_subject_hash),
+        "request_hash": URL_SAFE_NO_PAD.encode(expired_request_hash),
+        "base_revision_id": expired_base_revision_id,
+        "base_revision_label": simulation_request.base_revision,
+        "created_at": expired_created_at,
+        "expires_at": expired_expires_at,
+        "snapshot": expired_snapshot
+    });
+    let mut expired_evidence_hash = Sha256::new();
+    expired_evidence_hash.update(b"dayweave.mcp-simulation-evidence.v1\0");
+    expired_evidence_hash.update(serde_json::to_vec(&expired_commitment).unwrap());
+    let expired_evidence_hash: [u8; 32] = expired_evidence_hash.finalize().into();
+    sqlx::query(
+        "INSERT INTO schedule_simulations (id, workspace_id, user_id, token_hash, subject_hash, \
+           request_digest, base_revision_id, base_revision_label, result_snapshot, created_at, \
+           expires_at, evidence_schema, request_hash, evidence_hash, compilation_outcome, \
+           compiled_payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+           1, $12, $13, 'manual_review', NULL)",
+    )
+    .bind(expired_simulation_id)
+    .bind(scope.workspace_id)
     .bind(scope.user_id)
-    .bind(expired_hash.finalize().as_slice())
+    .bind(expired_token_hash.as_slice())
+    .bind(expired_subject_hash.as_slice())
+    .bind(&expired_request_hash[..16])
+    .bind(expired_base_revision_id)
+    .bind(&simulation_request.base_revision)
+    .bind(expired_snapshot)
+    .bind(expired_created_at)
+    .bind(expired_expires_at)
+    .bind(expired_request_hash.as_slice())
+    .bind(expired_evidence_hash.as_slice())
     .execute(&test_database.pool)
     .await
     .unwrap();
@@ -1775,7 +1929,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                     "durable-proposal-expired",
                     [88; 32],
                     &simulation_request,
-                    Some(expired_simulation.simulation_token),
+                    expired_token,
                 ),
             )
             .await,
@@ -2011,6 +2165,20 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         ))
         .await
         .expect("Calendar projection fence migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0015_transactional_proposal_applications.sql"
+        ))
+        .await
+        .expect("transactional proposal application migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0016_mcp_simulation_evidence.sql"
+        ))
+        .await
+        .expect("MCP simulation evidence migration applies");
 
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
@@ -2124,7 +2292,11 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
                 &access,
                 SimulationRequest {
                     base_revision: fresh.revision.revision,
-                    operations: vec![operation(PlanOperationKind::CreateItem, None, json!({}))],
+                    operations: vec![operation(
+                        PlanOperationKind::CreateItem,
+                        None,
+                        create_task_parameters("Fresh upgrade proposal"),
+                    )],
                     assumptions: Vec::new(),
                 },
             )
@@ -2728,45 +2900,31 @@ fn operation(kind: PlanOperationKind, target_id: Option<&str>, parameters: Value
     }
 }
 
+fn create_task_parameters(title: &str) -> Value {
+    let mut parameters =
+        serde_json::to_value(task(Uuid::new_v4(), title, false, None, json!({}))).unwrap();
+    parameters.as_object_mut().unwrap().remove("id");
+    parameters
+}
+
 fn proposal_submission(
-    subject: &str,
+    _subject: &str,
     idempotency_key: &str,
     request_fingerprint: [u8; 32],
     request: &SimulationRequest,
-    simulation_token: Option<String>,
+    simulation_token: String,
 ) -> ProposalSubmissionSpec {
-    let expected_simulation_digest = simulation_request_digest(request).unwrap();
-    let proposal = Proposal::new(
-        NewProposal {
-            submitted_by: subject.to_owned(),
-            source: ProposalSource::ExternalMcp,
-            source_reference: Some("synthetic conversation".to_owned()),
-            kind: ProposalKind::SchedulePlan,
-            title: "Synthetic durable MCP proposal".to_owned(),
-            explanation: Some("Exercises transactional submission.".to_owned()),
-            payload: json!({
-                "schema_version": 1,
-                "base_revision": request.base_revision,
-                "assumptions": request.assumptions,
-                "operations": request.operations,
-                "source": {"client": "test", "conversation": "synthetic"},
-                "safety": {
-                    "proposal_only": true,
-                    "requires_app_review": true,
-                    "canonical_state_mutated": false
-                }
-            }),
-            expires_at: Utc::now() + chrono::Duration::days(1),
-        },
-        Utc::now(),
-    )
-    .unwrap();
     ProposalSubmissionSpec {
         idempotency_key: idempotency_key.to_owned(),
         request_fingerprint,
-        expected_simulation_digest,
         simulation_token,
-        proposal,
+        request: request.clone(),
+        title: "Synthetic durable MCP proposal".to_owned(),
+        explanation: "Exercises transactional submission.".to_owned(),
+        source_conversation_label: "synthetic conversation".to_owned(),
+        source_client_label: Some("schedule-postgres-test".to_owned()),
+        source_request_id: Uuid::new_v4().to_string(),
+        expires_at: Utc::now() + chrono::Duration::days(1),
     }
 }
 
@@ -2937,14 +3095,14 @@ async fn assert_private_simulation_rejected(
     );
     assert_simulation_unconsumed(pool, scope, &simulation.simulation_token).await;
 
+    let before = proposal_artifact_counts(pool, scope).await;
     let spec = proposal_submission(
         &access.subject,
         submission_key,
         fingerprint,
         request,
-        Some(simulation.simulation_token.clone()),
+        simulation.simulation_token.clone(),
     );
-    let proposal_id = spec.proposal.id;
     assert!(matches!(
         schedules.submit_proposal(access, spec).await,
         Err(ProposalSubmissionError::Simulation(
@@ -2952,20 +3110,379 @@ async fn assert_private_simulation_rejected(
         ))
     ));
     assert_simulation_unconsumed(pool, scope, &simulation.simulation_token).await;
-    let evidence: (i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT \
-           (SELECT COUNT(*) FROM proposals WHERE workspace_id = $1 AND id = $2), \
-           (SELECT COUNT(*) FROM outbox_messages WHERE workspace_id = $1 AND aggregate_id = $2), \
-           (SELECT COUNT(*) FROM audit_operations WHERE workspace_id = $1 AND entity_id = $2), \
-           (SELECT COUNT(*) FROM mcp_proposal_submissions WHERE workspace_id = $1 \
-             AND proposal_id = $2)",
+    assert_eq!(proposal_artifact_counts(pool, scope).await, before);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn submit_actionable_operation(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    schedules: &PostgresSchedulingRepository,
+    access: &ScheduleAccess,
+    base_revision: &str,
+    operation: PlanOperation,
+    idempotency_key: &str,
+    fingerprint: [u8; 32],
+    expected_kind: ProposalKind,
+) -> Proposal {
+    let request = SimulationRequest {
+        base_revision: base_revision.to_owned(),
+        operations: vec![operation],
+        assumptions: vec!["Typed bridge integration proof".to_owned()],
+    };
+    let simulation = schedules.simulate(access, request.clone()).await.unwrap();
+    assert!(simulation.application_ready);
+    assert_eq!(
+        simulation.change_set_schema.as_deref(),
+        Some("dayweave.proposal-change-set/1")
+    );
+    let public_result = serde_json::to_value(&simulation).unwrap();
+    assert!(public_result.get("proposal_evidence").is_none());
+
+    let submission = schedules
+        .submit_proposal(
+            access,
+            proposal_submission(
+                &access.subject,
+                idempotency_key,
+                fingerprint,
+                &request,
+                simulation.simulation_token,
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!submission.duplicate);
+    assert_eq!(submission.proposal.source, ProposalSource::ExternalMcp);
+    assert_eq!(submission.proposal.kind, expected_kind);
+    ProposalChangeSet::from_payload(&submission.proposal.payload)
+        .expect("application-ready simulation materializes the strict typed payload");
+    assert_submission_proof(pool, scope, submission.proposal.id, &request, "actionable").await;
+    submission.proposal
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn assert_actionable_proposal_bridge(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    items: &ItemService,
+    schedules: &PostgresSchedulingRepository,
+    access: &ScheduleAccess,
+    base_revision: &str,
+    target_item_id: Uuid,
+) {
+    let generated_item_marker = Uuid::new_v4();
+    let mut create_parameters = serde_json::to_value(task(
+        generated_item_marker,
+        "AI-created typed task",
+        false,
+        None,
+        json!({"preferred_period": "afternoon"}),
+    ))
+    .unwrap();
+    create_parameters.as_object_mut().unwrap().remove("id");
+    let created = submit_actionable_operation(
+        pool,
+        scope,
+        schedules,
+        access,
+        base_revision,
+        operation(PlanOperationKind::CreateItem, None, create_parameters),
+        "typed-bridge-create",
+        [101; 32],
+        ProposalKind::CreateItem,
+    )
+    .await;
+    let create_change_set = ProposalChangeSet::from_payload(&created.payload).unwrap();
+    match create_change_set.commands.as_slice() {
+        [ProposalCommand::CreateItem { command_id, item }] => {
+            assert_ne!(*command_id, Uuid::nil());
+            assert_ne!(item.id, Uuid::nil());
+            assert_ne!(item.id, generated_item_marker);
+            assert_eq!(item.title, "AI-created typed task");
+            assert_eq!(item.kind, ItemKind::Task);
+        }
+        commands => panic!("unexpected create change set: {commands:?}"),
+    }
+
+    let current = items.get(target_item_id).await.unwrap();
+    let target = target_item_id.to_string();
+    let completed = submit_actionable_operation(
+        pool,
+        scope,
+        schedules,
+        access,
+        base_revision,
+        operation(PlanOperationKind::CompleteItem, Some(&target), json!({})),
+        "typed-bridge-complete",
+        [102; 32],
+        ProposalKind::UpdateItem,
+    )
+    .await;
+    let complete_change_set = ProposalChangeSet::from_payload(&completed.payload).unwrap();
+    match complete_change_set.commands.as_slice() {
+        [
+            ProposalCommand::ReplaceItem {
+                item_id,
+                expected_revision,
+                item,
+                ..
+            },
+        ] => {
+            assert_eq!(*item_id, target_item_id);
+            assert_eq!(*expected_revision, current.revision);
+            assert_eq!(item.status, ItemStatus::Completed);
+            assert_eq!(item.title, current.title);
+        }
+        commands => panic!("unexpected complete change set: {commands:?}"),
+    }
+
+    let deleted = submit_actionable_operation(
+        pool,
+        scope,
+        schedules,
+        access,
+        base_revision,
+        operation(PlanOperationKind::DeleteItem, Some(&target), json!({})),
+        "typed-bridge-delete",
+        [103; 32],
+        ProposalKind::UpdateItem,
+    )
+    .await;
+    let delete_change_set = ProposalChangeSet::from_payload(&deleted.payload).unwrap();
+    match delete_change_set.commands.as_slice() {
+        [
+            ProposalCommand::TrashItem {
+                item_id,
+                expected_revision,
+                ..
+            },
+        ] => {
+            assert_eq!(*item_id, target_item_id);
+            assert_eq!(*expected_revision, current.revision);
+        }
+        commands => panic!("unexpected delete change set: {commands:?}"),
+    }
+
+    let constrained = submit_actionable_operation(
+        pool,
+        scope,
+        schedules,
+        access,
+        base_revision,
+        operation(
+            PlanOperationKind::UpdateConstraint,
+            Some(&target),
+            json!({
+                "duration_seconds": 5_400,
+                "flexible_constraints": {"preferred_period": "morning"}
+            }),
+        ),
+        "typed-bridge-constraint",
+        [104; 32],
+        ProposalKind::ConstraintChange,
+    )
+    .await;
+    let constraint_change_set = ProposalChangeSet::from_payload(&constrained.payload).unwrap();
+    match constraint_change_set.commands.as_slice() {
+        [
+            ProposalCommand::ReplaceItem {
+                item_id,
+                expected_revision,
+                item,
+                ..
+            },
+        ] => {
+            assert_eq!(*item_id, target_item_id);
+            assert_eq!(*expected_revision, current.revision);
+            assert_eq!(item.duration_seconds, Some(5_400));
+            assert_eq!(
+                item.flexible_constraints,
+                json!({"preferred_period": "morning"})
+            );
+            assert_eq!(item.status, current.status);
+        }
+        commands => panic!("unexpected constraint change set: {commands:?}"),
+    }
+
+    let mapped_request = SimulationRequest {
+        base_revision: base_revision.to_owned(),
+        operations: vec![operation(
+            PlanOperationKind::UpdateConstraint,
+            Some(&target),
+            json!({"duration_seconds": 6_000}),
+        )],
+        assumptions: vec!["Provider mapping may change before submission".to_owned()],
+    };
+    let before_mapping = schedules
+        .simulate(access, mapped_request.clone())
+        .await
+        .unwrap();
+    assert!(before_mapping.application_ready);
+    let mapping_id = mark_provider_mapped_dayweave(pool, scope, &current).await;
+    assert!(matches!(
+        schedules
+            .submit_proposal(
+                access,
+                proposal_submission(
+                    &access.subject,
+                    "typed-bridge-provider-race",
+                    [105; 32],
+                    &mapped_request,
+                    before_mapping.simulation_token.clone(),
+                ),
+            )
+            .await,
+        Err(ProposalSubmissionError::Simulation(
+            SchedulingPortError::InvalidQuery(_)
+        ))
+    ));
+    assert_simulation_unconsumed(pool, scope, &before_mapping.simulation_token).await;
+
+    let mapped_target = schedules
+        .simulate(access, mapped_request.clone())
+        .await
+        .unwrap();
+    assert!(!mapped_target.application_ready);
+    assert!(mapped_target.change_set_schema.is_none());
+
+    let mut child_parameters = serde_json::to_value(task(
+        Uuid::new_v4(),
+        "Child of mapped item",
+        false,
+        Some(target_item_id),
+        json!({}),
+    ))
+    .unwrap();
+    child_parameters.as_object_mut().unwrap().remove("id");
+    let mapped_parent = schedules
+        .simulate(
+            access,
+            SimulationRequest {
+                base_revision: base_revision.to_owned(),
+                operations: vec![operation(
+                    PlanOperationKind::CreateItem,
+                    None,
+                    child_parameters,
+                )],
+                assumptions: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!mapped_parent.application_ready);
+    assert!(mapped_parent.change_set_schema.is_none());
+
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET tombstoned_at = clock_timestamp(), \
+         updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(mapping_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn mark_provider_mapped_dayweave(pool: &PgPool, scope: DatabaseScope, item: &Item) -> Uuid {
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, external_account_id, \
+         display_label, encrypted_credentials, credential_key_version, status, sync_enabled, \
+         is_default) VALUES ($1,$2,$3,'google',$4,'Synthetic bridge provider',$5,1,'active',true,false)",
+    )
+    .bind(account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(format!("synthetic-bridge-provider-{account_id}"))
+    .bind(vec![0xA5_u8; 64])
+    .execute(pool)
+    .await
+    .unwrap();
+    let mapping_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, entity_kind, \
+         local_entity_id, remote_resource_id, local_revision, sync_state, ownership, created_at, \
+         updated_at) VALUES ($1,$2,$3,'item',$4,$5,$6,'synced','dayweave',$7,$7)",
+    )
+    .bind(mapping_id)
+    .bind(scope.workspace_id)
+    .bind(account_id)
+    .bind(item.id)
+    .bind(format!("synthetic-bridge-remote-{}", item.id))
+    .bind(i64::try_from(item.revision).unwrap())
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .unwrap();
+    mapping_id
+}
+
+async fn assert_submission_proof(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    proposal_id: Uuid,
+    request: &SimulationRequest,
+    expected_outcome: &str,
+) {
+    let (
+        request_digest,
+        request_hash,
+        evidence_schema,
+        evidence_hash,
+        outcome,
+        compiled_payload_hash,
+        proposal_payload_hash,
+        hidden_evidence_present,
+    ): SubmissionProofRow = sqlx::query_as(
+        "SELECT submission.simulation_request_digest, submission.simulation_request_hash, \
+           submission.simulation_evidence_schema, submission.simulation_evidence_hash, \
+           submission.compilation_outcome, submission.compiled_payload_hash, \
+           submission.proposal_payload_hash, simulation.result_snapshot ? 'proposal_evidence' \
+         FROM mcp_proposal_submissions AS submission \
+         JOIN schedule_simulations AS simulation \
+           ON simulation.workspace_id = submission.workspace_id \
+          AND simulation.user_id = submission.user_id \
+          AND simulation.id = submission.simulation_id \
+         WHERE submission.workspace_id = $1 AND submission.proposal_id = $2",
     )
     .bind(scope.workspace_id)
     .bind(proposal_id)
     .fetch_one(pool)
     .await
     .unwrap();
-    assert_eq!(evidence, (0, 0, 0, 0));
+    let expected_hash = simulation_request_hash(request).unwrap();
+    assert_eq!(request_hash, expected_hash);
+    assert_eq!(request_digest, expected_hash[..16]);
+    assert_eq!(evidence_schema, 1);
+    assert_eq!(evidence_hash.len(), 32);
+    assert_eq!(outcome, expected_outcome);
+    assert_eq!(proposal_payload_hash.len(), 32);
+    assert!(hidden_evidence_present);
+    if expected_outcome == "actionable" {
+        assert_eq!(
+            compiled_payload_hash.as_deref(),
+            Some(proposal_payload_hash.as_slice())
+        );
+    } else {
+        assert!(compiled_payload_hash.is_none());
+    }
+}
+
+async fn proposal_artifact_counts(pool: &PgPool, scope: DatabaseScope) -> (i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM proposals WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM outbox_messages WHERE workspace_id = $1 \
+             AND aggregate_type = 'proposal'), \
+           (SELECT COUNT(*) FROM audit_operations WHERE workspace_id = $1 \
+             AND entity_type = 'proposal'), \
+           (SELECT COUNT(*) FROM mcp_proposal_submissions WHERE workspace_id = $1)",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn publication_counts(pool: &PgPool, scope: DatabaseScope) -> (i64, i64, i64, i64, i64) {

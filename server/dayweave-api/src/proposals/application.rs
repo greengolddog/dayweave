@@ -13,6 +13,8 @@ use crate::items::{Item, NewItem, ReplaceItem};
 pub const MAX_PROPOSAL_COMMANDS: usize = 100;
 /// The largest proposal group reviewed and applied as one transaction.
 pub const MAX_PROPOSALS_PER_PREVIEW: usize = 20;
+/// Stable identifier for the only executable proposal payload schema.
+pub const PROPOSAL_CHANGE_SET_SCHEMA_V1: &str = "dayweave.proposal-change-set/1";
 
 /// The only proposal change-set schema this server is permitted to execute.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]

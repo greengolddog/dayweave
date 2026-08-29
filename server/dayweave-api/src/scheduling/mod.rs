@@ -4,6 +4,7 @@ mod memory;
 mod ports;
 mod postgres;
 mod projection;
+mod proposal_bridge;
 
 pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/2";
 
@@ -27,10 +28,14 @@ pub use compose::{
     PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem, Rfc3339SchedulePlan,
     SchedulerConfigInput, compose_canonical_schedule,
 };
-pub use memory::{InMemoryScheduleQueryPort, InMemorySimulationPort, simulation_request_digest};
+pub use memory::{
+    InMemoryScheduleQueryPort, InMemorySimulationPort, simulation_request_digest,
+    simulation_request_hash,
+};
 pub use ports::*;
 pub use postgres::{
     PostgresSchedulingRepository, PublishScheduleSpec, PublishedScheduleRevision,
     SchedulePublication, SchedulePublicationError,
 };
 pub(crate) use projection::{CalendarProjectionFenceError, CalendarProjectionStamp};
+pub(crate) use proposal_bridge::materialize_proposal;

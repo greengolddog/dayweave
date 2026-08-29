@@ -4,13 +4,13 @@ mod repository;
 mod service;
 
 pub use application::{
-    MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, ProposalApplicationReceipt,
-    ProposalApplicationStatus, ProposalAppliedMember, ProposalApplyRequest, ProposalApplyResponse,
-    ProposalChangeSet, ProposalChangeSetError, ProposalChangeSetPreview, ProposalChangeSetSchema,
-    ProposalCommand, ProposalConflict, ProposalConflictCode, ProposalImplicitChangeReason,
-    ProposalImplicitItemDiff, ProposalItemDiff, ProposalItemField, ProposalOperation,
-    ProposalPreviewMember, ProposalPreviewRequest, ProposalRisk, ProposalRiskCode,
-    ProposalRiskLevel, ProposalUndoRequest, ProposalUndoResponse,
+    MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, PROPOSAL_CHANGE_SET_SCHEMA_V1,
+    ProposalApplicationReceipt, ProposalApplicationStatus, ProposalAppliedMember,
+    ProposalApplyRequest, ProposalApplyResponse, ProposalChangeSet, ProposalChangeSetError,
+    ProposalChangeSetPreview, ProposalChangeSetSchema, ProposalCommand, ProposalConflict,
+    ProposalConflictCode, ProposalImplicitChangeReason, ProposalImplicitItemDiff, ProposalItemDiff,
+    ProposalItemField, ProposalOperation, ProposalPreviewMember, ProposalPreviewRequest,
+    ProposalRisk, ProposalRiskCode, ProposalRiskLevel, ProposalUndoRequest, ProposalUndoResponse,
 };
 pub use domain::{
     DecisionKind, EditProposal, NewProposal, Proposal, ProposalDomainError, ProposalKind,

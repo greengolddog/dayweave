@@ -17,6 +17,9 @@ SKILL_METADATA = ROOT / "skills" / "dayweave-scheduling" / "agents" / "openai.ya
 CONNECTION_REFERENCE = (
     ROOT / "skills" / "dayweave-scheduling" / "references" / "connection.md"
 )
+TOOL_CONTRACTS_REFERENCE = (
+    ROOT / "skills" / "dayweave-scheduling" / "references" / "tool-contracts.md"
+)
 
 SECRET_PATTERN = re.compile(
     br"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
@@ -52,6 +55,7 @@ def validate_manifest() -> None:
         is not None,
         "plugin version must be stable semantic versioning",
     )
+    require(version == "0.3.0", "plugin contract version must be 0.3.0")
     require(manifest.get("skills") == "./skills/", "skills path must remain local")
     require(manifest.get("mcpServers") == "./.mcp.json", "MCP path must remain local")
 
@@ -62,6 +66,18 @@ def validate_manifest() -> None:
     require(
         all(isinstance(prompt, str) and 1 <= len(prompt) <= 128 for prompt in prompts),
         "starter prompts must be non-empty and at most 128 characters",
+    )
+    capabilities = interface.get("capabilities")
+    require(
+        isinstance(capabilities, list) and "proposal-submission" in capabilities,
+        "plugin must advertise proposal-submission",
+    )
+    long_description = interface.get("longDescription")
+    require(
+        isinstance(long_description, str)
+        and "Only an authorized DayWeave device" in long_description
+        and "never changes canonical items" in long_description,
+        "plugin must preserve its device-only application boundary",
     )
 
 
@@ -112,6 +128,39 @@ def validate_skill() -> None:
         require(f"`{tool}`" in skill, f"skill must describe {tool}")
     require("references/connection.md" in skill, "skill must route connection failures")
     require(CONNECTION_REFERENCE.is_file(), "connection recovery reference is missing")
+    require(
+        "references/tool-contracts.md" in skill,
+        "skill must route proposal work to the tool contract reference",
+    )
+    require(TOOL_CONTRACTS_REFERENCE.is_file(), "tool contract reference is missing")
+    for expected in (
+        "simulation_token",
+        "application_ready",
+        "change_set_schema",
+        "dayweave.proposal-change-set/1",
+        "device-only",
+    ):
+        require(expected in skill, f"skill is missing proposal invariant {expected}")
+
+    tool_contract = TOOL_CONTRACTS_REFERENCE.read_text(encoding="utf-8")
+    for expected in (
+        "opaque, single-use",
+        "exact unexpired `simulation_token`",
+        "dayweave.proposal-change-set/1",
+        "at most 100 commands",
+        "`create_item`",
+        "`replace_item`",
+        "`trash_item`",
+        "`restore_item`",
+        "`application_ready` is a boolean",
+        "`change_set_schema` is a string or `null`",
+        "device-only preview, apply, or undo",
+    ):
+        require(expected in tool_contract, f"tool contract is missing {expected}")
+    require(
+        "when available" not in tool_contract,
+        "simulation tokens must not be described as optional",
+    )
 
     metadata = SKILL_METADATA.read_text(encoding="utf-8")
     for expected in (

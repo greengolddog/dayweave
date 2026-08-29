@@ -290,14 +290,24 @@ Local natural-language parsing may handle a conservative subset. Other model req
 
 The private plugin under `integrations/dayweave` packages a scheduling skill and MCP registration. The MCP facade exposes two capability families:
 
-- permission-filtered read resources/queries such as availability, selected schedule detail, and proposal status;
+- permission-filtered read queries for selected schedule detail, item search,
+  placement explanations, and conflicts;
 - side-effect-free simulation plus `submit_proposal` tools.
 
-There is deliberately no direct canonical mutation tool for external assistants. `submit_proposal` validates schema and permissions, stores provenance and expiry, and returns an Inbox reference. Accepting a proposal in DayWeave translates it into ordinary commands and confirmation policy. Each MCP client has a separate revocable credential and field-level access policy.
+There is deliberately no direct canonical mutation tool for external assistants.
+Every `submit_proposal` call must consume the opaque token from an otherwise
+identical `simulate_plan` request. The server—not the MCP caller—may compile a
+supported request into the strict `dayweave.proposal-change-set/1` payload and
+reports whether the stored Inbox entry is application-ready. Unsupported or
+mixed requests remain non-executable advisory proposals. Each durable receipt
+retains content-free commitments to the simulation and submitted payload after
+the short-lived hidden evidence is pruned.
 
-MCP submissions themselves remain non-executable; the device-only translation
-and application boundary is described in
-[proposal-applications.md](proposal-applications.md).
+Even an application-ready MCP submission is only Inbox content. Preview, apply,
+and undo are separate device-only REST operations with content-bound review and
+confirmation policy, as described in
+[proposal-applications.md](proposal-applications.md). Each MCP client has a
+separate revocable credential and field-level access policy.
 
 ## 11. Security architecture
 

@@ -1,5 +1,8 @@
 use std::{
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -18,15 +21,15 @@ use dayweave_api::{
     },
     http::router,
     proposals::{
-        Clock, InMemoryProposalRepository, ProposalQuery, ProposalRepository, ProposalService,
-        ProposalSource, ProposalStatus,
+        Clock, InMemoryProposalRepository, ProposalChangeSet, ProposalCommand, ProposalQuery,
+        ProposalRepository, ProposalService, ProposalSource, ProposalStatus,
     },
     readiness::Readiness,
     scheduling::{
         InMemoryScheduleQueryPort, InMemorySimulationPort, PlacementAlternative,
         PlacementExplanation, PlacementReason, PlanningSimulationPort, ScheduleAccess,
-        ScheduleConflict, SchedulingPortError, SimulationRequest, SimulationResult, StoredItem,
-        StoredSchedule, StoredScheduleBlock,
+        ScheduleConflict, SchedulingPortError, SimulationConsumption, SimulationRequest,
+        SimulationResult, StoredItem, StoredSchedule, StoredScheduleBlock,
     },
 };
 use http_body_util::BodyExt;
@@ -71,8 +74,40 @@ impl PlanningSimulationPort for RepublishRequiredSimulationPort {
         _access: &ScheduleAccess,
         _token: &str,
         _expected_request_digest: &str,
-    ) -> Result<SimulationResult, SchedulingPortError> {
+    ) -> Result<SimulationConsumption, SchedulingPortError> {
         Err(SchedulingPortError::RepublishRequired)
+    }
+}
+
+#[derive(Debug, Default)]
+struct CountingSimulationPort {
+    simulate_calls: AtomicUsize,
+    consume_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl PlanningSimulationPort for CountingSimulationPort {
+    async fn simulate(
+        &self,
+        _access: &ScheduleAccess,
+        _request: SimulationRequest,
+    ) -> Result<SimulationResult, SchedulingPortError> {
+        self.simulate_calls.fetch_add(1, Ordering::SeqCst);
+        Err(SchedulingPortError::Unavailable(
+            "unexpected simulation-port call".to_owned(),
+        ))
+    }
+
+    async fn consume_simulation(
+        &self,
+        _access: &ScheduleAccess,
+        _token: &str,
+        _expected_request_digest: &str,
+    ) -> Result<SimulationConsumption, SchedulingPortError> {
+        self.consume_calls.fetch_add(1, Ordering::SeqCst);
+        Err(SchedulingPortError::Unavailable(
+            "unexpected simulation-port call".to_owned(),
+        ))
     }
 }
 
@@ -139,6 +174,35 @@ fn republish_required_fixture() -> Router {
     .with_mcp_ports(
         Arc::new(schedule),
         Arc::new(RepublishRequiredSimulationPort),
+        Arc::new(vec!["https://chatgpt.com".to_owned()]),
+    );
+    router(state)
+}
+
+fn counting_simulation_fixture(simulations: Arc<CountingSimulationPort>) -> Router {
+    let stored_schedule = schedule_fixture();
+    let schedule = InMemoryScheduleQueryPort::new(
+        stored_schedule,
+        item_fixture(),
+        explanation_fixture(),
+        conflict_fixture(),
+    );
+    let repository: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        repository,
+        Arc::new(TestClock::new("2026-08-29T08:00:00Z".parse().unwrap())),
+        Duration::from_hours(7 * 24),
+    ));
+    let readiness = Readiness::default();
+    readiness.set_ready(true);
+    let state = AppState::new(
+        proposals,
+        Arc::new(StaticTokenAuthenticator::from_plaintext(&[TOKEN])),
+        readiness,
+    )
+    .with_mcp_ports(
+        Arc::new(schedule),
+        simulations,
         Arc::new(vec!["https://chatgpt.com".to_owned()]),
     );
     router(state)
@@ -641,8 +705,19 @@ async fn tools_list_is_deterministic_schema_complete_and_scope_filtered() {
         submit["inputSchema"]["properties"]["idempotency_key"]["x-mcp-header"],
         "Idempotency-Key"
     );
+    assert!(
+        submit["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "simulation_token"),
+        "submit_proposal must require proof from the exact simulate_plan call"
+    );
     assert_eq!(submit["annotations"]["destructiveHint"], false);
     assert_eq!(submit["annotations"]["idempotentHint"], true);
+    assert!(names.iter().all(|name| {
+        !name.contains("preview") && !name.contains("apply") && !name.contains("undo")
+    }));
 
     let scoped = fixture_with_authenticator(Arc::new(ScopedAuthenticator {
         token: TOKEN.to_owned(),
@@ -925,6 +1000,143 @@ async fn simulation_is_deterministic_honest_and_never_mutates_the_stored_schedul
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One end-to-end assertion locks the complete stored payload.
+async fn create_item_simulation_materializes_an_exact_typed_application_ready_change_set() {
+    let fixture = fixture();
+    let operation = json!({
+        "kind": "create_item",
+        "parameters": {
+            "is_sensitive": false,
+            "kind": "task",
+            "status": "inbox",
+            "title": "Prepare quarterly review",
+            "notes": "Collect the project outcomes first.",
+            "timezone_name": "Europe/Madrid",
+            "duration_seconds": 3600,
+            "deadline_at": "2026-09-04T16:00:00Z",
+            "earliest_start_at": "2026-08-31T07:00:00Z",
+            "recurrence": null,
+            "flexible_constraints": {},
+            "split_policy": {
+                "type": "splittable",
+                "minimum_chunk_seconds": 900,
+                "maximum_chunk_seconds": 1800
+            },
+            "importance": 4,
+            "urgency": 3,
+            "parent_id": null,
+            "sibling_order": 2
+        }
+    });
+    let simulation = send(
+        &fixture.app,
+        tool_request(
+            "simulate_plan",
+            json!({
+                "base_revision": "revision-7",
+                "operations": [operation.clone()]
+            }),
+            1,
+        ),
+    )
+    .await
+    .2;
+    assert_eq!(simulation["result"]["isError"], false);
+    assert_eq!(
+        simulation["result"]["structuredContent"]["application_ready"],
+        true
+    );
+    assert_eq!(
+        simulation["result"]["structuredContent"]["change_set_schema"],
+        "dayweave.proposal-change-set/1"
+    );
+    let token = simulation["result"]["structuredContent"]["simulation_token"]
+        .as_str()
+        .unwrap();
+
+    let key = "create-item-typed-change-set-v1";
+    let submitted = send(
+        &fixture.app,
+        proposal_request(
+            json!({
+                "idempotency_key": key,
+                "title": "Create quarterly review task",
+                "explanation": "The user requested a review-preparation task.",
+                "source_conversation_label": "ChatGPT quarterly planning",
+                "base_revision": "revision-7",
+                "simulation_token": token,
+                "operations": [operation]
+            }),
+            2,
+            Some(key),
+        ),
+    )
+    .await
+    .2;
+    assert_eq!(submitted["result"]["isError"], false);
+    assert_eq!(
+        submitted["result"]["structuredContent"]["application_ready"],
+        true
+    );
+    assert_eq!(
+        submitted["result"]["structuredContent"]["change_set_schema"],
+        "dayweave.proposal-change-set/1"
+    );
+    assert_eq!(
+        submitted["result"]["structuredContent"]["canonical_state_mutated"],
+        false
+    );
+
+    let proposals = fixture
+        .proposals
+        .list(ProposalQuery {
+            limit: 10,
+            ..ProposalQuery::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(proposals.len(), 1);
+    let change_set = ProposalChangeSet::from_payload(&proposals[0].payload).unwrap();
+    assert_eq!(change_set.commands.len(), 1);
+    let ProposalCommand::CreateItem { command_id, item } = &change_set.commands[0] else {
+        panic!("create_item simulation must store one typed create_item command");
+    };
+    let expected_payload = json!({
+        "schema": "dayweave.proposal-change-set/1",
+        "commands": [{
+            "operation": "create_item",
+            "command_id": command_id,
+            "item": {
+                "id": item.id,
+                "is_sensitive": false,
+                "kind": "task",
+                "status": "inbox",
+                "title": "Prepare quarterly review",
+                "notes": "Collect the project outcomes first.",
+                "timezone_name": "Europe/Madrid",
+                "duration_seconds": 3600,
+                "deadline_at": "2026-09-04T16:00:00Z",
+                "earliest_start_at": "2026-08-31T07:00:00Z",
+                "recurrence": null,
+                "flexible_constraints": {},
+                "split_policy": {
+                    "type": "splittable",
+                    "minimum_chunk_seconds": 900,
+                    "maximum_chunk_seconds": 1800
+                },
+                "importance": 4,
+                "urgency": 3,
+                "parent_id": null,
+                "sibling_order": 2
+            }
+        }]
+    });
+    assert_eq!(proposals[0].payload, expected_payload);
+    assert!(proposals[0].payload.get("safety").is_none());
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One scenario verifies the complete single-use and retry contract.
 async fn submit_proposal_is_idempotent_consumes_simulation_and_only_writes_inbox() {
     let fixture = fixture();
     let operation = json!({
@@ -948,6 +1160,11 @@ async fn submit_proposal_is_idempotent_consumes_simulation_and_only_writes_inbox
     let token = simulation["result"]["structuredContent"]["simulation_token"]
         .as_str()
         .unwrap();
+    assert_eq!(
+        simulation["result"]["structuredContent"]["application_ready"],
+        false
+    );
+    assert!(simulation["result"]["structuredContent"]["change_set_schema"].is_null());
     let key = "chatgpt-conversation-42-v1";
     let mut arguments = json!({
         "idempotency_key": key,
@@ -974,6 +1191,11 @@ async fn submit_proposal_is_idempotent_consumes_simulation_and_only_writes_inbox
         first["result"]["structuredContent"]["review_required"],
         true
     );
+    assert_eq!(
+        first["result"]["structuredContent"]["application_ready"],
+        false
+    );
+    assert!(first["result"]["structuredContent"]["change_set_schema"].is_null());
     let proposal_id = first["result"]["structuredContent"]["proposal_id"].clone();
 
     let replay = send(
@@ -1014,6 +1236,11 @@ async fn submit_proposal_is_idempotent_consumes_simulation_and_only_writes_inbox
     assert_eq!(proposals[0].source, ProposalSource::ExternalMcp);
     assert_eq!(proposals[0].status, ProposalStatus::Pending);
     assert_eq!(proposals[0].payload["safety"]["proposal_only"], true);
+    assert_eq!(proposals[0].payload["safety"]["application_ready"], false);
+    assert_eq!(
+        proposals[0].payload["safety"]["manual_review_reasons"],
+        json!(["unsupported_move_block"])
+    );
     assert_eq!(
         fixture.schedule.stored_schedule().blocks[0].start,
         "2026-08-29T09:00:00Z".parse::<DateTime<Utc>>().unwrap()
@@ -1134,6 +1361,42 @@ async fn submit_requires_mirrored_idempotency_header_and_stale_simulation_is_act
         stale["result"]["structuredContent"]["details"]["current_revision"],
         "revision-7"
     );
+}
+
+#[tokio::test]
+async fn submit_without_simulation_token_is_rejected_before_any_simulation_port_call() {
+    let simulations = Arc::new(CountingSimulationPort::default());
+    let app = counting_simulation_fixture(simulations.clone());
+    let key = "missing-required-simulation-token";
+    let response = send(
+        &app,
+        proposal_request(
+            json!({
+                "idempotency_key": key,
+                "title": "Unsimulated proposal",
+                "explanation": "This request intentionally omits simulation proof.",
+                "source_conversation_label": "contract test",
+                "base_revision": "revision-7",
+                "operations": [{
+                    "kind": "move_block",
+                    "target_id": "block-public",
+                    "parameters": { "start": "2026-08-29T12:00:00Z" }
+                }]
+            }),
+            1,
+            Some(key),
+        ),
+    )
+    .await
+    .2;
+
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(
+        response["result"]["structuredContent"]["code"],
+        "invalid_arguments"
+    );
+    assert_eq!(simulations.simulate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(simulations.consume_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::proposals::Proposal;
+use crate::proposals::{Proposal, ProposalChangeSet, ProposalCommand, ProposalKind};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScheduleAccess {
@@ -202,10 +202,161 @@ pub struct SimulationResult {
     pub simulation_token: String,
     pub request_digest: String,
     pub base_revision: String,
+    /// Whether the exact simulated request can become a typed proposal that an
+    /// authorized `DayWeave` device may preview and apply.
+    pub application_ready: bool,
+    /// The executable payload schema, when [`Self::application_ready`] is true.
+    pub change_set_schema: Option<String>,
     pub moved_blocks: Vec<SimulatedBlockMove>,
     pub unscheduled_item_ids: Vec<String>,
     pub violations: Vec<SimulationIssue>,
     pub warnings: Vec<SimulationIssue>,
+}
+
+/// Server-only evidence produced with a simulation and consumed when an MCP
+/// proposal is submitted. This value is persisted inside the hidden simulation
+/// snapshot, never serialized into an MCP response.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulationProposalEvidence {
+    schema_version: u8,
+    proposal_kind: Option<ProposalKind>,
+    change_set: Option<ProposalChangeSet>,
+    manual_review_reasons: Vec<String>,
+}
+
+impl SimulationProposalEvidence {
+    const SCHEMA_VERSION: u8 = 1;
+
+    #[must_use]
+    pub fn actionable(proposal_kind: ProposalKind, change_set: ProposalChangeSet) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            proposal_kind: Some(proposal_kind),
+            change_set: Some(change_set),
+            manual_review_reasons: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn manual_review(reasons: Vec<String>) -> Self {
+        Self {
+            schema_version: Self::SCHEMA_VERSION,
+            proposal_kind: None,
+            change_set: None,
+            manual_review_reasons: reasons,
+        }
+    }
+
+    #[must_use]
+    pub fn change_set(&self) -> Option<&ProposalChangeSet> {
+        self.change_set.as_ref()
+    }
+
+    #[must_use]
+    pub const fn proposal_kind(&self) -> Option<ProposalKind> {
+        self.proposal_kind
+    }
+
+    #[must_use]
+    pub fn manual_review_reasons(&self) -> &[String] {
+        &self.manual_review_reasons
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        let shape_valid = match &self.change_set {
+            Some(change_set) => {
+                self.proposal_kind.is_some()
+                    && self.manual_review_reasons.is_empty()
+                    && change_set.validate().is_ok()
+            }
+            None => {
+                self.proposal_kind.is_none()
+                    && !self.manual_review_reasons.is_empty()
+                    && self.manual_review_reasons.len() <= 100
+                    && self.manual_review_reasons.iter().all(|reason| {
+                        !reason.trim().is_empty()
+                            && reason.len() <= 100
+                            && reason.bytes().all(|byte| {
+                                byte.is_ascii_lowercase()
+                                    || byte.is_ascii_digit()
+                                    || matches!(byte, b'_' | b'-')
+                            })
+                    })
+            }
+        };
+        self.schema_version == Self::SCHEMA_VERSION
+            && shape_valid
+            && self
+                .proposal_kind
+                .zip(self.change_set.as_ref())
+                .is_none_or(|(kind, change_set)| proposal_kind_matches_change_set(kind, change_set))
+    }
+}
+
+pub(crate) fn proposal_kind_matches_change_set(
+    kind: ProposalKind,
+    change_set: &ProposalChangeSet,
+) -> bool {
+    match kind {
+        ProposalKind::CreateItem => {
+            change_set.commands.len() == 1
+                && matches!(
+                    change_set.commands.first(),
+                    Some(ProposalCommand::CreateItem { .. })
+                )
+        }
+        ProposalKind::CalendarEvent => change_set.commands.iter().all(|command| {
+            matches!(
+                command,
+                ProposalCommand::CreateItem { item, .. }
+                    if item.kind == crate::items::ItemKind::Event
+            )
+        }),
+        ProposalKind::UpdateItem => change_set.commands.iter().all(|command| {
+            matches!(
+                command,
+                ProposalCommand::ReplaceItem { .. }
+                    | ProposalCommand::TrashItem { .. }
+                    | ProposalCommand::RestoreItem { .. }
+            )
+        }),
+        ProposalKind::ConstraintChange => change_set
+            .commands
+            .iter()
+            .all(|command| matches!(command, ProposalCommand::ReplaceItem { .. })),
+        ProposalKind::GoalBreakdown => change_set
+            .commands
+            .iter()
+            .all(|command| matches!(command, ProposalCommand::CreateItem { .. })),
+        ProposalKind::SchedulePlan | ProposalKind::Recommendation => false,
+    }
+}
+
+/// Atomic result of consuming a single-use simulation token.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SimulationConsumption {
+    pub result: SimulationResult,
+    pub proposal_evidence: SimulationProposalEvidence,
+    /// Durable database proof copied into an immutable MCP submission receipt.
+    /// Deterministic in-memory adapters do not provide persistence proof.
+    pub persistence_proof: Option<SimulationPersistenceProof>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SimulationPersistenceProof {
+    pub simulation_id: Uuid,
+    pub subject_hash: [u8; 32],
+    pub request_digest: [u8; 16],
+    pub request_hash: [u8; 32],
+    pub base_revision_id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub evidence_schema: i16,
+    pub evidence_hash: [u8; 32],
+    pub compilation_outcome: String,
+    pub compiled_payload_hash: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -264,16 +415,21 @@ pub trait PlanningSimulationPort: Send + Sync {
         access: &ScheduleAccess,
         token: &str,
         expected_request_digest: &str,
-    ) -> Result<SimulationResult, SchedulingPortError>;
+    ) -> Result<SimulationConsumption, SchedulingPortError>;
 }
 
 #[derive(Clone, Debug)]
 pub struct ProposalSubmissionSpec {
     pub idempotency_key: String,
     pub request_fingerprint: [u8; 32],
-    pub expected_simulation_digest: String,
-    pub simulation_token: Option<String>,
-    pub proposal: Proposal,
+    pub simulation_token: String,
+    pub request: SimulationRequest,
+    pub title: String,
+    pub explanation: String,
+    pub source_conversation_label: String,
+    pub source_client_label: Option<String>,
+    pub source_request_id: String,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -373,7 +529,7 @@ impl PlanningSimulationPort for UnavailableSimulationPort {
         _access: &ScheduleAccess,
         _token: &str,
         _expected_request_digest: &str,
-    ) -> Result<SimulationResult, SchedulingPortError> {
+    ) -> Result<SimulationConsumption, SchedulingPortError> {
         Err(unavailable())
     }
 }

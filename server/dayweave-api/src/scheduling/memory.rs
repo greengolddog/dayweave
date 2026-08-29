@@ -5,12 +5,17 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
+use crate::proposals::PROPOSAL_CHANGE_SET_SCHEMA_V1;
+
 use super::{
     ConflictQuery, ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary,
     PlacementExplanation, PlanOperationKind, PlanningSimulationPort, ScheduleAccess,
     ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
-    ScheduleView, SchedulingPortError, SimulationIssue, SimulationRequest, SimulationResult,
-    StoredItem, StoredSchedule,
+    ScheduleView, SchedulingPortError, SimulationConsumption, SimulationIssue,
+    SimulationProposalEvidence, SimulationRequest, SimulationResult, StoredItem, StoredSchedule,
+    proposal_bridge::{
+        RequestCompilation, classify_request, compile_operation, finish_evidence, target_item_id,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -223,8 +228,10 @@ impl ScheduleQueryPort for InMemoryScheduleQueryPort {
 #[derive(Clone, Debug)]
 pub struct InMemorySimulationPort {
     schedule: Arc<StoredSchedule>,
-    simulations: Arc<RwLock<HashMap<String, (String, SimulationResult)>>>,
+    simulations: Arc<RwLock<HashMap<String, StoredSimulation>>>,
 }
+
+type StoredSimulation = (String, SimulationResult, SimulationProposalEvidence);
 
 impl InMemorySimulationPort {
     #[must_use]
@@ -243,6 +250,7 @@ impl InMemorySimulationPort {
 
 #[async_trait]
 impl PlanningSimulationPort for InMemorySimulationPort {
+    #[allow(clippy::too_many_lines)] // Mirrors the operation table used by the durable adapter.
     async fn simulate(
         &self,
         access: &ScheduleAccess,
@@ -261,7 +269,7 @@ impl PlanningSimulationPort for InMemorySimulationPort {
 
         let request_digest = simulation_request_digest(&request)?;
         let token = simulation_token(&access.subject, &request_digest);
-        if let Some((subject, result)) = self.simulations.read().await.get(&token)
+        if let Some((subject, result, _)) = self.simulations.read().await.get(&token)
             && subject == &access.subject
         {
             return Ok(result.clone());
@@ -269,7 +277,9 @@ impl PlanningSimulationPort for InMemorySimulationPort {
 
         let moved_blocks = Vec::new();
         let mut warnings = Vec::new();
+        let request_compilation = classify_request(&request.operations);
         for operation in &request.operations {
+            target_item_id(operation)?;
             match operation.kind {
                 PlanOperationKind::MoveBlock => {
                     let Some(block_id) = operation.target_id.as_ref() else {
@@ -317,19 +327,45 @@ impl PlanningSimulationPort for InMemorySimulationPort {
             }
         }
 
+        let proposal_evidence = match request_compilation {
+            RequestCompilation::Actionable(proposal_kind)
+                if request.operations.iter().all(|operation| {
+                    matches!(
+                        operation.kind,
+                        PlanOperationKind::CreateItem | PlanOperationKind::CreateEvent
+                    )
+                }) =>
+            {
+                let mut compilations = Vec::with_capacity(request.operations.len());
+                for operation in &request.operations {
+                    compilations.push(compile_operation(operation, None, Utc::now())?);
+                }
+                finish_evidence(proposal_kind, compilations)?
+            }
+            RequestCompilation::Actionable(_) => SimulationProposalEvidence::manual_review(vec![
+                "canonical_item_evidence_unavailable".to_owned(),
+            ]),
+            RequestCompilation::ManualReview(reason) => {
+                SimulationProposalEvidence::manual_review(vec![reason.to_owned()])
+            }
+        };
+        let application_ready = proposal_evidence.change_set().is_some();
+
         let result = SimulationResult {
             simulation_token: token.clone(),
             request_digest,
             base_revision: request.base_revision,
+            application_ready,
+            change_set_schema: application_ready.then(|| PROPOSAL_CHANGE_SET_SCHEMA_V1.to_owned()),
             moved_blocks,
             unscheduled_item_ids: Vec::new(),
             violations: Vec::new(),
             warnings,
         };
-        self.simulations
-            .write()
-            .await
-            .insert(token, (access.subject.clone(), result.clone()));
+        self.simulations.write().await.insert(
+            token,
+            (access.subject.clone(), result.clone(), proposal_evidence),
+        );
         Ok(result)
     }
 
@@ -338,9 +374,9 @@ impl PlanningSimulationPort for InMemorySimulationPort {
         access: &ScheduleAccess,
         token: &str,
         expected_request_digest: &str,
-    ) -> Result<SimulationResult, SchedulingPortError> {
+    ) -> Result<SimulationConsumption, SchedulingPortError> {
         let mut simulations = self.simulations.write().await;
-        if let Some((subject, result)) = simulations.get(token)
+        if let Some((subject, result, _)) = simulations.get(token)
             && subject == &access.subject
         {
             if result.request_digest != expected_request_digest {
@@ -350,7 +386,11 @@ impl PlanningSimulationPort for InMemorySimulationPort {
             }
             return simulations
                 .remove(token)
-                .map(|(_, result)| result)
+                .map(|(_, result, proposal_evidence)| SimulationConsumption {
+                    result,
+                    proposal_evidence,
+                    persistence_proof: None,
+                })
                 .ok_or(SchedulingPortError::NotFound);
         }
         Err(SchedulingPortError::NotFound)
@@ -380,17 +420,28 @@ fn validate_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<(), Schedu
 pub fn simulation_request_digest(
     request: &SimulationRequest,
 ) -> Result<String, SchedulingPortError> {
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_vec(request).map_err(|_| {
-        SchedulingPortError::InvalidQuery("simulation request cannot be encoded".to_owned())
-    })?);
-    let digest = hasher.finalize();
+    let digest = simulation_request_hash(request)?;
     Ok(digest[..16]
         .iter()
         .fold(String::with_capacity(32), |mut encoded, byte| {
             let _ = write!(encoded, "{byte:02x}");
             encoded
         }))
+}
+
+/// Returns the full stable SHA-256 commitment used by durable simulation
+/// receipts. The public request digest is its first 16 bytes.
+///
+/// # Errors
+///
+/// Returns [`SchedulingPortError`] when the typed request cannot be encoded.
+pub fn simulation_request_hash(
+    request: &SimulationRequest,
+) -> Result<[u8; 32], SchedulingPortError> {
+    let bytes = serde_json::to_vec(request).map_err(|_| {
+        SchedulingPortError::InvalidQuery("simulation request cannot be encoded".to_owned())
+    })?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn simulation_token(subject: &str, request_digest: &str) -> String {

@@ -1,7 +1,7 @@
 {
   "name": "dayweave",
-  "version": "0.2.0",
-  "description": "Safely inspect a DayWeave schedule and submit planning proposals for review.",
+  "version": "0.3.0",
+  "description": "Inspect and simulate DayWeave schedules, then submit simulation-bound proposals for device review.",
   "author": {
     "name": "greengolddog",
     "url": "https://github.com/greengolddog"
@@ -12,15 +12,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "DayWeave",
-    "shortDescription": "Review schedules and draft safe planning proposals.",
-    "longDescription": "Read your DayWeave schedule, explore what-if plans, and send proposed tasks, habits, routines, goals, constraints, events, or schedules to the Suggestions Inbox. The plugin never applies changes directly.",
+    "shortDescription": "Simulate plans and submit proposals for device review.",
+    "longDescription": "Read your DayWeave schedule, explore what-if plans, and submit simulation-bound typed or advisory proposals to the Suggestions Inbox. Only an authorized DayWeave device can preview or apply them; the plugin never changes canonical items.",
     "developerName": "greengolddog",
     "category": "Productivity",
-    "capabilities": ["schedule-reading", "what-if-planning", "proposal-drafting"],
+    "capabilities": ["schedule-reading", "what-if-planning", "proposal-submission"],
     "defaultPrompt": [
       "Review today's DayWeave schedule and explain the main conflicts.",
       "Simulate a realistic plan for my unfinished work without changing anything.",
-      "Draft a DayWeave Suggestions Inbox proposal for the plan we agree on."
+      "Simulate this plan and submit a DayWeave proposal for device review; do not apply it."
     ],
     "brandColor": "#4F46E5"
   },

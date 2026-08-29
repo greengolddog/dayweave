@@ -13,13 +13,14 @@ use crate::{
         SCOPE_SCHEDULE_READ as SCOPE_FOR_READ, SCOPE_SCHEDULE_SIMULATE as SCOPE_FOR_SIMULATE,
         SCOPE_SUGGESTIONS_SUBMIT as SCOPE_FOR_SUBMIT, scope_name,
     },
-    proposals::{NewProposal, ProposalKind, ProposalService, ProposalSource},
+    proposals::{PROPOSAL_CHANGE_SET_SCHEMA_V1, ProposalChangeSet, ProposalService},
     scheduling::{
-        ConflictQuery, ItemSearchQuery, PlanOperation, PlanOperationKind, PlanningSimulationPort,
+        ConflictQuery, ItemSearchQuery, PlanOperation, PlanningSimulationPort,
         ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
         ProposalSubmissionSpec, ScheduleAccess, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
         SchedulingPortError, SimulationRequest, has_postgres_timestamp_precision,
-        simulation_request_digest, truncate_to_postgres_timestamp_precision,
+        materialize_proposal, proposal_kind_matches_change_set, simulation_request_digest,
+        truncate_to_postgres_timestamp_precision,
     },
 };
 
@@ -271,43 +272,12 @@ impl McpService {
         let expires_at = validate_submission(&input, maximum_expiration)?;
         let request_fingerprint = submission_fingerprint(&input)?;
 
-        let expected_digest = simulation_request_digest(&SimulationRequest {
-            base_revision: input.base_revision.clone(),
-            operations: input.operations.clone(),
-            assumptions: input.assumptions.clone(),
-        })
-        .map_err(ToolCallError::from_port)?;
-
-        let proposal_kind = proposal_kind(&input.operations);
-        let payload = json!({
-            "schema_version": 1,
-            "base_revision": input.base_revision,
-            "assumptions": input.assumptions,
-            "operations": input.operations,
-            "source": {
-                "client": context.client_name,
-                "conversation": input.source_conversation_label,
-                "request_id": context.request_id,
-            },
-            "safety": {
-                "proposal_only": true,
-                "requires_app_review": true,
-                "canonical_state_mutated": false,
-            }
-        });
-        let proposal = self
-            .proposals
-            .prepare(NewProposal {
-                submitted_by: context.principal.subject.clone(),
-                source: ProposalSource::ExternalMcp,
-                source_reference: Some(input.source_conversation_label),
-                kind: proposal_kind,
-                title: input.title,
-                explanation: Some(input.explanation),
-                payload,
-                expires_at,
-            })
-            .map_err(|error| ToolCallError::execution("proposal_rejected", error.to_string()))?;
+        let simulation_token = input.simulation_token.clone();
+        let request = SimulationRequest {
+            base_revision: input.base_revision,
+            operations: input.operations,
+            assumptions: input.assumptions,
+        };
         let result = self
             .submissions
             .submit_proposal(
@@ -315,9 +285,14 @@ impl McpService {
                 ProposalSubmissionSpec {
                     idempotency_key: input.idempotency_key,
                     request_fingerprint,
-                    expected_simulation_digest: expected_digest,
-                    simulation_token: input.simulation_token,
-                    proposal,
+                    simulation_token,
+                    request,
+                    title: input.title,
+                    explanation: input.explanation,
+                    source_conversation_label: input.source_conversation_label,
+                    source_client_label: context.client_name.clone(),
+                    source_request_id: context.request_id.clone(),
+                    expires_at,
                 },
             )
             .await
@@ -487,7 +462,7 @@ struct SubmitProposalInput {
     explanation: String,
     source_conversation_label: String,
     base_revision: String,
-    simulation_token: Option<String>,
+    simulation_token: String,
     operations: Vec<PlanOperation>,
     #[serde(default)]
     assumptions: Vec<String>,
@@ -537,30 +512,29 @@ impl ProposalSubmissionPort for InMemoryProposalSubmissionPort {
                 duplicate: true,
             });
         }
-        if let Some(token) = spec.simulation_token.as_deref() {
-            let simulation = self
-                .simulations
-                .consume_simulation(access, token, &spec.expected_simulation_digest)
-                .await?;
-            if simulation.base_revision
-                != spec
-                    .proposal
-                    .payload
-                    .get("base_revision")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                || simulation.request_digest != spec.expected_simulation_digest
-            {
-                return Err(ProposalSubmissionError::Simulation(
-                    SchedulingPortError::InvalidQuery(
-                        "simulation token does not match the proposal base revision".to_owned(),
-                    ),
-                ));
-            }
+        let expected_digest = simulation_request_digest(&spec.request)?;
+        let consumption = self
+            .simulations
+            .consume_simulation(access, &spec.simulation_token, &expected_digest)
+            .await?;
+        if consumption.result.base_revision != spec.request.base_revision
+            || consumption.result.request_digest != expected_digest
+        {
+            return Err(ProposalSubmissionError::Simulation(
+                SchedulingPortError::InvalidQuery(
+                    "simulation token does not match the proposal base revision".to_owned(),
+                ),
+            ));
         }
+        let prepared = materialize_proposal(
+            &access.subject,
+            &spec,
+            &consumption.proposal_evidence,
+            Utc::now(),
+        )?;
         let proposal = self
             .proposals
-            .persist_prepared(spec.proposal)
+            .persist_prepared(prepared)
             .await
             .map_err(|_| ProposalSubmissionError::Unavailable)?;
         submissions.insert(
@@ -746,31 +720,12 @@ fn submission_fingerprint(input: &SubmitProposalInput) -> Result<[u8; 32], ToolC
     Ok(Sha256::digest(bytes).into())
 }
 
-fn proposal_kind(operations: &[PlanOperation]) -> ProposalKind {
-    if operations
-        .iter()
-        .all(|operation| operation.kind == PlanOperationKind::GoalBreakdown)
-    {
-        ProposalKind::GoalBreakdown
-    } else if operations
-        .iter()
-        .all(|operation| operation.kind == PlanOperationKind::UpdateConstraint)
-    {
-        ProposalKind::ConstraintChange
-    } else if operations
-        .iter()
-        .all(|operation| operation.kind == PlanOperationKind::CreateEvent)
-    {
-        ProposalKind::CalendarEvent
-    } else {
-        ProposalKind::SchedulePlan
-    }
-}
-
 fn proposal_output(
     proposal: &crate::proposals::Proposal,
     duplicate: bool,
 ) -> Result<ToolOutput, ToolCallError> {
+    let application_ready = ProposalChangeSet::from_payload(&proposal.payload)
+        .is_ok_and(|change_set| proposal_kind_matches_change_set(proposal.kind, &change_set));
     output(
         if duplicate {
             "This idempotency key already submitted the same Suggestions Inbox proposal."
@@ -785,6 +740,8 @@ fn proposal_output(
             "duplicate": duplicate,
             "canonical_state_mutated": false,
             "review_required": true,
+            "application_ready": application_ready,
+            "change_set_schema": application_ready.then_some(PROPOSAL_CHANGE_SET_SCHEMA_V1),
         }),
     )
 }
@@ -860,7 +817,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
         tools.push(tool(
             "simulate_plan",
             "Simulate plan",
-            "Run a side-effect-free what-if plan against a specific schedule revision. Returns an explicit simulation token; canonical state is never changed.",
+            "Run a side-effect-free what-if plan against a specific schedule revision. Returns an opaque single-use token plus application readiness; canonical state is never changed.",
             &simulation_schema(),
             &read_annotations(),
             oauth.then_some(SCOPE_FOR_SIMULATE),
@@ -870,7 +827,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
         tools.push(tool(
             "submit_proposal",
             "Submit proposal",
-            "Create only a reviewable Suggestions Inbox proposal. It never creates, edits, moves, completes, deletes, RSVPs, or publishes canonical items. The user must review it in DayWeave.",
+            "Consume the exact simulate_plan token and create only a reviewable Suggestions Inbox proposal. It never applies, creates, edits, moves, completes, deletes, RSVPs, or publishes canonical items. Only an authorized DayWeave device can preview or apply a typed proposal.",
             &proposal_schema(),
             &json!({
                 "readOnlyHint": false,
@@ -993,7 +950,7 @@ fn proposal_schema() -> Value {
             "explanation": { "type": "string", "minLength": 1, "maxLength": 4000 },
             "source_conversation_label": { "type": "string", "minLength": 1, "maxLength": 500 },
             "base_revision": string_schema("Schedule revision used to formulate the proposal"),
-            "simulation_token": { "type": "string", "description": "Optional single-use token from simulate_plan" },
+            "simulation_token": { "type": "string", "description": "Required opaque single-use token from the exact simulate_plan request" },
             "operations": operation_array_schema(),
             "assumptions": {
                 "type": "array",
@@ -1008,6 +965,7 @@ fn proposal_schema() -> Value {
             "explanation",
             "source_conversation_label",
             "base_revision",
+            "simulation_token",
             "operations",
         ],
     )
@@ -1018,6 +976,7 @@ fn operation_array_schema() -> Value {
         "type": "array",
         "minItems": 1,
         "maxItems": MAX_OPERATIONS,
+        "description": "The exact simulated operations. Application-ready plans are homogeneous: one create_item, one or more create_event, complete_item, delete_item, or update_constraint operations. Mixed or unsupported plans remain manual-review-only.",
         "items": {
             "type": "object",
             "additionalProperties": false,
@@ -1030,8 +989,14 @@ fn operation_array_schema() -> Value {
                         "goal_breakdown", "replace_schedule"
                     ]
                 },
-                "target_id": { "type": "string" },
-                "parameters": { "type": "object" }
+                "target_id": {
+                    "type": "string",
+                    "description": "Canonical item UUID for complete_item, delete_item, update_constraint, or update_item; block UUID for move_block. Omit for creates."
+                },
+                "parameters": {
+                    "type": "object",
+                    "description": "Strict parameters. create_item accepts kind (task|habit|routine|goal|break), title, timezone_name, optional is_sensitive/status/notes/duration_seconds/deadline_at/earliest_start_at/recurrence/flexible_constraints/split_policy/importance/urgency/parent_id/sibling_order; IDs are server-generated. create_event uses the same fields but kind is omitted or event. complete_item and delete_item require an empty object. update_constraint accepts only timezone_name, duration_seconds, deadline_at, earliest_start_at, recurrence, flexible_constraints, and split_policy. Unknown fields are rejected for application-ready operations."
+                }
             },
             "required": ["kind"]
         }

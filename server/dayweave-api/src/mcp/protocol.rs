@@ -5,7 +5,7 @@ pub const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
 pub const SUPPORTED_PROTOCOL_VERSIONS: [&str; 2] =
     [CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
 
-pub const SAFETY_INSTRUCTIONS: &str = "DayWeave is proposal-only for external assistants. Read only the minimum schedule detail needed for the current request; sensitive items remain redacted. Use simulate_plan before suggesting schedule changes. submit_proposal creates a reviewable Suggestions Inbox entry and never applies, creates, edits, moves, completes, deletes, RSVPs, or publishes canonical data. Clearly distinguish current state, simulated state, and submitted proposals. The user must review and approve every proposal in the DayWeave app.";
+pub const SAFETY_INSTRUCTIONS: &str = "DayWeave is proposal-only for external assistants. Read only the minimum schedule detail needed for the current request; sensitive items remain redacted. Before every submit_proposal call, use simulate_plan with the exact final revision, operations, and assumptions, then pass its opaque single-use simulation_token unchanged. A submission may be application-ready only when the server reports application_ready=true and change_set_schema=dayweave.proposal-change-set/1. submit_proposal creates a reviewable Suggestions Inbox entry and never applies, creates, edits, moves, completes, deletes, RSVPs, or publishes canonical data. Only an authorized DayWeave device can preview, apply, or undo typed changes. Clearly distinguish current state, simulated state, and submitted proposals.";
 
 #[derive(Clone, Debug)]
 pub struct RpcRequest {

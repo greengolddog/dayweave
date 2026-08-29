@@ -8,6 +8,24 @@ items. A durable device client may review a strictly typed proposal change set,
 approve the exact review it saw, inspect the resulting receipt, and request one
 bounded undo. External MCP clients remain proposal-only.
 
+## Simulation-backed MCP bridge
+
+An external assistant cannot author this executable payload directly. Before
+every submission it must simulate the exact final revision, operations, and
+assumptions and return the opaque single-use token. While holding the canonical
+item lock, DayWeave derives item revisions and complete replacements from its
+own state. Supported homogeneous operations become hidden typed evidence;
+unsupported, mixed, sensitive, or provider-managed work never becomes a partial
+change set.
+
+Submission atomically consumes that evidence and either stores its exact typed
+payload or a deliberately non-executable manual-review payload. The MCP result
+reports `application_ready` and `change_set_schema`, but exposes neither commands
+nor any preview/apply/undo capability. An immutable receipt preserves the
+compilation outcome plus hashes of the complete request, hidden evidence, and
+submitted payload after the short-lived simulation row is removed. Device preview still
+revalidates all canonical and provider state before any apply.
+
 ## Executable change-set contract
 
 An executable proposal payload has exactly this top-level shape:
@@ -206,16 +224,19 @@ credential without copying proposal or item content into general logs.
 
 ## Legacy and MCP behavior
 
-Generic legacy proposal objects and MCP schedule-operation payloads do not
-match `dayweave.proposal-change-set/1`; the application preview rejects them as
-non-executable. The legacy accept route may mark an ordinary proposal accepted,
-but that status change does not execute payload instructions or mutate items.
-Payloads in the reserved `dayweave.proposal-change-set/*` namespace cannot use
-legacy acceptance and must pass the transactional application path.
+Generic legacy proposal objects and advisory MCP schedule-operation payloads do
+not match `dayweave.proposal-change-set/1`; the application preview rejects them
+as non-executable. For the supported homogeneous MCP subset, the server may
+compile the hidden simulation evidence directly into that typed schema. The
+legacy accept route may mark an ordinary proposal accepted, but that status
+change does not execute payload instructions or mutate items. Payloads in the
+reserved `dayweave.proposal-change-set/*` namespace cannot use legacy acceptance
+and must pass the transactional application path.
 
 MCP tools can read granted schedule data, simulate, and submit an expiring
-Inbox proposal. They expose no apply or undo tool and cannot authenticate to
-the device-only application routes. To act on an MCP suggestion, the
-user-facing device flow must explicitly translate it into the typed contract
-while retaining proposal provenance; the resulting change set still passes the
-complete workflow above.
+Inbox proposal. They expose no preview, apply, or undo tool and cannot
+authenticate to the device-only application routes. An application-ready MCP
+suggestion already contains the exact server-derived typed payload; the
+user-facing device must still preview and explicitly approve it through the
+complete workflow above. Advisory suggestions remain non-executable until a
+separate, explicitly reviewed proposal is authored.

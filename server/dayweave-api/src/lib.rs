@@ -73,6 +73,10 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             database.pool().clone(),
             database.scope(),
         ));
+        scheduling
+            .maintain_simulation_retention()
+            .await
+            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
         let proposal_applications = Arc::new(PostgresProposalApplicationRepository::new(
             database.pool().clone(),
             database.scope(),
@@ -306,6 +310,9 @@ impl AppState {
 
         if let Some(repository) = proposal_applications.as_ref() {
             repository.spawn_maintenance_worker();
+        }
+        if let Some(repository) = scheduling.as_ref() {
+            repository.spawn_simulation_maintenance_worker();
         }
         Ok(Self {
             proposals,

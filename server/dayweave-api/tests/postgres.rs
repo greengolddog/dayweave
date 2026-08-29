@@ -29,7 +29,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 
     let schema = [
@@ -48,6 +48,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
         include_str!("../migrations/0014_google_calendar_projection.sql"),
         include_str!("../migrations/0015_transactional_proposal_applications.sql"),
+        include_str!("../migrations/0016_mcp_simulation_evidence.sql"),
     ]
     .join("\n");
     for table in [
@@ -104,6 +105,399 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("cursor.collection_key = 'calendar:' || collection.id::text"));
     assert!(schema.contains("provider_sync_mappings_sensitivity_floor_item_fk"));
     assert!(schema.contains("'dayweave.items.v1:' || NEW.workspace_id::text"));
+    assert!(schema.contains("schedule_simulations_evidence_guard"));
+    assert!(schema.contains("mcp_proposal_submissions_verify_simulation"));
+    assert!(schema.contains("compiled_payload_hash IS NOT NULL"));
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)]
+async fn mcp_simulation_evidence_upgrade_retires_legacy_capabilities_and_guards_proof() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in [
+        include_str!("../migrations/0001_identity_and_items.sql"),
+        include_str!("../migrations/0002_schedule_sync_and_audit.sql"),
+        include_str!("../migrations/0003_proposals_mcp_idempotency_outbox.sql"),
+        include_str!("../migrations/0004_item_delta_sync.sql"),
+        include_str!("../migrations/0005_execution_sessions.sql"),
+        include_str!("../migrations/0006_google_oauth.sql"),
+        include_str!("../migrations/0007_google_sync.sql"),
+        include_str!("../migrations/0008_credential_auth_foundation.sql"),
+        include_str!("../migrations/0009_sensitive_items.sql"),
+        include_str!("../migrations/0010_auth_runtime.sql"),
+        include_str!("../migrations/0011_google_outbound_safety.sql"),
+        include_str!("../migrations/0012_schedule_publication.sql"),
+        include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
+        include_str!("../migrations/0014_google_calendar_projection.sql"),
+        include_str!("../migrations/0015_transactional_proposal_applications.sql"),
+    ] {
+        pool.execute(migration)
+            .await
+            .expect("pre-simulation-evidence migration");
+    }
+
+    let scope = seed_scope(pool).await;
+    let now = Utc::now();
+    let revision_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
+         horizon_start, horizon_end, timezone_name, solver_version, input_digest, \
+         created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', $3, $4, 'UTC', \
+         'migration-test', $5, $6, $7)",
+    )
+    .bind(revision_id)
+    .bind(scope.workspace_id)
+    .bind(now - ChronoDuration::hours(1))
+    .bind(now + ChronoDuration::days(1))
+    .bind(vec![1_u8; 32])
+    .bind(scope.user_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("draft schedule revision");
+    sqlx::query(
+        "INSERT INTO schedule_revision_details (workspace_id, user_id, schedule_revision_id, \
+         result_snapshot, created_at) VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(revision_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("schedule revision evidence");
+    sqlx::query(
+        "UPDATE schedule_revisions SET state = 'published', published_at = $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("published schedule revision");
+
+    let legacy_simulation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO schedule_simulations (id, workspace_id, user_id, token_hash, subject_hash, \
+         request_digest, base_revision_id, base_revision_label, result_snapshot, created_at, \
+         expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, '1', '{}'::jsonb, $8, $9)",
+    )
+    .bind(legacy_simulation_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(vec![4_u8; 16])
+    .bind(revision_id)
+    .bind(now)
+    .bind(now + ChronoDuration::minutes(5))
+    .execute(pool)
+    .await
+    .expect("legacy simulation capability");
+    let legacy_proposal_id = Uuid::new_v4();
+    insert_mcp_proposal(
+        pool,
+        scope,
+        legacy_proposal_id,
+        now,
+        json!({"legacy": true}),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO mcp_proposal_submissions (workspace_id, user_id, subject_hash, key_hash, \
+         request_fingerprint, proposal_id, completed_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![5_u8; 32])
+    .bind(vec![6_u8; 32])
+    .bind(vec![7_u8; 32])
+    .bind(legacy_proposal_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("legacy submission receipt");
+
+    pool.execute(include_str!(
+        "../migrations/0016_mcp_simulation_evidence.sql"
+    ))
+    .await
+    .expect("simulation evidence migration");
+
+    let legacy_simulation_retained: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM schedule_simulations WHERE id = $1)")
+            .bind(legacy_simulation_id)
+            .fetch_one(pool)
+            .await
+            .expect("legacy simulation retirement");
+    assert!(!legacy_simulation_retained);
+    let legacy_receipt_proof: Option<Uuid> = sqlx::query_scalar(
+        "SELECT simulation_id FROM mcp_proposal_submissions \
+         WHERE workspace_id = $1 AND proposal_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(legacy_proposal_id)
+    .fetch_one(pool)
+    .await
+    .expect("legacy receipt remains readable");
+    assert_eq!(legacy_receipt_proof, None);
+
+    let request_hash = vec![8_u8; 32];
+    let request_digest = vec![8_u8; 16];
+    let typed_payload = json!({"schema_version": 1, "commands": []});
+    let result_snapshot = json!({
+        "proposal_evidence": {
+            "schema_version": 1,
+            "proposal_kind": "create_item",
+            "change_set": typed_payload,
+            "manual_review_reasons": [],
+        }
+    });
+    let invalid_actionable = sqlx::query(
+        "INSERT INTO schedule_simulations (id, workspace_id, user_id, token_hash, subject_hash, \
+         request_digest, base_revision_id, base_revision_label, result_snapshot, created_at, \
+         expires_at, evidence_schema, request_hash, evidence_hash, compilation_outcome, \
+         compiled_payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, '1', $8, $9, $10, 1, \
+         $11, $12, 'actionable', NULL)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![9_u8; 32])
+    .bind(vec![10_u8; 32])
+    .bind(&request_digest)
+    .bind(revision_id)
+    .bind(&result_snapshot)
+    .bind(now)
+    .bind(now + ChronoDuration::minutes(10))
+    .bind(&request_hash)
+    .bind(vec![11_u8; 32])
+    .execute(pool)
+    .await
+    .expect_err("actionable evidence requires a compiled payload hash");
+    assert_eq!(
+        postgres_error_code(&invalid_actionable).as_deref(),
+        Some("23514")
+    );
+
+    let simulation_id = Uuid::new_v4();
+    let simulation_subject_hash = vec![12_u8; 32];
+    let evidence_hash = vec![13_u8; 32];
+    let compiled_payload_hash = vec![14_u8; 32];
+    let expires_at = now + ChronoDuration::minutes(10);
+    sqlx::query(
+        "INSERT INTO schedule_simulations (id, workspace_id, user_id, token_hash, subject_hash, \
+         request_digest, base_revision_id, base_revision_label, result_snapshot, created_at, \
+         expires_at, evidence_schema, request_hash, evidence_hash, compilation_outcome, \
+         compiled_payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, '1', $8, $9, $10, 1, \
+         $11, $12, 'actionable', $13)",
+    )
+    .bind(simulation_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![15_u8; 32])
+    .bind(&simulation_subject_hash)
+    .bind(&request_digest)
+    .bind(revision_id)
+    .bind(&result_snapshot)
+    .bind(now)
+    .bind(expires_at)
+    .bind(&request_hash)
+    .bind(&evidence_hash)
+    .bind(&compiled_payload_hash)
+    .execute(pool)
+    .await
+    .expect("actionable simulation evidence");
+
+    let live_delete = sqlx::query(
+        "DELETE FROM schedule_simulations WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .execute(pool)
+    .await
+    .expect_err("a live unconsumed capability cannot be pruned");
+    assert_eq!(postgres_error_code(&live_delete).as_deref(), Some("P0001"));
+    let evidence_mutation = sqlx::query(
+        "UPDATE schedule_simulations SET evidence_hash = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .bind(vec![16_u8; 32])
+    .execute(pool)
+    .await
+    .expect_err("simulation evidence is immutable");
+    assert_eq!(
+        postgres_error_code(&evidence_mutation).as_deref(),
+        Some("P0001")
+    );
+    let future_consumption = sqlx::query(
+        "UPDATE schedule_simulations SET consumed_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .bind(now + ChronoDuration::minutes(1))
+    .execute(pool)
+    .await
+    .expect_err("a simulation cannot be pre-consumed with a future timestamp");
+    assert_eq!(
+        postgres_error_code(&future_consumption).as_deref(),
+        Some("P0001")
+    );
+    sqlx::query(
+        "UPDATE schedule_simulations SET consumed_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("single consumption transition");
+    let second_consumption = sqlx::query(
+        "UPDATE schedule_simulations SET consumed_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect_err("consumed evidence cannot transition twice");
+    assert_eq!(
+        postgres_error_code(&second_consumption).as_deref(),
+        Some("P0001")
+    );
+
+    let unproved_proposal_id = Uuid::new_v4();
+    insert_mcp_proposal(
+        pool,
+        scope,
+        unproved_proposal_id,
+        now,
+        json!({"manual": true}),
+    )
+    .await;
+    let unproved_receipt = sqlx::query(
+        "INSERT INTO mcp_proposal_submissions (workspace_id, user_id, subject_hash, key_hash, \
+         request_fingerprint, proposal_id, completed_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![17_u8; 32])
+    .bind(vec![18_u8; 32])
+    .bind(vec![19_u8; 32])
+    .bind(unproved_proposal_id)
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect_err("new receipts cannot omit simulation proof");
+    assert_eq!(
+        postgres_error_code(&unproved_receipt).as_deref(),
+        Some("P0001")
+    );
+
+    let mismatched_proposal_id = Uuid::new_v4();
+    insert_mcp_proposal(
+        pool,
+        scope,
+        mismatched_proposal_id,
+        now,
+        json!({"different": true}),
+    )
+    .await;
+    let mismatched_receipt = insert_simulation_proof_receipt(
+        pool,
+        scope,
+        mismatched_proposal_id,
+        simulation_id,
+        now,
+        expires_at,
+        &simulation_subject_hash,
+        &request_digest,
+        &request_hash,
+        revision_id,
+        &evidence_hash,
+        &compiled_payload_hash,
+        20,
+    )
+    .await
+    .expect_err("actionable proposal payload must equal its compiled evidence");
+    assert_eq!(
+        postgres_error_code(&mismatched_receipt).as_deref(),
+        Some("P0001")
+    );
+
+    let proposal_id = Uuid::new_v4();
+    insert_mcp_proposal(pool, scope, proposal_id, now, typed_payload).await;
+    insert_simulation_proof_receipt(
+        pool,
+        scope,
+        proposal_id,
+        simulation_id,
+        now,
+        expires_at,
+        &simulation_subject_hash,
+        &request_digest,
+        &request_hash,
+        revision_id,
+        &evidence_hash,
+        &compiled_payload_hash,
+        21,
+    )
+    .await
+    .expect("matching immutable simulation proof");
+
+    sqlx::query(
+        "DELETE FROM schedule_simulations WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(simulation_id)
+    .execute(pool)
+    .await
+    .expect("consumed evidence may be pruned after proof is copied");
+    let durable_proof: (Uuid, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT simulation_id, simulation_evidence_hash, proposal_payload_hash \
+         FROM mcp_proposal_submissions WHERE workspace_id = $1 AND proposal_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(proposal_id)
+    .fetch_one(pool)
+    .await
+    .expect("receipt retains the evidence commitment");
+    assert_eq!(
+        durable_proof,
+        (simulation_id, evidence_hash, compiled_payload_hash)
+    );
+    let receipt_mutation = sqlx::query(
+        "UPDATE mcp_proposal_submissions SET proposal_payload_hash = $3 \
+         WHERE workspace_id = $1 AND proposal_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(proposal_id)
+    .bind(vec![22_u8; 32])
+    .execute(pool)
+    .await
+    .expect_err("submission proof is immutable");
+    assert_eq!(
+        postgres_error_code(&receipt_mutation).as_deref(),
+        Some("P0001")
+    );
+
+    test_database.destroy().await;
 }
 
 #[tokio::test]
@@ -2708,6 +3102,82 @@ async fn google_oauth_migration_quarantines_until_verified_operator_recovery() {
     assert!(duplicate_default.is_err());
 
     test_database.destroy().await;
+}
+
+async fn insert_mcp_proposal(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    proposal_id: Uuid,
+    created_at: chrono::DateTime<Utc>,
+    payload: serde_json::Value,
+) {
+    sqlx::query(
+        "INSERT INTO proposals (id, workspace_id, revision, submitted_by_subject, source, kind, \
+         status, title, payload, created_at, updated_at, expires_at) VALUES ($1, $2, 1, \
+         'migration-proof-test', 'external_mcp', 'create_item', 'pending', \
+         'Migration proof proposal', $3, $4, $4, $5)",
+    )
+    .bind(proposal_id)
+    .bind(scope.workspace_id)
+    .bind(payload)
+    .bind(created_at)
+    .bind(created_at + ChronoDuration::days(1))
+    .execute(pool)
+    .await
+    .expect("MCP proposal fixture");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_simulation_proof_receipt(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    proposal_id: Uuid,
+    simulation_id: Uuid,
+    created_at: chrono::DateTime<Utc>,
+    expires_at: chrono::DateTime<Utc>,
+    simulation_subject_hash: &[u8],
+    request_digest: &[u8],
+    request_hash: &[u8],
+    revision_id: Uuid,
+    evidence_hash: &[u8],
+    compiled_payload_hash: &[u8],
+    marker: u8,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO mcp_proposal_submissions (workspace_id, user_id, subject_hash, key_hash, \
+         request_fingerprint, proposal_id, completed_at, simulation_id, simulation_subject_hash, \
+         simulation_request_digest, simulation_request_hash, simulation_base_revision_id, \
+         simulation_created_at, simulation_expires_at, simulation_evidence_schema, \
+         simulation_evidence_hash, compilation_outcome, compiled_payload_hash, \
+         proposal_payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+         $12, $13, $14, 1, $15, 'actionable', $16, $16)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![marker; 32])
+    .bind(vec![marker.wrapping_add(1); 32])
+    .bind(vec![marker.wrapping_add(2); 32])
+    .bind(proposal_id)
+    .bind(created_at)
+    .bind(simulation_id)
+    .bind(simulation_subject_hash)
+    .bind(request_digest)
+    .bind(request_hash)
+    .bind(revision_id)
+    .bind(created_at)
+    .bind(expires_at)
+    .bind(evidence_hash)
+    .bind(compiled_payload_hash)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+fn postgres_error_code(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
 }
 
 struct TestDatabase {

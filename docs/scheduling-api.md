@@ -153,22 +153,33 @@ bounded goal links, not only the first.
 calendar, or external block is explicitly `not_movable`; a move of a flexible
 planned block is currently `not_modeled`, because the simulation adapter does
 not yet prove availability, overlap, horizon, and hard-constraint feasibility.
-It never returns a moved block while that proof is absent. Deletion is flagged
-as requiring confirmation; every other unsupported operation receives an
-explicit `not_modeled` warning and remains proposal-only. Simulation
+It never returns a moved block while that proof is absent. A strict homogeneous
+subset (`create_item`, `create_event`, `complete_item`, `delete_item`, and
+`update_constraint`) can be compiled from canonical server state into hidden
+typed proposal evidence. Broad updates, goal decomposition, block movement,
+schedule replacement, mixed operation kinds, and provider-managed targets stay
+manual-review-only. Deletion is still flagged as requiring confirmation.
+Simulation responses expose only `application_ready` and
+`change_set_schema`, never the compiled commands. Simulation
 capabilities use 32 random bytes, are stored only as domain-separated
 token/subject hashes, expire within 15 minutes, are bounded per owner, survive
-restart, and are consumed once under a database row lock. Proposal creation,
+restart, and are consumed once under a database row lock. `submit_proposal`
+requires the exact token and repeats the exact base revision, operations, and
+assumptions. Proposal creation,
 outbox/audit insertion, capability consumption, and the tenant/subject-scoped
 exactly-once submission receipt commit in one PostgreSQL transaction.
 Publication after simulation makes the token stale via an exact revision check.
 Each durable simulation also carries internal, typed item/block reference sets
 and a monotonic `sensitive_at_simulation` bit. This privacy evidence is never
 returned by MCP, and consume/submission rechecks it against both the published
-revision and the current canonical hierarchy. Missing, malformed, unknown, or
-historically sensitive evidence fails closed without consuming the capability
-or committing any proposal, outbox, audit, or receipt row. Active simulation
-records created before this evidence existed must be simulated again.
+revision and the current canonical hierarchy. Missing, malformed, unknown,
+provider-divergent, or historically sensitive evidence fails closed without
+consuming the capability or committing any proposal, outbox, audit, or receipt
+row. The immutable receipt copies the compilation outcome plus full-request,
+evidence, and proposal-payload hashes before the hidden simulation is pruned;
+no token, provider identifier, or private item content is copied. Active simulation
+records created before this evidence existed must be simulated again. Startup
+and hourly maintenance remove consumed and expired hidden evidence.
 
 All timestamps at the HTTP boundary are RFC 3339 and must be aligned to
 microsecond precision, matching PostgreSQL `timestamptz`; finer fractions are
@@ -178,7 +189,7 @@ must be positive and no longer than 90 days.
 
 Production publication, immutable reads, and transactional MCP proposal
 submission require migrations through
-`0014_google_calendar_projection.sql`.
+`0016_mcp_simulation_evidence.sql`.
 
 An upgrade from migrations 1–11 safely seals any legacy published revision but
 cannot invent the missing durable detail/evidence snapshot. Schedule and item
