@@ -8,12 +8,11 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=/opt/dayweave/deploy
-EnvironmentFile=/opt/dayweave/deploy/.env
-ExecStart=/usr/bin/docker compose --profile tunnel up --detach --remove-orphans
+ExecStartPre=/opt/dayweave/deploy/scripts/verify-production-env.sh /opt/dayweave/deploy/.env
+ExecStart=/usr/bin/docker compose up --detach --remove-orphans
 ExecStartPost=/usr/bin/docker compose ps
-ExecStop=/usr/bin/docker compose --profile tunnel down
+ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target
-

@@ -1,0 +1,261 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+ssh_pwauth: false
+disable_root: true
+
+users:
+  - default
+  - name: ${ssh_user}
+    gecos: DayWeave administrator
+    groups: [sudo]
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    ssh_authorized_keys:
+      - ${jsonencode(ssh_public_key)}
+
+packages:
+  - age
+  - awscli
+  - ca-certificates
+  - curl
+  - docker.io
+  - git
+  - jq
+  - openssh-server
+  - unattended-upgrades
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/90-dayweave.conf
+    owner: root:root
+    permissions: "0644"
+    content: |
+      ListenAddress 127.0.0.1
+      ListenAddress ::1
+      PasswordAuthentication no
+      PermitRootLogin no
+      X11Forwarding no
+  - path: /etc/dayweave/README
+    owner: root:root
+    permissions: "0644"
+    content: |
+      This host contains no deployment credential in cloud-init or Terraform state.
+      The pinned tunnel agent authenticates through the VM service account metadata.
+      Install /opt/dayweave, the root-owned mode-0600 /opt/dayweave/deploy/.env,
+      and the backup access key through SSH over the tunnel after bootstrap.
+  - path: /usr/local/sbin/install-dayweave-tunnel
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      umask 077
+      ulimit -v 524288
+      ulimit -f 131072
+
+      agent_url="https://storage.eu-north1.nebius.cloud/products/releases/nebius-tunnel-agent/1.0.0/nebius-tunnel-agent-linux-x86_64.tar.gz"
+      agent_sha256="7b43d077488adff14c4a7af71e411fc0d91e1d06b54dc90edfcde411a136b9bd"
+
+      if [[ "$(uname -m)" != "x86_64" ]]; then
+        echo "The pinned DayWeave tunnel bootstrap supports Linux x86_64 only." >&2
+        exit 1
+      fi
+
+      work_dir="$(mktemp -d /tmp/dayweave-tunnel-install.XXXXXXXX)"
+      cleanup() {
+        case "$work_dir" in
+          /tmp/dayweave-tunnel-install.*) rm -rf -- "$work_dir" ;;
+          *) echo "Refusing to clean an unexpected tunnel install path." >&2 ;;
+        esac
+      }
+      trap cleanup EXIT
+
+      agent_archive="$work_dir/nebius-tunnel-agent.tar.gz"
+      curl -fsSL --retry 5 --retry-all-errors --connect-timeout 10 \
+        --max-time 300 --max-filesize 33554432 \
+        "$agent_url" -o "$agent_archive"
+      printf '%s  %s\n' "$agent_sha256" "$agent_archive" | sha256sum -c -
+      tar -xzf "$agent_archive" -C "$work_dir" nebius-tunnel-agent
+      if [[ -L "$work_dir/nebius-tunnel-agent" || ! -f "$work_dir/nebius-tunnel-agent" ]]; then
+        echo "The verified tunnel-agent archive did not contain one regular binary." >&2
+        exit 1
+      fi
+      install -o root -g root -m 0755 "$work_dir/nebius-tunnel-agent" \
+        /usr/local/bin/nebius-tunnel-agent
+  - path: /usr/local/sbin/secure-dayweave-ssh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      umask 077
+      ulimit -v 262144
+
+      if [[ ! -x /usr/sbin/sshd ]] || ! command -v ss >/dev/null 2>&1; then
+        echo "OpenSSH server and ss are required before tunnel startup." >&2
+        exit 1
+      fi
+      /usr/sbin/sshd -t
+
+      if systemctl cat ssh.socket >/dev/null 2>&1; then
+        systemctl disable --now ssh.socket
+        systemctl mask ssh.socket
+        if [[ "$(systemctl is-enabled ssh.socket 2>/dev/null || true)" != "masked" ]]; then
+          echo "Failed to disable and mask SSH socket activation." >&2
+          exit 1
+        fi
+      fi
+
+      systemctl unmask ssh.service
+      systemctl enable ssh.service
+      systemctl restart ssh.service
+      /usr/local/sbin/assert-dayweave-ssh-loopback
+  - path: /usr/local/sbin/assert-dayweave-ssh-loopback
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      ulimit -v 262144
+
+      listener_count=0
+      if ! systemctl is-active --quiet ssh.service; then
+        echo "The regular SSH service is not active." >&2
+        exit 1
+      fi
+      if systemctl is-active --quiet ssh.socket; then
+        echo "SSH socket activation is active." >&2
+        exit 1
+      fi
+      while read -r _state _recv_q _send_q local_address _peer_address _remainder; do
+        case "$local_address" in
+          127.0.0.1:22|'[::1]:22'|::1:22) ;;
+          *)
+            echo "A non-loopback port-22 listener would bypass the tunnel." >&2
+            exit 1
+            ;;
+        esac
+        listener_count=$((listener_count + 1))
+      done < <(ss -H -ltn 'sport = :22')
+      if ((listener_count == 0)); then
+        echo "No loopback port-22 listener exists." >&2
+        exit 1
+      fi
+  - path: /usr/local/sbin/bootstrap-dayweave-host
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      umask 077
+      ulimit -v 524288
+
+      install -d -o root -g root -m 0755 /opt/dayweave
+      install -d -o root -g root -m 0750 /etc/dayweave
+      usermod -aG docker ${ssh_user}
+      /usr/local/sbin/install-dayweave-tunnel
+      systemctl enable --now docker
+      systemctl enable --now unattended-upgrades
+      systemctl daemon-reload
+      systemctl enable dayweave-host-security.service dayweave-tunnel-agent.service
+      systemctl start dayweave-tunnel-agent.service
+  - path: /usr/local/sbin/dayweave-tunnel-bootstrap
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      umask 077
+
+      tunnel_id=${jsonencode(tunnel_id)}
+      if [[ ! "$tunnel_id" =~ ^applicationtunnel-[a-z][0-9]{2}[a-z0-9]+$ ]]; then
+        echo "Terraform did not inject one valid tunnel identifier." >&2
+        exit 1
+      fi
+
+      config_file=/run/dayweave-tunnel/config.yaml
+      temporary_config="$(mktemp /run/dayweave-tunnel/config.yaml.XXXXXXXX)"
+      cleanup_config() {
+        rm -f -- "$temporary_config"
+      }
+      trap cleanup_config EXIT
+      {
+        printf 'server_addr: tunnel.applications.eu-north1.nebius.cloud:8443\n'
+        printf 'tunnel_id: %s\n' "$tunnel_id"
+        printf 'iam:\n  metadata:\n    enabled: true\n'
+        printf 'services:\n'
+        printf '  - name: web\n    target: localhost:8080\n    type: http\n'
+        printf '  - name: ssh\n    target: localhost:22\n    type: tcp\n'
+      } >"$temporary_config"
+      unset tunnel_id
+      chmod 0600 "$temporary_config"
+      mv -f -- "$temporary_config" "$config_file"
+      trap - EXIT
+
+      exec /usr/local/bin/nebius-tunnel-agent -config "$config_file"
+  - path: /etc/systemd/system/dayweave-host-security.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Enforce DayWeave loopback-only SSH before tunnel exposure
+      Wants=network-online.target
+      After=network-online.target
+      Before=dayweave-tunnel-agent.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/secure-dayweave-ssh
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  - path: /etc/systemd/system/dayweave-tunnel-agent.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=DayWeave Nebius Tunnel agent
+      Requires=dayweave-host-security.service
+      Wants=network-online.target
+      After=network-online.target dayweave-host-security.service
+      StartLimitIntervalSec=0
+
+      [Service]
+      Type=simple
+      User=${ssh_user}
+      Group=${ssh_user}
+      Environment=HOME=/run/dayweave-tunnel
+      RuntimeDirectory=dayweave-tunnel
+      RuntimeDirectoryMode=0700
+      UMask=0077
+      ExecStartPre=/usr/local/sbin/assert-dayweave-ssh-loopback
+      ExecStart=/usr/local/sbin/dayweave-tunnel-bootstrap
+      Restart=always
+      RestartSec=15s
+      CapabilityBoundingSet=
+      LockPersonality=true
+      MemoryMax=256M
+      MemorySwapMax=0
+      NoNewPrivileges=true
+      PrivateDevices=true
+      PrivateTmp=true
+      ProtectControlGroups=true
+      ProtectHome=true
+      ProtectKernelLogs=true
+      ProtectKernelModules=true
+      ProtectKernelTunables=true
+      ProtectSystem=strict
+      ReadWritePaths=/run/dayweave-tunnel
+      RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+      RestrictSUIDSGID=true
+      TasksMax=128
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [/usr/local/sbin/bootstrap-dayweave-host]
+
+final_message: "DayWeave base host and metadata-auth tunnel bootstrap completed without storing a private deployment credential."
