@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{
     AppState,
@@ -21,9 +22,10 @@ use crate::{
 };
 
 use super::{
-    GoogleOutboundAccepted, GoogleSyncCollection, GoogleSyncRefreshAccepted,
-    GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncService, GoogleSyncServiceError,
-    GoogleSyncStatus, OutboundOperation, OutboundRequest,
+    GoogleCalendarPolicy, GoogleOutboundAccepted, GoogleOutboundApproval, GoogleOutboundPreview,
+    GoogleSyncCollection, GoogleSyncRefreshAccepted, GoogleSyncRepositoryError, GoogleSyncRole,
+    GoogleSyncService, GoogleSyncServiceError, GoogleSyncStatus, OutboundOperation,
+    OutboundRequest,
 };
 
 pub(crate) fn routes() -> Router<AppState> {
@@ -49,6 +51,14 @@ pub(crate) fn routes() -> Router<AppState> {
             post(manual_refresh),
         )
         .route(
+            "/integrations/google/accounts/{account_id}/outbound/previews",
+            post(preview_outbound),
+        )
+        .route(
+            "/integrations/google/accounts/{account_id}/outbound/previews/{preview_id}/approve",
+            post(approve_outbound),
+        )
+        .route(
             "/integrations/google/accounts/{account_id}/outbound",
             post(enqueue_outbound),
         )
@@ -67,6 +77,8 @@ pub struct ConfigureGoogleCollectionRequest {
     pub selected: bool,
     pub visible: bool,
     pub sync_role: GoogleSyncRole,
+    #[serde(default)]
+    pub calendar_policy: GoogleCalendarPolicy,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -84,13 +96,47 @@ pub struct GoogleSyncRefreshResponse {
     pub refresh: GoogleSyncRefreshAccepted,
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+// Deliberately not `Debug`: the body contains a one-time bearer capability.
+#[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EnqueueGoogleOutboundRequest {
     pub collection_id: Uuid,
     pub item_id: Uuid,
     pub expected_item_revision: u64,
     pub operation: OutboundOperation,
+    pub approval_capability: String,
+}
+
+impl Drop for EnqueueGoogleOutboundRequest {
+    fn drop(&mut self) {
+        self.approval_capability.zeroize();
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewGoogleOutboundRequest {
+    pub collection_id: Uuid,
+    pub item_id: Uuid,
+    pub expected_item_revision: u64,
+    pub operation: OutboundOperation,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct GoogleOutboundPreviewResponse {
+    pub preview: GoogleOutboundPreview,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ApproveGoogleOutboundRequest {
+    pub expected_preview_hash: String,
+}
+
+// Deliberately not `Debug`: the response contains a one-time bearer capability.
+#[derive(Serialize, ToSchema)]
+pub struct GoogleOutboundApprovalResponse {
+    pub approval: GoogleOutboundApproval,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -184,6 +230,7 @@ pub(crate) async fn configure_collection(
             request.selected,
             request.visible,
             request.sync_role,
+            request.calendar_policy,
         )
         .await
         .map_err(map_service_error)?;
@@ -245,6 +292,75 @@ pub(crate) async fn manual_refresh(
 
 #[utoipa::path(
     post,
+    path = "/v1/integrations/google/accounts/{account_id}/outbound/previews",
+    tag = "google_sync",
+    security(("bearer_token" = [])),
+    params(("account_id" = Uuid, Path, description = "Connected Google account")),
+    request_body = PreviewGoogleOutboundRequest,
+    responses(
+        (status = 200, description = "Exact provider mutation preview with a content-bound review hash", body = GoogleOutboundPreviewResponse),
+        (status = 401, description = "Missing or invalid DayWeave token", body = crate::error::ErrorEnvelope),
+        (status = 404, description = "Google account, collection, or canonical item not found", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Publication disabled or revision, ownership, policy, scope, or role conflict", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Canonical item cannot form a safe provider write", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn preview_outbound(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    request: Result<Json<PreviewGoogleOutboundRequest>, JsonRejection>,
+) -> Result<Json<GoogleOutboundPreviewResponse>, ApiError> {
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let preview = configured_service(&state)?
+        .preview_outbound(
+            account_id,
+            OutboundRequest {
+                collection_id: request.collection_id,
+                item_id: request.item_id,
+                expected_item_revision: request.expected_item_revision,
+                operation: request.operation,
+            },
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(Json(GoogleOutboundPreviewResponse { preview }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/integrations/google/accounts/{account_id}/outbound/previews/{preview_id}/approve",
+    tag = "google_sync",
+    security(("bearer_token" = [])),
+    params(
+        ("account_id" = Uuid, Path, description = "Connected Google account"),
+        ("preview_id" = Uuid, Path, description = "Server-minted outbound preview")
+    ),
+    request_body = ApproveGoogleOutboundRequest,
+    responses(
+        (status = 200, description = "Single-use expiring approval capability returned exactly once", body = GoogleOutboundApprovalResponse),
+        (status = 401, description = "Missing or invalid DayWeave token", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Preview expired, changed, already approved, or publication disabled", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn approve_outbound(
+    State(state): State<AppState>,
+    Path((account_id, preview_id)): Path<(Uuid, Uuid)>,
+    request: Result<Json<ApproveGoogleOutboundRequest>, JsonRejection>,
+) -> Result<Json<GoogleOutboundApprovalResponse>, ApiError> {
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let approval = configured_service(&state)?
+        .approve_outbound(account_id, preview_id, &request.expected_preview_hash)
+        .await
+        .map_err(map_service_error)?;
+    Ok(Json(GoogleOutboundApprovalResponse { approval }))
+}
+
+#[utoipa::path(
+    post,
     path = "/v1/integrations/google/accounts/{account_id}/outbound",
     tag = "google_sync",
     security(("bearer_token" = [])),
@@ -263,9 +379,10 @@ pub(crate) async fn enqueue_outbound(
     Path(account_id): Path<Uuid>,
     request: Result<Json<EnqueueGoogleOutboundRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let request = request
+    let mut request = request
         .map_err(|error| ApiError::from_json_rejection(&error))?
         .0;
+    let approval_capability = std::mem::take(&mut request.approval_capability);
     let outbound = configured_service(&state)?
         .enqueue_outbound(
             account_id,
@@ -275,6 +392,7 @@ pub(crate) async fn enqueue_outbound(
                 expected_item_revision: request.expected_item_revision,
                 operation: request.operation,
             },
+            approval_capability,
         )
         .await
         .map_err(map_service_error)?;
@@ -312,7 +430,9 @@ fn map_service_error(error: GoogleSyncServiceError) -> ApiError {
         }
         GoogleSyncServiceError::DeleteRequiresTrash
         | GoogleSyncServiceError::ProviderIdentityUnresolved
-        | GoogleSyncServiceError::ExternalApprovalRequired => ApiError::conflict(error.to_string()),
+        | GoogleSyncServiceError::ExternalPublicationDisabled
+        | GoogleSyncServiceError::InvalidApprovalCapability
+        | GoogleSyncServiceError::OutboundPolicyDenied => ApiError::conflict(error.to_string()),
         GoogleSyncServiceError::Repository(repository) => map_repository_error(&repository),
         GoogleSyncServiceError::OAuth(oauth) => map_oauth_error(&oauth),
         GoogleSyncServiceError::Item(ItemServiceError::Repository(
@@ -325,7 +445,10 @@ fn map_service_error(error: GoogleSyncServiceError) -> ApiError {
             dayweave_google::GoogleError::RateLimited { .. }
             | dayweave_google::GoogleError::Temporary { .. }
             | dayweave_google::GoogleError::Transport(_),
-        ) => ApiError::unavailable("Google is temporarily unavailable"),
+        )
+        | GoogleSyncServiceError::DispatchPreparationTimeout => {
+            ApiError::unavailable("Google is temporarily unavailable")
+        }
         GoogleSyncServiceError::Google(dayweave_google::GoogleError::Unauthorized) => {
             ApiError::conflict("Google authorization must be renewed")
         }
@@ -337,6 +460,7 @@ fn map_service_error(error: GoogleSyncServiceError) -> ApiError {
         GoogleSyncServiceError::CursorCorrupt
         | GoogleSyncServiceError::OutboundPayloadCorrupt
         | GoogleSyncServiceError::Crypto(_)
+        | GoogleSyncServiceError::Randomness
         | GoogleSyncServiceError::Item(_)
         | GoogleSyncServiceError::Internal => ApiError::internal(),
     }
@@ -371,8 +495,18 @@ fn map_repository_error(error: &GoogleSyncRepositoryError) -> ApiError {
         GoogleSyncRepositoryError::ExternalMutationForbidden => ApiError::conflict(
             "only DayWeave-owned provider records can be changed by this endpoint",
         ),
+        GoogleSyncRepositoryError::ApprovalInvalid => {
+            ApiError::conflict("outbound preview or approval capability is invalid")
+        }
+        GoogleSyncRepositoryError::ApprovalExpired => {
+            ApiError::conflict("outbound preview or approval capability expired")
+        }
+        GoogleSyncRepositoryError::ApprovalAlreadyIssued => {
+            ApiError::conflict("outbound preview was already approved")
+        }
         GoogleSyncRepositoryError::ClaimLost
         | GoogleSyncRepositoryError::CursorConflict
+        | GoogleSyncRepositoryError::IdentityRootMismatch
         | GoogleSyncRepositoryError::Internal => ApiError::internal(),
     }
 }

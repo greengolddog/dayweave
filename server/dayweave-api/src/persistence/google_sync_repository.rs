@@ -4,17 +4,24 @@ use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::google_sync::PreparedOutbound;
+#[cfg(test)]
+use sha2::{Digest as _, Sha256};
+
 use crate::{
     config::{
         GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_SCOPE, GOOGLE_TASKS_READONLY_SCOPE,
         GOOGLE_TASKS_SCOPE,
     },
     google_sync::{
-        DiscoveredCollection, GoogleCollectionKind, GoogleOutboundAccepted, GoogleSyncCollection,
-        GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncRunState,
-        GoogleSyncRunStatus, ImportOutcome, OutboundOperation, OutboundResult, OutboundWork,
-        OutboxCounts, PreparedOutbound, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
-        SyncFailureKind,
+        DiscoveredCollection, GoogleCalendarPolicy, GoogleCollectionKind, GoogleEventDisposition,
+        GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRepository,
+        GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncRunState, GoogleSyncRunStatus,
+        ImportOutcome, OutboundApprovalSpec, OutboundDispatchPermit, OutboundEnqueueSpec,
+        OutboundOperation, OutboundPreviewSpec, OutboundResult, OutboundWork, OutboxCounts,
+        RemoteItemChange, StoredCursor, SyncClaim, SyncCounts, SyncFailureKind,
+        outbound_intent_hash, outbound_preview_hash,
     },
     items::{Item, ItemStatus, ItemTombstone, ReplaceItem, SplitPolicy},
 };
@@ -23,8 +30,9 @@ use super::DatabaseScope;
 
 const COLLECTION_COLUMNS: &str = "id, provider_account_id, collection_kind, remote_collection_id, display_name, \
     provider_access_role, provider_primary, provider_selected, provider_hidden, provider_deleted, \
-    selected, visible, sync_role, revision, discovered_at, configured_at, last_import_at, \
-    created_at, updated_at";
+    selected, visible, sync_role, confirmed_busy_policy, tentative_policy, free_policy, \
+    all_day_policy, publish_all_day, publish_tentative, publish_free, revision, discovered_at, \
+    configured_at, last_import_at, created_at, updated_at";
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresGoogleSyncRepository {
@@ -63,11 +71,130 @@ impl PostgresGoogleSyncRepository {
         }
         row.try_get("granted_scopes").map_err(internal)
     }
+
+    #[cfg(test)]
+    async fn enqueue_test_outbound(
+        &self,
+        account_id: Uuid,
+        prepared: crate::google_sync::PreparedOutbound,
+        collection_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<GoogleOutboundAccepted, GoogleSyncRepositoryError> {
+        let collection = self.collection(account_id, collection_id).await?;
+        let required_scope = match prepared.entity_kind {
+            "calendar_event" => GOOGLE_CALENDAR_SCOPE,
+            "task" => GOOGLE_TASKS_SCOPE,
+            _ => return Err(GoogleSyncRepositoryError::CollectionNotWritable),
+        };
+        let preview_id = Uuid::new_v4();
+        let mut capability_digest = Sha256::new();
+        capability_digest.update(b"synthetic-google-approval");
+        capability_digest.update(preview_id.as_bytes());
+        let capability_hash: [u8; 32] = capability_digest.finalize().into();
+        let request = crate::google_sync::OutboundRequest {
+            collection_id,
+            item_id: prepared.item.id,
+            expected_item_revision: prepared.item.revision,
+            operation: prepared.operation,
+        };
+        let preview = self
+            .create_outbound_preview(
+                OutboundPreviewSpec {
+                    id: preview_id,
+                    account_id,
+                    collection_id,
+                    collection_revision: collection.revision,
+                    collection_remote_id: collection.remote_collection_id,
+                    collection_display_name: collection.display_name,
+                    required_scope,
+                    prepared,
+                    expires_at: now + chrono::Duration::minutes(10),
+                },
+                now,
+            )
+            .await?;
+        let preview_hash = decode_hex_bytes(&preview.preview_hash)?;
+        self.approve_outbound(
+            OutboundApprovalSpec {
+                account_id,
+                preview_id,
+                expected_preview_hash: preview_hash,
+                capability_hash,
+            },
+            now,
+        )
+        .await?;
+        self.enqueue_outbound(
+            OutboundEnqueueSpec {
+                account_id,
+                request,
+                capability_hash,
+            },
+            now,
+        )
+        .await
+    }
 }
 
 #[async_trait]
 #[allow(clippy::too_many_lines)] // SQL transaction bodies keep each durable fence atomic.
 impl GoogleSyncRepository for PostgresGoogleSyncRepository {
+    async fn verify_or_initialize_identity_root(
+        &self,
+        identity_key_version: u32,
+        root_verifier: [u8; 32],
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        if identity_key_version == 0 {
+            return Err(GoogleSyncRepositoryError::IdentityRootMismatch);
+        }
+        let identity_key_version = i64::from(identity_key_version);
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        sqlx::query(
+            "INSERT INTO google_provider_identity_roots (workspace_id, user_id, provider, \
+             identity_key_version, root_verifier, created_at, last_verified_at) \
+             VALUES ($1, $2, 'google', $3, $4, $5, $5) \
+             ON CONFLICT (workspace_id, user_id, provider) DO NOTHING",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(identity_key_version)
+        .bind(root_verifier.as_slice())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let matches: bool = sqlx::query_scalar(
+            "SELECT identity_key_version = $4 AND root_verifier = $5 \
+             FROM google_provider_identity_roots WHERE workspace_id = $1 AND user_id = $2 \
+               AND provider = $3 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind("google")
+        .bind(identity_key_version)
+        .bind(root_verifier.as_slice())
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if !matches {
+            return Err(GoogleSyncRepositoryError::IdentityRootMismatch);
+        }
+        sqlx::query(
+            "UPDATE google_provider_identity_roots SET last_verified_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider = $3",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind("google")
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
     async fn replace_discovered(
         &self,
         account_id: Uuid,
@@ -128,7 +255,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                     .map_err(internal)?;
                     sqlx::query(
                         "UPDATE google_sync_outbox SET state = 'conflict', \
-                         claim_id = NULL, claimed_at = NULL, \
+                         claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+                         run_claim_generation = NULL, dispatch_nonce = NULL, \
+                         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
                          last_error_code = 'collection_access_revoked', updated_at = $4 \
                          WHERE workspace_id = $1 AND user_id = $2 AND collection_id = $3 \
                            AND state IN ('pending', 'delivering', 'backoff')",
@@ -215,7 +344,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .map_err(internal)?;
         sqlx::query(
             "UPDATE google_sync_outbox outbox SET state = 'conflict', claim_id = NULL, \
-             claimed_at = NULL, last_error_code = 'collection_deleted', updated_at = $5 \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_authorized_at = NULL, \
+             dispatch_expires_at = NULL, last_error_code = 'collection_deleted', updated_at = $5 \
              FROM google_sync_collections collection WHERE outbox.workspace_id = $1 \
              AND outbox.user_id = $2 AND outbox.provider_account_id = $3 \
              AND outbox.collection_id = collection.id \
@@ -293,6 +424,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         selected: bool,
         visible: bool,
         role: GoogleSyncRole,
+        calendar_policy: GoogleCalendarPolicy,
         now: DateTime<Utc>,
     ) -> Result<GoogleSyncCollection, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
@@ -301,7 +433,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .await?;
         let current = sqlx::query(
             "SELECT collection_kind, provider_access_role, provider_deleted, selected, visible, \
-             sync_role, revision \
+             sync_role, confirmed_busy_policy, tentative_policy, free_policy, all_day_policy, \
+             publish_all_day, publish_tentative, publish_free, revision \
              FROM google_sync_collections WHERE workspace_id = $1 AND user_id = $2 \
              AND provider_account_id = $3 AND id = $4 FOR UPDATE",
         )
@@ -335,7 +468,35 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             || current
                 .try_get::<String, _>("sync_role")
                 .map_err(internal)?
-                != role.as_db();
+                != role.as_db()
+            || current
+                .try_get::<String, _>("confirmed_busy_policy")
+                .map_err(internal)?
+                != calendar_policy.confirmed_busy.as_db()
+            || current
+                .try_get::<String, _>("tentative_policy")
+                .map_err(internal)?
+                != calendar_policy.tentative.as_db()
+            || current
+                .try_get::<String, _>("free_policy")
+                .map_err(internal)?
+                != calendar_policy.free.as_db()
+            || current
+                .try_get::<String, _>("all_day_policy")
+                .map_err(internal)?
+                != calendar_policy.all_day.as_db()
+            || current
+                .try_get::<bool, _>("publish_all_day")
+                .map_err(internal)?
+                != calendar_policy.publish_all_day
+            || current
+                .try_get::<bool, _>("publish_tentative")
+                .map_err(internal)?
+                != calendar_policy.publish_tentative
+            || current
+                .try_get::<bool, _>("publish_free")
+                .map_err(internal)?
+                != calendar_policy.publish_free;
         if collection_kind == "task_list" && role == GoogleSyncRole::Blocking {
             return Err(GoogleSyncRepositoryError::InvalidCollectionRole);
         }
@@ -362,7 +523,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         }
         let row = sqlx::query(AssertSqlSafe(format!(
             "UPDATE google_sync_collections SET selected = $5, visible = $6, sync_role = $7, \
-             configured_at = $8, updated_at = $8, revision = revision + 1 \
+             confirmed_busy_policy = $8, tentative_policy = $9, free_policy = $10, \
+             all_day_policy = $11, publish_all_day = $12, publish_tentative = $13, \
+             publish_free = $14, configured_at = $15, updated_at = $15, revision = revision + 1 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4 \
              RETURNING {COLLECTION_COLUMNS}"
         )))
@@ -373,6 +536,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(selected)
         .bind(visible)
         .bind(role.as_db())
+        .bind(calendar_policy.confirmed_busy.as_db())
+        .bind(calendar_policy.tentative.as_db())
+        .bind(calendar_policy.free.as_db())
+        .bind(calendar_policy.all_day.as_db())
+        .bind(calendar_policy.publish_all_day)
+        .bind(calendar_policy.publish_tentative)
+        .bind(calendar_policy.publish_free)
         .bind(now)
         .fetch_one(&mut *transaction)
         .await
@@ -394,11 +564,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .await
             .map_err(internal)?;
         }
-        if !selected || role != GoogleSyncRole::Writable {
+        {
             sqlx::query(
                 "UPDATE google_sync_outbox SET state = 'conflict', \
-                 claim_id = NULL, claimed_at = NULL, \
-                 last_error_code = 'collection_not_writable', updated_at = $4 \
+                 claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+                 run_claim_generation = NULL, dispatch_nonce = NULL, \
+                 dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+                 last_error_code = $5, updated_at = $4 \
                  WHERE workspace_id = $1 AND user_id = $2 AND collection_id = $3 \
                    AND state IN ('pending', 'delivering', 'backoff')",
             )
@@ -406,6 +578,11 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .bind(self.scope.user_id)
             .bind(collection_id)
             .bind(now)
+            .bind(if !selected || role != GoogleSyncRole::Writable {
+                "collection_not_writable"
+            } else {
+                "collection_configuration_changed"
+            })
             .execute(&mut *transaction)
             .await
             .map_err(internal)?;
@@ -433,10 +610,20 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
     async fn recover_startup(&self, now: DateTime<Utc>) -> Result<(), GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         sqlx::query(
-            "UPDATE google_sync_runs SET state = 'backoff', claim_id = NULL, lease_until = NULL, \
-             next_attempt_at = $3, last_error_code = 'worker_restarted', last_error_at = $3, \
-             consecutive_failures = consecutive_failures + 1, revision = revision + 1, updated_at = $3 \
-             WHERE workspace_id = $1 AND user_id = $2 AND state = 'running'",
+            "UPDATE google_sync_outbox SET \
+             state = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                AND remote_resource_id IS NULL \
+                                AND provider_post_may_have_started \
+                           THEN 'conflict' ELSE 'backoff' END, \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $3, \
+             last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                          AND remote_resource_id IS NULL \
+                                          AND provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' \
+                                    ELSE 'worker_restarted_before_send' END, updated_at = $3 \
+             WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering'",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -445,9 +632,10 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .await
         .map_err(internal)?;
         sqlx::query(
-            "UPDATE google_sync_outbox SET state = 'backoff', claim_id = NULL, claimed_at = NULL, \
-             available_at = $3, last_error_code = 'worker_restarted', attempts = attempts + 1, \
-             updated_at = $3 WHERE workspace_id = $1 AND user_id = $2 AND state = 'delivering'",
+            "UPDATE google_sync_runs SET state = 'backoff', claim_id = NULL, lease_until = NULL, \
+             next_attempt_at = $3, last_error_code = 'worker_restarted', last_error_at = $3, \
+             consecutive_failures = consecutive_failures + 1, revision = revision + 1, updated_at = $3 \
+             WHERE workspace_id = $1 AND user_id = $2 AND state = 'running'",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -524,6 +712,37 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         lease_until: DateTime<Utc>,
     ) -> Result<Option<SyncClaim>, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        // Reconcile every child delivery while the expired parent identity is
+        // still visible. This makes takeover itself the fence: an old worker
+        // cannot authorize or complete even if the outbox lease was newer.
+        sqlx::query(
+            "UPDATE google_sync_outbox outbox SET \
+             state = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                                AND outbox.remote_resource_id IS NULL \
+                                AND outbox.provider_post_may_have_started \
+                           THEN 'conflict' ELSE 'backoff' END, \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $3, \
+             last_error_code = CASE WHEN outbox.entity_kind = 'task' \
+                                          AND outbox.operation = 'upsert' \
+                                          AND outbox.remote_resource_id IS NULL \
+                                          AND outbox.provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' \
+                                    ELSE 'parent_run_lease_expired_before_send' END, updated_at = $3 \
+             FROM google_sync_runs run WHERE run.workspace_id = $1 AND run.user_id = $2 \
+               AND run.state = 'running' AND run.lease_until <= $3 \
+               AND outbox.workspace_id = run.workspace_id AND outbox.user_id = run.user_id \
+               AND outbox.provider_account_id = run.provider_account_id \
+               AND outbox.state = 'delivering' AND outbox.run_claim_id = run.claim_id \
+               AND outbox.run_claim_generation = run.claim_generation",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
         sqlx::query(
             "UPDATE google_sync_runs SET state = 'backoff', claim_id = NULL, lease_until = NULL, \
              next_attempt_at = $3, consecutive_failures = consecutive_failures + 1, \
@@ -549,10 +768,11 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                ORDER BY run.next_attempt_at, run.provider_account_id \
                FOR UPDATE OF account, run SKIP LOCKED LIMIT 1) \
              UPDATE google_sync_runs run SET state = 'running', claim_id = $4, lease_until = $5, \
-               started_at = $3, updated_at = $3, revision = revision + 1 \
+               claim_generation = claim_generation + 1, started_at = $3, updated_at = $3, \
+               revision = revision + 1 \
              FROM candidate WHERE run.workspace_id = $1 \
                AND run.provider_account_id = candidate.provider_account_id \
-             RETURNING run.provider_account_id",
+             RETURNING run.provider_account_id, run.claim_generation",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -567,6 +787,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 Ok(SyncClaim {
                     account_id: row.try_get("provider_account_id").map_err(internal)?,
                     claim_id,
+                    claim_generation: i64_to_u64(
+                        row.try_get("claim_generation").map_err(internal)?,
+                    )?,
                 })
             })
             .transpose()?;
@@ -583,7 +806,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         let updated = sqlx::query(
             "UPDATE google_sync_runs SET lease_until = $5, updated_at = $4 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
-             AND state = 'running' AND claim_id = $6 AND lease_until > $4",
+             AND state = 'running' AND claim_id = $6 AND claim_generation = $7 \
+             AND lease_until > $4",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -591,6 +815,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(now)
         .bind(lease_until)
         .bind(claim.claim_id)
+        .bind(u64_to_i64(claim.claim_generation)?)
         .execute(&self.pool)
         .await
         .map_err(internal)?
@@ -609,6 +834,16 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
         next_attempt_at: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
+        reconcile_outbound_for_parent_end(
+            &mut transaction,
+            self.scope,
+            claim,
+            "parent_run_completed_with_active_delivery",
+            now,
+        )
+        .await?;
         let updated = sqlx::query(
             "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
              completed_at = $5, next_attempt_at = CASE WHEN requested_at > started_at THEN $5 ELSE $6 END, \
@@ -616,7 +851,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
              imported_count = $7, updated_count = $8, deleted_count = $9, conflict_count = $10, \
              rejected_count = $11, revision = revision + 1, updated_at = $5 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
-               AND state = 'running' AND claim_id = $4 AND lease_until > $5",
+               AND state = 'running' AND claim_id = $4 AND claim_generation = $12 \
+               AND lease_until > $5",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -629,11 +865,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(u64_to_i64(counts.deleted)?)
         .bind(u64_to_i64(counts.conflicts)?)
         .bind(u64_to_i64(counts.rejected)?)
-        .execute(&self.pool)
+        .bind(u64_to_i64(claim.claim_generation)?)
+        .execute(&mut *transaction)
         .await
         .map_err(internal)?
         .rows_affected();
         if updated == 1 {
+            transaction.commit().await.map_err(internal)?;
             Ok(())
         } else {
             Err(GoogleSyncRepositoryError::ClaimLost)
@@ -653,12 +891,23 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             SyncFailureKind::ReauthorizationRequired => "reauthorization_required",
             SyncFailureKind::Failed => "failed",
         };
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
+        reconcile_outbound_for_parent_end(
+            &mut transaction,
+            self.scope,
+            claim,
+            "parent_run_failed_with_active_delivery",
+            now,
+        )
+        .await?;
         let updated = sqlx::query(
             "UPDATE google_sync_runs SET state = $5, claim_id = NULL, lease_until = NULL, \
              next_attempt_at = $6, consecutive_failures = consecutive_failures + 1, \
              last_error_code = $7, last_error_at = $8, revision = revision + 1, updated_at = $8 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
-               AND state = 'running' AND claim_id = $4 AND lease_until > $8",
+               AND state = 'running' AND claim_id = $4 AND claim_generation = $9 \
+               AND lease_until > $8",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -668,11 +917,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(next_attempt_at)
         .bind(code)
         .bind(now)
-        .execute(&self.pool)
+        .bind(u64_to_i64(claim.claim_generation)?)
+        .execute(&mut *transaction)
         .await
         .map_err(internal)?
         .rows_affected();
         if updated == 1 {
+            transaction.commit().await.map_err(internal)?;
             Ok(())
         } else {
             Err(GoogleSyncRepositoryError::ClaimLost)
@@ -854,8 +1105,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         )
         .await?;
         let mapping = sqlx::query(
-            "SELECT id, local_entity_id, remote_payload_hash, remote_projection_hash, local_revision, \
-             sync_state, ownership \
+            "SELECT id, local_entity_id, remote_etag, remote_payload_hash, remote_projection_hash, \
+             local_revision, sync_state, ownership \
              FROM provider_sync_mappings WHERE workspace_id = $1 AND provider_account_id = $2 \
              AND collection_id = $3 AND entity_kind = 'item' AND remote_resource_id = $4 \
              AND tombstoned_at IS NULL FOR UPDATE",
@@ -868,10 +1119,25 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .await
         .map_err(internal)?;
         let outcome = if change.is_deleted() {
-            apply_remote_delete(&mut transaction, self.scope, &change, mapping.as_ref(), now)
-                .await?
+            apply_remote_delete(
+                &mut transaction,
+                self.scope,
+                claim,
+                &change,
+                mapping.as_ref(),
+                now,
+            )
+            .await?
         } else {
-            apply_remote_upsert(&mut transaction, self.scope, change, mapping.as_ref(), now).await?
+            apply_remote_upsert(
+                &mut transaction,
+                self.scope,
+                claim,
+                change,
+                mapping.as_ref(),
+                now,
+            )
+            .await?
         };
         transaction.commit().await.map_err(internal)?;
         Ok(outcome)
@@ -967,37 +1233,43 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 remote_updated_at: mapping.try_get("remote_updated_at").map_err(internal)?,
                 remote_payload_hash: mapping_hash(mapping, "remote_payload_hash")?,
                 remote_projection_hash: mapping_hash(mapping, "remote_projection_hash")?,
+                reviewed_provider_projection: None,
                 item: None,
             };
             counts.add(
-                apply_remote_delete(&mut transaction, self.scope, &change, Some(mapping), now)
-                    .await?,
+                apply_remote_delete(
+                    &mut transaction,
+                    self.scope,
+                    claim,
+                    &change,
+                    Some(mapping),
+                    now,
+                )
+                .await?,
             );
         }
         transaction.commit().await.map_err(internal)?;
         Ok(counts)
     }
 
-    async fn enqueue_outbound(
+    async fn create_outbound_preview(
         &self,
-        account_id: Uuid,
-        prepared: PreparedOutbound,
-        collection_id: Uuid,
+        spec: OutboundPreviewSpec,
         now: DateTime<Utc>,
-    ) -> Result<GoogleOutboundAccepted, GoogleSyncRepositoryError> {
+    ) -> Result<GoogleOutboundPreview, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         let granted_scopes = self
-            .ensure_account(&mut transaction, account_id, true)
+            .ensure_account(&mut transaction, spec.account_id, true)
             .await?;
         let collection = sqlx::query(
-            "SELECT collection_kind, selected, provider_deleted, sync_role \
+            "SELECT collection_kind, remote_collection_id, revision, selected, provider_deleted, sync_role \
              FROM google_sync_collections WHERE workspace_id = $1 AND user_id = $2 \
              AND provider_account_id = $3 AND id = $4 FOR SHARE",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
-        .bind(account_id)
-        .bind(collection_id)
+        .bind(spec.account_id)
+        .bind(spec.collection_id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(internal)?
@@ -1016,19 +1288,27 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         {
             return Err(GoogleSyncRepositoryError::CollectionNotWritable);
         }
-        let required_scope = match (prepared.entity_kind, collection_kind.as_str()) {
+        let required_scope = match (spec.prepared.entity_kind, collection_kind.as_str()) {
             ("calendar_event", "calendar") => GOOGLE_CALENDAR_SCOPE,
             ("task", "task_list") => GOOGLE_TASKS_SCOPE,
             _ => return Err(GoogleSyncRepositoryError::CollectionNotWritable),
         };
-        if !granted_scopes.iter().any(|scope| scope == required_scope) {
+        if required_scope != spec.required_scope
+            || !granted_scopes.iter().any(|scope| scope == required_scope)
+            || collection
+                .try_get::<String, _>("remote_collection_id")
+                .map_err(internal)?
+                != spec.collection_remote_id
+            || i64_to_u64(collection.try_get("revision").map_err(internal)?)?
+                != spec.collection_revision
+        {
             return Err(GoogleSyncRepositoryError::WriteScopeMissing);
         }
         let stored_revision: Option<i64> = sqlx::query_scalar(
             "SELECT revision FROM items WHERE workspace_id = $1 AND id = $2 FOR UPDATE",
         )
         .bind(self.scope.workspace_id)
-        .bind(prepared.item.id)
+        .bind(spec.prepared.item.id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(internal)?;
@@ -1036,9 +1316,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             return Err(GoogleSyncRepositoryError::ItemNotFound);
         };
         let stored_revision = i64_to_u64(stored_revision)?;
-        if stored_revision != prepared.item.revision {
+        if stored_revision != spec.prepared.item.revision {
             return Err(GoogleSyncRepositoryError::RevisionConflict {
-                expected: prepared.item.revision,
+                expected: spec.prepared.item.revision,
                 actual: stored_revision,
             });
         }
@@ -1048,7 +1328,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
              AND tombstoned_at IS NULL)",
         )
         .bind(self.scope.workspace_id)
-        .bind(prepared.item.id)
+        .bind(spec.prepared.item.id)
         .fetch_one(&mut *transaction)
         .await
         .map_err(internal)?;
@@ -1061,9 +1341,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                AND entity_kind = 'item' AND local_entity_id = $4 AND tombstoned_at IS NULL FOR UPDATE",
         )
         .bind(self.scope.workspace_id)
-        .bind(account_id)
-        .bind(collection_id)
-        .bind(prepared.item.id)
+        .bind(spec.account_id)
+        .bind(spec.collection_id)
+        .bind(spec.prepared.item.id)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(internal)?;
@@ -1080,14 +1360,447 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .as_ref()
             .map(|row| row.try_get("remote_etag").map_err(internal))
             .transpose()?;
-        if remote_resource_id.is_some() && expected_etag.is_none() {
+        if remote_resource_id
+            .as_deref()
+            .is_some_and(|remote_id| remote_id.trim().is_empty())
+            || (remote_resource_id.is_some()
+                && expected_etag
+                    .as_deref()
+                    .is_none_or(|etag| etag.trim().is_empty()))
+        {
             return Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable);
         }
-        if prepared.operation == OutboundOperation::Delete && remote_resource_id.is_none() {
+        if spec.prepared.operation == OutboundOperation::Delete && remote_resource_id.is_none() {
             return Err(GoogleSyncRepositoryError::ExternalMutationForbidden);
+        }
+        if spec.prepared.entity_kind == "task"
+            && spec.prepared.operation == OutboundOperation::Upsert
+            && remote_resource_id.is_none()
+        {
+            let unsafe_prior_create: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM google_sync_outbox WHERE workspace_id = $1 \
+                 AND user_id = $2 AND provider_account_id = $3 AND collection_id = $4 \
+                 AND item_id = $5 AND entity_kind = 'task' AND operation = 'upsert' \
+                 AND (last_error_code = 'provider_identity_unresolved' \
+                   OR (remote_resource_id IS NULL AND provider_post_may_have_started)))",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.account_id)
+            .bind(spec.collection_id)
+            .bind(spec.prepared.item.id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            if unsafe_prior_create {
+                return Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable);
+            }
+        }
+        let intent_hash = outbound_intent_hash(
+            self.scope.workspace_id,
+            self.scope.user_id,
+            spec.account_id,
+            spec.collection_id,
+            spec.collection_revision,
+            &spec.collection_remote_id,
+            parse_collection_kind(&collection_kind)?,
+            spec.required_scope,
+            spec.prepared.item.id,
+            spec.prepared.item.revision,
+            spec.prepared.entity_kind,
+            spec.prepared.operation,
+            &spec.prepared.payload,
+            remote_resource_id.as_deref(),
+            expected_etag.as_deref(),
+        )
+        .map_err(internal)?;
+        let preview_hash = outbound_preview_hash(spec.id, intent_hash, spec.expires_at);
+        sqlx::query(
+            "INSERT INTO google_outbound_previews (id, workspace_id, user_id, provider_account_id, \
+             collection_id, collection_revision, collection_remote_id, item_id, item_revision, \
+             entity_kind, operation, required_scope, provider_resource_id, expected_etag, intent_hash, \
+             preview_hash, payload, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, \
+             $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19)",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.account_id)
+        .bind(spec.collection_id)
+        .bind(u64_to_i64(spec.collection_revision)?)
+        .bind(&spec.collection_remote_id)
+        .bind(spec.prepared.item.id)
+        .bind(u64_to_i64(spec.prepared.item.revision)?)
+        .bind(spec.prepared.entity_kind)
+        .bind(spec.prepared.operation.as_db())
+        .bind(spec.required_scope)
+        .bind(&remote_resource_id)
+        .bind(&expected_etag)
+        .bind(intent_hash.as_slice())
+        .bind(preview_hash.as_slice())
+        .bind(&spec.prepared.payload)
+        .bind(spec.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let result = GoogleOutboundPreview {
+            id: spec.id,
+            account_id: spec.account_id,
+            collection_id: spec.collection_id,
+            collection_revision: spec.collection_revision,
+            collection_display_name: spec.collection_display_name,
+            item_id: spec.prepared.item.id,
+            item_revision: spec.prepared.item.revision,
+            entity_kind: spec.prepared.entity_kind.to_owned(),
+            operation: spec.prepared.operation,
+            provider_resource_id: remote_resource_id,
+            provider_etag: expected_etag,
+            preview_hash: encode_hex_bytes(&preview_hash),
+            provider_payload: review_payload(&spec.prepared.payload),
+            expires_at: spec.expires_at,
+        };
+        transaction.commit().await.map_err(internal)?;
+        Ok(result)
+    }
+
+    async fn approve_outbound(
+        &self,
+        spec: OutboundApprovalSpec,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let row = sqlx::query(
+            "SELECT provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             item_id, item_revision, entity_kind, operation, required_scope, intent_hash, \
+             preview_hash, expires_at, approved_at FROM google_outbound_previews \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+        if row
+            .try_get::<Uuid, _>("provider_account_id")
+            .map_err(internal)?
+            != spec.account_id
+            || row
+                .try_get::<Vec<u8>, _>("preview_hash")
+                .map_err(internal)?
+                != spec.expected_preview_hash
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let expires_at: DateTime<Utc> = row.try_get("expires_at").map_err(internal)?;
+        if expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ApprovalExpired);
+        }
+        if row
+            .try_get::<Option<DateTime<Utc>>, _>("approved_at")
+            .map_err(internal)?
+            .is_some()
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalAlreadyIssued);
+        }
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_accounts account \
+             JOIN google_sync_collections collection ON collection.workspace_id = account.workspace_id \
+               AND collection.user_id = account.user_id AND collection.provider_account_id = account.id \
+             JOIN items item ON item.workspace_id = account.workspace_id \
+             WHERE account.workspace_id = $1 AND account.user_id = $2 AND account.id = $3 \
+               AND account.provider = 'google' AND account.status = 'active' AND account.sync_enabled \
+               AND account.tombstoned_at IS NULL AND $4 = ANY(account.granted_scopes) \
+               AND collection.id = $5 AND collection.revision = $6 \
+               AND collection.remote_collection_id = $7 AND collection.selected \
+               AND NOT collection.provider_deleted AND collection.sync_role = 'writable' \
+               AND item.id = $8 AND item.revision = $9)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.account_id)
+        .bind(row.try_get::<String, _>("required_scope").map_err(internal)?)
+        .bind(row.try_get::<Uuid, _>("collection_id").map_err(internal)?)
+        .bind(row.try_get::<i64, _>("collection_revision").map_err(internal)?)
+        .bind(row.try_get::<String, _>("collection_remote_id").map_err(internal)?)
+        .bind(row.try_get::<Uuid, _>("item_id").map_err(internal)?)
+        .bind(row.try_get::<i64, _>("item_revision").map_err(internal)?)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if !valid {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let audit_id = Uuid::new_v4();
+        let item_id: Uuid = row.try_get("item_id").map_err(internal)?;
+        let item_revision: i64 = row.try_get("item_revision").map_err(internal)?;
+        let collection_id: Uuid = row.try_get("collection_id").map_err(internal)?;
+        let operation: String = row.try_get("operation").map_err(internal)?;
+        sqlx::query(
+            "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+             entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
+             VALUES ($1, $2, $3, 'google.sync.outbound_approved', 'item', $4, $5, $5, \
+             'succeeded', $6, $7)",
+        )
+        .bind(audit_id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(item_id)
+        .bind(item_revision)
+        .bind(json!({
+            "preview_id": spec.preview_id,
+            "account_id": spec.account_id,
+            "collection_id": collection_id,
+            "operation": operation,
+            "expires_at": expires_at,
+        }))
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        sqlx::query(
+            "UPDATE google_outbound_previews SET approved_at = $4, capability_hash = $5, \
+             approval_audit_id = $6, updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
+             AND id = $3 AND approved_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.preview_id)
+        .bind(now)
+        .bind(spec.capability_hash.as_slice())
+        .bind(audit_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(expires_at)
+    }
+
+    async fn enqueue_outbound(
+        &self,
+        spec: OutboundEnqueueSpec,
+        now: DateTime<Utc>,
+    ) -> Result<GoogleOutboundAccepted, GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let approval = sqlx::query(
+            "SELECT id, provider_account_id, collection_id, collection_revision, \
+             collection_remote_id, item_id, item_revision, entity_kind, operation, required_scope, \
+             provider_resource_id, expected_etag, intent_hash, payload, expires_at, approved_at, \
+             consumed_at, outbox_id, approval_audit_id \
+             FROM google_outbound_previews WHERE workspace_id = $1 AND user_id = $2 \
+             AND capability_hash = $3 FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.capability_hash.as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+        let account_id: Uuid = approval.try_get("provider_account_id").map_err(internal)?;
+        let collection_id: Uuid = approval.try_get("collection_id").map_err(internal)?;
+        let item_id: Uuid = approval.try_get("item_id").map_err(internal)?;
+        let item_revision = i64_to_u64(approval.try_get("item_revision").map_err(internal)?)?;
+        let operation = parse_outbound_operation(
+            &approval
+                .try_get::<String, _>("operation")
+                .map_err(internal)?,
+        )?;
+        let request_matches = account_id == spec.account_id
+            && collection_id == spec.request.collection_id
+            && item_id == spec.request.item_id
+            && item_revision == spec.request.expected_item_revision
+            && operation == spec.request.operation;
+        if !request_matches {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let expires_at: DateTime<Utc> = approval.try_get("expires_at").map_err(internal)?;
+        if expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ApprovalExpired);
+        }
+        if approval
+            .try_get::<Option<DateTime<Utc>>, _>("consumed_at")
+            .map_err(internal)?
+            .is_some()
+        {
+            let outbox_id = approval
+                .try_get::<Option<Uuid>, _>("outbox_id")
+                .map_err(internal)?
+                .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
+            transaction.commit().await.map_err(internal)?;
+            return Ok(GoogleOutboundAccepted {
+                outbox_id,
+                replayed: true,
+            });
+        }
+        if approval
+            .try_get::<Option<DateTime<Utc>>, _>("approved_at")
+            .map_err(internal)?
+            .is_none()
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let required_scope: String = approval.try_get("required_scope").map_err(internal)?;
+        let collection_revision: i64 = approval.try_get("collection_revision").map_err(internal)?;
+        let collection_remote_id: String =
+            approval.try_get("collection_remote_id").map_err(internal)?;
+        let entity_kind: String = approval.try_get("entity_kind").map_err(internal)?;
+        let (collection_kind, expected_required_scope) = match entity_kind.as_str() {
+            "calendar_event" => (GoogleCollectionKind::Calendar, GOOGLE_CALENDAR_SCOPE),
+            "task" => (GoogleCollectionKind::TaskList, GOOGLE_TASKS_SCOPE),
+            _ => return Err(GoogleSyncRepositoryError::ApprovalInvalid),
+        };
+        if required_scope != expected_required_scope {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let approved_remote_resource_id: Option<String> =
+            approval.try_get("provider_resource_id").map_err(internal)?;
+        let approved_etag: Option<String> = approval.try_get("expected_etag").map_err(internal)?;
+        let valid: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_accounts account \
+             JOIN google_sync_collections collection ON collection.workspace_id = account.workspace_id \
+               AND collection.user_id = account.user_id AND collection.provider_account_id = account.id \
+             JOIN items item ON item.workspace_id = account.workspace_id \
+             WHERE account.workspace_id = $1 AND account.user_id = $2 AND account.id = $3 \
+               AND account.provider = 'google' AND account.status = 'active' AND account.sync_enabled \
+               AND account.tombstoned_at IS NULL AND $4 = ANY(account.granted_scopes) \
+               AND collection.id = $5 AND collection.revision = $6 \
+               AND collection.remote_collection_id = $7 AND collection.selected \
+               AND NOT collection.provider_deleted AND collection.sync_role = 'writable' \
+               AND ((collection.collection_kind = 'calendar' AND $8 = 'calendar_event') \
+                 OR (collection.collection_kind = 'task_list' AND $8 = 'task')) \
+               AND item.id = $9 AND item.revision = $10)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(&required_scope)
+        .bind(collection_id)
+        .bind(collection_revision)
+        .bind(&collection_remote_id)
+        .bind(&entity_kind)
+        .bind(item_id)
+        .bind(u64_to_i64(item_revision)?)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if !valid {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        let mapping = sqlx::query(
+            "SELECT remote_resource_id, remote_etag, ownership FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND provider_account_id = $2 AND collection_id = $3 \
+               AND entity_kind = 'item' AND local_entity_id = $4 AND tombstoned_at IS NULL FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(account_id)
+        .bind(collection_id)
+        .bind(item_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if mapping.as_ref().is_some_and(|row| {
+            row.try_get::<String, _>("ownership").ok().as_deref() != Some("dayweave")
+        }) {
+            return Err(GoogleSyncRepositoryError::ExternalMutationForbidden);
+        }
+        let current_remote_resource_id: Option<String> = mapping
+            .as_ref()
+            .map(|row| row.try_get("remote_resource_id").map_err(internal))
+            .transpose()?;
+        let current_etag: Option<String> = mapping
+            .as_ref()
+            .map(|row| row.try_get("remote_etag").map_err(internal))
+            .transpose()?;
+        if current_remote_resource_id
+            .as_deref()
+            .is_some_and(|remote_id| remote_id.trim().is_empty())
+            || (current_remote_resource_id.is_some()
+                && current_etag
+                    .as_deref()
+                    .is_none_or(|etag| etag.trim().is_empty()))
+        {
+            return Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable);
+        }
+        if current_remote_resource_id != approved_remote_resource_id
+            || current_etag != approved_etag
+        {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+        }
+        if operation == OutboundOperation::Delete && approved_remote_resource_id.is_none() {
+            return Err(GoogleSyncRepositoryError::ExternalMutationForbidden);
+        }
+        if entity_kind == "task"
+            && operation == OutboundOperation::Upsert
+            && approved_remote_resource_id.is_none()
+        {
+            // Lock every prior create before deciding whether it is safe to
+            // supersede. This serializes against the worker's claim transition:
+            // a pending unsent revision may be replaced, but an in-flight or
+            // previously attempted markerless create must fail closed.
+            let prior_creates = sqlx::query(
+                "SELECT last_error_code, remote_resource_id, provider_post_may_have_started \
+                 FROM google_sync_outbox WHERE workspace_id = $1 AND user_id = $2 \
+                 AND provider_account_id = $3 AND collection_id = $4 AND item_id = $5 \
+                 AND entity_kind = 'task' AND operation = 'upsert' FOR UPDATE",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(account_id)
+            .bind(collection_id)
+            .bind(item_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            let unsafe_prior_create = prior_creates.iter().any(|row| {
+                row.try_get::<Option<String>, _>("last_error_code")
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some("provider_identity_unresolved")
+                    || (row
+                        .try_get::<Option<String>, _>("remote_resource_id")
+                        .ok()
+                        .flatten()
+                        .is_none()
+                        && row
+                            .try_get::<bool, _>("provider_post_may_have_started")
+                            .ok()
+                            == Some(true))
+            });
+            if unsafe_prior_create {
+                return Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable);
+            }
+        }
+        let payload: Value = approval.try_get("payload").map_err(internal)?;
+        let intent_hash: Vec<u8> = approval.try_get("intent_hash").map_err(internal)?;
+        let recomputed_intent_hash = outbound_intent_hash(
+            self.scope.workspace_id,
+            self.scope.user_id,
+            account_id,
+            collection_id,
+            i64_to_u64(collection_revision)?,
+            &collection_remote_id,
+            collection_kind,
+            &required_scope,
+            item_id,
+            item_revision,
+            &entity_kind,
+            operation,
+            &payload,
+            approved_remote_resource_id.as_deref(),
+            approved_etag.as_deref(),
+        )
+        .map_err(internal)?;
+        if intent_hash.as_slice() != recomputed_intent_hash {
+            return Err(GoogleSyncRepositoryError::ApprovalInvalid);
         }
         let superseded = sqlx::query(
             "UPDATE google_sync_outbox SET state = 'superseded', claim_id = NULL, claimed_at = NULL, \
+             run_claim_id = NULL, run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
              last_error_code = 'superseded_by_newer_revision', updated_at = $7 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
                AND collection_id = $4 AND item_id = $5 AND item_revision < $6 \
@@ -1097,8 +1810,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(self.scope.user_id)
         .bind(account_id)
         .bind(collection_id)
-        .bind(prepared.item.id)
-        .bind(u64_to_i64(prepared.item.revision)?)
+        .bind(item_id)
+        .bind(u64_to_i64(item_revision)?)
         .bind(now)
         .execute(&mut *transaction)
         .await
@@ -1114,8 +1827,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .bind(Uuid::new_v4())
             .bind(self.scope.workspace_id)
             .bind(self.scope.user_id)
-            .bind(prepared.item.id)
-            .bind(u64_to_i64(prepared.item.revision)?)
+            .bind(item_id)
+            .bind(u64_to_i64(item_revision)?)
             .bind(json!({"collection_id": collection_id, "superseded_count": superseded}))
             .bind(now)
             .execute(&mut *transaction)
@@ -1123,11 +1836,19 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .map_err(internal)?;
         }
         let outbox_id = Uuid::new_v4();
+        let approval_id: Uuid = approval.try_get("id").map_err(internal)?;
+        let approval_audit_id: Uuid = approval
+            .try_get::<Option<Uuid>, _>("approval_audit_id")
+            .map_err(internal)?
+            .ok_or(GoogleSyncRepositoryError::ApprovalInvalid)?;
         let inserted = sqlx::query(
             "INSERT INTO google_sync_outbox (id, workspace_id, user_id, provider_account_id, \
              collection_id, item_id, item_revision, entity_kind, operation, remote_resource_id, \
-             expected_etag, app_owned, payload, available_at, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $13, $13, $13) \
+             expected_etag, app_owned, approval_audit_id, approval_id, intent_hash, \
+             collection_revision, target_remote_collection_id, required_scope, payload, \
+             available_at, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, true, $12, $13, $14, \
+             $15, $16, $17, $18, $19, $19, $19) \
              ON CONFLICT (workspace_id, collection_id, item_id, item_revision, operation) DO NOTHING",
         )
         .bind(outbox_id)
@@ -1135,13 +1856,19 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(self.scope.user_id)
         .bind(account_id)
         .bind(collection_id)
-        .bind(prepared.item.id)
-        .bind(u64_to_i64(prepared.item.revision)?)
-        .bind(prepared.entity_kind)
-        .bind(prepared.operation.as_db())
-        .bind(remote_resource_id)
-        .bind(expected_etag)
-        .bind(prepared.payload)
+        .bind(item_id)
+        .bind(u64_to_i64(item_revision)?)
+        .bind(&entity_kind)
+        .bind(operation.as_db())
+        .bind(approved_remote_resource_id)
+        .bind(approved_etag)
+        .bind(approval_audit_id)
+        .bind(approval_id)
+        .bind(&intent_hash)
+        .bind(collection_revision)
+        .bind(&collection_remote_id)
+        .bind(&required_scope)
+        .bind(payload)
         .bind(now)
         .execute(&mut *transaction)
         .await
@@ -1153,23 +1880,43 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 replayed: false,
             }
         } else {
-            let existing: Uuid = sqlx::query_scalar(
-                "SELECT id FROM google_sync_outbox WHERE workspace_id = $1 AND collection_id = $2 \
-                 AND item_id = $3 AND item_revision = $4 AND operation = $5",
+            let existing = sqlx::query(
+                "SELECT id, intent_hash FROM google_sync_outbox WHERE workspace_id = $1 \
+                 AND collection_id = $2 AND item_id = $3 AND item_revision = $4 AND operation = $5",
             )
             .bind(self.scope.workspace_id)
             .bind(collection_id)
-            .bind(prepared.item.id)
-            .bind(u64_to_i64(prepared.item.revision)?)
-            .bind(prepared.operation.as_db())
+            .bind(item_id)
+            .bind(u64_to_i64(item_revision)?)
+            .bind(operation.as_db())
             .fetch_one(&mut *transaction)
             .await
             .map_err(internal)?;
+            if existing
+                .try_get::<Option<Vec<u8>>, _>("intent_hash")
+                .map_err(internal)?
+                .as_deref()
+                != Some(intent_hash.as_slice())
+            {
+                return Err(GoogleSyncRepositoryError::ApprovalInvalid);
+            }
             GoogleOutboundAccepted {
-                outbox_id: existing,
+                outbox_id: existing.try_get("id").map_err(internal)?,
                 replayed: true,
             }
         };
+        sqlx::query(
+            "UPDATE google_outbound_previews SET consumed_at = $4, outbox_id = $5, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND consumed_at IS NULL",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(approval_id)
+        .bind(now)
+        .bind(result.outbox_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
         ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
         sqlx::query(
             "UPDATE google_sync_runs SET requested_at = $4, next_attempt_at = LEAST(next_attempt_at, $4), \
@@ -1197,9 +1944,51 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .ensure_account(&mut transaction, claim.account_id, true)
             .await?;
         ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
+        // A child lease is valid only under the exact current parent run. This
+        // also repairs rows left by a crashed worker after a run takeover.
         sqlx::query(
-            "UPDATE google_sync_outbox outbox SET state = 'superseded', claim_id = NULL, \
-             claimed_at = NULL, last_error_code = 'superseded_by_canonical_revision', \
+            "UPDATE google_sync_outbox outbox SET \
+             state = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                                AND outbox.remote_resource_id IS NULL \
+                                AND outbox.provider_post_may_have_started \
+                           THEN 'conflict' ELSE 'backoff' END, \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $4, \
+             last_error_code = CASE WHEN outbox.entity_kind = 'task' \
+                                          AND outbox.operation = 'upsert' \
+                                          AND outbox.remote_resource_id IS NULL \
+                                          AND outbox.provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' \
+                                    ELSE 'parent_run_claim_changed_before_send' END, updated_at = $4 \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+               AND outbox.provider_account_id = $3 AND outbox.state = 'delivering' \
+               AND (outbox.run_claim_id <> $5 OR outbox.run_claim_generation <> $6)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(claim.account_id)
+        .bind(now)
+        .bind(claim.claim_id)
+        .bind(u64_to_i64(claim.claim_generation)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        sqlx::query(
+            "UPDATE google_sync_outbox outbox SET \
+             state = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                                AND outbox.remote_resource_id IS NULL \
+                                AND outbox.provider_post_may_have_started \
+                           THEN 'conflict' ELSE 'superseded' END, \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, dispatch_authorized_at = NULL, \
+             dispatch_expires_at = NULL, \
+             last_error_code = CASE WHEN outbox.entity_kind = 'task' \
+                                          AND outbox.operation = 'upsert' \
+                                          AND outbox.remote_resource_id IS NULL \
+                                          AND outbox.provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' \
+                                    ELSE 'superseded_by_canonical_revision' END, \
              updated_at = $4 FROM items item WHERE outbox.workspace_id = $1 \
              AND outbox.user_id = $2 AND outbox.provider_account_id = $3 \
              AND item.workspace_id = outbox.workspace_id AND item.id = outbox.item_id \
@@ -1214,10 +2003,58 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .await
         .map_err(internal)?;
         sqlx::query(
-            "UPDATE google_sync_outbox SET state = 'backoff', claim_id = NULL, claimed_at = NULL, \
-             available_at = $4, attempts = attempts + 1, last_error_code = 'delivery_lease_expired', \
+            "UPDATE google_sync_outbox SET \
+             state = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                AND remote_resource_id IS NULL \
+                                AND provider_post_may_have_started \
+                           THEN 'conflict' ELSE 'backoff' END, \
+             claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+             run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $4, \
+             last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                          AND remote_resource_id IS NULL \
+                                          AND provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' \
+                                    ELSE 'delivery_lease_expired_before_send' END, \
              updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
              AND state = 'delivering' AND claimed_at <= $4 - interval '10 minutes'",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(claim.account_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        // A reviewed create is valid only while no identity exists; edits and
+        // deletes require the exact DayWeave-owned mapping and reviewed ETag.
+        sqlx::query(
+            "UPDATE google_sync_outbox outbox SET state = 'conflict', claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             last_error_code = 'provider_mapping_changed_before_claim', updated_at = $4 \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+               AND outbox.provider_account_id = $3 AND outbox.state IN ('pending', 'backoff') \
+               AND NOT (((outbox.remote_resource_id IS NULL AND outbox.expected_etag IS NULL \
+                          AND outbox.operation = 'upsert') \
+                         AND NOT EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                           WHERE mapping.workspace_id = outbox.workspace_id \
+                             AND mapping.provider_account_id = outbox.provider_account_id \
+                             AND mapping.collection_id = outbox.collection_id \
+                             AND mapping.entity_kind = 'item' AND mapping.tombstoned_at IS NULL \
+                             AND (mapping.local_entity_id = outbox.item_id \
+                               OR (outbox.entity_kind = 'calendar_event' \
+                                 AND mapping.remote_resource_id = outbox.payload->>'id')))) \
+                      OR (outbox.remote_resource_id IS NOT NULL AND outbox.expected_etag IS NOT NULL \
+                         AND EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                           WHERE mapping.workspace_id = outbox.workspace_id \
+                             AND mapping.provider_account_id = outbox.provider_account_id \
+                             AND mapping.collection_id = outbox.collection_id \
+                             AND mapping.entity_kind = 'item' AND mapping.local_entity_id = outbox.item_id \
+                             AND mapping.remote_resource_id = outbox.remote_resource_id \
+                             AND mapping.remote_etag = outbox.expected_etag \
+                             AND mapping.ownership = 'dayweave' \
+                             AND mapping.tombstoned_at IS NULL)))",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -1229,31 +2066,78 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         let claim_id = Uuid::new_v4();
         let row = sqlx::query(
             "WITH candidate AS (SELECT outbox.id FROM google_sync_outbox outbox \
+               JOIN google_sync_runs run ON run.workspace_id = outbox.workspace_id \
+                 AND run.user_id = outbox.user_id \
+                 AND run.provider_account_id = outbox.provider_account_id \
                JOIN google_sync_collections collection ON collection.workspace_id = outbox.workspace_id \
                  AND collection.id = outbox.collection_id \
                JOIN items item ON item.workspace_id = outbox.workspace_id AND item.id = outbox.item_id \
+               JOIN google_outbound_previews approval ON approval.workspace_id = outbox.workspace_id \
+                 AND approval.id = outbox.approval_id \
                WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
                  AND outbox.provider_account_id = $3 AND outbox.state IN ('pending', 'backoff') \
                  AND collection.user_id = $2 AND collection.provider_account_id = $3 \
                  AND collection.selected AND NOT collection.provider_deleted \
                  AND collection.sync_role = 'writable' \
+                 AND collection.revision = outbox.collection_revision \
+                 AND collection.remote_collection_id = outbox.target_remote_collection_id \
                  AND item.revision = outbox.item_revision \
+                 AND approval.approved_at IS NOT NULL AND approval.consumed_at IS NOT NULL \
+                 AND approval.outbox_id = outbox.id AND approval.intent_hash = outbox.intent_hash \
+                 AND approval.provider_account_id = outbox.provider_account_id \
+                 AND approval.collection_id = outbox.collection_id \
+                 AND approval.collection_revision = outbox.collection_revision \
+                 AND approval.collection_remote_id = outbox.target_remote_collection_id \
+                 AND approval.item_id = outbox.item_id \
+                 AND approval.item_revision = outbox.item_revision \
+                 AND approval.entity_kind = outbox.entity_kind \
+                 AND approval.operation = outbox.operation \
+                 AND approval.required_scope = outbox.required_scope \
+                 AND approval.payload = outbox.payload \
+                 AND approval.provider_resource_id IS NOT DISTINCT FROM outbox.remote_resource_id \
+                 AND approval.expected_etag IS NOT DISTINCT FROM outbox.expected_etag \
+                 AND run.state = 'running' AND run.claim_id = $6 \
+                 AND run.claim_generation = $7 AND run.lease_until > $4 \
+                 AND (((outbox.remote_resource_id IS NULL AND outbox.expected_etag IS NULL \
+                        AND outbox.operation = 'upsert') \
+                       AND NOT EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                         WHERE mapping.workspace_id = outbox.workspace_id \
+                           AND mapping.provider_account_id = outbox.provider_account_id \
+                           AND mapping.collection_id = outbox.collection_id \
+                           AND mapping.entity_kind = 'item' AND mapping.tombstoned_at IS NULL \
+                           AND (mapping.local_entity_id = outbox.item_id \
+                             OR (outbox.entity_kind = 'calendar_event' \
+                               AND mapping.remote_resource_id = outbox.payload->>'id')))) \
+                    OR (outbox.remote_resource_id IS NOT NULL AND outbox.expected_etag IS NOT NULL \
+                       AND EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                         WHERE mapping.workspace_id = outbox.workspace_id \
+                           AND mapping.provider_account_id = outbox.provider_account_id \
+                           AND mapping.collection_id = outbox.collection_id \
+                           AND mapping.entity_kind = 'item' AND mapping.local_entity_id = outbox.item_id \
+                           AND mapping.remote_resource_id = outbox.remote_resource_id \
+                           AND mapping.remote_etag = outbox.expected_etag \
+                           AND mapping.ownership = 'dayweave' \
+                           AND mapping.tombstoned_at IS NULL))) \
                  AND outbox.available_at <= $4 ORDER BY outbox.available_at, outbox.created_at, outbox.id \
-               FOR UPDATE OF outbox, collection SKIP LOCKED LIMIT 1) \
+               FOR UPDATE OF outbox, run, collection SKIP LOCKED LIMIT 1) \
              UPDATE google_sync_outbox outbox SET state = 'delivering', claim_id = $5, claimed_at = $4, \
+               run_claim_id = $6, run_claim_generation = $7, \
+               dispatch_nonce = NULL, dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
                updated_at = $4 FROM candidate WHERE outbox.id = candidate.id \
              RETURNING outbox.id, outbox.provider_account_id, outbox.collection_id, outbox.item_id, \
                outbox.item_revision, outbox.entity_kind, outbox.operation, outbox.remote_resource_id, \
-               outbox.expected_etag, outbox.payload, outbox.attempts, \
-               (SELECT remote_collection_id FROM google_sync_collections collection \
-                 WHERE collection.workspace_id = outbox.workspace_id AND collection.id = outbox.collection_id) \
-                 AS collection_remote_id",
+               outbox.expected_etag, outbox.payload, outbox.attempts, outbox.collection_revision, \
+               outbox.target_remote_collection_id AS collection_remote_id, outbox.required_scope, \
+               outbox.intent_hash, outbox.approval_id, outbox.run_claim_id, \
+               outbox.run_claim_generation, outbox.provider_post_may_have_started",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
         .bind(claim.account_id)
         .bind(now)
         .bind(claim_id)
+        .bind(claim.claim_id)
+        .bind(u64_to_i64(claim.claim_generation)?)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(internal)?;
@@ -1266,7 +2150,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 "task" => GOOGLE_TASKS_SCOPE,
                 _ => return Err(GoogleSyncRepositoryError::Internal),
             };
-            if !granted_scopes.iter().any(|scope| scope == required_scope) {
+            if work.required_scope != required_scope
+                || !granted_scopes.iter().any(|scope| scope == required_scope)
+            {
                 return Err(GoogleSyncRepositoryError::WriteScopeMissing);
             }
         }
@@ -1279,9 +2165,22 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         work: &OutboundWork,
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_claim(
+            &mut transaction,
+            self.scope,
+            &SyncClaim {
+                account_id: work.account_id,
+                claim_id: work.run_claim_id,
+                claim_generation: work.run_claim_generation,
+            },
+            now,
+        )
+        .await?;
         let updated = sqlx::query(
             "UPDATE google_sync_outbox outbox SET claimed_at = $5, updated_at = $5 \
-             FROM google_sync_collections collection, provider_accounts account, items item \
+             FROM google_sync_collections collection, provider_accounts account, items item, \
+               google_sync_runs run \
              WHERE outbox.workspace_id = $1 AND outbox.id = $2 \
                AND outbox.provider_account_id = $3 AND outbox.state = 'delivering' \
                AND outbox.claim_id = $4 AND collection.workspace_id = outbox.workspace_id \
@@ -1291,18 +2190,272 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                AND account.user_id = outbox.user_id AND account.provider = 'google' \
                AND account.status = 'active' AND account.sync_enabled \
                AND account.tombstoned_at IS NULL AND item.workspace_id = outbox.workspace_id \
-               AND item.id = outbox.item_id AND item.revision = outbox.item_revision",
+               AND item.id = outbox.item_id AND item.revision = outbox.item_revision \
+               AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = outbox.provider_account_id \
+               AND run.state = 'running' AND run.claim_id = $6 AND run.claim_generation = $7 \
+               AND run.lease_until > $5 AND outbox.run_claim_id = run.claim_id \
+               AND outbox.run_claim_generation = run.claim_generation \
+               AND ((outbox.remote_resource_id IS NULL AND outbox.expected_etag IS NULL \
+                     AND outbox.operation = 'upsert' \
+                     AND NOT EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                       WHERE mapping.workspace_id = outbox.workspace_id \
+                         AND mapping.provider_account_id = outbox.provider_account_id \
+                         AND mapping.collection_id = outbox.collection_id \
+                         AND mapping.entity_kind = 'item' AND mapping.tombstoned_at IS NULL \
+                         AND (mapping.local_entity_id = outbox.item_id \
+                           OR (outbox.entity_kind = 'calendar_event' \
+                             AND mapping.remote_resource_id = outbox.payload->>'id')))) \
+                 OR (outbox.remote_resource_id IS NOT NULL AND outbox.expected_etag IS NOT NULL \
+                     AND EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                       WHERE mapping.workspace_id = outbox.workspace_id \
+                         AND mapping.provider_account_id = outbox.provider_account_id \
+                         AND mapping.collection_id = outbox.collection_id \
+                         AND mapping.entity_kind = 'item' AND mapping.local_entity_id = outbox.item_id \
+                         AND mapping.remote_resource_id = outbox.remote_resource_id \
+                         AND mapping.remote_etag = outbox.expected_etag \
+                         AND mapping.ownership = 'dayweave' AND mapping.tombstoned_at IS NULL)))",
         )
         .bind(self.scope.workspace_id)
         .bind(work.id)
         .bind(work.account_id)
         .bind(work.claim_id)
         .bind(now)
-        .execute(&self.pool)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .execute(&mut *transaction)
         .await
         .map_err(internal)?
         .rows_affected();
         if updated == 1 {
+            transaction.commit().await.map_err(internal)?;
+            Ok(())
+        } else {
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        }
+    }
+
+    async fn authorize_outbound_dispatch(
+        &self,
+        work: &OutboundWork,
+        provider_write: bool,
+        now: DateTime<Utc>,
+    ) -> Result<OutboundDispatchPermit, GoogleSyncRepositoryError> {
+        let nonce = Uuid::new_v4();
+        let expires_at = now + chrono::Duration::seconds(30);
+        let task_post_may_start = provider_write
+            && work.entity_kind == "task"
+            && work.operation == OutboundOperation::Upsert
+            && work.remote_resource_id.is_none();
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE google_sync_outbox outbox SET dispatch_nonce = $6, \
+             dispatch_authorized_at = $7, dispatch_expires_at = $8, claimed_at = $7, updated_at = $7, \
+             provider_post_may_have_started = \
+               outbox.provider_post_may_have_started OR $24, \
+             send_started_at = CASE WHEN $24 THEN COALESCE(outbox.send_started_at, $7) \
+                                    ELSE outbox.send_started_at END \
+             FROM provider_accounts account, google_sync_collections collection, items item, \
+               google_outbound_previews approval, google_sync_runs run \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+               AND outbox.provider_account_id = $4 AND outbox.claim_id = $5 \
+               AND outbox.state = 'delivering' AND outbox.approval_id IS NOT NULL \
+               AND outbox.intent_hash = $9 AND outbox.collection_revision = $10 \
+               AND outbox.target_remote_collection_id = $11 AND outbox.required_scope = $12 \
+               AND outbox.approval_id = $15 \
+               AND outbox.collection_id = $16 AND outbox.item_id = $17 \
+               AND outbox.item_revision = $18 AND outbox.entity_kind = $19 \
+               AND outbox.operation = $20 AND outbox.payload = $21 \
+               AND outbox.remote_resource_id IS NOT DISTINCT FROM $22 \
+               AND outbox.expected_etag IS NOT DISTINCT FROM $23 \
+               AND outbox.run_claim_id = $25 AND outbox.run_claim_generation = $26 \
+               AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = outbox.provider_account_id \
+               AND run.state = 'running' AND run.claim_id = $25 \
+               AND run.claim_generation = $26 AND run.lease_until > $7 \
+               AND account.workspace_id = outbox.workspace_id AND account.user_id = outbox.user_id \
+               AND account.id = outbox.provider_account_id AND account.provider = 'google' \
+               AND account.status = 'active' AND account.sync_enabled \
+               AND account.tombstoned_at IS NULL AND outbox.required_scope = ANY(account.granted_scopes) \
+               AND collection.workspace_id = outbox.workspace_id AND collection.user_id = outbox.user_id \
+               AND collection.provider_account_id = outbox.provider_account_id \
+               AND collection.id = outbox.collection_id AND collection.selected \
+               AND NOT collection.provider_deleted AND collection.sync_role = 'writable' \
+               AND collection.revision = outbox.collection_revision \
+               AND collection.remote_collection_id = outbox.target_remote_collection_id \
+               AND ((collection.collection_kind = 'calendar' AND outbox.entity_kind = 'calendar_event' \
+                     AND outbox.required_scope = $13) \
+                 OR (collection.collection_kind = 'task_list' AND outbox.entity_kind = 'task' \
+                     AND outbox.required_scope = $14)) \
+               AND item.workspace_id = outbox.workspace_id AND item.id = outbox.item_id \
+               AND item.revision = outbox.item_revision \
+               AND approval.workspace_id = outbox.workspace_id AND approval.id = outbox.approval_id \
+               AND approval.approved_at IS NOT NULL AND approval.consumed_at IS NOT NULL \
+               AND approval.outbox_id = outbox.id AND approval.intent_hash = outbox.intent_hash \
+               AND approval.provider_account_id = outbox.provider_account_id \
+               AND approval.collection_id = outbox.collection_id \
+               AND approval.collection_revision = outbox.collection_revision \
+               AND approval.collection_remote_id = outbox.target_remote_collection_id \
+               AND approval.item_id = outbox.item_id AND approval.item_revision = outbox.item_revision \
+               AND approval.entity_kind = outbox.entity_kind AND approval.operation = outbox.operation \
+               AND approval.required_scope = outbox.required_scope AND approval.payload = outbox.payload \
+               AND approval.provider_resource_id IS NOT DISTINCT FROM outbox.remote_resource_id \
+               AND approval.expected_etag IS NOT DISTINCT FROM outbox.expected_etag \
+               AND ((outbox.remote_resource_id IS NULL AND outbox.expected_etag IS NULL \
+                     AND outbox.operation = 'upsert' \
+                     AND NOT EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                       WHERE mapping.workspace_id = outbox.workspace_id \
+                         AND mapping.provider_account_id = outbox.provider_account_id \
+                         AND mapping.collection_id = outbox.collection_id \
+                         AND mapping.entity_kind = 'item' AND mapping.tombstoned_at IS NULL \
+                         AND (mapping.local_entity_id = outbox.item_id \
+                           OR (outbox.entity_kind = 'calendar_event' \
+                             AND mapping.remote_resource_id = outbox.payload->>'id')))) \
+                 OR (outbox.remote_resource_id IS NOT NULL AND outbox.expected_etag IS NOT NULL \
+                     AND EXISTS (SELECT 1 FROM provider_sync_mappings mapping \
+                       WHERE mapping.workspace_id = outbox.workspace_id \
+                         AND mapping.provider_account_id = outbox.provider_account_id \
+                         AND mapping.collection_id = outbox.collection_id \
+                         AND mapping.entity_kind = 'item' AND mapping.local_entity_id = outbox.item_id \
+                         AND mapping.remote_resource_id = outbox.remote_resource_id \
+                         AND mapping.remote_etag = outbox.expected_etag \
+                         AND mapping.ownership = 'dayweave' AND mapping.tombstoned_at IS NULL)))",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.id)
+        .bind(work.account_id)
+        .bind(work.claim_id)
+        .bind(nonce)
+        .bind(now)
+        .bind(expires_at)
+        .bind(work.intent_hash.as_slice())
+        .bind(u64_to_i64(work.collection_revision)?)
+        .bind(&work.collection_remote_id)
+        .bind(&work.required_scope)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(GOOGLE_TASKS_SCOPE)
+        .bind(work.approval_id)
+        .bind(work.collection_id)
+        .bind(work.item_id)
+        .bind(u64_to_i64(work.item_revision)?)
+        .bind(&work.entity_kind)
+        .bind(work.operation.as_db())
+        .bind(&work.payload)
+        .bind(&work.remote_resource_id)
+        .bind(&work.expected_etag)
+        .bind(task_post_may_start)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            // A failed final fence must never strand `delivering`. Only the
+            // still-current parent identity may perform this transition; a
+            // takeover owns (and already reconciles) the row instead.
+            sqlx::query(
+                "UPDATE google_sync_outbox outbox SET \
+                 state = CASE WHEN EXISTS (SELECT 1 FROM items item \
+                                      WHERE item.workspace_id = outbox.workspace_id \
+                                        AND item.id = outbox.item_id \
+                                        AND item.revision <> outbox.item_revision) \
+                              THEN 'superseded' ELSE 'conflict' END, \
+                 claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+                 run_claim_generation = NULL, dispatch_nonce = NULL, \
+                 dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+                 last_error_code = CASE WHEN EXISTS (SELECT 1 FROM items item \
+                                              WHERE item.workspace_id = outbox.workspace_id \
+                                                AND item.id = outbox.item_id \
+                                                AND item.revision <> outbox.item_revision) \
+                                        THEN 'superseded_before_provider_dispatch' \
+                                        ELSE 'dispatch_authorization_denied' END, updated_at = $7 \
+                 FROM google_sync_runs run WHERE outbox.workspace_id = $1 \
+                   AND outbox.user_id = $2 AND outbox.id = $3 \
+                   AND outbox.provider_account_id = $4 AND outbox.state = 'delivering' \
+                   AND outbox.claim_id = $5 AND outbox.run_claim_id = $6 \
+                   AND outbox.run_claim_generation = $8 \
+                   AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+                   AND run.provider_account_id = outbox.provider_account_id \
+                   AND run.claim_id = $6 AND run.claim_generation = $8",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(work.id)
+            .bind(work.account_id)
+            .bind(work.claim_id)
+            .bind(work.run_claim_id)
+            .bind(now)
+            .bind(u64_to_i64(work.run_claim_generation)?)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            transaction.commit().await.map_err(internal)?;
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(OutboundDispatchPermit {
+            nonce,
+            intent_hash: work.intent_hash,
+            expires_at,
+        })
+    }
+
+    async fn cancel_outbound_before_send(
+        &self,
+        work: &OutboundWork,
+        code: &'static str,
+        available_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE google_sync_outbox outbox SET state = 'backoff', claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             provider_post_may_have_started = false, send_started_at = NULL, \
+             available_at = $9, last_error_code = $8, updated_at = $10 \
+             FROM google_sync_runs run WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+               AND outbox.id = $3 AND outbox.provider_account_id = $4 \
+               AND outbox.state = 'delivering' AND outbox.claim_id = $5 \
+               AND outbox.run_claim_id = $6 AND outbox.run_claim_generation = $7 \
+               AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = outbox.provider_account_id \
+               AND run.claim_id = $6 AND run.claim_generation = $7",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.id)
+        .bind(work.account_id)
+        .bind(work.claim_id)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(code)
+        .bind(available_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated == 1 {
+            transaction.commit().await.map_err(internal)?;
             Ok(())
         } else {
             Err(GoogleSyncRepositoryError::ClaimLost)
@@ -1316,6 +2469,104 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
+        let authorization_valid = sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM google_sync_outbox outbox \
+             JOIN provider_accounts account ON account.workspace_id = outbox.workspace_id \
+               AND account.user_id = outbox.user_id AND account.id = outbox.provider_account_id \
+             JOIN google_sync_collections collection ON collection.workspace_id = outbox.workspace_id \
+               AND collection.user_id = outbox.user_id \
+               AND collection.provider_account_id = outbox.provider_account_id \
+               AND collection.id = outbox.collection_id \
+             JOIN items item ON item.workspace_id = outbox.workspace_id AND item.id = outbox.item_id \
+             JOIN google_outbound_previews approval ON approval.workspace_id = outbox.workspace_id \
+               AND approval.id = outbox.approval_id \
+             JOIN google_sync_runs run ON run.workspace_id = outbox.workspace_id \
+               AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = outbox.provider_account_id \
+             WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 AND outbox.id = $3 \
+               AND outbox.provider_account_id = $4 AND outbox.claim_id = $5 \
+               AND outbox.state = 'delivering' AND outbox.dispatch_nonce = $6 \
+               AND outbox.intent_hash = $7 AND outbox.collection_revision = $8 \
+               AND outbox.target_remote_collection_id = $9 AND outbox.required_scope = $10 \
+               AND outbox.run_claim_id = $13 AND outbox.run_claim_generation = $14 \
+               AND run.state = 'running' AND run.claim_id = $13 \
+               AND run.claim_generation = $14 AND run.lease_until > $15 \
+               AND account.provider = 'google' AND account.status = 'active' AND account.sync_enabled \
+               AND account.tombstoned_at IS NULL AND outbox.required_scope = ANY(account.granted_scopes) \
+               AND collection.selected AND NOT collection.provider_deleted \
+               AND collection.sync_role = 'writable' AND collection.revision = outbox.collection_revision \
+               AND collection.remote_collection_id = outbox.target_remote_collection_id \
+               AND ((collection.collection_kind = 'calendar' AND outbox.entity_kind = 'calendar_event' \
+                     AND outbox.required_scope = $11) \
+                 OR (collection.collection_kind = 'task_list' AND outbox.entity_kind = 'task' \
+                     AND outbox.required_scope = $12)) \
+               AND item.revision = outbox.item_revision \
+               AND approval.approved_at IS NOT NULL AND approval.consumed_at IS NOT NULL \
+               AND approval.outbox_id = outbox.id AND approval.intent_hash = outbox.intent_hash \
+               AND approval.provider_account_id = outbox.provider_account_id \
+               AND approval.collection_id = outbox.collection_id \
+               AND approval.collection_revision = outbox.collection_revision \
+               AND approval.collection_remote_id = outbox.target_remote_collection_id \
+               AND approval.item_id = outbox.item_id AND approval.item_revision = outbox.item_revision \
+               AND approval.entity_kind = outbox.entity_kind AND approval.operation = outbox.operation \
+               AND approval.required_scope = outbox.required_scope AND approval.payload = outbox.payload \
+               AND approval.provider_resource_id IS NOT DISTINCT FROM outbox.remote_resource_id \
+               AND approval.expected_etag IS NOT DISTINCT FROM outbox.expected_etag \
+             FOR SHARE OF outbox, account, collection, item, approval, run",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(work.id)
+        .bind(work.account_id)
+        .bind(work.claim_id)
+        .bind(result.dispatch_nonce)
+        .bind(work.intent_hash.as_slice())
+        .bind(u64_to_i64(work.collection_revision)?)
+        .bind(&work.collection_remote_id)
+        .bind(&work.required_scope)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(GOOGLE_TASKS_SCOPE)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .is_some();
+        if !authorization_valid {
+            let current_revision: Option<i64> = sqlx::query_scalar(
+                "SELECT revision FROM items WHERE workspace_id = $1 AND id = $2 FOR SHARE",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(work.item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            let superseded = current_revision != Some(u64_to_i64(work.item_revision)?);
+            revoke_outbound_after_provider(
+                &mut transaction,
+                self.scope,
+                work,
+                if superseded { "superseded" } else { "conflict" },
+                if superseded {
+                    "superseded_during_delivery"
+                } else {
+                    "dispatch_authorization_changed"
+                },
+                now,
+            )
+            .await?;
+            transaction.commit().await.map_err(internal)?;
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
         let account = sqlx::query(
             "SELECT status, sync_enabled, granted_scopes, tombstoned_at FROM provider_accounts \
              WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND provider = 'google' \
@@ -1349,7 +2600,10 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             "task" => GOOGLE_TASKS_SCOPE,
             _ => return Err(GoogleSyncRepositoryError::Internal),
         };
-        if !account_valid || !granted_scopes.iter().any(|scope| scope == required_scope) {
+        if work.required_scope != required_scope
+            || !account_valid
+            || !granted_scopes.iter().any(|scope| scope == required_scope)
+        {
             revoke_outbound_after_provider(
                 &mut transaction,
                 self.scope,
@@ -1430,67 +2684,166 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             transaction.commit().await.map_err(internal)?;
             return Err(GoogleSyncRepositoryError::ClaimLost);
         }
+        // Lock both possible identities before publication. The conditional
+        // mutation below is still required for the create case because an
+        // absent row cannot itself be locked against a concurrent insert.
+        let mapping_rows = sqlx::query(
+            "SELECT id, local_entity_id, remote_resource_id, remote_etag, ownership \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND provider_account_id = $2 \
+               AND collection_id = $3 AND entity_kind = 'item' AND tombstoned_at IS NULL \
+               AND (local_entity_id = $4 OR remote_resource_id = $5) ORDER BY id FOR UPDATE",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(work.account_id)
+        .bind(work.collection_id)
+        .bind(work.item_id)
+        .bind(&result.remote_resource_id)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let mapping = mapping_rows.iter().find(|mapping| {
+            mapping
+                .try_get::<Option<Uuid>, _>("local_entity_id")
+                .ok()
+                .flatten()
+                == Some(work.item_id)
+        });
+        let remote_identity_conflict = mapping_rows.iter().any(|candidate| {
+            candidate
+                .try_get::<String, _>("remote_resource_id")
+                .ok()
+                .as_deref()
+                == Some(result.remote_resource_id.as_str())
+                && candidate.try_get::<Uuid, _>("id").ok()
+                    != mapping.and_then(|current| current.try_get::<Uuid, _>("id").ok())
+        });
+        let mapping_valid = match (&work.remote_resource_id, &work.expected_etag, mapping) {
+            (None, None, None) => !remote_identity_conflict,
+            (Some(expected_remote_id), Some(expected_etag), Some(mapping)) => {
+                mapping
+                    .try_get::<String, _>("remote_resource_id")
+                    .ok()
+                    .as_ref()
+                    == Some(expected_remote_id)
+                    && mapping
+                        .try_get::<Option<String>, _>("remote_etag")
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(expected_etag)
+                    && mapping.try_get::<String, _>("ownership").ok().as_deref() == Some("dayweave")
+                    && !remote_identity_conflict
+            }
+            _ => false,
+        };
+        if !mapping_valid {
+            revoke_outbound_after_provider(
+                &mut transaction,
+                self.scope,
+                work,
+                "conflict",
+                "provider_mapping_changed_during_delivery",
+                now,
+            )
+            .await?;
+            transaction.commit().await.map_err(internal)?;
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
+        let mapping_state = if work.operation == OutboundOperation::Delete {
+            "deleted_remote"
+        } else {
+            "synced"
+        };
+        let mapping_updated = if let Some(mapping) = mapping {
+            let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
+            sqlx::query(
+                "UPDATE provider_sync_mappings SET remote_resource_id = $2, remote_etag = $3, \
+                 remote_updated_at = $4, remote_payload_hash = $5, local_revision = $6, \
+                 sync_state = $7, ownership = 'dayweave', conflict_metadata = NULL, updated_at = $8 \
+                 WHERE id = $1 AND workspace_id = $9 AND provider_account_id = $10 \
+                   AND collection_id = $11 AND entity_kind = 'item' AND local_entity_id = $12 \
+                   AND remote_resource_id = $13 AND remote_etag = $14 AND ownership = 'dayweave' \
+                   AND tombstoned_at IS NULL",
+            )
+            .bind(mapping_id)
+            .bind(&result.remote_resource_id)
+            .bind(&result.remote_etag)
+            .bind(result.remote_updated_at)
+            .bind(result.payload_hash.as_slice())
+            .bind(u64_to_i64(work.item_revision)?)
+            .bind(mapping_state)
+            .bind(now)
+            .bind(self.scope.workspace_id)
+            .bind(work.account_id)
+            .bind(work.collection_id)
+            .bind(work.item_id)
+            .bind(&work.remote_resource_id)
+            .bind(&work.expected_etag)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?
+            .rows_affected()
+        } else {
+            sqlx::query(
+                "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+                 collection_id, entity_kind, local_entity_id, remote_resource_id, remote_etag, \
+                 remote_updated_at, remote_payload_hash, local_revision, sync_state, ownership, \
+                 created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, $8, $9, \
+                 $10, $11, 'dayweave', $12, $12) ON CONFLICT DO NOTHING",
+            )
+            .bind(Uuid::new_v4())
+            .bind(self.scope.workspace_id)
+            .bind(work.account_id)
+            .bind(work.collection_id)
+            .bind(work.item_id)
+            .bind(&result.remote_resource_id)
+            .bind(&result.remote_etag)
+            .bind(result.remote_updated_at)
+            .bind(result.payload_hash.as_slice())
+            .bind(u64_to_i64(work.item_revision)?)
+            .bind(mapping_state)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?
+            .rows_affected()
+        };
+        if mapping_updated != 1 {
+            revoke_outbound_after_provider(
+                &mut transaction,
+                self.scope,
+                work,
+                "conflict",
+                "provider_mapping_changed_during_delivery",
+                now,
+            )
+            .await?;
+            transaction.commit().await.map_err(internal)?;
+            return Err(GoogleSyncRepositoryError::ClaimLost);
+        }
         let updated = sqlx::query(
             "UPDATE google_sync_outbox SET state = 'published', claim_id = NULL, claimed_at = NULL, \
-             remote_resource_id = $5, expected_etag = $6, attempts = attempts + 1, \
-             last_error_code = NULL, updated_at = $7 WHERE workspace_id = $1 AND id = $2 \
-             AND provider_account_id = $3 AND state = 'delivering' AND claim_id = $4",
+             run_claim_id = NULL, run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             attempts = attempts + 1, last_error_code = NULL, updated_at = $5 \
+             WHERE workspace_id = $1 AND id = $2 \
+             AND provider_account_id = $3 AND state = 'delivering' AND claim_id = $4 \
+             AND dispatch_nonce = $6 AND run_claim_id = $7 AND run_claim_generation = $8",
         )
         .bind(self.scope.workspace_id)
         .bind(work.id)
         .bind(work.account_id)
         .bind(work.claim_id)
-        .bind(&result.remote_resource_id)
-        .bind(&result.remote_etag)
         .bind(now)
+        .bind(result.dispatch_nonce)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
         .execute(&mut *transaction)
         .await
         .map_err(internal)?
         .rows_affected();
         if updated != 1 {
             return Err(GoogleSyncRepositoryError::ClaimLost);
-        }
-        sqlx::query(
-            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, collection_id, \
-             entity_kind, local_entity_id, remote_resource_id, remote_etag, remote_updated_at, \
-             remote_payload_hash, local_revision, sync_state, ownership, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, $8, $9, $10, 'synced', 'dayweave', $11, $11) \
-             ON CONFLICT (workspace_id, provider_account_id, collection_id, entity_kind, local_entity_id) \
-             WHERE collection_id IS NOT NULL AND local_entity_id IS NOT NULL AND tombstoned_at IS NULL \
-             DO UPDATE SET remote_resource_id = EXCLUDED.remote_resource_id, remote_etag = EXCLUDED.remote_etag, \
-               remote_updated_at = EXCLUDED.remote_updated_at, remote_payload_hash = EXCLUDED.remote_payload_hash, \
-               local_revision = EXCLUDED.local_revision, sync_state = 'synced', ownership = 'dayweave', \
-               conflict_metadata = NULL, updated_at = EXCLUDED.updated_at",
-        )
-        .bind(Uuid::new_v4())
-        .bind(self.scope.workspace_id)
-        .bind(work.account_id)
-        .bind(work.collection_id)
-        .bind(work.item_id)
-        .bind(&result.remote_resource_id)
-        .bind(result.remote_etag)
-        .bind(result.remote_updated_at)
-        .bind(result.payload_hash.as_slice())
-        .bind(u64_to_i64(work.item_revision)?)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(internal)?;
-        if work.operation == OutboundOperation::Delete {
-            sqlx::query(
-                "UPDATE provider_sync_mappings SET sync_state = 'deleted_remote', \
-                 conflict_metadata = NULL, updated_at = $5 WHERE workspace_id = $1 \
-                 AND provider_account_id = $2 AND collection_id = $3 AND local_entity_id = $4 \
-                 AND ownership = 'dayweave' AND tombstoned_at IS NULL",
-            )
-            .bind(self.scope.workspace_id)
-            .bind(work.account_id)
-            .bind(work.collection_id)
-            .bind(work.item_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(internal)?;
         }
         sqlx::query(
             "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
@@ -1523,11 +2876,53 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         if !matches!(terminal_state, "backoff" | "conflict" | "failed") {
             return Err(GoogleSyncRepositoryError::Internal);
         }
+        let markerless_task_create = work.entity_kind == "task"
+            && work.operation == OutboundOperation::Upsert
+            && work.remote_resource_id.is_none();
+        // Once the final dispatch transaction records a markerless Tasks POST,
+        // only an explicit non-success provider response proves that no object
+        // was created. Protocol/transport/internal failures after that point
+        // retain identity-unresolved evidence even if a caller misclassifies
+        // the unusable 2xx response.
+        let preserve_task_post_uncertainty = markerless_task_create
+            && !matches!(
+                code,
+                "reauthorization_required"
+                    | "rate_limited"
+                    | "precondition_failed"
+                    | "conditional_write_required"
+                    | "provider_not_found"
+                    | "provider_rejected"
+            );
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        ensure_run_identity(
+            &mut transaction,
+            self.scope,
+            work.account_id,
+            work.run_claim_id,
+            work.run_claim_generation,
+        )
+        .await?;
         let updated = sqlx::query(
-            "UPDATE google_sync_outbox SET state = $5, claim_id = NULL, claimed_at = NULL, \
-             attempts = attempts + 1, available_at = $6, last_error_code = $7, updated_at = $8 \
-             WHERE workspace_id = $1 AND id = $2 AND provider_account_id = $3 \
-               AND state = 'delivering' AND claim_id = $4",
+            "UPDATE google_sync_outbox outbox SET \
+             state = CASE WHEN $9 AND outbox.provider_post_may_have_started \
+                          THEN 'conflict' ELSE $5 END, \
+             claim_id = NULL, claimed_at = NULL, \
+             run_claim_id = NULL, run_claim_generation = NULL, dispatch_nonce = NULL, \
+             dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             provider_post_may_have_started = $9 AND outbox.provider_post_may_have_started, \
+             send_started_at = CASE WHEN $9 AND outbox.provider_post_may_have_started \
+                                    THEN outbox.send_started_at ELSE NULL END, \
+             attempts = attempts + 1, available_at = $6, \
+             last_error_code = CASE WHEN $9 AND outbox.provider_post_may_have_started \
+                                    THEN 'provider_identity_unresolved' ELSE $7 END, updated_at = $8 \
+             FROM google_sync_runs run WHERE outbox.workspace_id = $1 AND outbox.id = $2 \
+               AND outbox.provider_account_id = $3 AND outbox.state = 'delivering' \
+               AND outbox.claim_id = $4 AND outbox.run_claim_id = $10 \
+               AND outbox.run_claim_generation = $11 \
+               AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+               AND run.provider_account_id = outbox.provider_account_id \
+               AND run.claim_id = $10 AND run.claim_generation = $11",
         )
         .bind(self.scope.workspace_id)
         .bind(work.id)
@@ -1537,11 +2932,15 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(available_at)
         .bind(code)
         .bind(now)
-        .execute(&self.pool)
+        .bind(preserve_task_post_uncertainty)
+        .bind(work.run_claim_id)
+        .bind(u64_to_i64(work.run_claim_generation)?)
+        .execute(&mut *transaction)
         .await
         .map_err(internal)?
         .rows_affected();
         if updated == 1 {
+            transaction.commit().await.map_err(internal)?;
             Ok(())
         } else {
             Err(GoogleSyncRepositoryError::ClaimLost)
@@ -1635,13 +3034,14 @@ async fn ensure_run_claim(
     let retained = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
          AND provider_account_id = $3 AND state = 'running' AND claim_id = $4 \
-         AND lease_until > $5 FOR SHARE",
+         AND claim_generation = $6 AND lease_until > $5 FOR SHARE",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
     .bind(claim.account_id)
     .bind(claim.claim_id)
     .bind(now)
+    .bind(u64_to_i64(claim.claim_generation)?)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -1650,6 +3050,68 @@ async fn ensure_run_claim(
     } else {
         Err(GoogleSyncRepositoryError::ClaimLost)
     }
+}
+
+async fn ensure_run_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    claim_id: Uuid,
+    claim_generation: u64,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let retained = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+         AND provider_account_id = $3 AND claim_id = $4 AND claim_generation = $5 FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(claim_id)
+    .bind(u64_to_i64(claim_generation)?)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if retained.is_some() {
+        Ok(())
+    } else {
+        Err(GoogleSyncRepositoryError::ClaimLost)
+    }
+}
+
+async fn reconcile_outbound_for_parent_end(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    claim: &SyncClaim,
+    code: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    sqlx::query(
+        "UPDATE google_sync_outbox SET \
+         state = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                            AND remote_resource_id IS NULL \
+                            AND provider_post_may_have_started \
+                       THEN 'conflict' ELSE 'backoff' END, \
+         claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+         run_claim_generation = NULL, dispatch_nonce = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $7, \
+         last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                     AND remote_resource_id IS NULL \
+                                     AND provider_post_may_have_started \
+                                THEN 'provider_identity_unresolved' ELSE $6 END, updated_at = $7 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND state = 'delivering' AND run_claim_id = $4 AND run_claim_generation = $5",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(claim.account_id)
+    .bind(claim.claim_id)
+    .bind(u64_to_i64(claim.claim_generation)?)
+    .bind(code)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
 }
 
 async fn ensure_inbound_claim(
@@ -1672,7 +3134,8 @@ async fn ensure_inbound_claim(
          WHERE account.workspace_id = $1 AND account.user_id = $2 AND account.id = $3 \
            AND account.provider = 'google' AND account.status = 'active' \
            AND account.sync_enabled AND account.tombstoned_at IS NULL \
-           AND run.state = 'running' AND run.claim_id = $4 AND run.lease_until > $6 \
+           AND run.state = 'running' AND run.claim_id = $4 \
+           AND run.claim_generation = $7 AND run.lease_until > $6 \
            AND collection.id = $5 FOR SHARE OF account, run, collection",
     )
     .bind(scope.workspace_id)
@@ -1681,6 +3144,7 @@ async fn ensure_inbound_claim(
     .bind(claim.claim_id)
     .bind(collection_id)
     .bind(now)
+    .bind(u64_to_i64(claim.claim_generation)?)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(internal)?
@@ -1706,13 +3170,14 @@ async fn ensure_inbound_claim(
 async fn apply_remote_delete(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
+    claim: &SyncClaim,
     change: &RemoteItemChange,
     mapping: Option<&PgRow>,
     now: DateTime<Utc>,
 ) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
     let Some(mapping) = mapping else {
         if let Some((local_id, local_revision)) =
-            recover_dayweave_mapping(transaction, scope, change, false, now).await?
+            recover_dayweave_mapping(transaction, scope, claim, change, false, now).await?
         {
             let mapping_id: Uuid = sqlx::query_scalar(
                 "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
@@ -1756,11 +3221,12 @@ async fn apply_remote_delete(
     };
     let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
     let ownership: String = mapping.try_get("ownership").map_err(internal)?;
+    let old_etag: Option<String> = mapping.try_get("remote_etag").map_err(internal)?;
     let mapping_state: String = mapping.try_get("sync_state").map_err(internal)?;
     let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
     let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
     if local_id.is_none() && change.dayweave_item_id.is_some() {
-        if recover_dayweave_mapping(transaction, scope, change, false, now)
+        if recover_dayweave_mapping(transaction, scope, claim, change, false, now)
             .await?
             .is_some()
         {
@@ -1814,6 +3280,20 @@ async fn apply_remote_delete(
             now,
         )
         .await?;
+        if old_etag != change.remote_etag
+            && let Some(local_id) = local_id
+        {
+            conflict_active_outbox(
+                transaction,
+                scope,
+                change.account_id,
+                change.collection_id,
+                local_id,
+                "provider_version_changed_during_delivery",
+                now,
+            )
+            .await?;
+        }
         return Ok(ImportOutcome::Unchanged);
     }
     let Some(local_id) = local_id else {
@@ -1924,6 +3404,7 @@ async fn apply_remote_delete(
 async fn apply_remote_upsert(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
+    claim: &SyncClaim,
     mut change: RemoteItemChange,
     mapping: Option<&PgRow>,
     now: DateTime<Utc>,
@@ -1935,7 +3416,7 @@ async fn apply_remote_upsert(
     let candidate = Item::new(input, now).map_err(|_| GoogleSyncRepositoryError::Internal)?;
     let Some(mapping) = mapping else {
         if change.dayweave_item_id.is_some() {
-            if recover_dayweave_mapping(transaction, scope, &change, true, now)
+            if recover_dayweave_mapping(transaction, scope, claim, &change, true, now)
                 .await?
                 .is_some()
             {
@@ -1984,6 +3465,7 @@ async fn apply_remote_upsert(
     };
     let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
     let ownership: String = mapping.try_get("ownership").map_err(internal)?;
+    let old_etag: Option<String> = mapping.try_get("remote_etag").map_err(internal)?;
     let old_hash: Option<Vec<u8>> = mapping.try_get("remote_payload_hash").map_err(internal)?;
     let old_projection_hash: Option<Vec<u8>> = mapping
         .try_get("remote_projection_hash")
@@ -1992,7 +3474,7 @@ async fn apply_remote_upsert(
     let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
     let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
     if local_id.is_none() && change.dayweave_item_id.is_some() {
-        if recover_dayweave_mapping(transaction, scope, &change, true, now)
+        if recover_dayweave_mapping(transaction, scope, claim, &change, true, now)
             .await?
             .is_some()
         {
@@ -2052,6 +3534,23 @@ async fn apply_remote_upsert(
                 now,
             )
             .await?;
+            if old_etag != change.remote_etag
+                && let Some(local_id) = local_id
+            {
+                // Even a semantically unchanged provider record received a
+                // new conditional-write version. Revoke any in-flight permit
+                // approved against the former ETag in this same transaction.
+                conflict_active_outbox(
+                    transaction,
+                    scope,
+                    change.account_id,
+                    change.collection_id,
+                    local_id,
+                    "provider_version_changed_during_delivery",
+                    now,
+                )
+                .await?;
+            }
             return Ok(ImportOutcome::Unchanged);
         }
         update_mapping_remote(
@@ -2215,6 +3714,7 @@ async fn apply_remote_upsert(
 async fn recover_dayweave_mapping(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
+    claim: &SyncClaim,
     change: &RemoteItemChange,
     live_resource: bool,
     now: DateTime<Utc>,
@@ -2222,159 +3722,146 @@ async fn recover_dayweave_mapping(
     let Some(item_id) = change.dayweave_item_id else {
         return Ok(None);
     };
-    if live_resource && change.remote_etag.is_none() {
-        // A live resource without an ETag cannot safely become DayWeave-owned:
-        // the next write would be unconditional. Leave it as a provider
-        // conflict and keep the durable outbound intent unresolved.
+    if !live_resource
+        || change.remote_etag.is_none()
+        || change.reviewed_provider_projection.is_none()
+        || claim.account_id != change.account_id
+    {
+        // Tombstones and partial representations cannot prove the complete
+        // reviewed create. A live object without an ETag also cannot safely
+        // become DayWeave-owned for the next conditional mutation.
         return Ok(None);
     }
     let row = sqlx::query(
         "SELECT outbox.id, outbox.item_revision, outbox.entity_kind, outbox.payload, \
-           outbox.remote_resource_id \
-         FROM google_sync_outbox outbox JOIN items item \
+           outbox.remote_resource_id, outbox.expected_etag \
+         FROM google_sync_outbox outbox \
+         JOIN items item \
            ON item.workspace_id = outbox.workspace_id AND item.id = outbox.item_id \
+         JOIN google_outbound_previews approval ON approval.workspace_id = outbox.workspace_id \
+           AND approval.id = outbox.approval_id \
+         JOIN google_sync_runs run ON run.workspace_id = outbox.workspace_id \
+           AND run.user_id = outbox.user_id \
+           AND run.provider_account_id = outbox.provider_account_id \
          WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
            AND outbox.provider_account_id = $3 AND outbox.collection_id = $4 \
            AND outbox.item_id = $5 AND outbox.operation = 'upsert' AND outbox.app_owned \
-           AND outbox.item_revision = item.revision AND item.trashed_at IS NULL \
-           AND (outbox.state IN ('pending', 'delivering', 'backoff') \
+           AND outbox.entity_kind = 'calendar_event' AND item.trashed_at IS NULL \
+           AND outbox.remote_resource_id IS NULL AND outbox.expected_etag IS NULL \
+           AND outbox.payload->>'id' = $9 \
+           AND (outbox.state IN ('pending', 'delivering', 'backoff', 'superseded') \
              OR (outbox.state = 'conflict' \
                AND outbox.last_error_code = 'provider_identity_unresolved')) \
+           AND approval.approved_at IS NOT NULL AND approval.consumed_at IS NOT NULL \
+           AND approval.outbox_id = outbox.id AND approval.intent_hash = outbox.intent_hash \
+           AND approval.provider_account_id = outbox.provider_account_id \
+           AND approval.collection_id = outbox.collection_id \
+           AND approval.collection_revision = outbox.collection_revision \
+           AND approval.collection_remote_id = outbox.target_remote_collection_id \
+           AND approval.item_id = outbox.item_id \
+           AND approval.item_revision = outbox.item_revision \
+           AND approval.entity_kind = outbox.entity_kind AND approval.operation = outbox.operation \
+           AND approval.required_scope = outbox.required_scope AND approval.payload = outbox.payload \
+           AND approval.provider_resource_id IS NULL AND approval.expected_etag IS NULL \
+           AND run.state = 'running' AND run.claim_id = $6 AND run.claim_generation = $7 \
+           AND run.lease_until > $8 \
+           AND (outbox.state <> 'delivering' \
+             OR (outbox.run_claim_id = run.claim_id \
+               AND outbox.run_claim_generation = run.claim_generation)) \
          ORDER BY outbox.item_revision DESC, outbox.created_at DESC, outbox.id DESC \
-         FOR UPDATE OF outbox, item LIMIT 1",
+         FOR UPDATE OF outbox, item, approval, run",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
     .bind(change.account_id)
     .bind(change.collection_id)
     .bind(item_id)
-    .fetch_optional(&mut **transaction)
+    .bind(claim.claim_id)
+    .bind(u64_to_i64(claim.claim_generation)?)
+    .bind(now)
+    .bind(&change.remote_id)
+    .fetch_all(&mut **transaction)
     .await
     .map_err(internal)?;
-    let Some(row) = row else {
+    let Some(latest_row) = row.first() else {
         return Ok(None);
     };
+    let reviewed_projection = change
+        .reviewed_provider_projection
+        .as_ref()
+        .ok_or(GoogleSyncRepositoryError::Internal)?;
+    let exact_row = row.iter().find(|candidate| {
+        candidate.try_get::<Value, _>("payload").ok().as_ref() == Some(reviewed_projection)
+    });
+    let row = exact_row.unwrap_or(latest_row);
     let outbox_id: Uuid = row.try_get("id").map_err(internal)?;
     let local_revision: i64 = row.try_get("item_revision").map_err(internal)?;
-    let entity_kind: String = row.try_get("entity_kind").map_err(internal)?;
     let payload: Value = row.try_get("payload").map_err(internal)?;
-    let retained_remote_id: Option<String> = row.try_get("remote_resource_id").map_err(internal)?;
-    let identity_matches = match entity_kind.as_str() {
-        "calendar_event" => {
-            payload.get("id").and_then(Value::as_str) == Some(change.remote_id.as_str())
-        }
-        "task" => true,
-        _ => false,
-    } && retained_remote_id
-        .as_deref()
-        .is_none_or(|remote_id| remote_id == change.remote_id);
+    let identity_matches =
+        payload.get("id").and_then(Value::as_str) == Some(change.remote_id.as_str());
     if !identity_matches {
         return Ok(None);
     }
-    let local_mapping = sqlx::query(
-        "SELECT id, remote_resource_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+    let mappings = sqlx::query(
+        "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
          AND provider_account_id = $2 AND collection_id = $3 AND entity_kind = 'item' \
-         AND local_entity_id = $4 AND tombstoned_at IS NULL FOR UPDATE",
+         AND tombstoned_at IS NULL AND (local_entity_id = $4 OR remote_resource_id = $5) \
+         ORDER BY id FOR UPDATE",
     )
     .bind(scope.workspace_id)
     .bind(change.account_id)
     .bind(change.collection_id)
     .bind(item_id)
-    .fetch_optional(&mut **transaction)
+    .bind(&change.remote_id)
+    .fetch_all(&mut **transaction)
     .await
     .map_err(internal)?;
-    let mapping_id: Uuid = if let Some(mapping) = local_mapping {
-        if mapping
-            .try_get::<String, _>("remote_resource_id")
-            .map_err(internal)?
-            != change.remote_id
-        {
-            return Ok(None);
-        }
-        mapping.try_get("id").map_err(internal)?
-    } else {
-        let remote_mapping = sqlx::query(
-            "SELECT id, local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
-             AND provider_account_id = $2 AND collection_id = $3 AND entity_kind = 'item' \
-             AND remote_resource_id = $4 AND tombstoned_at IS NULL FOR UPDATE",
+    if !mappings.is_empty() || exact_row.is_none() {
+        // A proof-bearing provider object is not sufficient: every reviewed
+        // semantic field must still match. Never upgrade a provider edit to
+        // DayWeave ownership merely because the authenticated ID survived.
+        sqlx::query(
+            "UPDATE google_sync_outbox SET state = 'conflict', claim_id = NULL, \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+             last_error_code = 'provider_semantics_changed_before_recovery', updated_at = $2 \
+             WHERE id = $1",
         )
-        .bind(scope.workspace_id)
-        .bind(change.account_id)
-        .bind(change.collection_id)
-        .bind(&change.remote_id)
-        .fetch_optional(&mut **transaction)
+        .bind(outbox_id)
+        .bind(now)
+        .execute(&mut **transaction)
         .await
         .map_err(internal)?;
-        if let Some(mapping) = remote_mapping {
-            if mapping
-                .try_get::<Option<Uuid>, _>("local_entity_id")
-                .map_err(internal)?
-                .is_some_and(|mapped| mapped != item_id)
-            {
-                return Ok(None);
-            }
-            mapping.try_get("id").map_err(internal)?
-        } else {
-            insert_mapping(
-                transaction,
-                scope,
-                change,
-                Some(item_id),
-                Some(local_revision),
-                "synced",
-                "dayweave",
-                None,
-                now,
-            )
-            .await?;
-            sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
-                 AND provider_account_id = $2 AND collection_id = $3 AND entity_kind = 'item' \
-                 AND remote_resource_id = $4 AND tombstoned_at IS NULL",
-            )
-            .bind(scope.workspace_id)
-            .bind(change.account_id)
-            .bind(change.collection_id)
-            .bind(&change.remote_id)
-            .fetch_one(&mut **transaction)
-            .await
-            .map_err(internal)?
-        }
-    };
-    sqlx::query(
-        "UPDATE provider_sync_mappings SET local_entity_id = $2, local_revision = $3, \
-         remote_etag = $4, remote_updated_at = $5, remote_parent_id = $6, \
-         remote_payload_hash = $7, remote_projection_hash = $8, sync_state = 'synced', \
-         ownership = 'dayweave', conflict_metadata = NULL, updated_at = $9 WHERE id = $1",
+        return Ok(None);
+    }
+    insert_mapping(
+        transaction,
+        scope,
+        change,
+        Some(item_id),
+        Some(local_revision),
+        "synced",
+        "dayweave",
+        None,
+        now,
     )
-    .bind(mapping_id)
-    .bind(item_id)
-    .bind(local_revision)
-    .bind(&change.remote_etag)
-    .bind(change.remote_updated_at)
-    .bind(&change.remote_parent_id)
-    .bind(change.remote_payload_hash.as_slice())
-    .bind(change.remote_projection_hash.as_slice())
-    .bind(now)
-    .execute(&mut **transaction)
-    .await
-    .map_err(internal)?;
-    sqlx::query(
-        "UPDATE google_sync_outbox SET remote_resource_id = $2, expected_etag = $3, \
-         state = CASE WHEN state IN ('backoff', 'conflict') THEN 'pending' ELSE state END, \
-         claim_id = CASE WHEN state IN ('backoff', 'conflict') THEN NULL ELSE claim_id END, \
-         claimed_at = CASE WHEN state IN ('backoff', 'conflict') THEN NULL ELSE claimed_at END, \
-         available_at = CASE WHEN state IN ('backoff', 'conflict') THEN $4 ELSE available_at END, \
-         last_error_code = CASE WHEN state IN ('backoff', 'conflict') THEN NULL \
-                                ELSE last_error_code END, updated_at = $4 WHERE id = $1",
+    .await?;
+    let published = sqlx::query(
+        "UPDATE google_sync_outbox SET state = 'published', claim_id = NULL, claimed_at = NULL, \
+         run_claim_id = NULL, run_claim_generation = NULL, dispatch_nonce = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+         last_error_code = NULL, updated_at = $2 WHERE id = $1 \
+           AND remote_resource_id IS NULL AND expected_etag IS NULL",
     )
     .bind(outbox_id)
-    .bind(&change.remote_id)
-    .bind(&change.remote_etag)
     .bind(now)
     .execute(&mut **transaction)
     .await
-    .map_err(internal)?;
+    .map_err(internal)?
+    .rows_affected();
+    if published != 1 {
+        return Err(GoogleSyncRepositoryError::ClaimLost);
+    }
     sqlx::query(
         "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
          entity_type, entity_id, base_revision, result_revision, outcome, metadata, occurred_at) \
@@ -2406,9 +3893,15 @@ async fn conflict_active_outbox(
 ) -> Result<(), GoogleSyncRepositoryError> {
     sqlx::query(
         "UPDATE google_sync_outbox SET state = 'conflict', claim_id = NULL, claimed_at = NULL, \
-         available_at = $7, last_error_code = $6, updated_at = $7 WHERE workspace_id = $1 \
-         AND user_id = $2 AND provider_account_id = $3 AND collection_id = $4 AND item_id = $5 \
-         AND state IN ('pending', 'delivering', 'backoff', 'conflict')",
+         run_claim_id = NULL, run_claim_generation = NULL, dispatch_nonce = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $7, \
+         last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                     AND remote_resource_id IS NULL \
+                                     AND provider_post_may_have_started \
+                                THEN 'provider_identity_unresolved' ELSE $6 END, updated_at = $7 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND collection_id = $4 AND item_id = $5 \
+           AND state IN ('pending', 'delivering', 'backoff', 'conflict')",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -2435,10 +3928,32 @@ async fn revoke_outbound_after_provider(
         return Err(GoogleSyncRepositoryError::Internal);
     }
     sqlx::query(
-        "UPDATE google_sync_outbox SET state = $5, claim_id = NULL, claimed_at = NULL, \
-         attempts = attempts + 1, available_at = $6, last_error_code = $7, updated_at = $6 \
-         WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND provider_account_id = $4 \
-           AND state = 'delivering' AND claim_id = $8",
+        "UPDATE google_sync_outbox outbox SET \
+         state = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                           AND outbox.remote_resource_id IS NULL \
+                           AND outbox.provider_post_may_have_started \
+                      THEN 'conflict' ELSE $5 END, \
+         claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+         dispatch_nonce = NULL, dispatch_authorized_at = NULL, dispatch_expires_at = NULL, \
+         provider_post_may_have_started = outbox.entity_kind = 'task' \
+           AND outbox.operation = 'upsert' AND outbox.remote_resource_id IS NULL \
+           AND outbox.provider_post_may_have_started, \
+         send_started_at = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                                     AND outbox.remote_resource_id IS NULL \
+                                     AND outbox.provider_post_may_have_started \
+                                THEN outbox.send_started_at ELSE NULL END, \
+         attempts = attempts + 1, available_at = $6, \
+         last_error_code = CASE WHEN outbox.entity_kind = 'task' AND outbox.operation = 'upsert' \
+                                     AND outbox.remote_resource_id IS NULL \
+                                     AND outbox.provider_post_may_have_started \
+                                THEN 'provider_identity_unresolved' ELSE $7 END, updated_at = $6 \
+         FROM google_sync_runs run WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+           AND outbox.id = $3 AND outbox.provider_account_id = $4 \
+           AND outbox.state = 'delivering' AND outbox.claim_id = $8 \
+           AND outbox.run_claim_id = $9 AND outbox.run_claim_generation = $10 \
+           AND run.workspace_id = outbox.workspace_id AND run.user_id = outbox.user_id \
+           AND run.provider_account_id = outbox.provider_account_id \
+           AND run.claim_id = $9 AND run.claim_generation = $10",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
@@ -2448,6 +3963,8 @@ async fn revoke_outbound_after_provider(
     .bind(now)
     .bind(code)
     .bind(work.claim_id)
+    .bind(work.run_claim_id)
+    .bind(u64_to_i64(work.run_claim_generation)?)
     .execute(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -2765,6 +4282,26 @@ fn collection_from_row(row: &PgRow) -> Result<GoogleSyncCollection, GoogleSyncRe
         selected: row.try_get("selected").map_err(internal)?,
         visible: row.try_get("visible").map_err(internal)?,
         sync_role: parse_role(&row.try_get::<String, _>("sync_role").map_err(internal)?)?,
+        calendar_policy: GoogleCalendarPolicy {
+            confirmed_busy: parse_event_disposition(
+                &row.try_get::<String, _>("confirmed_busy_policy")
+                    .map_err(internal)?,
+            )?,
+            tentative: parse_event_disposition(
+                &row.try_get::<String, _>("tentative_policy")
+                    .map_err(internal)?,
+            )?,
+            free: parse_event_disposition(
+                &row.try_get::<String, _>("free_policy").map_err(internal)?,
+            )?,
+            all_day: parse_event_disposition(
+                &row.try_get::<String, _>("all_day_policy")
+                    .map_err(internal)?,
+            )?,
+            publish_all_day: row.try_get("publish_all_day").map_err(internal)?,
+            publish_tentative: row.try_get("publish_tentative").map_err(internal)?,
+            publish_free: row.try_get("publish_free").map_err(internal)?,
+        },
         revision: i64_to_u64(row.try_get("revision").map_err(internal)?)?,
         discovered_at: row.try_get("discovered_at").map_err(internal)?,
         configured_at: row.try_get("configured_at").map_err(internal)?,
@@ -2772,6 +4309,17 @@ fn collection_from_row(row: &PgRow) -> Result<GoogleSyncCollection, GoogleSyncRe
         created_at: row.try_get("created_at").map_err(internal)?,
         updated_at: row.try_get("updated_at").map_err(internal)?,
     })
+}
+
+fn parse_event_disposition(
+    value: &str,
+) -> Result<GoogleEventDisposition, GoogleSyncRepositoryError> {
+    match value {
+        "ignore" => Ok(GoogleEventDisposition::Ignore),
+        "visible_nonblocking" => Ok(GoogleEventDisposition::VisibleNonblocking),
+        "blocking" => Ok(GoogleEventDisposition::Blocking),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
 }
 
 fn run_from_row(row: &PgRow) -> Result<GoogleSyncRunStatus, GoogleSyncRepositoryError> {
@@ -2814,6 +4362,7 @@ fn outbound_from_row(
         account_id: row.try_get("provider_account_id").map_err(internal)?,
         collection_id: row.try_get("collection_id").map_err(internal)?,
         collection_remote_id: row.try_get("collection_remote_id").map_err(internal)?,
+        collection_revision: i64_to_u64(row.try_get("collection_revision").map_err(internal)?)?,
         item_id: row.try_get("item_id").map_err(internal)?,
         item_revision: i64_to_u64(row.try_get("item_revision").map_err(internal)?)?,
         entity_kind: row.try_get("entity_kind").map_err(internal)?,
@@ -2829,9 +4378,74 @@ fn outbound_from_row(
         remote_resource_id: row.try_get("remote_resource_id").map_err(internal)?,
         expected_etag: row.try_get("expected_etag").map_err(internal)?,
         payload: row.try_get("payload").map_err(internal)?,
+        required_scope: row.try_get("required_scope").map_err(internal)?,
+        intent_hash: fixed_hash(&row.try_get::<Vec<u8>, _>("intent_hash").map_err(internal)?)?,
+        approval_id: row.try_get("approval_id").map_err(internal)?,
         claim_id,
+        run_claim_id: row.try_get("run_claim_id").map_err(internal)?,
+        run_claim_generation: i64_to_u64(row.try_get("run_claim_generation").map_err(internal)?)?,
+        provider_post_may_have_started: row
+            .try_get("provider_post_may_have_started")
+            .map_err(internal)?,
         attempts: i32_to_u32(row.try_get("attempts").map_err(internal)?)?,
     })
+}
+
+fn fixed_hash(value: &[u8]) -> Result<[u8; 32], GoogleSyncRepositoryError> {
+    value
+        .try_into()
+        .map_err(|_| GoogleSyncRepositoryError::Internal)
+}
+
+fn parse_outbound_operation(value: &str) -> Result<OutboundOperation, GoogleSyncRepositoryError> {
+    match value {
+        "upsert" => Ok(OutboundOperation::Upsert),
+        "delete" => Ok(OutboundOperation::Delete),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(char::from(HEX[usize::from(byte >> 4)]));
+        result.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    result
+}
+
+#[cfg(test)]
+fn decode_hex_bytes(value: &str) -> Result<[u8; 32], GoogleSyncRepositoryError> {
+    if value.len() != 64 {
+        return Err(GoogleSyncRepositoryError::Internal);
+    }
+    let mut result = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let high = nibble(pair[0]).ok_or(GoogleSyncRepositoryError::Internal)?;
+        let low = nibble(pair[1]).ok_or(GoogleSyncRepositoryError::Internal)?;
+        result[index] = (high << 4) | low;
+    }
+    Ok(result)
+}
+
+fn review_payload(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    if let Some(private) = payload
+        .get_mut("extendedProperties")
+        .and_then(|properties| properties.get_mut("private"))
+        .and_then(Value::as_object_mut)
+    {
+        for value in private.values_mut() {
+            *value = Value::String("[server-managed]".to_owned());
+        }
+    }
+    payload
 }
 
 fn parse_collection_kind(value: &str) -> Result<GoogleCollectionKind, GoogleSyncRepositoryError> {
@@ -3018,6 +4632,7 @@ mod tests {
                 true,
                 true,
                 GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
                 now,
             )
             .await
@@ -3079,6 +4694,748 @@ mod tests {
             now,
         )
         .expect("local firm block")
+    }
+
+    fn local_task(id: Uuid, title: &str, now: DateTime<Utc>) -> Item {
+        Item::new(
+            NewItem {
+                id,
+                is_sensitive: false,
+                kind: ItemKind::Task,
+                status: ItemStatus::Planned,
+                title: title.to_owned(),
+                notes: None,
+                timezone_name: "UTC".to_owned(),
+                duration_seconds: Some(1_800),
+                deadline_at: None,
+                earliest_start_at: Some(now),
+                recurrence: None,
+                flexible_constraints: json!({}),
+                split_policy: SplitPolicy::Indivisible,
+                importance: 0,
+                urgency: 0,
+                parent_id: None,
+                sibling_order: 0,
+            },
+            now,
+        )
+        .expect("local task")
+    }
+
+    #[tokio::test]
+    async fn postgres_identity_root_binding_survives_restart_and_rejects_config_drift() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; identity-root test skipped");
+            return;
+        };
+        let database = TestDatabase::create(&database_url).await;
+        MIGRATOR
+            .run(&database.pool)
+            .await
+            .expect("migrations apply");
+        let scope = seed_scope(&database.pool).await;
+        let first = PostgresGoogleSyncRepository::new(database.pool.clone(), scope);
+        let now: DateTime<Utc> = "2026-08-29T10:00:00Z".parse().expect("time");
+        first
+            .verify_or_initialize_identity_root(1, [71; 32], now)
+            .await
+            .expect("first startup pins verifier");
+
+        // A new repository instance models a process restart. The exact root
+        // remains valid and advances only the non-security timestamp.
+        let restarted = PostgresGoogleSyncRepository::new(database.pool.clone(), scope);
+        restarted
+            .verify_or_initialize_identity_root(1, [71; 32], now + Duration::seconds(1))
+            .await
+            .expect("same root survives restart");
+        assert_eq!(
+            restarted
+                .verify_or_initialize_identity_root(2, [71; 32], now + Duration::seconds(2))
+                .await,
+            Err(GoogleSyncRepositoryError::IdentityRootMismatch)
+        );
+        assert_eq!(
+            restarted
+                .verify_or_initialize_identity_root(1, [72; 32], now + Duration::seconds(3))
+                .await,
+            Err(GoogleSyncRepositoryError::IdentityRootMismatch)
+        );
+        let stored: (i64, bool, DateTime<Utc>) = sqlx::query_as(
+            "SELECT identity_key_version, root_verifier = $4, last_verified_at \
+             FROM google_provider_identity_roots WHERE workspace_id = $1 AND user_id = $2 \
+               AND provider = $3",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind("google")
+        .bind(vec![71_u8; 32])
+        .fetch_one(&database.pool)
+        .await
+        .expect("durable identity root");
+        assert_eq!(stored, (1, true, now + Duration::seconds(1)));
+        database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_markerless_task_create_fence_survives_revision_changes() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; task-create fence test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let task_lists = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                None,
+                GoogleCollectionKind::TaskList,
+                vec![DiscoveredCollection {
+                    kind: GoogleCollectionKind::TaskList,
+                    remote_id: "tasks@example.test".to_owned(),
+                    display_name: "Tasks".to_owned(),
+                    provider_access_role: None,
+                    provider_primary: false,
+                    provider_selected: true,
+                    provider_hidden: false,
+                    provider_deleted: false,
+                }],
+                fixture.now,
+            )
+            .await
+            .expect("task-list discovery");
+        let task_list_discovered = task_lists
+            .iter()
+            .find(|collection| collection.kind == GoogleCollectionKind::TaskList)
+            .expect("discovered task list");
+        let task_list = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                task_list_discovered.id,
+                task_list_discovered.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .expect("writable task list");
+        let task = local_task(Uuid::new_v4(), "Markerless create", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("task transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &task)
+            .await
+            .expect("task fixture");
+        transaction.commit().await.expect("task commit");
+        fixture
+            .repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "task",
+                    item: task.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"title": "Markerless create"}),
+                },
+                task_list.id,
+                fixture.now,
+            )
+            .await
+            .expect("initial task create queued");
+        let work = fixture
+            .repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("task create claim")
+            .expect("task create work");
+        assert_eq!(work.entity_kind, "task");
+        assert!(work.remote_resource_id.is_none());
+
+        sqlx::query(
+            "UPDATE items SET title = 'Markerless create revised', revision = 2, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task.id)
+        .bind(fixture.now + Duration::seconds(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("task revision");
+        let mut revised = task.clone();
+        revised.title = "Markerless create revised".to_owned();
+        revised.revision = 2;
+        revised.updated_at = fixture.now + Duration::seconds(1);
+        let revised_prepared = PreparedOutbound {
+            entity_kind: "task",
+            item: revised,
+            operation: OutboundOperation::Upsert,
+            payload: json!({"title": "Markerless create revised"}),
+        };
+        let revised_accepted = fixture
+            .repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                revised_prepared.clone(),
+                task_list.id,
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("pre-send claim does not consume the one safe POST");
+        assert_ne!(revised_accepted.outbox_id, work.id);
+        assert_eq!(
+            fixture
+                .repository
+                .fail_outbound(
+                    &work,
+                    "backoff",
+                    "provider_temporary",
+                    fixture.now + Duration::seconds(2),
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        );
+        let revised_work = fixture
+            .repository
+            .claim_outbound(&fixture.claim, fixture.now + Duration::seconds(2))
+            .await
+            .expect("revised task claim")
+            .expect("revised task work");
+        fixture
+            .repository
+            .authorize_outbound_dispatch(&revised_work, true, fixture.now + Duration::seconds(2))
+            .await
+            .expect("task POST initiation fenced");
+        sqlx::query(
+            "UPDATE items SET title = 'Markerless create third', revision = 3, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task.id)
+        .bind(fixture.now + Duration::seconds(3))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("third task revision");
+        let mut third = revised_prepared;
+        third.item.title = "Markerless create third".to_owned();
+        third.item.revision = 3;
+        third.item.updated_at = fixture.now + Duration::seconds(3);
+        third.payload = json!({"title": "Markerless create third"});
+        assert_eq!(
+            fixture
+                .repository
+                .enqueue_test_outbound(
+                    fixture.account_id,
+                    third.clone(),
+                    task_list.id,
+                    fixture.now + Duration::seconds(3),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable)
+        );
+        fixture
+            .repository
+            .fail_outbound(
+                &revised_work,
+                "failed",
+                "provider_protocol",
+                fixture.now + Duration::seconds(4),
+                fixture.now + Duration::seconds(4),
+            )
+            .await
+            .expect("unusable success is normalized to ambiguous create evidence");
+        let retained_uncertainty: (String, Option<String>, bool, bool) = sqlx::query_as(
+            "SELECT state, last_error_code, provider_post_may_have_started, \
+                    send_started_at IS NOT NULL \
+             FROM google_sync_outbox WHERE id = $1",
+        )
+        .bind(revised_work.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("retained markerless create uncertainty");
+        assert_eq!(
+            retained_uncertainty,
+            (
+                "conflict".to_owned(),
+                Some("provider_identity_unresolved".to_owned()),
+                true,
+                true,
+            ),
+            "the live send-start marker, not a caller-supplied protocol label, is authoritative",
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .enqueue_test_outbound(
+                    fixture.account_id,
+                    third,
+                    task_list.id,
+                    fixture.now + Duration::seconds(5),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ConditionalWriteUnavailable)
+        );
+        let outbox_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM google_sync_outbox WHERE workspace_id = $1 \
+             AND collection_id = $2 AND item_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task_list.id)
+        .bind(task.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("task outbox count");
+        assert_eq!(outbox_count, 2);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_outbound_approval_is_bound_expiring_replay_safe_and_dispatch_fenced() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL approval test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let repository = &fixture.repository;
+        let item = local_firm_block(Uuid::new_v4(), "Approval fixture", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("approval item fixture");
+        transaction.commit().await.expect("approval item commit");
+
+        let preview_id = Uuid::new_v4();
+        let preview = repository
+            .create_outbound_preview(
+                OutboundPreviewSpec {
+                    id: preview_id,
+                    account_id: fixture.account_id,
+                    collection_id: fixture.collection.id,
+                    collection_revision: fixture.collection.revision,
+                    collection_remote_id: fixture.collection.remote_collection_id.clone(),
+                    collection_display_name: fixture.collection.display_name.clone(),
+                    required_scope: GOOGLE_CALENDAR_SCOPE,
+                    prepared: PreparedOutbound {
+                        entity_kind: "calendar_event",
+                        item: item.clone(),
+                        operation: OutboundOperation::Upsert,
+                        payload: json!({"id": "synthetic-reviewed-event", "summary": "Approval fixture"}),
+                    },
+                    expires_at: fixture.now + Duration::minutes(10),
+                },
+                fixture.now,
+            )
+            .await
+            .expect("preview created");
+        assert!(preview.provider_resource_id.is_none());
+        assert!(preview.provider_etag.is_none());
+        let preview_hash = decode_hex_bytes(&preview.preview_hash).expect("preview hash");
+        let capability_hash = [91_u8; 32];
+        assert_eq!(
+            repository
+                .approve_outbound(
+                    OutboundApprovalSpec {
+                        account_id: fixture.account_id,
+                        preview_id,
+                        expected_preview_hash: [92_u8; 32],
+                        capability_hash,
+                    },
+                    fixture.now,
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ApprovalInvalid)
+        );
+        repository
+            .approve_outbound(
+                OutboundApprovalSpec {
+                    account_id: fixture.account_id,
+                    preview_id,
+                    expected_preview_hash: preview_hash,
+                    capability_hash,
+                },
+                fixture.now,
+            )
+            .await
+            .expect("exact preview approved");
+        assert_eq!(
+            repository
+                .approve_outbound(
+                    OutboundApprovalSpec {
+                        account_id: fixture.account_id,
+                        preview_id,
+                        expected_preview_hash: preview_hash,
+                        capability_hash: [93_u8; 32],
+                    },
+                    fixture.now,
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ApprovalAlreadyIssued)
+        );
+
+        let request = crate::google_sync::OutboundRequest {
+            collection_id: fixture.collection.id,
+            item_id: item.id,
+            expected_item_revision: item.revision,
+            operation: OutboundOperation::Upsert,
+        };
+        for swapped in [
+            OutboundEnqueueSpec {
+                account_id: Uuid::new_v4(),
+                request: request.clone(),
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    collection_id: Uuid::new_v4(),
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    operation: OutboundOperation::Delete,
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+        ] {
+            assert_eq!(
+                repository.enqueue_outbound(swapped, fixture.now).await,
+                Err(GoogleSyncRepositoryError::ApprovalInvalid)
+            );
+        }
+
+        let enqueue = OutboundEnqueueSpec {
+            account_id: fixture.account_id,
+            request: request.clone(),
+            capability_hash,
+        };
+        let accepted = repository
+            .enqueue_outbound(enqueue.clone(), fixture.now)
+            .await
+            .expect("capability consumed exactly once");
+        assert!(!accepted.replayed);
+        let replay = repository
+            .enqueue_outbound(enqueue.clone(), fixture.now + Duration::seconds(1))
+            .await
+            .expect("exact immediate retry is idempotent");
+        assert!(replay.replayed);
+        assert_eq!(replay.outbox_id, accepted.outbox_id);
+        assert_eq!(
+            repository
+                .enqueue_outbound(enqueue, fixture.now + Duration::minutes(11))
+                .await,
+            Err(GoogleSyncRepositoryError::ApprovalExpired)
+        );
+
+        let work = repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("claim approved work")
+            .expect("approved work exists");
+        sqlx::query(
+            "UPDATE google_sync_outbox SET payload = '{\"summary\":\"mutated after review\"}'::jsonb \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(work.id)
+        .execute(&fixture.database.pool)
+        .await
+        .expect("synthetic TOCTOU mutation");
+        assert!(matches!(
+            repository
+                .authorize_outbound_dispatch(&work, true, fixture.now)
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        ));
+
+        let expiring_item = local_firm_block(Uuid::new_v4(), "Expiry fixture", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("expiry item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &expiring_item)
+            .await
+            .expect("expiry item fixture");
+        transaction.commit().await.expect("expiry item commit");
+        let expiring_preview_id = Uuid::new_v4();
+        let expiring_preview = repository
+            .create_outbound_preview(
+                OutboundPreviewSpec {
+                    id: expiring_preview_id,
+                    account_id: fixture.account_id,
+                    collection_id: fixture.collection.id,
+                    collection_revision: fixture.collection.revision,
+                    collection_remote_id: fixture.collection.remote_collection_id.clone(),
+                    collection_display_name: fixture.collection.display_name.clone(),
+                    required_scope: GOOGLE_CALENDAR_SCOPE,
+                    prepared: PreparedOutbound {
+                        entity_kind: "calendar_event",
+                        item: expiring_item.clone(),
+                        operation: OutboundOperation::Upsert,
+                        payload: json!({"id": "synthetic-expiring-event"}),
+                    },
+                    expires_at: fixture.now + Duration::seconds(1),
+                },
+                fixture.now,
+            )
+            .await
+            .expect("expiring preview");
+        repository
+            .approve_outbound(
+                OutboundApprovalSpec {
+                    account_id: fixture.account_id,
+                    preview_id: expiring_preview_id,
+                    expected_preview_hash: decode_hex_bytes(&expiring_preview.preview_hash)
+                        .expect("expiring preview hash"),
+                    capability_hash: [94_u8; 32],
+                },
+                fixture.now,
+            )
+            .await
+            .expect("expiring capability issued");
+        assert_eq!(
+            repository
+                .enqueue_outbound(
+                    OutboundEnqueueSpec {
+                        account_id: fixture.account_id,
+                        request: crate::google_sync::OutboundRequest {
+                            collection_id: fixture.collection.id,
+                            item_id: expiring_item.id,
+                            expected_item_revision: expiring_item.revision,
+                            operation: OutboundOperation::Upsert,
+                        },
+                        capability_hash: [94_u8; 32],
+                    },
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ApprovalExpired)
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_post_provider_mapping_guard_rejects_create_and_existing_identity_races() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL mapping race test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let repository = &fixture.repository;
+
+        let create_item = local_firm_block(Uuid::new_v4(), "Create mapping race", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("create item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &create_item)
+            .await
+            .expect("create item fixture");
+        transaction.commit().await.expect("create item commit");
+        let create_outbox = repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: create_item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "reviewed-create-id"}),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("create work queued");
+        let create_work = repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("create work claim")
+            .expect("create work");
+        assert!(create_work.remote_resource_id.is_none());
+        let create_permit = repository
+            .authorize_outbound_dispatch(&create_work, true, fixture.now)
+            .await
+            .expect("create dispatch permit");
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, collection_id, \
+             entity_kind, local_entity_id, remote_resource_id, remote_etag, local_revision, sync_state, \
+             ownership, created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', NULL, $5, $6, NULL, \
+             'synced', 'external', $7, $7)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.account_id)
+        .bind(fixture.collection.id)
+        // Simulate an inbound mapping for the provider identity returned by
+        // the write while the create dispatch was in flight. It has no local
+        // identity, so guarding only `local_entity_id` would miss it.
+        .bind("reviewed-create-id")
+        .bind("etag-race-create")
+        .bind(fixture.now + Duration::seconds(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("concurrent create mapping fixture");
+        assert_eq!(
+            repository
+                .complete_outbound(
+                    &create_work,
+                    OutboundResult {
+                        remote_resource_id: "reviewed-create-id".to_owned(),
+                        remote_etag: Some("etag-provider-response".to_owned()),
+                        remote_updated_at: Some(fixture.now),
+                        payload_hash: [81_u8; 32],
+                        dispatch_nonce: create_permit.nonce,
+                    },
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        );
+        let create_state: (String, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT state, last_error_code, dispatch_nonce FROM google_sync_outbox \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(create_outbox.outbox_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("create race state");
+        assert_eq!(
+            create_state,
+            (
+                "conflict".to_owned(),
+                "provider_mapping_changed_during_delivery".to_owned(),
+                None,
+            )
+        );
+
+        let existing_item = local_firm_block(Uuid::new_v4(), "ETag mapping race", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("existing item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &existing_item)
+            .await
+            .expect("existing item fixture");
+        transaction.commit().await.expect("existing item commit");
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, collection_id, \
+             entity_kind, local_entity_id, remote_resource_id, remote_etag, local_revision, sync_state, \
+             ownership, created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, $8, \
+             'synced', 'dayweave', $9, $9)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.account_id)
+        .bind(fixture.collection.id)
+        .bind(existing_item.id)
+        .bind("provider-existing")
+        .bind("etag-reviewed")
+        .bind(u64_to_i64(existing_item.revision).expect("revision"))
+        .bind(fixture.now)
+        .execute(&fixture.database.pool)
+        .await
+        .expect("existing mapping fixture");
+        let existing_outbox = repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: existing_item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "reviewed-existing-id"}),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("existing work queued");
+        let existing_work = repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("existing work claim")
+            .expect("existing work");
+        assert_eq!(
+            existing_work.remote_resource_id.as_deref(),
+            Some("provider-existing")
+        );
+        assert_eq!(
+            existing_work.expected_etag.as_deref(),
+            Some("etag-reviewed")
+        );
+        let existing_permit = repository
+            .authorize_outbound_dispatch(&existing_work, true, fixture.now)
+            .await
+            .expect("existing dispatch permit");
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET remote_etag = 'etag-raced', updated_at = $5 \
+             WHERE workspace_id = $1 AND provider_account_id = $2 AND collection_id = $3 \
+               AND local_entity_id = $4 AND tombstoned_at IS NULL",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.account_id)
+        .bind(fixture.collection.id)
+        .bind(existing_item.id)
+        .bind(fixture.now + Duration::seconds(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("concurrent ETag mutation fixture");
+        assert_eq!(
+            repository
+                .complete_outbound(
+                    &existing_work,
+                    OutboundResult {
+                        remote_resource_id: "provider-existing".to_owned(),
+                        remote_etag: Some("etag-provider-response".to_owned()),
+                        remote_updated_at: Some(fixture.now),
+                        payload_hash: [82_u8; 32],
+                        dispatch_nonce: existing_permit.nonce,
+                    },
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        );
+        let existing_state: (String, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT state, last_error_code, dispatch_nonce FROM google_sync_outbox \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(existing_outbox.outbox_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("existing race state");
+        assert_eq!(
+            existing_state,
+            (
+                "conflict".to_owned(),
+                "provider_mapping_changed_during_delivery".to_owned(),
+                None,
+            )
+        );
+        fixture.database.destroy().await;
     }
 
     #[tokio::test]
@@ -3143,7 +5500,7 @@ mod tests {
             .expect("owned item fixture");
         transaction.commit().await.expect("owned item commit");
         repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 fixture.account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -3165,25 +5522,7 @@ mod tests {
             [54; 32],
         );
         observed_owned.dayweave_item_id = Some(owned.id);
-        let mut missing_etag = observed_owned.clone();
-        missing_etag.remote_etag = None;
-        assert_eq!(
-            repository
-                .apply_remote_item(&fixture.claim, missing_etag, fixture.now)
-                .await
-                .expect("missing ETag marker is retained as a conflict"),
-            ImportOutcome::Conflict
-        );
-        let unresolved_local_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
-             AND collection_id = $2 AND remote_resource_id = 'snapshot-owned'",
-        )
-        .bind(fixture.scope.workspace_id)
-        .bind(fixture.collection.id)
-        .fetch_one(&fixture.database.pool)
-        .await
-        .expect("missing ETag conflict mapping");
-        assert!(unresolved_local_id.is_none());
+        observed_owned.reviewed_provider_projection = Some(json!({"id": "snapshot-owned"}));
         repository
             .apply_remote_item(&fixture.claim, observed_owned, fixture.now)
             .await
@@ -3254,8 +5593,8 @@ mod tests {
         .expect("guarded snapshot states");
         assert_eq!(retained_states, vec![true, true, true]);
         let owned_conflict: String = sqlx::query_scalar(
-            "SELECT last_error_code FROM google_sync_outbox WHERE workspace_id = $1 \
-             AND collection_id = $2 AND item_id = $3",
+            "SELECT conflict_metadata->>'reason' FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 AND local_entity_id = $3",
         )
         .bind(fixture.scope.workspace_id)
         .bind(fixture.collection.id)
@@ -3288,7 +5627,7 @@ mod tests {
             .expect("stale item fixture");
         transaction.commit().await.expect("stale item commit");
         let stale_outbox = repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 fixture.account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -3306,6 +5645,10 @@ mod tests {
             .await
             .expect("stale response claim")
             .expect("stale response work");
+        let stale_permit = repository
+            .authorize_outbound_dispatch(&stale_work, true, fixture.now)
+            .await
+            .expect("stale response dispatch authorized before the race");
         sqlx::query(
             "UPDATE items SET revision = revision + 1, updated_at = $3 \
              WHERE workspace_id = $1 AND id = $2",
@@ -3325,6 +5668,7 @@ mod tests {
                         remote_etag: Some("etag-stale".to_owned()),
                         remote_updated_at: Some(fixture.now),
                         payload_hash: [60; 32],
+                        dispatch_nonce: stale_permit.nonce,
                     },
                     fixture.now + Duration::seconds(2),
                 )
@@ -3359,7 +5703,7 @@ mod tests {
             .expect("pause item fixture");
         transaction.commit().await.expect("pause item commit");
         let pause_outbox = repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 fixture.account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -3377,6 +5721,10 @@ mod tests {
             .await
             .expect("pause claim")
             .expect("pause work");
+        let pause_permit = repository
+            .authorize_outbound_dispatch(&pause_work, true, fixture.now)
+            .await
+            .expect("pause dispatch authorized before the race");
         let oauth =
             PostgresGoogleOAuthRepository::new(fixture.database.pool.clone(), fixture.scope);
         let paused = oauth
@@ -3446,6 +5794,7 @@ mod tests {
                         remote_etag: Some("etag-pause".to_owned()),
                         remote_updated_at: Some(fixture.now),
                         payload_hash: [62; 32],
+                        dispatch_nonce: pause_permit.nonce,
                     },
                     fixture.now + Duration::minutes(1),
                 )
@@ -3564,6 +5913,7 @@ mod tests {
                     true,
                     true,
                     GoogleSyncRole::Writable,
+                    GoogleCalendarPolicy::default(),
                     fixture.now + Duration::minutes(2),
                 )
                 .await,
@@ -3732,6 +6082,7 @@ mod tests {
                 true,
                 true,
                 GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
                 now,
             )
             .await
@@ -4177,6 +6528,7 @@ mod tests {
                 true,
                 false,
                 GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
                 now + Duration::minutes(6),
             )
             .await
@@ -4244,53 +6596,15 @@ mod tests {
             payload: json!({"id": "stable-provider-id"}),
         };
         let queued = repository
-            .enqueue_outbound(account_id, prepared.clone(), collection.id, now)
+            .enqueue_test_outbound(account_id, prepared.clone(), collection.id, now)
             .await
             .expect("outbound queued");
         let replay = repository
-            .enqueue_outbound(account_id, prepared, collection.id, now)
+            .enqueue_test_outbound(account_id, prepared, collection.id, now)
             .await
             .expect("outbound replay");
         assert_eq!(queued.outbox_id, replay.outbox_id);
         assert!(replay.replayed);
-        sqlx::query(
-            "UPDATE items SET title = 'DayWeave firm block revised', revision = 2, updated_at = $3 \
-             WHERE workspace_id = $1 AND id = $2",
-        )
-        .bind(scope.workspace_id)
-        .bind(local.id)
-        .bind(now + Duration::seconds(30))
-        .execute(&database.pool)
-        .await
-        .expect("new canonical revision");
-        let mut revised_local = local.clone();
-        revised_local.title = "DayWeave firm block revised".to_owned();
-        revised_local.revision = 2;
-        revised_local.updated_at = now + Duration::seconds(30);
-        let revised = repository
-            .enqueue_outbound(
-                account_id,
-                PreparedOutbound {
-                    entity_kind: "calendar_event",
-                    item: revised_local,
-                    operation: OutboundOperation::Upsert,
-                    payload: json!({"id": "stable-provider-id"}),
-                },
-                collection.id,
-                now + Duration::seconds(30),
-            )
-            .await
-            .expect("newer outbound revision");
-        assert_ne!(revised.outbox_id, queued.outbox_id);
-        let superseded_state: String = sqlx::query_scalar(
-            "SELECT state FROM google_sync_outbox WHERE workspace_id = $1 AND id = $2",
-        )
-        .bind(scope.workspace_id)
-        .bind(queued.outbox_id)
-        .fetch_one(&database.pool)
-        .await
-        .expect("older outbox state");
-        assert_eq!(superseded_state, "superseded");
         let mut observed_before_ack = remote_event(
             account_id,
             collection.id,
@@ -4300,11 +6614,13 @@ mod tests {
             [9; 32],
         );
         observed_before_ack.dayweave_item_id = Some(local.id);
+        observed_before_ack.reviewed_provider_projection =
+            Some(json!({"id": "stable-provider-id"}));
         assert_eq!(
             repository
-                .apply_remote_item(&claim, observed_before_ack, now + Duration::minutes(1))
+                .apply_remote_item(&claim, observed_before_ack, now + Duration::seconds(15))
                 .await
-                .expect("provider acceptance recovered through durable marker"),
+                .expect("exact provider create recovered through durable proof"),
             ImportOutcome::Unchanged
         );
         let recovered_mapping = sqlx::query(
@@ -4329,6 +6645,44 @@ mod tests {
                 .expect("recovered ownership"),
             "dayweave"
         );
+        sqlx::query(
+            "UPDATE items SET title = 'DayWeave firm block revised', revision = 2, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(local.id)
+        .bind(now + Duration::seconds(30))
+        .execute(&database.pool)
+        .await
+        .expect("new canonical revision");
+        let mut revised_local = local.clone();
+        revised_local.title = "DayWeave firm block revised".to_owned();
+        revised_local.revision = 2;
+        revised_local.updated_at = now + Duration::seconds(30);
+        let revised = repository
+            .enqueue_test_outbound(
+                account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: revised_local,
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "stable-provider-id"}),
+                },
+                collection.id,
+                now + Duration::seconds(30),
+            )
+            .await
+            .expect("newer outbound revision");
+        assert_ne!(revised.outbox_id, queued.outbox_id);
+        let superseded_state: String = sqlx::query_scalar(
+            "SELECT state FROM google_sync_outbox WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(queued.outbox_id)
+        .fetch_one(&database.pool)
+        .await
+        .expect("older outbox state");
+        assert_eq!(superseded_state, "published");
         let mut duplicate_marker = remote_event(
             account_id,
             collection.id,
@@ -4427,6 +6781,10 @@ mod tests {
             .await
             .expect("reclaim outbound")
             .expect("backoff advanced by manual refresh");
+        let permit = repository
+            .authorize_outbound_dispatch(&work, true, now + Duration::minutes(2))
+            .await
+            .expect("final dispatch authorization");
         repository
             .complete_outbound(
                 &work,
@@ -4435,11 +6793,27 @@ mod tests {
                     remote_etag: Some("etag-1".to_owned()),
                     remote_updated_at: Some(now),
                     payload_hash: [9; 32],
+                    dispatch_nonce: permit.nonce,
                 },
                 now + Duration::minutes(2),
             )
             .await
             .expect("publish acknowledgement");
+        let immutable_reviewed_identity: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT remote_resource_id, expected_etag FROM google_sync_outbox WHERE id = $1",
+        )
+        .bind(work.id)
+        .fetch_one(&database.pool)
+        .await
+        .expect("immutable reviewed provider identity");
+        assert_eq!(
+            immutable_reviewed_identity,
+            (
+                Some("stable-provider-id".to_owned()),
+                Some("etag-stable-provider-id".to_owned())
+            ),
+            "publication must not rewrite the provider ID/ETag bound to approval"
+        );
         let ownership: String = sqlx::query_scalar(
             "SELECT ownership FROM provider_sync_mappings WHERE workspace_id = $1 \
              AND collection_id = $2 AND local_entity_id = $3",
@@ -4467,7 +6841,7 @@ mod tests {
         third_revision.revision = 3;
         third_revision.updated_at = now + Duration::minutes(3);
         let third_outbound = repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -4573,7 +6947,7 @@ mod tests {
             .expect("stale item fixture");
         transaction.commit().await.expect("stale item commit");
         let stale_outbound = repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -4617,7 +6991,7 @@ mod tests {
         guarded_local.revision = 2;
         guarded_local.updated_at = now + Duration::minutes(5);
         let guarded_outbound = repository
-            .enqueue_outbound(
+            .enqueue_test_outbound(
                 account_id,
                 PreparedOutbound {
                     entity_kind: "calendar_event",
@@ -4733,6 +7107,609 @@ mod tests {
         database.destroy().await;
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_parent_run_takeover_fences_authorize_complete_and_claim_aba() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; parent-run fence test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let item = local_firm_block(Uuid::new_v4(), "Parent run fence", fixture.now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("item fixture");
+        transaction.commit().await.expect("item commit");
+        let accepted = fixture
+            .repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "parent-run-fence", "summary": "Parent run fence"}),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("queued");
+        let stale_work = fixture
+            .repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("claimed")
+            .expect("work");
+
+        let takeover_at = fixture.now + Duration::minutes(11);
+        let second_claim = fixture
+            .repository
+            .claim_due(takeover_at, takeover_at + Duration::minutes(10))
+            .await
+            .expect("takeover query")
+            .expect("second parent claim");
+        assert!(second_claim.claim_generation > fixture.claim.claim_generation);
+        assert!(matches!(
+            fixture
+                .repository
+                .authorize_outbound_dispatch(&stale_work, true, takeover_at)
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        ));
+        assert_eq!(
+            fixture
+                .repository
+                .renew_claim(
+                    &fixture.claim,
+                    takeover_at,
+                    takeover_at + Duration::minutes(10),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost),
+            "the old claim ID and generation cannot survive takeover"
+        );
+        let after_first_takeover: (String, String) =
+            sqlx::query_as("SELECT state, last_error_code FROM google_sync_outbox WHERE id = $1")
+                .bind(accepted.outbox_id)
+                .fetch_one(&fixture.database.pool)
+                .await
+                .expect("reconciled outbox");
+        assert_eq!(
+            after_first_takeover,
+            (
+                "backoff".to_owned(),
+                "parent_run_lease_expired_before_send".to_owned()
+            )
+        );
+
+        let second_work = fixture
+            .repository
+            .claim_outbound(&second_claim, takeover_at)
+            .await
+            .expect("second claim outbound")
+            .expect("reclaimed work");
+        let permit = fixture
+            .repository
+            .authorize_outbound_dispatch(&second_work, true, takeover_at)
+            .await
+            .expect("second run authorization");
+        let second_takeover_at = takeover_at + Duration::minutes(11);
+        let third_claim = fixture
+            .repository
+            .claim_due(
+                second_takeover_at,
+                second_takeover_at + Duration::minutes(10),
+            )
+            .await
+            .expect("second takeover query")
+            .expect("third parent claim");
+        assert!(third_claim.claim_generation > second_claim.claim_generation);
+        assert_eq!(
+            fixture
+                .repository
+                .complete_outbound(
+                    &second_work,
+                    OutboundResult {
+                        remote_resource_id: "parent-run-fence".to_owned(),
+                        remote_etag: Some("etag-parent-run-fence".to_owned()),
+                        remote_updated_at: Some(second_takeover_at),
+                        payload_hash: [81; 32],
+                        dispatch_nonce: permit.nonce,
+                    },
+                    second_takeover_at,
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost),
+            "a slow response cannot publish after parent takeover"
+        );
+        let mapping_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND local_entity_id = $3)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(item.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping absence");
+        assert!(!mapping_exists);
+        fixture.database.destroy().await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum OutboundParentLockStage {
+        Renew,
+        Authorize,
+        Cancel,
+        Fail,
+    }
+
+    #[tokio::test]
+    async fn postgres_every_outbound_stage_serializes_parent_takeover() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; parent lock race test skipped");
+            return;
+        };
+        for stage in [
+            OutboundParentLockStage::Renew,
+            OutboundParentLockStage::Authorize,
+            OutboundParentLockStage::Cancel,
+            OutboundParentLockStage::Fail,
+        ] {
+            assert_outbound_stage_serializes_takeover(&database_url, stage).await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_outbound_stage_serializes_takeover(
+        database_url: &str,
+        stage: OutboundParentLockStage,
+    ) {
+        let fixture = sync_fixture(database_url).await;
+        let item = local_firm_block(
+            Uuid::new_v4(),
+            &format!("Parent lock {stage:?}"),
+            fixture.now,
+        );
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("item fixture");
+        transaction.commit().await.expect("item commit");
+        fixture
+            .repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": format!("parent-lock-{}", item.id.simple())}),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("queued");
+        let work = fixture
+            .repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("claim query")
+            .expect("work");
+        if matches!(stage, OutboundParentLockStage::Cancel) {
+            fixture
+                .repository
+                .authorize_outbound_dispatch(&work, true, fixture.now)
+                .await
+                .expect("pre-cancel authorization");
+        }
+
+        // Hold the child row so the stage must pause after acquiring its
+        // shared parent-run lock and before its own child mutation.
+        let mut outbox_gate = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("outbox gate transaction");
+        sqlx::query("SELECT 1 FROM google_sync_outbox WHERE id = $1 FOR UPDATE")
+            .bind(work.id)
+            .fetch_one(&mut *outbox_gate)
+            .await
+            .expect("outbox row locked");
+        let stage_repository = fixture.repository.clone();
+        let stage_work = work.clone();
+        let stage_now = fixture.now;
+        let stage_task = tokio::spawn(async move {
+            match stage {
+                OutboundParentLockStage::Renew => {
+                    stage_repository
+                        .renew_outbound(&stage_work, stage_now)
+                        .await
+                }
+                OutboundParentLockStage::Authorize => stage_repository
+                    .authorize_outbound_dispatch(&stage_work, true, stage_now)
+                    .await
+                    .map(|_| ()),
+                OutboundParentLockStage::Cancel => {
+                    stage_repository
+                        .cancel_outbound_before_send(
+                            &stage_work,
+                            "synthetic_pre_send_cancel",
+                            stage_now,
+                            stage_now,
+                        )
+                        .await
+                }
+                OutboundParentLockStage::Fail => {
+                    stage_repository
+                        .fail_outbound(
+                            &stage_work,
+                            "backoff",
+                            "synthetic_pre_send_failure",
+                            stage_now,
+                            stage_now,
+                        )
+                        .await
+                }
+            }
+        });
+
+        let mut parent_lock_observed = false;
+        for _ in 0..100 {
+            let lock_attempt = sqlx::query(
+                "SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 \
+                 AND provider_account_id = $2 FOR UPDATE NOWAIT",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.account_id)
+            .fetch_optional(&fixture.database.pool)
+            .await;
+            if matches!(
+                lock_attempt,
+                Err(sqlx::Error::Database(ref error))
+                    if error.code().as_deref() == Some("55P03")
+            ) {
+                parent_lock_observed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            parent_lock_observed,
+            "{stage:?} must lock the exact parent before waiting on the child"
+        );
+
+        let takeover_pool = fixture.database.pool.clone();
+        let takeover_scope = fixture.scope;
+        let takeover_account = fixture.account_id;
+        let old_parent_claim = fixture.claim.clone();
+        let replacement_claim_id = Uuid::new_v4();
+        let takeover = tokio::spawn(async move {
+            sqlx::query(
+                "UPDATE google_sync_runs SET claim_id = $6, \
+                 claim_generation = claim_generation + 1, revision = revision + 1 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+                   AND claim_id = $4 AND claim_generation = $5",
+            )
+            .bind(takeover_scope.workspace_id)
+            .bind(takeover_scope.user_id)
+            .bind(takeover_account)
+            .bind(old_parent_claim.claim_id)
+            .bind(u64_to_i64(old_parent_claim.claim_generation).expect("generation"))
+            .bind(replacement_claim_id)
+            .execute(&takeover_pool)
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(
+            !takeover.is_finished(),
+            "{stage:?} must exclude parent takeover until its child transition commits"
+        );
+        outbox_gate.commit().await.expect("release outbox gate");
+        stage_task
+            .await
+            .expect("stage task joined")
+            .expect("stage completed before takeover");
+        assert_eq!(
+            takeover
+                .await
+                .expect("takeover task joined")
+                .expect("takeover query")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .repository
+                .renew_claim(
+                    &fixture.claim,
+                    fixture.now,
+                    fixture.now + Duration::minutes(10),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ClaimLost)
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_claim_and_authorize_both_fence_mapping_identity_changes() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; mapping-stage fence test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        for (suffix, mutate_after_claim) in [("claim", false), ("authorize", true)] {
+            let item = local_firm_block(
+                Uuid::new_v4(),
+                &format!("Mapping fence {suffix}"),
+                fixture.now,
+            );
+            let mut transaction = fixture
+                .database
+                .pool
+                .begin()
+                .await
+                .expect("item transaction");
+            insert_imported_item(&mut transaction, fixture.scope, &item)
+                .await
+                .expect("item fixture");
+            transaction.commit().await.expect("item commit");
+            let remote_id = format!("mapping-fence-{suffix}");
+            let accepted = fixture
+                .repository
+                .enqueue_test_outbound(
+                    fixture.account_id,
+                    PreparedOutbound {
+                        entity_kind: "calendar_event",
+                        item: item.clone(),
+                        operation: OutboundOperation::Upsert,
+                        payload: json!({"id": remote_id}),
+                    },
+                    fixture.collection.id,
+                    fixture.now,
+                )
+                .await
+                .expect("queued");
+            let work = if mutate_after_claim {
+                Some(
+                    fixture
+                        .repository
+                        .claim_outbound(&fixture.claim, fixture.now)
+                        .await
+                        .expect("claim query")
+                        .expect("claimed work"),
+                )
+            } else {
+                None
+            };
+            let mut change = remote_event(
+                fixture.account_id,
+                fixture.collection.id,
+                fixture.collection.revision,
+                &remote_id,
+                "Concurrent provider identity",
+                [82; 32],
+            );
+            change.dayweave_item_id = Some(item.id);
+            let mut transaction = fixture
+                .database
+                .pool
+                .begin()
+                .await
+                .expect("mapping transaction");
+            insert_mapping(
+                &mut transaction,
+                fixture.scope,
+                &change,
+                Some(item.id),
+                Some(1),
+                "synced",
+                "dayweave",
+                None,
+                fixture.now,
+            )
+            .await
+            .expect("concurrent mapping");
+            transaction.commit().await.expect("mapping commit");
+            if let Some(work) = work {
+                assert!(matches!(
+                    fixture
+                        .repository
+                        .authorize_outbound_dispatch(&work, true, fixture.now)
+                        .await,
+                    Err(GoogleSyncRepositoryError::ClaimLost)
+                ));
+            } else {
+                assert!(
+                    fixture
+                        .repository
+                        .claim_outbound(&fixture.claim, fixture.now)
+                        .await
+                        .expect("claim-stage mapping scan")
+                        .is_none()
+                );
+            }
+            let state: (String, String) = sqlx::query_as(
+                "SELECT state, last_error_code FROM google_sync_outbox WHERE id = $1",
+            )
+            .bind(accepted.outbox_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("mapping-fenced state");
+            assert_eq!(state.0, "conflict");
+            assert!(matches!(
+                state.1.as_str(),
+                "provider_mapping_changed_before_claim" | "dispatch_authorization_denied"
+            ));
+        }
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_recovery_requires_complete_reviewed_semantics() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar recovery test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        for (suffix, provider_summary, expected_ownership) in [
+            ("exact", "Reviewed summary", "dayweave"),
+            ("edited", "Externally edited", "external"),
+        ] {
+            let item = local_firm_block(Uuid::new_v4(), &format!("Recovery {suffix}"), fixture.now);
+            let mut transaction = fixture
+                .database
+                .pool
+                .begin()
+                .await
+                .expect("item transaction");
+            insert_imported_item(&mut transaction, fixture.scope, &item)
+                .await
+                .expect("item fixture");
+            transaction.commit().await.expect("item commit");
+            let remote_id = format!("recovery-{suffix}");
+            let reviewed = json!({
+                "id": remote_id,
+                "summary": "Reviewed summary",
+                "description": "Reviewed description",
+                "extendedProperties": {"private": {"proof": "synthetic"}}
+            });
+            let accepted = fixture
+                .repository
+                .enqueue_test_outbound(
+                    fixture.account_id,
+                    PreparedOutbound {
+                        entity_kind: "calendar_event",
+                        item: item.clone(),
+                        operation: OutboundOperation::Upsert,
+                        payload: reviewed.clone(),
+                    },
+                    fixture.collection.id,
+                    fixture.now,
+                )
+                .await
+                .expect("queued create");
+            if suffix == "exact" {
+                sqlx::query(
+                    "UPDATE items SET title = 'Newer local revision', revision = 2, updated_at = $3 \
+                     WHERE workspace_id = $1 AND id = $2",
+                )
+                .bind(fixture.scope.workspace_id)
+                .bind(item.id)
+                .bind(fixture.now + Duration::seconds(1))
+                .execute(&fixture.database.pool)
+                .await
+                .expect("newer local revision");
+                let mut newer_item = item.clone();
+                newer_item.title = "Newer local revision".to_owned();
+                newer_item.revision = 2;
+                newer_item.updated_at = fixture.now + Duration::seconds(1);
+                fixture
+                    .repository
+                    .enqueue_test_outbound(
+                        fixture.account_id,
+                        PreparedOutbound {
+                            entity_kind: "calendar_event",
+                            item: newer_item,
+                            operation: OutboundOperation::Upsert,
+                            payload: json!({
+                                "id": remote_id,
+                                "summary": "Newer local revision",
+                                "description": "Reviewed description",
+                                "extendedProperties": {"private": {"proof": "synthetic"}}
+                            }),
+                        },
+                        fixture.collection.id,
+                        fixture.now + Duration::seconds(1),
+                    )
+                    .await
+                    .expect("newer reviewed create queued before recovery");
+                let original_state: String =
+                    sqlx::query_scalar("SELECT state FROM google_sync_outbox WHERE id = $1")
+                        .bind(accepted.outbox_id)
+                        .fetch_one(&fixture.database.pool)
+                        .await
+                        .expect("superseded original");
+                assert_eq!(original_state, "superseded");
+            }
+            let mut observed = remote_event(
+                fixture.account_id,
+                fixture.collection.id,
+                fixture.collection.revision,
+                &remote_id,
+                provider_summary,
+                [83; 32],
+            );
+            observed.dayweave_item_id = Some(item.id);
+            observed.reviewed_provider_projection = Some(json!({
+                "id": remote_id,
+                "summary": provider_summary,
+                "description": "Reviewed description",
+                "extendedProperties": {"private": {"proof": "synthetic"}}
+            }));
+            let outcome = fixture
+                .repository
+                .apply_remote_item(&fixture.claim, observed, fixture.now)
+                .await
+                .expect("inbound recovery");
+            assert_eq!(
+                outcome,
+                if suffix == "exact" {
+                    ImportOutcome::Unchanged
+                } else {
+                    ImportOutcome::Conflict
+                }
+            );
+            let mapping: (Option<Uuid>, String) = sqlx::query_as(
+                "SELECT local_entity_id, ownership FROM provider_sync_mappings \
+                 WHERE workspace_id = $1 AND collection_id = $2 AND remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.collection.id)
+            .bind(&remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("recovery mapping");
+            assert_eq!(mapping.1, expected_ownership);
+            assert_eq!(mapping.0, (suffix == "exact").then_some(item.id));
+            let outbox: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+                "SELECT state, remote_resource_id, expected_etag, last_error_code \
+                     FROM google_sync_outbox WHERE id = $1",
+            )
+            .bind(accepted.outbox_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("recovery outbox");
+            if suffix == "exact" {
+                assert_eq!(outbox, ("published".to_owned(), None, None, None));
+            } else {
+                assert_eq!(outbox.0, "conflict");
+                assert_eq!(
+                    outbox.3.as_deref(),
+                    Some("provider_semantics_changed_before_recovery")
+                );
+            }
+        }
+        fixture.database.destroy().await;
+    }
+
     fn remote_event(
         account_id: Uuid,
         collection_id: Uuid,
@@ -4752,6 +7729,7 @@ mod tests {
             remote_updated_at: None,
             remote_payload_hash: hash,
             remote_projection_hash: hash,
+            reviewed_provider_projection: None,
             item: Some(NewItem {
                 id: Uuid::new_v4(),
                 is_sensitive: false,
@@ -4792,6 +7770,7 @@ mod tests {
             remote_updated_at: None,
             remote_payload_hash: hash,
             remote_projection_hash: hash,
+            reviewed_provider_projection: None,
             item: None,
         }
     }

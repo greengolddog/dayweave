@@ -27,7 +27,7 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),
@@ -39,6 +39,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0007_google_sync.sql"),
         include_str!("../migrations/0008_credential_auth_foundation.sql"),
         include_str!("../migrations/0009_sensitive_items.sql"),
+        include_str!("../migrations/0010_auth_runtime.sql"),
+        include_str!("../migrations/0011_google_outbound_safety.sql"),
     ]
     .join("\n");
     for table in [
@@ -70,6 +72,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_sync_collections",
         "google_sync_runs",
         "google_sync_outbox",
+        "google_outbound_previews",
+        "google_provider_identity_roots",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }

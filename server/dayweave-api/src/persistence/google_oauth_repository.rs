@@ -1625,7 +1625,9 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
             .map_err(internal)?;
             sqlx::query(
                 "UPDATE google_sync_outbox SET state = 'backoff', claim_id = NULL, \
-                 claimed_at = NULL, attempts = attempts + 1, available_at = $4, \
+                 claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+                 dispatch_nonce = NULL, dispatch_authorized_at = NULL, \
+                 dispatch_expires_at = NULL, attempts = attempts + 1, available_at = $4, \
                  last_error_code = 'account_paused', updated_at = $4 \
                  WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
                    AND state = 'delivering'",
@@ -1824,7 +1826,9 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         // later replay provider mutations after the owner disconnects.
         sqlx::query(
             "UPDATE google_sync_outbox SET state = 'conflict', claim_id = NULL, \
-             claimed_at = NULL, last_error_code = 'account_disconnecting', updated_at = $4 \
+             claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
+             dispatch_nonce = NULL, dispatch_authorized_at = NULL, \
+             dispatch_expires_at = NULL, last_error_code = 'account_disconnecting', updated_at = $4 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
              AND state IN ('pending', 'delivering', 'backoff')",
         )

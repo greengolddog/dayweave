@@ -148,12 +148,12 @@ impl GoogleClient {
     /// # Errors
     ///
     /// Returns typed transport, authorization, rate-limit, or provider errors.
-    pub async fn insert_task_at(
+    pub async fn prepare_insert_task_at(
         &self,
         task_list_id: &str,
         task: &GoogleTask,
         options: &TaskInsertOptions,
-    ) -> Result<GoogleTask, GoogleError> {
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
         let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks"])?;
         let mut query = Vec::new();
         if let Some(parent) = &options.parent {
@@ -163,27 +163,74 @@ impl GoogleClient {
             query.push(("previous", previous));
         }
         let request = self.request(Method::POST, url).await?.query(&query);
-        self.json(Self::body(request, &GoogleTaskWrite::from(task)))
+        self.prepare(Self::body(request, &GoogleTaskWrite::from(task)))
+    }
+
+    /// Prepares a top-level task insert without contacting Google.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed request-construction or authorization errors.
+    pub async fn prepare_insert_task(
+        &self,
+        task_list_id: &str,
+        task: &GoogleTask,
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
+        self.prepare_insert_task_at(task_list_id, task, &TaskInsertOptions::default())
             .await
+    }
+
+    /// Inserts and positions a top-level task or subtask.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed transport, authorization, rate-limit, or provider errors.
+    pub async fn insert_task_at(
+        &self,
+        task_list_id: &str,
+        task: &GoogleTask,
+        options: &TaskInsertOptions,
+    ) -> Result<GoogleTask, GoogleError> {
+        self.prepare_insert_task_at(task_list_id, task, options)
+            .await?
+            .send_json(None)
+            .await
+    }
+
+    /// Updates a task conditionally using the last-seen `ETag`.
+    /// # Errors
+    ///
+    /// Returns [`GoogleError::PreconditionFailed`] for a stale record and typed
+    /// transport/provider errors otherwise.
+    pub async fn prepare_update_task(
+        &self,
+        task_list_id: &str,
+        task: &GoogleTask,
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
+        let etag = task
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.trim().is_empty())
+            .ok_or(GoogleError::ConditionalWriteRequired)?;
+        let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks", &task.id])?;
+        let mut request = self.request(Method::PUT, url).await?;
+        request = request.header(reqwest::header::IF_MATCH, etag);
+        self.prepare(Self::body(request, &GoogleTaskWrite::from(task)))
     }
 
     /// Updates a task conditionally using the last-seen `ETag`.
     ///
     /// # Errors
     ///
-    /// Returns [`GoogleError::PreconditionFailed`] for a stale record and typed
-    /// transport/provider errors otherwise.
+    /// Returns stale-write, transport, authorization, or provider errors.
     pub async fn update_task(
         &self,
         task_list_id: &str,
         task: &GoogleTask,
     ) -> Result<GoogleTask, GoogleError> {
-        let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks", &task.id])?;
-        let mut request = self.request(Method::PUT, url).await?;
-        if let Some(etag) = &task.etag {
-            request = request.header(reqwest::header::IF_MATCH, etag);
-        }
-        self.json(Self::body(request, &GoogleTaskWrite::from(task)))
+        self.prepare_update_task(task_list_id, task)
+            .await?
+            .send_json(None)
             .await
     }
 
@@ -193,17 +240,35 @@ impl GoogleClient {
     /// # Errors
     ///
     /// Returns stale-write, transport, authorization, or API errors.
+    pub async fn prepare_delete_task(
+        &self,
+        task_list_id: &str,
+        task_id: &str,
+        etag: &str,
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
+        if etag.trim().is_empty() {
+            return Err(GoogleError::ConditionalWriteRequired);
+        }
+        let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks", task_id])?;
+        let mut request = self.request(Method::DELETE, url).await?;
+        request = request.header(reqwest::header::IF_MATCH, etag);
+        self.prepare(request)
+    }
+
+    /// Deletes a task conditionally using its last-seen `ETag`.
+    ///
+    /// # Errors
+    ///
+    /// Returns stale-write, transport, authorization, or provider errors.
     pub async fn delete_task(
         &self,
         task_list_id: &str,
         task_id: &str,
-        etag: Option<&str>,
+        etag: &str,
     ) -> Result<(), GoogleError> {
-        let url = self.endpoint(&["tasks", "v1", "lists", task_list_id, "tasks", task_id])?;
-        let mut request = self.request(Method::DELETE, url).await?;
-        if let Some(etag) = etag {
-            request = request.header(reqwest::header::IF_MATCH, etag);
-        }
-        self.empty(request).await
+        self.prepare_delete_task(task_list_id, task_id, etag)
+            .await?
+            .send_empty(None)
+            .await
     }
 }

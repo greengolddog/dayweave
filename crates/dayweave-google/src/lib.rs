@@ -11,7 +11,7 @@ pub mod oauth;
 pub mod recurrence;
 pub mod tasks;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 
 use reqwest::{Method, RequestBuilder, Response};
 use secrecy::ExposeSecret;
@@ -20,6 +20,67 @@ use url::Url;
 
 pub use auth::{AccessTokenProvider, StaticAccessToken};
 pub use error::GoogleError;
+
+/// A fully authorized and serialized provider request that has not touched the
+/// network yet. Services can finish their durable authorization fence after
+/// OAuth refresh/request construction, then consume this value exactly once.
+///
+/// Deliberately not `Debug`: its request contains an Authorization header.
+pub struct PreparedGoogleRequest {
+    http: reqwest::Client,
+    request: reqwest::Request,
+}
+
+impl PreparedGoogleRequest {
+    fn ensure_initiation_deadline(
+        initiation_deadline: Option<SystemTime>,
+    ) -> Result<(), GoogleError> {
+        if initiation_deadline.is_some_and(|deadline| SystemTime::now() >= deadline) {
+            return Err(GoogleError::DispatchInitiationExpired);
+        }
+        Ok(())
+    }
+
+    /// Sends and parses a prepared JSON request. The deadline is checked at
+    /// the last local instruction before `reqwest` starts provider I/O; it is
+    /// an initiation deadline, not a response-completion timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an initiation-expired, transport, provider, or JSON error.
+    pub async fn send_json<T: serde::de::DeserializeOwned>(
+        self,
+        initiation_deadline: Option<SystemTime>,
+    ) -> Result<T, GoogleError> {
+        Self::ensure_initiation_deadline(initiation_deadline)?;
+        let response = self
+            .http
+            .execute(self.request)
+            .await
+            .map_err(GoogleError::Transport)?;
+        let response = ensure_success(response)?;
+        response.json().await.map_err(GoogleError::Transport)
+    }
+
+    /// Sends a prepared request whose successful response body is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an initiation-expired, transport, or provider error.
+    pub async fn send_empty(
+        self,
+        initiation_deadline: Option<SystemTime>,
+    ) -> Result<(), GoogleError> {
+        Self::ensure_initiation_deadline(initiation_deadline)?;
+        let response = self
+            .http
+            .execute(self.request)
+            .await
+            .map_err(GoogleError::Transport)?;
+        ensure_success(response)?;
+        Ok(())
+    }
+}
 
 /// Shared authorized transport. It never logs access tokens or response bodies.
 #[derive(Clone)]
@@ -107,10 +168,14 @@ impl GoogleClient {
         response.json().await.map_err(GoogleError::Transport)
     }
 
-    pub(crate) async fn empty(&self, request: RequestBuilder) -> Result<(), GoogleError> {
-        let response = request.send().await.map_err(GoogleError::Transport)?;
-        ensure_success(response)?;
-        Ok(())
+    pub(crate) fn prepare(
+        &self,
+        request: RequestBuilder,
+    ) -> Result<PreparedGoogleRequest, GoogleError> {
+        Ok(PreparedGoogleRequest {
+            http: self.http.clone(),
+            request: request.build().map_err(GoogleError::Transport)?,
+        })
     }
 
     pub(crate) fn body<T: Serialize + ?Sized>(request: RequestBuilder, body: &T) -> RequestBuilder {

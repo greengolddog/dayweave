@@ -20,6 +20,7 @@ chrono-tz = "0.10"
 dayweave-core = { path = "../../crates/dayweave-core" }
 dayweave-google = { path = "../../crates/dayweave-google" }
 getrandom = "0.4"
+hmac = "0.12"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }

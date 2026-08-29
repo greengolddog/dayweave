@@ -12,6 +12,10 @@ pub enum GoogleError {
     SyncTokenExpired,
     #[error("Google resource changed since it was read")]
     PreconditionFailed,
+    #[error("Google mutation requires a non-empty last-seen ETag")]
+    ConditionalWriteRequired,
+    #[error("Google mutation initiation authorization expired before network dispatch")]
+    DispatchInitiationExpired,
     #[error("Google API rate limit reached")]
     RateLimited { retry_after_seconds: Option<u64> },
     #[error("Google API is temporarily unavailable ({status})")]

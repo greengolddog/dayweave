@@ -38,6 +38,17 @@ unrelated project.
    terminate TLS and register that exact HTTPS URI.
 4. Store the client ID and client secret in Nebius MysteryBox or the VM's
    root-readable environment file, never in GitHub or client binaries.
+   Configure `DAYWEAVE_GOOGLE_CREDENTIAL_KEYS` as the versioned server keyring,
+   `DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION` as the key used for new
+   encrypted envelopes, and `DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION` as a
+   separately pinned identity root. The identity version must remain configured
+   and byte-identical for the lifetime of every published Calendar item; rotate
+   only the active encryption version. The first outbound-enabled startup stores
+   a scope-bound, domain-separated one-way verifier—not key material—in
+   PostgreSQL. Later outbound-enabled startups must match both its version and
+   verifier or initialization fails closed. Losing or changing the identity
+   root can make crash recovery miss an existing provider event and is therefore
+   a restore-blocking incident, not routine key retirement.
 5. Request offline access and incremental authorization. The backend owns the
    encrypted refresh token; macOS and Android receive only a DayWeave session.
 6. Start with Calendar read access during import/onboarding. Request write
@@ -141,61 +152,86 @@ or Tasks collections is represented as deletion in the old collection plus
 import in the new collection, preserving any conflicting local edit rather than
 guessing identity across sources.
 
-The outbound foundation exposes `POST .../outbound` with `collection_id`,
-`item_id`, `expected_item_revision`, and `operation` (`upsert` or `delete`), but
-the service currently fails closed with `external publication requires a
-server-minted approval` after validating the candidate. Bearer authentication
-plus a revision is not treated as human confirmation. Enabling this path requires
-a server-minted, expiring approval bound to the exact preview, item revision,
-provider target, and payload, with a durable audit record. Two additional
-prerequisites are mandatory before removing either unconditional enqueue or
-delivery gate: every ownership marker must be authenticated and ambiguity must
-be resolved atomically across the complete provider collection (or marker-based
-crash recovery must remain disabled), and the worker must lock and revalidate
-the stored write scope immediately before every provider mutation. An earlier
-service snapshot and the post-provider completion guardian are not substitutes
-for that final scope fence. These gates apply to all external Calendar and Tasks
-publication, including DayWeave-owned records; they are not limited to attendee
-edits.
+External publication remains deployment-disabled by default. Set
+`DAYWEAVE_GOOGLE_OUTBOUND_ENABLED=true` only after OAuth, PostgreSQL, storage
+encryption, backups, and operator monitoring are ready. Approval lifetimes use
+`DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES` (default 10, accepted range
+1–30). The complete mutation flow is intentionally three-step:
 
-The dormant delivery machinery accepts only selected writable collections and
-DayWeave-owned mappings. Calendar insertion also requires canonical
-`dayweave_firm_block` ownership and increasing RFC 3339 `starts_at`/`ends_at`
-bounds; deterministic Google event IDs provide useful retry correlation. The
-Calendar UUID extended-property marker and the visible Tasks
-`[DayWeave item:…]` note marker are correlation values only, not authenticated
-proof of DayWeave ownership. A copied or forged marker can match a current
-durable intent, and the current recovery code must therefore not be activated
-for outbound publication. While publication remains disabled, malformed,
-unrecognized, repeated, or conflicting markers become import conflicts and do
-not create a second canonical item. A production outbound implementation must
-use authenticated ownership evidence and reject multiple matching provider
-resources before adopting any identity. Because Google Tasks has no
-client-chosen task ID, the dormant implementation performs at most one insert
-attempt per durable revision. If a failed attempt cannot be matched by marker,
-it reports
-`provider_identity_unresolved` instead of risking a duplicate. Inspect the
-selected Google list, then revise and enqueue the canonical item only after the
-operator has established that no accepted task remains. The implementation uses
-the general durable delivery-attempt counter: even a transient marker-list
-failure before the POST can conservatively consume that revision and require a
-new revision, trading availability for duplicate prevention. Updates and deletes use
-the last provider ETag; a 412 is a durable conflict. To recover another terminal
-or conflicted publication, reconcile provider state, revise the canonical item,
-and explicitly enqueue the newer revision; the durable outbox marks every older
-unpublished revision as `superseded` instead of later replaying stale content.
-Deletion is refused until the canonical item is in recoverable trash. A
-provider-side deletion or material edit of a DayWeave-owned record conflicts any
-queued publication and never silently trashes or overwrites the canonical item.
-External or attendee-bearing event edits are additionally forbidden: there is
-not yet a server-minted preview/approval audit primitive, so supplying arbitrary
-material event JSON is not an API capability.
+1. `POST .../outbound/previews` validates the canonical revision, selected
+   writable collection, provider account, exact full write scope, publication
+   policy, ownership, remote resource ID, and retained ETag. It returns the
+   redacted provider payload, provider target/version, expiry, and review hash.
+2. `POST .../outbound/previews/{preview_id}/approve` must echo that hash. The
+   server records an audit operation and returns one OS-CSPRNG capability. Only
+   its SHA-256 hash is stored; request/response types carrying it have no debug
+   representation.
+3. `POST .../outbound` presents the capability with the exact account,
+   collection, item revision, and operation. Consumption is atomic. An exact
+   retry before expiry returns the same outbox ID; swaps or mutations fail and
+   do not consume authority. Expired capabilities are rejected, including
+   retries.
 
-Provider cursors are encrypted, but durable outbound JSON currently contains
-the selected DayWeave item's title and notes in PostgreSQL plaintext. Production
+The reviewed intent binds workspace user, account, collection ID and revision,
+remote collection ID, collection kind, full write scope, canonical item and
+revision, operation, provider resource ID and ETag, and payload. Immediately
+before each Google mutation, OAuth token acquisition/refresh and complete HTTP
+request construction finish without sending. A short database statement then
+revalidates all reviewed values plus the exact unexpired parent sync-run claim
+and its monotonic generation, account status, scope, collection policy/role,
+current item revision, ownership mapping, and ETag. It records a nonce whose
+30-second lifetime is only a provider-write initiation deadline; the prepared
+transport checks it at the last local instruction before network I/O. A response
+that finishes later may commit only while the same nonce, child claim, parent
+claim/generation, and every guardian still match.
+No database transaction or row lock is held across provider network I/O. The
+post-response transaction requires the nonce and repeats the guardians; a
+concurrent pause, revocation, configuration change, item edit, or provider
+mapping change is surfaced as conflict/superseded work rather than silently
+committed. Parent-run takeover atomically cancels child claims and nonces; the
+schema's required run-claim columns also reject unsafe mixed-version workers
+that predate this fence.
+
+Calendar writes require a canonical `dayweave_firm_block`. New events use an
+account/calendar/user-bound non-reversible event ID and an AES-GCM authenticated
+private ownership proof; raw DayWeave UUIDs are never published. A lost create
+response is recovered only when the event at that deterministic ID still
+matches the complete reviewed semantics and proof. Any provider-side edit is a
+conflict, not an overwrite. Google Tasks exposes no private marker or
+client-selected ID, so DayWeave neither publishes nor trusts note markers and
+strips its legacy visible marker on import and export. A task create is attempted
+only once after the final transaction records the explicit
+`provider_post_may_have_started` marker. Pre-token, preparation, policy, and
+expired-initiation failures do not consume that attempt. A crash, transport
+failure, provider 5xx, lost response, malformed or otherwise unusable 2xx body,
+missing/invalid provider ID or ETag, invalid provider update timestamp, or
+unexpected response variant after that marker therefore becomes durable
+`provider_identity_unresolved` evidence. The database's send-start marker is
+authoritative even if a caller reports a generic protocol error. Recovery
+requires operator reconciliation, never title matching or a blind second POST.
+The unresolved identity fence follows the same item and target across later
+canonical revisions; a revision change alone cannot authorize another create.
+
+Every edit and delete sends the retained ETag with `If-Match`; missing versions
+fail before network access, 412 and 404 responses become durable conflicts, and
+deletion is refused until the canonical item is in recoverable trash. Rate
+limits and temporary provider failures use bounded retry/backoff; non-idempotent
+Tasks creates are the deliberate fail-closed exception. Older unpublished item
+revisions are durably marked `superseded`.
+
+Calendar planning policy is stored per collection. Safe defaults block only
+confirmed opaque busy events; tentative, transparent/free, birthdays, and
+all-day events remain visible but nonblocking. Out-of-office and focus-time
+events block by default. Each category can instead be ignored, retained as
+nonblocking context, or blocking. Publishing all-day, tentative, and free blocks
+is independently opt-in. All-day bounds use Google-exclusive local dates and
+the configured IANA time zone, so 23- and 25-hour DST days retain the correct
+calendar dates.
+
+Provider cursors are encrypted, but durable preview/outbox JSON contains the
+selected DayWeave item's title and notes in PostgreSQL plaintext. Production
 deployment therefore still depends on restricted database access and the
-documented database/storage encryption gate; the migration does not classify
-outbox payloads as non-sensitive metadata.
+documented database/storage encryption gate; these payloads are sensitive.
 
 Two canonical-model gaps remain explicit. Imported attendee identity,
 conference, and attachment entities have no first-class canonical tables; the

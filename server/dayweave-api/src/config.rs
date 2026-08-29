@@ -26,6 +26,8 @@ const DEFAULT_WORKSPACE_ID: &str = "00000000-0000-4000-8000-000000000002";
 const DEFAULT_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 10;
 const MIN_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 5;
 const MAX_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 30;
+const DEFAULT_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 10;
+const MAX_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 30;
 
 pub const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
@@ -73,6 +75,9 @@ pub struct GoogleOAuthConfig {
     pub redirect_uri: Url,
     pub keys: Arc<BTreeMap<u32, CredentialKey>>,
     pub active_key_version: u32,
+    /// Pinned HMAC root for provider identities. Unlike the active encryption
+    /// key, this version must be retained for the lifetime of published items.
+    pub identity_key_version: u32,
     pub session_ttl: Duration,
 }
 
@@ -85,6 +90,7 @@ impl std::fmt::Debug for GoogleOAuthConfig {
             .field("redirect_uri", &self.redirect_uri)
             .field("key_versions", &self.keys.keys().collect::<Vec<_>>())
             .field("active_key_version", &self.active_key_version)
+            .field("identity_key_version", &self.identity_key_version)
             .field("session_ttl", &self.session_ttl)
             .finish()
     }
@@ -169,6 +175,10 @@ pub struct Config {
     pub mcp_allowed_origins: Arc<Vec<String>>,
     pub database: Option<DatabaseConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
+    /// External Google writes require both this explicit deployment opt-in and
+    /// a consumed, content-bound approval capability. The safe default is off.
+    pub google_outbound_enabled: bool,
+    pub google_outbound_approval_ttl: Duration,
     pub log_filter: String,
     pub json_logs: bool,
 }
@@ -297,6 +307,29 @@ impl Config {
         if google_oauth.is_some() && database.is_none() {
             return Err(ConfigError::MissingGoogleOAuthDatabase);
         }
+        let google_outbound_enabled = match values
+            .get("DAYWEAVE_GOOGLE_OUTBOUND_ENABLED")
+            .map(String::as_str)
+        {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(_) => return Err(ConfigError::InvalidGoogleOutboundEnabled),
+        };
+        if google_outbound_enabled && google_oauth.is_none() {
+            return Err(ConfigError::GoogleOutboundRequiresOAuth);
+        }
+        let google_outbound_approval_ttl_minutes = values
+            .get("DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")
+            .map_or(Ok(DEFAULT_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES), |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| ConfigError::InvalidGoogleOutboundApprovalTtl)
+            })?;
+        if google_outbound_approval_ttl_minutes == 0
+            || google_outbound_approval_ttl_minutes > MAX_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES
+        {
+            return Err(ConfigError::InvalidGoogleOutboundApprovalTtl);
+        }
 
         Ok(Self {
             bind_address,
@@ -307,6 +340,10 @@ impl Config {
             mcp_allowed_origins,
             database,
             google_oauth,
+            google_outbound_enabled,
+            google_outbound_approval_ttl: Duration::from_secs(
+                google_outbound_approval_ttl_minutes * 60,
+            ),
             log_filter,
             json_logs,
         })
@@ -363,8 +400,18 @@ pub enum ConfigError {
     InvalidGoogleCredentialKeys,
     #[error("DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION must name a configured key as vN")]
     InvalidGoogleActiveCredentialKeyVersion,
+    #[error(
+        "DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION must name a permanently retained configured key as vN"
+    )]
+    InvalidGoogleIdentityKeyVersion,
     #[error("invalid DAYWEAVE_GOOGLE_OAUTH_SESSION_TTL_MINUTES")]
     InvalidGoogleOAuthSessionTtl,
+    #[error("DAYWEAVE_GOOGLE_OUTBOUND_ENABLED must be true or false")]
+    InvalidGoogleOutboundEnabled,
+    #[error("Google outbound publication requires Google OAuth")]
+    GoogleOutboundRequiresOAuth,
+    #[error("invalid DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")]
+    InvalidGoogleOutboundApprovalTtl,
 }
 
 fn google_oauth_config(
@@ -378,9 +425,15 @@ fn google_oauth_config(
         Some("true") => true,
         Some(_) => return Err(ConfigError::InvalidGoogleOAuthEnabled),
     };
-    let google_settings_present = values
-        .keys()
-        .any(|key| key.starts_with("DAYWEAVE_GOOGLE_") && key != "DAYWEAVE_GOOGLE_OAUTH_ENABLED");
+    let google_settings_present = values.keys().any(|key| {
+        key.starts_with("DAYWEAVE_GOOGLE_")
+            && !matches!(
+                key.as_str(),
+                "DAYWEAVE_GOOGLE_OAUTH_ENABLED"
+                    | "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED"
+                    | "DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES"
+            )
+    });
     if !enabled {
         if google_settings_present {
             return Err(ConfigError::DisabledGoogleOAuthConfiguration);
@@ -405,6 +458,11 @@ fn google_oauth_config(
     if !keys.contains_key(&active_key_version) {
         return Err(ConfigError::InvalidGoogleActiveCredentialKeyVersion);
     }
+    let identity_key_version = parse_key_version(required("DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION")?)
+        .ok_or(ConfigError::InvalidGoogleIdentityKeyVersion)?;
+    if !keys.contains_key(&identity_key_version) {
+        return Err(ConfigError::InvalidGoogleIdentityKeyVersion);
+    }
     let ttl_minutes = values
         .get("DAYWEAVE_GOOGLE_OAUTH_SESSION_TTL_MINUTES")
         .map_or(Ok(DEFAULT_GOOGLE_OAUTH_SESSION_TTL_MINUTES), |value| {
@@ -424,6 +482,7 @@ fn google_oauth_config(
         redirect_uri,
         keys: Arc::new(keys),
         active_key_version,
+        identity_key_version,
         session_ttl: Duration::from_secs(ttl_minutes * 60),
     }))
 }
@@ -611,6 +670,45 @@ mod tests {
         assert_eq!(config.api_token_hashes.len(), 1);
         assert!(config.mcp_allowed_origins.is_empty());
         assert!(config.google_oauth.is_none());
+        assert!(!config.google_outbound_enabled);
+        assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(10));
+    }
+
+    #[test]
+    fn google_outbound_opt_in_and_approval_ttl_fail_closed() {
+        let mut values = valid_values();
+        values.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED".to_owned(),
+            "yes".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values).expect_err("ambiguous outbound switch must fail"),
+            ConfigError::InvalidGoogleOutboundEnabled
+        );
+
+        values.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED".to_owned(),
+            "true".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values).expect_err("outbound requires configured OAuth"),
+            ConfigError::GoogleOutboundRequiresOAuth
+        );
+
+        values.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED".to_owned(),
+            "false".to_owned(),
+        );
+        for ttl in ["0", "31", "not-a-number"] {
+            values.insert(
+                "DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES".to_owned(),
+                ttl.to_owned(),
+            );
+            assert_eq!(
+                Config::from_map(&values).expect_err("approval TTL is bounded"),
+                ConfigError::InvalidGoogleOutboundApprovalTtl
+            );
+        }
     }
 
     #[test]
@@ -815,6 +913,10 @@ mod tests {
                 "DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION".to_owned(),
                 "v2".to_owned(),
             ),
+            (
+                "DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION".to_owned(),
+                "v1".to_owned(),
+            ),
         ]);
         assert_eq!(
             Config::from_map(&enabled).expect_err("OAuth credentials require durable storage"),
@@ -824,9 +926,20 @@ mod tests {
             "DAYWEAVE_DATABASE_URL".to_owned(),
             "postgres://dayweave:redacted@db/dayweave".to_owned(),
         );
+        enabled.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_ENABLED".to_owned(),
+            "true".to_owned(),
+        );
+        enabled.insert(
+            "DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES".to_owned(),
+            "30".to_owned(),
+        );
         let config = Config::from_map(&enabled).expect("complete OAuth config");
+        assert!(config.google_outbound_enabled);
+        assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(30));
         let google = config.google_oauth.expect("enabled");
         assert_eq!(google.active_key_version, 2);
+        assert_eq!(google.identity_key_version, 1);
         assert_eq!(google.keys.len(), 2);
         let debug = format!("{google:?}");
         assert!(!debug.contains("never-print-this-client-secret"));
@@ -861,6 +974,10 @@ mod tests {
                 ),
                 (
                     "DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION".to_owned(),
+                    "v1".to_owned(),
+                ),
+                (
+                    "DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION".to_owned(),
                     "v1".to_owned(),
                 ),
             ]);
@@ -905,6 +1022,18 @@ mod tests {
         assert_eq!(
             Config::from_map(&ambiguous).expect_err("base64 is not accepted as hex"),
             ConfigError::InvalidGoogleCredentialKeys
+        );
+
+        let mut missing_identity =
+            base("https://api.example.test/v1/integrations/google/oauth/callback");
+        missing_identity.insert(
+            "DAYWEAVE_GOOGLE_IDENTITY_KEY_VERSION".to_owned(),
+            "v2".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&missing_identity)
+                .expect_err("identity key must remain in the configured keyring"),
+            ConfigError::InvalidGoogleIdentityKeyVersion
         );
 
         assert_eq!(parse_key_version("v2147483647"), Some(2_147_483_647));

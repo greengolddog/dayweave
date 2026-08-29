@@ -4,8 +4,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    DiscoveredCollection, GoogleOutboundAccepted, GoogleSyncCollection, GoogleSyncRole,
-    GoogleSyncRunStatus, ImportOutcome, OutboundResult, OutboundWork, PreparedOutbound,
+    DiscoveredCollection, GoogleCalendarPolicy, GoogleOutboundAccepted, GoogleOutboundPreview,
+    GoogleSyncCollection, GoogleSyncRole, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
+    OutboundDispatchPermit, OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
     RemoteItemChange, StoredCursor, SyncClaim, SyncCounts, SyncFailureKind,
 };
 
@@ -22,6 +23,13 @@ pub(crate) struct OutboxCounts {
 
 #[async_trait]
 pub(crate) trait GoogleSyncRepository: Send + Sync {
+    async fn verify_or_initialize_identity_root(
+        &self,
+        identity_key_version: u32,
+        root_verifier: [u8; 32],
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
     async fn replace_discovered(
         &self,
         account_id: Uuid,
@@ -51,6 +59,7 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
         selected: bool,
         visible: bool,
         role: GoogleSyncRole,
+        calendar_policy: GoogleCalendarPolicy,
         now: DateTime<Utc>,
     ) -> Result<GoogleSyncCollection, GoogleSyncRepositoryError>;
 
@@ -152,11 +161,21 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<SyncCounts, GoogleSyncRepositoryError>;
 
+    async fn create_outbound_preview(
+        &self,
+        spec: OutboundPreviewSpec,
+        now: DateTime<Utc>,
+    ) -> Result<GoogleOutboundPreview, GoogleSyncRepositoryError>;
+
+    async fn approve_outbound(
+        &self,
+        spec: OutboundApprovalSpec,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>, GoogleSyncRepositoryError>;
+
     async fn enqueue_outbound(
         &self,
-        account_id: Uuid,
-        prepared: PreparedOutbound,
-        collection_id: Uuid,
+        spec: OutboundEnqueueSpec,
         now: DateTime<Utc>,
     ) -> Result<GoogleOutboundAccepted, GoogleSyncRepositoryError>;
 
@@ -169,6 +188,21 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
     async fn renew_outbound(
         &self,
         work: &OutboundWork,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
+    async fn authorize_outbound_dispatch(
+        &self,
+        work: &OutboundWork,
+        provider_write: bool,
+        now: DateTime<Utc>,
+    ) -> Result<OutboundDispatchPermit, GoogleSyncRepositoryError>;
+
+    async fn cancel_outbound_before_send(
+        &self,
+        work: &OutboundWork,
+        code: &'static str,
+        available_at: DateTime<Utc>,
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError>;
 
@@ -218,6 +252,14 @@ pub(crate) enum GoogleSyncRepositoryError {
     ConditionalWriteUnavailable,
     #[error("outbound mutation is not DayWeave-owned")]
     ExternalMutationForbidden,
+    #[error("outbound preview or approval capability is invalid")]
+    ApprovalInvalid,
+    #[error("outbound preview or approval capability expired")]
+    ApprovalExpired,
+    #[error("outbound preview was already approved")]
+    ApprovalAlreadyIssued,
+    #[error("configured Google provider-identity root does not match its durable binding")]
+    IdentityRootMismatch,
     #[error("sync lease is no longer owned by this worker")]
     ClaimLost,
     #[error("sync cursor changed concurrently")]

@@ -92,6 +92,8 @@ pub enum PersistenceError {
     ScopeBootstrapFailed,
     #[error("external integration initialization failed")]
     IntegrationInitializationFailed,
+    #[error("Google provider identity root does not match its durable binding")]
+    GoogleIdentityRootMismatch,
     #[error("authentication runtime initialization failed")]
     AuthenticationInitializationFailed,
 }

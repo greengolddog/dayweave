@@ -1,4 +1,8 @@
-use std::sync::Arc;
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use dayweave_google::{
     GoogleClient, GoogleError, StaticAccessToken,
@@ -53,7 +57,128 @@ fn event(attendees: Vec<EventAttendee>) -> GoogleEvent {
         updated: Some("2026-08-29T20:00:00Z".to_owned()),
         sequence: Some(1),
         extended_properties: Some(ExtendedProperties::default()),
+        additional_properties: BTreeMap::new(),
     }
+}
+
+#[tokio::test]
+async fn prepared_write_is_network_quiet_until_guarded_send_and_expiry_is_pre_send() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/calendar/v3/calendars/primary/events"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(event(Vec::new())))
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let prepared = client
+        .prepare_insert_event(
+            "primary",
+            &event(Vec::new()),
+            &EventWriteApproval::PrivateAppOwned,
+            SendUpdates::None,
+        )
+        .await
+        .expect("OAuth and request serialization complete");
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .is_empty(),
+        "preparation must not initiate a provider write"
+    );
+    let error = prepared
+        .send_json::<GoogleEvent>(Some(SystemTime::UNIX_EPOCH))
+        .await
+        .expect_err("expired initiation capability must fail locally");
+    assert!(matches!(error, GoogleError::DispatchInitiationExpired));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .is_empty(),
+        "expired guarded send must make zero provider requests"
+    );
+}
+
+#[tokio::test]
+async fn valid_initiation_deadline_does_not_abort_a_slow_provider_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/calendar/v3/calendars/primary/events"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(75))
+                .set_body_json(event(Vec::new())),
+        )
+        .mount(&server)
+        .await;
+    let prepared = client(&server)
+        .prepare_insert_event(
+            "primary",
+            &event(Vec::new()),
+            &EventWriteApproval::PrivateAppOwned,
+            SendUpdates::None,
+        )
+        .await
+        .expect("prepared event");
+    let result: GoogleEvent = prepared
+        .send_json(Some(SystemTime::now() + Duration::from_millis(25)))
+        .await
+        .expect("a response may finish after valid initiation");
+    assert_eq!(result.id, "event-1");
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn malformed_task_create_success_is_an_ambiguous_post_send_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tasks/v1/lists/primary/tasks"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .mount(&server)
+        .await;
+    let task = GoogleTask {
+        id: String::new(),
+        etag: None,
+        title: "Synthetic task".to_owned(),
+        notes: None,
+        status: Some("needsAction".to_owned()),
+        due: None,
+        completed: None,
+        updated: None,
+        parent: None,
+        position: None,
+        links: None,
+        deleted: false,
+        hidden: false,
+    };
+    let prepared = client(&server)
+        .prepare_insert_task("primary", &task)
+        .await
+        .expect("task request preparation remains network quiet");
+    let error = prepared
+        .send_json::<GoogleTask>(None)
+        .await
+        .expect_err("an unusable 2xx body cannot identify the created task");
+    assert!(matches!(error, GoogleError::Transport(_)));
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .len(),
+        1,
+        "the decode error occurs only after the markerless POST was sent"
+    );
 }
 
 #[tokio::test]
@@ -297,13 +422,112 @@ async fn conditional_event_update_maps_stale_etag() {
 }
 
 #[tokio::test]
+async fn every_edit_and_delete_requires_a_nonempty_provider_version_before_network() {
+    let server = MockServer::start().await;
+    let mut unversioned_event = event(Vec::new());
+    unversioned_event.etag = None;
+    assert!(matches!(
+        client(&server)
+            .update_event(
+                "primary",
+                &unversioned_event,
+                &EventWriteApproval::PrivateAppOwned,
+                SendUpdates::None,
+            )
+            .await,
+        Err(GoogleError::ConditionalWriteRequired)
+    ));
+    assert!(matches!(
+        client(&server)
+            .delete_event(
+                "primary",
+                "event-1",
+                " ",
+                &EventWriteApproval::PrivateAppOwned,
+                SendUpdates::None,
+            )
+            .await,
+        Err(GoogleError::ConditionalWriteRequired)
+    ));
+
+    let unversioned_task = GoogleTask {
+        id: "task-1".to_owned(),
+        etag: None,
+        title: "Safe update".to_owned(),
+        notes: None,
+        status: Some("needsAction".to_owned()),
+        due: None,
+        completed: None,
+        updated: None,
+        parent: None,
+        position: None,
+        links: None,
+        deleted: false,
+        hidden: false,
+    };
+    assert!(matches!(
+        client(&server)
+            .update_task("list-1", &unversioned_task)
+            .await,
+        Err(GoogleError::ConditionalWriteRequired)
+    ));
+    assert!(matches!(
+        client(&server).delete_task("list-1", "task-1", "").await,
+        Err(GoogleError::ConditionalWriteRequired)
+    ));
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("request journal")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn conditional_deletes_send_if_match_and_surface_provider_conflicts() {
+    let server = MockServer::start().await;
+    Mock::given(method("DELETE"))
+        .and(path("/calendar/v3/calendars/primary/events/event-1"))
+        .and(header("if-match", "\"event-etag\""))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/tasks/v1/lists/list-1/tasks/task-1"))
+        .and(header("if-match", "\"task-etag\""))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+
+    assert!(matches!(
+        client(&server)
+            .delete_event(
+                "primary",
+                "event-1",
+                "\"event-etag\"",
+                &EventWriteApproval::PrivateAppOwned,
+                SendUpdates::None,
+            )
+            .await,
+        Err(GoogleError::PreconditionFailed)
+    ));
+    assert!(matches!(
+        client(&server)
+            .delete_task("list-1", "task-1", "\"task-etag\"")
+            .await,
+        Err(GoogleError::PreconditionFailed)
+    ));
+}
+
+#[tokio::test]
 async fn conditional_task_update_encodes_ids_and_maps_stale_etag() {
     let server = MockServer::start().await;
     let task = GoogleTask {
         id: "task/one".to_owned(),
         etag: Some("\"task-etag\"".to_owned()),
         title: "Safe update".to_owned(),
-        notes: Some("[DayWeave item:00000000-0000-0000-0000-000000000001]".to_owned()),
+        notes: Some("Synthetic non-sensitive task details".to_owned()),
         status: Some("needsAction".to_owned()),
         due: None,
         completed: None,

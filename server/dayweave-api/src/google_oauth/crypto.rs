@@ -4,7 +4,10 @@ use aes_gcm::{
     Aes256Gcm, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use thiserror::Error;
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::config::CredentialKey;
@@ -16,6 +19,7 @@ const HEADER_LENGTH: usize = 4 + 4 + 12;
 pub(crate) struct SecretCipher {
     keys: Arc<BTreeMap<u32, CredentialKey>>,
     active_version: u32,
+    identity_version: u32,
 }
 
 impl std::fmt::Debug for SecretCipher {
@@ -24,16 +28,33 @@ impl std::fmt::Debug for SecretCipher {
             .debug_struct("SecretCipher")
             .field("key_versions", &self.keys.keys().collect::<Vec<_>>())
             .field("active_version", &self.active_version)
+            .field("identity_version", &self.identity_version)
             .finish()
     }
 }
 
 impl SecretCipher {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(keys: Arc<BTreeMap<u32, CredentialKey>>, active_version: u32) -> Self {
+        let identity_version = keys.keys().next().copied().unwrap_or(active_version);
+        Self::new_with_identity(keys, active_version, identity_version)
+    }
+
+    /// Constructs a cipher with a separately pinned provider-identity root.
+    /// `identity_version` must never be changed or removed while any derived
+    /// external identity may still exist; rotating `active_version` affects
+    /// only new encryption envelopes.
+    #[must_use]
+    pub(crate) fn new_with_identity(
+        keys: Arc<BTreeMap<u32, CredentialKey>>,
+        active_version: u32,
+        identity_version: u32,
+    ) -> Self {
         Self {
             keys,
             active_version,
+            identity_version,
         }
     }
 
@@ -101,6 +122,44 @@ impl SecretCipher {
                 },
             )
             .map_err(|_| CryptoError::Authentication)
+    }
+
+    /// Produces a domain-separated keyed digest without exposing the active
+    /// credential key. It is used only for non-reversible, account-bound
+    /// provider identifiers; callers must include every authorization scope in
+    /// `context`.
+    pub(crate) fn identity_digest(
+        &self,
+        domain: &[u8],
+        context: &[u8],
+    ) -> Result<(u32, [u8; 32]), CryptoError> {
+        let key = self
+            .keys
+            .get(&self.identity_version)
+            .ok_or(CryptoError::UnknownKeyVersion)?;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key.expose())
+            .map_err(|_| CryptoError::InvalidKey)?;
+        mac.update(&(domain.len() as u64).to_be_bytes());
+        mac.update(domain);
+        mac.update(&(context.len() as u64).to_be_bytes());
+        mac.update(context);
+        Ok((self.identity_version, mac.finalize().into_bytes().into()))
+    }
+
+    /// Derives the one-way verifier persisted for the provider-identity root.
+    /// The verifier binds the personal scope but cannot recover the root key.
+    pub(crate) fn identity_root_verifier(
+        &self,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<(u32, [u8; 32]), CryptoError> {
+        let mut context = [0_u8; 32];
+        context[..16].copy_from_slice(workspace_id.as_bytes());
+        context[16..].copy_from_slice(user_id.as_bytes());
+        self.identity_digest(
+            b"dayweave.google.provider-identity-root.verifier.v1",
+            &context,
+        )
     }
 }
 
@@ -213,6 +272,54 @@ mod tests {
                 &sync_cursor_aad(workspace_id, user_id, account_id, "tasks:default")
             ),
             Err(CryptoError::Authentication)
+        );
+    }
+
+    #[test]
+    fn identity_root_verifier_survives_active_rotation_and_detects_config_drift() {
+        let keys = Arc::new(BTreeMap::from([
+            (1, CredentialKey::from_test_bytes([7; 32])),
+            (2, CredentialKey::from_test_bytes([8; 32])),
+        ]));
+        let workspace_id = Uuid::from_u128(21);
+        let user_id = Uuid::from_u128(22);
+        let before = SecretCipher::new_with_identity(keys.clone(), 1, 1)
+            .identity_root_verifier(workspace_id, user_id)
+            .expect("initial verifier");
+        let after_active_rotation = SecretCipher::new_with_identity(keys.clone(), 2, 1)
+            .identity_root_verifier(workspace_id, user_id)
+            .expect("post-rotation verifier");
+        assert_eq!(before, after_active_rotation);
+
+        let changed_version = SecretCipher::new_with_identity(keys, 2, 2)
+            .identity_root_verifier(workspace_id, user_id)
+            .expect("changed-version verifier");
+        assert_ne!(before, changed_version);
+
+        let replaced_bytes = SecretCipher::new_with_identity(
+            Arc::new(BTreeMap::from([(
+                1,
+                CredentialKey::from_test_bytes([9; 32]),
+            )])),
+            1,
+            1,
+        )
+        .identity_root_verifier(workspace_id, user_id)
+        .expect("replacement verifier");
+        assert_ne!(before, replaced_bytes);
+        assert_ne!(before.1, [7; 32]);
+        assert_ne!(
+            before,
+            SecretCipher::new_with_identity(
+                Arc::new(BTreeMap::from([(
+                    1,
+                    CredentialKey::from_test_bytes([7; 32]),
+                )])),
+                1,
+                1,
+            )
+            .identity_root_verifier(workspace_id, Uuid::from_u128(23))
+            .expect("different-scope verifier")
         );
     }
 }

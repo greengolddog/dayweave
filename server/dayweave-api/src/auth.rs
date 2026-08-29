@@ -379,6 +379,8 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/integrations/google/accounts/{account_id}/collections/discover"
             | "/integrations/google/accounts/{account_id}/collections/{collection_id}"
             | "/integrations/google/accounts/{account_id}/sync/refresh"
+            | "/integrations/google/accounts/{account_id}/outbound/previews"
+            | "/integrations/google/accounts/{account_id}/outbound/previews/{preview_id}/approve"
             | "/integrations/google/accounts/{account_id}/outbound",
         ) => Some(Scope::GoogleWrite),
         (&Method::GET, "/auth/sessions") => Some(Scope::AuthSessionsRead),

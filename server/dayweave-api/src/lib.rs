@@ -197,7 +197,31 @@ impl AppState {
             .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
             let client = OAuthClient::new(oauth_config)
                 .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
-            let cipher = SecretCipher::new(google.keys.clone(), google.active_key_version);
+            let cipher = SecretCipher::new_with_identity(
+                google.keys.clone(),
+                google.active_key_version,
+                google.identity_key_version,
+            );
+            let sync_repository =
+                google_sync_repository.ok_or(PersistenceError::IntegrationInitializationFailed)?;
+            if config.google_outbound_enabled {
+                let (identity_key_version, root_verifier) = cipher
+                    .identity_root_verifier(oauth_scope.workspace_id, oauth_scope.user_id)
+                    .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+                sync_repository
+                    .verify_or_initialize_identity_root(
+                        identity_key_version,
+                        root_verifier,
+                        clock.now(),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        google_sync::GoogleSyncRepositoryError::IdentityRootMismatch => {
+                            PersistenceError::GoogleIdentityRootMismatch
+                        }
+                        _ => PersistenceError::IntegrationInitializationFailed,
+                    })?;
+            }
             let service = Arc::new(
                 GoogleOAuthService::new(
                     google_oauth_repository,
@@ -217,8 +241,6 @@ impl AppState {
                 .await
                 .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
             service.spawn_recovery_worker();
-            let sync_repository =
-                google_sync_repository.ok_or(PersistenceError::IntegrationInitializationFailed)?;
             let sync = Arc::new(GoogleSyncService::new(
                 sync_repository,
                 Arc::new(ProductionGoogleSyncProvider::new(service.clone())),
@@ -227,6 +249,8 @@ impl AppState {
                 cipher,
                 oauth_scope,
                 clock.clone(),
+                config.google_outbound_enabled,
+                config.google_outbound_approval_ttl,
             ));
             sync.recover_startup()
                 .await

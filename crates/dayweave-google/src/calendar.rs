@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
+
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{GoogleClient, GoogleError};
 
@@ -241,6 +244,10 @@ pub struct GoogleEvent {
     pub updated: Option<String>,
     pub sequence: Option<i64>,
     pub extended_properties: Option<ExtendedProperties>,
+    /// Fields not yet modeled by `DayWeave` are retained so recovery never
+    /// mistakes an externally changed event for the exact reviewed create.
+    #[serde(default, flatten)]
+    pub additional_properties: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,18 +504,17 @@ impl GoogleClient {
     }
 
     /// Creates an event after enforcing the external-change approval boundary.
-    ///
     /// # Errors
     ///
     /// Returns [`GoogleError::ApprovalRequired`] for attendee-bearing events
     /// without explicit approval, plus typed provider errors.
-    pub async fn insert_event(
+    pub async fn prepare_insert_event(
         &self,
         calendar_id: &str,
         event: &GoogleEvent,
         approval: &EventWriteApproval,
         send_updates: SendUpdates,
-    ) -> Result<GoogleEvent, GoogleError> {
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
         approval.validate(Some(event))?;
         let url = self.endpoint(&["calendar", "v3", "calendars", calendar_id, "events"])?;
         let request = self.request(Method::POST, url).await?.query(&[
@@ -516,7 +522,59 @@ impl GoogleClient {
             ("conferenceDataVersion", "1"),
             ("supportsAttachments", "true"),
         ]);
-        self.json(Self::body(request, event)).await
+        self.prepare(Self::body(request, event))
+    }
+
+    /// Creates an event after enforcing the external-change approval boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns approval, transport, authorization, or provider errors.
+    pub async fn insert_event(
+        &self,
+        calendar_id: &str,
+        event: &GoogleEvent,
+        approval: &EventWriteApproval,
+        send_updates: SendUpdates,
+    ) -> Result<GoogleEvent, GoogleError> {
+        self.prepare_insert_event(calendar_id, event, approval, send_updates)
+            .await?
+            .send_json(None)
+            .await
+    }
+
+    /// Replaces an event conditionally using its last-seen `ETag`.
+    /// # Errors
+    ///
+    /// Returns approval, stale-write, transport, authorization, or API errors.
+    pub async fn prepare_update_event(
+        &self,
+        calendar_id: &str,
+        event: &GoogleEvent,
+        approval: &EventWriteApproval,
+        send_updates: SendUpdates,
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
+        approval.validate(Some(event))?;
+        let etag = event
+            .etag
+            .as_deref()
+            .filter(|etag| !etag.trim().is_empty())
+            .ok_or(GoogleError::ConditionalWriteRequired)?;
+        let url = self.endpoint(&[
+            "calendar",
+            "v3",
+            "calendars",
+            calendar_id,
+            "events",
+            &event.id,
+        ])?;
+        let mut request = self.request(Method::PUT, url).await?.query(&[
+            ("sendUpdates", send_updates.as_str()),
+            ("conferenceDataVersion", "1"),
+            ("supportsAttachments", "true"),
+        ]);
+        request = request.header(reqwest::header::IF_MATCH, etag);
+        self.prepare(Self::body(request, event))
     }
 
     /// Replaces an event conditionally using its last-seen `ETag`.
@@ -531,24 +589,10 @@ impl GoogleClient {
         approval: &EventWriteApproval,
         send_updates: SendUpdates,
     ) -> Result<GoogleEvent, GoogleError> {
-        approval.validate(Some(event))?;
-        let url = self.endpoint(&[
-            "calendar",
-            "v3",
-            "calendars",
-            calendar_id,
-            "events",
-            &event.id,
-        ])?;
-        let mut request = self.request(Method::PUT, url).await?.query(&[
-            ("sendUpdates", send_updates.as_str()),
-            ("conferenceDataVersion", "1"),
-            ("supportsAttachments", "true"),
-        ]);
-        if let Some(etag) = &event.etag {
-            request = request.header(reqwest::header::IF_MATCH, etag);
-        }
-        self.json(Self::body(request, event)).await
+        self.prepare_update_event(calendar_id, event, approval, send_updates)
+            .await?
+            .send_json(None)
+            .await
     }
 
     /// Deletes an event. Callers must carry either the private-app-owned proof
@@ -557,15 +601,18 @@ impl GoogleClient {
     /// # Errors
     ///
     /// Returns approval, stale-write, transport, authorization, or API errors.
-    pub async fn delete_event(
+    pub async fn prepare_delete_event(
         &self,
         calendar_id: &str,
         event_id: &str,
-        etag: Option<&str>,
+        etag: &str,
         approval: &EventWriteApproval,
         send_updates: SendUpdates,
-    ) -> Result<(), GoogleError> {
+    ) -> Result<crate::PreparedGoogleRequest, GoogleError> {
         approval.validate(None)?;
+        if etag.trim().is_empty() {
+            return Err(GoogleError::ConditionalWriteRequired);
+        }
         let url = self.endpoint(&[
             "calendar",
             "v3",
@@ -578,9 +625,26 @@ impl GoogleClient {
             .request(Method::DELETE, url)
             .await?
             .query(&[("sendUpdates", send_updates.as_str())]);
-        if let Some(etag) = etag {
-            request = request.header(reqwest::header::IF_MATCH, etag);
-        }
-        self.empty(request).await
+        request = request.header(reqwest::header::IF_MATCH, etag);
+        self.prepare(request)
+    }
+
+    /// Deletes an event conditionally after approval validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns approval, stale-write, transport, authorization, or API errors.
+    pub async fn delete_event(
+        &self,
+        calendar_id: &str,
+        event_id: &str,
+        etag: &str,
+        approval: &EventWriteApproval,
+        send_updates: SendUpdates,
+    ) -> Result<(), GoogleError> {
+        self.prepare_delete_event(calendar_id, event_id, etag, approval, send_updates)
+            .await?
+            .send_empty(None)
+            .await
     }
 }

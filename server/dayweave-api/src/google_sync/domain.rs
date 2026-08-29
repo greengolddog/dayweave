@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::items::{Item, NewItem};
 
@@ -34,6 +35,58 @@ pub enum GoogleSyncRole {
     Writable,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GoogleEventDisposition {
+    /// Do not retain the provider record in the canonical planning model.
+    Ignore,
+    /// Retain it for context without reserving schedule capacity.
+    VisibleNonblocking,
+    /// Retain it and reserve its complete interval when the collection role
+    /// permits blocking constraints.
+    Blocking,
+}
+
+impl GoogleEventDisposition {
+    pub(crate) const fn as_db(self) -> &'static str {
+        match self {
+            Self::Ignore => "ignore",
+            Self::VisibleNonblocking => "visible_nonblocking",
+            Self::Blocking => "blocking",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoogleCalendarPolicy {
+    pub confirmed_busy: GoogleEventDisposition,
+    pub tentative: GoogleEventDisposition,
+    pub free: GoogleEventDisposition,
+    pub all_day: GoogleEventDisposition,
+    /// All-day publication is opt-in because Google uses date-only exclusive
+    /// bounds whose elapsed UTC duration changes across DST transitions.
+    pub publish_all_day: bool,
+    /// Tentative `DayWeave` blocks stay app-only unless explicitly enabled.
+    pub publish_tentative: bool,
+    /// Non-busy provider publication is opt-in.
+    pub publish_free: bool,
+}
+
+impl Default for GoogleCalendarPolicy {
+    fn default() -> Self {
+        Self {
+            confirmed_busy: GoogleEventDisposition::Blocking,
+            tentative: GoogleEventDisposition::VisibleNonblocking,
+            free: GoogleEventDisposition::VisibleNonblocking,
+            all_day: GoogleEventDisposition::VisibleNonblocking,
+            publish_all_day: false,
+            publish_tentative: false,
+            publish_free: false,
+        }
+    }
+}
+
 impl GoogleSyncRole {
     pub(crate) const fn as_db(self) -> &'static str {
         match self {
@@ -60,6 +113,7 @@ pub struct GoogleSyncCollection {
     pub selected: bool,
     pub visible: bool,
     pub sync_role: GoogleSyncRole,
+    pub calendar_policy: GoogleCalendarPolicy,
     pub revision: u64,
     pub discovered_at: DateTime<Utc>,
     pub configured_at: Option<DateTime<Utc>>,
@@ -154,6 +208,7 @@ pub(crate) enum ImportOutcome {
 pub(crate) struct SyncClaim {
     pub account_id: Uuid,
     pub claim_id: Uuid,
+    pub claim_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +237,9 @@ pub(crate) struct RemoteItemChange {
     pub remote_updated_at: Option<DateTime<Utc>>,
     pub remote_payload_hash: [u8; 32],
     pub remote_projection_hash: [u8; 32],
+    /// Complete provider representation used only for authenticated Calendar
+    /// create recovery, with provider-assigned version/timestamp fields removed.
+    pub reviewed_provider_projection: Option<Value>,
     pub item: Option<NewItem>,
 }
 
@@ -198,6 +256,75 @@ pub(crate) struct OutboundRequest {
     pub item_id: Uuid,
     pub expected_item_revision: u64,
     pub operation: OutboundOperation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct GoogleOutboundPreview {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub collection_display_name: String,
+    pub item_id: Uuid,
+    pub item_revision: u64,
+    pub entity_kind: String,
+    pub operation: OutboundOperation,
+    /// Existing provider object that will be conditionally changed. `None`
+    /// means this is a create. This value is part of the approval binding.
+    pub provider_resource_id: Option<String>,
+    /// Last-seen provider version used for `If-Match`. It is part of the
+    /// approval binding and is absent only for a create.
+    pub provider_etag: Option<String>,
+    /// SHA-256 review binding represented as lower-case hexadecimal. Clients
+    /// must display the preview and echo this exact value to approve it.
+    pub preview_hash: String,
+    pub provider_payload: Value,
+    pub expires_at: DateTime<Utc>,
+}
+
+// Deliberately not `Debug`: this value carries the one-time bearer capability
+// returned to the approving client. Keeping it out of derived debug output
+// prevents otherwise-benign request/response logging from disclosing it.
+#[derive(Clone, Eq, PartialEq, Serialize, ToSchema)]
+pub struct GoogleOutboundApproval {
+    pub preview_id: Uuid,
+    /// Returned exactly once. The server stores only its SHA-256 hash.
+    pub approval_capability: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl Drop for GoogleOutboundApproval {
+    fn drop(&mut self) {
+        self.approval_capability.zeroize();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundPreviewSpec {
+    pub id: Uuid,
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub collection_remote_id: String,
+    pub collection_display_name: String,
+    pub required_scope: &'static str,
+    pub prepared: PreparedOutbound,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundApprovalSpec {
+    pub account_id: Uuid,
+    pub preview_id: Uuid,
+    pub expected_preview_hash: [u8; 32],
+    pub capability_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OutboundEnqueueSpec {
+    pub account_id: Uuid,
+    pub request: OutboundRequest,
+    pub capability_hash: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -230,6 +357,7 @@ pub(crate) struct OutboundWork {
     pub account_id: Uuid,
     pub collection_id: Uuid,
     pub collection_remote_id: String,
+    pub collection_revision: u64,
     pub item_id: Uuid,
     pub item_revision: u64,
     pub entity_kind: String,
@@ -237,8 +365,26 @@ pub(crate) struct OutboundWork {
     pub remote_resource_id: Option<String>,
     pub expected_etag: Option<String>,
     pub payload: Value,
+    pub required_scope: String,
+    pub intent_hash: [u8; 32],
+    pub approval_id: Uuid,
+    /// Per-outbox delivery claim.
     pub claim_id: Uuid,
+    /// Parent sync-run ownership; both values must still match the unexpired
+    /// run at every stage, preventing stale-worker and ABA takeover.
+    pub run_claim_id: Uuid,
+    pub run_claim_generation: u64,
+    pub provider_post_may_have_started: bool,
     pub attempts: u32,
+}
+
+/// Short-lived immutable authorization lease minted by the final database
+/// fence. No database transaction is held over provider network I/O; the nonce
+/// is required again by the post-response guardian.
+pub(crate) struct OutboundDispatchPermit {
+    pub(crate) nonce: Uuid,
+    pub(crate) intent_hash: [u8; 32],
+    pub(crate) expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,6 +393,7 @@ pub(crate) struct OutboundResult {
     pub remote_etag: Option<String>,
     pub remote_updated_at: Option<DateTime<Utc>>,
     pub payload_hash: [u8; 32],
+    pub dispatch_nonce: Uuid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
