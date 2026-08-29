@@ -23,8 +23,12 @@ import com.greengolddog.dayweave.network.RemotePlanOccurrence
 import com.greengolddog.dayweave.network.RemoteScheduleBlock
 import com.greengolddog.dayweave.network.RemoteSchedulePlan
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
+import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
+import com.greengolddog.dayweave.network.RemotePublishedScheduleRevision
 import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
+import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
+import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
 import java.time.Instant
@@ -44,6 +48,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -53,6 +58,563 @@ import org.junit.Test
 
 class CanonicalSyncManagerTest {
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
+
+    @Test
+    fun failedPublicationKeepsOldPlanAndRestartReplaysExactJournal() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationError = IOException("synthetic lost publication response")
+        }
+        val first = manager(plannerStore, transport).refreshAndCompose()
+
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE, first)
+        val journal = requireNotNull(plannerStore.state.value.pendingSchedulePublication)
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+        assertEquals(null, plannerStore.state.value.scheduleInputDigest)
+        assertFalse(plannerStore.state.value.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+        assertEquals(1, transport.publicationRequests.size)
+        val exactRequest = transport.publicationRequests.single()
+
+        transport.publicationError = null
+        val restarted = PlannerStore(plannerStore.state.value)
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(restarted, transport).refreshAndCompose(),
+        )
+
+        assertEquals(3, transport.publicationRequests.size)
+        assertEquals(exactRequest, transport.publicationRequests[1])
+        assertTrue(transport.publicationRequests[2] != exactRequest)
+        assertEquals(journal.idempotencyKey, Json.decodeFromString<SchedulePublishRequest>(
+            transport.publicationRequests[1].bodyJson,
+        ).idempotencyKey)
+        assertTrue(
+            Json.decodeFromString<SchedulePublishRequest>(transport.publicationRequests[2].bodyJson)
+                .idempotencyKey != journal.idempotencyKey,
+        )
+        assertEquals(null, restarted.state.value.pendingSchedulePublication)
+        assertEquals("cursor-1", restarted.state.value.canonicalDeltaCursor)
+        assertEquals(preview().inputDigest, restarted.state.value.scheduleInputDigest)
+        assertNotNull(restarted.state.value.publishedScheduleRevision)
+        assertTrue(restarted.state.value.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+    }
+
+    @Test
+    fun publicationResponseMismatchRetainsExactJournalAndNeverAdvancesCursor() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationHandler = { request ->
+                val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+                RemoteSchedulePublishResponse(
+                    revision = RemotePublishedScheduleRevision(
+                        id = "77777777-7777-4777-8777-777777777777",
+                        revision = "1:77777777-7777-4777-8777-777777777777",
+                        revisionNumber = 1uL,
+                        inputDigest = "sha256:${"f".repeat(64)}",
+                        horizonStart = decoded.schedule.horizonStart,
+                        horizonEnd = decoded.schedule.horizonEnd,
+                        timezoneName = decoded.schedule.timezoneName,
+                        publishedAt = decoded.schedule.asOf,
+                    ),
+                    replayed = false,
+                )
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+        assertEquals(null, plannerStore.state.value.publishedScheduleRevision)
+    }
+
+    @Test
+    fun typedStalePublicationIsDurablyDiscardedThenFreshlyPublishedWithANewKey() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        var calls = 0
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationHandler = { request ->
+                calls += 1
+                if (calls == 1) throw PlannerApiException.SchedulePublicationStale()
+                publicationResponse(request, replayed = false)
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+
+        assertEquals(2, transport.publicationRequests.size)
+        val first = Json.decodeFromString<SchedulePublishRequest>(
+            transport.publicationRequests[0].bodyJson,
+        )
+        val second = Json.decodeFromString<SchedulePublishRequest>(
+            transport.publicationRequests[1].bodyJson,
+        )
+        assertTrue(first.idempotencyKey != second.idempotencyKey)
+        assertEquals(2, transport.previewRequests.size)
+        assertEquals(null, plannerStore.state.value.pendingSchedulePublication)
+        assertNotNull(plannerStore.state.value.publishedScheduleRevision)
+        assertTrue(plannerStore.state.value.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+    }
+
+    @Test
+    fun genericPublicationConflictRetainsExactJournalForExplicitRecovery() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationError = PlannerApiException.Conflict()
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.STALE_REVISION,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        val journal = requireNotNull(plannerStore.state.value.pendingSchedulePublication)
+        val restarted = PlannerStore(plannerStore.state.value)
+        assertEquals(
+            CanonicalRefreshOutcome.STALE_REVISION,
+            manager(restarted, transport).refreshAndCompose(),
+        )
+        assertEquals(2, transport.publicationRequests.size)
+        assertEquals(transport.publicationRequests[0], transport.publicationRequests[1])
+        assertEquals(journal, restarted.state.value.pendingSchedulePublication)
+    }
+
+    @Test
+    fun stalePublicationQuarantinePersistenceFailureNeverSendsFreshOrInstallsCandidate() =
+        runBlocking {
+            val initial = DayWeaveUiState()
+            var durable = initial
+            var failSaves = false
+            val repository = object : PlannerStateRepository {
+                override suspend fun load(): DayWeaveUiState = durable
+
+                override suspend fun save(state: DayWeaveUiState) {
+                    if (failSaves) throw IOException("synthetic stale-journal clear failure")
+                    durable = state
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val plannerStore = PlannerStore(initial, repository, scope)
+                withTimeout(3_000) {
+                    plannerStore.loadState.first { it == PlannerLoadState.READY }
+                }
+                val transport = FakeCanonicalTransport().apply {
+                    pages[null] = RemoteItemDeltaPage(
+                        listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                        "cursor-1",
+                        false,
+                    )
+                    previewResult = preview()
+                    publicationHandler = {
+                        failSaves = true
+                        throw PlannerApiException.SchedulePublicationStale()
+                    }
+                }
+
+                assertEquals(
+                    CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
+                    manager(plannerStore, transport).refreshAndCompose(),
+                )
+                assertEquals(1, transport.publicationRequests.size)
+                assertNotNull(durable.pendingSchedulePublication)
+                assertTrue(plannerStore.state.value.schedule.isEmpty())
+                assertEquals(null, plannerStore.state.value.scheduleInputDigest)
+                assertEquals(PlannerLoadState.PERSISTENCE_FAILED, plannerStore.loadState.value)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun supersededExactReplayNeverInstallsOldCandidateOrMarksItCurrent() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationError = IOException("synthetic lost first response")
+        }
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        val exact = transport.publicationRequests.single()
+        val oldCandidate = requireNotNull(
+            plannerStore.state.value.pendingSchedulePublication,
+        ).candidate
+        val newer = remoteItem().copy(
+            title = "Newer canonical work",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.pages[null] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = newer)),
+            "cursor-2",
+            false,
+        )
+        transport.previewResult = scheduledPreview(newer).copy(
+            inputDigest = "sha256:${"c".repeat(64)}",
+        )
+        transport.publicationError = null
+        transport.publicationHandler = { request ->
+            if (request == exact) {
+                publicationResponse(
+                    request,
+                    replayed = true,
+                    publishedAt = clock.minusSeconds(60).toString(),
+                )
+            } else {
+                throw IOException("synthetic lost fresh publication response")
+            }
+        }
+
+        val restarted = PlannerStore(plannerStore.state.value)
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(restarted, transport).refreshAndCompose(),
+        )
+
+        assertEquals(3, transport.publicationRequests.size)
+        assertEquals(exact, transport.publicationRequests[1])
+        assertTrue(transport.publicationRequests[2] != exact)
+        assertTrue(oldCandidate.schedule.isNotEmpty())
+        assertTrue(restarted.state.value.schedule.isEmpty())
+        assertEquals(null, restarted.state.value.publishedScheduleRevision)
+        assertEquals(null, restarted.state.value.scheduleInputDigest)
+        assertNotNull(restarted.state.value.pendingSchedulePublication)
+        assertFalse(restarted.state.value.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+    }
+
+    @Test
+    fun replayResolutionPersistenceFailureKeepsDurableJournalAndNeverInstallsCandidate() =
+        runBlocking {
+            val initial = DayWeaveUiState()
+            var durable = initial
+            var failSaves = false
+            val repository = object : PlannerStateRepository {
+                override suspend fun load(): DayWeaveUiState = durable
+
+                override suspend fun save(state: DayWeaveUiState) {
+                    if (failSaves) throw IOException("synthetic replay-resolution save failure")
+                    durable = state
+                }
+            }
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            try {
+                val plannerStore = PlannerStore(initial, repository, scope)
+                withTimeout(3_000) {
+                    plannerStore.loadState.first { it == PlannerLoadState.READY }
+                }
+                val transport = FakeCanonicalTransport().apply {
+                    pages[null] = RemoteItemDeltaPage(
+                        listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                        "cursor-1",
+                        false,
+                    )
+                    previewResult = preview()
+                    publicationError = IOException("synthetic lost first response")
+                }
+                assertEquals(
+                    CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+                    manager(plannerStore, transport).refreshAndCompose(),
+                )
+                val durableJournal = requireNotNull(durable.pendingSchedulePublication)
+                failSaves = true
+                transport.publicationError = null
+
+                assertEquals(
+                    CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
+                    manager(plannerStore, transport).refreshAndCompose(),
+                )
+                assertEquals(2, transport.publicationRequests.size)
+                assertEquals(transport.publicationRequests[0], transport.publicationRequests[1])
+                assertEquals(durableJournal, durable.pendingSchedulePublication)
+                assertTrue(plannerStore.state.value.schedule.isEmpty())
+                assertEquals(null, plannerStore.state.value.publishedScheduleRevision)
+                assertEquals(null, plannerStore.state.value.scheduleInputDigest)
+                assertEquals(PlannerLoadState.PERSISTENCE_FAILED, plannerStore.loadState.value)
+            } finally {
+                scope.cancel()
+            }
+        }
+
+    @Test
+    fun pendingPublicationCannotBeRetargetedToAnotherConfiguration() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationError = IOException("synthetic ambiguous publication")
+        }
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        val sent = transport.publicationRequests.single()
+        transport.publicationError = null
+        val replacement = object : ApiCredentialStore {
+            override fun snapshot() = ApiConnectionSnapshot(
+                baseUrl = "https://api.example.test/gateway-b/",
+                hasBearerToken = true,
+                lastSuccessfulSyncEpochMillis = null,
+                configurationId = "connection-1",
+            )
+
+            override fun authenticatedConfiguration() = AuthenticatedApiConfiguration.createBound(
+                "https://api.example.test/gateway-b/",
+                "replacement-secret",
+                "connection-1",
+            )
+
+            override fun update(baseUrl: String, bearerToken: String?) = Unit
+            override fun clear() = Unit
+            override fun recordSuccessfulSync(epochMillis: Long) = Unit
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.CONFIGURATION_ERROR,
+            manager(plannerStore, transport, replacement).refreshAndCompose(),
+        )
+        assertEquals(listOf(sent), transport.publicationRequests)
+        assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+    }
+
+    @Test
+    fun publicationIsNeverSentWhenExactJournalCannotBeSaved() = runBlocking {
+        val initial = DayWeaveUiState()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                throw IOException("synthetic encrypted publication-journal failure")
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val plannerStore = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) { plannerStore.loadState.first { it == PlannerLoadState.READY } }
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = preview()
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
+                manager(plannerStore, transport).refreshAndCompose(),
+            )
+            assertTrue(transport.publicationRequests.isEmpty())
+            assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+            assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+            assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun non200PublicationStatusesRetainEncryptedJournalAndNeverCommit() = runBlocking {
+        listOf(201, 202, 204).forEach { status ->
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = preview()
+                publicationError = PlannerApiException.Http(status)
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.PERMANENT_SERVER_FAILURE,
+                manager(plannerStore, transport).refreshAndCompose(),
+            )
+            assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+            assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+            assertEquals(null, plannerStore.state.value.publishedScheduleRevision)
+        }
+    }
+
+    @Test
+    fun retryablePublicationStatusesRetainExactJournalAndNeverCommit() = runBlocking {
+        listOf(408, 425, 429, 500, 503).forEach { status ->
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = preview()
+                publicationError = PlannerApiException.Http(status)
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.RETRYABLE_SERVER_FAILURE,
+                manager(plannerStore, transport).refreshAndCompose(),
+            )
+            assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+            assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+            assertEquals(null, plannerStore.state.value.publishedScheduleRevision)
+        }
+    }
+
+    @Test
+    fun oldExactReplayReceiptIsResolvedWithoutReceiveTimeFreshness() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationError = IOException("synthetic lost old response")
+        }
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        val oldJournal = requireNotNull(plannerStore.state.value.pendingSchedulePublication)
+        transport.publicationError = null
+        transport.deltaError = IOException("synthetic fresh pull unavailable")
+        val restarted = PlannerStore(plannerStore.state.value)
+        val muchLater = CanonicalSyncManager(
+            plannerStore = restarted,
+            credentialStore = CanonicalCredentialStore(),
+            transport = transport,
+            now = { clock.plusSeconds(30L * 24L * 60L * 60L) },
+            zoneId = { ZoneId.of("Europe/Madrid") },
+        )
+
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE, muchLater.refreshAndCompose())
+        assertEquals(2, transport.publicationRequests.size)
+        assertEquals(transport.publicationRequests[0], transport.publicationRequests[1])
+        assertEquals(null, restarted.state.value.pendingSchedulePublication)
+        assertEquals(null, restarted.state.value.scheduleInputDigest)
+        assertEquals(null, restarted.state.value.publishedScheduleRevision)
+        assertTrue(restarted.state.value.schedule.isEmpty())
+        assertTrue(oldJournal.candidate.schedule.isNotEmpty())
+    }
+
+    @Test
+    fun newKeyCurrentRevisionDedupeAcceptsOldPublishedAtWhenNotMarkedReplay() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationHandler = { request ->
+                val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+                RemoteSchedulePublishResponse(
+                    revision = RemotePublishedScheduleRevision(
+                        id = "77777777-7777-4777-8777-777777777777",
+                        revision = "7:77777777-7777-4777-8777-777777777777",
+                        revisionNumber = 7uL,
+                        inputDigest = decoded.expectedInputDigest,
+                        horizonStart = decoded.schedule.horizonStart,
+                        horizonEnd = decoded.schedule.horizonEnd,
+                        timezoneName = decoded.schedule.timezoneName,
+                        publishedAt = "2020-01-01T00:00:00Z",
+                    ),
+                    replayed = false,
+                )
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        assertEquals(null, plannerStore.state.value.pendingSchedulePublication)
+        assertEquals(
+            "2020-01-01T00:00:00Z",
+            plannerStore.state.value.publishedScheduleRevision?.publishedAt,
+        )
+        assertEquals(preview().inputDigest, plannerStore.state.value.scheduleInputDigest)
+    }
+
+    @Test
+    fun publicationTimestampBeyondBoundedFutureSkewKeepsExactJournal() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            publicationHandler = { request ->
+                val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+                RemoteSchedulePublishResponse(
+                    revision = RemotePublishedScheduleRevision(
+                        id = "77777777-7777-4777-8777-777777777777",
+                        revision = "8:77777777-7777-4777-8777-777777777777",
+                        revisionNumber = 8uL,
+                        inputDigest = decoded.expectedInputDigest,
+                        horizonStart = decoded.schedule.horizonStart,
+                        horizonEnd = decoded.schedule.horizonEnd,
+                        timezoneName = decoded.schedule.timezoneName,
+                        publishedAt = clock.plusSeconds(5L * 60L + 1L).toString(),
+                    ),
+                    replayed = false,
+                )
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        assertNotNull(plannerStore.state.value.pendingSchedulePublication)
+        assertEquals(null, plannerStore.state.value.publishedScheduleRevision)
+        assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+    }
 
     @Test
     fun delayedOldBindingPlanCannotRepopulateAfterGenerationFence() = runBlocking {
@@ -1983,6 +2545,28 @@ class CanonicalSyncManagerTest {
         ),
     )
 
+    private fun publicationResponse(
+        request: SchedulePublishHttpRequest,
+        replayed: Boolean,
+        publishedAt: String? = null,
+    ): RemoteSchedulePublishResponse {
+        val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+        val revisionId = "77777777-7777-4777-8777-777777777777"
+        return RemoteSchedulePublishResponse(
+            revision = RemotePublishedScheduleRevision(
+                id = revisionId,
+                revision = "1:$revisionId",
+                revisionNumber = 1uL,
+                inputDigest = decoded.expectedInputDigest,
+                horizonStart = decoded.schedule.horizonStart,
+                horizonEnd = decoded.schedule.horizonEnd,
+                timezoneName = decoded.schedule.timezoneName,
+                publishedAt = publishedAt ?: decoded.schedule.asOf,
+            ),
+            replayed = replayed,
+        )
+    }
+
     private companion object {
         const val TASK_ID = "11111111-1111-4111-8111-111111111111"
         const val BLOCK_ID = "22222222-2222-4222-8222-222222222222"
@@ -2027,6 +2611,15 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
     var previewRequest: SchedulePreviewRequest? = null
     val queuedPreviews = ArrayDeque<RemoteSchedulePreview>()
     val previewRequests = mutableListOf<SchedulePreviewRequest>()
+    val publicationRequests = mutableListOf<SchedulePublishHttpRequest>()
+    private val publicationAttemptsByKey = mutableMapOf<String, Int>()
+    var publicationResult: RemoteSchedulePublishResponse? = null
+    var publicationError: Throwable? = null
+    var publicationStarted: CompletableDeferred<Unit>? = null
+    var publicationGate: CompletableDeferred<Unit>? = null
+    var publicationHandler: (suspend (
+        request: SchedulePublishHttpRequest,
+    ) -> RemoteSchedulePublishResponse)? = null
     var deltaStarted: CompletableDeferred<Unit>? = null
     var deltaGate: CompletableDeferred<Unit>? = null
     var deltaError: Throwable? = null
@@ -2063,6 +2656,35 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         return queuedPreviews.removeFirstOrNull() ?: requireNotNull(previewResult)
     }
 
+    override suspend fun publish(
+        configuration: AuthenticatedApiConfiguration,
+        request: SchedulePublishHttpRequest,
+    ): RemoteSchedulePublishResponse {
+        publicationRequests += request
+        val decoded = Json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+        val keyAttempt = (publicationAttemptsByKey[decoded.idempotencyKey] ?: 0) + 1
+        publicationAttemptsByKey[decoded.idempotencyKey] = keyAttempt
+        publicationStarted?.complete(Unit)
+        publicationGate?.await()
+        publicationHandler?.let { return it(request) }
+        publicationError?.let { throw it }
+        publicationResult?.let { return it }
+        val revisionNumber = publicationRequests.size.toULong()
+        return RemoteSchedulePublishResponse(
+            revision = RemotePublishedScheduleRevision(
+                id = PUBLISHED_REVISION_ID,
+                revision = "$revisionNumber:$PUBLISHED_REVISION_ID",
+                revisionNumber = revisionNumber,
+                inputDigest = decoded.expectedInputDigest,
+                horizonStart = decoded.schedule.horizonStart,
+                horizonEnd = decoded.schedule.horizonEnd,
+                timezoneName = decoded.schedule.timezoneName,
+                publishedAt = decoded.schedule.asOf,
+            ),
+            replayed = keyAttempt > 1,
+        )
+    }
+
     override suspend fun replaceItem(
         configuration: AuthenticatedApiConfiguration,
         id: String,
@@ -2077,5 +2699,9 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         replacementHandler?.let { return it(id, idempotencyKey, request) }
         replacementError?.let { throw it }
         return requireNotNull(replacementResult)
+    }
+
+    private companion object {
+        const val PUBLISHED_REVISION_ID = "77777777-7777-4777-8777-777777777777"
     }
 }

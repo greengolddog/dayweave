@@ -51,8 +51,19 @@ class PlannerModelsTest {
     fun currentPlanRequiresTheCurrentDeviceZone() {
         val state = DayWeaveUiState(
             canonicalSyncOrigin = "https://api.example.test/",
+            scheduleInputDigest = "sha256:${"a".repeat(64)}",
             scheduleGeneratedAt = "2026-09-01T07:00:00Z",
             schedulePlanningZoneId = "Europe/Madrid",
+            publishedScheduleRevision = PublishedScheduleRevisionSnapshot(
+                id = "11111111-1111-4111-8111-111111111111",
+                revision = "1:11111111-1111-4111-8111-111111111111",
+                revisionNumber = 1uL,
+                inputDigest = "sha256:${"a".repeat(64)}",
+                horizonStart = "2026-09-01T00:00:00Z",
+                horizonEnd = "2026-09-02T00:00:00Z",
+                timezoneName = "Europe/Madrid",
+                publishedAt = "2026-09-01T07:00:00Z",
+            ),
         )
 
         assertTrue(

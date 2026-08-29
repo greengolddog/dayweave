@@ -2,6 +2,10 @@ package com.greengolddog.dayweave.network
 
 import java.io.IOException
 import java.io.Reader
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.resumeWithException
@@ -13,9 +17,14 @@ import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -157,6 +166,47 @@ data class SchedulePreviewRequest(
 )
 
 @Serializable
+data class SchedulePublishRequest(
+    @SerialName("idempotency_key") val idempotencyKey: String,
+    @SerialName("expected_input_digest") val expectedInputDigest: String,
+    val schedule: SchedulePreviewRequest,
+)
+
+/** Exact non-secret publication request persisted before the first network send. */
+@Serializable
+data class SchedulePublishHttpRequest(
+    val url: String,
+    val method: String,
+    @SerialName("accept_header") val acceptHeader: String,
+    @SerialName("content_type_header") val contentTypeHeader: String,
+    @SerialName("cache_control_header") val cacheControlHeader: String,
+    @SerialName("pragma_header") val pragmaHeader: String,
+    @SerialName("body_json") val bodyJson: String,
+    @SerialName("body_sha256") val bodySha256: String,
+) {
+    override fun toString(): String =
+        "SchedulePublishHttpRequest(url=$url, method=$method, body=<redacted>)"
+}
+
+@Serializable
+data class RemotePublishedScheduleRevision(
+    val id: String,
+    val revision: String,
+    @SerialName("revision_number") val revisionNumber: ULong,
+    @SerialName("input_digest") val inputDigest: String,
+    @SerialName("horizon_start") val horizonStart: String,
+    @SerialName("horizon_end") val horizonEnd: String,
+    @SerialName("timezone_name") val timezoneName: String,
+    @SerialName("published_at") val publishedAt: String,
+)
+
+@Serializable
+data class RemoteSchedulePublishResponse(
+    val revision: RemotePublishedScheduleRevision,
+    val replayed: Boolean,
+)
+
+@Serializable
 data class RemoteRejectedScheduleItem(
     @SerialName("item_id") val itemId: String,
     @SerialName("is_sensitive") val isSensitive: Boolean,
@@ -274,6 +324,10 @@ sealed class PlannerApiException(message: String, cause: Throwable? = null) :
 
     class Conflict : PlannerApiException("The canonical item changed on the server")
 
+    class SchedulePublicationStale : PlannerApiException(
+        "The validated schedule preview became stale before publication",
+    )
+
     class Validation(val statusCode: Int) : PlannerApiException(
         "The DayWeave API rejected planner input with HTTP $statusCode",
     )
@@ -298,6 +352,11 @@ interface CanonicalPlannerTransport {
         configuration: AuthenticatedApiConfiguration,
         request: SchedulePreviewRequest,
     ): RemoteSchedulePreview
+
+    suspend fun publish(
+        configuration: AuthenticatedApiConfiguration,
+        request: SchedulePublishHttpRequest,
+    ): RemoteSchedulePublishResponse
 
     suspend fun replaceItem(
         configuration: AuthenticatedApiConfiguration,
@@ -332,6 +391,25 @@ class OkHttpCanonicalPlannerTransport(
             .build()
         val body = json.encodeToString(request).toRequestBody(JSON_MEDIA_TYPE)
         return execute(requestBuilder(configuration, url.toString()).post(body).build())
+    }
+
+    override suspend fun publish(
+        configuration: AuthenticatedApiConfiguration,
+        request: SchedulePublishHttpRequest,
+    ): RemoteSchedulePublishResponse {
+        validateSchedulePublishHttpRequest(configuration, request)
+        val body = request.bodyJson.toRequestBody(request.contentTypeHeader.toMediaType())
+        val httpRequest = Request.Builder()
+            .url(request.url)
+            .tag(AuthenticatedApiConfiguration::class.java, configuration)
+            .header("Accept", request.acceptHeader)
+            .header("Authorization", "Bearer ${configuration.bearerToken}")
+            .header("Cache-Control", request.cacheControlHeader)
+            .header("Pragma", request.pragmaHeader)
+            .header("Content-Type", request.contentTypeHeader)
+            .post(body)
+            .build()
+        return executePublication(httpRequest)
     }
 
     override suspend fun replaceItem(
@@ -380,6 +458,58 @@ class OkHttpCanonicalPlannerTransport(
         }
     }
 
+    private fun Response.isStrictSchedulePublicationStale(): Boolean {
+        if (code != 409) return false
+        val mediaType = header("Content-Type")?.toMediaTypeOrNull() ?: return false
+        if (mediaType.type != "application" || mediaType.subtype != "json") return false
+        val responseText = runCatching {
+            body.charStream().use { reader ->
+                reader.readBoundedPlannerText(MAX_ERROR_RESPONSE_CHARS)
+            }
+        }.getOrNull() ?: return false
+        val root = runCatching {
+            json.parseToJsonElement(responseText).jsonObject
+        }.getOrNull() ?: return false
+        if (root.keys != setOf("error")) return false
+        val error = runCatching { root.getValue("error").jsonObject }.getOrNull() ?: return false
+        if (error.keys != setOf("code", "message")) return false
+        val codePrimitive = error["code"]?.jsonPrimitive ?: return false
+        val messagePrimitive = error["message"]?.jsonPrimitive ?: return false
+        if (!codePrimitive.isString || !messagePrimitive.isString) return false
+        val code = codePrimitive.contentOrNull ?: return false
+        val message = messagePrimitive.contentOrNull ?: return false
+        return code == SCHEDULE_PUBLICATION_STALE_CODE &&
+            message.isNotBlank() && message.length <= MAX_ERROR_MESSAGE_CHARS
+    }
+
+    private suspend fun executePublication(request: Request): RemoteSchedulePublishResponse {
+        val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
+            ?: throw PlannerApiException.InvalidResponse()
+        val response = configuration.executeAuthenticated(client, request)
+        response.use {
+            if (response.code != 200) {
+                if (response.isStrictSchedulePublicationStale()) {
+                    throw PlannerApiException.SchedulePublicationStale()
+                }
+                throw response.toPlannerApiException()
+            }
+            val mediaType = response.header("Content-Type")?.toMediaTypeOrNull()
+            if (mediaType?.type != "application" || mediaType.subtype != "json") {
+                throw PlannerApiException.InvalidResponse()
+            }
+            val responseText = response.body.charStream().use { reader ->
+                reader.readBoundedPlannerText()
+            }
+            try {
+                return json.decodeFromString(responseText)
+            } catch (error: SerializationException) {
+                throw PlannerApiException.InvalidResponse(error)
+            } catch (error: IllegalArgumentException) {
+                throw PlannerApiException.InvalidResponse(error)
+            }
+        }
+    }
+
     private fun Response.toPlannerApiException(): PlannerApiException = when (code) {
         401 -> PlannerApiException.Authentication()
         409 -> PlannerApiException.Conflict()
@@ -391,6 +521,9 @@ class OkHttpCanonicalPlannerTransport(
         const val MAX_DELTA_PAGE_SIZE = 50
         // One page can legitimately contain large notes plus bounded recurrence/constraint JSON.
         private const val MAX_RESPONSE_CHARS = 12 * 1024 * 1024
+        private const val MAX_ERROR_RESPONSE_CHARS = 8 * 1024
+        private const val MAX_ERROR_MESSAGE_CHARS = 500
+        private const val SCHEDULE_PUBLICATION_STALE_CODE = "schedule_publication_stale"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
@@ -411,13 +544,15 @@ class OkHttpCanonicalPlannerTransport(
             encodeDefaults = true
         }
 
-        private fun Reader.readBoundedPlannerText(): String {
+        private fun Reader.readBoundedPlannerText(
+            maxChars: Int = MAX_RESPONSE_CHARS,
+        ): String {
             val result = StringBuilder()
             val buffer = CharArray(DEFAULT_BUFFER_SIZE)
             while (true) {
                 val read = read(buffer)
                 if (read < 0) break
-                if (result.length + read > MAX_RESPONSE_CHARS) {
+                if (result.length + read > maxChars) {
                     throw PlannerApiException.InvalidResponse()
                 }
                 result.append(buffer, 0, read)
@@ -426,6 +561,96 @@ class OkHttpCanonicalPlannerTransport(
         }
     }
 }
+
+internal fun buildSchedulePublishHttpRequest(
+    configuration: AuthenticatedApiConfiguration,
+    request: SchedulePublishRequest,
+): SchedulePublishHttpRequest {
+    val body = OkHttpCanonicalPlannerTransport.defaultJson().encodeToString(request)
+    val result = SchedulePublishHttpRequest(
+        url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/schedule/publish")
+            .build()
+            .toString(),
+        method = SCHEDULE_PUBLISH_METHOD,
+        acceptHeader = SCHEDULE_PUBLISH_ACCEPT,
+        contentTypeHeader = SCHEDULE_PUBLISH_CONTENT_TYPE,
+        cacheControlHeader = SCHEDULE_PUBLISH_CACHE_CONTROL,
+        pragmaHeader = SCHEDULE_PUBLISH_PRAGMA,
+        bodyJson = body,
+        bodySha256 = plannerSha256(body),
+    )
+    validateSchedulePublishHttpRequest(configuration, result)
+    return result
+}
+
+internal fun validateSchedulePublishHttpRequest(
+    configuration: AuthenticatedApiConfiguration,
+    request: SchedulePublishHttpRequest,
+): SchedulePublishRequest = validateSchedulePublishHttpRequest(
+    expectedBaseUrl = configuration.baseUrl.toString(),
+    request = request,
+)
+
+internal fun validateSchedulePublishHttpRequest(
+    expectedBaseUrl: String,
+    request: SchedulePublishHttpRequest,
+): SchedulePublishRequest {
+    val baseUrl = expectedBaseUrl.toHttpUrlOrNull()
+        ?: throw IllegalArgumentException("Invalid publication origin")
+    require(baseUrl.toString() == expectedBaseUrl)
+    require(baseUrl.query == null && baseUrl.fragment == null && baseUrl.username.isEmpty())
+    require(baseUrl.password.isEmpty())
+    require(baseUrl.isHttps || baseUrl.host in setOf("127.0.0.1", "localhost", "::1"))
+    val expectedUrl = baseUrl.newBuilder()
+        .addPathSegments("v1/schedule/publish")
+        .build()
+        .toString()
+    require(request.url == expectedUrl)
+    require(request.method == SCHEDULE_PUBLISH_METHOD)
+    require(request.acceptHeader == SCHEDULE_PUBLISH_ACCEPT)
+    require(request.contentTypeHeader == SCHEDULE_PUBLISH_CONTENT_TYPE)
+    require(request.cacheControlHeader == SCHEDULE_PUBLISH_CACHE_CONTROL)
+    require(request.pragmaHeader == SCHEDULE_PUBLISH_PRAGMA)
+    require(
+        request.bodyJson.toByteArray(StandardCharsets.UTF_8).size <=
+            MAX_SCHEDULE_PUBLISH_BODY_BYTES,
+    )
+    require(request.bodySha256 == plannerSha256(request.bodyJson))
+    val json = OkHttpCanonicalPlannerTransport.defaultJson()
+    val decoded = json.decodeFromString<SchedulePublishRequest>(request.bodyJson)
+    require(json.encodeToString(decoded) == request.bodyJson)
+    require(UUID.fromString(decoded.idempotencyKey).toString() == decoded.idempotencyKey)
+    requireScheduleInputDigest(decoded.expectedInputDigest)
+    requireNotNull(runCatching { Instant.parse(decoded.schedule.asOf) }.getOrNull())
+    val start = requireNotNull(
+        runCatching { Instant.parse(decoded.schedule.horizonStart) }.getOrNull(),
+    )
+    val end = requireNotNull(
+        runCatching { Instant.parse(decoded.schedule.horizonEnd) }.getOrNull(),
+    )
+    require(end > start)
+    require(decoded.schedule.timezoneName.isNotBlank())
+    return decoded
+}
+
+internal fun requireScheduleInputDigest(value: String) {
+    require(SCHEDULE_INPUT_DIGEST.matches(value))
+}
+
+internal fun plannerSha256(value: String): String = "sha256:" +
+    MessageDigest.getInstance("SHA-256")
+        .digest(value.toByteArray(StandardCharsets.UTF_8))
+        .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) }
+
+private const val SCHEDULE_PUBLISH_METHOD = "POST"
+private const val SCHEDULE_PUBLISH_ACCEPT = "application/json"
+private const val SCHEDULE_PUBLISH_CONTENT_TYPE = "application/json; charset=utf-8"
+private const val SCHEDULE_PUBLISH_CACHE_CONTROL = "no-store"
+private const val SCHEDULE_PUBLISH_PRAGMA = "no-cache"
+/** Checked before a schedule-publication request can enter the encrypted crash journal. */
+internal const val MAX_SCHEDULE_PUBLISH_BODY_BYTES = 12 * 1024 * 1024
+private val SCHEDULE_INPUT_DIGEST = Regex("^sha256:[0-9a-f]{64}$")
 
 @OptIn(ExperimentalCoroutinesApi::class)
 private suspend fun Call.awaitPlannerResponse(): Response =

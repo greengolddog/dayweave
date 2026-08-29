@@ -3,6 +3,10 @@ package com.greengolddog.dayweave.data
 import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.network.requireScheduleInputDigest
+import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
+import java.time.Instant
+import java.util.UUID
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -41,7 +45,12 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V4 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V5 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V4 -> {
+                val migrated = decodeVersionFourSnapshot(snapshot.payload)
+                save(migrated)
+                migrated
+            }
             PlannerSnapshotFormats.JSON_V3 -> {
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
@@ -71,18 +80,23 @@ class RoomPlannerStateRepository(
     }
 
     override suspend fun save(state: DayWeaveUiState) {
+        validateSchedulePublicationState(state)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(state),
                 updatedAtEpochMillis = nowEpochMillis(),
-                payloadFormat = PlannerSnapshotFormats.JSON_V4,
+                payloadFormat = PlannerSnapshotFormats.JSON_V5,
             ),
         )
     }
 
     private fun decodeCurrentSnapshot(payload: String): DayWeaveUiState {
         val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        if (!root.containsKey("pendingSchedulePublication") ||
+            !root.containsKey("publishedScheduleRevision")) {
+            throw SerializationException("Current schedule publication fields are required")
+        }
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
         requireExplicitSensitivity(root, "inbox")
@@ -109,6 +123,37 @@ class RoomPlannerStateRepository(
         }
         return SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(root)
             .withPendingSensitivityHardened()
+            .also(::validateSchedulePublicationState)
+    }
+
+    /** V4 already required explicit sensitivity and an exact pending replacement target. */
+    private fun decodeVersionFourSnapshot(payload: String): DayWeaveUiState {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        requireExplicitSensitivity(root, "schedule")
+        requireExplicitSensitivity(root, "canonicalItems")
+        requireExplicitSensitivity(root, "inbox")
+        when (val pendingElement = root["pendingCanonicalMutation"]) {
+            null, JsonNull -> Unit
+            is JsonObject -> {
+                val target = pendingElement["targetIsSensitive"]
+                    ?.jsonPrimitive
+                    ?.booleanOrNull
+                    ?: throw SerializationException(
+                        "pendingCanonicalMutation.targetIsSensitive is required by the v4 " +
+                            "snapshot contract",
+                    )
+                if (target != journaledPendingSensitivity(pendingElement)) {
+                    throw SerializationException(
+                        "pendingCanonicalMutation.targetIsSensitive does not match its exact " +
+                            "replacement body",
+                    )
+                }
+            }
+            else -> throw SerializationException("pendingCanonicalMutation must be an object")
+        }
+        return SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(root)
+            .withPendingSensitivityHardened()
+            .also(::validateSchedulePublicationState)
     }
 
     /**
@@ -160,6 +205,71 @@ class RoomPlannerStateRepository(
         }
         return LEGACY_SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(migratedRoot)
             .withPendingSensitivityHardened()
+            .also(::validateSchedulePublicationState)
+    }
+
+    private fun validateSchedulePublicationState(state: DayWeaveUiState) {
+        state.pendingSchedulePublication?.let { pending ->
+            if (pending.schemaVersion != 1) {
+                throw SerializationException("Unsupported schedule publication journal")
+            }
+            val key = runCatching { UUID.fromString(pending.idempotencyKey) }.getOrNull()
+                ?: throw SerializationException("Invalid schedule publication idempotency key")
+            if (key.toString() != pending.idempotencyKey || key == UUID(0L, 0L)) {
+                throw SerializationException("Invalid schedule publication idempotency key")
+            }
+            runCatching { Instant.parse(pending.preparedAt) }.getOrElse {
+                throw SerializationException("Invalid schedule publication timestamp")
+            }
+            val request = runCatching {
+                validateSchedulePublishHttpRequest(pending.syncOrigin, pending.request)
+            }.getOrElse {
+                throw SerializationException("Invalid exact schedule publication request", it)
+            }
+            if (
+                request.idempotencyKey != pending.idempotencyKey ||
+                request.expectedInputDigest != pending.candidate.inputDigest ||
+                request.schedule.asOf != pending.candidate.generatedAt ||
+                request.schedule.timezoneName != pending.candidate.planningZoneId ||
+                pending.candidate.syncOrigin != pending.syncOrigin ||
+                pending.candidate.configurationId != pending.configurationId
+            ) {
+                throw SerializationException("Schedule publication journal fields disagree")
+            }
+        }
+        state.publishedScheduleRevision?.let { published ->
+            val id = runCatching { UUID.fromString(published.id) }.getOrNull()
+                ?: throw SerializationException("Invalid published schedule id")
+            if (
+                id.toString() != published.id || id == UUID(0L, 0L) ||
+                published.revisionNumber == 0uL ||
+                published.revision != "${published.revisionNumber}:${published.id}"
+            ) {
+                throw SerializationException("Invalid published schedule revision")
+            }
+            runCatching { requireScheduleInputDigest(published.inputDigest) }.getOrElse {
+                throw SerializationException("Invalid published schedule digest", it)
+            }
+            val start = runCatching { Instant.parse(published.horizonStart) }.getOrElse {
+                throw SerializationException("Invalid published schedule horizon", it)
+            }
+            val end = runCatching { Instant.parse(published.horizonEnd) }.getOrElse {
+                throw SerializationException("Invalid published schedule horizon", it)
+            }
+            if (end <= start || published.timezoneName.isBlank()) {
+                throw SerializationException("Invalid published schedule horizon")
+            }
+            runCatching { Instant.parse(published.publishedAt) }.getOrElse {
+                throw SerializationException("Invalid published schedule timestamp", it)
+            }
+            if (
+                state.canonicalSyncOrigin == null ||
+                state.scheduleInputDigest != published.inputDigest ||
+                state.schedulePlanningZoneId != published.timezoneName
+            ) {
+                throw SerializationException("Published schedule receipt does not match the cache")
+            }
+        }
     }
 
     /** Validates the duplicated fence fields against the real snake_case wire journal. */

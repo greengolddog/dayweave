@@ -12,10 +12,20 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
+import com.greengolddog.dayweave.network.MAX_SCHEDULE_PUBLISH_BODY_BYTES
+import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
+import com.greengolddog.dayweave.network.SchedulePreviewRequest
+import com.greengolddog.dayweave.network.SchedulePublishRequest
+import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
+import com.greengolddog.dayweave.network.plannerSha256
+import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
@@ -38,6 +48,341 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlannerStoreTest {
+    @Test
+    fun overLimitPublicationBodyIsRejectedBeforeStateMutationOrPersistence() = runBlocking {
+        val initial = DayWeaveUiState()
+        var saveCalls = 0
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                saveCalls += 1
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val store = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) { store.loadState.first { it == PlannerLoadState.READY } }
+            val normal = publication(
+                canonicalUpdate(
+                    item = canonicalItem("planned", 8),
+                    block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                    cursor = "cursor-1",
+                ),
+            )
+            val normalBytes = normal.request.bodyJson.toByteArray(StandardCharsets.UTF_8).size
+            val overLimitBody = normal.request.bodyJson +
+                " ".repeat(MAX_SCHEDULE_PUBLISH_BODY_BYTES + 1 - normalBytes)
+            assertEquals(
+                MAX_SCHEDULE_PUBLISH_BODY_BYTES + 1,
+                overLimitBody.toByteArray(StandardCharsets.UTF_8).size,
+            )
+            val overLimit = normal.copy(
+                request = normal.request.copy(
+                    bodyJson = overLimitBody,
+                    bodySha256 = plannerSha256(overLimitBody),
+                ),
+            )
+
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                store.stageSchedulePublication(overLimit)
+            }
+
+            assertNull(store.state.value.pendingSchedulePublication)
+            assertEquals(0, saveCalls)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun publicationJournalFencesCurrentPlanAndCommitIsExactAtomicCas() {
+        val oldItem = canonicalItem("planned", 7)
+        val oldBlock = canonicalBlock(ItemStatus.SCHEDULED, 7)
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(oldItem),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+                schedule = listOf(oldBlock),
+                scheduleInputDigest = "sha256:${"0".repeat(64)}",
+                scheduleGeneratedAt = "1970-01-01T00:00:00Z",
+                schedulePlanningZoneId = "UTC",
+            ),
+        )
+        val candidate = canonicalUpdate(
+            item = canonicalItem("planned", 8),
+            block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+            cursor = "cursor-1",
+        )
+        val pending = publication(candidate)
+
+        assertNotNull(store.stageSchedulePublication(pending))
+        assertEquals("cursor-0", store.state.value.canonicalDeltaCursor)
+        assertEquals(7L, store.state.value.canonicalItems.single().revision)
+        assertTrue(store.hasCredentialReplacementBlocker())
+        assertFalse(store.state.value.isCanonicalPlanCurrent(Instant.EPOCH, java.time.ZoneOffset.UTC))
+
+        val revision = publishedRevision()
+        assertNotNull(store.commitSchedulePublication(pending, revision))
+        assertEquals(null, store.state.value.pendingSchedulePublication)
+        assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+        assertEquals(8L, store.state.value.canonicalItems.single().revision)
+        assertEquals(revision, store.state.value.publishedScheduleRevision)
+        assertTrue(store.state.value.isCanonicalPlanCurrent(Instant.EPOCH, java.time.ZoneId.of("UTC")))
+
+        val stale = runCatching { store.commitSchedulePublication(pending, revision) }
+        assertTrue(stale.isFailure)
+        assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
+    fun replayAndTypedStaleResolutionClearOnlyExactJournalWithoutInstallingCandidate() {
+        listOf(true, false).forEach { replayed ->
+            val oldBlock = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(title = "Old plan")
+            val store = PlannerStore(
+                publishedCanonicalState(block = oldBlock).copy(canonicalDeltaCursor = "cursor-0"),
+            )
+            val candidate = canonicalUpdate(
+                item = canonicalItem("planned", 8),
+                block = canonicalBlock(ItemStatus.SCHEDULED, 8).copy(title = "Rejected candidate"),
+                cursor = "cursor-1",
+            )
+            val pending = publication(candidate)
+            assertNotNull(store.stageSchedulePublication(pending))
+
+            val receipt = if (replayed) {
+                store.resolveReplayedSchedulePublication(pending, publishedRevision())
+            } else {
+                store.discardStaleSchedulePublication(pending)
+            }
+
+            assertNotNull(receipt)
+            assertEquals(null, store.state.value.pendingSchedulePublication)
+            assertEquals(null, store.state.value.publishedScheduleRevision)
+            assertEquals(null, store.state.value.scheduleInputDigest)
+            assertEquals("cursor-0", store.state.value.canonicalDeltaCursor)
+            assertEquals(listOf(oldBlock), store.state.value.schedule)
+            assertFalse(store.state.value.schedule.any { it.title == "Rejected candidate" })
+
+            val stale = runCatching {
+                if (replayed) {
+                    store.resolveReplayedSchedulePublication(pending, publishedRevision())
+                } else {
+                    store.discardStaleSchedulePublication(pending)
+                }
+            }
+            assertTrue(stale.isFailure)
+        }
+    }
+
+    @Test
+    fun publicationJournalBlocksOtherServerWritesAndExplicitForgetQuarantinesIt() {
+        val candidate = canonicalUpdate(
+            item = canonicalItem("planned", 7),
+            block = canonicalBlock(ItemStatus.SCHEDULED, 7),
+            cursor = "cursor-1",
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val pending = publication(candidate)
+        assertNotNull(store.stageSchedulePublication(pending))
+
+        val mutation = PendingCanonicalMutation(
+            idempotencyKey = "99999999-9999-4999-8999-999999999999",
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            itemId = CANONICAL_ITEM_ID,
+            expectedRevision = 7,
+            targetStatus = "planned",
+            targetIsSensitive = false,
+            startedAt = "1970-01-01T00:00:00Z",
+            replacementRequestJson = "{}",
+            focusedBlockId = CANONICAL_BLOCK_ID,
+            displayStatus = ItemStatus.SCHEDULED,
+        )
+        assertTrue(runCatching { store.stageCanonicalMutation(mutation) }.isFailure)
+
+        assertNotNull(store.abandonCanonicalConnection())
+        assertEquals(null, store.state.value.pendingSchedulePublication)
+        assertEquals(null, store.state.value.publishedScheduleRevision)
+        assertFalse(store.hasCredentialReplacementBlocker())
+    }
+
+    @Test
+    fun acknowledgedCanonicalMutationInvalidatesPublishedReceiptWithItsInputDigest() {
+        val store = PlannerStore(publishedCanonicalState())
+        val mutation = canonicalMutation(
+            targetStatus = "completed",
+            displayStatus = ItemStatus.COMPLETED,
+        )
+
+        assertNotNull(store.stageCanonicalMutation(mutation))
+        assertNotNull(
+            store.reconcileCanonicalItem(
+                item = canonicalItem("completed", 8),
+                focusedBlockId = CANONICAL_BLOCK_ID,
+                displayStatus = ItemStatus.COMPLETED,
+            ),
+        )
+
+        assertPublishedPlanInvalidated(store)
+    }
+
+    @Test
+    fun acknowledgedSensitivityMutationInvalidatesPublishedReceiptWithItsInputDigest() {
+        val store = PlannerStore(publishedCanonicalState())
+        val mutation = canonicalMutation(
+            targetStatus = "planned",
+            displayStatus = ItemStatus.SCHEDULED,
+            targetIsSensitive = true,
+            focusedBlockId = CANONICAL_ITEM_ID,
+        )
+
+        assertNotNull(store.stageCanonicalMutation(mutation))
+        assertNotNull(
+            store.reconcileCanonicalItemSensitivity(
+                canonicalItem("planned", 8).copy(isSensitive = true),
+            ),
+        )
+
+        assertPublishedPlanInvalidated(store)
+    }
+
+    @Test
+    fun localRecurrenceResolutionInvalidatesPublishedReceiptWithItsInputDigest() {
+        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
+        val store = PlannerStore(
+            publishedCanonicalState(item, block).copy(
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            ),
+            nowEpochMillis = { 60_000L },
+        )
+
+        assertNotNull(
+            store.reconcileLocalCanonicalSession(
+                CANONICAL_BLOCK_ID,
+                ItemStatus.COMPLETED,
+            ),
+        )
+
+        assertPublishedPlanInvalidated(store)
+        assertTrue(occurrenceId in store.state.value.recurrenceOutcomes)
+    }
+
+    @Test
+    fun remoteRecurrenceResolutionInvalidatesPublishedReceiptWithItsInputDigest() {
+        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
+        val store = PlannerStore(
+            publishedCanonicalState(item, block).copy(
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            ),
+        )
+        val terminal = executionSession("active", 1).copy(
+            occurrenceId = occurrenceId,
+            status = "completed",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+
+        assertNotNull(
+            store.reconcileCanonicalExecution(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revision = 2,
+                activeSession = null,
+                changedSession = terminal,
+                message = "Recurring session completed",
+            ),
+        )
+
+        assertPublishedPlanInvalidated(store)
+        assertTrue(occurrenceId in store.state.value.recurrenceOutcomes)
+    }
+
+    @Test
+    fun recurringDeferralInvalidatesPublishedReceiptWithItsInputDigest() {
+        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
+        val store = PlannerStore(
+            publishedCanonicalState(item, block).copy(
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            ),
+            nowEpochMillis = { 60_000L },
+        )
+
+        assertNotNull(store.deferLocalCanonicalSession(CANONICAL_BLOCK_ID, 60))
+
+        assertPublishedPlanInvalidated(store)
+        assertTrue(occurrenceId in store.state.value.recurrenceMoves)
+    }
+
+    @Test
+    fun provenDeletionDuringTerminalProjectionInvalidatesPublishedReceiptAndDigest() {
+        val store = PlannerStore(publishedCanonicalState())
+        val running = executionSession("active", 1, projectionEligible = true)
+        assertNotNull(
+            store.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                1,
+                running,
+                message = "Execution started",
+            ),
+        )
+        val terminal = running.copy(
+            status = "completed",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+        assertNotNull(
+            store.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                2,
+                null,
+                terminal,
+                message = "Execution completed",
+            ),
+        )
+        val pending = canonicalMutation(
+            targetStatus = "completed",
+            displayStatus = ItemStatus.COMPLETED,
+            terminalExecutionSessionId = EXECUTION_ID,
+        )
+        assertNotNull(store.stageCanonicalMutation(pending))
+
+        assertNotNull(
+            store.resolveDeletedPendingTerminalProjection(
+                pending.idempotencyKey,
+                EXECUTION_ID,
+            ),
+        )
+
+        assertPublishedPlanInvalidated(store)
+        assertTrue(store.state.value.canonicalItems.isEmpty())
+        assertTrue(store.state.value.schedule.isEmpty())
+    }
+
     @Test
     fun exactRemoteGenerationWaitsForItsOwnSaveWhileLaterUiMutationStaysNonBlocking() =
         runBlocking {
@@ -1221,6 +1566,91 @@ class PlannerStoreTest {
         occurrenceSeriesItemIds = emptyMap(),
         message = "Updated",
     )
+
+    private fun publication(candidate: CanonicalPlanUpdate): PendingSchedulePublication {
+        val idempotencyKey = "88888888-8888-4888-8888-888888888888"
+        val schedule = SchedulePreviewRequest(
+            asOf = candidate.generatedAt,
+            horizonStart = "1970-01-01T00:00:00Z",
+            horizonEnd = "1970-01-02T00:00:00Z",
+            timezoneName = candidate.planningZoneId,
+            availability = listOf(
+                ScheduleAvailabilityRequest(
+                    start = "1970-01-01T00:00:00Z",
+                    end = "1970-01-02T00:00:00Z",
+                ),
+            ),
+        )
+        val configuration = AuthenticatedApiConfiguration.createBound(
+            CANONICAL_ORIGIN,
+            "synthetic-token",
+            "connection-1",
+        )
+        return PendingSchedulePublication(
+            schemaVersion = 1,
+            idempotencyKey = idempotencyKey,
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            preparedAt = "1970-01-01T00:00:00Z",
+            request = buildSchedulePublishHttpRequest(
+                configuration,
+                SchedulePublishRequest(idempotencyKey, candidate.inputDigest, schedule),
+            ),
+            candidate = candidate,
+        )
+    }
+
+    private fun publishedRevision() = PublishedScheduleRevisionSnapshot(
+        id = "77777777-7777-4777-8777-777777777777",
+        revision = "1:77777777-7777-4777-8777-777777777777",
+        revisionNumber = 1uL,
+        inputDigest = "sha256:${"a".repeat(64)}",
+        horizonStart = "1970-01-01T00:00:00Z",
+        horizonEnd = "1970-01-02T00:00:00Z",
+        timezoneName = "UTC",
+        publishedAt = "1970-01-01T00:00:00Z",
+    )
+
+    private fun publishedCanonicalState(
+        item: CanonicalItemSnapshot = canonicalItem("planned", 7),
+        block: ScheduleItem = canonicalBlock(ItemStatus.SCHEDULED, 7),
+    ) = DayWeaveUiState(
+        canonicalItems = listOf(item),
+        canonicalSyncOrigin = CANONICAL_ORIGIN,
+        canonicalConfigurationId = "connection-1",
+        canonicalDeltaCursor = "cursor-1",
+        schedule = listOf(block),
+        publishedScheduleRevision = publishedRevision(),
+        scheduleInputDigest = publishedRevision().inputDigest,
+        scheduleGeneratedAt = "1970-01-01T00:00:00Z",
+        schedulePlanningZoneId = "UTC",
+    )
+
+    private fun canonicalMutation(
+        targetStatus: String,
+        displayStatus: ItemStatus,
+        targetIsSensitive: Boolean = false,
+        focusedBlockId: String = CANONICAL_BLOCK_ID,
+        terminalExecutionSessionId: String? = null,
+    ) = PendingCanonicalMutation(
+        idempotencyKey = "99999999-9999-4999-8999-999999999999",
+        syncOrigin = CANONICAL_ORIGIN,
+        configurationId = "connection-1",
+        itemId = CANONICAL_ITEM_ID,
+        expectedRevision = 7,
+        targetStatus = targetStatus,
+        targetIsSensitive = targetIsSensitive,
+        startedAt = "1970-01-01T00:00:00Z",
+        replacementRequestJson = "{}",
+        focusedBlockId = focusedBlockId,
+        displayStatus = displayStatus,
+        terminalExecutionSessionId = terminalExecutionSessionId,
+    )
+
+    private fun assertPublishedPlanInvalidated(store: PlannerStore) {
+        assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.scheduleInputDigest)
+    }
 
     private fun assertTerminalExecutionSurvivesComposition(
         wireStatus: String,

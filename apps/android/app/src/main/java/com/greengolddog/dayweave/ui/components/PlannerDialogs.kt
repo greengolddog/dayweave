@@ -309,7 +309,9 @@ fun ApiConnectionDialog(
                 )
                 if (credentialReplacementBlocked) {
                     Text(
-                        "A canonical or execution action must be reconciled before enrollment, sign-out, or local destruction can change the session binding.",
+                        "Recover the exact schedule publication or canonical/execution action " +
+                            "before enrollment or sign-out. Confirmed local-only removal remains " +
+                            "available and will quarantine that recovery journal first.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
@@ -451,7 +453,7 @@ fun ApiConnectionDialog(
                 if (authState.phase != DeviceAuthPhase.UNCONFIGURED) {
                     TextButton(
                         onClick = { confirmLocalOnly = true },
-                        enabled = !bindingChangeBlocked,
+                        enabled = !authState.isBusy,
                     ) { Text("Local-only removal") }
                 }
                 TextButton(

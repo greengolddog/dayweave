@@ -1104,6 +1104,43 @@ class DeviceAuthCoordinatorTest {
     }
 
     @Test
+    fun confirmedLocalDestroyUsesTheExplicitAmbiguousJournalQuarantinePath() = runBlocking {
+        val active = syntheticActiveState(now)
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        var ordinaryBindingChanges = 0
+        var confirmedDestructions = 0
+        val fence = object : DeviceAuthBindingFence {
+            override suspend fun beforeBindingChange(
+                previousBaseUrl: String?,
+                previousBindingId: String?,
+                nextBaseUrl: String?,
+                nextBindingId: String?,
+            ): Boolean {
+                ordinaryBindingChanges += 1
+                return false
+            }
+
+            override suspend fun beforeConfirmedLocalDestruction(
+                previousBaseUrl: String?,
+                previousBindingId: String?,
+            ): Boolean {
+                assertEquals(active.baseUrl, previousBaseUrl)
+                assertEquals(active.session.id, previousBindingId)
+                confirmedDestructions += 1
+                return true
+            }
+        }
+
+        assertEquals(
+            DeviceAuthActionResult.SUCCESS,
+            coordinator(store, RecordingDeviceAuthTransport(), fence).destroyLocalOnly(true),
+        )
+        assertEquals(0, ordinaryBindingChanges)
+        assertEquals(1, confirmedDestructions)
+        assertTrue(store.envelope.state is StoredDeviceAuthState.Unconfigured)
+    }
+
+    @Test
     fun exhaustedBindingGenerationRejectsWriterBeforeAnyMutation() = runBlocking {
         val gate = ApiBindingOperationGate(initialGeneration = Long.MAX_VALUE)
         var mutationEntered = false

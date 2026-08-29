@@ -11,7 +11,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 
-internal const val DEVICE_AUTH_CONTRACT_VERSION = 1
+internal const val DEVICE_AUTH_CONTRACT_VERSION = 2
 internal const val DEVICE_AUTH_ENVELOPE_VERSION = 2
 internal const val DEVICE_ACCESS_TOKEN_PREFIX = "dw_da1_"
 internal const val DEVICE_REFRESH_TOKEN_PREFIX = "dw_dr1_"
@@ -26,6 +26,7 @@ internal val ANDROID_DEVICE_AUTH_SCOPES = listOf(
     "suggestions_write",
     "schedule_read",
     "schedule_simulate",
+    "schedule_publish",
     "items_read",
     "items_write",
     "execution_read",

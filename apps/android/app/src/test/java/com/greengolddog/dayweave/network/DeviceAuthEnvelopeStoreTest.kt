@@ -293,6 +293,58 @@ class DeviceAuthEnvelopeStoreTest {
     }
 
     @Test
+    fun contractOneSessionWithoutPublishScopeFailsClosedForReenrollment() {
+        val keys = InMemoryDeviceAuthKeyAccess()
+        val store = testStore(keys)
+        store.read()
+        val now = java.time.Instant.parse("2026-08-29T12:00:00Z")
+        val oldSession = syntheticSession(now).copy(
+            scopes = ANDROID_DEVICE_AUTH_SCOPES.filterNot { it == "schedule_publish" },
+            clientContractVersion = 1,
+        )
+        val plaintext = Json {
+            classDiscriminator = "phase"
+            ignoreUnknownKeys = false
+            explicitNulls = true
+            encodeDefaults = true
+        }.encodeToString(
+            StoredDeviceAuthEnvelope(
+                schemaVersion = DEVICE_AUTH_ENVELOPE_VERSION,
+                revision = 7,
+                state = syntheticActiveState(now, session = oldSession),
+            ),
+        )
+        val encrypt = store.javaClass.getDeclaredMethod(
+            "encrypt",
+            String::class.java,
+            SecretKey::class.java,
+        ).apply { isAccessible = true }
+        val encoded = encrypt.invoke(
+            store,
+            plaintext,
+            requireNotNull(keys.existing(TEST_KEY_ALIAS)),
+        ) as String
+        preferences.edit()
+            .putString(KeystoreDeviceAuthEnvelopeStore.ENCRYPTED_ENVELOPE, encoded)
+            .commit()
+
+        val loaded = store.read()
+
+        assertTrue(loaded.state is StoredDeviceAuthState.Incompatible)
+        assertEquals("stored_state_invalid", (loaded.state as StoredDeviceAuthState.Incompatible).reason)
+        assertEquals(0L, loaded.revision)
+        assertFalse(
+            store.compareAndSet(
+                loaded,
+                StoredDeviceAuthState.Unconfigured(
+                    baseUrl = null,
+                    clientInstanceId = SYNTHETIC_CLIENT_INSTANCE_ID,
+                ),
+            ),
+        )
+    }
+
+    @Test
     fun compareAndSetAndDestroyVerifyExactReadback() {
         val keys = InMemoryDeviceAuthKeyAccess()
         val corrupt = testStore(keys, readbackOverride = { stored ->

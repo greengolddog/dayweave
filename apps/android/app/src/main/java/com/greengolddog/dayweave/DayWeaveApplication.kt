@@ -88,16 +88,13 @@ class DayWeaveApplication : Application() {
                 .ifBlank { "Personal Android device" },
             bindingOperationGate = apiBindingOperationGate,
             bindingFence = object : DeviceAuthBindingFence {
-                override suspend fun beforeBindingChange(
-                    previousBaseUrl: String?,
-                    previousBindingId: String?,
-                    nextBaseUrl: String?,
-                    nextBindingId: String?,
+                private suspend fun quarantineBinding(
+                    allowAmbiguousJournal: Boolean,
                 ): Boolean {
                     val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
                     if (
                         loaded != PlannerLoadState.READY ||
-                        plannerStore.hasCredentialReplacementBlocker()
+                        !allowAmbiguousJournal && plannerStore.hasCredentialReplacementBlocker()
                     ) {
                         return false
                     }
@@ -119,6 +116,18 @@ class DayWeaveApplication : Application() {
                     }
                     return quarantined
                 }
+
+                override suspend fun beforeBindingChange(
+                    previousBaseUrl: String?,
+                    previousBindingId: String?,
+                    nextBaseUrl: String?,
+                    nextBindingId: String?,
+                ): Boolean = quarantineBinding(allowAmbiguousJournal = false)
+
+                override suspend fun beforeConfirmedLocalDestruction(
+                    previousBaseUrl: String?,
+                    previousBindingId: String?,
+                ): Boolean = quarantineBinding(allowAmbiguousJournal = true)
             },
         )
     }

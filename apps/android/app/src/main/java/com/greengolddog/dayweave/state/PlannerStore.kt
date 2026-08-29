@@ -20,6 +20,8 @@ import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
+import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
@@ -28,6 +30,8 @@ import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.network.requireScheduleInputDigest
+import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
 import java.time.Instant
 import java.time.ZoneId
 import java.util.ArrayDeque
@@ -378,9 +382,17 @@ class PlannerStore(
      * replace the last durable plan.
      */
     fun replaceCanonicalPlan(update: CanonicalPlanUpdate): PlannerPersistenceReceipt? {
-        require(update.inputDigest.startsWith("sha256:") && update.inputDigest.length > 7) {
-            "Canonical schedule digest is invalid"
+        validateCanonicalPlanUpdate(update)
+        return mutateDurably { current ->
+            require(current.pendingSchedulePublication == null) {
+                "A schedule publication must be reconciled before direct plan replacement"
+            }
+            canonicalPlanState(current, update).copy(publishedScheduleRevision = null)
         }
+    }
+
+    private fun validateCanonicalPlanUpdate(update: CanonicalPlanUpdate) {
+        requireScheduleInputDigest(update.inputDigest)
         require(update.syncOrigin.isNotBlank() && update.deltaCursor.isNotBlank()) {
             "Canonical synchronization metadata is invalid"
         }
@@ -422,8 +434,15 @@ class PlannerStore(
                 block.canonicalRevision == item.revision
             },
         ) { "Canonical schedule references an unknown or stale item revision" }
+    }
 
-        return mutateDurably { current ->
+    private fun canonicalPlanState(
+        current: DayWeaveUiState,
+        update: CanonicalPlanUpdate,
+    ): DayWeaveUiState {
+            val planningZone = ZoneId.of(update.planningZoneId)
+            val planningDate = Instant.parse(update.generatedAt).atZone(planningZone).toLocalDate()
+            val itemsById = update.items.associateBy { it.id }
             val canonicalBindingCompatible = current.canonicalSyncOrigin == null ||
                 current.canonicalSyncOrigin == update.syncOrigin &&
                 current.canonicalConfigurationId == update.configurationId
@@ -433,8 +452,9 @@ class PlannerStore(
             val sameBinding = canonicalBindingCompatible && executionBindingCompatible
             if (!sameBinding) {
                 require(
-                    current.canonicalItems.isEmpty() &&
+                        current.canonicalItems.isEmpty() &&
                         current.canonicalDeltaCursor == null &&
+                        current.pendingSchedulePublication == null &&
                         current.pendingCanonicalMutation == null &&
                         current.pendingExecutionCommand == null &&
                         current.canonicalExecutionSession == null &&
@@ -558,7 +578,7 @@ class PlannerStore(
                         running
                     }
                 }
-            current.copy(
+            return current.copy(
                 canonicalItems = update.items.sortedWith(
                     compareBy({ it.parentId.orEmpty() }, { it.siblingOrder }, { it.id }),
                 ),
@@ -600,13 +620,160 @@ class PlannerStore(
                 dayScore = update.dayScore,
                 scheduleMessage = update.message,
             )
+    }
+
+    /** Writes the exact publication tuple before its first network send. */
+    fun stageSchedulePublication(
+        publication: PendingSchedulePublication,
+    ): PlannerPersistenceReceipt? {
+        validateSchedulePublicationJournal(publication)
+        return mutateDurably { current ->
+            require(current.pendingSchedulePublication == null) {
+                "A schedule publication already needs exact reconciliation"
+            }
+            require(current.pendingCanonicalMutation == null) {
+                "A canonical mutation must be reconciled before schedule publication"
+            }
+            require(current.pendingExecutionCommand == null) {
+                "An execution command must be reconciled before schedule publication"
+            }
+            current.canonicalSyncOrigin?.let { origin ->
+                require(
+                    origin == publication.syncOrigin &&
+                        current.canonicalConfigurationId == publication.configurationId,
+                ) { "Publication binding does not match the canonical cache" }
+            }
+            current.canonicalExecutionSyncOrigin?.let { origin ->
+                require(
+                    origin == publication.syncOrigin &&
+                        current.canonicalExecutionConfigurationId == publication.configurationId,
+                ) { "Publication binding does not match canonical execution state" }
+            }
+            current.copy(
+                pendingSchedulePublication = publication,
+                scheduleMessage =
+                    "Publishing validated schedule · awaiting authoritative confirmation",
+            )
         }
+    }
+
+    /**
+     * Installs the locally accepted candidate and clears its exact journal in one generation.
+     * Equality against the complete expected journal is the stale-response/CAS fence.
+     */
+    fun commitSchedulePublication(
+        expected: PendingSchedulePublication,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PlannerPersistenceReceipt? {
+        validateSchedulePublicationJournal(expected)
+        validatePublishedScheduleRevision(expected, revision)
+        return mutateDurably { current ->
+            require(current.pendingSchedulePublication == expected) {
+                "Schedule publication changed before its response was committed"
+            }
+            canonicalPlanState(current, expected.candidate).copy(
+                pendingSchedulePublication = null,
+                publishedScheduleRevision = revision,
+            )
+        }
+    }
+
+    /**
+     * An exact replay proves that this request committed once, but not that its revision is still
+     * current. Clear only the matching journal and invalidate every local publication proof before
+     * pulling and publishing a fresh snapshot.
+     */
+    fun resolveReplayedSchedulePublication(
+        expected: PendingSchedulePublication,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PlannerPersistenceReceipt? {
+        validateSchedulePublicationJournal(expected)
+        validatePublishedScheduleRevision(expected, revision)
+        return mutateDurably { current ->
+            require(current.pendingSchedulePublication == expected) {
+                "Schedule publication changed before its replay was resolved"
+            }
+            current.copy(
+                pendingSchedulePublication = null,
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage =
+                    "An exact publication replay may be superseded · recomposing before use",
+            )
+        }
+    }
+
+    /** A typed stale rejection proves this candidate did not publish and is safe to discard. */
+    fun discardStaleSchedulePublication(
+        expected: PendingSchedulePublication,
+    ): PlannerPersistenceReceipt? {
+        validateSchedulePublicationJournal(expected)
+        return mutateDurably { current ->
+            require(current.pendingSchedulePublication == expected) {
+                "Schedule publication changed before its stale rejection was resolved"
+            }
+            current.copy(
+                pendingSchedulePublication = null,
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage =
+                    "The validated preview became stale · recomposing before schedule use",
+            )
+        }
+    }
+
+    /** Used before every first send and restart replay so a corrupted candidate never leaves disk. */
+    fun validateSchedulePublication(publication: PendingSchedulePublication) {
+        validateSchedulePublicationJournal(publication)
+    }
+
+    private fun validateSchedulePublicationJournal(publication: PendingSchedulePublication) {
+        require(publication.schemaVersion == SCHEDULE_PUBLICATION_JOURNAL_VERSION)
+        val idempotencyKey = UUID.fromString(publication.idempotencyKey)
+        require(idempotencyKey != NIL_UUID && idempotencyKey.toString() == publication.idempotencyKey)
+        require(publication.syncOrigin.isNotBlank())
+        publication.configurationId?.let { require(it.isNotBlank()) }
+        requireNotNull(runCatching { Instant.parse(publication.preparedAt) }.getOrNull())
+        validateCanonicalPlanUpdate(publication.candidate)
+        require(publication.candidate.syncOrigin == publication.syncOrigin)
+        require(publication.candidate.configurationId == publication.configurationId)
+        val request = validateSchedulePublishHttpRequest(
+            expectedBaseUrl = publication.syncOrigin,
+            request = publication.request,
+        )
+        require(request.idempotencyKey == publication.idempotencyKey)
+        require(request.expectedInputDigest == publication.candidate.inputDigest)
+        require(request.schedule.asOf == publication.candidate.generatedAt)
+        require(request.schedule.timezoneName == publication.candidate.planningZoneId)
+    }
+
+    private fun validatePublishedScheduleRevision(
+        publication: PendingSchedulePublication,
+        revision: PublishedScheduleRevisionSnapshot,
+    ) {
+        val revisionId = UUID.fromString(revision.id)
+        require(revisionId != NIL_UUID && revisionId.toString() == revision.id)
+        require(revision.revisionNumber > 0uL)
+        require(revision.revision == "${revision.revisionNumber}:${revision.id}")
+        requireScheduleInputDigest(revision.inputDigest)
+        val request = validateSchedulePublishHttpRequest(
+            expectedBaseUrl = publication.syncOrigin,
+            request = publication.request,
+        )
+        require(revision.inputDigest == request.expectedInputDigest)
+        require(revision.horizonStart == request.schedule.horizonStart)
+        require(revision.horizonEnd == request.schedule.horizonEnd)
+        require(revision.timezoneName == request.schedule.timezoneName)
+        requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
     }
 
     /** Persists the idempotency fence before a canonical mutation can leave the device. */
     fun stageCanonicalMutation(
         mutation: PendingCanonicalMutation,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.pendingSchedulePublication == null) {
+            "A schedule publication must be reconciled before a canonical mutation"
+        }
         require(current.pendingCanonicalMutation == null) {
             "A canonical mutation already needs reconciliation"
         }
@@ -699,6 +866,8 @@ class PlannerStore(
             canonicalItems = current.canonicalItems.filterNot { it.id == pending.itemId },
             schedule = current.schedule.filterNot { it.canonicalItemId == pending.itemId },
             activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
+            publishedScheduleRevision = null,
+            scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             terminalExecutionOutcomes = current.terminalExecutionOutcomes + (
                 sessionId to outcome.copy(
@@ -890,6 +1059,9 @@ class PlannerStore(
     fun stageExecutionCommand(
         command: PendingExecutionCommand,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.pendingSchedulePublication == null) {
+            "A schedule publication must be reconciled before an execution command"
+        }
         require(current.pendingExecutionCommand == null) {
             "An execution command already needs reconciliation"
         }
@@ -960,6 +1132,7 @@ class PlannerStore(
             }
         }.getOrElse { true }
         return current.pendingCanonicalMutation != null ||
+            current.pendingSchedulePublication != null ||
             current.pendingExecutionCommand != null ||
             projectionBlocked
     }
@@ -1344,6 +1517,9 @@ class PlannerStore(
                 current.schedule.firstOrNull { it.id == local.itemId }?.canonicalItemId == null
             }
         }
+        val recurrenceChanged = recurrenceOutcomes != current.recurrenceOutcomes ||
+            recurrenceMoves != current.recurrenceMoves ||
+            completionAnchors != current.recurrenceCompletionAnchors
         current.copy(
             schedule = schedule,
             activeSession = localActiveSession,
@@ -1360,6 +1536,9 @@ class PlannerStore(
             recurrenceOutcomes = recurrenceOutcomes,
             recurrenceMoves = recurrenceMoves,
             recurrenceCompletionAnchors = completionAnchors,
+            publishedScheduleRevision = current.publishedScheduleRevision
+                .takeUnless { recurrenceChanged },
+            scheduleInputDigest = current.scheduleInputDigest.takeUnless { recurrenceChanged },
             scheduleMessage = when {
                 authoritativeActiveSession != null && activeBlock == null ->
                     "Another device owns an execution session that is not in this plan · recompose to locate it"
@@ -1383,6 +1562,8 @@ class PlannerStore(
             canonicalSyncOrigin = null,
             canonicalConfigurationId = null,
             canonicalDeltaCursor = null,
+            pendingSchedulePublication = null,
+            publishedScheduleRevision = null,
             schedule = current.schedule.filter { it.canonicalItemId == null },
             activeSession = current.activeSession?.takeUnless { it.itemId in canonicalBlockIds },
             scheduleInputDigest = null,
@@ -1532,6 +1713,7 @@ class PlannerStore(
             },
             schedule = updatedSchedule,
             activeSession = activeSession,
+            publishedScheduleRevision = null,
             scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             terminalExecutionOutcomes = terminalExecutionOutcomes,
@@ -1587,6 +1769,7 @@ class PlannerStore(
         current.copy(
             canonicalItems = updatedItems,
             schedule = updatedSchedule,
+            publishedScheduleRevision = null,
             scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             scheduleMessage = if (item.isSensitive) {
@@ -1746,6 +1929,8 @@ class PlannerStore(
             recurrenceOutcomes = recurrenceOutcomes,
             recurrenceMoves = recurrenceMoves,
             recurrenceCompletionAnchors = completionAnchors,
+            publishedScheduleRevision = current.publishedScheduleRevision
+                .takeUnless { recurrenceChanged },
             scheduleInputDigest = current.scheduleInputDigest.takeUnless { recurrenceChanged },
             scheduleMessage = when (displayStatus) {
                 ItemStatus.ACTIVE -> "Started this scheduled session"
@@ -1809,6 +1994,7 @@ class PlannerStore(
             },
             activeSession = current.activeSession?.takeUnless { it.itemId in targetIds },
             recurrenceMoves = moves,
+            publishedScheduleRevision = null,
             scheduleInputDigest = null,
             scheduleMessage =
                 "Move requested · the previous placement remains visible until server validation",
@@ -2468,6 +2654,7 @@ class PlannerStore(
         const val MAX_EXECUTION_HISTORY_WINDOW = 100
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60
         const val MAX_TERMINAL_PROJECTION_CONFLICT_CHARS = 500
+        const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
         val NIL_UUID: UUID = UUID(0L, 0L)
         const val TERMINAL_PROJECTION_ITEM_DELETED = "item_deleted"
         const val TERMINAL_PROJECTION_USER_KEPT_LATEST = "user_kept_latest_item"

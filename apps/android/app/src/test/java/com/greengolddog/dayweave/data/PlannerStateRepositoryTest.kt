@@ -1,12 +1,19 @@
 package com.greengolddog.dayweave.data
 
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
+import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
+import com.greengolddog.dayweave.network.SchedulePreviewRequest
+import com.greengolddog.dayweave.network.SchedulePublishRequest
+import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
 import org.junit.Assert.assertEquals
@@ -17,7 +24,7 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV4() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV5() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -32,7 +39,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -70,8 +77,36 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
+    }
+
+    @Test
+    fun exactSchedulePublicationJournalRoundTripsAndTamperingFailsClosed() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao)
+        val state = pendingPublicationState()
+
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(
+            state.pendingSchedulePublication,
+            restored.pendingSchedulePublication,
+        )
+        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+
+        val digest = "sha256:${"a".repeat(64)}"
+        val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
+            digest,
+            "sha256:${"b".repeat(64)}",
+        )
+        dao.snapshot = requireNotNull(dao.snapshot).copy(payload = tampered)
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        Unit
     }
 
     @Test
@@ -127,7 +162,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -151,7 +186,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 
@@ -221,6 +256,64 @@ class PlannerStateRepositoryTest {
         createdAt = "2026-08-29T08:00:00Z",
         updatedAt = "2026-08-29T08:00:00Z",
     )
+
+    private fun pendingPublicationState(): DayWeaveUiState {
+        val origin = "https://api.example.test/"
+        val configurationId = "connection-1"
+        val idempotencyKey = "33333333-3333-4333-8333-333333333333"
+        val digest = "sha256:${"a".repeat(64)}"
+        val schedule = SchedulePreviewRequest(
+            asOf = "2026-08-29T08:00:00Z",
+            horizonStart = "2026-08-29T00:00:00Z",
+            horizonEnd = "2026-08-30T00:00:00Z",
+            timezoneName = "UTC",
+            availability = listOf(
+                ScheduleAvailabilityRequest(
+                    start = "2026-08-29T00:00:00Z",
+                    end = "2026-08-30T00:00:00Z",
+                ),
+            ),
+        )
+        val candidate = CanonicalPlanUpdate(
+            items = emptyList(),
+            schedule = emptyList(),
+            syncOrigin = origin,
+            configurationId = configurationId,
+            deltaCursor = "cursor-1",
+            inputDigest = digest,
+            generatedAt = schedule.asOf,
+            planningZoneId = schedule.timezoneName,
+            rejectedItemCount = 0,
+            unscheduledItemCount = 0,
+            protectedFreeMinutes = 0,
+            dayScore = 100,
+            violationMessages = emptyList(),
+            violationCount = 0,
+            errorViolationCount = 0,
+            unscheduledWork = emptyList(),
+            occurrenceSeriesItemIds = emptyMap(),
+            message = "Synthetic pending publication",
+        )
+        val configuration = AuthenticatedApiConfiguration.createBound(
+            origin,
+            "synthetic-token",
+            configurationId,
+        )
+        return DayWeaveUiState(
+            pendingSchedulePublication = PendingSchedulePublication(
+                schemaVersion = 1,
+                idempotencyKey = idempotencyKey,
+                syncOrigin = origin,
+                configurationId = configurationId,
+                preparedAt = schedule.asOf,
+                request = buildSchedulePublishHttpRequest(
+                    configuration,
+                    SchedulePublishRequest(idempotencyKey, digest, schedule),
+                ),
+                candidate = candidate,
+            ),
+        )
+    }
 
     private class FakePlannerSnapshotDao(
         var snapshot: PlannerSnapshotEntity? = null,

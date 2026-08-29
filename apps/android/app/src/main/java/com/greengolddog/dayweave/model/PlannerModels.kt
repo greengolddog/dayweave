@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.model
 
+import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalTime
@@ -342,6 +343,7 @@ data class UnscheduledWorkSnapshot(
 )
 
 /** One atomically persisted server reconciliation. */
+@Serializable
 data class CanonicalPlanUpdate(
     val items: List<CanonicalItemSnapshot>,
     val schedule: List<ScheduleItem>,
@@ -362,6 +364,35 @@ data class CanonicalPlanUpdate(
     val unscheduledWork: List<UnscheduledWorkSnapshot>,
     val occurrenceSeriesItemIds: Map<String, String>,
     val message: String,
+)
+
+@Serializable
+data class PublishedScheduleRevisionSnapshot(
+    val id: String,
+    val revision: String,
+    val revisionNumber: ULong,
+    val inputDigest: String,
+    val horizonStart: String,
+    val horizonEnd: String,
+    val timezoneName: String,
+    val publishedAt: String,
+)
+
+/**
+ * Crash-replay journal written before a schedule publication can leave the device.
+ *
+ * [candidate] is intentionally not installed into the active canonical cache until the exact
+ * request has a strictly validated server receipt.
+ */
+@Serializable
+data class PendingSchedulePublication(
+    val schemaVersion: Int,
+    val idempotencyKey: String,
+    val syncOrigin: String,
+    val configurationId: String? = null,
+    val preparedAt: String,
+    val request: SchedulePublishHttpRequest,
+    val candidate: CanonicalPlanUpdate,
 )
 
 @Serializable
@@ -463,6 +494,10 @@ data class DayWeaveUiState(
     /** Credential/workspace binding for every canonical cursor/cache field above and below. */
     val canonicalConfigurationId: String? = null,
     val canonicalDeltaCursor: String? = null,
+    /** Non-null only between durable staging and a strictly validated publish receipt. */
+    val pendingSchedulePublication: PendingSchedulePublication? = null,
+    /** Receipt proving that [scheduleInputDigest] was published under this exact binding. */
+    val publishedScheduleRevision: PublishedScheduleRevisionSnapshot? = null,
     val scheduleInputDigest: String? = null,
     val scheduleGeneratedAt: String? = null,
     val schedulePlanningZoneId: String? = null,
@@ -577,11 +612,14 @@ data class DayWeaveUiState(
         reference: Instant = Instant.now(),
         currentZone: ZoneId = ZoneId.systemDefault(),
     ): Boolean {
+        if (pendingSchedulePublication != null) return false
         if (canonicalSyncOrigin == null) return true
+        val published = publishedScheduleRevision ?: return false
+        if (published.inputDigest != scheduleInputDigest) return false
         val zone = schedulePlanningZoneId?.let { raw ->
             runCatching { ZoneId.of(raw) }.getOrNull()
         } ?: return false
-        return zone == currentZone &&
+        return published.timezoneName == zone.id && zone == currentZone &&
             canonicalPlanningDate() == reference.atZone(currentZone).toLocalDate()
     }
 

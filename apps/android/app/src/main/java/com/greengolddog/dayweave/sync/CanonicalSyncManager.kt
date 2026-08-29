@@ -6,6 +6,8 @@ import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.network.ApiBindingChangedException
@@ -23,9 +25,12 @@ import com.greengolddog.dayweave.network.RemoteCanonicalItem
 import com.greengolddog.dayweave.network.RemoteItemDeltaChange
 import com.greengolddog.dayweave.network.RemoteScheduleBlock
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
+import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
+import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.network.SecureCredentialException
+import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.normalizedHttpsApiBaseUrl
 import com.greengolddog.dayweave.network.validateBearerToken
 import com.greengolddog.dayweave.state.PlannerLoadState
@@ -94,7 +99,7 @@ enum class CanonicalRefreshOutcome {
 }
 
 class CanonicalConfigurationChangeBlockedException : IllegalStateException(
-    "A canonical item action must be reconciled before changing API credentials",
+    "A canonical server action must be reconciled before changing API credentials",
 )
 
 class CanonicalAbandonmentPersistenceException : IllegalStateException(
@@ -110,6 +115,7 @@ class CanonicalSyncManager(
     private val zoneId: () -> ZoneId = ZoneId::systemDefault,
     private val dayStartMinute: Int = DEFAULT_DAY_START_MINUTE,
     private val dayEndMinute: Int = DEFAULT_DAY_END_MINUTE,
+    private val newPublicationIdempotencyKey: () -> String = { UUID.randomUUID().toString() },
 ) {
     private val operationMutex = Mutex()
     private val focusTransitionMutex = Mutex()
@@ -186,8 +192,9 @@ class CanonicalSyncManager(
         validateBearerToken(requireNotNull(bearerToken))
         if (plannerStore.hasCredentialReplacementBlocker()) {
             updateError(
-                "Reconcile the pending canonical/execution action or explicitly forget the " +
-                    "connection before replacing its bearer token.",
+                "Recover the exact pending schedule publication, reconcile the pending " +
+                    "canonical/execution action, or explicitly forget the connection before " +
+                    "replacing its bearer token.",
             )
             throw CanonicalConfigurationChangeBlockedException()
         }
@@ -199,6 +206,8 @@ class CanonicalSyncManager(
         val planner = plannerStore.state.value
         val hasCredentialBoundPlannerState = planner.canonicalSyncOrigin != null ||
             planner.canonicalDeltaCursor != null || planner.canonicalItems.isNotEmpty() ||
+            planner.pendingSchedulePublication != null ||
+            planner.publishedScheduleRevision != null ||
             planner.schedule.any { it.canonicalItemId != null } ||
             planner.canonicalExecutionSyncOrigin != null ||
             planner.canonicalExecutionSession != null ||
@@ -251,24 +260,11 @@ class CanonicalSyncManager(
                     val instant = now()
                     val planningZone = zoneId()
                     ensureDurableWorkspaceBinding(configuration)
-                    val pendingResolution = reconcilePendingMutation(configuration)
-                    if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
-                        projectPendingTerminalExecution(configuration)
-                    }
-                    var loadedUpdate = loadConsistentPlan(
+                    var update = recoverOrPublishAcceptedSchedule(
                         configuration = configuration,
                         instant = instant,
                         planningZone = planningZone,
                     )
-                    var update = if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
-                        loadedUpdate.copy(
-                            message = "${loadedUpdate.message} A pending action was superseded by newer canonical state.",
-                        )
-                    } else {
-                        loadedUpdate
-                    }
-                    ensureConfigurationCurrent(configuration)
-                    persistCanonicalPlan(update)
                     var projectionPasses = 0
                     var projectionResult = projectPendingTerminalExecution(configuration)
                     while (
@@ -276,14 +272,11 @@ class CanonicalSyncManager(
                         projectionResult in TERMINAL_PROJECTION_RELOAD_RESULTS
                     ) {
                         projectionPasses += 1
-                        loadedUpdate = loadConsistentPlan(
+                        update = recoverOrPublishAcceptedSchedule(
                             configuration = configuration,
                             instant = instant,
                             planningZone = planningZone,
                         )
-                        update = loadedUpdate
-                        ensureConfigurationCurrent(configuration)
-                        persistCanonicalPlan(update)
                         projectionResult = projectPendingTerminalExecution(configuration)
                     }
                     val metadataSaved = runCatching {
@@ -320,7 +313,7 @@ class CanonicalSyncManager(
         configuration: AuthenticatedApiConfiguration,
         instant: Instant,
         planningZone: ZoneId,
-    ): CanonicalPlanUpdate {
+    ): AcceptedCanonicalPreview {
         val planningDate = instant.atZone(planningZone).toLocalDate()
         for (attempt in 1..MAX_SNAPSHOT_ATTEMPTS) {
             val canonical = loadDelta(configuration)
@@ -334,7 +327,7 @@ class CanonicalSyncManager(
             val preview = transport.preview(configuration, request)
             ensureConfigurationCurrent(configuration)
             try {
-                return mapPreview(
+                val update = mapPreview(
                     preview = preview,
                     canonicalItems = canonical.items,
                     syncOrigin = configuration.baseUrl.toString(),
@@ -353,6 +346,7 @@ class CanonicalSyncManager(
                         dayEndMinute,
                     ),
                 ).copy(configurationId = configuration.configurationId)
+                return AcceptedCanonicalPreview(request, update)
             } catch (error: RemoteSnapshotChangedException) {
                 if (attempt == MAX_SNAPSHOT_ATTEMPTS) throw error
                 // Neither transient delta nor preview has touched durable state. Pull again from
@@ -362,9 +356,180 @@ class CanonicalSyncManager(
         throw RemoteSnapshotChangedException()
     }
 
-    private suspend fun persistCanonicalPlan(update: CanonicalPlanUpdate) {
-        val receipt = plannerStore.replaceCanonicalPlan(update)
-        if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+    private suspend fun recoverOrPublishAcceptedSchedule(
+        configuration: AuthenticatedApiConfiguration,
+        instant: Instant,
+        planningZone: ZoneId,
+    ): CanonicalPlanUpdate {
+        var recoveredStaleOrReplayCount = 0
+        while (true) {
+            try {
+                plannerStore.state.value.pendingSchedulePublication?.let { pending ->
+                    return resumeSchedulePublication(configuration, pending)
+                }
+                val pendingResolution = reconcilePendingMutation(configuration)
+                if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
+                    projectPendingTerminalExecution(configuration)
+                }
+                val loaded = loadConsistentPlan(
+                    configuration = configuration,
+                    instant = instant,
+                    planningZone = planningZone,
+                )
+                var message = loaded.update.message
+                if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
+                    message += " A pending action was superseded by newer canonical state."
+                }
+                if (recoveredStaleOrReplayCount > 0) {
+                    message += " A stale or replayed publication was safely recomposed."
+                }
+                return publishAcceptedSchedule(
+                    configuration,
+                    loaded.copy(update = loaded.update.copy(message = message)),
+                )
+            } catch (_: ReplayedSchedulePublicationNeedsFreshSnapshotException) {
+                recoveredStaleOrReplayCount += 1
+            } catch (error: StaleSchedulePublicationRejectedException) {
+                val cleared = try {
+                    plannerStore.discardStaleSchedulePublication(error.expected)
+                } catch (_: IllegalArgumentException) {
+                    throw CanonicalConfigurationChangedException()
+                }
+                if (cleared == null || !cleared.awaitDurable()) {
+                    throw LocalPlannerStorageException()
+                }
+                ensureConfigurationCurrent(configuration)
+                recoveredStaleOrReplayCount += 1
+            }
+            if (
+                recoveredStaleOrReplayCount >
+                MAX_SCHEDULE_PUBLICATION_RECOVERY_RECOMPOSITIONS
+            ) {
+                throw SchedulePublicationRecoveryExhaustedException()
+            }
+        }
+    }
+
+    private suspend fun publishAcceptedSchedule(
+        configuration: AuthenticatedApiConfiguration,
+        accepted: AcceptedCanonicalPreview,
+    ): CanonicalPlanUpdate {
+        ensureConfigurationCurrent(configuration)
+        val idempotencyKey = newPublicationIdempotencyKey()
+        val pending = try {
+            val canonicalKey = UUID.fromString(idempotencyKey)
+            require(canonicalKey != NIL_UUID && canonicalKey.toString() == idempotencyKey)
+            val publishRequest = SchedulePublishRequest(
+                idempotencyKey = idempotencyKey,
+                expectedInputDigest = accepted.update.inputDigest,
+                schedule = accepted.request,
+            )
+            PendingSchedulePublication(
+                schemaVersion = SCHEDULE_PUBLICATION_JOURNAL_VERSION,
+                idempotencyKey = idempotencyKey,
+                syncOrigin = configuration.baseUrl.toString(),
+                configurationId = configuration.configurationId,
+                preparedAt = now().toString(),
+                request = buildSchedulePublishHttpRequest(configuration, publishRequest),
+                candidate = accepted.update,
+            ).also(plannerStore::validateSchedulePublication)
+        } catch (error: IllegalArgumentException) {
+            throw SchedulePublicationContractException(error)
+        }
+        val staged = try {
+            plannerStore.stageSchedulePublication(pending)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalConfigurationChangedException()
+        }
+        if (staged == null || !staged.awaitDurable()) throw LocalPlannerStorageException()
+        ensureConfigurationCurrent(configuration)
+        if (plannerStore.state.value.pendingSchedulePublication != pending) {
+            throw CanonicalConfigurationChangedException()
+        }
+        return resumeSchedulePublication(configuration, pending)
+    }
+
+    private suspend fun resumeSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        pending: PendingSchedulePublication,
+    ): CanonicalPlanUpdate {
+        try {
+            plannerStore.validateSchedulePublication(pending)
+        } catch (error: IllegalArgumentException) {
+            throw SchedulePublicationContractException(error)
+        }
+        if (
+            pending.syncOrigin != configuration.baseUrl.toString() ||
+            pending.configurationId != configuration.configurationId ||
+            plannerStore.state.value.pendingSchedulePublication != pending
+        ) {
+            throw CanonicalConfigurationChangedException()
+        }
+        ensureConfigurationCurrent(configuration)
+        val response = try {
+            transport.publish(configuration, pending.request)
+        } catch (error: PlannerApiException.SchedulePublicationStale) {
+            throw StaleSchedulePublicationRejectedException(pending, error)
+        }
+        val receivedAt = now()
+        ensureConfigurationCurrent(configuration)
+        if (plannerStore.state.value.pendingSchedulePublication != pending) {
+            throw CanonicalConfigurationChangedException()
+        }
+        val revision = validateSchedulePublishResponse(pending, response, receivedAt)
+        if (response.replayed) {
+            val resolved = try {
+                plannerStore.resolveReplayedSchedulePublication(pending, revision)
+            } catch (_: IllegalArgumentException) {
+                throw CanonicalConfigurationChangedException()
+            }
+            if (resolved == null || !resolved.awaitDurable()) throw LocalPlannerStorageException()
+            ensureConfigurationCurrent(configuration)
+            throw ReplayedSchedulePublicationNeedsFreshSnapshotException()
+        }
+        val committed = try {
+            plannerStore.commitSchedulePublication(pending, revision)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalConfigurationChangedException()
+        }
+        if (committed == null || !committed.awaitDurable()) throw LocalPlannerStorageException()
+        ensureConfigurationCurrent(configuration)
+        return pending.candidate
+    }
+
+    private fun validateSchedulePublishResponse(
+        pending: PendingSchedulePublication,
+        response: RemoteSchedulePublishResponse,
+        receivedAt: Instant,
+    ): PublishedScheduleRevisionSnapshot = try {
+        val remote = response.revision
+        val revisionId = UUID.fromString(remote.id)
+        require(revisionId != NIL_UUID && revisionId.toString() == remote.id)
+        require(remote.revisionNumber > 0uL)
+        require(remote.revision == "${remote.revisionNumber}:${remote.id}")
+        val exactRequest = mutationJson.decodeFromString<SchedulePublishRequest>(
+            pending.request.bodyJson,
+        )
+        require(remote.inputDigest == exactRequest.expectedInputDigest)
+        require(remote.horizonStart == exactRequest.schedule.horizonStart)
+        require(remote.horizonEnd == exactRequest.schedule.horizonEnd)
+        require(remote.timezoneName == exactRequest.schedule.timezoneName)
+        val publishedAt = requireNotNull(
+            runCatching { Instant.parse(remote.publishedAt) }.getOrNull(),
+        )
+        require(!publishedAt.isAfter(receivedAt.plusSeconds(PUBLICATION_CLOCK_SKEW_SECONDS)))
+        PublishedScheduleRevisionSnapshot(
+            id = remote.id,
+            revision = remote.revision,
+            revisionNumber = remote.revisionNumber,
+            inputDigest = remote.inputDigest,
+            horizonStart = remote.horizonStart,
+            horizonEnd = remote.horizonEnd,
+            timezoneName = remote.timezoneName,
+            publishedAt = remote.publishedAt,
+        )
+    } catch (error: IllegalArgumentException) {
+        throw SchedulePublicationContractException(error)
     }
 
     suspend fun start(blockId: String): CanonicalRefreshOutcome = focusTransitionMutex.withLock {
@@ -2400,9 +2565,13 @@ class CanonicalSyncManager(
         val current = plannerStore.state.value
         val origin = configuration.baseUrl.toString()
         val configurationId = configuration.configurationId
-        val hasCanonicalState = current.canonicalSyncOrigin != null ||
+        val hasCanonicalCache = current.canonicalSyncOrigin != null ||
             current.canonicalDeltaCursor != null || current.canonicalItems.isNotEmpty() ||
-            current.pendingCanonicalMutation != null
+            current.pendingCanonicalMutation != null ||
+            current.publishedScheduleRevision != null
+        val pendingPublicationMismatch = current.pendingSchedulePublication?.let { pending ->
+            pending.syncOrigin != origin || pending.configurationId != configurationId
+        } ?: false
         val hasExecutionState = current.canonicalExecutionSyncOrigin != null ||
             current.canonicalExecutionSession != null ||
             current.canonicalExecutionHistoryWindow.isNotEmpty() ||
@@ -2411,7 +2580,7 @@ class CanonicalSyncManager(
             current.canonicalExecutionHistoryVerified ||
             current.terminalExecutionOutcomes.isNotEmpty() ||
             current.pendingExecutionCommand != null
-        val canonicalMismatch = hasCanonicalState &&
+        val canonicalMismatch = pendingPublicationMismatch || hasCanonicalCache &&
             (current.canonicalSyncOrigin != origin ||
                 current.canonicalConfigurationId != configurationId)
         val executionMismatch = hasExecutionState &&
@@ -2460,10 +2629,16 @@ class CanonicalSyncManager(
             is PlannerApiException.InvalidResponse,
             is RemotePlannerMappingException,
             is RemoteSnapshotChangedException,
+            is SchedulePublicationContractException,
             -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "The server planner contract is incompatible with this DayWeave build.",
                 CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            )
+            is SchedulePublicationRecoveryExhaustedException -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "Canonical items kept changing during publication. Recompose again to publish a fresh schedule.",
+                CanonicalRefreshOutcome.STALE_REVISION,
             )
             is InvalidCanonicalTransitionException -> Triple(
                 CanonicalSyncPhase.ERROR,
@@ -2487,11 +2662,12 @@ class CanonicalSyncManager(
             )
             is LocalPlannerStorageException -> Triple(
                 CanonicalSyncPhase.ERROR,
-                "The server accepted the action, but encrypted local storage failed. Recompose before continuing.",
+                "A server outcome could not be recorded in encrypted local storage. Restart " +
+                    "before continuing so the durable recovery journal remains authoritative.",
                 CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
             )
             is PlannerApiException.Http -> if (
-                error.statusCode == 408 || error.statusCode == 429 || error.statusCode in 500..599
+                error.statusCode in setOf(408, 425, 429) || error.statusCode in 500..599
             ) {
                 Triple(
                     CanonicalSyncPhase.OFFLINE,
@@ -2549,6 +2725,11 @@ class CanonicalSyncManager(
         val cursor: String,
     )
 
+    private data class AcceptedCanonicalPreview(
+        val request: SchedulePreviewRequest,
+        val update: CanonicalPlanUpdate,
+    )
+
     private data class ParentTerminalResolution(
         val wireStatus: String,
         val displayStatus: ItemStatus,
@@ -2579,6 +2760,20 @@ class CanonicalSyncManager(
 
     private class RemoteSnapshotChangedException :
         IllegalArgumentException("Canonical snapshot changed during composition")
+
+    private class SchedulePublicationContractException(cause: Throwable? = null) :
+        IllegalArgumentException("Invalid schedule publication contract", cause)
+
+    private class ReplayedSchedulePublicationNeedsFreshSnapshotException :
+        IllegalStateException("Replayed schedule publication requires a fresh snapshot")
+
+    private class StaleSchedulePublicationRejectedException(
+        val expected: PendingSchedulePublication,
+        cause: Throwable,
+    ) : IllegalStateException("Schedule publication was rejected as stale", cause)
+
+    private class SchedulePublicationRecoveryExhaustedException :
+        IllegalStateException("Schedule publication changed repeatedly")
 
     private class InvalidCanonicalTransitionException :
         IllegalStateException("Invalid canonical transition")
@@ -2612,6 +2807,7 @@ class CanonicalSyncManager(
         private const val DEFAULT_DAY_END_MINUTE = 22 * 60
         private const val MAX_BLOCK_MINUTES = 2 * MINUTES_PER_DAY
         private const val MAX_CANONICAL_ITEMS = 10_000
+        private const val MAX_SCHEDULE_PUBLICATION_RECOVERY_RECOMPOSITIONS = 1
         private const val MAX_CANONICAL_CACHE_ESTIMATED_BYTES = 24L * 1024L * 1024L
         private const val CANONICAL_ITEM_OBJECT_OVERHEAD_BYTES = 512L
         private const val MAX_DELTA_PAGES = 512
@@ -2638,6 +2834,9 @@ class CanonicalSyncManager(
         private const val MAX_REMOTE_MESSAGE_CHARS = 4_000
         private const val MAX_BLOCK_EXPLANATIONS = 64
         private const val MAX_PERSISTED_VIOLATION_MESSAGES = 100
+        private const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
+        private const val PUBLICATION_CLOCK_SKEW_SECONDS = 5 * 60L
+        private val NIL_UUID = UUID(0L, 0L)
         private val DIGEST_PATTERN = Regex("^sha256:[0-9a-f]{64}$")
         private val SUPPORTED_BLOCK_KINDS = setOf(
             "planned",

@@ -6,11 +6,40 @@ Planner state, including the last server proposal cache, is stored offline in a 
 
 Canonical focus sessions use the server-authoritative `/v1/execution` lease. Android reconciles that lease before every start, pause (duration, absolute end, or open-ended), resume, complete, and skip command. The app persists a stable random device UUID plus the exact request body and idempotency key before network I/O; an ambiguous response or process restart therefore retries byte-for-byte instead of creating local success or a second session. HTTP 401 keeps the exact retry fenced, while deterministic 404/409/422 responses trigger an authoritative snapshot/history reconciliation. Noncanonical preview blocks still use device-local timing, but canonical blocks never fall back to local execution while offline.
 
+Schedule preview is side-effect-free. After Android validates a preview against the exact pulled item
+revision map, it durably writes a versioned publication journal containing the full canonical
+`POST /v1/schedule/publish` URL, method, security headers, body bytes/digest, idempotency key,
+credential binding, and still-uninstalled candidate plan. Only an exact HTTP 200 receipt whose
+revision, digest, horizon, and timezone match that journal can atomically install the candidate and
+advance the delta cursor. A timeout, cancellation, process death, trusted-401 credential rotation,
+or lost response retains and replays the same request. A strictly typed
+`schedule_publication_stale` 409 durably discards only that candidate and performs one bounded fresh
+pull/preview/new-key publication; generic and idempotency-conflict 409s remain journaled. An HTTP 200
+with `replayed=true` proves the old request once committed but not that it is still the newest
+revision, so Android resolves the journal without installing its candidate, invalidates the local
+publication proof, and freshly recomposes before enabling the plan. Invalid responses leave the
+exact journal intact and block silent credential replacement. Explicit local-only removal is the
+warned escape hatch for irreconcilable ambiguity. Room 5-to-6 / JSON-v4-to-v5 adds this crash journal
+and its published-revision receipt, and a pending journal always makes the cached plan non-current.
+Before constructing or persisting that journal, Android caps the exact UTF-8 publication body at
+12 MiB. This deliberately accommodates the separately bounded 8 MiB retained plan while leaving
+headroom below the server's 16 MiB request limit; 12 MiB is accepted and even one additional byte
+is rejected locally without staging durable publication state.
+
 A timed break never resumes automatically. When its server deadline passes, the explicit Resume / Extend 10m / Keep paused choice appears. Keep paused closes the message without inventing a server mutation, and extending sends another revision-guarded pause command while the lease stays paused.
 
 While the UI is visible, one lifecycle-bound job refreshes the execution lease immediately and every 30 seconds. The process action gate coalesces that work with taps, settings changes, and composition so foreground polling cannot create duplicate command jobs. If a cached lease disappears, Android pages the complete execution history between two equal execution snapshots before applying its terminal outcome; a racing, incomplete, or malformed history read retains any command fence and leaves execution locked instead of guessing. The encrypted snapshot keeps a rolling 100-session history window for display plus a lifetime terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after enough newer sessions.
 
-All authenticated Android APIs share one process-wide device-auth coordinator. A first installation either upgrades with the reviewed hybrid bootstrap credential or consumes an already-minted one-time `dw_en1_` enrollment code bound to the client ID displayed by Android. The resulting access and refresh credentials live only in a versioned whole-state envelope encrypted by a non-exportable Android Keystore key; they are never placed in the Room planner snapshot, WorkManager data, logs, or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from backup and device transfer.
+All authenticated Android APIs share one process-wide device-auth coordinator. Contract version 2
+adds the REST-only `schedule_publish` scope to the Android enrollment tuple; it is not an MCP scope.
+An older active or pending contract cannot gain that authority through refresh and therefore fails
+closed until the user explicitly revokes/removes and re-enrolls. A first installation either
+upgrades with the reviewed hybrid bootstrap credential or consumes an already-minted one-time
+`dw_en1_` enrollment code bound to the client ID displayed by Android. The resulting access and
+refresh credentials live only in a versioned whole-state envelope encrypted by a non-exportable
+Android Keystore key; they are never placed in the Room planner snapshot, WorkManager data, logs,
+or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from
+backup and device transfer.
 
 ## Sensitive-item authoring
 

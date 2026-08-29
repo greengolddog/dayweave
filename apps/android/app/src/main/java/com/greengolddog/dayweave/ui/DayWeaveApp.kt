@@ -475,7 +475,8 @@ private fun DayWeaveRoot(
     if (showApiConnection) {
         ApiConnectionDialog(
             authState = deviceAuthState,
-            credentialReplacementBlocked = state.pendingCanonicalMutation != null ||
+            credentialReplacementBlocked = state.pendingSchedulePublication != null ||
+                state.pendingCanonicalMutation != null ||
                 state.pendingExecutionCommand != null ||
                 state.terminalExecutionOutcomes.values.any {
                     it.requiresCanonicalItemProjection &&

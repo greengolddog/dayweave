@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.network
 
+import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -97,6 +98,168 @@ class OkHttpCanonicalPlannerTransportTest {
             ?.single() as JsonObject
         assertEquals("true", fixedBlock["is_sensitive"]?.jsonPrimitive?.content)
         assertEquals(JsonObject(emptyMap()), body["recurrence_context"])
+    }
+
+    @Test
+    fun publishSendsExactJournaledRequestAndDecodesStrictRevision() = runBlocking {
+        val configuration = configuration()
+        val schedule = scheduleRequest()
+        val digest = "sha256:${"b".repeat(64)}"
+        val idempotencyKey = "33333333-3333-4333-8333-333333333333"
+        val request = buildSchedulePublishHttpRequest(
+            configuration,
+            SchedulePublishRequest(idempotencyKey, digest, schedule),
+        )
+        val revisionId = "55555555-5555-4555-8555-555555555555"
+        server.enqueue(
+            jsonResponse(
+                """{"revision":{"id":"$revisionId","revision":"9:$revisionId","revision_number":9,"input_digest":"$digest","horizon_start":"${schedule.horizonStart}","horizon_end":"${schedule.horizonEnd}","timezone_name":"${schedule.timezoneName}","published_at":"2026-09-01T07:01:00Z"},"replayed":false}""",
+            ),
+        )
+
+        val response = transport.publish(configuration, request)
+
+        assertEquals(9uL, response.revision.revisionNumber)
+        assertFalse(response.replayed)
+        val recorded = server.takeRequest()
+        assertEquals("POST", recorded.method)
+        assertEquals("/tenant/v1/schedule/publish", recorded.url.encodedPath)
+        assertEquals("application/json", recorded.headers["Accept"])
+        assertEquals("application/json; charset=utf-8", recorded.headers["Content-Type"])
+        assertEquals("no-store", recorded.headers["Cache-Control"])
+        assertEquals("no-cache", recorded.headers["Pragma"])
+        assertEquals("Bearer unit-test-secret", recorded.headers["Authorization"])
+        assertEquals(request.bodyJson, requireNotNull(recorded.body).utf8())
+        assertEquals(plannerSha256(request.bodyJson), request.bodySha256)
+    }
+
+    @Test
+    fun publicationBodyCeilingAcceptsExactLimitAndRejectsOneAdditionalByte() {
+        val configuration = configuration()
+        val emptyTitleRequest = SchedulePublishRequest(
+            idempotencyKey = "33333333-3333-4333-8333-333333333333",
+            expectedInputDigest = "sha256:${"b".repeat(64)}",
+            schedule = scheduleRequest().copy(
+                fixedBlocks = listOf(syntheticFixedBlock(title = "")),
+            ),
+        )
+        val json = OkHttpCanonicalPlannerTransport.defaultJson()
+        val emptyTitleBytes = json.encodeToString(emptyTitleRequest)
+            .toByteArray(StandardCharsets.UTF_8)
+            .size
+        val paddingBytes = MAX_SCHEDULE_PUBLISH_BODY_BYTES - emptyTitleBytes
+        assertTrue(paddingBytes > 0)
+
+        val exactRequest = emptyTitleRequest.copy(
+            schedule = emptyTitleRequest.schedule.copy(
+                fixedBlocks = listOf(syntheticFixedBlock(title = "x".repeat(paddingBytes))),
+            ),
+        )
+        val exact = buildSchedulePublishHttpRequest(configuration, exactRequest)
+
+        assertEquals(
+            MAX_SCHEDULE_PUBLISH_BODY_BYTES,
+            exact.bodyJson.toByteArray(StandardCharsets.UTF_8).size,
+        )
+        assertEquals(exactRequest, validateSchedulePublishHttpRequest(configuration, exact))
+
+        val overLimitRequest = exactRequest.copy(
+            schedule = exactRequest.schedule.copy(
+                fixedBlocks = listOf(
+                    syntheticFixedBlock(title = "x".repeat(paddingBytes + 1)),
+                ),
+            ),
+        )
+        assertEquals(
+            MAX_SCHEDULE_PUBLISH_BODY_BYTES + 1,
+            json.encodeToString(overLimitRequest).toByteArray(StandardCharsets.UTF_8).size,
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            buildSchedulePublishHttpRequest(configuration, overLimitRequest)
+        }
+    }
+
+    @Test
+    fun publishRejectsNon200AndNonJsonWithoutWeakeningExactJournal() {
+        val configuration = configuration()
+        val request = buildSchedulePublishHttpRequest(
+            configuration,
+            SchedulePublishRequest(
+                "33333333-3333-4333-8333-333333333333",
+                "sha256:${"b".repeat(64)}",
+                scheduleRequest(),
+            ),
+        )
+        listOf(201, 202, 204).forEach { status ->
+            server.enqueue(
+                MockResponse.Builder()
+                    .code(status)
+                    .addHeader("Content-Type", "application/json")
+                    .apply { if (status != 204) body("{}") }
+                    .build(),
+            )
+            val error = assertThrows(PlannerApiException.Http::class.java) {
+                runBlocking { transport.publish(configuration, request) }
+            }
+            assertEquals(status, error.statusCode)
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .addHeader("Content-Type", "application/javascript")
+                .body("{}")
+                .build(),
+        )
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.publish(configuration, request) }
+        }
+        assertEquals(4, server.requestCount)
+    }
+
+    @Test
+    fun publishTrustsOnlyTheExactTypedStaleConflictEnvelope() {
+        val configuration = configuration()
+        val request = buildSchedulePublishHttpRequest(
+            configuration,
+            SchedulePublishRequest(
+                "33333333-3333-4333-8333-333333333333",
+                "sha256:${"b".repeat(64)}",
+                scheduleRequest(),
+            ),
+        )
+        server.enqueue(
+            MockResponse.Builder()
+                .code(409)
+                .addHeader("Content-Type", "application/json; charset=utf-8")
+                .body(
+                    """{"error":{"code":"schedule_publication_stale","message":"Synthetic item revision changed"}}""",
+                )
+                .build(),
+        )
+        assertThrows(PlannerApiException.SchedulePublicationStale::class.java) {
+            runBlocking { transport.publish(configuration, request) }
+        }
+
+        listOf(
+            """{"error":{"code":"schedule_publication_idempotency_conflict","message":"Synthetic tuple conflict"}}""",
+            """{"error":{"code":"conflict","message":"Synthetic generic conflict"}}""",
+            """{"error":{"code":"schedule_publication_stale","message":"Synthetic item revision changed","future":true}}""",
+            """{"error":{"code":"schedule_publication_stale","message":"Synthetic item revision changed","details":{"unexpected":true}}}""",
+            """{"error":{"code":"schedule_publication_stale","message":"Synthetic item revision changed","details":null}}""",
+        ).forEach { body ->
+            server.enqueue(
+                MockResponse.Builder()
+                    .code(409)
+                    .addHeader("Content-Type", "application/json")
+                    .body(body)
+                    .build(),
+            )
+            assertThrows(PlannerApiException.Conflict::class.java) {
+                runBlocking { transport.publish(configuration, request) }
+            }
+        }
+        assertEquals(6, server.requestCount)
     }
 
     @Test
@@ -280,6 +443,28 @@ class OkHttpCanonicalPlannerTransportTest {
           }
         }
     """.trimIndent()
+
+    private fun scheduleRequest() = SchedulePreviewRequest(
+        asOf = "2026-09-01T07:00:00Z",
+        horizonStart = "2026-08-31T22:00:00Z",
+        horizonEnd = "2026-09-01T22:00:00Z",
+        timezoneName = "Europe/Madrid",
+        availability = listOf(
+            ScheduleAvailabilityRequest(
+                start = "2026-09-01T05:00:00Z",
+                end = "2026-09-01T20:00:00Z",
+            ),
+        ),
+    )
+
+    private fun syntheticFixedBlock(title: String) = FixedScheduleBlockRequest(
+        id = "44444444-4444-4444-8444-444444444444",
+        isSensitive = false,
+        title = title,
+        start = "2026-09-01T08:00:00Z",
+        end = "2026-09-01T08:30:00Z",
+        source = "synthetic_boundary_fixture",
+    )
 
     private companion object {
         const val TASK_ID = "11111111-1111-4111-8111-111111111111"

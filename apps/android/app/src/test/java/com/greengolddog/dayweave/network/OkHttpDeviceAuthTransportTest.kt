@@ -48,7 +48,7 @@ class OkHttpDeviceAuthTransportTest {
         server.enqueue(
             strictJson(
                 201,
-                """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"${now.plus(Duration.ofMinutes(10))}","client_contract_version":1,"replayed":false}""",
+                """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"${now.plus(Duration.ofMinutes(10))}","client_contract_version":$DEVICE_AUTH_CONTRACT_VERSION,"replayed":false}""",
             ),
         )
 
@@ -94,7 +94,7 @@ class OkHttpDeviceAuthTransportTest {
         val enrollment = syntheticDeviceToken(DEVICE_ENROLLMENT_TOKEN_PREFIX, 30)
         val future = now.plusSeconds(600)
         fun response(id: String, token: String, replayed: Boolean) =
-            """{"id":"$id","enrollment_token":"$token","expires_at":"$future","client_contract_version":1,"replayed":$replayed}"""
+            """{"id":"$id","enrollment_token":"$token","expires_at":"$future","client_contract_version":$DEVICE_AUTH_CONTRACT_VERSION,"replayed":$replayed}"""
 
         server.enqueue(strictJson(200, response(SYNTHETIC_SESSION_ID, enrollment, true)))
         assertTrue(createEnrollment().replayed)
@@ -341,7 +341,7 @@ class OkHttpDeviceAuthTransportTest {
     @Test
     fun successWithoutExactNoStoreOrJsonMediaTypeFailsClosed() {
         val enrollment = syntheticDeviceToken(DEVICE_ENROLLMENT_TOKEN_PREFIX, 12)
-        val body = """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"${now.plus(Duration.ofMinutes(10))}","client_contract_version":1,"replayed":false}"""
+        val body = """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"${now.plus(Duration.ofMinutes(10))}","client_contract_version":$DEVICE_AUTH_CONTRACT_VERSION,"replayed":false}"""
         server.enqueue(
             MockResponse.Builder()
                 .code(201)
@@ -360,7 +360,7 @@ class OkHttpDeviceAuthTransportTest {
             runBlocking { createEnrollment() }
         }
 
-        val expired = """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"$now","client_contract_version":1,"replayed":false}"""
+        val expired = """{"id":"$SYNTHETIC_SESSION_ID","enrollment_token":"$enrollment","expires_at":"$now","client_contract_version":$DEVICE_AUTH_CONTRACT_VERSION,"replayed":false}"""
         server.enqueue(strictJson(201, expired))
         assertThrows(DeviceAuthApiException.InvalidResponse::class.java) {
             runBlocking { createEnrollment() }

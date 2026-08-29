@@ -54,6 +54,15 @@ internal interface DeviceAuthBindingFence {
         nextBaseUrl: String?,
         nextBindingId: String?,
     ): Boolean
+
+    /**
+     * Explicitly confirmed local-only destruction may quarantine an ambiguous write journal.
+     * Implementations still have to make that quarantine durable before returning true.
+     */
+    suspend fun beforeConfirmedLocalDestruction(
+        previousBaseUrl: String?,
+        previousBindingId: String?,
+    ): Boolean = beforeBindingChange(previousBaseUrl, previousBindingId, null, null)
 }
 
 internal object AllowDeviceAuthBindingChange : DeviceAuthBindingFence {
@@ -426,11 +435,9 @@ internal class DurableDeviceAuthCoordinator(
                     return@invalidateBeforeQuarantine BindingDestroyOutcome.Stale
                 }
                 if (
-                    !bindingFence.beforeBindingChange(
+                    !bindingFence.beforeConfirmedLocalDestruction(
                         state.baseUrl,
                         priorBinding(state),
-                        null,
-                        null,
                     )
                 ) {
                     return@invalidateBeforeQuarantine BindingDestroyOutcome.FenceBlocked

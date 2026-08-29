@@ -75,6 +75,63 @@ class DeviceAuthRequestCoordinatorTest {
     }
 
     @Test
+    fun trusted401ReplaysExactSchedulePublicationBodyAndSecurityHeaders() = runBlocking {
+        val baseUrl = server.url("/tenant/").toString()
+        val active = activeForRequests(baseUrl, accessExpiry = now.plus(Duration.ofMinutes(10)))
+        val store = FakeDeviceAuthEnvelopeStore(active)
+        val refreshTransport = successfulRefreshTransport(active)
+        val coordinator = coordinator(store, refreshTransport)
+        val configuration = requireNotNull(coordinator.authenticatedConfiguration())
+        val digest = "sha256:${"a".repeat(64)}"
+        val schedule = SchedulePreviewRequest(
+            asOf = now.toString(),
+            horizonStart = now.minus(Duration.ofHours(1)).toString(),
+            horizonEnd = now.plus(Duration.ofDays(1)).toString(),
+            timezoneName = "UTC",
+            availability = listOf(
+                ScheduleAvailabilityRequest(
+                    start = now.toString(),
+                    end = now.plus(Duration.ofHours(8)).toString(),
+                ),
+            ),
+        )
+        val exact = buildSchedulePublishHttpRequest(
+            configuration,
+            SchedulePublishRequest(
+                idempotencyKey = "33333333-3333-4333-8333-333333333333",
+                expectedInputDigest = digest,
+                schedule = schedule,
+            ),
+        )
+        val revisionId = "44444444-4444-4444-8444-444444444444"
+        server.enqueue(trustedUnauthorized())
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .addHeader("Content-Type", "application/json")
+                .body(
+                    """{"revision":{"id":"$revisionId","revision":"1:$revisionId","revision_number":1,"input_digest":"$digest","horizon_start":"${schedule.horizonStart}","horizon_end":"${schedule.horizonEnd}","timezone_name":"UTC","published_at":"$now"},"replayed":false}""",
+                )
+                .build(),
+        )
+
+        val published = OkHttpCanonicalPlannerTransport().publish(configuration, exact)
+
+        assertEquals(1uL, published.revision.revisionNumber)
+        assertEquals(1, refreshTransport.refreshCalls.size)
+        val first = server.takeRequest()
+        val retry = server.takeRequest()
+        assertEquals(first.method, retry.method)
+        assertEquals(first.url, retry.url)
+        assertEquals(first.body, retry.body)
+        assertEquals(first.headers["Accept"], retry.headers["Accept"])
+        assertEquals(first.headers["Content-Type"], retry.headers["Content-Type"])
+        assertEquals(first.headers["Cache-Control"], retry.headers["Cache-Control"])
+        assertEquals(first.headers["Pragma"], retry.headers["Pragma"])
+        assertNotEquals(first.headers["Authorization"], retry.headers["Authorization"])
+    }
+
+    @Test
     fun concurrentProactiveRequestsShareOneRefresh() = runBlocking {
         val baseUrl = server.url("/tenant/").toString()
         val active = activeForRequests(baseUrl, accessExpiry = now.plus(Duration.ofMinutes(1)))

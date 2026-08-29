@@ -40,11 +40,12 @@ object PlannerSnapshotFormats {
     const val JSON_V2 = "json-v2-canonical-execution"
     const val JSON_V3 = "json-v3-sensitive-items"
     const val JSON_V4 = "json-v4-sensitive-authoring"
+    const val JSON_V5 = "json-v5-schedule-publication-journal"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 5,
+    version = 6,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -82,6 +83,14 @@ object PlannerDatabaseMigrations {
      * explicit Inbox sensitivity and an exact sensitivity target for pending canonical writes.
      */
     val MIGRATION_4_5 = object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
+
+    /**
+     * No columns change. The encrypted payload gains an exact schedule-publication journal and a
+     * published revision receipt; the version fence prevents an older binary from ignoring them.
+     */
+    val MIGRATION_5_6 = object : Migration(5, 6) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
 }
@@ -128,6 +137,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_2_3,
                 PlannerDatabaseMigrations.MIGRATION_3_4,
                 PlannerDatabaseMigrations.MIGRATION_4_5,
+                PlannerDatabaseMigrations.MIGRATION_5_6,
             )
             .build()
     }
