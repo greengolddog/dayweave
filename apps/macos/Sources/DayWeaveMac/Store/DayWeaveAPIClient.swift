@@ -551,6 +551,7 @@ extension DayWeaveAPIError: LocalizedError {
 struct DayWeaveAPIClient: Sendable {
     static let maximumResponseBytes = 16 * 1_048_576
     static let maximumRequestBytes = 16 * 1_048_576
+    static let maximumExecutionHistoryLimit = 100
 
     private struct SuggestionListEnvelope: Decodable {
         let suggestions: [DayWeaveProposal]
@@ -673,6 +674,100 @@ struct DayWeaveAPIClient: Sendable {
             body: body
         )
         return envelope.suggestion
+    }
+
+    func executionSnapshot() async throws -> DayWeaveExecutionSnapshot {
+        let envelope: DayWeaveExecutionSnapshotEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "execution"]
+        )
+        return envelope.execution
+    }
+
+    func executionHistory(limit: Int = Self.maximumExecutionHistoryLimit) async throws
+        -> [DayWeaveExecutionSession]
+    {
+        guard (1...Self.maximumExecutionHistoryLimit).contains(limit) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let envelope: DayWeaveExecutionHistoryEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "execution", "history"],
+            queryItems: [URLQueryItem(name: "limit", value: String(limit))]
+        )
+        guard envelope.sessions.count <= limit,
+              Set(envelope.sessions.map(\.id)).count == envelope.sessions.count,
+              envelope.sessions.count(where: { $0.status.isOpen }) <= 1,
+              zip(envelope.sessions, envelope.sessions.dropFirst()).allSatisfy({ newer, older in
+                  newer.updatedAt > older.updatedAt
+                      || (newer.updatedAt == older.updatedAt
+                          && newer.id.uuidString.lowercased()
+                              > older.id.uuidString.lowercased())
+              }) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return envelope.sessions
+    }
+
+    /// Produces the deterministic body that the caller must durably retain
+    /// together with its idempotency key before the first network attempt.
+    func encodedExecutionCommand(_ request: DayWeaveExecutionCommandRequest) throws -> Data {
+        try encode(request)
+    }
+
+    func applyExecutionCommand(
+        _ request: DayWeaveExecutionCommandRequest,
+        idempotencyKey: String
+    ) async throws -> DayWeaveExecutionMutation {
+        try await applyExecutionCommand(
+            encodedRequest: encodedExecutionCommand(request),
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    /// Replays a previously persisted byte-for-byte command body.
+    func applyExecutionCommand(
+        encodedRequest: Data,
+        idempotencyKey: String
+    ) async throws -> DayWeaveExecutionMutation {
+        let persistedRequest: DayWeaveExecutionCommandRequest
+        do {
+            guard encodedRequest.count <= Self.maximumRequestBytes else {
+                throw DayWeaveAPIError.requestEncodingFailed
+            }
+            persistedRequest = try makeDecoder().decode(
+                DayWeaveExecutionCommandRequest.self,
+                from: encodedRequest
+            )
+        } catch let error as DayWeaveAPIError {
+            throw error
+        } catch {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let idempotencyBytes = idempotencyKey.utf8
+        guard (8...128).contains(idempotencyBytes.count),
+              idempotencyBytes.allSatisfy({ byte in
+                  (48...57).contains(byte)
+                      || (65...90).contains(byte)
+                      || (97...122).contains(byte)
+                      || [46, 95, 58, 45].contains(byte)
+              }) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let envelope: DayWeaveExecutionMutationEnvelope = try await send(
+            method: "POST",
+            pathComponents: ["v1", "execution", "commands"],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: encodedRequest
+        )
+        let expectedMutationRevision = persistedRequest.expectedRevision + 1
+        guard envelope.mutation.revision == expectedMutationRevision,
+              persistedRequest.command.matchesChangedSession(
+                  envelope.mutation.changedSession
+              ) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return envelope.mutation
     }
 
     func itemDelta(cursor: String?, limit: Int = 200) async throws -> DayWeaveItemDeltaPage {
