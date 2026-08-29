@@ -84,6 +84,7 @@ pub trait ExecutionRepository: Send + Sync {
     async fn history(
         &self,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<ExecutionSession>, ExecutionRepositoryError>;
 }
 
@@ -224,6 +225,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
     async fn history(
         &self,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<ExecutionSession>, ExecutionRepositoryError> {
         let state = self.state.lock().await;
         let mut sessions: Vec<_> = state.sessions.values().cloned().collect();
@@ -233,8 +235,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
                 .cmp(&left.updated_at)
                 .then_with(|| right.id.cmp(&left.id))
         });
-        sessions.truncate(limit);
-        Ok(sessions)
+        Ok(sessions.into_iter().skip(offset).take(limit).collect())
     }
 }
 

@@ -320,6 +320,7 @@ async fn execution_is_authenticated_cross_device_revisioned_and_idempotent() {
     let history = body_json(history).await;
     assert_eq!(history["sessions"].as_array().unwrap().len(), 1);
     assert_eq!(history["sessions"][0]["status"], "completed");
+    assert!(history["next_offset"].is_null());
 }
 
 #[tokio::test]

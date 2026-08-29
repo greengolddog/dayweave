@@ -16,7 +16,7 @@ const HISTORY_SELECT: &str = "SELECT id, item_id, item_revision, occurrence_id, 
     planned_block_id, source_device_id, state, revision, accumulated_seconds, actual_seconds, \
     started_at, running_since, paused_at, pause_until, pause_reason, ended_at, created_at, updated_at \
     FROM execution_sessions WHERE workspace_id = $1 \
-    ORDER BY updated_at DESC, id DESC LIMIT $2";
+    ORDER BY updated_at DESC, id DESC LIMIT $2 OFFSET $3";
 const SESSION_BY_ID: &str = "SELECT id, item_id, item_revision, occurrence_id, session_index, \
     planned_block_id, source_device_id, state, revision, accumulated_seconds, actual_seconds, \
     started_at, running_since, paused_at, pause_until, pause_reason, ended_at, created_at, updated_at \
@@ -180,11 +180,14 @@ impl ExecutionRepository for PostgresExecutionRepository {
     async fn history(
         &self,
         limit: usize,
+        offset: usize,
     ) -> Result<Vec<ExecutionSession>, ExecutionRepositoryError> {
         let limit = i64::try_from(limit).map_err(|_| ExecutionRepositoryError::Internal)?;
+        let offset = i64::try_from(offset).map_err(|_| ExecutionRepositoryError::Internal)?;
         sqlx::query(HISTORY_SELECT)
             .bind(self.scope.workspace_id)
             .bind(limit)
+            .bind(offset)
             .fetch_all(&self.pool)
             .await
             .map_err(internal)?

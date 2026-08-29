@@ -94,6 +94,7 @@ class ApiCredentialStoreClearTest {
 
         store.update("$TEST_BASE_URL/", null)
         assertEquals(first.baseUrl, store.snapshot().baseUrl)
+        assertEquals(first.configurationId, store.snapshot().configurationId)
         assertEquals(TEST_TOKEN, store.authenticatedConfiguration()?.bearerToken)
 
         assertThrows(InvalidApiConfigurationException::class.java) {

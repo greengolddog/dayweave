@@ -156,6 +156,9 @@ class KeystoreApiCredentialStore private constructor(
                 "Enter a replacement bearer token when changing the API URL",
             )
         }
+        // A blank-token save of the normalized current URL is a true no-op. In particular it
+        // must not mint a new opaque workspace binding for the credential already on this device.
+        if (bearerToken == null && previousBaseUrl == normalizedBaseUrl) return@synchronized
         val encodedToken = bearerToken?.let { token ->
             val validated = validateBearerToken(token)
             wrap(validated, getOrCreateWrappingKey())
@@ -391,9 +394,9 @@ private fun normalizeBaseUrl(rawBaseUrl: String, allowCleartextLoopback: Boolean
 internal fun normalizedHttpsApiBaseUrl(rawBaseUrl: String): String =
     normalizeBaseUrl(rawBaseUrl.trim(), allowCleartextLoopback = false).toString()
 
-private fun validateBearerToken(token: String): String {
-    if (token.isBlank() || token.any(Char::isWhitespace)) {
-        throw InvalidApiConfigurationException("Enter a bearer token without spaces")
+internal fun validateBearerToken(token: String): String {
+    if (token.isBlank() || token.any { it.isWhitespace() || it.isISOControl() }) {
+        throw InvalidApiConfigurationException("Enter a bearer token without spaces or control characters")
     }
     if (token.length > MAX_BEARER_TOKEN_LENGTH) {
         throw InvalidApiConfigurationException("The bearer token is unexpectedly long")

@@ -22,13 +22,18 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.AppDestination
@@ -50,6 +55,8 @@ import com.greengolddog.dayweave.ui.screens.TodayScreen
 import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 @Composable
 fun DayWeaveApp(viewModel: DayWeaveViewModel = viewModel()) {
@@ -101,13 +108,44 @@ private fun PlannerPersistenceFailureScreen() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
+    val lifecycleOwner = LocalLifecycleOwner.current
     val state by viewModel.state.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
+    val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
+    val effectiveCanonicalSyncState = if (
+        executionSyncState.phase in setOf(
+            CanonicalSyncPhase.AUTH_REQUIRED,
+            CanonicalSyncPhase.SYNCING,
+            CanonicalSyncPhase.OFFLINE,
+            CanonicalSyncPhase.ERROR,
+        )
+    ) {
+        canonicalSyncState.copy(
+            phase = executionSyncState.phase,
+            message = executionSyncState.message,
+        )
+    } else {
+        canonicalSyncState
+    }
+    val canonicalExecutionActionsEnabled =
+        !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
+            state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
     var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
+    var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(lifecycleOwner, viewModel) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            viewModel.refreshExecution()
+            while (isActive) {
+                delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
+                viewModel.refreshExecution()
+            }
+        }
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -135,9 +173,9 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                     val planningSurface = state.destination == AppDestination.TODAY ||
                         state.destination == AppDestination.CALENDAR
                     val syncIcon = when {
-                        planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED ->
+                        planningSurface && effectiveCanonicalSyncState.phase == CanonicalSyncPhase.CONNECTED ->
                             Icons.Outlined.CloudDone
-                        planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.SYNCING ->
+                        planningSurface && effectiveCanonicalSyncState.phase == CanonicalSyncPhase.SYNCING ->
                             Icons.Outlined.Sync
                         !planningSurface && suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED ->
                             Icons.Outlined.CloudDone
@@ -148,12 +186,12 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                     Icon(
                         syncIcon,
                         contentDescription = if (planningSurface) {
-                            canonicalSyncState.message
+                            effectiveCanonicalSyncState.message
                         } else {
                             suggestionSyncState.message
                         },
                         tint = if (
-                            (planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED) ||
+                            (planningSurface && effectiveCanonicalSyncState.phase == CanonicalSyncPhase.CONNECTED) ||
                             (!planningSurface && suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED)
                         ) {
                             MaterialTheme.colorScheme.primary
@@ -176,6 +214,8 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                         ActiveSessionBar(
                             item = active,
                             session = session,
+                            actionsEnabled = active.canonicalItemId == null ||
+                                canonicalExecutionActionsEnabled,
                             onPause = { showPauseChooser = true },
                             onResume = viewModel::resumeActive,
                             onComplete = viewModel::completeActive,
@@ -200,13 +240,16 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         when (state.destination) {
             AppDestination.TODAY -> TodayScreen(
                 state = state,
-                syncState = canonicalSyncState,
+                syncState = effectiveCanonicalSyncState,
+                canonicalExecutionActionsEnabled = canonicalExecutionActionsEnabled,
                 onStart = viewModel::startItem,
                 onPause = { showPauseChooser = true },
                 onResume = viewModel::resumeActive,
                 onComplete = viewModel::completeActive,
                 onSkip = viewModel::skipActive,
                 onLater = viewModel::doActiveLater,
+                onRetryTerminalProjection = viewModel::retryTerminalProjection,
+                onKeepLatestItem = viewModel::keepLatestItemAfterTerminalConflict,
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.CALENDAR -> CalendarScreen(
@@ -234,7 +277,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onToggleQuietSuggestions = viewModel::toggleQuietSuggestions,
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
                 suggestionSyncState = suggestionSyncState,
-                canonicalSyncState = canonicalSyncState,
+                canonicalSyncState = effectiveCanonicalSyncState,
                 modifier = Modifier.padding(innerPadding),
             )
         }
@@ -257,11 +300,21 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         )
     }
 
-    if (state.activeSession?.timedBreakEnded == true) {
+    val endedBreak = state.activeSession?.takeIf { it.timedBreakEnded }
+    val endedBreakKey = endedBreak?.let { session ->
+        "${session.canonicalExecutionSessionId ?: session.itemId}:${session.pauseUntilEpochMillis}"
+    }
+    if (endedBreak != null && endedBreakKey != dismissedBreakKey) {
         BreakEndedDialog(
-            onResume = viewModel::resumeActive,
-            onExtend = { viewModel.pauseActive(10) },
-            onChooseLater = viewModel::doActiveLater,
+            onResume = {
+                dismissedBreakKey = endedBreakKey
+                viewModel.resumeActive()
+            },
+            onExtend = {
+                dismissedBreakKey = endedBreakKey
+                viewModel.pauseActive(10)
+            },
+            onKeepPaused = { dismissedBreakKey = endedBreakKey },
         )
     }
 
@@ -280,6 +333,17 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         ApiConnectionDialog(
             currentBaseUrl = suggestionSyncState.baseUrl.orEmpty(),
             hasStoredToken = suggestionSyncState.hasStoredToken,
+            credentialReplacementBlocked = state.pendingCanonicalMutation != null ||
+                state.pendingExecutionCommand != null ||
+                state.terminalExecutionOutcomes.values.any {
+                    it.requiresCanonicalItemProjection &&
+                        it.canonicalProjectionRevision == null &&
+                        it.canonicalProjectionResolution == null &&
+                        (
+                            it.canonicalProjectionConflict == null ||
+                                it.canonicalProjectionRetryAuthorizedAt != null
+                            )
+                },
             onDismiss = { showApiConnection = false },
             onSave = { baseUrl, bearerToken ->
                 viewModel.updateSuggestionConnection(baseUrl, bearerToken)
@@ -292,3 +356,5 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         )
     }
 }
+
+private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L

@@ -26,6 +26,7 @@ import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SecureCredentialException
 import com.greengolddog.dayweave.network.normalizedHttpsApiBaseUrl
+import com.greengolddog.dayweave.network.validateBearerToken
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
@@ -96,7 +97,7 @@ class CanonicalConfigurationChangeBlockedException : IllegalStateException(
 )
 
 class CanonicalAbandonmentPersistenceException : IllegalStateException(
-    "Credentials were removed but canonical cache quarantine was not durable",
+    "Canonical cache quarantine was not durable; existing credentials were kept",
 )
 
 /** Pulls canonical deltas, composes one local day server-side, then commits both atomically. */
@@ -129,7 +130,7 @@ class CanonicalSyncManager(
         change: suspend () -> T,
     ): T =
         operationMutex.withLock {
-            if (plannerStore.state.value.pendingCanonicalMutation != null) {
+            if (plannerStore.hasCredentialReplacementBlocker()) {
                 updateError(
                     "Reconnect the pending canonical action before changing the API connection.",
                 )
@@ -152,30 +153,65 @@ class CanonicalSyncManager(
         clearCredentials()
     }
 
-    /** Allows replacing a token for the same pending origin, but never leaks its action cross-origin. */
+    /**
+     * Treats every bearer replacement as an unknown subject/workspace, even on the same origin.
+     *
+     * No server-issued immutable identity exists yet, so a pending write can never be rebound. A
+     * safe replacement first durably quarantines every canonical/execution cache generation while
+     * the old credential is still installed; a persistence failure therefore keeps the old token.
+     */
     suspend fun <T> withConfigurationUpdateLock(
         requestedBaseUrl: String,
+        bearerToken: String?,
         change: suspend () -> T,
     ): T = operationMutex.withLock {
-        val pending = plannerStore.state.value.pendingCanonicalMutation
-        if (pending != null) {
-            val requestedOrigin = runCatching {
-                normalizedHttpsApiBaseUrl(requestedBaseUrl)
-            }.getOrNull()
-            val connection = credentialStore.snapshot()
-            when {
-                requestedOrigin == null || requestedOrigin == pending.syncOrigin -> Unit
-                connection.baseUrl == null || !connection.hasBearerToken -> {
-                    val durable = plannerStore.abandonCanonicalConnection()
-                        ?.awaitDurable() == true
-                    if (!durable) throw CanonicalConfigurationChangeBlockedException()
-                }
-                else -> {
-                    updateError(
-                        "Reconcile or forget the pending action before switching API origins.",
-                    )
-                    throw CanonicalConfigurationChangeBlockedException()
-                }
+        val requestedOrigin = runCatching {
+            normalizedHttpsApiBaseUrl(requestedBaseUrl)
+        }.getOrNull()
+        val connection = credentialStore.snapshot()
+        val isCredentialReplacement = bearerToken != null
+        if (!isCredentialReplacement) {
+            // The credential store independently rejects URL changes without a replacement token.
+            // A normalized same-URL save is intentionally a no-op and preserves configurationId.
+            return@withLock change()
+        }
+        // Validate secret syntax before any durable cache quarantine. The same validator is used by
+        // the credential store, so a rejected replacement cannot erase the old workspace locally.
+        validateBearerToken(requireNotNull(bearerToken))
+        if (plannerStore.hasCredentialReplacementBlocker()) {
+            updateError(
+                "Reconcile the pending canonical/execution action or explicitly forget the " +
+                    "connection before replacing its bearer token.",
+            )
+            throw CanonicalConfigurationChangeBlockedException()
+        }
+        if (requestedOrigin == null) {
+            // Let the connection store report the precise validation error without destroying the
+            // old cache. No new identity can be installed through an invalid origin.
+            return@withLock change()
+        }
+        val planner = plannerStore.state.value
+        val hasCredentialBoundPlannerState = planner.canonicalSyncOrigin != null ||
+            planner.canonicalDeltaCursor != null || planner.canonicalItems.isNotEmpty() ||
+            planner.schedule.any { it.canonicalItemId != null } ||
+            planner.canonicalExecutionSyncOrigin != null ||
+            planner.canonicalExecutionSession != null ||
+            planner.canonicalExecutionHistoryWindow.isNotEmpty() ||
+            planner.canonicalExecutionHistoryWindowRevision != null ||
+            planner.canonicalExecutionHistoryContinuityEstablished ||
+            planner.canonicalExecutionHistoryVerified ||
+            planner.pendingExecutionCommand != null ||
+            planner.terminalExecutionOutcomes.isNotEmpty()
+        if (
+            connection.baseUrl != null || connection.hasBearerToken ||
+            hasCredentialBoundPlannerState
+        ) {
+            val durable = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+            if (!durable) {
+                updateError(
+                    "Encrypted canonical state could not be quarantined; the old bearer token was kept.",
+                )
+                throw CanonicalAbandonmentPersistenceException()
             }
         }
         change()
@@ -207,13 +243,17 @@ class CanonicalSyncManager(
             try {
                 val instant = now()
                 val planningZone = zoneId()
+                ensureDurableWorkspaceBinding(configuration)
                 val pendingResolution = reconcilePendingMutation(configuration)
-                val loadedUpdate = loadConsistentPlan(
+                if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
+                    projectPendingTerminalExecution(configuration)
+                }
+                var loadedUpdate = loadConsistentPlan(
                     configuration = configuration,
                     instant = instant,
                     planningZone = planningZone,
                 )
-                val update = if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
+                var update = if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
                     loadedUpdate.copy(
                         message = "${loadedUpdate.message} A pending action was superseded by newer canonical state.",
                     )
@@ -221,10 +261,23 @@ class CanonicalSyncManager(
                     loadedUpdate
                 }
                 ensureConfigurationCurrent(configuration)
-                val receipt = plannerStore.replaceCanonicalPlan(update)
-                if (receipt == null || !receipt.awaitDurable()) {
-                    updateError("Encrypted planner storage is unavailable; the cached plan was kept.")
-                    return@withLock CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                persistCanonicalPlan(update)
+                var projectionPasses = 0
+                var projectionResult = projectPendingTerminalExecution(configuration)
+                while (
+                    projectionPasses < MAX_TERMINAL_PROJECTION_RELOADS &&
+                    projectionResult in TERMINAL_PROJECTION_RELOAD_RESULTS
+                ) {
+                    projectionPasses += 1
+                    loadedUpdate = loadConsistentPlan(
+                        configuration = configuration,
+                        instant = instant,
+                        planningZone = planningZone,
+                    )
+                    update = loadedUpdate
+                    ensureConfigurationCurrent(configuration)
+                    persistCanonicalPlan(update)
+                    projectionResult = projectPendingTerminalExecution(configuration)
                 }
                 val metadataSaved = runCatching {
                     credentialStore.recordSuccessfulSync(instant.toEpochMilli())
@@ -268,6 +321,7 @@ class CanonicalSyncManager(
                 planningZone,
                 canonical.items,
                 configuration.baseUrl.toString(),
+                configuration.configurationId,
             )
             val preview = transport.preview(configuration, request)
             ensureConfigurationCurrent(configuration)
@@ -290,7 +344,7 @@ class CanonicalSyncManager(
                         planningZone,
                         dayEndMinute,
                     ),
-                )
+                ).copy(configurationId = configuration.configurationId)
             } catch (error: RemoteSnapshotChangedException) {
                 if (attempt == MAX_SNAPSHOT_ATTEMPTS) throw error
                 // Neither transient delta nor preview has touched durable state. Pull again from
@@ -298,6 +352,11 @@ class CanonicalSyncManager(
             }
         }
         throw RemoteSnapshotChangedException()
+    }
+
+    private suspend fun persistCanonicalPlan(update: CanonicalPlanUpdate) {
+        val receipt = plannerStore.replaceCanonicalPlan(update)
+        if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
     }
 
     suspend fun start(blockId: String): CanonicalRefreshOutcome = focusTransitionMutex.withLock {
@@ -814,7 +873,8 @@ class CanonicalSyncManager(
         pauseLabel: String? = null,
         pauseMinutes: Int? = null,
         deferUntil: Instant? = null,
-    ) {
+        terminalExecutionSessionId: String? = null,
+    ): PendingMutationResolution {
         val current = plannerStore.state.value
         val block = current.schedule.firstOrNull { it.id == blockId }
             ?: throw InvalidCanonicalTransitionException()
@@ -824,7 +884,8 @@ class CanonicalSyncManager(
         if (
             block.canonicalRevision != item.revision || !item.isExecutable ||
             item.revision == Long.MAX_VALUE ||
-            current.canonicalSyncOrigin != configuration.baseUrl.toString()
+            current.canonicalSyncOrigin != configuration.baseUrl.toString() ||
+            current.canonicalConfigurationId != configuration.configurationId
         ) {
             throw InvalidCanonicalTransitionException()
         }
@@ -854,10 +915,10 @@ class CanonicalSyncManager(
             expectedRevision = item.revision,
             item = replacement,
         )
-        val pendingReceipt = plannerStore.stageCanonicalMutation(
-            PendingCanonicalMutation(
+        val pending = PendingCanonicalMutation(
                 idempotencyKey = idempotencyKey,
                 syncOrigin = configuration.baseUrl.toString(),
+                configurationId = configuration.configurationId,
                 itemId = item.id,
                 expectedRevision = item.revision,
                 targetStatus = targetStatus,
@@ -867,36 +928,153 @@ class CanonicalSyncManager(
                 displayStatus = displayStatus,
                 pauseLabel = pauseLabel,
                 pauseMinutes = pauseMinutes,
-            ),
+                terminalExecutionSessionId = terminalExecutionSessionId,
         )
+        val pendingReceipt = plannerStore.stageCanonicalMutation(pending)
         if (pendingReceipt == null || !pendingReceipt.awaitDurable()) {
             throw LocalPlannerStorageException()
         }
-        val response = transport.replaceItem(
+        return sendAndReconcileCanonicalMutation(
             configuration = configuration,
-            id = item.id,
-            idempotencyKey = idempotencyKey,
+            pending = pending,
+            previous = item,
             request = replaceRequest,
+            reconcileConflict = terminalExecutionSessionId != null,
         )
-        ensureConfigurationCurrent(configuration)
-        if (
-            response.id != item.id || response.status != targetStatus ||
-            response.revision != item.revision + 1
-        ) {
-            throw RemotePlannerMappingException()
+    }
+
+    /**
+     * Projects one confirmed terminal execution onto an eligible one-shot parent item.
+     *
+     * The execution row itself is already durable. This second write deliberately uses the same
+     * canonical replacement fence as every user item mutation, so response loss and process death
+     * replay the exact body/idempotency key instead of issuing a second status transition.
+     */
+    private suspend fun projectPendingTerminalExecution(
+        configuration: AuthenticatedApiConfiguration,
+    ): TerminalProjectionResult {
+        val current = plannerStore.state.value
+        val origin = configuration.baseUrl.toString()
+        val unresolved = current.terminalExecutionOutcomes.values
+            .filter {
+                it.syncOrigin == origin && it.requiresCanonicalItemProjection &&
+                    it.canonicalProjectionRevision == null &&
+                    it.canonicalProjectionResolution == null
+            }
+        val outcome = unresolved
+            .filter {
+                it.canonicalProjectionConflict == null ||
+                    it.canonicalProjectionRetryAuthorizedAt != null
+            }
+            .minWithOrNull(
+                compareBy<com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot> {
+                    Instant.parse(it.recordedAt)
+                }.thenBy { it.session.id },
+            )
+            ?: return if (unresolved.isEmpty()) {
+                TerminalProjectionResult.NONE
+            } else {
+                TerminalProjectionResult.CONFLICT
+            }
+        val session = outcome.session
+        val item = current.canonicalItems.firstOrNull { it.id == session.itemId }
+        if (item == null) {
+            if (current.canonicalDeltaCursor == null) {
+                return persistTerminalProjectionConflict(
+                    outcome.session.id,
+                    "Canonical cache is incomplete; refresh before resolving this execution outcome.",
+                    outcome.canonicalProjectionConflict,
+                )
+            }
+            val receipt = plannerStore.resolveDeletedTerminalProjection(session.id)
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return TerminalProjectionResult.RESOLVED_WITHOUT_WRITE
         }
-        val mapped = mapCanonicalItem(response)
-        if (!matchesReplacement(mapped, item, replacement)) {
-            throw RemotePlannerMappingException()
+        if (item.status in TERMINAL_CANONICAL_STATUSES) {
+            if (item.status != session.status) {
+                return persistTerminalProjectionConflict(
+                    session.id,
+                    "Execution ended as ${session.status}, but the latest canonical item is " +
+                        "${item.status}. Choose which result should remain authoritative.",
+                    outcome.canonicalProjectionConflict,
+                )
+            }
+            val receipt = plannerStore.markTerminalProjectionApplied(session.id, item.revision)
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return TerminalProjectionResult.RESOLVED_WITHOUT_WRITE
         }
-        val receipt = plannerStore.reconcileCanonicalItem(
-            item = mapped,
-            focusedBlockId = blockId,
+        val itemBlocks = current.schedule.filter {
+            it.canonicalItemId == item.id && it.occurrenceId == null
+        }
+        val block = itemBlocks.singleOrNull()?.takeIf {
+            it.sessionIndex == session.sessionIndex && it.canonicalRevision == item.revision
+        }
+        val splitType = parseJsonObject(item.splitPolicyJson)["type"]
+            ?.let { it as? JsonPrimitive }
+            ?.contentOrNull
+        val conflict = when {
+            current.canonicalSyncOrigin != origin ||
+                current.canonicalConfigurationId != configuration.configurationId ->
+                "The latest item belongs to a different canonical connection."
+            current.pendingCanonicalMutation != null ->
+                "Another canonical write must be reconciled before this execution outcome."
+            item.status !in TERMINAL_PROJECTION_SOURCE_STATUSES ->
+                "The latest canonical status '${item.status}' cannot accept an execution outcome."
+            !item.isExecutable ->
+                "The latest canonical item is no longer an executable leaf."
+            item.recurrenceJson != null || session.occurrenceId != null ->
+                "The latest canonical item is recurring; its old one-shot outcome cannot be rebased."
+            splitType != "indivisible" || block?.isSplittable == true ->
+                "The latest canonical item is splittable; its old one-shot outcome cannot be rebased."
+            itemBlocks.size != 1 || block == null ->
+                "The latest canonical item is not represented by one fully scheduled session."
+            current.unscheduledWork.any {
+                it.itemId == item.id && it.occurrenceId == null && it.remainingMinutes > 0
+            } -> "The latest canonical item still has unscheduled work."
+            else -> null
+        }
+        if (conflict != null) {
+            return persistTerminalProjectionConflict(
+                session.id,
+                conflict,
+                outcome.canonicalProjectionConflict,
+            )
+        }
+        val displayStatus = when (session.status) {
+            "completed" -> ItemStatus.COMPLETED
+            "skipped" -> ItemStatus.SKIPPED
+            else -> throw InvalidCanonicalTransitionException()
+        }
+        return when (
+            replaceCanonicalBlock(
+            configuration = configuration,
+            blockId = requireNotNull(block).id,
+            targetStatus = session.status,
             displayStatus = displayStatus,
-            pauseLabel = pauseLabel,
-            pauseMinutes = pauseMinutes,
-        )
+            terminalExecutionSessionId = session.id,
+            )
+        ) {
+            PendingMutationResolution.APPLIED -> TerminalProjectionResult.APPLIED_WRITE
+            PendingMutationResolution.SUPERSEDED -> TerminalProjectionResult.NEEDS_RELOAD
+            PendingMutationResolution.NONE -> throw InvalidCanonicalTransitionException()
+        }
+    }
+
+    private suspend fun persistTerminalProjectionConflict(
+        sessionId: String,
+        conflict: String,
+        previousConflict: String?,
+    ): TerminalProjectionResult {
+        val outcome = plannerStore.state.value.terminalExecutionOutcomes[sessionId]
+        if (
+            conflict == previousConflict &&
+            outcome?.canonicalProjectionRetryAuthorizedAt == null
+        ) {
+            return TerminalProjectionResult.CONFLICT
+        }
+        val receipt = plannerStore.recordTerminalProjectionConflict(sessionId, conflict)
         if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+        return TerminalProjectionResult.CONFLICT
     }
 
     /** Replays exactly one durable request; a read-only refresh can never clear write uncertainty. */
@@ -905,12 +1083,16 @@ class CanonicalSyncManager(
     ): PendingMutationResolution {
         val pending = plannerStore.state.value.pendingCanonicalMutation
             ?: return PendingMutationResolution.NONE
-        if (pending.syncOrigin != configuration.baseUrl.toString()) {
+        if (
+            pending.syncOrigin != configuration.baseUrl.toString() ||
+            pending.configurationId != configuration.configurationId
+        ) {
             throw CanonicalMutationNeedsReconciliationException()
         }
         validateUuid(pending.idempotencyKey)
         validateUuid(pending.itemId)
         validateUuid(pending.focusedBlockId)
+        pending.terminalExecutionSessionId?.let(::validateUuid)
         parseTimestamp(pending.startedAt)
         if (
             pending.expectedRevision <= 0 || pending.replacementRequestJson.length >
@@ -935,6 +1117,23 @@ class CanonicalSyncManager(
         ) {
             throw RemotePlannerMappingException()
         }
+        return sendAndReconcileCanonicalMutation(
+            configuration = configuration,
+            pending = pending,
+            previous = previous,
+            request = request,
+            reconcileConflict = true,
+        )
+    }
+
+    /** Sends one exact durable body and classifies every non-success response conservatively. */
+    private suspend fun sendAndReconcileCanonicalMutation(
+        configuration: AuthenticatedApiConfiguration,
+        pending: PendingCanonicalMutation,
+        previous: CanonicalItemSnapshot,
+        request: ReplaceCanonicalItemRequest,
+        reconcileConflict: Boolean,
+    ): PendingMutationResolution {
         val response = try {
             transport.replaceItem(
                 configuration = configuration,
@@ -943,12 +1142,50 @@ class CanonicalSyncManager(
                 request = request,
             )
         } catch (conflict: PlannerApiException.Conflict) {
+            if (pending.terminalExecutionSessionId != null) {
+                return reconcileRejectedTerminalProjection(
+                    configuration = configuration,
+                    pending = pending,
+                    previous = previous,
+                    request = request,
+                    rejection = TerminalProjectionRejection.CONFLICT,
+                    originalError = conflict,
+                )
+            }
+            if (!reconcileConflict) throw conflict
             return reconcileExpiredOrSupersededPendingMutation(
                 configuration = configuration,
                 pending = pending,
                 previous = previous,
                 request = request,
                 originalConflict = conflict,
+            )
+        } catch (notFound: PlannerApiException.Http) {
+            if (pending.terminalExecutionSessionId == null || notFound.statusCode != 404) {
+                throw notFound
+            }
+            return reconcileRejectedTerminalProjection(
+                configuration = configuration,
+                pending = pending,
+                previous = previous,
+                request = request,
+                rejection = TerminalProjectionRejection.NOT_FOUND,
+                originalError = notFound,
+            )
+        } catch (rejected: PlannerApiException.Validation) {
+            if (
+                pending.terminalExecutionSessionId == null ||
+                rejected.statusCode !in setOf(400, 422)
+            ) {
+                throw rejected
+            }
+            return reconcileRejectedTerminalProjection(
+                configuration = configuration,
+                pending = pending,
+                previous = previous,
+                request = request,
+                rejection = TerminalProjectionRejection.DETERMINISTIC_REJECTION,
+                originalError = rejected,
             )
         }
         ensureConfigurationCurrent(configuration)
@@ -971,6 +1208,92 @@ class CanonicalSyncManager(
         )
         if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
         return PendingMutationResolution.APPLIED
+    }
+
+    /**
+     * A rejected terminal PUT can release its fence only after a complete authoritative delta.
+     * Any read, mapping, or configuration failure escapes before local state changes, retaining the
+     * exact request and idempotency key for a later unambiguous replay.
+     */
+    private suspend fun reconcileRejectedTerminalProjection(
+        configuration: AuthenticatedApiConfiguration,
+        pending: PendingCanonicalMutation,
+        previous: CanonicalItemSnapshot,
+        request: ReplaceCanonicalItemRequest,
+        rejection: TerminalProjectionRejection,
+        originalError: Throwable,
+    ): PendingMutationResolution {
+        val sessionId = requireNotNull(pending.terminalExecutionSessionId)
+        val authoritative = loadDelta(configuration).items.firstOrNull { it.id == pending.itemId }
+        ensureConfigurationCurrent(configuration)
+        if (authoritative == null) {
+            val receipt = plannerStore.resolveDeletedPendingTerminalProjection(
+                idempotencyKey = pending.idempotencyKey,
+                sessionId = sessionId,
+            )
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return PendingMutationResolution.APPLIED
+        }
+        if (rejection == TerminalProjectionRejection.NOT_FOUND) {
+            // A 404 with a still-readable item is contradictory. Keep the exact write fence; a
+            // later authoritative read may prove a tombstone, but this read cannot.
+            throw originalError
+        }
+        if (rejection == TerminalProjectionRejection.DETERMINISTIC_REJECTION) {
+            if (
+                authoritative.revision > pending.expectedRevision &&
+                authoritative.status == pending.targetStatus &&
+                matchesReplacement(authoritative, previous, request.item)
+            ) {
+                val receipt = plannerStore.reconcileCanonicalItem(
+                    item = authoritative,
+                    focusedBlockId = pending.focusedBlockId,
+                    displayStatus = pending.displayStatus,
+                    pauseLabel = pending.pauseLabel,
+                    pauseMinutes = pending.pauseMinutes,
+                )
+                if (receipt == null || !receipt.awaitDurable()) {
+                    throw LocalPlannerStorageException()
+                }
+                return PendingMutationResolution.APPLIED
+            }
+            val statusCode = (originalError as? PlannerApiException.Validation)?.statusCode
+                ?: throw originalError
+            val receipt = plannerStore.rejectPendingTerminalProjectionAsConflict(
+                idempotencyKey = pending.idempotencyKey,
+                sessionId = sessionId,
+                conflict = "The server rejected this terminal status with HTTP $statusCode. " +
+                    "Authoritative item revision ${authoritative.revision} does not exactly " +
+                    "match the approved terminal replacement; review it before retrying.",
+            )
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return PendingMutationResolution.APPLIED
+        }
+        if (
+            authoritative.revision > pending.expectedRevision &&
+            authoritative.status == pending.targetStatus
+        ) {
+            val receipt = plannerStore.reconcileCanonicalItem(
+                item = authoritative,
+                focusedBlockId = pending.focusedBlockId,
+                displayStatus = pending.displayStatus,
+                pauseLabel = pending.pauseLabel,
+                pauseMinutes = pending.pauseMinutes,
+            )
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return PendingMutationResolution.APPLIED
+        }
+        if (authoritative.revision > pending.expectedRevision) {
+            val receipt = plannerStore.clearPendingCanonicalMutation(
+                idempotencyKey = pending.idempotencyKey,
+                message = "Pending terminal projection was superseded by newer canonical state",
+            )
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+            return PendingMutationResolution.SUPERSEDED
+        }
+        // A 409 and an item still at the expected revision are a mixed or unstable read. Retain
+        // the exact uncertainty fence; no new body or key may be invented.
+        throw originalError
     }
 
     private suspend fun reconcileExpiredOrSupersededPendingMutation(
@@ -1046,8 +1369,9 @@ class CanonicalSyncManager(
         configuration: AuthenticatedApiConfiguration,
     ): CanonicalDeltaSnapshot {
         val cached = plannerStore.state.value
-        val sameOrigin = cached.canonicalSyncOrigin == configuration.baseUrl.toString()
-        val firstCursor = cached.canonicalDeltaCursor.takeIf { sameOrigin }
+        val sameBinding = cached.canonicalSyncOrigin == configuration.baseUrl.toString() &&
+            cached.canonicalConfigurationId == configuration.configurationId
+        val firstCursor = cached.canonicalDeltaCursor.takeIf { sameBinding }
         val initialItems = if (firstCursor == null) {
             emptyList()
         } else {
@@ -1173,6 +1497,7 @@ class CanonicalSyncManager(
         planningZone: ZoneId,
         canonicalItems: List<CanonicalItemSnapshot>,
         syncOrigin: String,
+        configurationId: String?,
     ): SchedulePreviewRequest {
         val date = instant.atZone(planningZone).toLocalDate()
         val horizonStart = date.atStartOfDay(planningZone)
@@ -1181,7 +1506,8 @@ class CanonicalSyncManager(
         val availableEnd = localMinute(date, planningZone, dayEndMinute)
         val revisions = canonicalItems.associate { it.id to it.revision }
         val cached = plannerStore.state.value
-        val sameOrigin = cached.canonicalSyncOrigin == syncOrigin
+        val sameOrigin = cached.canonicalSyncOrigin == syncOrigin &&
+            cached.canonicalConfigurationId == configurationId
         val relevantOutcomeStart = horizonStart.toInstant().minusSeconds(OUTCOME_CONTEXT_MARGIN_SECONDS)
         val relevantOutcomeEnd = horizonEnd.toInstant().plusSeconds(OUTCOME_CONTEXT_MARGIN_SECONDS)
         val recurrenceOutcomes = (if (sameOrigin) cached.recurrenceOutcomes else emptyMap()).entries
@@ -1241,7 +1567,7 @@ class CanonicalSyncManager(
             ?.let { it == date }
             ?: false
         val previousSchedule = if (
-            generatedForPlanningDate && cached.canonicalSyncOrigin == syncOrigin &&
+            generatedForPlanningDate && sameOrigin &&
             cached.schedulePlanningZoneId == planningZone.id
         ) {
             cached.schedule
@@ -1866,6 +2192,38 @@ class CanonicalSyncManager(
         }
     }
 
+    /** Rejects or quarantines every cache whose opaque credential binding is unknown. */
+    private suspend fun ensureDurableWorkspaceBinding(
+        configuration: AuthenticatedApiConfiguration,
+    ) {
+        val current = plannerStore.state.value
+        val origin = configuration.baseUrl.toString()
+        val configurationId = configuration.configurationId
+        val hasCanonicalState = current.canonicalSyncOrigin != null ||
+            current.canonicalDeltaCursor != null || current.canonicalItems.isNotEmpty() ||
+            current.pendingCanonicalMutation != null
+        val hasExecutionState = current.canonicalExecutionSyncOrigin != null ||
+            current.canonicalExecutionSession != null ||
+            current.canonicalExecutionHistoryWindow.isNotEmpty() ||
+            current.canonicalExecutionHistoryWindowRevision != null ||
+            current.canonicalExecutionHistoryContinuityEstablished ||
+            current.canonicalExecutionHistoryVerified ||
+            current.terminalExecutionOutcomes.isNotEmpty() ||
+            current.pendingExecutionCommand != null
+        val canonicalMismatch = hasCanonicalState &&
+            (current.canonicalSyncOrigin != origin ||
+                current.canonicalConfigurationId != configurationId)
+        val executionMismatch = hasExecutionState &&
+            (current.canonicalExecutionSyncOrigin != origin ||
+                current.canonicalExecutionConfigurationId != configurationId)
+        if (!canonicalMismatch && !executionMismatch) return
+        if (plannerStore.hasCredentialReplacementBlocker()) {
+            throw CanonicalConfigurationChangedException()
+        }
+        val receipt = plannerStore.abandonCanonicalConnection()
+        if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+    }
+
     private fun parseJsonObject(raw: String): JsonObject = JsonObjectParser.parse(raw)
 
     private fun handleFailure(error: Throwable): CanonicalRefreshOutcome {
@@ -1990,6 +2348,20 @@ class CanonicalSyncManager(
         NONE,
         APPLIED,
         SUPERSEDED,
+    }
+
+    private enum class TerminalProjectionResult {
+        NONE,
+        APPLIED_WRITE,
+        NEEDS_RELOAD,
+        RESOLVED_WITHOUT_WRITE,
+        CONFLICT,
+    }
+
+    private enum class TerminalProjectionRejection {
+        CONFLICT,
+        NOT_FOUND,
+        DETERMINISTIC_REJECTION,
     }
 
     private class RemotePlannerMappingException(cause: Throwable? = null) :
@@ -2309,6 +2681,18 @@ class CanonicalSyncManager(
             "completed",
             "skipped",
             "cancelled",
+        )
+        private val TERMINAL_CANONICAL_STATUSES = setOf("completed", "skipped")
+        private val TERMINAL_PROJECTION_SOURCE_STATUSES = setOf(
+            "planned",
+            "scheduled",
+            "in_progress",
+            "paused",
+        )
+        private const val MAX_TERMINAL_PROJECTION_RELOADS = 2
+        private val TERMINAL_PROJECTION_RELOAD_RESULTS = setOf(
+            TerminalProjectionResult.APPLIED_WRITE,
+            TerminalProjectionResult.NEEDS_RELOAD,
         )
     }
 }

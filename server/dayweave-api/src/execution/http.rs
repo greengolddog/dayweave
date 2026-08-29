@@ -46,6 +46,7 @@ pub(crate) struct ExecutionCommandRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionHistoryQuery {
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -61,6 +62,7 @@ pub(crate) struct ExecutionMutationEnvelope {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ExecutionHistoryEnvelope {
     pub sessions: Vec<ExecutionSession>,
+    pub next_offset: Option<usize>,
 }
 
 #[utoipa::path(
@@ -142,12 +144,18 @@ pub(crate) async fn execution_history(
     let query = query
         .map(|Query(query)| query)
         .map_err(|_| ApiError::validation("query parameters are invalid"))?;
-    let sessions = state
+    let page = state
         .execution
-        .history(query.limit.unwrap_or(DEFAULT_HISTORY_LIMIT))
+        .history_page(
+            query.limit.unwrap_or(DEFAULT_HISTORY_LIMIT),
+            query.offset.unwrap_or(0),
+        )
         .await
         .map_err(map_execution_error)?;
-    Ok(Json(ExecutionHistoryEnvelope { sessions }))
+    Ok(Json(ExecutionHistoryEnvelope {
+        sessions: page.sessions,
+        next_offset: page.next_offset,
+    }))
 }
 
 fn execution_idempotency(
@@ -215,6 +223,9 @@ fn map_execution_error(error: ExecutionServiceError) -> ApiError {
         }
         ExecutionServiceError::InvalidHistoryLimit => {
             ApiError::validation("limit must be between 1 and 100")
+        }
+        ExecutionServiceError::InvalidHistoryOffset => {
+            ApiError::validation("offset is outside the supported range")
         }
         ExecutionServiceError::Item(_)
         | ExecutionServiceError::Repository(ExecutionRepositoryError::Internal)

@@ -118,15 +118,15 @@ fun PauseChooserDialog(
 fun BreakEndedDialog(
     onResume: () -> Unit,
     onExtend: () -> Unit,
-    onChooseLater: () -> Unit,
+    onKeepPaused: () -> Unit,
 ) {
     AlertDialog(
-        onDismissRequest = {},
+        onDismissRequest = onKeepPaused,
         icon = { Icon(Icons.Outlined.Coffee, contentDescription = null) },
         title = { Text("Your break is over") },
         text = {
             Text(
-                "Resume the paused item, extend the break by 10 minutes, or let DayWeave choose something else.",
+                "Resume the paused item, extend the break by 10 minutes, or close this message and keep it paused.",
             )
         },
         confirmButton = {
@@ -135,7 +135,7 @@ fun BreakEndedDialog(
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onExtend) { Text("Extend 10m") }
-                TextButton(onClick = onChooseLater) { Text("Something else") }
+                TextButton(onClick = onKeepPaused) { Text("Keep paused") }
             }
         },
     )
@@ -188,6 +188,7 @@ fun EditSuggestionDialog(
 fun ApiConnectionDialog(
     currentBaseUrl: String,
     hasStoredToken: Boolean,
+    credentialReplacementBlocked: Boolean,
     onDismiss: () -> Unit,
     onSave: (baseUrl: String, bearerToken: String?) -> Unit,
     onForget: () -> Unit,
@@ -232,6 +233,15 @@ fun ApiConnectionDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (credentialReplacementBlocked) {
+                    Text(
+                        "A canonical/execution action is pending. Keep the stored token, " +
+                            "reconcile that action, or explicitly forget the connection before " +
+                            "entering a replacement token.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
                 OutlinedTextField(
                     value = baseUrl,
                     onValueChange = { baseUrl = it },
@@ -277,6 +287,7 @@ fun ApiConnectionDialog(
                     onSave(baseUrl, submittedToken)
                 },
                 enabled = baseUrl.trim().startsWith("https://", ignoreCase = true) &&
+                    !(credentialReplacementBlocked && bearerToken.isNotBlank()) &&
                     (
                         bearerToken.isNotBlank() ||
                             (hasStoredToken && baseUrl.trim() == currentBaseUrl.trim())

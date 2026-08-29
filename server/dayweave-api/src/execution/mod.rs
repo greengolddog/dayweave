@@ -11,4 +11,6 @@ pub use repository::{
     ExecutionIdempotency, ExecutionMutation, ExecutionRepository, ExecutionRepositoryError,
     ExecutionSnapshot, InMemoryExecutionRepository,
 };
-pub use service::{ExecutionIdempotencyKey, ExecutionService, ExecutionServiceError};
+pub use service::{
+    ExecutionHistoryPage, ExecutionIdempotencyKey, ExecutionService, ExecutionServiceError,
+};

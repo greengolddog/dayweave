@@ -25,7 +25,7 @@ struct ExecutionAPIClientTests {
             ),
             .init(
                 statusCode: 200,
-                body: Data(#"{"sessions":[\#(Self.session(status: "completed", revision: 3))]}"#.utf8)
+                body: Data(#"{"sessions":[\#(Self.session(status: "completed", revision: 3))],"next_offset":null}"#.utf8)
             )
         )
         let client = Self.client()
@@ -267,7 +267,7 @@ struct ExecutionAPIClientTests {
             key: Self.token,
             .init(
                 statusCode: 200,
-                body: Data(#"{"sessions":[\#(row),\#(row)]}"#.utf8)
+                body: Data(#"{"sessions":[\#(row),\#(row)],"next_offset":null}"#.utf8)
             )
         )
         do {
@@ -317,7 +317,7 @@ struct ExecutionAPIClientTests {
             key: Self.token,
             .init(
                 statusCode: 200,
-                body: Data(#"{"sessions":[\#(newer),\#(older)]}"#.utf8)
+                body: Data(#"{"sessions":[\#(newer),\#(older)],"next_offset":null}"#.utf8)
             )
         )
         do {

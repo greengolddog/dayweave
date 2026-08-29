@@ -42,7 +42,19 @@ if [[ ! -f "${built_apk}" ]]; then
   echo "A signed release APK was not produced at ${built_apk}." >&2
   exit 1
 fi
-"${apksigner}" verify --verbose "${built_apk}"
+verification_output="$("${apksigner}" verify --verbose "${built_apk}")"
+printf '%s\n' "${verification_output}"
+assert_verification_line() {
+  local expected="$1"
+  if [[ "$(grep -Fxc -- "${expected}" <<<"${verification_output}")" != "1" ]]; then
+    echo "APK signature verification did not report exactly: ${expected}" >&2
+    exit 1
+  fi
+}
+assert_verification_line "Verified using v1 scheme (JAR signing): false"
+assert_verification_line "Verified using v2 scheme (APK Signature Scheme v2): false"
+assert_verification_line "Verified using v3 scheme (APK Signature Scheme v3): true"
+assert_verification_line "Number of signers: 1"
 install -d -m 0755 "${output_dir}"
 install -m 0644 "${built_apk}" "${output_apk}"
 shasum -a 256 "${output_apk}"

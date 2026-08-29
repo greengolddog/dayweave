@@ -78,6 +78,8 @@ fun ScheduleItemCard(
     item: ScheduleItem,
     onStart: () -> Unit,
     modifier: Modifier = Modifier,
+    canStart: Boolean = true,
+    unavailableLabel: String = "Needs review",
 ) {
     val kindColor = item.kind.color()
     Card(
@@ -157,7 +159,8 @@ fun ScheduleItemCard(
                 if (item.status == ItemStatus.SCHEDULED && item.kind != ItemKind.EVENT) {
                     AssistChip(
                         onClick = onStart,
-                        label = { Text("Start") },
+                        enabled = canStart,
+                        label = { Text(if (canStart) "Start" else unavailableLabel) },
                         leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
                     )
                 }
@@ -174,6 +177,7 @@ fun ActiveSessionBar(
     onResume: () -> Unit,
     onComplete: () -> Unit,
     modifier: Modifier = Modifier,
+    actionsEnabled: Boolean = true,
 ) {
     Surface(
         modifier = modifier.fillMaxWidth(),
@@ -205,13 +209,16 @@ fun ActiveSessionBar(
                     Text(it, style = MaterialTheme.typography.bodySmall)
                 }
             }
-            FilledTonalIconButton(onClick = if (session.isPaused) onResume else onPause) {
+            FilledTonalIconButton(
+                onClick = if (session.isPaused) onResume else onPause,
+                enabled = actionsEnabled,
+            ) {
                 Icon(
                     if (session.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
                     contentDescription = if (session.isPaused) "Resume" else "Pause",
                 )
             }
-            IconButton(onClick = onComplete) {
+            IconButton(onClick = onComplete, enabled = actionsEnabled) {
                 Icon(Icons.Default.Check, contentDescription = "Complete")
             }
         }
@@ -221,6 +228,8 @@ fun ActiveSessionBar(
 @Composable
 fun ActiveItemActions(
     isPaused: Boolean,
+    canDefer: Boolean,
+    actionsEnabled: Boolean = true,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onComplete: () -> Unit,
@@ -229,20 +238,43 @@ fun ActiveItemActions(
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            Button(onClick = if (isPaused) onResume else onPause, modifier = Modifier.weight(1f)) {
+            Button(
+                onClick = if (isPaused) onResume else onPause,
+                enabled = actionsEnabled,
+                modifier = Modifier.weight(1f),
+            ) {
                 Icon(if (isPaused) Icons.Default.PlayArrow else Icons.Default.Pause, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text(if (isPaused) "Resume" else "Take a break")
             }
-            OutlinedButton(onClick = onComplete, modifier = Modifier.weight(1f)) {
+            OutlinedButton(
+                onClick = onComplete,
+                enabled = actionsEnabled,
+                modifier = Modifier.weight(1f),
+            ) {
                 Icon(Icons.Default.Check, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("Complete")
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            OutlinedButton(onClick = onSkip, modifier = Modifier.weight(1f)) { Text("Skipped") }
-            OutlinedButton(onClick = onLater, modifier = Modifier.weight(1f)) { Text("Will do later") }
+            OutlinedButton(
+                onClick = onSkip,
+                enabled = actionsEnabled,
+                modifier = Modifier.weight(1f),
+            ) { Text("Skipped") }
+            if (canDefer) {
+                OutlinedButton(onClick = onLater, modifier = Modifier.weight(1f)) {
+                    Text("Will do later")
+                }
+            }
+        }
+        if (!canDefer) {
+            Text(
+                "Moving an active synced session later needs server support. Keep it paused, complete it, or skip it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
     }
 }

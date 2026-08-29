@@ -14,8 +14,10 @@ import androidx.compose.material.icons.outlined.AddTask
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Button
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -32,12 +34,15 @@ import java.time.format.DateTimeFormatter
 fun TodayScreen(
     state: DayWeaveUiState,
     syncState: CanonicalSyncState,
+    canonicalExecutionActionsEnabled: Boolean,
     onStart: (String) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
     onComplete: () -> Unit,
     onSkip: () -> Unit,
     onLater: () -> Unit,
+    onRetryTerminalProjection: (String) -> Unit,
+    onKeepLatestItem: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
@@ -54,7 +59,17 @@ fun TodayScreen(
                     style = MaterialTheme.typography.headlineSmall,
                 )
                 Text(
-                    if (isCurrentPlan) state.scheduleMessage else syncState.message,
+                    if (
+                        !isCurrentPlan || syncState.phase in setOf(
+                            com.greengolddog.dayweave.sync.CanonicalSyncPhase.AUTH_REQUIRED,
+                            com.greengolddog.dayweave.sync.CanonicalSyncPhase.OFFLINE,
+                            com.greengolddog.dayweave.sync.CanonicalSyncPhase.ERROR,
+                        )
+                    ) {
+                        syncState.message
+                    } else {
+                        state.scheduleMessage
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -80,6 +95,79 @@ fun TodayScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onErrorContainer,
                         )
+                    }
+                }
+            }
+        }
+
+        val terminalConflict = state.terminalExecutionOutcomes.values.firstOrNull {
+            it.canonicalProjectionConflict != null
+        }
+        if (terminalConflict != null) {
+            val canonicalWritePending = state.pendingCanonicalMutation != null
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        val terminalLabel = if (terminalConflict.session.status == "completed") {
+                            "completed"
+                        } else {
+                            "skipped"
+                        }
+                        val itemTitle = state.canonicalItems.firstOrNull {
+                            it.id == terminalConflict.session.itemId
+                        }?.title ?: "Deleted or unavailable item"
+                        Text(
+                            "Execution outcome needs review",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            "$itemTitle was $terminalLabel, but that exact outcome cannot be " +
+                                "safely applied to the latest item. " +
+                                requireNotNull(terminalConflict.canonicalProjectionConflict),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    onRetryTerminalProjection(terminalConflict.session.id)
+                                },
+                                enabled =
+                                    terminalConflict.canonicalProjectionRetryAuthorizedAt == null &&
+                                        !canonicalWritePending,
+                            ) {
+                                Text(
+                                    if (
+                                        terminalConflict.canonicalProjectionRetryAuthorizedAt == null
+                                    ) {
+                                        "Approve retry"
+                                    } else {
+                                        "Retry approved"
+                                    },
+                                )
+                            }
+                            OutlinedButton(
+                                onClick = {
+                                    onKeepLatestItem(terminalConflict.session.id)
+                                },
+                                enabled = !canonicalWritePending,
+                            ) {
+                                Text(
+                                    if (canonicalWritePending) {
+                                        "Canonical write pending"
+                                    } else {
+                                        "Keep latest as new work"
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -144,6 +232,9 @@ fun TodayScreen(
                         }
                         ActiveItemActions(
                             isPaused = activeSession.isPaused,
+                            canDefer = activeItem.canonicalItemId == null,
+                            actionsEnabled = activeItem.canonicalItemId == null ||
+                                canonicalExecutionActionsEnabled,
                             onPause = onPause,
                             onResume = onResume,
                             onComplete = onComplete,
@@ -211,7 +302,35 @@ fun TodayScreen(
         }
 
         items(visibleTimeline, key = { it.id }) { item ->
-            ScheduleItemCard(item = item, onStart = { onStart(item.id) })
+            val terminalStartBlocked = state.terminalExecutionOutcomes.values.any { outcome ->
+                val sameOrigin = outcome.syncOrigin == (
+                    state.canonicalSyncOrigin ?: state.canonicalExecutionSyncOrigin
+                )
+                val exactIdentity = outcome.session.itemId == item.canonicalItemId &&
+                    outcome.session.itemRevision == item.canonicalRevision &&
+                    outcome.session.occurrenceId == item.occurrenceId &&
+                    outcome.session.sessionIndex == item.sessionIndex
+                val exactTerminalApplies = exactIdentity &&
+                    outcome.canonicalProjectionResolution != "user_kept_latest_item"
+                val unresolvedParentProjection =
+                    outcome.requiresCanonicalItemProjection &&
+                        outcome.canonicalProjectionRevision == null &&
+                        outcome.canonicalProjectionResolution == null &&
+                        outcome.session.itemId == item.canonicalItemId
+                sameOrigin && (exactTerminalApplies || unresolvedParentProjection)
+            } || item.canonicalItemId != null && (
+                !state.canonicalExecutionHistoryVerified ||
+                    state.canonicalExecutionSyncOrigin != state.canonicalSyncOrigin ||
+                    state.canonicalExecutionConfigurationId != state.canonicalConfigurationId
+                )
+            ScheduleItemCard(
+                item = item,
+                onStart = { onStart(item.id) },
+                canStart = !terminalStartBlocked && (
+                    item.canonicalItemId == null || canonicalExecutionActionsEnabled
+                ),
+                unavailableLabel = if (terminalStartBlocked) "Needs review" else "Syncing…",
+            )
         }
 
         if (visibleTimeline.isEmpty() && isCurrentPlan) {

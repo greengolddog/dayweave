@@ -96,10 +96,13 @@ android {
                 storePassword = releaseSigningProperties.requiredSigningValue("storePassword")
                 keyAlias = releaseSigningProperties.requiredSigningValue("keyAlias")
                 keyPassword = releaseSigningProperties.requiredSigningValue("keyPassword")
-                enableV1Signing = true
-                enableV2Signing = true
+                // minSdk 28 supports APK Signature Scheme v3 on every supported device. Keep the
+                // direct-download artifact deliberately v3-only and verify that contract in the
+                // release script instead of requesting v2 and then shipping a v3-only APK.
+                enableV1Signing = false
+                enableV2Signing = false
                 enableV3Signing = true
-                enableV4Signing = true
+                enableV4Signing = false
             }
         }
     }

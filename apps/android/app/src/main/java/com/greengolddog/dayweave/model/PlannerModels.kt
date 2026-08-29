@@ -166,6 +166,8 @@ data class RecurrenceMoveSnapshot(
 data class PendingCanonicalMutation(
     val idempotencyKey: String,
     val syncOrigin: String,
+    /** Opaque credential/workspace binding; null is migration-only and never rebound. */
+    val configurationId: String? = null,
     val itemId: String,
     val expectedRevision: Long,
     val targetStatus: String,
@@ -175,6 +177,92 @@ data class PendingCanonicalMutation(
     val displayStatus: ItemStatus,
     val pauseLabel: String? = null,
     val pauseMinutes: Int? = null,
+    /** Terminal execution whose one-shot parent status is being projected by this exact write. */
+    val terminalExecutionSessionId: String? = null,
+)
+
+/** Durable, redacted copy of the server-owned execution lease. */
+@Serializable
+data class CanonicalExecutionSessionSnapshot(
+    val id: String,
+    val itemId: String,
+    val itemRevision: Long,
+    val occurrenceId: String? = null,
+    val sessionIndex: Int,
+    val plannedBlockId: String? = null,
+    val sourceDeviceId: String,
+    val status: String,
+    val revision: Long,
+    val accumulatedSeconds: Long,
+    val actualSeconds: Long? = null,
+    val startedAt: String,
+    val runningSince: String? = null,
+    val pausedAt: String? = null,
+    val pauseUntil: String? = null,
+    val pauseReason: String? = null,
+    val endedAt: String? = null,
+    val createdAt: String,
+    val updatedAt: String,
+    /**
+     * Local provenance captured while this exact lease still matched its original composition.
+     *
+     * `null` is intentionally the migration/unknown value. A server payload cannot assert this;
+     * the encrypted planner store sets it only after proving that the lease represented the sole,
+     * fully scheduled, executable, non-recurring and indivisible leaf at [itemRevision].
+     */
+    val canonicalProjectionEligibleAtLeaseStart: Boolean? = null,
+)
+
+/**
+ * Durable terminal execution fact retained independently from a composed schedule.
+ *
+ * A schedule preview is allowed to move or replace blocks, but it cannot erase a server-confirmed
+ * completion/skip. One-shot, indivisible leaves additionally project their terminal status through
+ * the canonical item replacement fence; recurring and split work remains scoped to this exact
+ * occurrence/session identity.
+ */
+@Serializable
+data class TerminalExecutionOutcomeSnapshot(
+    val syncOrigin: String,
+    val session: CanonicalExecutionSessionSnapshot,
+    val requiresCanonicalItemProjection: Boolean,
+    val canonicalProjectionRevision: Long? = null,
+    /** Non-null when projection was intentionally resolved without a canonical status write. */
+    val canonicalProjectionResolution: String? = null,
+    /** Durable user-visible reason why the latest canonical item cannot be projected safely. */
+    val canonicalProjectionConflict: String? = null,
+    /** Explicit user approval to make exactly one safe retry from a persisted conflict. */
+    val canonicalProjectionRetryAuthorizedAt: String? = null,
+    val recordedAt: String,
+)
+
+/**
+ * Exact execution request persisted before network I/O.
+ *
+ * Retries reuse both [idempotencyKey] and [requestJson]. A response timeout therefore cannot
+ * make Android invent a second session or a different transition after process death.
+ */
+@Serializable
+data class PendingExecutionCommand(
+    val idempotencyKey: String,
+    val syncOrigin: String,
+    val configurationId: String? = null,
+    val expectedRevision: Long,
+    val sessionId: String,
+    val itemId: String,
+    val itemRevision: Long,
+    val occurrenceId: String? = null,
+    val sessionIndex: Int,
+    /** Authoritative value from the lease; it can be null or refer to an older composed block. */
+    val plannedBlockId: String? = null,
+    /** Nullable only so a pre-integration encrypted snapshot decodes and then fails closed. */
+    val sourceDeviceId: String? = null,
+    val commandType: String,
+    val requestJson: String,
+    val focusedBlockId: String,
+    val startedAt: String,
+    /** Minted locally and durably only while staging this client's exact lease start. */
+    val canonicalProjectionEligibleAtLeaseStart: Boolean = false,
 )
 
 @Serializable
@@ -190,6 +278,8 @@ data class CanonicalPlanUpdate(
     val items: List<CanonicalItemSnapshot>,
     val schedule: List<ScheduleItem>,
     val syncOrigin: String,
+    /** Opaque credential/workspace binding that produced this cache generation. */
+    val configurationId: String? = null,
     val deltaCursor: String,
     val inputDigest: String,
     val generatedAt: String,
@@ -217,6 +307,8 @@ data class ActiveSession(
     val pauseUntilEpochMillis: Long? = null,
     /** Set when a timed break expires; resuming remains an explicit user choice by default. */
     val timedBreakEnded: Boolean = false,
+    /** Non-null only when timing is owned by the canonical cross-device execution lease. */
+    val canonicalExecutionSessionId: String? = null,
 )
 
 @Serializable
@@ -292,6 +384,8 @@ data class DayWeaveUiState(
     val useDynamicColor: Boolean = false,
     val canonicalItems: List<CanonicalItemSnapshot> = emptyList(),
     val canonicalSyncOrigin: String? = null,
+    /** Credential/workspace binding for every canonical cursor/cache field above and below. */
+    val canonicalConfigurationId: String? = null,
     val canonicalDeltaCursor: String? = null,
     val scheduleInputDigest: String? = null,
     val scheduleGeneratedAt: String? = null,
@@ -307,6 +401,24 @@ data class DayWeaveUiState(
     /** Last real completion instant by recurring canonical item. */
     val recurrenceCompletionAnchors: Map<String, String> = emptyMap(),
     val pendingCanonicalMutation: PendingCanonicalMutation? = null,
+    /** Origin-bound global revision and active lease returned by `/v1/execution`. */
+    val canonicalExecutionSyncOrigin: String? = null,
+    val canonicalExecutionConfigurationId: String? = null,
+    val canonicalExecutionRevision: Long = 0,
+    val canonicalExecutionSession: CanonicalExecutionSessionSnapshot? = null,
+    /** Newest 100 rows from the last stable paged history read, retained for rolling overlap. */
+    val canonicalExecutionHistoryWindow: List<CanonicalExecutionSessionSnapshot> = emptyList(),
+    /** Workspace revision at which [canonicalExecutionHistoryWindow] was captured. */
+    val canonicalExecutionHistoryWindowRevision: Long? = null,
+    /** True only while this page chain remains proven from one complete history baseline. */
+    val canonicalExecutionHistoryContinuityEstablished: Boolean = false,
+    /** False fences every canonical start until bounded history continuity is proven. */
+    val canonicalExecutionHistoryVerified: Boolean = false,
+    /** Bounded ledger preventing a confirmed execution outcome from being recomposed away. */
+    val terminalExecutionOutcomes: Map<String, TerminalExecutionOutcomeSnapshot> = emptyMap(),
+    val pendingExecutionCommand: PendingExecutionCommand? = null,
+    /** Random device identity generated once and retained only inside encrypted planner state. */
+    val executionDeviceId: String? = null,
     val unscheduledWork: List<UnscheduledWorkSnapshot> = emptyList(),
     /** Materialized occurrence id to the recurring root that owns its context/actions. */
     val occurrenceSeriesItemIds: Map<String, String> = emptyMap(),

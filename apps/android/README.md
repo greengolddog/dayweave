@@ -4,6 +4,12 @@ Native Jetpack Compose client for `com.greengolddog.dayweave`. The current found
 
 Planner state, including the last server proposal cache, is stored offline in a Room database encrypted by SQLCipher. A random 256-bit database passphrase is AES-GCM wrapped by a non-exportable Android Keystore key; plaintext key material is never written to storage. Startup restores the last atomic snapshot, blocks edits until restore finishes, and autosaves subsequent intents through one serialized writer.
 
+Canonical focus sessions use the server-authoritative `/v1/execution` lease. Android reconciles that lease before every start, pause (duration, absolute end, or open-ended), resume, complete, and skip command. The app persists a stable random device UUID plus the exact request body and idempotency key before network I/O; an ambiguous response or process restart therefore retries byte-for-byte instead of creating local success or a second session. HTTP 401 keeps the exact retry fenced, while deterministic 404/409/422 responses trigger an authoritative snapshot/history reconciliation. Noncanonical preview blocks still use device-local timing, but canonical blocks never fall back to local execution while offline.
+
+A timed break never resumes automatically. When its server deadline passes, the explicit Resume / Extend 10m / Keep paused choice appears. Keep paused closes the message without inventing a server mutation, and extending sends another revision-guarded pause command while the lease stays paused.
+
+While the UI is visible, one lifecycle-bound job refreshes the execution lease immediately and every 30 seconds. The process action gate coalesces that work with taps, settings changes, and composition so foreground polling cannot create duplicate command jobs. If a cached lease disappears, Android pages the complete execution history between two equal execution snapshots before applying its terminal outcome; a racing, incomplete, or malformed history read retains any command fence and leaves execution locked instead of guessing. The encrypted snapshot keeps a rolling 100-session history window for display plus a lifetime terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after enough newer sessions.
+
 The Suggestions tab connects to the existing `/v1/suggestions` API with OkHttp and a bearer token. The token is separately AES-GCM wrapped with its own non-exportable Android Keystore key and is never placed in the Room planner snapshot or application logs. The connection preference and both encrypted databases are excluded from backup and device transfer.
 
 ## Build
@@ -22,7 +28,9 @@ export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
 ./gradlew testDebugUnitTest lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
 ```
 
-The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`.
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signed minified release is produced with `scripts/build-android-apk.sh`, using the private external signing properties created by `scripts/create-android-signing-key.sh`.
+
+The supported floor is Android 9 / API 28, so the direct-download release APK intentionally uses APK Signature Scheme v3 only. Gradle disables v1, v2, and the uncopied v4 sidecar; the release script runs verbose `apksigner` verification before copying `dist/android/DayWeave-release.apk`. Release acceptance requires v3 `true`, v1/v2 `false`, and exactly one signer in that output.
 
 ## Suggestions API configuration
 
@@ -47,6 +55,8 @@ For the device smoke test, start an API 35 emulator or connect the Pixel with US
 Accepting a ChatGPT, Codex, or in-app assistant proposal first records the revision-aware API decision and then creates a reviewable Inbox draft. It never mutates the schedule. On the next refresh, any accepted server proposal is reconciled idempotently into a draft, so an interrupted client response cannot bypass review or lose the accepted proposal locally.
 
 A refresh or proposal mutation reports success only after the exact replaced/reconciled planner generation has completed its encrypted Room save. That acknowledgement is limited to server sync; ordinary UI intents remain non-blocking and are serialized by the same writer.
+
+Execution completion is durably block-scoped first: the exact terminal lease identity is retained independently of schedule composition, so a fresh preview or restart cannot resurrect it. For a non-recurring, indivisible executable leaf represented by one fully scheduled block, Android then projects completion/skip through the existing durable, idempotent canonical item-replacement fence before recomposing. If another client edited the item first, Android safely rebases onto the latest revision while preserving every latest field; an already-matching terminal item or tombstone resolves without another write. A latest item that became recurring, split, otherwise ineligible, or oppositely terminal produces a durable review card with **Retry reconciliation** and **Keep latest as new work** actions, and remains non-startable until explicitly resolved. Recurring and split work remains exact-occurrence/session only and never silently completes its parent or siblings. The server execution API still has no atomic “release this lease and defer/recompose this occurrence” command, so **Will do later** remains disabled while a canonical lease is open; occurrence-level cross-device parent projection remains a server API gap, not a local fallback.
 
 ## Persistence safety
 

@@ -10,7 +10,7 @@ use crate::{
 
 use super::{
     ExecutionCommand, ExecutionDomainError, ExecutionIdempotency, ExecutionMutation,
-    ExecutionRepository, ExecutionRepositoryError, ExecutionSnapshot,
+    ExecutionRepository, ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot,
 };
 
 const IDEMPOTENCY_TTL: StdDuration = StdDuration::from_hours(24);
@@ -20,6 +20,12 @@ const MAX_HISTORY_LIMIT: usize = 100;
 pub struct ExecutionIdempotencyKey {
     pub key: String,
     pub fingerprint: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionHistoryPage {
+    pub sessions: Vec<ExecutionSession>,
+    pub next_offset: Option<usize>,
 }
 
 pub struct ExecutionService {
@@ -124,10 +130,40 @@ impl ExecutionService {
         &self,
         limit: usize,
     ) -> Result<Vec<super::ExecutionSession>, ExecutionServiceError> {
+        Ok(self.history_page(limit, 0).await?.sessions)
+    }
+
+    /// Returns one newest-first history page with an exact continuation offset.
+    pub async fn history_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<ExecutionHistoryPage, ExecutionServiceError> {
         if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
             return Err(ExecutionServiceError::InvalidHistoryLimit);
         }
-        Ok(self.repository.history(limit).await?)
+        if offset > i64::MAX as usize {
+            return Err(ExecutionServiceError::InvalidHistoryOffset);
+        }
+        let probe_limit = limit
+            .checked_add(1)
+            .ok_or(ExecutionServiceError::Internal)?;
+        let mut sessions = self.repository.history(probe_limit, offset).await?;
+        let has_more = sessions.len() > limit;
+        sessions.truncate(limit);
+        let next_offset = if has_more {
+            Some(
+                offset
+                    .checked_add(limit)
+                    .ok_or(ExecutionServiceError::Internal)?,
+            )
+        } else {
+            None
+        };
+        Ok(ExecutionHistoryPage {
+            sessions,
+            next_offset,
+        })
     }
 }
 
@@ -145,6 +181,8 @@ pub enum ExecutionServiceError {
     InvalidRevision,
     #[error("history limit must be between 1 and 100")]
     InvalidHistoryLimit,
+    #[error("history offset is outside the supported range")]
+    InvalidHistoryOffset,
     #[error("item revision conflict: expected {expected}, found {actual}")]
     ItemRevisionConflict { expected: u64, actual: u64 },
     #[error("item is not an executable active leaf")]
@@ -338,5 +376,63 @@ mod tests {
         let replay = service.command(1, pause, idempotency(6)).await.unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn history_pages_have_exact_non_overlapping_continuations() {
+        let (service, clock, item_id) = fixture().await;
+        let first_id = Uuid::from_u128(41);
+        service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: first_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(42),
+                }),
+                idempotency(7),
+            )
+            .await
+            .unwrap();
+        service
+            .command(
+                1,
+                ExecutionCommand::Complete(FinishExecution {
+                    session_id: first_id,
+                    actual_seconds: None,
+                }),
+                idempotency(8),
+            )
+            .await
+            .unwrap();
+        clock.set(clock.now() + chrono::Duration::seconds(1));
+        let second_id = Uuid::from_u128(43);
+        service
+            .command(
+                2,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: second_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 1,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(42),
+                }),
+                idempotency(9),
+            )
+            .await
+            .unwrap();
+
+        let first = service.history_page(1, 0).await.unwrap();
+        assert_eq!(first.sessions[0].id, second_id);
+        assert_eq!(first.next_offset, Some(1));
+        let second = service.history_page(1, 1).await.unwrap();
+        assert_eq!(second.sessions[0].id, first_id);
+        assert_eq!(second.next_offset, None);
     }
 }

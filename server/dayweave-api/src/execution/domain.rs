@@ -78,21 +78,24 @@ impl ExecutionSession {
         command: &ExecutionCommand,
         now: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
+        // Wall clocks can move backwards. Session time is a persisted protocol clock: keeping it
+        // monotonic preserves elapsed accounting, newest-first pagination, and client continuity.
+        let transition_at = now.max(self.updated_at);
         match command {
             ExecutionCommand::Start(_) => Err(ExecutionDomainError::InvalidTransition),
-            ExecutionCommand::Pause(input) => self.pause(input, now),
-            ExecutionCommand::Resume(input) => self.resume(input, now),
+            ExecutionCommand::Pause(input) => self.pause(input, transition_at),
+            ExecutionCommand::Resume(input) => self.resume(input, transition_at),
             ExecutionCommand::Complete(input) => self.finish(
                 input.session_id,
                 input.actual_seconds,
                 ExecutionStatus::Completed,
-                now,
+                transition_at,
             ),
             ExecutionCommand::Skip(input) => self.finish(
                 input.session_id,
                 input.actual_seconds,
                 ExecutionStatus::Skipped,
-                now,
+                transition_at,
             ),
         }
     }
@@ -403,6 +406,50 @@ mod tests {
         assert_eq!(completed.accumulated_seconds, 150);
         assert_eq!(completed.actual_seconds, Some(150));
         assert_eq!(completed.status, ExecutionStatus::Completed);
+    }
+
+    #[test]
+    fn persisted_session_clock_never_moves_backwards_with_wall_clock() {
+        let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let session = ExecutionSession::start(&start(), t0);
+        let paused = session
+            .apply(
+                &ExecutionCommand::Pause(PauseExecution {
+                    session_id: session.id,
+                    duration_seconds: Some(60),
+                    pause_until: None,
+                    reason: None,
+                }),
+                t0 - chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        assert_eq!(paused.updated_at, t0);
+        assert_eq!(paused.paused_at, Some(t0));
+        assert_eq!(paused.pause_until, Some(t0 + chrono::Duration::seconds(60)));
+
+        let resumed = paused
+            .apply(
+                &ExecutionCommand::Resume(ResumeExecution {
+                    session_id: session.id,
+                }),
+                t0 - chrono::Duration::minutes(4),
+            )
+            .unwrap();
+        assert_eq!(resumed.updated_at, t0);
+        assert_eq!(resumed.running_since, Some(t0));
+
+        let completed = resumed
+            .apply(
+                &ExecutionCommand::Complete(FinishExecution {
+                    session_id: session.id,
+                    actual_seconds: None,
+                }),
+                t0 - chrono::Duration::minutes(3),
+            )
+            .unwrap();
+        assert_eq!(completed.updated_at, t0);
+        assert_eq!(completed.ended_at, Some(t0));
+        assert_eq!(completed.accumulated_seconds, 0);
     }
 
     #[test]

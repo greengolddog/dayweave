@@ -478,13 +478,18 @@ struct DayWeaveExecutionMutationEnvelope: Decodable, Sendable {
 
 struct DayWeaveExecutionHistoryEnvelope: Decodable, Sendable {
     let sessions: [DayWeaveExecutionSession]
+    let nextOffset: Int?
 
-    private enum CodingKeys: String, CodingKey, CaseIterable { case sessions }
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case sessions
+        case nextOffset = "next_offset"
+    }
 
     init(from decoder: any Decoder) throws {
         try requireExactExecutionKeys(CodingKeys.self, from: decoder)
-        sessions = try decoder.container(keyedBy: CodingKeys.self)
-            .decode([DayWeaveExecutionSession].self, forKey: .sessions)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessions = try container.decode([DayWeaveExecutionSession].self, forKey: .sessions)
+        nextOffset = try container.decodeIfPresent(Int.self, forKey: .nextOffset)
     }
 }
 

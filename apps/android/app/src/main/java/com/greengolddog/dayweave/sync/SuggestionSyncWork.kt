@@ -80,7 +80,7 @@ class SuggestionConnectionController(
 
     suspend fun update(baseUrl: String, bearerToken: String?): Boolean = settingsMutex.withLock {
         try {
-            withCanonicalConfigurationUpdateLock(baseUrl) {
+            withCanonicalConfigurationUpdateLock(baseUrl, bearerToken) {
                 if (!syncManager.updateConnection(baseUrl, bearerToken)) {
                     return@withCanonicalConfigurationUpdateLock false
                 }
@@ -119,8 +119,13 @@ class SuggestionConnectionController(
 
     private suspend fun <T> withCanonicalConfigurationUpdateLock(
         baseUrl: String,
+        bearerToken: String?,
         block: suspend () -> T,
-    ): T = canonicalSyncManager?.withConfigurationUpdateLock(baseUrl, block) ?: block()
+    ): T = canonicalSyncManager?.withConfigurationUpdateLock(
+        requestedBaseUrl = baseUrl,
+        bearerToken = bearerToken,
+        change = block,
+    ) ?: block()
 
     private suspend fun forgetWithoutCanonicalManager(): Boolean {
         return try {
