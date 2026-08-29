@@ -10,6 +10,9 @@ struct DayWeaveMacApp: App {
     @StateObject private var codexConversation: CodexConversationController
     @StateObject private var suggestionSync: SuggestionSyncStore
     @StateObject private var canonicalSync: CanonicalSyncStore
+    @StateObject private var executionSync: ExecutionSyncStore
+    @State private var activationTask: Task<Void, Never>?
+    @State private var servicesAreActive = false
 
     init() {
         let store = PlannerStore.live()
@@ -23,6 +26,7 @@ struct DayWeaveMacApp: App {
         ))
         _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
         _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
+        _executionSync = StateObject(wrappedValue: ExecutionSyncStore(planner: store))
         codex.startIfNeeded()
     }
 
@@ -34,13 +38,23 @@ struct DayWeaveMacApp: App {
                 .environmentObject(codexConversation)
                 .environmentObject(suggestionSync)
                 .environmentObject(canonicalSync)
+                .environmentObject(executionSync)
                 .frame(minWidth: 1_080, minHeight: 720)
+                .onAppear {
+                    if scenePhase == .active {
+                        activateServices()
+                    }
+                }
                 .onChange(of: scenePhase) { _, phase in
-                    if phase != .active {
+                    if phase == .active {
+                        activateServices()
+                    } else {
+                        deactivateServices()
                         store.flushPersistence()
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    deactivateServices()
                     store.flushPersistence()
                     codexConversation.shutDown()
                     codex.shutDown()
@@ -63,9 +77,14 @@ struct DayWeaveMacApp: App {
             }
         }
 
-        MenuBarExtra("DayWeave", systemImage: store.activeItem == nil ? "sparkles" : "timer") {
+        MenuBarExtra(
+            "DayWeave",
+            systemImage: executionSync.activeSession == nil && store.activeItem == nil
+                ? "sparkles" : "timer"
+        ) {
             MenuBarView()
                 .environmentObject(store)
+                .environmentObject(executionSync)
         }
         .menuBarExtraStyle(.window)
 
@@ -75,7 +94,30 @@ struct DayWeaveMacApp: App {
                 .environmentObject(codex)
                 .environmentObject(suggestionSync)
                 .environmentObject(canonicalSync)
+                .environmentObject(executionSync)
                 .frame(width: 660, height: 620)
         }
+    }
+
+    private func activateServices() {
+        guard !servicesAreActive else { return }
+        servicesAreActive = true
+        activationTask = Task { @MainActor in
+            let executionOutcome = await executionSync.refresh()
+            guard !Task.isCancelled, servicesAreActive else { return }
+            if executionOutcome == .success, canonicalSync.isConfigured {
+                await canonicalSync.sync()
+            }
+            guard !Task.isCancelled, servicesAreActive else { return }
+            executionSync.startForegroundPolling()
+            activationTask = nil
+        }
+    }
+
+    private func deactivateServices() {
+        servicesAreActive = false
+        activationTask?.cancel()
+        activationTask = nil
+        executionSync.stopForegroundPolling()
     }
 }

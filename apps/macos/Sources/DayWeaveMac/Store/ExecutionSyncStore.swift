@@ -326,7 +326,7 @@ final class ExecutionSyncStore: ObservableObject {
     }
 
     func startForegroundPolling(every interval: Duration = .seconds(30)) {
-        stopForegroundPolling()
+        guard foregroundPollingTask == nil else { return }
         foregroundPollingTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled {

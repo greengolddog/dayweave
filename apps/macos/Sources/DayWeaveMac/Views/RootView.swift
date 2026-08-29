@@ -1,11 +1,40 @@
 import AppKit
 import SwiftUI
 
+private func executionSession(
+    _ session: DayWeaveExecutionSession,
+    matches block: ScheduleBlock
+) -> Bool {
+    block.sourceItemID == session.itemID
+        && block.sourceItemRevision == session.itemRevision
+        && block.occurrenceID == session.occurrenceID
+        && (block.sessionIndex ?? 0) == session.sessionIndex
+}
+
+private func executionBlock(
+    matching session: DayWeaveExecutionSession,
+    in blocks: [ScheduleBlock]
+) -> ScheduleBlock? {
+    if let plannedBlockID = session.plannedBlockID,
+       let block = blocks.first(where: {
+           $0.id == plannedBlockID && executionSession(session, matches: $0)
+       }) {
+        return block
+    }
+    let matches = blocks.filter { executionSession(session, matches: $0) }
+    if matches.count == 1 { return matches[0] }
+    return matches.first(where: {
+        $0.syncOrigin == .remoteExecutionLease && $0.id == session.id
+    })
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var isResolvingExpiredBreak = false
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -25,9 +54,29 @@ struct RootView: View {
         .onAppear {
             codex.startIfNeeded()
         }
-        .task {
-            guard canonicalSync.isConfigured else { return }
-            await canonicalSync.sync()
+        .alert("Your break has ended", isPresented: expiredBreakAlertBinding) {
+            Button("Resume") {
+                if let blockID = activeExecutionBlockID {
+                    isResolvingExpiredBreak = true
+                    Task {
+                        _ = await executionSync.resume(blockID)
+                        isResolvingExpiredBreak = false
+                    }
+                }
+            }
+            .accessibilityIdentifier("execution.expired-break.resume")
+            .disabled(executionSync.isSyncing
+                || store.executionState.pendingCommand != nil
+                || !store.canMutatePlan)
+            Button("Keep paused") {
+                _ = executionSync.keepPausedAfterExpiredBreak()
+            }
+            .accessibilityIdentifier("execution.expired-break.keep-paused")
+            .disabled(executionSync.isSyncing
+                || store.executionState.pendingCommand != nil
+                || !store.canMutatePlan)
+        } message: {
+            Text("Choose whether to resume the authoritative session or keep it paused. DayWeave will not resume it automatically.")
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
@@ -38,6 +87,15 @@ struct RootView: View {
                 }
                 .help("Pull canonical items, publish safe local changes, and compose a preview")
                 .disabled(!canonicalSync.isConfigured || canonicalSync.isSyncing || !store.canMutatePlan)
+
+                Button {
+                    Task { await executionSync.refresh() }
+                } label: {
+                    Label("Refresh execution", systemImage: "timer")
+                }
+                .help("Reconcile the authoritative execution lease and complete history")
+                .disabled(executionSync.isSyncing || !store.canMutatePlan)
+                .accessibilityIdentifier("execution.refresh")
 
                 Button {
                     store.recomposeSchedule()
@@ -56,6 +114,20 @@ struct RootView: View {
                 .disabled(!store.canMutatePlan)
             }
         }
+    }
+
+    private var expiredBreakAlertBinding: Binding<Bool> {
+        Binding(
+            get: {
+                executionSync.expiredBreakChoiceRequired && !isResolvingExpiredBreak
+            },
+            set: { _ in }
+        )
+    }
+
+    private var activeExecutionBlockID: UUID? {
+        guard let active = executionSync.activeSession else { return nil }
+        return executionBlock(matching: active, in: store.blocks)?.id
     }
 
     @ViewBuilder
@@ -82,6 +154,7 @@ struct RootView: View {
 private struct SidebarView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
 
     var body: some View {
         List(selection: $store.destination) {
@@ -118,11 +191,18 @@ private struct SidebarView: View {
                 }
                 .font(.caption)
                 .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
+                Label {
+                    Text(executionSync.status.message).lineLimit(2)
+                } icon: {
+                    Image(systemName: executionSync.isSyncing ? "timer.circle" : "timer")
+                }
+                .font(.caption)
+                .foregroundStyle(executionStatusIsFailure ? .red : .secondary)
             }
         }
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) {
-            if let active = store.activeItem {
+            if let active = focusedExecutionBlock {
                 ActiveMiniPlayer(block: active)
                     .padding(10)
             }
@@ -146,6 +226,23 @@ private struct SidebarView: View {
                 ? "Planner state is encrypted on this Mac"
                 : "This store has no encrypted persistence backend")
     }
+
+    private var executionStatusIsFailure: Bool {
+        switch executionSync.status.phase {
+        case .failed, .authenticationRequired, .notConfigured, .offline:
+            true
+        case .ready, .syncing, .connected:
+            false
+        }
+    }
+
+    private var focusedExecutionBlock: ScheduleBlock? {
+        if let session = executionSync.activeSession,
+           let block = executionBlock(matching: session, in: store.blocks) {
+            return block
+        }
+        return store.activeItem
+    }
 }
 
 private struct ActiveMiniPlayer: View {
@@ -154,7 +251,7 @@ private struct ActiveMiniPlayer: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("NOW")
+            Text(block.status == .paused ? "PAUSED" : "NOW")
                 .font(.caption2.weight(.bold))
                 .foregroundStyle(.secondary)
             Text(block.title)
@@ -165,13 +262,20 @@ private struct ActiveMiniPlayer: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button {
-                    store.pauseActive()
-                } label: {
-                    Image(systemName: "pause.fill")
+                if block.sourceItemID != nil {
+                    AuthoritativeExecutionControls(block: block, includesCustomPause: false)
+                        .controlSize(.mini)
+                } else {
+                    Button {
+                        store.pauseActive()
+                    } label: {
+                        Image(systemName: "pause.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(!store.canMutate(block))
+                    .accessibilityLabel("Pause current item")
+                    .help("Pause current item")
                 }
-                .buttonStyle(.borderless)
-                .disabled(!store.canMutate(block))
             }
         }
         .padding(12)
@@ -187,6 +291,7 @@ private struct TodayView: View {
         VStack(spacing: 0) {
             TodayHeader()
             CanonicalSyncBanner()
+            ExecutionSyncBanner()
             PreviewDiagnosticsStrip()
             Divider()
             if store.visibleBlocks.isEmpty {
@@ -250,11 +355,10 @@ private struct PreviewDiagnosticsStrip: View {
                             .textSelection(.enabled)
                     }
                     ForEach(conflictedMutations) { mutation in
-                        Button("Retry \(title(for: mutation.itemID)) edit on current revision") {
-                            store.retryConflictedCanonicalMutation(mutation.id)
-                        }
-                        .buttonStyle(.link)
-                        .disabled(!store.canRetryCanonicalMutation(mutation))
+                        CanonicalConflictRecoveryControls(
+                            mutation: mutation,
+                            itemTitle: title(for: mutation.itemID)
+                        )
                     }
                 }
                 .font(.caption)
@@ -365,6 +469,62 @@ private struct CanonicalSyncBanner: View {
     }
 }
 
+private struct ExecutionSyncBanner: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+
+    var body: some View {
+        HStack(spacing: 9) {
+            if executionSync.isSyncing {
+                ProgressView().controlSize(.small)
+            } else {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+            }
+            Text(executionSync.status.message)
+                .font(.caption)
+                .foregroundStyle(statusIsFailure ? .red : .secondary)
+                .lineLimit(2)
+            Spacer()
+            if store.executionState.pendingCommand != nil {
+                Label("Replay protected", systemImage: "lock.shield")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .help("The exact command bytes and idempotency key are retained in encrypted storage until reconciliation succeeds.")
+            }
+            Button("Refresh execution") {
+                Task { await executionSync.refresh() }
+            }
+            .controlSize(.small)
+            .disabled(executionSync.isSyncing || !store.canMutatePlan)
+            .accessibilityIdentifier("execution.refresh.banner")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 9)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.4))
+    }
+
+    private var statusColor: Color {
+        switch executionSync.status.phase {
+        case .notConfigured: .secondary
+        case .ready: .orange
+        case .syncing: .blue
+        case .connected: .green
+        case .offline, .authenticationRequired, .failed: .red
+        }
+    }
+
+    private var statusIsFailure: Bool {
+        switch executionSync.status.phase {
+        case .offline, .authenticationRequired, .failed:
+            true
+        case .notConfigured, .ready, .syncing, .connected:
+            false
+        }
+    }
+}
+
 private struct TodayHeader: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
@@ -468,18 +628,21 @@ private struct ScheduleBlockView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-                if block.status == .active || block.status == .paused {
-                    HStack {
-                        Button(block.status == .active ? "Pause" : "Resume") {
-                            block.status == .active ? store.pauseActive() : store.start(block.id)
+                if block.sourceItemID != nil {
+                    AuthoritativeExecutionControls(block: block)
+                        .controlSize(.small)
+                } else if block.status == .active || block.status == .paused {
+                        HStack {
+                            Button(block.status == .active ? "Pause" : "Resume") {
+                                block.status == .active ? store.pauseActive() : store.start(block.id)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button("Complete") { store.complete(block.id) }
+                            Button("Later") { store.doLater(block.id) }
+                                .disabled(!block.isFlexible || block.isHardConstraint)
                         }
-                        .buttonStyle(.borderedProminent)
-                        Button("Complete") { store.complete(block.id) }
-                        Button("Later") { store.doLater(block.id) }
-                            .disabled(!block.isFlexible || block.isHardConstraint)
-                    }
-                    .controlSize(.small)
-                    .disabled(!store.canMutate(block))
+                        .controlSize(.small)
+                        .disabled(!store.canMutate(block))
                 }
             }
             .opacity(block.status == .completed ? 0.55 : 1)
@@ -495,12 +658,356 @@ private struct ScheduleBlockView: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .contextMenu {
-            Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
-            Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
+            if block.sourceItemID != nil {
+                AuthoritativeExecutionContextMenu(block: block)
+            } else {
+                Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
+                Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
+                Divider()
+                Button("Do Later") { store.doLater(block.id) }
+                    .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
+                Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
+            }
+        }
+    }
+}
+
+private enum ExecutionPauseEditorMode: String, CaseIterable, Identifiable {
+    case duration
+    case until
+
+    var id: Self { self }
+    var title: String { self == .duration ? "Duration" : "Until" }
+}
+
+private struct AuthoritativeExecutionControls: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+    let block: ScheduleBlock
+    var includesCustomPause = true
+
+    @State private var isPauseEditorPresented = false
+    @State private var pauseMode = ExecutionPauseEditorMode.duration
+    @State private var pauseMinutes = 15
+    @State private var pauseUntil = Date.now.addingTimeInterval(15 * 60)
+    @State private var pauseReason = ""
+
+    var body: some View {
+        HStack(spacing: 7) {
+            switch block.status {
+            case .scheduled:
+                Button("Start") {
+                    Task { await executionSync.start(block.id) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canStart)
+                .accessibilityIdentifier("execution.start.\(block.id.uuidString.lowercased())")
+                Menu("More") {
+                    Button("Do later") { store.doLater(block.id) }
+                        .disabled(!canEditScheduledBlock
+                            || !block.isFlexible || block.isHardConstraint)
+                    Button("Skip without starting") { store.skip(block.id) }
+                        .disabled(!canEditScheduledBlock)
+                }
+            case .active:
+                pauseMenu
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canControlOpenLease)
+                    .accessibilityIdentifier("execution.pause.\(block.id.uuidString.lowercased())")
+                terminalMenu
+                    .disabled(!canControlOpenLease)
+            case .paused:
+                Button("Resume") {
+                    Task { await executionSync.resume(block.id) }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canControlOpenLease)
+                .accessibilityIdentifier("execution.resume.\(block.id.uuidString.lowercased())")
+                terminalMenu
+                    .disabled(!canControlOpenLease)
+            default:
+                EmptyView()
+            }
+        }
+        .sheet(isPresented: $isPauseEditorPresented) {
+            ExecutionPauseEditor(
+                mode: $pauseMode,
+                minutes: $pauseMinutes,
+                pauseUntil: $pauseUntil,
+                reason: $pauseReason,
+                onCancel: { isPauseEditorPresented = false },
+                onPause: applyCustomPause
+            )
+        }
+    }
+
+    private var pauseMenu: some View {
+        Menu("Pause") {
+            Button("Pause indefinitely") {
+                pause(durationSeconds: nil)
+            }
             Divider()
-            Button("Do Later") { store.doLater(block.id) }
-                .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
-            Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
+            ForEach([5, 15, 30, 60], id: \.self) { minutes in
+                Button("Pause for \(minutes) minutes") {
+                    pause(durationSeconds: UInt32(minutes * 60))
+                }
+            }
+            if includesCustomPause {
+                Divider()
+                Button("Custom break…") {
+                    pauseMode = .duration
+                    pauseMinutes = 15
+                    pauseUntil = Date.now.addingTimeInterval(15 * 60)
+                    pauseReason = ""
+                    isPauseEditorPresented = true
+                }
+            }
+        }
+        .help("Pause for a stated duration, until a time, or indefinitely")
+    }
+
+    private var terminalMenu: some View {
+        Menu("Finish") {
+            Button("Complete") {
+                Task { await executionSync.complete(block.id) }
+            }
+            .accessibilityIdentifier("execution.complete.\(block.id.uuidString.lowercased())")
+            Button("Skip") {
+                Task { await executionSync.skip(block.id) }
+            }
+            .accessibilityIdentifier("execution.skip.\(block.id.uuidString.lowercased())")
+        }
+    }
+
+    private var canStart: Bool {
+        operationIsUnlocked
+            && block.status == .scheduled
+            && store.canMutate(block)
+            && executionSync.activeSession == nil
+            && store.executionState.historyVerified
+            && store.executionState.pendingCommand == nil
+            && store.pendingCanonicalMutations.isEmpty
+            && block.sourceItemRevision == block.sourceItemID.flatMap {
+                store.canonicalItem(id: $0)?.revision
+            }
+            && block.sourceItemID.flatMap { store.canonicalItem(id: $0) }?.isExecutable == true
+            && !store.executionState.terminalOutcomes.values.contains { outcome in
+                outcome.session.itemID == block.sourceItemID
+                    && outcome.session.itemRevision == block.sourceItemRevision
+                    && outcome.session.occurrenceID == block.occurrenceID
+                    && outcome.session.sessionIndex == (block.sessionIndex ?? 0)
+            }
+    }
+
+    private var canControlOpenLease: Bool {
+        guard operationIsUnlocked, let active = executionSync.activeSession else { return false }
+        return executionSession(active, matches: block)
+    }
+
+    private var operationIsUnlocked: Bool {
+        store.canMutatePlan
+            && !executionSync.isSyncing
+            && store.executionState.pendingCommand == nil
+    }
+
+    private var canEditScheduledBlock: Bool {
+        operationIsUnlocked && store.canMutate(block)
+    }
+
+    private func pause(durationSeconds: UInt32?) {
+        Task {
+            await executionSync.pause(block.id, durationSeconds: durationSeconds)
+        }
+    }
+
+    private func applyCustomPause() {
+        let reason = normalizedPauseReason
+        let duration = pauseMode == .duration ? UInt32(pauseMinutes * 60) : nil
+        let until = pauseMode == .until ? pauseUntil : nil
+        isPauseEditorPresented = false
+        Task {
+            await executionSync.pause(
+                block.id,
+                durationSeconds: duration,
+                pauseUntil: until,
+                reason: reason
+            )
+        }
+    }
+
+    private var normalizedPauseReason: String? {
+        let trimmed = pauseReason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+private struct ExecutionPauseEditor: View {
+    @Binding var mode: ExecutionPauseEditorMode
+    @Binding var minutes: Int
+    @Binding var pauseUntil: Date
+    @Binding var reason: String
+    let onCancel: () -> Void
+    let onPause: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Pause session").font(.title2.weight(.semibold))
+            Picker("Break type", selection: $mode) {
+                ForEach(ExecutionPauseEditorMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            if mode == .duration {
+                Stepper("\(minutes) minutes", value: $minutes, in: 1...1_440)
+            } else {
+                DatePicker("Resume no earlier than", selection: $pauseUntil)
+            }
+            TextField("Reason (optional)", text: $reason)
+                .textFieldStyle(.roundedBorder)
+            Text("\(reason.unicodeScalars.count)/500 characters")
+                .font(.caption)
+                .foregroundStyle(reasonIsValid ? Color.secondary : Color.red)
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Pause", action: onPause)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!submissionIsValid)
+            }
+        }
+        .padding(24)
+        .frame(width: 430)
+    }
+
+    private var reasonIsValid: Bool {
+        let trimmed = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reason.isEmpty || (!trimmed.isEmpty && reason.unicodeScalars.count <= 500)
+    }
+
+    private var submissionIsValid: Bool {
+        guard reasonIsValid else { return false }
+        if mode == .duration { return (1...1_440).contains(minutes) }
+        let interval = pauseUntil.timeIntervalSinceNow
+        return interval > 0 && interval <= 86_400
+    }
+}
+
+private struct AuthoritativeExecutionContextMenu: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+    let block: ScheduleBlock
+
+    var body: some View {
+        Group {
+            if block.status == .scheduled {
+                Button("Start") { Task { await executionSync.start(block.id) } }
+                    .disabled(!canStart)
+                Button("Do later") { store.doLater(block.id) }
+                    .disabled(!contextIsUnlocked || !store.canMutate(block)
+                        || !block.isFlexible || block.isHardConstraint)
+                Button("Skip without starting") { store.skip(block.id) }
+                    .disabled(!contextIsUnlocked || !store.canMutate(block))
+            } else if block.status == .active {
+                Menu("Pause") {
+                    Button("Indefinitely") {
+                        Task { await executionSync.pause(block.id) }
+                    }
+                    ForEach([5, 15, 30, 60], id: \.self) { minutes in
+                        Button("For \(minutes) minutes") {
+                            Task {
+                                await executionSync.pause(
+                                    block.id,
+                                    durationSeconds: UInt32(minutes * 60)
+                                )
+                            }
+                        }
+                    }
+                }
+                .disabled(!canControlOpenLease)
+            } else if block.status == .paused {
+                Button("Resume") { Task { await executionSync.resume(block.id) } }
+                    .disabled(!canControlOpenLease)
+            }
+            if block.status == .active || block.status == .paused {
+                Divider()
+                Button("Complete") { Task { await executionSync.complete(block.id) } }
+                    .disabled(!canControlOpenLease)
+                Button("Skip") { Task { await executionSync.skip(block.id) } }
+                    .disabled(!canControlOpenLease)
+            }
+        }
+    }
+
+    private var canStart: Bool {
+        store.canMutatePlan
+            && !executionSync.isSyncing
+            && store.canMutate(block)
+            && executionSync.activeSession == nil
+            && store.executionState.historyVerified
+            && store.executionState.pendingCommand == nil
+            && store.pendingCanonicalMutations.isEmpty
+            && block.sourceItemRevision == block.sourceItemID.flatMap {
+                store.canonicalItem(id: $0)?.revision
+            }
+            && block.sourceItemID.flatMap { store.canonicalItem(id: $0) }?.isExecutable == true
+            && !store.executionState.terminalOutcomes.values.contains { outcome in
+                outcome.session.itemID == block.sourceItemID
+                    && outcome.session.itemRevision == block.sourceItemRevision
+                    && outcome.session.occurrenceID == block.occurrenceID
+                    && outcome.session.sessionIndex == (block.sessionIndex ?? 0)
+            }
+    }
+
+    private var canControlOpenLease: Bool {
+        guard contextIsUnlocked,
+              let active = executionSync.activeSession else { return false }
+        return executionSession(active, matches: block)
+    }
+
+    private var contextIsUnlocked: Bool {
+        store.canMutatePlan
+            && !executionSync.isSyncing
+            && store.executionState.pendingCommand == nil
+    }
+}
+
+private struct CanonicalConflictRecoveryControls: View {
+    @EnvironmentObject private var store: PlannerStore
+    let mutation: PendingCanonicalMutation
+    let itemTitle: String
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Button("Retry \(itemTitle) edit on current revision") {
+                    errorMessage = nil
+                    store.retryConflictedCanonicalMutation(mutation.id)
+                }
+                .buttonStyle(.link)
+                .disabled(!store.canRetryCanonicalMutation(mutation))
+                if let sessionID = mutation.executionSessionID {
+                    Button("Keep latest canonical item") {
+                        do {
+                            try store.keepLatestCanonicalItem(forExecutionSession: sessionID)
+                            errorMessage = nil
+                        } catch {
+                            errorMessage = error.localizedDescription
+                        }
+                    }
+                    .buttonStyle(.link)
+                    .disabled(!store.canMutatePlan)
+                }
+            }
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
         }
     }
 }
@@ -602,10 +1109,10 @@ private struct BlockInspector: View {
                         Text(mutation.diagnostic ?? "The server revision changed while this local edit was pending.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        Button("Retry edit on current revision") {
-                            store.retryConflictedCanonicalMutation(mutation.id)
-                        }
-                        .disabled(!store.canRetryCanonicalMutation(mutation))
+                        CanonicalConflictRecoveryControls(
+                            mutation: mutation,
+                            itemTitle: block.title
+                        )
                         Text("This keeps the requested status, rebases it onto the currently cached revision, and leaves it pending until the next sync.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -640,17 +1147,21 @@ private struct BlockInspector: View {
                     }
                 }
 
-                HStack {
-                    Button("Start") { store.start(block.id) }
-                        .buttonStyle(.borderedProminent)
-                    Button("Complete") { store.complete(block.id) }
-                    Menu("More") {
-                        Button("Do Later") { store.doLater(block.id) }
-                            .disabled(!block.isFlexible || block.isHardConstraint)
-                        Button("Skip") { store.skip(block.id) }
+                if block.sourceItemID != nil {
+                    AuthoritativeExecutionControls(block: block)
+                } else {
+                    HStack {
+                        Button("Start") { store.start(block.id) }
+                            .buttonStyle(.borderedProminent)
+                        Button("Complete") { store.complete(block.id) }
+                        Menu("More") {
+                            Button("Do Later") { store.doLater(block.id) }
+                                .disabled(!block.isFlexible || block.isHardConstraint)
+                            Button("Skip") { store.skip(block.id) }
+                        }
                     }
+                    .disabled(!store.canMutate(block))
                 }
-                .disabled(!store.canMutate(block))
             }
             .padding(18)
         }
@@ -1250,18 +1761,36 @@ private struct QuickAddView: View {
 
 struct MenuBarView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let active = store.activeItem {
-                Text("In progress").font(.caption).foregroundStyle(.secondary)
+            if let active = focusedExecutionBlock {
+                Text(active.status == .paused ? "Paused" : "In progress")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Text(active.title).font(.headline)
                 Text(active.timeRange).font(.caption).foregroundStyle(.secondary)
-                HStack {
-                    Button("Pause") { store.pauseActive() }
-                    Button("Complete") { store.complete(active.id) }
+                if active.sourceItemID != nil {
+                    AuthoritativeExecutionControls(
+                        block: active,
+                        includesCustomPause: false
+                    )
+                    if executionSync.expiredBreakChoiceRequired {
+                        Button("Keep paused") {
+                            _ = executionSync.keepPausedAfterExpiredBreak()
+                        }
+                        .disabled(executionSync.isSyncing
+                            || store.executionState.pendingCommand != nil
+                            || !store.canMutatePlan)
+                    }
+                } else {
+                    HStack {
+                        Button("Pause") { store.pauseActive() }
+                        Button("Complete") { store.complete(active.id) }
+                    }
+                    .disabled(!store.canMutate(active))
                 }
-                .disabled(!store.canMutate(active))
             } else {
                 ContentUnavailableView("Nothing active", systemImage: "checkmark.circle")
             }
@@ -1270,9 +1799,26 @@ struct MenuBarView: View {
                 .disabled(!store.canMutatePlan)
             Button("Recompose") { store.recomposeSchedule() }
                 .disabled(!store.canRecomposeSchedule)
+            Divider()
+            Text(executionSync.status.message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+            Button("Refresh execution") {
+                Task { await executionSync.refresh() }
+            }
+            .disabled(executionSync.isSyncing || !store.canMutatePlan)
         }
         .padding(14)
         .frame(width: 300)
+    }
+
+    private var focusedExecutionBlock: ScheduleBlock? {
+        if let session = executionSync.activeSession,
+           let block = executionBlock(matching: session, in: store.blocks) {
+            return block
+        }
+        return store.activeItem
     }
 }
 
@@ -1281,9 +1827,11 @@ struct SettingsView: View {
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
     @State private var isCanonicalResetConfirmationPresented = false
+    @State private var apiSettingsError: String?
 
     var body: some View {
         Form {
@@ -1307,14 +1855,7 @@ struct SettingsView: View {
 
                 HStack {
                     Button("Save API settings") {
-                        if suggestionSync.applyConfiguration(
-                            baseURL: dayWeaveAPIBaseURL,
-                            newToken: dayWeaveBearerToken
-                        ) {
-                            dayWeaveBearerToken = ""
-                            dayWeaveAPIBaseURL = suggestionSync.baseURLString
-                            canonicalSync.configurationDidChange()
-                        }
+                        saveAPISettings()
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
@@ -1323,17 +1864,24 @@ struct SettingsView: View {
                                 && dayWeaveBearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
+                            || executionSync.isSyncing
+                            || canonicalSync.isSyncing
+                            || !store.canMutatePlan
+                            || (apiCredentialReplacementRequired
+                                && executionSync.credentialReplacementIsBlocked)
                     )
 
                     if suggestionSync.tokenConfigured {
                         Button("Remove saved token", role: .destructive) {
-                            suggestionSync.clearBearerToken()
-                            canonicalSync.configurationDidChange()
-                            dayWeaveBearerToken = ""
+                            removeBearerToken()
                         }
                         .disabled(
                             suggestionSync.isRefreshing
                                 || !suggestionSync.activeProposalIDs.isEmpty
+                                || executionSync.isSyncing
+                                || canonicalSync.isSyncing
+                                || !store.canMutatePlan
+                                || executionSync.credentialReplacementIsBlocked
                         )
                     }
                 }
@@ -1342,15 +1890,28 @@ struct SettingsView: View {
                 Text(suggestionSync.status.message)
                     .font(.caption)
                     .foregroundStyle(suggestionSync.status.isFailure ? .red : .secondary)
+                if let apiSettingsError {
+                    Text(apiSettingsError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
+                if executionSync.credentialReplacementIsBlocked {
+                    Text("Reconcile the exact execution command or resolve pending canonical outcome choices before replacing this credential.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. Changing the API origin requires re-entering the token, which is never saved in the planner snapshot.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("Planner sync", value: canonicalSync.status.message)
                     .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
+                LabeledContent("Execution sync", value: executionSync.status.message)
+                    .foregroundStyle(executionStatusIsFailure ? .red : .secondary)
                 Button("Reset local canonical cache…", role: .destructive) {
                     isCanonicalResetConfirmationPresented = true
                 }
-                .disabled(!store.canMutatePlan)
+                .disabled(!store.canMutatePlan || executionSync.credentialReplacementIsBlocked)
             }
             Section("Local data") {
                 LabeledContent(
@@ -1387,6 +1948,70 @@ struct SettingsView: View {
         .padding()
         .onAppear {
             dayWeaveAPIBaseURL = suggestionSync.baseURLString
+        }
+    }
+
+    private var apiCredentialReplacementRequired: Bool {
+        let tokenIsBeingReplaced = !dayWeaveBearerToken
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard let requested = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL),
+              let current = try? DayWeaveAPIBaseURL(suggestionSync.baseURLString) else {
+            return tokenIsBeingReplaced || dayWeaveAPIBaseURL != suggestionSync.baseURLString
+        }
+        return tokenIsBeingReplaced
+            || requested.canonicalConfigurationIdentifier
+                != current.canonicalConfigurationIdentifier
+    }
+
+    private var executionStatusIsFailure: Bool {
+        switch executionSync.status.phase {
+        case .offline, .authenticationRequired, .failed:
+            true
+        case .notConfigured, .ready, .syncing, .connected:
+            false
+        }
+    }
+
+    private func saveAPISettings() {
+        apiSettingsError = nil
+        do {
+            _ = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            let replacementRequired = apiCredentialReplacementRequired
+            if replacementRequired {
+                try executionSync.prepareForCredentialReplacement()
+            }
+            guard suggestionSync.applyConfiguration(
+                baseURL: dayWeaveAPIBaseURL,
+                newToken: dayWeaveBearerToken
+            ) else {
+                apiSettingsError = suggestionSync.status.message
+                return
+            }
+            dayWeaveBearerToken = ""
+            dayWeaveAPIBaseURL = suggestionSync.baseURLString
+            guard replacementRequired else { return }
+            canonicalSync.configurationDidChange()
+            executionSync.configurationDidChange()
+            executionSync.startForegroundPolling()
+        } catch {
+            apiSettingsError = error.localizedDescription
+        }
+    }
+
+    private func removeBearerToken() {
+        apiSettingsError = nil
+        do {
+            try executionSync.prepareForCredentialReplacement()
+            suggestionSync.clearBearerToken()
+            guard !suggestionSync.tokenConfigured else {
+                apiSettingsError = suggestionSync.status.message
+                return
+            }
+            canonicalSync.configurationDidChange()
+            executionSync.configurationDidChange()
+            dayWeaveBearerToken = ""
+        } catch {
+            apiSettingsError = error.localizedDescription
         }
     }
 

@@ -426,6 +426,29 @@ struct ExecutionSyncStoreTests {
         #expect(await transport.snapshotRequestCount() == 2)
     }
 
+    @Test("foreground polling is idempotent across repeated window activation")
+    func foregroundPollingStartsOnlyOnce() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty, empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)],
+            snapshotDelay: .milliseconds(80)
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(planner: planner, transport: transport)
+
+        sync.startForegroundPolling(every: .seconds(60))
+        try await Task.sleep(for: .milliseconds(20))
+        sync.startForegroundPolling(every: .seconds(60))
+        try await Task.sleep(for: .milliseconds(250))
+        sync.stopForegroundPolling()
+
+        #expect(await transport.snapshotRequestCount() == 2)
+        #expect(planner.executionState.historyVerified)
+    }
+
     private static var emptyBoundState: DayWeaveExecutionDurableState {
         var state = DayWeaveExecutionDurableState.empty
         state.deviceID = deviceID
