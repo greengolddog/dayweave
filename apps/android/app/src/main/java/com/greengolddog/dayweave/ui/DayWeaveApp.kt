@@ -290,9 +290,11 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onConfigureApiConnection = { showApiConnection = true },
                 onConnectGoogle = viewModel::connectGoogleAccount,
                 onRefreshGoogle = viewModel::refreshGoogleAccounts,
+                onRestartGoogleAuthorization = viewModel::restartGoogleAuthorization,
                 onOpenGoogleAuthorization = { url ->
-                    runCatching { uriHandler.openUri(url) }
-                        .onFailure { viewModel.googleBrowserOpenFailed() }
+                    viewModel.openGoogleAuthorization(url) { currentUrl ->
+                        uriHandler.openUri(currentUrl)
+                    }
                 },
                 onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
                 onSetGooglePaused = viewModel::setGoogleAccountPaused,

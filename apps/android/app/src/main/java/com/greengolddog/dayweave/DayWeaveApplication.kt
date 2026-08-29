@@ -93,6 +93,7 @@ class DayWeaveApplication : Application() {
             syncManager = suggestionSyncManager,
             schedulingCoordinator = suggestionSyncSchedulingCoordinator,
             canonicalSyncManager = canonicalSyncManager,
+            googleAccountManager = googleAccountManager,
         )
     }
 

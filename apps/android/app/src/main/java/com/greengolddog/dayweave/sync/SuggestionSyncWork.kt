@@ -75,47 +75,55 @@ class SuggestionConnectionController(
     private val syncManager: SuggestionSyncManager,
     private val schedulingCoordinator: SuggestionSyncSchedulingCoordinator,
     private val canonicalSyncManager: CanonicalSyncManager? = null,
+    private val googleAccountManager: GoogleAccountManager? = null,
 ) {
     private val settingsMutex = Mutex()
 
     suspend fun update(baseUrl: String, bearerToken: String?): Boolean = settingsMutex.withLock {
-        try {
-            withCanonicalConfigurationUpdateLock(baseUrl, bearerToken) {
-                if (!syncManager.updateConnection(baseUrl, bearerToken)) {
-                    return@withCanonicalConfigurationUpdateLock false
+        withGoogleConfigurationChangeLock {
+            try {
+                withCanonicalConfigurationUpdateLock(baseUrl, bearerToken) {
+                    if (!syncManager.updateConnection(baseUrl, bearerToken)) {
+                        return@withCanonicalConfigurationUpdateLock false
+                    }
+                    schedulingCoordinator.onConfigurationSaved()
+                    true
                 }
-                schedulingCoordinator.onConfigurationSaved()
-                true
+            } catch (_: CanonicalConfigurationChangeBlockedException) {
+                false
+            } catch (_: CanonicalAbandonmentPersistenceException) {
+                false
             }
-        } catch (_: CanonicalConfigurationChangeBlockedException) {
-            false
-        } catch (_: CanonicalAbandonmentPersistenceException) {
-            false
         }
     }
 
     suspend fun forget(): Boolean = settingsMutex.withLock {
-        try {
-            canonicalSyncManager?.forgetConfiguration(
-                cancelBackgroundWork = {
-                    try {
-                        schedulingCoordinator.cancelBeforeCredentialClear()
-                        true
-                    } catch (error: CancellationException) {
-                        throw error
-                    } catch (error: Exception) {
-                        syncManager.reportCredentialClearBlocked()
-                        false
-                    }
-                },
-                clearCredentials = syncManager::clearConnection,
-            ) ?: forgetWithoutCanonicalManager()
-        } catch (_: CanonicalConfigurationChangeBlockedException) {
-            false
-        } catch (_: CanonicalAbandonmentPersistenceException) {
-            false
+        withGoogleConfigurationChangeLock {
+            try {
+                canonicalSyncManager?.forgetConfiguration(
+                    cancelBackgroundWork = {
+                        try {
+                            schedulingCoordinator.cancelBeforeCredentialClear()
+                            true
+                        } catch (error: CancellationException) {
+                            throw error
+                        } catch (error: Exception) {
+                            syncManager.reportCredentialClearBlocked()
+                            false
+                        }
+                    },
+                    clearCredentials = syncManager::clearConnection,
+                ) ?: forgetWithoutCanonicalManager()
+            } catch (_: CanonicalConfigurationChangeBlockedException) {
+                false
+            } catch (_: CanonicalAbandonmentPersistenceException) {
+                false
+            }
         }
     }
+
+    private suspend fun <T> withGoogleConfigurationChangeLock(change: suspend () -> T): T =
+        googleAccountManager?.withConfigurationChangeLock(change) ?: change()
 
     private suspend fun <T> withCanonicalConfigurationUpdateLock(
         baseUrl: String,

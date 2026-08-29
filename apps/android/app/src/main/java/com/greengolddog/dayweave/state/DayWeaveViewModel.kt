@@ -171,6 +171,10 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { googleAccountManager.reauthorize(accountId) }
     }
 
+    fun restartGoogleAuthorization() {
+        viewModelScope.launch { googleAccountManager.restartAuthorization() }
+    }
+
     fun setGoogleAccountPaused(accountId: String, paused: Boolean) {
         viewModelScope.launch { googleAccountManager.setPaused(accountId, paused) }
     }
@@ -179,7 +183,17 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { googleAccountManager.disconnect(accountId) }
     }
 
-    fun googleBrowserOpenFailed() = googleAccountManager.browserOpenFailed()
+    fun openGoogleAuthorization(candidate: String, opener: (String) -> Unit) {
+        viewModelScope.launch {
+            try {
+                if (!googleAccountManager.useAuthorizationUrlIfCurrent(candidate, opener)) {
+                    googleAccountManager.refresh()
+                }
+            } catch (_: RuntimeException) {
+                googleAccountManager.browserOpenFailed()
+            }
+        }
+    }
 
     fun sendAssistantMessage(text: String): Boolean = plannerStore.sendAssistantMessage(text)
     fun toggleCompleted() = plannerStore.toggleCompleted()

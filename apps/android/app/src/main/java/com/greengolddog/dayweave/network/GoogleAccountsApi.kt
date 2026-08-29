@@ -258,7 +258,8 @@ class OkHttpGoogleAccountsTransport(
 
         fun defaultJson(): Json = Json {
             ignoreUnknownKeys = false
-            explicitNulls = false
+            // Required nullable response members must still be present on the wire.
+            explicitNulls = true
             encodeDefaults = true
         }
 
@@ -274,7 +275,7 @@ class OkHttpGoogleAccountsTransport(
             require(
                 value.length in 8..128 && value.all { character ->
                     character in '0'..'9' || character in 'A'..'Z' || character in 'a'..'z' ||
-                        character in setOf('.', '_', ':', '-')
+                        character in setOf('.', '_', '-')
                 },
             ) { "Google idempotency key is invalid" }
         }

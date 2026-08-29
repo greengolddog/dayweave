@@ -31,6 +31,16 @@ class OkHttpGoogleAccountsTransportTest {
             assertThrows(GoogleAccountsApiException.InvalidResponse::class.java) {
                 runBlocking { transport().accounts(configuration(server)) }
             }
+
+            server.enqueue(
+                jsonResponse(
+                    200,
+                    accountsJson().replace(",\"last_failure_at\":null", ""),
+                ),
+            )
+            assertThrows(GoogleAccountsApiException.InvalidResponse::class.java) {
+                runBlocking { transport().accounts(configuration(server)) }
+            }
             Unit
         } finally {
             server.close()
@@ -125,6 +135,20 @@ class OkHttpGoogleAccountsTransportTest {
             assertThrows(IllegalArgumentException::class.java) {
                 runBlocking {
                     transport.disconnect(configuration, "not-a-uuid", 1, IDEMPOTENCY_KEY)
+                }
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                runBlocking {
+                    transport.startAuthorization(
+                        configuration,
+                        "invalid:key",
+                        StartGoogleAuthorizationRequest(
+                            services = setOf("calendar"),
+                            forceConsent = false,
+                            connectNew = true,
+                            makeDefault = true,
+                        ),
+                    )
                 }
             }
             assertThrows(IllegalArgumentException::class.java) {

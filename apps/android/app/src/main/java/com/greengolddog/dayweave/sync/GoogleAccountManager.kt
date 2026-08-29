@@ -11,6 +11,7 @@ import java.io.IOException
 import java.net.URI
 import java.time.Instant
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,9 +44,14 @@ data class GoogleAccountSummary(
 data class PendingGoogleAuthorization(
     val url: String,
     val expiresAt: Instant,
+    /** Existing account being repaired; null means a new Google account is being connected. */
+    val accountId: String? = null,
+    /** Accounts present before a connect-new ceremony, used to prove callback completion. */
+    val baselineAccountIds: Set<String> = emptySet(),
 ) {
     override fun toString(): String =
-        "PendingGoogleAuthorization(url=<redacted>, expiresAt=$expiresAt)"
+        "PendingGoogleAuthorization(url=<redacted>, expiresAt=$expiresAt, " +
+            "target=${if (accountId == null) "new-account" else "existing-account"})"
 }
 
 data class GoogleAccountState(
@@ -55,6 +61,8 @@ data class GoogleAccountState(
     val message: String,
     val isBusy: Boolean = false,
     val requiresPlannerApiConfiguration: Boolean = false,
+    /** Opaque API credential generation that owns every account and URL in this state. */
+    val configurationId: String? = null,
 )
 
 class GoogleAccountManager(
@@ -76,6 +84,7 @@ class GoogleAccountManager(
                 phase = GoogleAccountPhase.AUTH_REQUIRED,
                 message = "Planner credentials are unavailable · reconnect the DayWeave API",
                 requiresPlannerApiConfiguration = true,
+                configurationId = binding.configurationId,
             )
             return@withLock
         }
@@ -83,7 +92,8 @@ class GoogleAccountManager(
             mutableState.value = initialState(binding)
             return@withLock
         }
-        val previous = mutableState.value
+        if (!configurationMatchesBinding(configuration, binding)) return@withLock
+        val previous = stateForBinding(binding)
         mutableState.value = previous.copy(
             phase = GoogleAccountPhase.LOADING,
             isBusy = true,
@@ -95,23 +105,35 @@ class GoogleAccountManager(
             mutableState.value = mapState(
                 response,
                 previous.authorization?.takeIf { it.expiresAt > now() },
+                binding.configurationId,
             )
+        } catch (error: CancellationException) {
+            if (bindingStillCurrent(binding)) mutableState.value = previous.copy(isBusy = false)
+            throw error
         } catch (error: Exception) {
             if (!bindingStillCurrent(binding)) return@withLock
             mutableState.value = failureState(error, previous.copy(isBusy = false))
         }
     }
 
-    suspend fun connectNew() = beginAuthorization(account = null)
+    suspend fun connectNew() = beginAuthorization(accountId = null)
 
-    suspend fun reauthorize(accountId: String) {
-        val account = mutableState.value.accounts.firstOrNull { it.id == accountId } ?: return
-        beginAuthorization(account)
+    suspend fun reauthorize(accountId: String) = beginAuthorization(accountId)
+
+    suspend fun restartAuthorization() {
+        val restart = operationMutex.withLock {
+            val current = mutableState.value
+            val pending = current.authorization ?: return@withLock null
+            RestartAuthorization(pending.accountId, current.configurationId)
+        } ?: return
+        beginAuthorization(
+            accountId = restart.accountId,
+            expectedConfigurationId = restart.configurationId,
+        )
     }
 
-    suspend fun setPaused(accountId: String, paused: Boolean) = operationMutex.withLock {
-        val account = mutableState.value.accounts.firstOrNull { it.id == accountId } ?: return@withLock
-        mutateAccount("Updating Google sync…") { configuration ->
+    suspend fun setPaused(accountId: String, paused: Boolean) =
+        mutateAccount(accountId, "Updating Google sync…") { configuration, account ->
             transport.setPaused(
                 configuration = configuration,
                 accountId = account.id,
@@ -120,11 +142,13 @@ class GoogleAccountManager(
                 idempotencyKey = newUuid().toString(),
             )
         }
-    }
 
-    suspend fun disconnect(accountId: String) = operationMutex.withLock {
-        val account = mutableState.value.accounts.firstOrNull { it.id == accountId } ?: return@withLock
-        mutateAccount("Revoking Google access…") { configuration ->
+    suspend fun disconnect(accountId: String) =
+        mutateAccount(
+            accountId = accountId,
+            progressMessage = "Revoking Google access…",
+            reconcileUnavailable = true,
+        ) { configuration, account ->
             transport.disconnect(
                 configuration = configuration,
                 accountId = account.id,
@@ -132,11 +156,49 @@ class GoogleAccountManager(
                 idempotencyKey = newUuid().toString(),
             )
         }
+
+    /**
+     * Consumes the URL synchronously while holding the same lock used for credential replacement.
+     * This closes the otherwise unavoidable check-to-browser-open generation race.
+     */
+    suspend fun useAuthorizationUrlIfCurrent(
+        candidate: String,
+        consumer: (String) -> Unit,
+    ): Boolean = operationMutex.withLock {
+        val current = mutableState.value
+        val binding = credentialStore.snapshot()
+        val authorization = current.authorization
+        val trusted =
+            current.configurationId == binding.configurationId &&
+                authorization?.url == candidate && authorization.expiresAt > now()
+        if (!trusted) {
+            mutableState.value = initialState(binding)
+            return@withLock false
+        }
+        consumer(candidate)
+        true
     }
 
-    fun browserOpenFailed() {
+    /** Serializes the only credential update/clear path with all Google requests and URL use. */
+    suspend fun <T> withConfigurationChangeLock(change: suspend () -> T): T =
+        operationMutex.withLock {
+            val before = credentialStore.snapshot().configurationId
+            try {
+                change()
+            } finally {
+                val after = credentialStore.snapshot()
+                if (after.configurationId != before) {
+                    mutableState.value = initialState(after)
+                }
+            }
+        }
+
+    suspend fun browserOpenFailed() = operationMutex.withLock {
         val current = mutableState.value
-        if (current.authorization != null) {
+        val binding = credentialStore.snapshot()
+        if (current.configurationId != binding.configurationId) {
+            mutableState.value = initialState(binding)
+        } else if (current.authorization != null) {
             mutableState.value = current.copy(
                 phase = GoogleAccountPhase.ERROR,
                 message = "Google could not be opened · try the authorization button again",
@@ -144,9 +206,19 @@ class GoogleAccountManager(
         }
     }
 
-    private suspend fun beginAuthorization(account: GoogleAccountSummary?) =
+    private suspend fun beginAuthorization(
+        accountId: String?,
+        expectedConfigurationId: String? = null,
+    ) =
         operationMutex.withLock {
             val binding = credentialStore.snapshot()
+            if (
+                expectedConfigurationId != null &&
+                expectedConfigurationId != binding.configurationId
+            ) {
+                mutableState.value = initialState(binding)
+                return@withLock
+            }
             val configuration = try {
                 credentialStore.authenticatedConfiguration()
             } catch (_: RuntimeException) {
@@ -154,6 +226,7 @@ class GoogleAccountManager(
                     phase = GoogleAccountPhase.AUTH_REQUIRED,
                     message = "Reconnect the DayWeave API before connecting Google",
                     requiresPlannerApiConfiguration = true,
+                    configurationId = binding.configurationId,
                 )
                 return@withLock
             }
@@ -161,7 +234,19 @@ class GoogleAccountManager(
                 mutableState.value = initialState(binding)
                 return@withLock
             }
-            val previous = mutableState.value
+            if (!configurationMatchesBinding(configuration, binding)) return@withLock
+            val previous = stateForBinding(binding)
+            val account = accountId?.let { requestedId ->
+                previous.accounts.firstOrNull { it.id == requestedId }
+            }
+            if (accountId != null && account == null) {
+                mutableState.value = previous.copy(
+                    phase = GoogleAccountPhase.ERROR,
+                    authorization = null,
+                    message = "That Google account belongs to an older API connection · refresh status",
+                )
+                return@withLock
+            }
             mutableState.value = previous.copy(
                 phase = GoogleAccountPhase.LOADING,
                 isBusy = true,
@@ -185,10 +270,18 @@ class GoogleAccountManager(
                 validateGoogleAuthorizationUrl(started.authorizationUrl)
                 mutableState.value = previous.copy(
                     phase = GoogleAccountPhase.AWAITING_BROWSER,
-                    authorization = PendingGoogleAuthorization(started.authorizationUrl, expiresAt),
+                    authorization = PendingGoogleAuthorization(
+                        url = started.authorizationUrl,
+                        expiresAt = expiresAt,
+                        accountId = account?.id,
+                        baselineAccountIds = previous.accounts.mapTo(mutableSetOf()) { it.id },
+                    ),
                     isBusy = false,
                     message = "Authorize in Google, return here, then refresh status",
                 )
+            } catch (error: CancellationException) {
+                if (bindingStillCurrent(binding)) mutableState.value = previous.copy(isBusy = false)
+                throw error
             } catch (error: Exception) {
                 if (!bindingStillCurrent(binding)) return@withLock
                 mutableState.value = failureState(error, previous.copy(isBusy = false))
@@ -196,10 +289,14 @@ class GoogleAccountManager(
         }
 
     private suspend fun mutateAccount(
+        accountId: String,
         progressMessage: String,
-        mutation: suspend (com.greengolddog.dayweave.network.AuthenticatedApiConfiguration) ->
-            RemoteGoogleAccount,
-    ) {
+        reconcileUnavailable: Boolean = false,
+        mutation: suspend (
+            com.greengolddog.dayweave.network.AuthenticatedApiConfiguration,
+            GoogleAccountSummary,
+        ) -> RemoteGoogleAccount,
+    ) = operationMutex.withLock {
         val binding = credentialStore.snapshot()
         val configuration = try {
             credentialStore.authenticatedConfiguration()
@@ -208,46 +305,161 @@ class GoogleAccountManager(
                 phase = GoogleAccountPhase.AUTH_REQUIRED,
                 message = "Reconnect the DayWeave API before changing Google access",
                 requiresPlannerApiConfiguration = true,
+                configurationId = binding.configurationId,
             )
-            return
+            return@withLock
         }
         if (configuration == null) {
             mutableState.value = initialState(binding)
-            return
+            return@withLock
         }
-        val previous = mutableState.value
+        if (!configurationMatchesBinding(configuration, binding)) return@withLock
+        val previous = stateForBinding(binding)
+        val account = previous.accounts.firstOrNull { it.id == accountId }
+        if (account == null) {
+            mutableState.value = previous.copy(
+                phase = GoogleAccountPhase.ERROR,
+                authorization = null,
+                message = "That Google account belongs to an older API connection · refresh status",
+            )
+            return@withLock
+        }
         mutableState.value = previous.copy(
             phase = GoogleAccountPhase.LOADING,
             isBusy = true,
             message = progressMessage,
         )
         try {
-            validateAccount(mutation(configuration))
-            if (!bindingStillCurrent(binding)) return
+            validateAccount(mutation(configuration, account))
+            if (!bindingStillCurrent(binding)) return@withLock
             val refreshed = transport.accounts(configuration)
-            if (!bindingStillCurrent(binding)) return
-            mutableState.value = mapState(refreshed, authorization = null)
+            if (!bindingStillCurrent(binding)) return@withLock
+            mutableState.value = mapState(
+                refreshed,
+                authorization = null,
+                configurationId = binding.configurationId,
+            )
+        } catch (error: GoogleAccountsApiException.Unavailable) {
+            if (!bindingStillCurrent(binding)) return@withLock
+            if (!reconcileUnavailable) {
+                mutableState.value = failureState(error, previous.copy(isBusy = false))
+                return@withLock
+            }
+            reconcileAmbiguousDisconnect(
+                configuration = configuration,
+                binding = binding,
+                accountId = accountId,
+                previous = previous,
+                unavailable = true,
+            )
         } catch (error: GoogleAccountsApiException.Conflict) {
-            if (!bindingStillCurrent(binding)) return
+            if (!bindingStillCurrent(binding)) return@withLock
             try {
-                mutableState.value = mapState(transport.accounts(configuration), authorization = null)
+                val refreshed = transport.accounts(configuration)
+                if (!bindingStillCurrent(binding)) return@withLock
+                mutableState.value = mapState(
+                    refreshed,
+                    authorization = null,
+                    configurationId = binding.configurationId,
+                )
+            } catch (refreshError: CancellationException) {
+                if (bindingStillCurrent(binding)) {
+                    mutableState.value = previous.copy(
+                        phase = GoogleAccountPhase.ERROR,
+                        isBusy = false,
+                        message = "Google account reconciliation was interrupted · refresh status",
+                    )
+                }
+                throw refreshError
             } catch (refreshError: Exception) {
+                if (!bindingStillCurrent(binding)) return@withLock
                 mutableState.value = failureState(refreshError, previous.copy(isBusy = false))
             }
+        } catch (error: GoogleAccountsApiException.Http) {
+            if (!bindingStillCurrent(binding)) return@withLock
+            if (reconcileUnavailable && error.statusCode == 404) {
+                reconcileAmbiguousDisconnect(
+                    configuration = configuration,
+                    binding = binding,
+                    accountId = accountId,
+                    previous = previous,
+                    unavailable = false,
+                )
+            } else {
+                mutableState.value = failureState(error, previous.copy(isBusy = false))
+            }
+        } catch (error: CancellationException) {
+            if (bindingStillCurrent(binding)) {
+                mutableState.value = previous.copy(
+                    phase = GoogleAccountPhase.ERROR,
+                    isBusy = false,
+                    message = "Google update outcome is unknown · refresh status before retrying",
+                )
+            }
+            throw error
         } catch (error: Exception) {
-            if (!bindingStillCurrent(binding)) return
+            if (!bindingStillCurrent(binding)) return@withLock
             mutableState.value = failureState(error, previous.copy(isBusy = false))
+        }
+    }
+
+    private suspend fun reconcileAmbiguousDisconnect(
+        configuration: com.greengolddog.dayweave.network.AuthenticatedApiConfiguration,
+        binding: ApiConnectionSnapshot,
+        accountId: String,
+        previous: GoogleAccountState,
+        unavailable: Boolean,
+    ) {
+        try {
+            val refreshed = transport.accounts(configuration)
+            if (!bindingStillCurrent(binding)) return
+            val mapped = mapState(
+                refreshed,
+                authorization = null,
+                configurationId = binding.configurationId,
+            )
+            mutableState.value = if (mapped.accounts.any { it.id == accountId }) {
+                mapped.copy(
+                    phase = GoogleAccountPhase.ERROR,
+                    message = if (unavailable) {
+                        "Google access was not confirmed revoked · encrypted credentials remain for a safe retry"
+                    } else {
+                        "Google disconnect changed on the server · review status and retry if needed"
+                    },
+                )
+            } else {
+                mapped
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            mutableState.value = previous.copy(
+                phase = GoogleAccountPhase.ERROR,
+                authorization = null,
+                isBusy = false,
+                message = "Google access was not confirmed revoked · refresh status before retrying",
+            )
         }
     }
 
     private fun mapState(
         response: RemoteGoogleAccounts,
         authorization: PendingGoogleAuthorization?,
+        configurationId: String?,
     ): GoogleAccountState {
         validateCleanup(response)
         val accounts = response.accounts.map(::validateAccount)
             .filter { it.status != "revoked" }
             .sortedWith(compareByDescending<GoogleAccountSummary> { it.isDefault }.thenBy { it.label })
+        val unresolvedAuthorization = authorization?.takeUnless { pending ->
+            if (pending.accountId != null) {
+                accounts.any { account ->
+                    account.id == pending.accountId && account.status in setOf("active", "paused")
+                }
+            } else {
+                accounts.any { it.id !in pending.baselineAccountIds }
+            }
+        }
         val operatorRecovery = response.cleanup.operatorRecoveryRequired ||
             response.cleanup.legacyRecoveryRequired > 0
         val recovery = operatorRecovery || response.cleanup.durabilityDegraded ||
@@ -265,10 +477,10 @@ class GoogleAccountManager(
                     "Google credential cleanup is fenced · the server will retry safely"
                 },
             )
-            authorization != null -> GoogleAccountState(
+            unresolvedAuthorization != null -> GoogleAccountState(
                 phase = GoogleAccountPhase.AWAITING_BROWSER,
                 accounts = accounts,
-                authorization = authorization,
+                authorization = unresolvedAuthorization,
                 message = "Finish authorization in Google, then refresh status",
             )
             revocationFailed -> GoogleAccountState(
@@ -295,7 +507,7 @@ class GoogleAccountManager(
                 phase = GoogleAccountPhase.DISCONNECTED,
                 message = "Google Calendar and Tasks are not connected",
             )
-        }
+        }.copy(configurationId = configurationId)
     }
 
     private fun validateAccount(remote: RemoteGoogleAccount): GoogleAccountSummary {
@@ -344,16 +556,22 @@ class GoogleAccountManager(
                 GoogleAccountPhase.AUTH_REQUIRED to "Planner API authentication is required"
             is GoogleAccountsApiException.Unavailable ->
                 GoogleAccountPhase.ERROR to "Google authorization is not configured on the server"
+            is GoogleAccountsApiException.Conflict ->
+                GoogleAccountPhase.ERROR to "Google connection is already changing · refresh status"
             is GoogleAccountsApiException.Validation ->
                 GoogleAccountPhase.ERROR to "Google rejected this connection request"
             is GoogleAccountsApiException.InvalidResponse, is IllegalArgumentException ->
                 GoogleAccountPhase.ERROR to "Google connection response was invalid · no state changed"
+            is GoogleAccountsApiException.Http ->
+                GoogleAccountPhase.ERROR to "The DayWeave server could not update Google access"
             is IOException ->
                 GoogleAccountPhase.OFFLINE to "Offline · Google connection state may be outdated"
             else -> GoogleAccountPhase.ERROR to "Google connection could not be updated"
         }
+        val clearCachedIdentity = error is GoogleAccountsApiException.Authentication
         val trustedAuthorization = if (
-            error is GoogleAccountsApiException.InvalidResponse || error is IllegalArgumentException
+            clearCachedIdentity || error is GoogleAccountsApiException.InvalidResponse ||
+            error is IllegalArgumentException
         ) {
             null
         } else {
@@ -361,6 +579,7 @@ class GoogleAccountManager(
         }
         return previous.copy(
             phase = phase,
+            accounts = if (clearCachedIdentity) emptyList() else previous.accounts,
             authorization = trustedAuthorization,
             isBusy = false,
             message = message,
@@ -392,6 +611,30 @@ class GoogleAccountManager(
         return false
     }
 
+    private fun configurationMatchesBinding(
+        configuration: com.greengolddog.dayweave.network.AuthenticatedApiConfiguration,
+        binding: ApiConnectionSnapshot,
+    ): Boolean {
+        if (
+            binding.configurationId != null &&
+            configuration.configurationId == binding.configurationId
+        ) {
+            return true
+        }
+        mutableState.value = initialState(credentialStore.snapshot())
+        return false
+    }
+
+    private fun stateForBinding(binding: ApiConnectionSnapshot): GoogleAccountState =
+        mutableState.value.takeIf { state ->
+            state.configurationId != null && state.configurationId == binding.configurationId
+        } ?: initialState(binding)
+
+    private data class RestartAuthorization(
+        val accountId: String?,
+        val configurationId: String?,
+    )
+
     companion object {
         private const val MAX_AUTHORIZATION_SECONDS = 15 * 60L
         private const val MAX_AUTHORIZATION_URL_CHARS = 8 * 1024
@@ -415,11 +658,13 @@ class GoogleAccountManager(
                     phase = GoogleAccountPhase.NOT_CONFIGURED,
                     message = "Connect the DayWeave API before connecting Google",
                     requiresPlannerApiConfiguration = true,
+                    configurationId = snapshot.configurationId,
                 )
             } else {
                 GoogleAccountState(
                     phase = GoogleAccountPhase.DISCONNECTED,
                     message = "Google connection has not been checked",
+                    configurationId = snapshot.configurationId,
                 )
             }
     }

@@ -56,6 +56,7 @@ fun MoreScreen(
     onConfigureApiConnection: () -> Unit,
     onConnectGoogle: () -> Unit,
     onRefreshGoogle: () -> Unit,
+    onRestartGoogleAuthorization: () -> Unit,
     onOpenGoogleAuthorization: (String) -> Unit,
     onReauthorizeGoogle: (String) -> Unit,
     onSetGooglePaused: (String, Boolean) -> Unit,
@@ -166,6 +167,7 @@ fun MoreScreen(
                 onConfigureApiConnection = onConfigureApiConnection,
                 onConnect = onConnectGoogle,
                 onRefresh = onRefreshGoogle,
+                onRestartAuthorization = onRestartGoogleAuthorization,
                 onOpenAuthorization = onOpenGoogleAuthorization,
                 onReauthorize = onReauthorizeGoogle,
                 onSetPaused = onSetGooglePaused,
@@ -205,6 +207,7 @@ private fun GoogleConnectionCard(
     onConfigureApiConnection: () -> Unit,
     onConnect: () -> Unit,
     onRefresh: () -> Unit,
+    onRestartAuthorization: () -> Unit,
     onOpenAuthorization: (String) -> Unit,
     onReauthorize: (String) -> Unit,
     onSetPaused: (String, Boolean) -> Unit,
@@ -250,6 +253,13 @@ private fun GoogleConnectionCard(
                 TextButton(onClick = onRefresh, enabled = !state.isBusy) {
                     Text("I’ve finished")
                 }
+            }
+            TextButton(
+                onClick = onRestartAuthorization,
+                enabled = !state.isBusy,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            ) {
+                Text("Authorization failed? Start over")
             }
         }
         state.accounts.forEach { account ->
