@@ -53,6 +53,7 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::replace_item,
         crate::items::http::delete_item,
         crate::items::http::restore_item,
+        crate::scheduling::http::preview_schedule,
     ),
     components(schemas(
         HealthResponse,
@@ -80,12 +81,24 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::ItemEnvelope,
         crate::items::http::ItemListEnvelope,
         crate::items::http::ItemDeltaEnvelope,
+        crate::scheduling::ComposeScheduleRequest,
+        crate::scheduling::ComposeScheduleResult,
+        crate::scheduling::AvailabilityInput,
+        crate::scheduling::EnergyInput,
+        crate::scheduling::FixedBlockInput,
+        crate::scheduling::FixedBlockSourceInput,
+        crate::scheduling::PreviousAssignmentInput,
+        crate::scheduling::PreviousBlockInput,
+        crate::scheduling::SchedulerConfigInput,
+        crate::scheduling::RejectedScheduleItem,
+        crate::scheduling::IgnoredPreviousAssignment,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Liveness, readiness, and build identity"),
         (name = "suggestions", description = "Reviewable proposals from AI and external tools"),
-        (name = "items", description = "Canonical offline-first planner items and delta sync")
+        (name = "items", description = "Canonical offline-first planner items and delta sync"),
+        (name = "schedule", description = "Deterministic side-effect-free planning previews")
     )
 )]
 pub struct ApiDoc;
@@ -118,6 +131,7 @@ pub fn router(state: AppState) -> Router {
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .merge(crate::items::http::routes())
+        .merge(crate::scheduling::http::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,

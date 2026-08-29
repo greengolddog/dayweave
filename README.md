@@ -23,6 +23,8 @@ The complete agreed product scope is preserved in
 [`docs/discovery-answers.md`](docs/discovery-answers.md).
 The implemented controls and explicit production security gates are documented
 in [`docs/security.md`](docs/security.md).
+The deterministic preview request and strict canonical scheduling metadata are
+documented in [`docs/scheduling-api.md`](docs/scheduling-api.md).
 
 ## Status
 

@@ -117,6 +117,7 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
         .unwrap();
     let document = body_json(openapi).await;
     assert!(document["paths"]["/v1/suggestions"].is_object());
+    assert!(document["paths"]["/v1/schedule/preview"].is_object());
     assert!(document["components"]["securitySchemes"].is_object());
 }
 
