@@ -49,12 +49,22 @@ impl GoogleClient {
         base_url: &str,
     ) -> Result<Self, GoogleError> {
         let api_base = Url::parse(base_url).map_err(|_| GoogleError::InvalidBaseUrl)?;
-        if api_base.cannot_be_a_base() {
+        if api_base.cannot_be_a_base()
+            || api_base.username() != ""
+            || api_base.password().is_some()
+            || api_base.query().is_some()
+            || api_base.fragment().is_some()
+        {
             return Err(GoogleError::InvalidBaseUrl);
         }
         Ok(Self {
             http: reqwest::Client::builder()
                 .user_agent("DayWeave/0.1")
+                // Authorization headers must never be replayed to a redirect
+                // target selected by a provider or test double.
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .map_err(GoogleError::Transport)?,
             token_provider,

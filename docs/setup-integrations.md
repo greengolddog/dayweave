@@ -30,7 +30,9 @@ unrelated project.
    as a test user until the app is ready to move to production status.
 3. Create a Web application OAuth client for the private backend. Register the
    exact HTTPS callback under the final Nebius Tunnel origin; redirects must
-   match exactly.
+   match exactly. The server rejects cleartext callback URLs in every
+   environment, including loopback development and tests; local OAuth work must
+   terminate TLS and register that exact HTTPS URI.
 4. Store the client ID and client secret in Nebius MysteryBox or the VM's
    root-readable environment file, never in GitHub or client binaries.
 5. Request offline access and incremental authorization. The backend owns the
@@ -84,46 +86,113 @@ responses.
    `blocking` imports busy Calendar records as fixed constraints; `writable`
    additionally permits guarded DayWeave-owned writes. Task lists support
    `read_only` and `writable`, not `blocking`. Calendar `writable` also requires
-   Google `owner` or `writer` access and the broad Calendar scope.
+   Google `owner` or `writer` access and the broad Calendar scope. Changing
+   visibility or role invalidates that collection's incremental cursor and
+   requests a complete paginated replay. Collection revisions fence in-flight workers,
+   so a worker using the prior redaction or blocking policy cannot commit items
+   or a cursor after the configuration change.
+   If Google later downgrades a Calendar from `owner`/`writer`, discovery
+   atomically downgrades DayWeave's role to `read_only`, invalidates its cursor,
+   and conflicts any unpublished outbound work for that collection, including a
+   delivery claim that was already in progress.
 4. `POST .../sync/refresh` durably requests a run and returns `202`; periodic
    reconciliation also runs every 15 minutes. `GET .../sync` reports the run,
-   retry time, stable redacted error code, import conflicts, and outbound queue
-   counts. Rate limiting and transient provider failures enter bounded backoff;
-   invalid authorization and terminal durable failures make `/ready` false.
+   retry time, stable redacted run/outbound error codes, import conflicts, and
+   outbound queue counts. Rate limiting and transient provider failures enter
+   bounded backoff. A manual refresh advances backoff work for an explicit
+   retry; after reauthorization, call it to resume retained outbound work.
+   Invalid authorization and terminal durable failures make `/ready` false.
 
 Calendar pages include tombstones and whole recurrence series. Exceptions retain
 their series ID and original start. All-day bounds keep Google's exclusive end
 and are converted using the event/calendar IANA timezone, including DST days.
-Birthdays, working-location events, transparent events, and self-declined events
-never block. Out-of-office and ordinary opaque events block only for `blocking`
-or `writable` sources. An invisible source imports only a redacted label and
-time bounds. Tasks import completed, hidden, deleted, due, parent, and ordering
-metadata. Provider cursors are AES-GCM sealed with account/collection AAD and
-advance only after every page and canonical mutation commits. Calendar 410
-recovery performs a bounded full scan from 366 days in the past through 730 days
-in the future; older history remains at Google unless the product adds an
-explicit archival import.
+Birthdays, working-location events, and transparent events never block.
+Self-declined invitations are ignored; if an already imported invitation becomes
+self-declined, reconciliation moves that mapped item to recoverable trash, while
+another attendee's decline does not hide it. Out-of-office and ordinary opaque
+events block only for `blocking` or `writable` sources. An invisible source
+redacts the user-facing title, notes, and location while retaining time bounds
+and bounded structural sync metadata such as recurrence, response/count flags,
+event type, and conference/attachment presence. Tasks import completed, hidden,
+deleted, due, parent, and ordering metadata. Provider cursors are AES-GCM sealed
+with account/collection AAD and advance only after every page and canonical
+mutation commits. Calendar 410 recovery, and every cursorless Calendar or Tasks
+run after configuration invalidates a cursor, performs a complete paginated
+provider scan. The run fails before advancing its cursor if the documented
+100,000-item safety cap is exceeded. After a complete scan, mappings absent from
+the snapshot are reconciled: unchanged external items move to recoverable trash,
+local edits conflict, and DayWeave-owned records conflict rather than being
+silently detached from their provider identity.
 
 Provider changes never silently overwrite a locally edited canonical item. The
 mapping records the last imported local revision: a provider update or deletion
 applies only while that revision still matches. Otherwise it becomes an
-operator-visible conflict. Provider deletion moves an unchanged item to
-recoverable trash. A move between Calendar or Tasks collections is represented
-as deletion in the old collection plus import in the new collection, preserving
-any conflicting local edit rather than guessing identity across sources.
+aggregate operator-visible conflict. `GET .../sync` reports conflict counts and
+the latest redacted outbox code, but the current API does not yet enumerate the
+specific mapping/outbox IDs or conflict metadata; item-level diagnosis currently
+requires restricted database/operator tooling, and a conflict-detail/retry API
+remains an explicit client-workflow gap. Provider deletion moves an unchanged item to
+recoverable trash; if Google restores that same record before a local edit, the
+next import restores the mapped canonical item as well. A move between Calendar
+or Tasks collections is represented as deletion in the old collection plus
+import in the new collection, preserving any conflicting local edit rather than
+guessing identity across sources.
 
-Outbound publication uses `POST .../outbound` with `collection_id`, `item_id`,
-`expected_item_revision`, and `operation` (`upsert` or `delete`). It accepts only
-selected writable collections and DayWeave-owned mappings. Calendar insertion
-also requires canonical `dayweave_firm_block` ownership and increasing RFC 3339
-`starts_at`/`ends_at` bounds; deterministic Google event IDs make crash retries
-idempotent. Tasks carry a visible `[DayWeave item:…]` note marker so a crash
-between provider acceptance and local acknowledgement can be recovered without
-duplicating the task. Updates and deletes use the last provider ETag; a 412 is a
-durable conflict. Deletion is refused until the canonical item is in recoverable
-trash. External or attendee-bearing event edits are deliberately forbidden:
-there is not yet a server-minted preview/approval audit primitive, so supplying
-arbitrary material event JSON is not an API capability.
+The outbound foundation exposes `POST .../outbound` with `collection_id`,
+`item_id`, `expected_item_revision`, and `operation` (`upsert` or `delete`), but
+the service currently fails closed with `external publication requires a
+server-minted approval` after validating the candidate. Bearer authentication
+plus a revision is not treated as human confirmation. Enabling this path requires
+a server-minted, expiring approval bound to the exact preview, item revision,
+provider target, and payload, with a durable audit record. Two additional
+prerequisites are mandatory before removing either unconditional enqueue or
+delivery gate: every ownership marker must be authenticated and ambiguity must
+be resolved atomically across the complete provider collection (or marker-based
+crash recovery must remain disabled), and the worker must lock and revalidate
+the stored write scope immediately before every provider mutation. An earlier
+service snapshot and the post-provider completion guardian are not substitutes
+for that final scope fence. These gates apply to all external Calendar and Tasks
+publication, including DayWeave-owned records; they are not limited to attendee
+edits.
+
+The dormant delivery machinery accepts only selected writable collections and
+DayWeave-owned mappings. Calendar insertion also requires canonical
+`dayweave_firm_block` ownership and increasing RFC 3339 `starts_at`/`ends_at`
+bounds; deterministic Google event IDs provide useful retry correlation. The
+Calendar UUID extended-property marker and the visible Tasks
+`[DayWeave item:…]` note marker are correlation values only, not authenticated
+proof of DayWeave ownership. A copied or forged marker can match a current
+durable intent, and the current recovery code must therefore not be activated
+for outbound publication. While publication remains disabled, malformed,
+unrecognized, repeated, or conflicting markers become import conflicts and do
+not create a second canonical item. A production outbound implementation must
+use authenticated ownership evidence and reject multiple matching provider
+resources before adopting any identity. Because Google Tasks has no
+client-chosen task ID, the dormant implementation performs at most one insert
+attempt per durable revision. If a failed attempt cannot be matched by marker,
+it reports
+`provider_identity_unresolved` instead of risking a duplicate. Inspect the
+selected Google list, then revise and enqueue the canonical item only after the
+operator has established that no accepted task remains. The implementation uses
+the general durable delivery-attempt counter: even a transient marker-list
+failure before the POST can conservatively consume that revision and require a
+new revision, trading availability for duplicate prevention. Updates and deletes use
+the last provider ETag; a 412 is a durable conflict. To recover another terminal
+or conflicted publication, reconcile provider state, revise the canonical item,
+and explicitly enqueue the newer revision; the durable outbox marks every older
+unpublished revision as `superseded` instead of later replaying stale content.
+Deletion is refused until the canonical item is in recoverable trash. A
+provider-side deletion or material edit of a DayWeave-owned record conflicts any
+queued publication and never silently trashes or overwrites the canonical item.
+External or attendee-bearing event edits are additionally forbidden: there is
+not yet a server-minted preview/approval audit primitive, so supplying arbitrary
+material event JSON is not an API capability.
+
+Provider cursors are encrypted, but durable outbound JSON currently contains
+the selected DayWeave item's title and notes in PostgreSQL plaintext. Production
+deployment therefore still depends on restricted database access and the
+documented database/storage encryption gate; the migration does not classify
+outbox payloads as non-sensitive metadata.
 
 Two canonical-model gaps remain explicit. Imported attendee identity,
 conference, and attachment entities have no first-class canonical tables; the

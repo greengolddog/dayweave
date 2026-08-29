@@ -1497,6 +1497,66 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         rows.iter().map(account_from_row).collect()
     }
 
+    async fn update_access_credentials(
+        &self,
+        account_id: Uuid,
+        expected_revision: u64,
+        credentials: EncryptedCredentials,
+        granted_scopes: BTreeSet<String>,
+        token_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<AccountSecretSnapshot, GoogleOAuthRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_scope(&mut transaction, self.scope).await?;
+        ensure_no_open_authorization(&mut transaction, self.scope).await?;
+        ensure_no_revocation_fence(&mut transaction, self.scope).await?;
+        let current = fetch_account_by_id(&mut transaction, self.scope, account_id, true).await?;
+        check_revision(&current.account, expected_revision)?;
+        if current.account.status != GoogleAccountStatus::Active || !current.account.sync_enabled {
+            return Err(GoogleOAuthRepositoryError::AccountStateConflict);
+        }
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or(GoogleOAuthRepositoryError::Internal)?;
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "UPDATE provider_accounts SET encrypted_credentials = $4, credential_key_version = $5, \
+             granted_scopes = $6, token_expires_at = $7, revision = $8, updated_at = $9 \
+             WHERE workspace_id = $1 AND user_id = $2 AND id = $3 AND provider = 'google' \
+             AND status = 'active' AND sync_enabled AND revision = $10 \
+             RETURNING {ACCOUNT_COLUMNS}"
+        )))
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(&credentials.sealed.ciphertext)
+        .bind(version_to_i32(credentials.sealed.key_version)?)
+        .bind(granted_scopes.into_iter().collect::<Vec<_>>())
+        .bind(token_expires_at)
+        .bind(revision_to_i64(next_revision)?)
+        .bind(now)
+        .bind(revision_to_i64(expected_revision)?)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(GoogleOAuthRepositoryError::RevisionConflict {
+            expected: expected_revision,
+            actual: current.account.revision,
+        })?;
+        sqlx::query(
+            "UPDATE google_oauth_scope_state SET credential_generation = credential_generation + 1 \
+             WHERE workspace_id = $1 AND user_id = $2",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let snapshot = account_from_row(&row)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(snapshot)
+    }
+
+    #[allow(clippy::too_many_lines)] // Account state and every sync guardian change atomically.
     async fn set_paused(
         &self,
         account_id: Uuid,
@@ -1546,6 +1606,68 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .fetch_one(&mut *transaction)
         .await
         .map_err(internal)?;
+        if paused {
+            // Account pause is a guardian fence for both inbound reconciliation
+            // and provider publication. Revoke the run and every live delivery
+            // claim in the same transaction as the credential-state change.
+            sqlx::query(
+                "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
+                 requested_at = NULL, next_attempt_at = $4, last_error_code = 'account_paused', \
+                 last_error_at = $4, revision = revision + 1, updated_at = $4 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(account_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            sqlx::query(
+                "UPDATE google_sync_outbox SET state = 'backoff', claim_id = NULL, \
+                 claimed_at = NULL, attempts = attempts + 1, available_at = $4, \
+                 last_error_code = 'account_paused', updated_at = $4 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+                   AND state = 'delivering'",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(account_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        } else {
+            sqlx::query(
+                "UPDATE google_sync_runs SET requested_at = $4, next_attempt_at = $4, \
+                 last_error_code = CASE WHEN last_error_code = 'account_paused' \
+                                        THEN NULL ELSE last_error_code END, \
+                 last_error_at = CASE WHEN last_error_code = 'account_paused' \
+                                      THEN NULL ELSE last_error_at END, \
+                 revision = revision + 1, updated_at = $4 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(account_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+            sqlx::query(
+                "UPDATE google_sync_outbox SET available_at = $4, last_error_code = NULL, \
+                 updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
+                 AND provider_account_id = $3 AND state = 'backoff' \
+                 AND last_error_code = 'account_paused'",
+            )
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(account_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
         let account = account_from_row(&row)?.account;
         let response =
             serde_json::to_value(&account).map_err(|_| GoogleOAuthRepositoryError::Internal)?;
@@ -1696,6 +1818,36 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         if changed != 1 {
             return Err(GoogleOAuthRepositoryError::Internal);
         }
+        // Disconnect is the account-level guardian fence for Calendar/Tasks.
+        // Revoke every local delivery claim in the same transaction that makes
+        // the credentials unavailable, so a stale worker cannot acknowledge or
+        // later replay provider mutations after the owner disconnects.
+        sqlx::query(
+            "UPDATE google_sync_outbox SET state = 'conflict', claim_id = NULL, \
+             claimed_at = NULL, last_error_code = 'account_disconnecting', updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+             AND state IN ('pending', 'delivering', 'backoff')",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        sqlx::query(
+            "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
+             next_attempt_at = $4, requested_at = NULL, last_error_code = 'account_disconnecting', \
+             last_error_at = $4, revision = revision + 1, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
         if !retry {
             insert_idempotency(
                 &mut transaction,

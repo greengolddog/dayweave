@@ -70,6 +70,10 @@ impl ItemService {
         Ok(self.repository.get(id, false).await?)
     }
 
+    pub(crate) async fn get_including_deleted(&self, id: Uuid) -> Result<Item, ItemServiceError> {
+        Ok(self.repository.get(id, true).await?)
+    }
+
     /// Lists items in deterministic sibling order.
     ///
     /// # Errors

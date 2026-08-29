@@ -158,6 +158,55 @@ async fn maps_expired_sync_token_to_bounded_resync_signal() {
 }
 
 #[tokio::test]
+async fn calendar_list_tombstones_allow_omitted_display_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/users/me/calendarList"))
+        .and(query_param("showDeleted", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{"id": "removed-calendar", "deleted": true}]
+        })))
+        .mount(&server)
+        .await;
+
+    let page = client(&server)
+        .list_calendars(None, None)
+        .await
+        .expect("minimal calendar tombstone parses");
+    assert!(page.items[0].deleted);
+    assert!(page.items[0].summary.is_empty());
+    assert!(page.items[0].access_role.is_empty());
+}
+
+#[tokio::test]
+async fn authorized_transport_never_follows_provider_redirects() {
+    let source = MockServer::start().await;
+    let target = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/users/me/calendarList"))
+        .and(header("authorization", "Bearer test-access-token"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/capture", target.uri())),
+        )
+        .mount(&source)
+        .await;
+
+    let error = client(&source)
+        .list_calendars(None, None)
+        .await
+        .expect_err("redirect is surfaced instead of followed");
+    assert!(matches!(error, GoogleError::Api { status: 302 }));
+    assert!(
+        target
+            .received_requests()
+            .await
+            .expect("target request journal")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn attendee_write_requires_explicit_approval_without_sending_request() {
     let server = MockServer::start().await;
     let external = event(vec![EventAttendee {
@@ -248,6 +297,38 @@ async fn conditional_event_update_maps_stale_etag() {
 }
 
 #[tokio::test]
+async fn conditional_task_update_encodes_ids_and_maps_stale_etag() {
+    let server = MockServer::start().await;
+    let task = GoogleTask {
+        id: "task/one".to_owned(),
+        etag: Some("\"task-etag\"".to_owned()),
+        title: "Safe update".to_owned(),
+        notes: Some("[DayWeave item:00000000-0000-0000-0000-000000000001]".to_owned()),
+        status: Some("needsAction".to_owned()),
+        due: None,
+        completed: None,
+        updated: None,
+        parent: None,
+        position: None,
+        links: None,
+        deleted: false,
+        hidden: false,
+    };
+    Mock::given(method("PUT"))
+        .and(path("/tasks/v1/lists/list%2Fone/tasks/task%2Fone"))
+        .and(header("if-match", "\"task-etag\""))
+        .respond_with(ResponseTemplate::new(412))
+        .mount(&server)
+        .await;
+
+    let error = client(&server)
+        .update_task("list/one", &task)
+        .await
+        .expect_err("stale task must not overwrite provider state");
+    assert!(matches!(error, GoogleError::PreconditionFailed));
+}
+
+#[tokio::test]
 async fn task_listing_preserves_completed_hidden_and_deleted_state() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -259,7 +340,6 @@ async fn task_listing_preserves_completed_hidden_and_deleted_state() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [{
                 "id": "task-1",
-                "title": "Archived task",
                 "status": "completed",
                 "deleted": true,
                 "hidden": true
@@ -275,6 +355,7 @@ async fn task_listing_preserves_completed_hidden_and_deleted_state() {
 
     assert!(page.items[0].deleted);
     assert!(page.items[0].hidden);
+    assert!(page.items[0].title.is_empty());
 }
 
 #[tokio::test]
@@ -445,6 +526,10 @@ async fn positions_google_subtask_with_encoded_task_list() {
         .and(path("/tasks/v1/lists/travel%2Flist/tasks"))
         .and(query_param("parent", "parent-1"))
         .and(query_param("previous", "sibling-1"))
+        .and(body_json(json!({
+            "title": "Pack charger",
+            "status": "needsAction"
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(&task))
         .mount(&server)
         .await;

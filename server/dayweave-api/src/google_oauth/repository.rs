@@ -198,6 +198,16 @@ pub trait GoogleOAuthRepository: Send + Sync {
 
     async fn accounts(&self) -> Result<Vec<AccountSecretSnapshot>, GoogleOAuthRepositoryError>;
 
+    async fn update_access_credentials(
+        &self,
+        account_id: Uuid,
+        expected_revision: u64,
+        credentials: EncryptedCredentials,
+        granted_scopes: std::collections::BTreeSet<String>,
+        token_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<AccountSecretSnapshot, GoogleOAuthRepositoryError>;
+
     async fn set_paused(
         &self,
         account_id: Uuid,
@@ -1222,6 +1232,37 @@ impl GoogleOAuthRepository for InMemoryGoogleOAuthRepository {
             )
         });
         Ok(accounts)
+    }
+
+    async fn update_access_credentials(
+        &self,
+        account_id: Uuid,
+        expected_revision: u64,
+        credentials: EncryptedCredentials,
+        granted_scopes: std::collections::BTreeSet<String>,
+        token_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<AccountSecretSnapshot, GoogleOAuthRepositoryError> {
+        let mut state = self.state.lock().await;
+        ensure_no_open_authorization(&state)?;
+        ensure_no_revocation_fence(&state)?;
+        let snapshot = {
+            let account = account_mut(&mut state, account_id)?;
+            check_revision(account, expected_revision)?;
+            if account.value.status != GoogleAccountStatus::Active || !account.value.sync_enabled {
+                return Err(GoogleOAuthRepositoryError::AccountStateConflict);
+            }
+            account.credentials = Some(credentials);
+            account.value.granted_scopes = granted_scopes;
+            account.value.token_expires_at = Some(token_expires_at);
+            bump(&mut account.value, now)?;
+            memory_snapshot(account).ok_or(GoogleOAuthRepositoryError::Internal)?
+        };
+        state.credential_generation = state
+            .credential_generation
+            .checked_add(1)
+            .ok_or(GoogleOAuthRepositoryError::Internal)?;
+        Ok(snapshot)
     }
 
     async fn set_paused(

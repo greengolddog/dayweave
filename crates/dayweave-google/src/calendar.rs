@@ -133,9 +133,11 @@ pub struct CalendarListPage {
 #[allow(clippy::struct_excessive_bools)] // Independent fields in Google's wire schema.
 pub struct CalendarListEntry {
     pub id: String,
+    #[serde(default)]
     pub summary: String,
     pub description: Option<String>,
     pub time_zone: Option<String>,
+    #[serde(default)]
     pub access_role: String,
     #[serde(default)]
     pub primary: bool,

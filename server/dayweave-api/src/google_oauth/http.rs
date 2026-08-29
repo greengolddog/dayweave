@@ -20,7 +20,10 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::Principal,
-    config::{GOOGLE_CALENDAR_SCOPE, GOOGLE_TASKS_SCOPE},
+    config::{
+        GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_SCOPE, GOOGLE_TASKS_READONLY_SCOPE,
+        GOOGLE_TASKS_SCOPE,
+    },
     error::{ApiError, ErrorEnvelope},
 };
 
@@ -139,7 +142,7 @@ pub(crate) async fn start(
     let request = request
         .map_err(|error| ApiError::from_json_rejection(&error))?
         .0;
-    if request.services.len() > 2
+    if request.services.len() > 4
         || (request.connect_new && request.account_id.is_some())
         || request.login_hint.as_ref().is_some_and(|hint| {
             hint.is_empty() || hint.len() > 320 || hint.chars().any(char::is_control)
@@ -422,8 +425,12 @@ pub(crate) async fn callback(
 }
 
 fn callback_success_message(account: &GoogleAccount) -> &'static str {
-    let calendar = account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE);
-    let tasks = account.granted_scopes.contains(GOOGLE_TASKS_SCOPE);
+    let calendar = account.granted_scopes.contains(GOOGLE_CALENDAR_SCOPE)
+        || account
+            .granted_scopes
+            .contains(GOOGLE_CALENDAR_READONLY_SCOPE);
+    let tasks = account.granted_scopes.contains(GOOGLE_TASKS_SCOPE)
+        || account.granted_scopes.contains(GOOGLE_TASKS_READONLY_SCOPE);
     match (calendar, tasks) {
         (true, true) => "Google Calendar and Tasks are connected. You may close this window.",
         (true, false) => "Google Calendar is connected. You may close this window.",
@@ -659,6 +666,20 @@ mod tests {
                     GOOGLE_OPENID_SCOPE.to_owned(),
                     GOOGLE_EMAIL_SCOPE.to_owned(),
                 ]),
+                id_token: None,
+            })
+        }
+
+        async fn refresh(
+            &self,
+            _refresh_token: &SecretString,
+        ) -> Result<OAuthTokenSet, GoogleError> {
+            Ok(OAuthTokenSet {
+                access_token: SecretString::from("http-refreshed-access"),
+                refresh_token: None,
+                expires_in_seconds: 3_600,
+                token_type: "Bearer".to_owned(),
+                granted_scopes: BTreeSet::new(),
                 id_token: None,
             })
         }

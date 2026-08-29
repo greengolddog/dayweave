@@ -64,6 +64,12 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_oauth::http::disconnect,
         crate::google_oauth::http::acknowledge_recovery,
         crate::google_oauth::http::callback,
+        crate::google_sync::http::list_collections,
+        crate::google_sync::http::discover_collections,
+        crate::google_sync::http::configure_collection,
+        crate::google_sync::http::sync_status,
+        crate::google_sync::http::manual_refresh,
+        crate::google_sync::http::enqueue_outbound,
     ),
     components(schemas(
         HealthResponse,
@@ -124,6 +130,22 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_oauth::http::AccountRevisionRequest,
         crate::google_oauth::http::AcknowledgeGoogleOAuthRecoveryRequest,
         crate::google_oauth::http::AcknowledgeGoogleOAuthRecoveryResponse,
+        crate::google_sync::GoogleCollectionKind,
+        crate::google_sync::GoogleSyncRole,
+        crate::google_sync::GoogleSyncCollection,
+        crate::google_sync::GoogleSyncRunState,
+        crate::google_sync::GoogleSyncRunStatus,
+        crate::google_sync::GoogleSyncStatus,
+        crate::google_sync::GoogleSyncRefreshAccepted,
+        crate::google_sync::GoogleOutboundAccepted,
+        crate::google_sync::OutboundOperation,
+        crate::google_sync::http::GoogleCollectionsResponse,
+        crate::google_sync::http::ConfigureGoogleCollectionRequest,
+        crate::google_sync::http::GoogleCollectionResponse,
+        crate::google_sync::http::GoogleSyncStatusResponse,
+        crate::google_sync::http::GoogleSyncRefreshResponse,
+        crate::google_sync::http::EnqueueGoogleOutboundRequest,
+        crate::google_sync::http::GoogleOutboundResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -132,7 +154,8 @@ const MAX_LIST_LIMIT: usize = 200;
         (name = "items", description = "Canonical offline-first planner items and delta sync"),
         (name = "schedule", description = "Deterministic side-effect-free planning previews"),
         (name = "execution", description = "Server-authoritative cross-device timers and breaks"),
-        (name = "google", description = "Google Calendar and Tasks identity authorization")
+        (name = "google", description = "Google Calendar and Tasks identity authorization"),
+        (name = "google_sync", description = "Durable Google Calendar and Tasks reconciliation")
     )
 )]
 pub struct ApiDoc;
@@ -168,6 +191,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())
         .merge(crate::google_oauth::http::protected_routes())
+        .merge(crate::google_sync::http::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,

@@ -96,7 +96,13 @@ impl Readiness {
                     EXISTS(SELECT 1 FROM google_oauth_cleanup_tokens WHERE workspace_id = $1 \
                         AND user_id = $2 AND (status = 'operator_required' OR attempt_count >= 12)) OR \
                     EXISTS(SELECT 1 FROM google_oauth_legacy_credential_quarantine \
-                        WHERE workspace_id = $1 AND user_id = $2 AND recovery_confirmed_at IS NULL) \
+                        WHERE workspace_id = $1 AND user_id = $2 AND recovery_confirmed_at IS NULL) OR \
+                    EXISTS(SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+                        AND (state IN ('reauthorization_required', 'failed') \
+                            OR (state = 'running' AND lease_until <= clock_timestamp()))) OR \
+                    EXISTS(SELECT 1 FROM google_sync_outbox WHERE workspace_id = $1 AND user_id = $2 \
+                        AND (state = 'failed' OR (state = 'delivering' \
+                            AND claimed_at <= clock_timestamp() - interval '10 minutes'))) \
                 )",
             )
             .bind(workspace_id)

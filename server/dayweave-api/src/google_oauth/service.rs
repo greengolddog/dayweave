@@ -19,7 +19,10 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::{
-    config::{GOOGLE_CALENDAR_SCOPE, GOOGLE_EMAIL_SCOPE, GOOGLE_OPENID_SCOPE, GOOGLE_TASKS_SCOPE},
+    config::{
+        GOOGLE_CALENDAR_READONLY_SCOPE, GOOGLE_CALENDAR_SCOPE, GOOGLE_EMAIL_SCOPE,
+        GOOGLE_OPENID_SCOPE, GOOGLE_TASKS_READONLY_SCOPE, GOOGLE_TASKS_SCOPE,
+    },
     proposals::Clock,
     readiness::Readiness,
 };
@@ -182,6 +185,8 @@ pub(crate) trait GoogleOAuthTransport: Send + Sync {
         code: &SecretString,
     ) -> Result<OAuthTokenSet, GoogleError>;
 
+    async fn refresh(&self, refresh_token: &SecretString) -> Result<OAuthTokenSet, GoogleError>;
+
     async fn identity(&self, access_token: &SecretString) -> Result<GoogleIdentity, GoogleError>;
 
     async fn revoke(&self, token: &SecretString) -> Result<(), GoogleError>;
@@ -234,6 +239,10 @@ impl GoogleOAuthTransport for ProductionGoogleOAuthTransport {
         self.client
             .exchange_code(&session, state.expose_secret(), code)
             .await
+    }
+
+    async fn refresh(&self, refresh_token: &SecretString) -> Result<OAuthTokenSet, GoogleError> {
+        self.client.refresh(refresh_token).await
     }
 
     async fn identity(&self, access_token: &SecretString) -> Result<GoogleIdentity, GoogleError> {
@@ -328,14 +337,18 @@ impl std::fmt::Debug for OAuthIdempotencyKey {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum GoogleService {
+    CalendarReadOnly,
     Calendar,
+    TasksReadOnly,
     Tasks,
 }
 
 impl GoogleService {
     const fn scope(self) -> &'static str {
         match self {
+            Self::CalendarReadOnly => GOOGLE_CALENDAR_READONLY_SCOPE,
             Self::Calendar => GOOGLE_CALENDAR_SCOPE,
+            Self::TasksReadOnly => GOOGLE_TASKS_READONLY_SCOPE,
             Self::Tasks => GOOGLE_TASKS_SCOPE,
         }
     }
@@ -482,7 +495,10 @@ impl GoogleOAuthService {
         self.reconcile_cleanup(None).await?;
         self.repository.reconcile_staged().await?;
         let requested_services = if input.services.is_empty() {
-            BTreeSet::from([GoogleService::Calendar, GoogleService::Tasks])
+            BTreeSet::from([
+                GoogleService::CalendarReadOnly,
+                GoogleService::TasksReadOnly,
+            ])
         } else {
             input.services
         };
@@ -523,6 +539,12 @@ impl GoogleOAuthService {
                 .map(GoogleService::scope)
                 .map(str::to_owned),
         );
+        if scopes.contains(GOOGLE_CALENDAR_SCOPE) {
+            scopes.remove(GOOGLE_CALENDAR_READONLY_SCOPE);
+        }
+        if scopes.contains(GOOGLE_TASKS_SCOPE) {
+            scopes.remove(GOOGLE_TASKS_READONLY_SCOPE);
+        }
         scopes.insert(GOOGLE_OPENID_SCOPE.to_owned());
         scopes.insert(GOOGLE_EMAIL_SCOPE.to_owned());
         let force_consent = input.force_consent || !has_usable_existing_refresh;
@@ -774,6 +796,95 @@ impl GoogleOAuthService {
             || cleanup.legacy_recovery_required > 0
             || cleanup.exhausted > 0;
         Ok((accounts, cleanup))
+    }
+
+    pub(crate) async fn access_token_for_sync(
+        &self,
+        account_id: Uuid,
+    ) -> Result<SecretString, GoogleOAuthServiceError> {
+        for _ in 0..2 {
+            let snapshot = self
+                .repository
+                .account_by_id(account_id)
+                .await?
+                .ok_or(GoogleOAuthRepositoryError::AccountNotFound)?;
+            if snapshot.account.status != GoogleAccountStatus::Active
+                || !snapshot.account.sync_enabled
+            {
+                return Err(GoogleOAuthRepositoryError::AccountStateConflict.into());
+            }
+            let mut credentials = self.open_credentials(&snapshot)?;
+            let now = self.clock.now();
+            if credentials.access_expires_at > now + TimeDelta::seconds(90) {
+                return Ok(credentials.access_token);
+            }
+            let tokens = tokio::time::timeout(
+                GOOGLE_EXCHANGE_TIMEOUT,
+                self.transport.refresh(&credentials.refresh_token),
+            )
+            .await
+            .map_err(|_| GoogleOAuthServiceError::IntegrationTimeout)??;
+            if tokens.refresh_token.is_some()
+                || tokens.access_token.expose_secret().is_empty()
+                || tokens.access_token.expose_secret().len() > 16_384
+                || !tokens.token_type.eq_ignore_ascii_case("bearer")
+                || tokens.expires_in_seconds == 0
+                || tokens.expires_in_seconds > 86_400
+            {
+                return Err(GoogleOAuthServiceError::InvalidTokenResponse);
+            }
+            let expires_at = now
+                + TimeDelta::try_seconds(
+                    i64::try_from(tokens.expires_in_seconds)
+                        .map_err(|_| GoogleOAuthServiceError::InvalidTokenResponse)?,
+                )
+                .ok_or(GoogleOAuthServiceError::InvalidTokenResponse)?;
+            let access_token = tokens.access_token.clone();
+            credentials.access_token = tokens.access_token;
+            credentials.token_type = tokens.token_type;
+            credentials.access_expires_at = expires_at;
+            let encrypted = super::domain::EncryptedCredentials {
+                sealed: self.seal_credentials(account_id, &credentials)?,
+            };
+            let granted_scopes = if tokens.granted_scopes.is_empty() {
+                snapshot.account.granted_scopes.clone()
+            } else {
+                tokens.granted_scopes
+            };
+            match self
+                .repository
+                .update_access_credentials(
+                    account_id,
+                    snapshot.account.revision,
+                    encrypted,
+                    granted_scopes,
+                    expires_at,
+                    now,
+                )
+                .await
+            {
+                Ok(_) => return Ok(access_token),
+                Err(GoogleOAuthRepositoryError::RevisionConflict { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(GoogleOAuthRepositoryError::AuthorizationConflict.into())
+    }
+
+    pub(crate) async fn account_for_sync(
+        &self,
+        account_id: Uuid,
+    ) -> Result<GoogleAccount, GoogleOAuthServiceError> {
+        let snapshot = self
+            .repository
+            .account_by_id(account_id)
+            .await?
+            .ok_or(GoogleOAuthRepositoryError::AccountNotFound)?;
+        if snapshot.account.status != GoogleAccountStatus::Active || !snapshot.account.sync_enabled
+        {
+            return Err(GoogleOAuthRepositoryError::AccountStateConflict.into());
+        }
+        Ok(snapshot.account)
     }
 
     pub(crate) async fn set_paused(
@@ -1745,6 +1856,8 @@ mod tests {
         begins: Vec<AuthorizationOptions>,
         states: Vec<String>,
         exchanges: usize,
+        refreshes: usize,
+        rotate_refresh_next: bool,
         refresh_tokens: VecDeque<Option<String>>,
         fail_next_revoke: bool,
         revoke_failures_remaining: usize,
@@ -1828,15 +1941,15 @@ mod tests {
             }
             let exchange = state.exchanges;
             let refresh_token = state.refresh_tokens.pop_front().flatten();
-            let mut granted_scopes = BTreeSet::from([
-                GOOGLE_CALENDAR_SCOPE.to_owned(),
-                GOOGLE_TASKS_SCOPE.to_owned(),
-                GOOGLE_OPENID_SCOPE.to_owned(),
-                GOOGLE_EMAIL_SCOPE.to_owned(),
-            ]);
+            let mut granted_scopes = state
+                .begins
+                .last()
+                .map(|begin| begin.scopes.clone())
+                .unwrap_or_default();
             if state.omit_tasks_scope_next {
                 state.omit_tasks_scope_next = false;
                 granted_scopes.remove(GOOGLE_TASKS_SCOPE);
+                granted_scopes.remove(GOOGLE_TASKS_READONLY_SCOPE);
             }
             Ok(OAuthTokenSet {
                 access_token: SecretString::from(format!("access-{exchange}")),
@@ -1844,6 +1957,26 @@ mod tests {
                 expires_in_seconds: 3_600,
                 token_type: "Bearer".to_owned(),
                 granted_scopes,
+                id_token: None,
+            })
+        }
+
+        async fn refresh(
+            &self,
+            _refresh_token: &SecretString,
+        ) -> Result<OAuthTokenSet, GoogleError> {
+            let mut state = self.0.lock().expect("transport lock");
+            state.refreshes += 1;
+            let refresh_token = state
+                .rotate_refresh_next
+                .then(|| SecretString::from("unexpected-rotated-refresh"));
+            state.rotate_refresh_next = false;
+            Ok(OAuthTokenSet {
+                access_token: SecretString::from("refreshed-access"),
+                refresh_token,
+                expires_in_seconds: 3_600,
+                token_type: "Bearer".to_owned(),
+                granted_scopes: BTreeSet::new(),
                 id_token: None,
             })
         }
@@ -2049,8 +2182,10 @@ mod tests {
             .expect("first callback");
         assert_eq!(first_account.revision, 1);
 
+        let mut promoted = begin_input();
+        promoted.services = BTreeSet::from([GoogleService::Tasks]);
         let second = service
-            .begin(begin_input(), idempotency("incremental-second"))
+            .begin(promoted, idempotency("incremental-second"))
             .await
             .expect("second begin");
         let second_state = FakeTransport::state_from_url(&second.authorization_url);
@@ -2067,12 +2202,17 @@ mod tests {
             assert!(
                 transport_state.begins[1]
                     .scopes
-                    .contains(GOOGLE_CALENDAR_SCOPE)
+                    .contains(GOOGLE_CALENDAR_READONLY_SCOPE)
             );
             assert!(
                 transport_state.begins[1]
                     .scopes
                     .contains(GOOGLE_TASKS_SCOPE)
+            );
+            assert!(
+                !transport_state.begins[1]
+                    .scopes
+                    .contains(GOOGLE_TASKS_READONLY_SCOPE)
             );
         }
 
@@ -2088,6 +2228,63 @@ mod tests {
             transport.0.lock().expect("transport lock").revoked_tokens,
             vec!["refresh-one"]
         );
+    }
+
+    #[tokio::test]
+    async fn sync_access_refresh_is_encrypted_revisioned_and_rejects_unexpected_rotation() {
+        let (service, repository, transport, clock) = fixture([Some("refresh-one")]);
+        let started = service
+            .begin(begin_input(), idempotency("sync-refresh-connect"))
+            .await
+            .expect("authorization start");
+        let state = FakeTransport::state_from_url(&started.authorization_url);
+        let account = service
+            .callback(&state, "code")
+            .await
+            .expect("account installed");
+
+        let reused = service
+            .access_token_for_sync(account.id)
+            .await
+            .expect("unexpired access reused");
+        assert_eq!(reused.expose_secret(), "access-1");
+        assert_eq!(transport.0.lock().expect("transport lock").refreshes, 0);
+
+        clock.advance(TimeDelta::minutes(59));
+        let refreshed = service
+            .access_token_for_sync(account.id)
+            .await
+            .expect("expiring access refreshed");
+        assert_eq!(refreshed.expose_secret(), "refreshed-access");
+        assert_eq!(transport.0.lock().expect("transport lock").refreshes, 1);
+        let stored = repository
+            .account_by_id(account.id)
+            .await
+            .expect("account query")
+            .expect("account");
+        assert_eq!(stored.account.revision, account.revision + 1);
+        let opened = service
+            .open_credentials(&stored)
+            .expect("encrypted credentials");
+        assert_eq!(opened.access_token.expose_secret(), "refreshed-access");
+        assert_eq!(opened.refresh_token.expose_secret(), "refresh-one");
+
+        clock.advance(TimeDelta::minutes(59));
+        transport
+            .0
+            .lock()
+            .expect("transport lock")
+            .rotate_refresh_next = true;
+        assert!(matches!(
+            service.access_token_for_sync(account.id).await,
+            Err(GoogleOAuthServiceError::InvalidTokenResponse)
+        ));
+        let unchanged = repository
+            .account_by_id(account.id)
+            .await
+            .expect("account query")
+            .expect("account");
+        assert_eq!(unchanged.account.revision, stored.account.revision);
     }
 
     #[tokio::test]

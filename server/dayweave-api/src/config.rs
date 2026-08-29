@@ -8,7 +8,7 @@ use std::{
 
 use secrecy::SecretString;
 use thiserror::Error;
-use url::{Host, Url};
+use url::Url;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -29,6 +29,9 @@ const MAX_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 30;
 
 pub const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
+pub const GOOGLE_CALENDAR_READONLY_SCOPE: &str =
+    "https://www.googleapis.com/auth/calendar.readonly";
+pub const GOOGLE_TASKS_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/tasks.readonly";
 pub const GOOGLE_OPENID_SCOPE: &str = "openid";
 pub const GOOGLE_EMAIL_SCOPE: &str = "email";
 
@@ -250,7 +253,7 @@ impl Config {
         {
             return Err(ConfigError::MissingDatabaseUrl);
         }
-        let google_oauth = google_oauth_config(values, environment)?;
+        let google_oauth = google_oauth_config(values)?;
         if google_oauth.is_some() && database.is_none() {
             return Err(ConfigError::MissingGoogleOAuthDatabase);
         }
@@ -303,9 +306,7 @@ pub enum ConfigError {
     MissingGoogleOAuthSetting(&'static str),
     #[error("DAYWEAVE_DATABASE_URL is required whenever Google OAuth is enabled")]
     MissingGoogleOAuthDatabase,
-    #[error(
-        "DAYWEAVE_GOOGLE_REDIRECT_URI must be an exact HTTPS callback URI (loopback HTTP is development/test only)"
-    )]
+    #[error("DAYWEAVE_GOOGLE_REDIRECT_URI must be an exact HTTPS callback URI")]
     InvalidGoogleRedirectUri,
     #[error(
         "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS must contain unique entries formatted vN:<64 lowercase hex characters>"
@@ -319,7 +320,6 @@ pub enum ConfigError {
 
 fn google_oauth_config(
     values: &HashMap<String, String>,
-    environment: Environment,
 ) -> Result<Option<GoogleOAuthConfig>, ConfigError> {
     let enabled = match values
         .get("DAYWEAVE_GOOGLE_OAUTH_ENABLED")
@@ -348,8 +348,7 @@ fn google_oauth_config(
     };
     let client_id = required("DAYWEAVE_GOOGLE_CLIENT_ID")?.to_owned();
     let client_secret = SecretString::from(required("DAYWEAVE_GOOGLE_CLIENT_SECRET")?.to_owned());
-    let redirect_uri =
-        parse_google_redirect_uri(required("DAYWEAVE_GOOGLE_REDIRECT_URI")?, environment)?;
+    let redirect_uri = parse_google_redirect_uri(required("DAYWEAVE_GOOGLE_REDIRECT_URI")?)?;
     let keys = parse_credential_keys(required("DAYWEAVE_GOOGLE_CREDENTIAL_KEYS")?)?;
     let active_key_version =
         parse_key_version(required("DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION")?)
@@ -380,7 +379,7 @@ fn google_oauth_config(
     }))
 }
 
-fn parse_google_redirect_uri(value: &str, environment: Environment) -> Result<Url, ConfigError> {
+fn parse_google_redirect_uri(value: &str) -> Result<Url, ConfigError> {
     let uri = Url::parse(value).map_err(|_| ConfigError::InvalidGoogleRedirectUri)?;
     if uri.username() != ""
         || uri.password().is_some()
@@ -391,23 +390,10 @@ fn parse_google_redirect_uri(value: &str, environment: Environment) -> Result<Ur
     {
         return Err(ConfigError::InvalidGoogleRedirectUri);
     }
-    let loopback_host = match uri.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        None => false,
-    };
-    if uri.scheme() == "https"
-        && (!loopback_host || matches!(environment, Environment::Development | Environment::Test))
-    {
+    if uri.scheme() == "https" {
         return Ok(uri);
     }
-    let loopback = matches!(environment, Environment::Development | Environment::Test)
-        && uri.scheme() == "http"
-        && loopback_host;
-    loopback
-        .then_some(uri)
-        .ok_or(ConfigError::InvalidGoogleRedirectUri)
+    Err(ConfigError::InvalidGoogleRedirectUri)
 }
 
 fn parse_credential_keys(value: &str) -> Result<BTreeMap<u32, CredentialKey>, ConfigError> {
@@ -775,10 +761,13 @@ mod tests {
             values
         };
 
-        Config::from_map(&base(
-            "http://127.0.0.1:8080/v1/integrations/google/oauth/callback",
-        ))
-        .expect("loopback HTTP is allowed in development");
+        assert_eq!(
+            Config::from_map(&base(
+                "http://127.0.0.1:8080/v1/integrations/google/oauth/callback",
+            ))
+            .expect_err("loopback HTTP must fail in development"),
+            ConfigError::InvalidGoogleRedirectUri
+        );
         let mut production = base("http://localhost:8080/v1/integrations/google/oauth/callback");
         production.insert("DAYWEAVE_ENVIRONMENT".to_owned(), "production".to_owned());
         production.insert(
@@ -793,10 +782,7 @@ mod tests {
             "DAYWEAVE_GOOGLE_REDIRECT_URI".to_owned(),
             "https://localhost/v1/integrations/google/oauth/callback".to_owned(),
         );
-        assert_eq!(
-            Config::from_map(&production).expect_err("production loopback must fail"),
-            ConfigError::InvalidGoogleRedirectUri
-        );
+        Config::from_map(&production).expect("HTTPS loopback remains encrypted");
         assert_eq!(
             Config::from_map(&base(
                 "http://localhost.evil.test/v1/integrations/google/oauth/callback",

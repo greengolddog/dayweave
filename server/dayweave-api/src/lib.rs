@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod execution;
 pub mod google_oauth;
+pub mod google_sync;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
@@ -30,11 +31,12 @@ use google_oauth::{
     GoogleOAuthRepository, GoogleOAuthService, InMemoryGoogleOAuthRepository, OAuthScope,
     ProductionGoogleOAuthTransport, SecretCipher,
 };
+use google_sync::{GoogleSyncRepository, GoogleSyncService, ProductionGoogleSyncProvider};
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
 use persistence::{
     Database, PersistenceError, PostgresExecutionRepository, PostgresGoogleOAuthRepository,
-    PostgresItemRepository, PostgresProposalRepository,
+    PostgresGoogleSyncRepository, PostgresItemRepository, PostgresProposalRepository,
 };
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
@@ -51,6 +53,7 @@ type Repositories = (
     Arc<dyn ItemRepository>,
     Arc<dyn ExecutionRepository>,
     Arc<dyn GoogleOAuthRepository>,
+    Option<Arc<dyn GoogleSyncRepository>>,
     OAuthScope,
     Readiness,
 );
@@ -75,6 +78,10 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             )),
+            Some(Arc::new(PostgresGoogleSyncRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            ))),
             OAuthScope {
                 workspace_id: database.scope().workspace_id,
                 user_id: database.scope().user_id,
@@ -91,6 +98,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         Arc::new(InMemoryItemRepository::default()),
         Arc::new(InMemoryExecutionRepository::default()),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
+        None,
         OAuthScope {
             workspace_id: Uuid::from_u128(2),
             user_id: Uuid::from_u128(1),
@@ -109,6 +117,7 @@ pub struct AppState {
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
     pub google_oauth: Option<Arc<GoogleOAuthService>>,
+    pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
     execution_repository: Arc<dyn ExecutionRepository>,
     clock: Arc<dyn Clock>,
 }
@@ -129,6 +138,7 @@ impl AppState {
             item_repository,
             execution_repository,
             google_oauth_repository,
+            google_sync_repository,
             oauth_scope,
             readiness,
         ): Repositories = repositories(config).await?;
@@ -153,6 +163,7 @@ impl AppState {
             proposals.clone(),
             config.mcp_allowed_origins.clone(),
         ));
+        let mut google_sync = None;
         let google_oauth = if let Some(google) = config.google_oauth.as_ref() {
             use secrecy::ExposeSecret as _;
 
@@ -164,6 +175,7 @@ impl AppState {
             .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
             let client = OAuthClient::new(oauth_config)
                 .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+            let cipher = SecretCipher::new(google.keys.clone(), google.active_key_version);
             let service = Arc::new(
                 GoogleOAuthService::new(
                     google_oauth_repository,
@@ -171,7 +183,7 @@ impl AppState {
                         ProductionGoogleOAuthTransport::new(client)
                             .map_err(|_| PersistenceError::IntegrationInitializationFailed)?,
                     ),
-                    SecretCipher::new(google.keys.clone(), google.active_key_version),
+                    cipher.clone(),
                     oauth_scope,
                     clock.clone(),
                     google.session_ttl,
@@ -183,6 +195,22 @@ impl AppState {
                 .await
                 .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
             service.spawn_recovery_worker();
+            let sync_repository =
+                google_sync_repository.ok_or(PersistenceError::IntegrationInitializationFailed)?;
+            let sync = Arc::new(GoogleSyncService::new(
+                sync_repository,
+                Arc::new(ProductionGoogleSyncProvider::new(service.clone())),
+                service.clone(),
+                items.clone(),
+                cipher,
+                oauth_scope,
+                clock.clone(),
+            ));
+            sync.recover_startup()
+                .await
+                .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+            sync.spawn_worker();
+            google_sync = Some(sync);
             Some(service)
         } else {
             None
@@ -196,6 +224,7 @@ impl AppState {
             readiness,
             mcp,
             google_oauth,
+            google_sync,
             execution_repository,
             clock,
         })
@@ -233,6 +262,7 @@ impl AppState {
             readiness,
             mcp,
             google_oauth: None,
+            google_sync: None,
             execution_repository,
             clock,
         }

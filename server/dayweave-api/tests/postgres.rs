@@ -27,7 +27,7 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),
@@ -36,6 +36,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0004_item_delta_sync.sql"),
         include_str!("../migrations/0005_execution_sessions.sql"),
         include_str!("../migrations/0006_google_oauth.sql"),
+        include_str!("../migrations/0007_google_sync.sql"),
     ]
     .join("\n");
     for table in [
@@ -63,6 +64,9 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_oauth_scope_state",
         "google_oauth_guardian_resolutions",
         "google_oauth_legacy_credential_quarantine",
+        "google_sync_collections",
+        "google_sync_runs",
+        "google_sync_outbox",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }
@@ -1593,6 +1597,9 @@ async fn google_oauth_migration_quarantines_until_verified_operator_recovery() {
     pool.execute(include_str!("../migrations/0006_google_oauth.sql"))
         .await
         .expect("Google OAuth migration");
+    pool.execute(include_str!("../migrations/0007_google_sync.sql"))
+        .await
+        .expect("Google sync migration");
     let quarantined_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM provider_accounts WHERE id = ANY($1) \
          AND provider IN ('google_calendar', 'google_tasks') \

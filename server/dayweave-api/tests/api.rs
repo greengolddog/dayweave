@@ -121,6 +121,53 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     assert!(document["paths"]["/v1/integrations/google/oauth/start"].is_object());
     assert!(document["paths"]["/v1/integrations/google/oauth/callback"].is_object());
     assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/collections"].is_object()
+    );
+    assert!(
+        document["paths"]
+            ["/v1/integrations/google/accounts/{account_id}/collections/discover"]["post"]
+            .is_object()
+    );
+    assert!(
+        document["paths"]
+            ["/v1/integrations/google/accounts/{account_id}/collections/{collection_id}"]["put"]
+            .is_object()
+    );
+    assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/sync"]["get"].is_object()
+    );
+    assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/sync/refresh"]["post"]
+            .is_object()
+    );
+    assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/outbound"]["post"]
+            .is_object()
+    );
+    assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/outbound"]["post"]
+            ["responses"]["202"]
+            .is_null()
+    );
+    assert!(
+        document["paths"]["/v1/integrations/google/accounts/{account_id}/outbound"]["post"]
+            ["responses"]["409"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("server-minted audited approval"))
+    );
+    assert!(
+        document["components"]["schemas"]["GoogleSyncCollection"]["properties"]["sync_role"]
+            .is_object()
+    );
+    assert_eq!(
+        document["components"]["schemas"]["GoogleSyncRole"]["enum"],
+        json!(["read_only", "blocking", "writable"])
+    );
+    assert!(
+        document["components"]["schemas"]["GoogleSyncStatus"]["properties"]["pending_outbound"]
+            .is_object()
+    );
+    assert!(
         document["paths"]["/v1/integrations/google/oauth/recovery/acknowledge"]["post"].is_object()
     );
     assert!(
@@ -183,6 +230,31 @@ async fn google_oauth_is_fail_closed_when_disabled_and_callback_is_non_cacheable
         .await
         .unwrap();
     assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let account_id = "00000000-0000-4000-8000-000000000099";
+    let sync_unauthenticated = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/v1/integrations/google/accounts/{account_id}/collections"),
+            None,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sync_unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let sync_disabled = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/v1/integrations/google/accounts/{account_id}/collections"),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(sync_disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(sync_disabled.headers()[header::CACHE_CONTROL], "no-store");
 
     let callback = app
         .oneshot(request(

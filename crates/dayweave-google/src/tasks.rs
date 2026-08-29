@@ -31,6 +31,8 @@ pub struct TaskPage {
 pub struct GoogleTask {
     pub id: String,
     pub etag: Option<String>,
+    /// Deleted-task tombstones may omit user content.
+    #[serde(default)]
     pub title: String,
     pub notes: Option<String>,
     pub status: Option<String>,
@@ -44,6 +46,32 @@ pub struct GoogleTask {
     pub deleted: bool,
     #[serde(default)]
     pub hidden: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleTaskWrite<'a> {
+    title: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notes: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<&'a str>,
+}
+
+impl<'a> From<&'a GoogleTask> for GoogleTaskWrite<'a> {
+    fn from(task: &'a GoogleTask) -> Self {
+        Self {
+            title: &task.title,
+            notes: task.notes.as_deref(),
+            status: task.status.as_deref(),
+            due: task.due.as_deref(),
+            completed: task.completed.as_deref(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -135,7 +163,8 @@ impl GoogleClient {
             query.push(("previous", previous));
         }
         let request = self.request(Method::POST, url).await?.query(&query);
-        self.json(Self::body(request, task)).await
+        self.json(Self::body(request, &GoogleTaskWrite::from(task)))
+            .await
     }
 
     /// Updates a task conditionally using the last-seen `ETag`.
@@ -154,7 +183,8 @@ impl GoogleClient {
         if let Some(etag) = &task.etag {
             request = request.header(reqwest::header::IF_MATCH, etag);
         }
-        self.json(Self::body(request, task)).await
+        self.json(Self::body(request, &GoogleTaskWrite::from(task)))
+            .await
     }
 
     /// Deletes a task after the service layer has moved its canonical `DayWeave`
