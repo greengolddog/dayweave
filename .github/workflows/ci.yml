@@ -41,8 +41,8 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
-      - run: swift build --package-path apps/macos
-      - run: swift test --package-path apps/macos
+      - run: swift build --package-path apps/macos -Xswiftc -warnings-as-errors
+      - run: scripts/test-macos.sh -Xswiftc -warnings-as-errors
       - run: scripts/build-macos-app.sh
 
   android:
