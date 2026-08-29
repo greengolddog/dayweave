@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Git supplies remote metadata as arguments and ref updates on stdin. The
+# scanner intentionally consumes only the update stream and never prints it.
+: "${1:-unused-remote-name}" "${2:-unused-remote-location}"
+repo_root="$(git rev-parse --show-toplevel)"
+exec python3 -B "${repo_root}/scripts/scan-repository-credentials.py" \
+  pre-push --repo "${repo_root}"

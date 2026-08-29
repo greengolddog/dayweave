@@ -53,7 +53,7 @@ export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
 ./gradlew testDebugUnitTest lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
 ```
 
-The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signed minified release is produced with `scripts/build-android-apk.sh`, using the private external signing properties created by `scripts/create-android-signing-key.sh`.
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signed minified release is produced with `scripts/build-android-apk.sh`, using the private external signing properties created by `scripts/create-android-signing-key.sh`. The generator rejects lexical or symlink-resolved destinations inside the repository and its Git metadata before invoking any private-key tool.
 
 The supported floor is Android 9 / API 28, so the direct-download release APK intentionally uses APK Signature Scheme v3 only. Gradle disables v1, v2, and the uncopied v4 sidecar; the release script runs verbose `apksigner` verification before copying `dist/android/DayWeave-release.apk`. Release acceptance requires v3 `true`, v1/v2 `false`, and exactly one signer in that output.
 

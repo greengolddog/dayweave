@@ -49,6 +49,10 @@ jobs:
             printf '%s\n%s\n' 'Mutable action references:' "$invalid_references" >&2
             exit 1
           }
+      - name: Test the redacting repository credential scanner
+        run: python3 -B scripts/test-repository-credential-scanner.py
+      - name: Scan every reachable Git object and historical path
+        run: python3 -B scripts/scan-repository-credentials.py history
       - name: Scan repository
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
