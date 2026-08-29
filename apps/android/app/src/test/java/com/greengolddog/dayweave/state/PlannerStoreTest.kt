@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
@@ -264,13 +265,81 @@ class PlannerStoreTest {
         val store = PlannerStore(DayWeaveUiState.preview())
         val scheduleBefore = store.state.value.schedule
 
-        val accepted = store.quickCapture("Call the dentist", ItemKind.TASK)
+        val accepted = store.quickCapture(
+            title = "Call the dentist",
+            kind = ItemKind.TASK,
+            isSensitive = true,
+        )
 
         assertTrue(accepted)
         assertEquals(scheduleBefore, store.state.value.schedule)
         assertEquals("Call the dentist", store.state.value.inbox.first().title)
         assertEquals(InboxSource.QUICK_CAPTURE, store.state.value.inbox.first().source)
         assertTrue(store.state.value.inbox.first().requiresReview)
+        assertTrue(store.state.value.inbox.first().isSensitive)
+    }
+
+    @Test
+    fun ancestorSensitivityAcknowledgementImmediatelyProtectsCachedDescendantBlocks() {
+        val parentId = "77777777-7777-4777-8777-777777777777"
+        val parent = canonicalItem("planned", 1).copy(
+            id = parentId,
+            title = "SYNTHETIC-PRIVATE-PARENT",
+            isExecutable = false,
+        )
+        val child = canonicalItem("planned", 1).copy(
+            id = CANONICAL_ITEM_ID,
+            title = "SYNTHETIC-PRIVATE-CHILD",
+            parentId = parentId,
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 1).copy(isSensitive = false)
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(parent, child),
+                schedule = listOf(block),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+            ),
+        )
+        val pending = PendingCanonicalMutation(
+            idempotencyKey = "88888888-8888-4888-8888-888888888888",
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            itemId = parentId,
+            expectedRevision = 1,
+            targetStatus = "planned",
+            targetIsSensitive = true,
+            startedAt = "2026-08-29T08:00:00Z",
+            replacementRequestJson = "{}",
+            focusedBlockId = parentId,
+            displayStatus = ItemStatus.SCHEDULED,
+        )
+
+        assertNotNull(store.stageCanonicalMutation(pending))
+        assertTrue(store.state.value.schedule.single().isSensitive)
+        val restarted = PlannerStore(
+            store.state.value.copy(schedule = listOf(block.copy(isSensitive = false))),
+        )
+        assertTrue(restarted.state.value.schedule.single().isSensitive)
+        assertTrue(
+            requireNotNull(restarted.state.value.pendingCanonicalMutation).targetIsSensitive,
+        )
+        assertNotNull(
+            store.reconcileCanonicalItemSensitivity(
+                parent.copy(
+                    isSensitive = true,
+                    revision = 2,
+                    updatedAt = "2026-08-29T08:01:00Z",
+                ),
+            ),
+        )
+
+        val current = store.state.value
+        assertTrue(current.canonicalItems.first { it.id == parentId }.isSensitive)
+        assertFalse(current.canonicalItems.first { it.id == CANONICAL_ITEM_ID }.isSensitive)
+        assertTrue(current.schedule.single().isSensitive)
+        assertEquals(1L, current.schedule.single().canonicalRevision)
+        assertNull(current.pendingCanonicalMutation)
     }
 
     @Test

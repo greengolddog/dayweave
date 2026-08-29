@@ -39,11 +39,12 @@ object PlannerSnapshotFormats {
     const val JSON_V1 = "json-v1"
     const val JSON_V2 = "json-v2-canonical-execution"
     const val JSON_V3 = "json-v3-sensitive-items"
+    const val JSON_V4 = "json-v4-sensitive-authoring"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -73,6 +74,14 @@ object PlannerDatabaseMigrations {
      * rewritten from v2 with explicit non-sensitive legacy values into the strict v3 contract.
      */
     val MIGRATION_3_4 = object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
+
+    /**
+     * No columns change. The version fence prevents rollback while encrypted snapshots gain
+     * explicit Inbox sensitivity and an exact sensitivity target for pending canonical writes.
+     */
+    val MIGRATION_4_5 = object : Migration(4, 5) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
 }
@@ -118,6 +127,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_1_2,
                 PlannerDatabaseMigrations.MIGRATION_2_3,
                 PlannerDatabaseMigrations.MIGRATION_3_4,
+                PlannerDatabaseMigrations.MIGRATION_4_5,
             )
             .build()
     }

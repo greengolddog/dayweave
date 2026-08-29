@@ -413,6 +413,13 @@ private fun DayWeaveRoot(
                 onSetAppLockTimeout = onSetAppLockTimeout,
                 onLockNow = onLockNow,
                 onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+                canonicalPrivacyActionsEnabled = canonicalExecutionActionsEnabled &&
+                    state.canonicalSyncOrigin != null &&
+                    effectiveCanonicalSyncState.phase in setOf(
+                        CanonicalSyncPhase.READY,
+                        CanonicalSyncPhase.CONNECTED,
+                    ),
+                onSetCanonicalItemSensitive = viewModel::setCanonicalItemSensitive,
                 modifier = Modifier.padding(innerPadding),
             )
         }

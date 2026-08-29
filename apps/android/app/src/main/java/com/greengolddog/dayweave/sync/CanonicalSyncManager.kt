@@ -513,6 +513,111 @@ class CanonicalSyncManager(
         }
     }
 
+    /**
+     * Replaces only an item's own sensitivity bit under the same durable idempotency fence used
+     * for execution-state writes. A network ambiguity therefore remains replayable after process
+     * death, and a stale revision can never be silently rebased into a declassification.
+     */
+    suspend fun setItemSensitivity(
+        itemId: String,
+        expectedRevision: Long,
+        isSensitive: Boolean,
+    ): CanonicalRefreshOutcome {
+        val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+        if (loadState != PlannerLoadState.READY) {
+            updateError("Encrypted planner storage is unavailable; privacy was not changed.")
+            return CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        val outcome = operationMutex.withLock {
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            val initial = plannerStore.state.value
+            if (initial.pendingCanonicalMutation != null) {
+                return@withLock handleFailure(CanonicalMutationNeedsReconciliationException())
+            }
+            mutableState.value = CanonicalSyncState(
+                phase = CanonicalSyncPhase.SYNCING,
+                message = "Saving sensitive-item setting…",
+                lastInputDigest = initial.scheduleInputDigest,
+                sourceItemCount = initial.canonicalItems.size,
+                scheduledBlockCount = initial.schedule.size,
+            )
+            try {
+                val item = initial.canonicalItems.firstOrNull { it.id == itemId }
+                    ?: throw InvalidCanonicalTransitionException()
+                if (
+                    expectedRevision <= 0 || item.revision != expectedRevision ||
+                    item.deletedAt != null || item.revision == Long.MAX_VALUE ||
+                    initial.canonicalSyncOrigin != configuration.baseUrl.toString() ||
+                    initial.canonicalConfigurationId != configuration.configurationId
+                ) {
+                    throw InvalidCanonicalTransitionException()
+                }
+                if (item.isSensitive == isSensitive) {
+                    mutableState.value = mutableState.value.copy(
+                        phase = CanonicalSyncPhase.CONNECTED,
+                        message = "Sensitive-item setting is already current",
+                    )
+                    return@withLock CanonicalRefreshOutcome.SUCCESS
+                }
+                val mutation = replaceCanonicalItemSensitivity(
+                    configuration = configuration,
+                    item = item,
+                    targetIsSensitive = isSensitive,
+                )
+                if (mutation == PendingMutationResolution.SUPERSEDED) {
+                    updateError("A newer item revision superseded the privacy change; review it again.")
+                    return@withLock CanonicalRefreshOutcome.STALE_REVISION
+                }
+                val savedAt = now()
+                val metadataSaved = runCatching {
+                    credentialStore.recordSuccessfulSync(savedAt.toEpochMilli())
+                }.isSuccess
+                val current = plannerStore.state.value
+                mutableState.value = CanonicalSyncState(
+                    phase = if (metadataSaved) {
+                        CanonicalSyncPhase.CONNECTED
+                    } else {
+                        CanonicalSyncPhase.ERROR
+                    },
+                    message = if (metadataSaved) {
+                        current.scheduleMessage
+                    } else {
+                        "${current.scheduleMessage} Last-sync metadata could not be saved."
+                    },
+                    lastInputDigest = current.scheduleInputDigest,
+                    sourceItemCount = current.canonicalItems.size,
+                    scheduledBlockCount = current.schedule.size,
+                )
+                if (metadataSaved) {
+                    CanonicalRefreshOutcome.SUCCESS
+                } else {
+                    CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                }
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+        val uncertain = plannerStore.state.value.pendingCanonicalMutation
+        if (outcome == CanonicalRefreshOutcome.SUCCESS || uncertain == null) return outcome
+        val reconciled = refreshAndCompose()
+        if (reconciled != CanonicalRefreshOutcome.SUCCESS) return outcome
+        val authoritative = plannerStore.state.value.canonicalItems.firstOrNull {
+            it.id == uncertain.itemId
+        }
+        return if (
+            authoritative != null && authoritative.revision > uncertain.expectedRevision &&
+            authoritative.status == uncertain.targetStatus &&
+            authoritative.isSensitive == uncertain.targetIsSensitive
+        ) {
+            CanonicalRefreshOutcome.SUCCESS
+        } else {
+            updateError("The uncertain privacy change was reconciled and was not applied.")
+            outcome
+        }
+    }
+
     private suspend fun recomposeAfterTerminalAction(
         outcome: CanonicalRefreshOutcome,
     ): CanonicalRefreshOutcome {
@@ -856,7 +961,8 @@ class CanonicalSyncManager(
         }
         return if (
             authoritative != null && authoritative.revision > uncertain.expectedRevision &&
-            authoritative.status == uncertain.targetStatus
+            authoritative.status == uncertain.targetStatus &&
+            authoritative.isSensitive == uncertain.targetIsSensitive
         ) {
             CanonicalRefreshOutcome.SUCCESS
         } else {
@@ -893,23 +999,11 @@ class CanonicalSyncManager(
             val existing = item.earliestStartAt?.let(::parseTimestamp)?.toInstant()
             if (existing != null && existing >= threshold) item.earliestStartAt else threshold.toString()
         } ?: item.earliestStartAt
-        val replacement = CanonicalItemReplacement(
-            isSensitive = item.isSensitive,
-            kind = item.kind,
-            status = targetStatus,
-            title = item.title,
-            notes = item.notes,
-            timezoneName = item.timezoneName,
-            durationSeconds = item.durationSeconds,
-            deadlineAt = item.deadlineAt,
+        val replacement = canonicalReplacement(
+            item = item,
+            targetStatus = targetStatus,
+            targetIsSensitive = item.isSensitive,
             earliestStartAt = earliestStartAt,
-            recurrence = item.recurrenceJson?.let(::parseJsonObject),
-            flexibleConstraints = parseJsonObject(item.flexibleConstraintsJson),
-            splitPolicy = parseJsonObject(item.splitPolicyJson),
-            importance = item.importance,
-            urgency = item.urgency,
-            parentId = item.parentId,
-            siblingOrder = item.siblingOrder,
         )
         val idempotencyKey = UUID.randomUUID().toString()
         val replaceRequest = ReplaceCanonicalItemRequest(
@@ -923,6 +1017,7 @@ class CanonicalSyncManager(
                 itemId = item.id,
                 expectedRevision = item.revision,
                 targetStatus = targetStatus,
+                targetIsSensitive = item.isSensitive,
                 startedAt = now().toString(),
                 replacementRequestJson = mutationJson.encodeToString(replaceRequest),
                 focusedBlockId = blockId,
@@ -943,6 +1038,80 @@ class CanonicalSyncManager(
             reconcileConflict = terminalExecutionSessionId != null,
         )
     }
+
+    private suspend fun replaceCanonicalItemSensitivity(
+        configuration: AuthenticatedApiConfiguration,
+        item: CanonicalItemSnapshot,
+        targetIsSensitive: Boolean,
+    ): PendingMutationResolution {
+        val current = plannerStore.state.value
+        if (
+            current.canonicalItems.firstOrNull { it.id == item.id } != item ||
+            current.canonicalSyncOrigin != configuration.baseUrl.toString() ||
+            current.canonicalConfigurationId != configuration.configurationId
+        ) {
+            throw InvalidCanonicalTransitionException()
+        }
+        val replaceRequest = ReplaceCanonicalItemRequest(
+            expectedRevision = item.revision,
+            item = canonicalReplacement(
+                item = item,
+                targetStatus = item.status,
+                targetIsSensitive = targetIsSensitive,
+                earliestStartAt = item.earliestStartAt,
+            ),
+        )
+        val pending = PendingCanonicalMutation(
+            idempotencyKey = UUID.randomUUID().toString(),
+            syncOrigin = configuration.baseUrl.toString(),
+            configurationId = configuration.configurationId,
+            itemId = item.id,
+            expectedRevision = item.revision,
+            targetStatus = item.status,
+            targetIsSensitive = targetIsSensitive,
+            startedAt = now().toString(),
+            replacementRequestJson = mutationJson.encodeToString(replaceRequest),
+            // Sensitivity writes can target an unscheduled parent. The canonical UUID is a stable
+            // non-secret sentinel; sensitivity reconciliation never treats it as a block ID.
+            focusedBlockId = item.id,
+            displayStatus = mapItemStatus(item.status),
+        )
+        val pendingReceipt = plannerStore.stageCanonicalMutation(pending)
+        if (pendingReceipt == null || !pendingReceipt.awaitDurable()) {
+            throw LocalPlannerStorageException()
+        }
+        return sendAndReconcileCanonicalMutation(
+            configuration = configuration,
+            pending = pending,
+            previous = item,
+            request = replaceRequest,
+            reconcileConflict = true,
+        )
+    }
+
+    private fun canonicalReplacement(
+        item: CanonicalItemSnapshot,
+        targetStatus: String,
+        targetIsSensitive: Boolean,
+        earliestStartAt: String?,
+    ) = CanonicalItemReplacement(
+        isSensitive = targetIsSensitive,
+        kind = item.kind,
+        status = targetStatus,
+        title = item.title,
+        notes = item.notes,
+        timezoneName = item.timezoneName,
+        durationSeconds = item.durationSeconds,
+        deadlineAt = item.deadlineAt,
+        earliestStartAt = earliestStartAt,
+        recurrence = item.recurrenceJson?.let(::parseJsonObject),
+        flexibleConstraints = parseJsonObject(item.flexibleConstraintsJson),
+        splitPolicy = parseJsonObject(item.splitPolicyJson),
+        importance = item.importance,
+        urgency = item.urgency,
+        parentId = item.parentId,
+        siblingOrder = item.siblingOrder,
+    )
 
     /**
      * Projects one confirmed terminal execution onto an eligible one-shot parent item.
@@ -1114,6 +1283,7 @@ class CanonicalSyncManager(
         if (
             request.expectedRevision != pending.expectedRevision ||
             request.item.status != pending.targetStatus ||
+            request.item.isSensitive != pending.targetIsSensitive ||
             previous.revision != pending.expectedRevision
         ) {
             throw RemotePlannerMappingException()
@@ -1192,6 +1362,7 @@ class CanonicalSyncManager(
         ensureConfigurationCurrent(configuration)
         if (
             response.id != pending.itemId || response.status != pending.targetStatus ||
+            response.isSensitive != pending.targetIsSensitive ||
             response.revision != pending.expectedRevision + 1
         ) {
             throw RemotePlannerMappingException()
@@ -1200,13 +1371,7 @@ class CanonicalSyncManager(
         if (!matchesReplacement(mapped, previous, request.item)) {
             throw RemotePlannerMappingException()
         }
-        val receipt = plannerStore.reconcileCanonicalItem(
-            item = mapped,
-            focusedBlockId = pending.focusedBlockId,
-            displayStatus = pending.displayStatus,
-            pauseLabel = pending.pauseLabel,
-            pauseMinutes = pending.pauseMinutes,
-        )
+        val receipt = reconcileCanonicalMutation(mapped, pending, previous)
         if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
         return PendingMutationResolution.APPLIED
     }
@@ -1244,15 +1409,10 @@ class CanonicalSyncManager(
             if (
                 authoritative.revision > pending.expectedRevision &&
                 authoritative.status == pending.targetStatus &&
+                authoritative.isSensitive == pending.targetIsSensitive &&
                 matchesReplacement(authoritative, previous, request.item)
             ) {
-                val receipt = plannerStore.reconcileCanonicalItem(
-                    item = authoritative,
-                    focusedBlockId = pending.focusedBlockId,
-                    displayStatus = pending.displayStatus,
-                    pauseLabel = pending.pauseLabel,
-                    pauseMinutes = pending.pauseMinutes,
-                )
+                val receipt = reconcileCanonicalMutation(authoritative, pending, previous)
                 if (receipt == null || !receipt.awaitDurable()) {
                     throw LocalPlannerStorageException()
                 }
@@ -1272,15 +1432,10 @@ class CanonicalSyncManager(
         }
         if (
             authoritative.revision > pending.expectedRevision &&
-            authoritative.status == pending.targetStatus
+            authoritative.status == pending.targetStatus &&
+            authoritative.isSensitive == pending.targetIsSensitive
         ) {
-            val receipt = plannerStore.reconcileCanonicalItem(
-                item = authoritative,
-                focusedBlockId = pending.focusedBlockId,
-                displayStatus = pending.displayStatus,
-                pauseLabel = pending.pauseLabel,
-                pauseMinutes = pending.pauseMinutes,
-            )
+            val receipt = reconcileCanonicalMutation(authoritative, pending, previous)
             if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
             return PendingMutationResolution.APPLIED
         }
@@ -1312,15 +1467,10 @@ class CanonicalSyncManager(
         }
         if (
             authoritative != null && authoritative.status == pending.targetStatus &&
+            authoritative.isSensitive == pending.targetIsSensitive &&
             matchesReplacement(authoritative, previous, request.item)
         ) {
-            val receipt = plannerStore.reconcileCanonicalItem(
-                item = authoritative,
-                focusedBlockId = pending.focusedBlockId,
-                displayStatus = pending.displayStatus,
-                pauseLabel = pending.pauseLabel,
-                pauseMinutes = pending.pauseMinutes,
-            )
+            val receipt = reconcileCanonicalMutation(authoritative, pending, previous)
             if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
             return PendingMutationResolution.APPLIED
         }
@@ -1331,6 +1481,22 @@ class CanonicalSyncManager(
         )
         if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
         return PendingMutationResolution.SUPERSEDED
+    }
+
+    private fun reconcileCanonicalMutation(
+        item: CanonicalItemSnapshot,
+        pending: PendingCanonicalMutation,
+        previous: CanonicalItemSnapshot,
+    ) = if (pending.targetIsSensitive != previous.isSensitive) {
+        plannerStore.reconcileCanonicalItemSensitivity(item)
+    } else {
+        plannerStore.reconcileCanonicalItem(
+            item = item,
+            focusedBlockId = pending.focusedBlockId,
+            displayStatus = pending.displayStatus,
+            pauseLabel = pending.pauseLabel,
+            pauseMinutes = pending.pauseMinutes,
+        )
     }
 
     private fun matchesReplacement(

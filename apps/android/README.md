@@ -12,6 +12,31 @@ While the UI is visible, one lifecycle-bound job refreshes the execution lease i
 
 The Suggestions tab connects to the existing `/v1/suggestions` API with OkHttp and a bearer token. The token is separately AES-GCM wrapped with its own non-exportable Android Keystore key and is never placed in the Room planner snapshot or application logs. The connection preference and both encrypted databases are excluded from backup and device transfer.
 
+## Sensitive-item authoring
+
+Quick capture has an explicit **Sensitive** switch, and captured drafts retain that classification
+inside the encrypted planner snapshot. Sensitive drafts and composed blocks have visible privacy
+indicators. For canonical items, **More → Appearance & privacy → Sensitive items** shows both the
+item's own setting and effective protection inherited from any ancestor. Unscheduled goals and
+other non-executable parents are included, so protecting a parent immediately protects every
+cached descendant block without changing its placement.
+
+Canonical privacy changes use a complete item replacement guarded by the current server revision.
+Android durably journals the exact body, idempotency key, status, and target sensitivity before the
+request leaves the device. A lost response is replayed byte-for-byte; a newer conflicting revision
+is shown for review and is never silently rebased into a declassification. Removing an own
+sensitive label requires confirmation bound to the exact reviewed revision, and the dialog
+explicitly says when parent protection will continue to apply. A pending promotion immediately
+hardens the target and every cached descendant because its response may already have committed;
+a pending removal never lowers local protection. The Room 4-to-5 and JSON-v3-to-v4 migration
+preserves the old strict sensitivity
+contract, adds explicit draft/write-target fields, and derives any in-flight target only from its
+already-journaled replacement body.
+
+This authoring surface does not itself grant disclosure. Sensitive values remain excluded by
+default from assistant/MCP and future locked notification, widget, indexing, attachment, and export
+surfaces; those surfaces require their own tested policy gate before they can be enabled.
+
 ## Build
 
 Requirements:

@@ -16,6 +16,7 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.GppGood
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.KeyOff
+import androidx.compose.material.icons.outlined.PrivacyTip
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
@@ -148,11 +149,25 @@ private fun CapturedList(items: List<InboxItem>, modifier: Modifier = Modifier) 
                         }
                     }
                     if (item.requiresReview) {
-                        Text(
-                            "REVIEW",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
+                        Column(horizontalAlignment = Alignment.End) {
+                            if (item.isSensitive) {
+                                Icon(
+                                    Icons.Outlined.PrivacyTip,
+                                    contentDescription = "Sensitive draft",
+                                    tint = MaterialTheme.colorScheme.tertiary,
+                                )
+                                Text(
+                                    "SENSITIVE",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary,
+                                )
+                            }
+                            Text(
+                                "REVIEW",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                        }
                     }
                 }
             }

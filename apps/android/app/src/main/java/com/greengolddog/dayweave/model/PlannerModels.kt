@@ -185,6 +185,27 @@ data class CanonicalItemSnapshot(
     val deletedAt: String? = null,
 )
 
+/** Resolves ancestor privacy and fails closed when a cached hierarchy is incomplete or cyclic. */
+fun effectiveCanonicalSensitivity(
+    items: List<CanonicalItemSnapshot>,
+    itemId: String,
+    pendingMutation: PendingCanonicalMutation? = null,
+): Boolean {
+    val byId = items.associateBy(CanonicalItemSnapshot::id)
+    val visited = mutableSetOf<String>()
+    var currentId: String? = itemId
+    var sensitive = false
+    while (currentId != null) {
+        if (!visited.add(currentId)) return true
+        val item = byId[currentId] ?: return true
+        sensitive = sensitive || item.isSensitive || (
+            pendingMutation?.itemId == item.id && pendingMutation.targetIsSensitive
+            )
+        currentId = item.parentId
+    }
+    return sensitive
+}
+
 @Serializable
 data class RecurrenceOutcomeSnapshot(
     val itemId: String,
@@ -216,6 +237,8 @@ data class PendingCanonicalMutation(
     val itemId: String,
     val expectedRevision: Long,
     val targetStatus: String,
+    /** Exact own-sensitivity value carried by the durably journaled replacement body. */
+    val targetIsSensitive: Boolean = false,
     val startedAt: String,
     val replacementRequestJson: String,
     val focusedBlockId: String,
@@ -397,6 +420,8 @@ enum class InboxSource(val label: String) {
 @Serializable
 data class InboxItem(
     val id: String,
+    /** Local draft sensitivity; inherited sensitivity starts once the draft becomes canonical. */
+    val isSensitive: Boolean = false,
     val title: String,
     val source: InboxSource,
     val detail: String = "",
@@ -701,6 +726,25 @@ data class DayWeaveUiState(
             dayScore = 82,
         )
     }
+}
+
+/**
+ * A durable pending promotion may already have committed remotely. Its target and descendants
+ * therefore become locally sensitive as soon as the fence exists and remain so after restart.
+ * Pending declassification never lowers the confirmed classification.
+ */
+fun DayWeaveUiState.withPendingSensitivityHardened(): DayWeaveUiState {
+    val pending = pendingCanonicalMutation?.takeIf(PendingCanonicalMutation::targetIsSensitive)
+        ?: return this
+    var changed = false
+    val hardenedSchedule = schedule.map { block ->
+        val canonicalId = block.canonicalItemId ?: return@map block
+        val mustProtect = effectiveCanonicalSensitivity(canonicalItems, canonicalId, pending)
+        if (!mustProtect || block.isSensitive) return@map block
+        changed = true
+        block.copy(isSensitive = true)
+    }
+    return if (changed) copy(schedule = hardenedSchedule) else this
 }
 
 private fun EnergyLevel.rank(): Int = when (this) {

@@ -4,6 +4,8 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.InboxItem
+import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ScheduleItem
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
@@ -15,7 +17,7 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV3() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV4() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -30,7 +32,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V3, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -52,6 +54,14 @@ class PlannerStateRepositoryTest {
                 ),
             ),
             canonicalItems = listOf(sensitiveCanonicalItem()),
+            inbox = listOf(
+                InboxItem(
+                    id = "SYNTHETIC-SENSITIVE-INBOX-ANDROID",
+                    isSensitive = true,
+                    title = "SYNTHETIC-SENSITIVE-INBOX-TITLE",
+                    source = InboxSource.QUICK_CAPTURE,
+                ),
+            ),
         )
 
         repository.save(state)
@@ -59,18 +69,19 @@ class PlannerStateRepositoryTest {
 
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V3, dao.snapshot?.payloadFormat)
+        assertTrue(restored.inbox.single().isSensitive)
+        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
     @Test
-    fun currentV3PayloadMissingSensitivityFailsClosed() {
+    fun currentV4PayloadMissingSensitivityFailsClosed() {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = LEGACY_V2_PAYLOAD,
                 updatedAtEpochMillis = 17,
-                payloadFormat = PlannerSnapshotFormats.JSON_V3,
+                payloadFormat = PlannerSnapshotFormats.JSON_V4,
             ),
         )
         val repository = RoomPlannerStateRepository(dao)
@@ -78,8 +89,118 @@ class PlannerStateRepositoryTest {
         assertThrows(SerializationException::class.java) {
             runBlocking { repository.load() }
         }
-        assertEquals(PlannerSnapshotFormats.JSON_V3, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
         assertEquals(17L, dao.snapshot?.updatedAtEpochMillis)
+    }
+
+    @Test
+    fun legacyV3StillRejectsMissingPreviouslyRequiredSensitivity() {
+        val dao = FakePlannerSnapshotDao(
+            PlannerSnapshotEntity(
+                singletonId = 1,
+                payload = LEGACY_V2_PAYLOAD,
+                updatedAtEpochMillis = 18,
+                payloadFormat = PlannerSnapshotFormats.JSON_V3,
+            ),
+        )
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { RoomPlannerStateRepository(dao).load() }
+        }
+        assertEquals(PlannerSnapshotFormats.JSON_V3, dao.snapshot?.payloadFormat)
+        assertEquals(18L, dao.snapshot?.updatedAtEpochMillis)
+    }
+
+    @Test
+    fun legacyV3DerivesPendingSensitivityFromExactReplacementBody() = runBlocking {
+        val dao = FakePlannerSnapshotDao(
+            PlannerSnapshotEntity(
+                singletonId = 1,
+                payload = LEGACY_V3_PENDING_PAYLOAD,
+                updatedAtEpochMillis = 19,
+                payloadFormat = PlannerSnapshotFormats.JSON_V3,
+            ),
+        )
+        val repository = RoomPlannerStateRepository(dao) { 23 }
+
+        val restored = requireNotNull(repository.load())
+
+        assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
+        assertFalse(restored.inbox.single().isSensitive)
+        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
+        assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
+    }
+
+    @Test
+    fun legacyV2PendingJournalWithoutPreexistingSensitivityMigratesExplicitlyFalse() = runBlocking {
+        val preSensitivityPayload = LEGACY_V3_PENDING_PAYLOAD
+            .replace("\"isSensitive\": true", "\"isSensitive\": false")
+            .replace(",\\\"is_sensitive\\\":true", "")
+        val dao = FakePlannerSnapshotDao(
+            PlannerSnapshotEntity(
+                singletonId = 1,
+                payload = preSensitivityPayload,
+                updatedAtEpochMillis = 24,
+                payloadFormat = PlannerSnapshotFormats.JSON_V2,
+            ),
+        )
+        val repository = RoomPlannerStateRepository(dao) { 25 }
+
+        val restored = requireNotNull(repository.load())
+
+        assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
+        assertEquals(PlannerSnapshotFormats.JSON_V4, dao.snapshot?.payloadFormat)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
+    }
+
+    @Test
+    fun currentV4PendingMutationMissingSensitivityTargetFailsClosed() {
+        val currentPayload = LEGACY_V3_PENDING_PAYLOAD.replace(
+            "\"source\": \"QUICK_CAPTURE\"",
+            "\"source\": \"QUICK_CAPTURE\", \"isSensitive\": false",
+        )
+        val dao = FakePlannerSnapshotDao(
+            PlannerSnapshotEntity(
+                singletonId = 1,
+                payload = currentPayload,
+                updatedAtEpochMillis = 29,
+                payloadFormat = PlannerSnapshotFormats.JSON_V4,
+            ),
+        )
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { RoomPlannerStateRepository(dao).load() }
+        }
+        assertEquals(29L, dao.snapshot?.updatedAtEpochMillis)
+    }
+
+    @Test
+    fun currentV4RejectsSensitivityTargetThatDisagreesWithWireJournal() {
+        val currentPayload = LEGACY_V3_PENDING_PAYLOAD
+            .replace(
+                "\"source\": \"QUICK_CAPTURE\"",
+                "\"source\": \"QUICK_CAPTURE\", \"isSensitive\": false",
+            )
+            .replace(
+                "\"targetStatus\": \"planned\",",
+                "\"targetStatus\": \"planned\", \"targetIsSensitive\": false,",
+            )
+        val dao = FakePlannerSnapshotDao(
+            PlannerSnapshotEntity(
+                singletonId = 1,
+                payload = currentPayload,
+                updatedAtEpochMillis = 31,
+                payloadFormat = PlannerSnapshotFormats.JSON_V4,
+            ),
+        )
+
+        val failure = assertThrows(SerializationException::class.java) {
+            runBlocking { RoomPlannerStateRepository(dao).load() }
+        }
+        assertTrue(requireNotNull(failure.message).contains("does not match its exact replacement"))
+        assertEquals(31L, dao.snapshot?.updatedAtEpochMillis)
     }
 
     private fun sensitiveCanonicalItem() = CanonicalItemSnapshot(
@@ -139,6 +260,47 @@ class PlannerStateRepositoryTest {
                 "createdAt": "2026-08-29T08:00:00Z",
                 "updatedAt": "2026-08-29T08:00:00Z"
               }]
+            }
+        """
+
+        const val LEGACY_V3_PENDING_PAYLOAD = """
+            {
+              "schedule": [],
+              "canonicalItems": [{
+                "id": "11111111-1111-4111-8111-111111111111",
+                "isSensitive": true,
+                "kind": "task",
+                "status": "planned",
+                "title": "SYNTHETIC-LEGACY-PENDING-CANONICAL",
+                "timezoneName": "UTC",
+                "durationSeconds": 1800,
+                "flexibleConstraintsJson": "{}",
+                "splitPolicyJson": "{\"type\":\"indivisible\"}",
+                "importance": 50,
+                "urgency": 50,
+                "siblingOrder": 0,
+                "isExecutable": true,
+                "revision": 1,
+                "createdAt": "2026-08-29T08:00:00Z",
+                "updatedAt": "2026-08-29T08:00:00Z"
+              }],
+              "inbox": [{
+                "id": "SYNTHETIC-LEGACY-INBOX",
+                "title": "SYNTHETIC-LEGACY-INBOX-TITLE",
+                "source": "QUICK_CAPTURE"
+              }],
+              "pendingCanonicalMutation": {
+                "idempotencyKey": "22222222-2222-4222-8222-222222222222",
+                "syncOrigin": "https://api.example.test/",
+                "configurationId": "SYNTHETIC-CONNECTION",
+                "itemId": "11111111-1111-4111-8111-111111111111",
+                "expectedRevision": 1,
+                "targetStatus": "planned",
+                "startedAt": "2026-08-29T08:01:00Z",
+                "replacementRequestJson": "{\"expected_revision\":1,\"item\":{\"status\":\"planned\",\"is_sensitive\":true}}",
+                "focusedBlockId": "11111111-1111-4111-8111-111111111111",
+                "displayStatus": "SCHEDULED"
+              }
             }
         """
     }

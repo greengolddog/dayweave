@@ -134,7 +134,15 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             localAction = plannerStore::doActiveLater,
         )
     }
-    fun quickCapture(title: String, kind: ItemKind): Boolean = plannerStore.quickCapture(title, kind)
+    fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean): Boolean =
+        plannerStore.quickCapture(title, kind, isSensitive)
+
+    fun setCanonicalItemSensitive(itemId: String, expectedRevision: Long, isSensitive: Boolean) {
+        if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
+        dayWeaveApplication.launchCanonicalAction {
+            canonicalSyncManager.setItemSensitivity(itemId, expectedRevision, isSensitive)
+        }
+    }
     fun approveSuggestion(id: String) {
         viewModelScope.launch { suggestionSyncManager.accept(id) }
     }

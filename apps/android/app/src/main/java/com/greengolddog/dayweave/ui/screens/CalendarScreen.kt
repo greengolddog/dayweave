@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.PrivacyTip
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -131,6 +132,14 @@ fun CalendarScreen(
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,
                             )
+                            if (item.isSensitive) {
+                                Icon(
+                                    Icons.Outlined.PrivacyTip,
+                                    contentDescription = "Sensitive item",
+                                    modifier = Modifier.size(16.dp),
+                                    tint = MaterialTheme.colorScheme.tertiary,
+                                )
+                            }
                         }
                     }
                 }

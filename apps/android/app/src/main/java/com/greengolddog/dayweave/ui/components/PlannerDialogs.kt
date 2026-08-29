@@ -20,6 +20,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -28,6 +29,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -38,10 +40,11 @@ import com.greengolddog.dayweave.model.PlanningSuggestion
 @Composable
 fun QuickCaptureSheet(
     onDismiss: () -> Unit,
-    onCapture: (String, ItemKind) -> Boolean,
+    onCapture: (String, ItemKind, Boolean) -> Boolean,
 ) {
     var title by remember { mutableStateOf("") }
     var kind by remember { mutableStateOf(ItemKind.TASK) }
+    var isSensitive by remember { mutableStateOf(false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -77,8 +80,26 @@ fun QuickCaptureSheet(
                     )
                 }
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Sensitive", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "Keep this draft classified for privacy controls while you clarify it.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Switch(
+                    checked = isSensitive,
+                    onCheckedChange = { isSensitive = it },
+                    modifier = Modifier.testTag("quick_capture_sensitive_toggle"),
+                )
+            }
             Button(
-                onClick = { if (onCapture(title, kind)) onDismiss() },
+                onClick = { if (onCapture(title, kind, isSensitive)) onDismiss() },
                 enabled = title.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {

@@ -26,6 +26,8 @@ import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import java.time.Instant
 import java.time.ZoneId
 import java.util.ArrayDeque
@@ -71,7 +73,7 @@ class PlannerStore(
     private val onPersistenceError: (Throwable) -> Unit = {},
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) {
-    private val mutableState = MutableStateFlow(initialState)
+    private val mutableState = MutableStateFlow(initialState.withPendingSensitivityHardened())
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
     private val mutableLoadState = MutableStateFlow(
         if (repository == null) PlannerLoadState.READY else PlannerLoadState.LOADING,
@@ -240,7 +242,7 @@ class PlannerStore(
         return active.isPaused && nowEpochMillis() >= deadline
     }
 
-    fun quickCapture(title: String, kind: ItemKind): Boolean {
+    fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean = false): Boolean {
         val trimmed = title.trim()
         if (trimmed.isEmpty()) return false
         val captureId = UUID.randomUUID().toString()
@@ -250,6 +252,7 @@ class PlannerStore(
                 inbox = listOf(
                     InboxItem(
                         id = captureId,
+                        isSensitive = isSensitive,
                         title = trimmed,
                         source = InboxSource.QUICK_CAPTURE,
                         detail = "${kind.label} · needs duration and constraints",
@@ -619,6 +622,18 @@ class PlannerStore(
         require(mutation.replacementRequestJson.isNotBlank())
         require(UUID.fromString(mutation.focusedBlockId).toString() == mutation.focusedBlockId)
         require(mutation.pauseMinutes == null || mutation.pauseMinutes in 1..24 * 60)
+        val cachedItem = current.canonicalItems.firstOrNull { it.id == mutation.itemId }
+            ?: throw IllegalArgumentException("Canonical item is not cached")
+        require(cachedItem.revision == mutation.expectedRevision)
+        if (cachedItem.isSensitive != mutation.targetIsSensitive) {
+            require(
+                mutation.targetStatus == cachedItem.status &&
+                    mutation.focusedBlockId == mutation.itemId &&
+                    mutation.pauseLabel == null &&
+                    mutation.pauseMinutes == null &&
+                    mutation.terminalExecutionSessionId == null
+            ) { "Sensitivity replacement must not change execution state" }
+        }
         mutation.terminalExecutionSessionId?.let { sessionId ->
             require(UUID.fromString(sessionId).toString() == sessionId)
             val outcome = current.terminalExecutionOutcomes[sessionId]
@@ -1471,7 +1486,8 @@ class PlannerStore(
             require(
                 pending.itemId == item.id &&
                     pending.expectedRevision < item.revision &&
-                    pending.targetStatus == item.status,
+                    pending.targetStatus == item.status &&
+                    pending.targetIsSensitive == item.isSensitive,
             ) { "Canonical mutation response does not match the durable uncertainty fence" }
         }
         val terminalExecutionOutcomes = pendingMutation?.terminalExecutionSessionId?.let { sessionId ->
@@ -1524,6 +1540,62 @@ class PlannerStore(
                 ItemStatus.SKIPPED -> "Skipped · canonical state synced"
                 ItemStatus.SCHEDULED -> "Will do later · canonical constraint synced"
                 else -> "Canonical item state synced"
+            },
+        )
+    }
+
+    /**
+     * Durably applies only an acknowledged own-sensitivity replacement. Placement and execution
+     * state stay intact; effective sensitivity is recomputed for every scheduled descendant so an
+     * ancestor promotion cannot briefly expose a child through the local cache.
+     */
+    fun reconcileCanonicalItemSensitivity(
+        item: CanonicalItemSnapshot,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val pending = current.pendingCanonicalMutation
+            ?: throw IllegalArgumentException("No canonical mutation is pending")
+        val previous = current.canonicalItems.firstOrNull { it.id == item.id }
+            ?: throw IllegalArgumentException("Canonical item is not cached")
+        require(
+            pending.itemId == item.id &&
+                pending.expectedRevision == previous.revision &&
+                item.revision > previous.revision &&
+                pending.targetStatus == item.status &&
+                pending.targetIsSensitive == item.isSensitive &&
+                previous.status == item.status &&
+                previous.isSensitive != item.isSensitive &&
+                pending.terminalExecutionSessionId == null &&
+                item.deletedAt == null
+        ) { "Sensitivity response does not match the durable uncertainty fence" }
+
+        val updatedItems = current.canonicalItems.map { existing ->
+            if (existing.id == item.id) item else existing
+        }
+        val updatedSchedule = current.schedule.map { block ->
+            val canonicalId = block.canonicalItemId ?: return@map block
+            block.copy(
+                isSensitive = effectiveSensitivity(updatedItems, canonicalId),
+                canonicalRevision = if (canonicalId == item.id) {
+                    item.revision
+                } else {
+                    block.canonicalRevision
+                },
+            )
+        }
+        current.copy(
+            canonicalItems = updatedItems,
+            schedule = updatedSchedule,
+            scheduleInputDigest = null,
+            pendingCanonicalMutation = null,
+            scheduleMessage = if (item.isSensitive) {
+                "Marked sensitive · descendants now inherit this protection"
+            } else if (item.parentId?.let { parentId ->
+                    effectiveSensitivity(updatedItems, parentId)
+                } == true
+            ) {
+                "Own sensitive label removed · parent protection still applies"
+            } else {
+                "Sensitive label removed after confirmation"
             },
         )
     }
@@ -2073,7 +2145,11 @@ class PlannerStore(
         return ScheduleItem(
             id = session.id,
             isSensitive = item?.let { canonical ->
-                effectiveSensitivity(state.canonicalItems, canonical.id)
+                effectiveCanonicalSensitivity(
+                    state.canonicalItems,
+                    canonical.id,
+                    state.pendingCanonicalMutation,
+                )
             } ?: true,
             title = item?.title ?: "Remote focus session",
             kind = kind,
@@ -2237,7 +2313,7 @@ class PlannerStore(
         ) {
             return@synchronized null
         }
-        val snapshot = transform(mutableState.value)
+        val snapshot = transform(mutableState.value).withPendingSensitivityHardened()
         mutableState.value = snapshot
         currentGeneration += 1
 
@@ -2283,7 +2359,7 @@ class PlannerStore(
 
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
-            val snapshot = persistedState ?: initialState
+            val snapshot = (persistedState ?: initialState).withPendingSensitivityHardened()
             mutableState.value = snapshot
             currentGeneration += 1
             persistenceStatus = PersistenceStatus.READY
@@ -2408,19 +2484,8 @@ class PlannerStore(
         }
 
         /** Resolves inherited sensitivity and fails closed on a missing or cyclic ancestor. */
-        fun effectiveSensitivity(items: List<CanonicalItemSnapshot>, itemId: String): Boolean {
-            val byId = items.associateBy(CanonicalItemSnapshot::id)
-            val visited = mutableSetOf<String>()
-            var currentId: String? = itemId
-            var sensitive = false
-            while (currentId != null) {
-                if (!visited.add(currentId)) return true
-                val item = byId[currentId] ?: return true
-                sensitive = sensitive || item.isSensitive
-                currentId = item.parentId
-            }
-            return sensitive
-        }
+        fun effectiveSensitivity(items: List<CanonicalItemSnapshot>, itemId: String): Boolean =
+            effectiveCanonicalSensitivity(items, itemId)
 
         fun missingAcceptedDrafts(
             existing: List<InboxItem>,

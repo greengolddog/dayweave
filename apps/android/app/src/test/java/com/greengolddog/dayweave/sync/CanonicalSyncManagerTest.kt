@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -135,6 +136,181 @@ class CanonicalSyncManagerTest {
         assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.start(BLOCK_ID))
         assertTrue(requireNotNull(transport.replacementRequest).item.isSensitive)
         assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+    }
+
+    @Test
+    fun sensitivityAuthoringUsesFullRevisionGuardAndUpdatesCachedBlocks() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false, isSensitive = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                nextCursor = "sensitivity-authoring-cursor",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = false)
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        transport.replacementResult = initial.copy(
+            isSensitive = true,
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager.setItemSensitivity(TASK_ID, expectedRevision = 7, isSensitive = true),
+        )
+
+        val promotion = requireNotNull(transport.replacementRequest)
+        assertEquals(7L, promotion.expectedRevision)
+        assertEquals(initial.status, promotion.item.status)
+        assertTrue(promotion.item.isSensitive)
+        assertEquals(initial.title, promotion.item.title)
+        assertEquals(initial.flexibleConstraints, promotion.item.flexibleConstraints)
+        assertEquals(initial.splitPolicy, promotion.item.splitPolicy)
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
+        assertEquals(8L, plannerStore.state.value.schedule.single().canonicalRevision)
+        assertEquals(null, plannerStore.state.value.pendingCanonicalMutation)
+
+        transport.replacementResult = transport.replacementResult?.copy(
+            isSensitive = false,
+            revision = 9,
+            updatedAt = "2026-09-01T07:02:00Z",
+        )
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager.setItemSensitivity(TASK_ID, expectedRevision = 8, isSensitive = false),
+        )
+        assertFalse(requireNotNull(transport.replacementRequest).item.isSensitive)
+        assertFalse(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertFalse(plannerStore.state.value.schedule.single().isSensitive)
+    }
+
+    @Test
+    fun lostSensitivityResponseReplaysExactRequestAndNeverInventsLocalSuccess() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false, isSensitive = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                nextCursor = "sensitivity-lost-response-cursor",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = false)
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        transport.replacementError = IOException("synthetic response loss")
+
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager.setItemSensitivity(TASK_ID, expectedRevision = 7, isSensitive = true),
+        )
+        val pending = requireNotNull(plannerStore.state.value.pendingCanonicalMutation)
+        val exactBody = pending.replacementRequestJson
+        assertTrue(pending.targetIsSensitive)
+        assertFalse(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
+        assertTrue(
+            effectiveCanonicalSensitivity(
+                plannerStore.state.value.canonicalItems,
+                TASK_ID,
+                pending,
+            ),
+        )
+
+        val applied = initial.copy(
+            isSensitive = true,
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.replacementError = PlannerApiException.Conflict()
+        transport.queuedPages.getOrPut("sensitivity-lost-response-cursor", ::ArrayDeque).apply {
+            add(
+                RemoteItemDeltaPage(
+                    changes = listOf(RemoteItemDeltaChange(type = "upsert", item = applied)),
+                    nextCursor = "sensitivity-applied-cursor",
+                    hasMore = false,
+                ),
+            )
+            add(
+                RemoteItemDeltaPage(
+                    changes = listOf(RemoteItemDeltaChange(type = "upsert", item = applied)),
+                    nextCursor = "sensitivity-applied-cursor",
+                    hasMore = false,
+                ),
+            )
+        }
+        transport.previewResult = preview(isSensitive = true).copy(
+            sourceItemRevisions = mapOf(TASK_ID to 8L),
+        )
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertEquals(null, plannerStore.state.value.pendingCanonicalMutation)
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
+        assertTrue(transport.replacementIdempotencyKeys.size >= 2)
+        assertTrue(
+            transport.replacementIdempotencyKeys.all { it == pending.idempotencyKey },
+        )
+        assertEquals(transport.replacementRequests.first(), transport.replacementRequests.last())
+        assertEquals(exactBody, pending.replacementRequestJson)
+    }
+
+    @Test
+    fun ambiguousSensitivityRemovalNeverDeclassifiesBeforeConfirmation() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false, isSensitive = true)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                nextCursor = "sensitivity-removal-cursor",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = true)
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        transport.replacementError = IOException("synthetic removal response loss")
+
+        assertEquals(
+            CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager.setItemSensitivity(TASK_ID, expectedRevision = 7, isSensitive = false),
+        )
+
+        val pending = requireNotNull(plannerStore.state.value.pendingCanonicalMutation)
+        assertFalse(pending.targetIsSensitive)
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
+    }
+
+    @Test
+    fun staleReviewedRevisionCannotConstructSensitivityReplacement() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false, isSensitive = true)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                nextCursor = "sensitivity-reviewed-revision-cursor",
+                hasMore = false,
+            )
+            previewResult = preview(isSensitive = true)
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.setItemSensitivity(TASK_ID, expectedRevision = 6, isSensitive = false),
+        )
+        assertEquals(null, transport.replacementRequest)
+        assertEquals(null, plannerStore.state.value.pendingCanonicalMutation)
+        assertTrue(plannerStore.state.value.canonicalItems.single().isSensitive)
+        assertTrue(plannerStore.state.value.schedule.single().isSensitive)
     }
 
     @Test

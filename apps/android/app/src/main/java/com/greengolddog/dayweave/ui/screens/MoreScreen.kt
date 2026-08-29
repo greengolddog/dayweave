@@ -5,9 +5,11 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountCircle
@@ -18,8 +20,10 @@ import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.HealthAndSafety
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.PrivacyTip
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.Card
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
@@ -31,16 +35,24 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.health.EnergySignalPhase
 import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
@@ -79,8 +91,13 @@ fun MoreScreen(
     onSetAppLockTimeout: (AppLockTimeout) -> Unit,
     onLockNow: () -> Unit,
     onOpenDeviceSecuritySettings: () -> Unit,
+    canonicalPrivacyActionsEnabled: Boolean,
+    onSetCanonicalItemSensitive: (String, Long, Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    var pendingSensitivityRemoval by remember {
+        mutableStateOf<CanonicalItemSnapshot?>(null)
+    }
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
@@ -229,13 +246,18 @@ fun MoreScreen(
         }
 
         item {
-            Card {
-                SettingsInfo(
-                    Icons.Outlined.PrivacyTip,
-                    "Privacy & sensitive items",
-                    "AI access, notification detail, widgets, and MCP permissions",
-                )
-            }
+            SensitiveItemsCard(
+                items = state.canonicalItems,
+                pendingMutation = state.pendingCanonicalMutation,
+                actionsEnabled = canonicalPrivacyActionsEnabled,
+                onSetSensitive = { item, sensitive ->
+                    if (sensitive) {
+                        onSetCanonicalItemSensitive(item.id, item.revision, true)
+                    } else {
+                        pendingSensitivityRemoval = item
+                    }
+                },
+            )
         }
 
         item {
@@ -247,6 +269,182 @@ fun MoreScreen(
             )
         }
     }
+
+    pendingSensitivityRemoval?.let { item ->
+        val inherited = item.parentId?.let { parentId ->
+            effectiveCanonicalSensitivity(
+                state.canonicalItems,
+                parentId,
+                state.pendingCanonicalMutation,
+            )
+        } == true
+        AlertDialog(
+            onDismissRequest = { pendingSensitivityRemoval = null },
+            icon = { Icon(Icons.Outlined.PrivacyTip, contentDescription = null) },
+            title = {
+                Text(if (inherited) "Remove this item’s own label?" else "Make item standard?")
+            },
+            text = {
+                Text(
+                    if (inherited) {
+                        "This item will remain sensitive through its parent. Only its own label " +
+                            "will be removed."
+                    } else {
+                        "This reduces privacy protection for this item and descendants that do " +
+                            "not have another sensitive ancestor. The change is synced only " +
+                            "after server confirmation."
+                    },
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingSensitivityRemoval = null
+                        onSetCanonicalItemSensitive(item.id, item.revision, false)
+                    },
+                ) {
+                    Text(if (inherited) "Remove own label" else "Make standard")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingSensitivityRemoval = null }) { Text("Cancel") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun SensitiveItemsCard(
+    items: List<CanonicalItemSnapshot>,
+    pendingMutation: PendingCanonicalMutation?,
+    actionsEnabled: Boolean,
+    onSetSensitive: (CanonicalItemSnapshot, Boolean) -> Unit,
+) {
+    val activeItems = items.filter { it.deletedAt == null }
+    val effectiveCount = activeItems.count { item ->
+        effectiveCanonicalSensitivity(activeItems, item.id, pendingMutation)
+    }
+    Card(modifier = Modifier.fillMaxWidth().testTag("sensitive_items_card")) {
+        ListItem(
+            headlineContent = { Text("Sensitive items") },
+            supportingContent = {
+                Text(
+                    if (activeItems.isEmpty()) {
+                        "Connect and sync canonical items to manage their privacy."
+                    } else {
+                        "$effectiveCount of ${activeItems.size} protected. Children inherit every " +
+                            "sensitive parent."
+                    },
+                )
+            },
+            leadingContent = { Icon(Icons.Outlined.PrivacyTip, contentDescription = null) },
+        )
+        if (activeItems.isNotEmpty()) {
+            HorizontalDivider()
+            canonicalHierarchy(activeItems).forEach { entry ->
+                val effective = effectiveCanonicalSensitivity(
+                    activeItems,
+                    entry.item.id,
+                    pendingMutation,
+                )
+                val inherited = !entry.item.isSensitive && effective
+                val pendingPromotion = pendingMutation?.let { pending ->
+                    pending.itemId == entry.item.id && pending.targetIsSensitive &&
+                        !entry.item.isSensitive
+                } == true
+                val pendingRemoval = pendingMutation?.let { pending ->
+                    pending.itemId == entry.item.id && !pending.targetIsSensitive &&
+                        entry.item.isSensitive
+                } == true
+                ListItem(
+                    modifier = Modifier.testTag("sensitive_item_${entry.item.id}"),
+                    headlineContent = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (entry.depth > 0) {
+                                Spacer(Modifier.width((entry.depth.coerceAtMost(6) * 12).dp))
+                            }
+                            Text(entry.item.title, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    },
+                    supportingContent = {
+                        Text(
+                            when {
+                                pendingPromotion -> "Protection pending server confirmation"
+                                pendingRemoval ->
+                                    "Removal pending · protection remains until confirmation"
+                                entry.item.isSensitive -> "Marked sensitive · children inherit"
+                                inherited -> "Sensitive through parent"
+                                else -> "Standard privacy"
+                            },
+                        )
+                    },
+                    leadingContent = {
+                        Icon(
+                            if (effective) Icons.Outlined.Shield else Icons.Outlined.PrivacyTip,
+                            contentDescription = if (effective) "Sensitive" else "Standard privacy",
+                            tint = if (effective) {
+                                MaterialTheme.colorScheme.tertiary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    },
+                    trailingContent = {
+                        Switch(
+                            checked = entry.item.isSensitive || pendingPromotion,
+                            onCheckedChange = { onSetSensitive(entry.item, it) },
+                            enabled = actionsEnabled,
+                            modifier = Modifier.testTag("sensitive_toggle_${entry.item.id}"),
+                        )
+                    },
+                )
+            }
+        }
+        Text(
+            if (actionsEnabled) {
+                "Turning protection off always asks for confirmation."
+            } else {
+                "Privacy changes are available when canonical sync is ready and no write is pending."
+            },
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        )
+    }
+}
+
+private data class CanonicalHierarchyEntry(
+    val item: CanonicalItemSnapshot,
+    val depth: Int,
+)
+
+/** Stable server hierarchy order without using private titles as a sorting key. */
+private fun canonicalHierarchy(items: List<CanonicalItemSnapshot>): List<CanonicalHierarchyEntry> {
+    val byId = items.associateBy(CanonicalItemSnapshot::id)
+    val children = items.groupBy(CanonicalItemSnapshot::parentId)
+    val visited = mutableSetOf<String>()
+    val result = mutableListOf<CanonicalHierarchyEntry>()
+    val order = compareBy<CanonicalItemSnapshot>({ it.siblingOrder }, { it.id })
+
+    fun append(root: CanonicalItemSnapshot) {
+        val remaining = ArrayDeque<Pair<CanonicalItemSnapshot, Int>>()
+        remaining.addLast(root to 0)
+        while (remaining.isNotEmpty()) {
+            val (item, depth) = remaining.removeLast()
+            if (!visited.add(item.id)) continue
+            result += CanonicalHierarchyEntry(item, depth)
+            children[item.id].orEmpty().sortedWith(order).asReversed().forEach { child ->
+                remaining.addLast(child to depth + 1)
+            }
+        }
+    }
+
+    items.filter { it.parentId == null || it.parentId !in byId }
+        .sortedWith(order)
+        .forEach(::append)
+    // Invalid/cyclic cache entries remain visible for repair while effective sensitivity fails shut.
+    items.filterNot { it.id in visited }.sortedWith(order).forEach(::append)
+    return result
 }
 
 @Composable
