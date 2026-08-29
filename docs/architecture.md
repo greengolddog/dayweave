@@ -183,6 +183,10 @@ The Rust API service provides:
 
 Commands validate authorization and expected revision, write canonical rows and an append-only operation/audit record in one PostgreSQL transaction, and enqueue external effects through a transactional outbox.
 
+Canonical planner items are exposed under `/v1/items`. Clients generate item UUIDs offline and send an `Idempotency-Key` for every create, replace, delete, and restore command. Replacements carry an expected revision and replace the full mutable item contract. The repository commits the item or tombstone, hierarchy edge, idempotency result, audit operation, outbox message, and delta-stream record atomically. Parent changes are serialized per workspace and reject cycles; only leaves may enter executable states, while `sibling_order` gives every level deterministic ordering.
+
+`GET /v1/items/delta` returns ordered upserts and tombstones behind an opaque, versioned, integrity-checked cursor bound to the authenticated deployment workspace. Hierarchy edits also revision and emit affected parent snapshots so derived leaf executability converges without same-revision replacement. Clients persist the returned cursor only in the same local transaction that applies the page. No item command directly invokes Google or another provider; workers consume the transactional outbox separately.
+
 ### 7.2 Worker
 
 The worker leases transactional-outbox jobs and owns:

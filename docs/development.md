@@ -27,6 +27,13 @@ dependencies, configuration, secrets, and the built API container. Do not
 silence a finding without documenting why it cannot affect this deployment and
 what compensating control remains.
 
+The PostgreSQL repository tests create and drop isolated schemas when
+`DAYWEAVE_TEST_DATABASE_URL` is set. Without it they remain compiled and report
+an explicit skip. To exercise migrations, transactional item CRUD, workspace
+isolation, hierarchy cycle prevention, idempotency, audit/outbox writes, and
+delta tombstones locally, point the variable at a disposable PostgreSQL
+database before running `cargo test -p dayweave-api --test items_postgres`.
+
 Build the direct macOS bundle with:
 
 ```sh
