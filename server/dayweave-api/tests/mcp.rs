@@ -12,7 +12,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use dayweave_api::{
     AppState,
-    auth::{AuthenticationError, Authenticator, Principal, Scope, StaticTokenAuthenticator},
+    auth::{
+        AuthenticationError, Authenticator, Principal, PrincipalAudience, Scope,
+        StaticTokenAuthenticator,
+    },
     http::router,
     proposals::{
         Clock, InMemoryProposalRepository, ProposalQuery, ProposalRepository, ProposalService,
@@ -309,6 +312,8 @@ async fn modern_discovery_is_stateless_self_describing_and_proposal_only() {
         "mcp-test-request-id"
     );
     assert_eq!(headers.get("x-request-id").unwrap(), "mcp-test-request-id");
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store, max-age=0");
+    assert!(body["result"].get("securitySchemes").is_none());
     assert!(!headers.contains_key("mcp-session-id"));
 }
 
@@ -379,14 +384,13 @@ async fn transport_rejects_missing_auth_bad_origins_and_invalid_media_contracts(
     missing_auth.headers_mut().remove(header::AUTHORIZATION);
     let (status, headers, body) = send(&fixture.app, missing_auth).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert!(
-        headers
-            .get(header::WWW_AUTHENTICATE)
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .starts_with("Bearer")
-    );
+    let challenge = headers
+        .get(header::WWW_AUTHENTICATE)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(challenge.starts_with("Bearer realm=\"dayweave-native-mcp\""));
+    assert!(!challenge.contains("resource_metadata"));
     assert_eq!(body["error"]["code"], -33001);
 
     let mut bad_origin = modern_request("server/discover", json!(2), json!({}), None);
@@ -410,6 +414,63 @@ async fn transport_rejects_missing_auth_bad_origins_and_invalid_media_contracts(
     assert_eq!(
         send(&fixture.app, invalid_accept).await.0,
         StatusCode::NOT_ACCEPTABLE
+    );
+}
+
+#[tokio::test]
+async fn durable_mcp_origin_policy_is_the_intersection_and_device_audience_is_rejected() {
+    let denied = fixture_with_authenticator(Arc::new(ScopedAuthenticator {
+        token: TOKEN.to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        audience: PrincipalAudience::Mcp,
+        allowed_origins: vec!["https://different.example".to_owned()],
+    }));
+    let mut globally_allowed = modern_request("server/discover", json!(1), json!({}), None);
+    globally_allowed
+        .headers_mut()
+        .insert(header::ORIGIN, "https://chatgpt.com".parse().unwrap());
+    assert_eq!(
+        send(&denied.app, globally_allowed).await.0,
+        StatusCode::FORBIDDEN,
+        "global permission alone is insufficient for a durable MCP client"
+    );
+    assert_eq!(
+        send(
+            &denied.app,
+            modern_request("server/discover", json!(2), json!({}), None),
+        )
+        .await
+        .0,
+        StatusCode::OK,
+        "native clients without an Origin remain supported"
+    );
+
+    let allowed = fixture_with_authenticator(Arc::new(ScopedAuthenticator {
+        token: TOKEN.to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        audience: PrincipalAudience::Mcp,
+        allowed_origins: vec!["https://chatgpt.com".to_owned()],
+    }));
+    let mut intersected = modern_request("server/discover", json!(3), json!({}), None);
+    intersected
+        .headers_mut()
+        .insert(header::ORIGIN, "https://chatgpt.com".parse().unwrap());
+    assert_eq!(send(&allowed.app, intersected).await.0, StatusCode::OK);
+
+    let device = fixture_with_authenticator(Arc::new(ScopedAuthenticator {
+        token: TOKEN.to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        audience: PrincipalAudience::Device,
+        allowed_origins: Vec::new(),
+    }));
+    assert_eq!(
+        send(
+            &device.app,
+            modern_request("server/discover", json!(4), json!({}), None),
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
     );
 }
 
@@ -533,6 +594,8 @@ async fn tools_list_is_deterministic_schema_complete_and_scope_filtered() {
     let scoped = fixture_with_authenticator(Arc::new(ScopedAuthenticator {
         token: TOKEN.to_owned(),
         scopes: vec![Scope::ScheduleRead],
+        audience: PrincipalAudience::Legacy,
+        allowed_origins: Vec::new(),
     }));
     let (_, _, body) = send(
         &scoped.app,
@@ -901,6 +964,8 @@ async fn submit_requires_mirrored_idempotency_header_and_stale_simulation_is_act
 struct ScopedAuthenticator {
     token: String,
     scopes: Vec<Scope>,
+    audience: PrincipalAudience,
+    allowed_origins: Vec<String>,
 }
 
 #[async_trait]
@@ -912,6 +977,11 @@ impl Authenticator for ScopedAuthenticator {
         Ok(Principal {
             subject: "scoped-test-client".to_owned(),
             scopes: self.scopes.clone(),
+            audience: self.audience,
+            workspace_id: None,
+            user_id: None,
+            credential_id: None,
+            allowed_origins: self.allowed_origins.clone(),
         })
     }
 }

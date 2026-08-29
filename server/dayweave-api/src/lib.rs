@@ -24,8 +24,9 @@ pub mod scheduling;
 
 use std::sync::Arc;
 
-use auth::{Authenticator, StaticTokenAuthenticator};
-use config::Config;
+use auth::{Authenticator, RuntimeAuthenticator, StaticTokenAuthenticator};
+use config::{AuthMode, Config};
+use credential_auth::CredentialRepository;
 use dayweave_google::oauth::{OAuthClient, OAuthConfig};
 use execution::{ExecutionRepository, ExecutionService, InMemoryExecutionRepository};
 use google_oauth::{
@@ -36,8 +37,9 @@ use google_sync::{GoogleSyncRepository, GoogleSyncService, ProductionGoogleSyncP
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
 use persistence::{
-    Database, PersistenceError, PostgresExecutionRepository, PostgresGoogleOAuthRepository,
-    PostgresGoogleSyncRepository, PostgresItemRepository, PostgresProposalRepository,
+    Database, PersistenceError, PostgresCredentialRepository, PostgresExecutionRepository,
+    PostgresGoogleOAuthRepository, PostgresGoogleSyncRepository, PostgresItemRepository,
+    PostgresProposalRepository,
 };
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
@@ -55,6 +57,7 @@ type Repositories = (
     Arc<dyn ExecutionRepository>,
     Arc<dyn GoogleOAuthRepository>,
     Option<Arc<dyn GoogleSyncRepository>>,
+    Option<Arc<dyn CredentialRepository>>,
     OAuthScope,
     Readiness,
 );
@@ -83,6 +86,10 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             ))),
+            Some(Arc::new(PostgresCredentialRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            ))),
             OAuthScope {
                 workspace_id: database.scope().workspace_id,
                 user_id: database.scope().user_id,
@@ -100,6 +107,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         Arc::new(InMemoryExecutionRepository::default()),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
         None,
+        None,
         OAuthScope {
             workspace_id: Uuid::from_u128(2),
             user_id: Uuid::from_u128(1),
@@ -115,12 +123,14 @@ pub struct AppState {
     pub items: Arc<ItemService>,
     pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
+    pub credential_repository: Option<Arc<dyn CredentialRepository>>,
+    pub auth_mode: AuthMode,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
     pub google_oauth: Option<Arc<GoogleOAuthService>>,
     pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
     execution_repository: Arc<dyn ExecutionRepository>,
-    clock: Arc<dyn Clock>,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
 impl AppState {
@@ -133,6 +143,7 @@ impl AppState {
     ///
     /// Returns a redacted persistence error if the configured database cannot
     /// connect, migrate, or initialize its personal workspace scope.
+    #[allow(clippy::too_many_lines)] // Constructs and recovers the complete fail-closed dependency graph.
     pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
         let (
             repository,
@@ -140,6 +151,7 @@ impl AppState {
             execution_repository,
             google_oauth_repository,
             google_sync_repository,
+            credential_repository,
             oauth_scope,
             readiness,
         ): Repositories = repositories(config).await?;
@@ -155,9 +167,18 @@ impl AppState {
             items.clone(),
             clock.clone(),
         ));
-        let authenticator = Arc::new(StaticTokenAuthenticator::from_hashes(
-            config.api_token_hashes.clone(),
-        ));
+        let authenticator: Arc<dyn Authenticator> = match config.auth_mode {
+            AuthMode::LegacyStatic => Arc::new(StaticTokenAuthenticator::from_hashes(
+                config.api_token_hashes.clone(),
+            )),
+            AuthMode::Hybrid | AuthMode::CredentialOnly => Arc::new(RuntimeAuthenticator::new(
+                (config.auth_mode == AuthMode::Hybrid).then(|| config.api_token_hashes.clone()),
+                credential_repository
+                    .clone()
+                    .ok_or(PersistenceError::AuthenticationInitializationFailed)?,
+                clock.clone(),
+            )),
+        };
         let mcp = Arc::new(McpService::new(
             Arc::new(UnavailableScheduleQueryPort),
             Arc::new(UnavailableSimulationPort),
@@ -222,6 +243,8 @@ impl AppState {
             items,
             execution,
             authenticator,
+            credential_repository,
+            auth_mode: config.auth_mode,
             readiness,
             mcp,
             google_oauth,
@@ -260,6 +283,8 @@ impl AppState {
             items,
             execution,
             authenticator,
+            credential_repository: None,
+            auth_mode: AuthMode::LegacyStatic,
             readiness,
             mcp,
             google_oauth: None,
@@ -299,6 +324,19 @@ impl AppState {
     #[must_use]
     pub fn with_google_oauth(mut self, google_oauth: Arc<GoogleOAuthService>) -> Self {
         self.google_oauth = Some(google_oauth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_credential_auth(
+        mut self,
+        repository: Arc<dyn CredentialRepository>,
+        authenticator: Arc<dyn Authenticator>,
+        mode: AuthMode,
+    ) -> Self {
+        self.credential_repository = Some(repository);
+        self.authenticator = authenticator;
+        self.auth_mode = mode;
         self
     }
 }

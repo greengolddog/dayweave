@@ -92,6 +92,8 @@ pub enum PersistenceError {
     ScopeBootstrapFailed,
     #[error("external integration initialization failed")]
     IntegrationInitializationFailed,
+    #[error("authentication runtime initialization failed")]
+    AuthenticationInitializationFailed,
 }
 
 async fn bootstrap_personal_scope(

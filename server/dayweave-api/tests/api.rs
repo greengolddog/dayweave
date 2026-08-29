@@ -3,6 +3,7 @@ use std::{
     time::Duration,
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
@@ -11,7 +12,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use dayweave_api::{
     AppState,
-    auth::StaticTokenAuthenticator,
+    auth::{
+        AuthenticationError, Authenticator, Principal, PrincipalAudience, Scope,
+        StaticTokenAuthenticator,
+    },
     http::router,
     proposals::{Clock, InMemoryProposalRepository, ProposalRepository, ProposalService},
     readiness::Readiness,
@@ -54,6 +58,34 @@ fn test_app(ready: bool) -> (Router, TestClock) {
     readiness.set_ready(ready);
     let state = AppState::new(service, authenticator, readiness);
     (router(state), clock)
+}
+
+#[derive(Clone)]
+struct PrincipalAuthenticator(Principal);
+
+#[async_trait]
+impl Authenticator for PrincipalAuthenticator {
+    async fn authenticate(&self, token: &str) -> Result<Principal, AuthenticationError> {
+        if token == TOKEN {
+            Ok(self.0.clone())
+        } else {
+            Err(AuthenticationError::InvalidCredentials)
+        }
+    }
+}
+
+fn app_with_principal(principal: Principal) -> Router {
+    let repository: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
+    let service = Arc::new(ProposalService::new(
+        repository,
+        Arc::new(TestClock::new(Utc::now())),
+        Duration::from_hours(7 * 24),
+    ));
+    router(AppState::new(
+        service,
+        Arc::new(PrincipalAuthenticator(principal)),
+        Readiness::default(),
+    ))
 }
 
 fn request(method: &str, uri: &str, body: Option<Value>, authenticated: bool) -> Request<Body> {
@@ -181,6 +213,14 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
             .is_object()
     );
     assert!(document["components"]["securitySchemes"].is_object());
+    assert!(document["paths"]["/v1/auth/device-enrollments"]["post"].is_object());
+    assert!(document["paths"]["/v1/auth/device-enrollments/consume"]["post"].is_object());
+    assert!(document["paths"]["/v1/auth/sessions/refresh"]["post"].is_object());
+    assert!(document["paths"]["/v1/auth/sessions"]["get"].is_object());
+    assert!(document["paths"]["/v1/auth/sessions/{id}"]["delete"].is_object());
+    assert!(document["paths"]["/v1/auth/mcp-clients"]["post"].is_object());
+    assert!(document["paths"]["/v1/auth/mcp-clients"]["get"].is_object());
+    assert!(document["paths"]["/v1/auth/mcp-clients/{id}"]["delete"].is_object());
 }
 
 #[tokio::test]
@@ -202,6 +242,98 @@ async fn protected_routes_require_a_valid_bearer_token() {
         .unwrap();
     let wrong = app.oneshot(wrong).await.unwrap();
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn rest_scopes_and_credential_audiences_are_enforced_before_handlers() {
+    let device = Principal {
+        subject: "device-session:synthetic".to_owned(),
+        scopes: vec![Scope::ItemsRead],
+        audience: PrincipalAudience::Device,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+    let app = app_with_principal(device);
+    let read = app
+        .clone()
+        .oneshot(request("GET", "/v1/items", None, true))
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+    let write = app
+        .oneshot(request("POST", "/v1/items", Some(json!({})), true))
+        .await
+        .unwrap();
+    assert_eq!(write.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(write).await["error"]["code"], "forbidden");
+
+    let mcp = Principal {
+        subject: "mcp-client:synthetic".to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        audience: PrincipalAudience::Mcp,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+    let response = app_with_principal(mcp)
+        .oneshot(request("GET", "/v1/items", None, true))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn legacy_mode_does_not_activate_durable_issuance_and_auth_errors_are_no_store() {
+    let (app, _) = test_app(true);
+    let protected = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/auth/device-enrollments",
+            Some(json!({
+                "client_instance_id": "00000000-0000-4000-8000-000000000123",
+                "client_kind": "macos",
+                "device_label": "Synthetic Mac",
+                "client_version": "test-1"
+            })),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(protected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        protected.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+
+    let public = app
+        .oneshot(request(
+            "POST",
+            "/v1/auth/sessions/refresh",
+            Some(json!({
+                "next_access_token": "never-reflect-access",
+                "next_refresh_token": "never-reflect-refresh"
+            })),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(public.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(public.headers()[header::PRAGMA], "no-cache");
+    let body = String::from_utf8(
+        public
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!body.contains("never-reflect"));
 }
 
 #[tokio::test]

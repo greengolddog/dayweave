@@ -1,19 +1,32 @@
-use std::str::FromStr;
+use std::{str::FromStr, sync::Arc, time::Duration};
 
+use axum::{
+    body::Body,
+    http::{Request, Response, StatusCode, header},
+};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dayweave_api::{
-    auth::Scope,
+    AppState,
+    auth::{RuntimeAuthenticator, Scope, hash_token},
+    config::AuthMode,
     credential_auth::{
-        CredentialKind, CredentialRepository, CredentialRepositoryError, DeviceClientKind,
-        DeviceEnrollmentSpec, McpClientSpec, OpaqueCredential,
+        ACCESS_TOKEN_TTL, CredentialKind, CredentialRepository, CredentialRepositoryError,
+        DEVICE_SESSION_ABSOLUTE_TTL, DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind,
+        DeviceEnrollmentSpec, DeviceSession, McpClientSpec, OpaqueCredential,
     },
+    http::router,
     persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository},
+    proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock},
+    readiness::Readiness,
 };
+use http_body_util::BodyExt;
+use serde_json::{Value, json};
 use sqlx::{
     AssertSqlSafe, ConnectOptions, Executor, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tower::ServiceExt;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -41,6 +54,9 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
                 client_kind: DeviceClientKind::Macos,
                 device_label: "Personal Mac".to_owned(),
                 scopes: vec![Scope::ScheduleRead, Scope::SuggestionsWrite],
+                client_contract_version: 1,
+                client_version: "test-1".to_owned(),
+                client_capabilities: vec!["exact-replay".to_owned()],
                 created_at: now,
             },
             &enrollment,
@@ -98,17 +114,19 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
         Err(CredentialRepositoryError::InvalidInput),
         "one-time enrollment material cannot be reused for an issued credential"
     );
+    let first_session_id = Uuid::new_v4();
+    let second_session_id = Uuid::new_v4();
     let (first_consume, second_consume) = tokio::join!(
         repository.consume_device_enrollment(
             &enrollment,
-            Uuid::new_v4(),
+            first_session_id,
             &first_access,
             &first_refresh,
             now
         ),
         repository.consume_device_enrollment(
             &enrollment,
-            Uuid::new_v4(),
+            second_session_id,
             &second_access,
             &second_refresh,
             now
@@ -127,6 +145,36 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
         first_consume.unwrap_err()
     };
     assert_eq!(loser, CredentialRepositoryError::InvalidCredential);
+    let exact_consume_replay = if first_won {
+        repository
+            .consume_device_enrollment(
+                &enrollment,
+                first_session_id,
+                &first_access,
+                &first_refresh,
+                now + ChronoDuration::seconds(1),
+            )
+            .await
+    } else {
+        repository
+            .consume_device_enrollment(
+                &enrollment,
+                second_session_id,
+                &second_access,
+                &second_refresh,
+                now + ChronoDuration::seconds(1),
+            )
+            .await
+    }
+    .expect("the exact enrollment issue can be recovered after response loss");
+    assert!(exact_consume_replay.replayed);
+    assert_eq!(exact_consume_replay.id, session.id);
+    let listed_sessions = repository
+        .list_device_sessions(now + ChronoDuration::seconds(1))
+        .await
+        .expect("active sessions listed");
+    assert_eq!(listed_sessions.len(), 1);
+    assert_eq!(listed_sessions[0].id, session.id);
     assert_eq!(session.workspace_id, scope.workspace_id);
     assert_eq!(session.user_id, scope.user_id);
     assert_eq!(session.client_instance_id, client_instance_id);
@@ -312,17 +360,39 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
         .execute(pool)
         .await
         .expect("restore device label fixture");
-    assert_eq!(
+    let exact_refresh_replay = if first_rotation_won {
         repository
             .refresh_device_session(
                 active_refresh,
                 &rotated_access_one,
                 &rotated_refresh_one,
-                refresh_at
+                refresh_at + ChronoDuration::seconds(1),
             )
-            .await,
-        Err(CredentialRepositoryError::InvalidCredential),
-        "the old refresh token cannot be replayed"
+            .await
+    } else {
+        repository
+            .refresh_device_session(
+                active_refresh,
+                &rotated_access_two,
+                &rotated_refresh_two,
+                refresh_at + ChronoDuration::seconds(1),
+            )
+            .await
+    }
+    .expect("the exact refresh pair can be recovered after response loss");
+    assert!(exact_refresh_replay.replayed);
+    assert_eq!(exact_refresh_replay.id, session.id);
+    let refresh_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \
+         AND operation_type = 'auth.device_session.refreshed'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .expect("refresh audit count");
+    assert_eq!(
+        refresh_audits, 1,
+        "exact replay does not duplicate audit rows"
     );
 
     let (access_hash, refresh_hash): (Vec<u8>, Vec<u8>) = sqlx::query_as(
@@ -396,6 +466,9 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
                 client_kind: DeviceClientKind::Android,
                 device_label: "Personal Pixel".to_owned(),
                 scopes: vec![Scope::ScheduleRead],
+                client_contract_version: 1,
+                client_version: "test-1".to_owned(),
+                client_capabilities: Vec::new(),
                 created_at: now,
             },
             &expired_enrollment,
@@ -420,6 +493,265 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Each replay lifecycle fence needs an independent session.
+async fn exact_replay_ignores_only_access_expiry_and_keeps_lifecycle_fences() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-replay-boundaries", "auth-replay-boundaries").await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let now = Utc::now();
+
+    let enrollment_fixture =
+        issue_device_session(&repository, now, 100, "Enrollment replay boundaries").await;
+    let enrollment = OpaqueCredential::parse(
+        CredentialKind::Enrollment,
+        &enrollment_fixture.enrollment_raw,
+    )
+    .unwrap();
+    let initial_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &enrollment_fixture.access_raw)
+            .unwrap();
+    let initial_refresh = OpaqueCredential::parse(
+        CredentialKind::DeviceRefresh,
+        &enrollment_fixture.refresh_raw,
+    )
+    .unwrap();
+    let recovered_enrollment = repository
+        .consume_device_enrollment(
+            &enrollment,
+            enrollment_fixture.session.id,
+            &initial_access,
+            &initial_refresh,
+            enrollment_fixture.session.access_expires_at + ChronoDuration::seconds(1),
+        )
+        .await
+        .expect("exact enrollment replay survives access expiry");
+    assert!(recovered_enrollment.replayed);
+    assert_eq!(recovered_enrollment.id, enrollment_fixture.session.id);
+    assert_eq!(
+        repository
+            .consume_device_enrollment(
+                &enrollment,
+                Uuid::new_v4(),
+                &initial_access,
+                &initial_refresh,
+                enrollment_fixture.session.access_expires_at + ChronoDuration::seconds(1),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "enrollment replay remains bound to the exact session ID"
+    );
+    assert_eq!(
+        repository
+            .consume_device_enrollment(
+                &enrollment,
+                enrollment_fixture.session.id,
+                &initial_access,
+                &initial_refresh,
+                enrollment_fixture.session.refresh_idle_expires_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "enrollment replay stops at the exclusive refresh-idle boundary"
+    );
+    assert_eq!(
+        repository
+            .consume_device_enrollment(
+                &enrollment,
+                enrollment_fixture.session.id,
+                &initial_access,
+                &initial_refresh,
+                enrollment_fixture.session.absolute_expires_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "enrollment replay stops at the exclusive absolute boundary"
+    );
+
+    let revoked_enrollment_fixture =
+        issue_device_session(&repository, now, 110, "Revoked enrollment replay").await;
+    assert!(
+        repository
+            .revoke_device_session(
+                revoked_enrollment_fixture.session.id,
+                now + ChronoDuration::minutes(1),
+            )
+            .await
+            .expect("session revoked")
+    );
+    let revoked_enrollment = OpaqueCredential::parse(
+        CredentialKind::Enrollment,
+        &revoked_enrollment_fixture.enrollment_raw,
+    )
+    .unwrap();
+    let revoked_access = OpaqueCredential::parse(
+        CredentialKind::DeviceAccess,
+        &revoked_enrollment_fixture.access_raw,
+    )
+    .unwrap();
+    let revoked_refresh = OpaqueCredential::parse(
+        CredentialKind::DeviceRefresh,
+        &revoked_enrollment_fixture.refresh_raw,
+    )
+    .unwrap();
+    assert_eq!(
+        repository
+            .consume_device_enrollment(
+                &revoked_enrollment,
+                revoked_enrollment_fixture.session.id,
+                &revoked_access,
+                &revoked_refresh,
+                now + ChronoDuration::minutes(2),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "revocation closes enrollment replay"
+    );
+
+    let refresh_fixture =
+        issue_device_session(&repository, now, 120, "Refresh replay boundaries").await;
+    let current_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_fixture.refresh_raw)
+            .unwrap();
+    let next_access_raw = token(CredentialKind::DeviceAccess, 123);
+    let next_refresh_raw = token(CredentialKind::DeviceRefresh, 124);
+    let next_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &next_access_raw).unwrap();
+    let next_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &next_refresh_raw).unwrap();
+    let refresh_at = now + ChronoDuration::minutes(1);
+    let rotated = repository
+        .refresh_device_session(&current_refresh, &next_access, &next_refresh, refresh_at)
+        .await
+        .expect("session rotated");
+    assert!(!rotated.replayed);
+    let recovered_refresh = repository
+        .refresh_device_session(
+            &current_refresh,
+            &next_access,
+            &next_refresh,
+            rotated.access_expires_at + ChronoDuration::seconds(1),
+        )
+        .await
+        .expect("exact refresh replay survives access expiry");
+    assert!(recovered_refresh.replayed);
+    assert_eq!(recovered_refresh.id, refresh_fixture.session.id);
+    assert_eq!(
+        repository
+            .refresh_device_session(
+                &current_refresh,
+                &next_access,
+                &next_refresh,
+                rotated.refresh_idle_expires_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "refresh replay stops at the exclusive refresh-idle boundary"
+    );
+    assert_eq!(
+        repository
+            .refresh_device_session(
+                &current_refresh,
+                &next_access,
+                &next_refresh,
+                rotated.absolute_expires_at,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "refresh replay stops at the exclusive absolute boundary"
+    );
+
+    let generation_fixture =
+        issue_device_session(&repository, now, 130, "Refresh generation boundaries").await;
+    let generation_zero_refresh = OpaqueCredential::parse(
+        CredentialKind::DeviceRefresh,
+        &generation_fixture.refresh_raw,
+    )
+    .unwrap();
+    let generation_one_access_raw = token(CredentialKind::DeviceAccess, 133);
+    let generation_one_refresh_raw = token(CredentialKind::DeviceRefresh, 134);
+    let generation_one_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &generation_one_access_raw).unwrap();
+    let generation_one_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &generation_one_refresh_raw)
+            .unwrap();
+    repository
+        .refresh_device_session(
+            &generation_zero_refresh,
+            &generation_one_access,
+            &generation_one_refresh,
+            now + ChronoDuration::minutes(1),
+        )
+        .await
+        .expect("first generation rotated");
+    let generation_two_access_raw = token(CredentialKind::DeviceAccess, 135);
+    let generation_two_refresh_raw = token(CredentialKind::DeviceRefresh, 136);
+    let generation_two_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &generation_two_access_raw).unwrap();
+    let generation_two_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &generation_two_refresh_raw)
+            .unwrap();
+    repository
+        .refresh_device_session(
+            &generation_one_refresh,
+            &generation_two_access,
+            &generation_two_refresh,
+            now + ChronoDuration::minutes(2),
+        )
+        .await
+        .expect("second generation rotated");
+    assert_eq!(
+        repository
+            .refresh_device_session(
+                &generation_zero_refresh,
+                &generation_one_access,
+                &generation_one_refresh,
+                now + ChronoDuration::minutes(3),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "a replay window closes when the next generation advances"
+    );
+    let current_generation_replay = repository
+        .refresh_device_session(
+            &generation_one_refresh,
+            &generation_two_access,
+            &generation_two_refresh,
+            now + ChronoDuration::minutes(3),
+        )
+        .await
+        .expect("current generation remains exactly replayable");
+    assert!(current_generation_replay.replayed);
+    assert!(
+        repository
+            .revoke_device_session(
+                generation_fixture.session.id,
+                now + ChronoDuration::minutes(4),
+            )
+            .await
+            .expect("generation session revoked")
+    );
+    assert_eq!(
+        repository
+            .refresh_device_session(
+                &generation_one_refresh,
+                &generation_two_access,
+                &generation_two_refresh,
+                now + ChronoDuration::minutes(5),
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidCredential),
+        "revocation closes refresh replay"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Audits pre-cutover enrollment and session hydration corruption.
 async fn device_hydration_rejects_ttl_corruption_without_the_schema_constraint() {
     let Some(test_database) = TestDatabase::from_environment().await else {
         return;
@@ -443,18 +775,43 @@ async fn device_hydration_rejects_ttl_corruption_without_the_schema_constraint()
                 client_kind: DeviceClientKind::Macos,
                 device_label: "Synthetic hydration audit".to_owned(),
                 scopes: vec![Scope::ScheduleRead],
+                client_contract_version: 1,
+                client_version: "test-1".to_owned(),
+                client_capabilities: Vec::new(),
                 created_at: now,
             },
             &enrollment,
         )
         .await
         .expect("enrollment created");
+    sqlx::query(
+        "ALTER TABLE device_enrollments DROP CONSTRAINT \
+         device_enrollments_runtime_scopes_check",
+    )
+    .execute(pool)
+    .await
+    .expect("drop enrollment audience constraint inside isolated audit schema");
+    sqlx::query("UPDATE device_enrollments SET scopes = ARRAY['suggestions_submit']")
+        .execute(pool)
+        .await
+        .expect("tamper pre-cutover enrollment fixture");
+    assert_eq!(
+        repository
+            .consume_device_enrollment(&enrollment, Uuid::new_v4(), &access, &refresh, now)
+            .await,
+        Err(CredentialRepositoryError::Internal),
+        "stored enrollment metadata with an invalid audience fails closed"
+    );
+    sqlx::query("UPDATE device_enrollments SET scopes = ARRAY['schedule_read']")
+        .execute(pool)
+        .await
+        .expect("restore enrollment fixture");
     let session = repository
         .consume_device_enrollment(&enrollment, Uuid::new_v4(), &access, &refresh, now)
         .await
         .expect("session issued");
 
-    sqlx::query("ALTER TABLE sessions DROP CONSTRAINT sessions_v1_shape_check")
+    sqlx::query("ALTER TABLE sessions DROP CONSTRAINT sessions_v1_runtime_shape_check")
         .execute(pool)
         .await
         .expect("drop shape constraint inside isolated audit schema");
@@ -533,6 +890,9 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                 display_name: "Personal chat suggestions".to_owned(),
                 scopes: vec![Scope::ScheduleRead, Scope::SuggestionsSubmit],
                 allowed_origins: vec!["https://assistant.example.test".to_owned()],
+                client_contract_version: 1,
+                client_version: "test-1".to_owned(),
+                client_capabilities: vec!["origin-binding".to_owned()],
                 created_at: now,
                 requested_expires_at: None,
             },
@@ -540,6 +900,12 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
         )
         .await
         .expect("MCP client registered");
+    let listed_clients = repository
+        .list_mcp_clients(now)
+        .await
+        .expect("active MCP clients listed");
+    assert_eq!(listed_clients.len(), 1);
+    assert_eq!(listed_clients[0].id, client_id);
     assert_postgres_instant_eq(client.expires_at, now + ChronoDuration::days(90));
     assert_eq!(
         client.scopes,
@@ -656,6 +1022,9 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                 display_name: "Short lived".to_owned(),
                 scopes: vec![Scope::SuggestionsSubmit],
                 allowed_origins: Vec::new(),
+                client_contract_version: 1,
+                client_version: "test-1".to_owned(),
+                client_capabilities: Vec::new(),
                 created_at: now,
                 requested_expires_at: Some(now + ChronoDuration::minutes(1)),
             },
@@ -682,6 +1051,9 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
                     display_name: "Overlong".to_owned(),
                     scopes: vec![Scope::ScheduleRead],
                     allowed_origins: Vec::new(),
+                    client_contract_version: 1,
+                    client_version: "test-1".to_owned(),
+                    client_capabilities: Vec::new(),
                     created_at: now,
                     requested_expires_at: Some(
                         now + ChronoDuration::days(365) + ChronoDuration::seconds(1)
@@ -694,6 +1066,311 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
     );
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exercises the complete public/protected auth HTTP lifecycle.
+async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_device_secrets() {
+    const STATIC_TOKEN: &str = "synthetic-static-bootstrap-token-for-tests";
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-http-owner", "auth-http").await;
+    let repository: Arc<dyn CredentialRepository> =
+        Arc::new(PostgresCredentialRepository::new(pool.clone(), scope));
+    let clock = Arc::new(SystemClock);
+    let authenticator = Arc::new(RuntimeAuthenticator::new(
+        Some(Arc::new(vec![hash_token(STATIC_TOKEN)])),
+        repository.clone(),
+        clock.clone(),
+    ));
+    let proposal_repository: Arc<dyn ProposalRepository> =
+        Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposal_repository,
+        clock,
+        Duration::from_hours(24),
+    ));
+    let app =
+        router(
+            AppState::new(proposals, authenticator.clone(), Readiness::default())
+                .with_credential_auth(repository, authenticator, AuthMode::Hybrid),
+        );
+
+    let enrollment_response = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments",
+            STATIC_TOKEN,
+            Some(json!({
+                "client_instance_id": Uuid::new_v4(),
+                "client_kind": "macos",
+                "device_label": "Synthetic HTTP Mac",
+                "client_contract_version": 1,
+                "client_version": "test-1",
+                "client_capabilities": ["exact-replay"]
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(enrollment_response.status(), StatusCode::CREATED);
+    assert_eq!(
+        enrollment_response.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    let enrollment = response_json(enrollment_response).await;
+    let enrollment_token = enrollment["enrollment_token"].as_str().unwrap().to_owned();
+    assert!(enrollment_token.starts_with(CredentialKind::Enrollment.prefix()));
+
+    let session_id = Uuid::new_v4();
+    let access = token(CredentialKind::DeviceAccess, 81);
+    let refresh = token(CredentialKind::DeviceRefresh, 82);
+    let consume_body = json!({
+        "session_id": session_id,
+        "access_token": access,
+        "refresh_token": refresh
+    });
+    let consumed_response = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments/consume",
+            &enrollment_token,
+            Some(consume_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(consumed_response.status(), StatusCode::CREATED);
+    let consumed_bytes = consumed_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
+    let consumed_text = String::from_utf8(consumed_bytes.to_vec()).unwrap();
+    assert!(!consumed_text.contains(&access));
+    assert!(!consumed_text.contains(&refresh));
+    assert_eq!(
+        serde_json::from_str::<Value>(&consumed_text).unwrap()["replayed"],
+        false
+    );
+
+    let replayed_enrollment = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments/consume",
+            &enrollment_token,
+            Some(consume_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed_enrollment.status(), StatusCode::OK);
+    assert_eq!(response_json(replayed_enrollment).await["replayed"], true);
+
+    let next_access = token(CredentialKind::DeviceAccess, 83);
+    let next_refresh = token(CredentialKind::DeviceRefresh, 84);
+    let refresh_body = json!({
+        "next_access_token": next_access,
+        "next_refresh_token": next_refresh
+    });
+    let refreshed = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/sessions/refresh",
+            &refresh,
+            Some(refresh_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(refreshed.status(), StatusCode::OK);
+    assert_eq!(response_json(refreshed).await["replayed"], false);
+    let replayed_refresh = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/sessions/refresh",
+            &refresh,
+            Some(refresh_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed_refresh.status(), StatusCode::OK);
+    assert_eq!(response_json(replayed_refresh).await["replayed"], true);
+
+    let listed = app
+        .clone()
+        .oneshot(auth_request("GET", "/v1/auth/sessions", &next_access, None))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(listed).await["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mcp_issued = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/mcp-clients",
+            STATIC_TOKEN,
+            Some(json!({
+                "client_identifier": "synthetic-http-mcp",
+                "display_name": "Synthetic HTTP MCP",
+                "scopes": ["schedule_read"],
+                "allowed_origins": ["https://chatgpt.com"],
+                "client_contract_version": 1,
+                "client_version": "test-1"
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mcp_issued.status(), StatusCode::CREATED);
+    let mcp_issued = response_json(mcp_issued).await;
+    let mcp_credential = mcp_issued["credential"].as_str().unwrap().to_owned();
+    assert!(mcp_credential.starts_with(CredentialKind::McpClient.prefix()));
+    let mcp_id = mcp_issued["client"]["id"].as_str().unwrap().to_owned();
+    let listed_mcp = app
+        .clone()
+        .oneshot(auth_request(
+            "GET",
+            "/v1/auth/mcp-clients",
+            STATIC_TOKEN,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed_mcp.status(), StatusCode::OK);
+    let listed_mcp = listed_mcp.into_body().collect().await.unwrap().to_bytes();
+    let listed_mcp = String::from_utf8(listed_mcp.to_vec()).unwrap();
+    assert!(!listed_mcp.contains(&mcp_credential));
+    assert_eq!(
+        serde_json::from_str::<Value>(&listed_mcp).unwrap()["clients"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let revoked_mcp = app
+        .clone()
+        .oneshot(auth_request(
+            "DELETE",
+            &format!("/v1/auth/mcp-clients/{mcp_id}"),
+            STATIC_TOKEN,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_mcp.status(), StatusCode::NO_CONTENT);
+
+    let revoked_session = app
+        .clone()
+        .oneshot(auth_request(
+            "DELETE",
+            &format!("/v1/auth/sessions/{session_id}"),
+            &next_access,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked_session.status(), StatusCode::NO_CONTENT);
+    let rejected = app
+        .oneshot(auth_request("GET", "/v1/items", &next_access, None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    test_database.destroy().await;
+}
+
+struct IssuedDeviceSession {
+    session: DeviceSession,
+    enrollment_raw: String,
+    access_raw: String,
+    refresh_raw: String,
+}
+
+async fn issue_device_session(
+    repository: &PostgresCredentialRepository,
+    now: DateTime<Utc>,
+    marker: u8,
+    device_label: &str,
+) -> IssuedDeviceSession {
+    let enrollment_raw = token(CredentialKind::Enrollment, marker);
+    let access_raw = token(
+        CredentialKind::DeviceAccess,
+        marker.checked_add(1).expect("fixture marker range"),
+    );
+    let refresh_raw = token(
+        CredentialKind::DeviceRefresh,
+        marker.checked_add(2).expect("fixture marker range"),
+    );
+    let enrollment = OpaqueCredential::parse(CredentialKind::Enrollment, &enrollment_raw).unwrap();
+    let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
+    let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_raw).unwrap();
+    repository
+        .create_device_enrollment(
+            DeviceEnrollmentSpec {
+                id: Uuid::new_v4(),
+                client_instance_id: Uuid::new_v4(),
+                client_kind: DeviceClientKind::Macos,
+                device_label: device_label.to_owned(),
+                scopes: vec![Scope::ScheduleRead],
+                client_contract_version: 1,
+                client_version: "replay-boundary-test-1".to_owned(),
+                client_capabilities: vec!["exact-replay".to_owned()],
+                created_at: now,
+            },
+            &enrollment,
+        )
+        .await
+        .expect("replay fixture enrollment created");
+    let session = repository
+        .consume_device_enrollment(&enrollment, Uuid::new_v4(), &access, &refresh, now)
+        .await
+        .expect("replay fixture session issued");
+    assert!(!session.replayed);
+    assert_postgres_instant_eq(session.access_expires_at, now + ACCESS_TOKEN_TTL);
+    assert_postgres_instant_eq(
+        session.refresh_idle_expires_at,
+        now + DEVICE_SESSION_REFRESH_IDLE_TTL,
+    );
+    assert_postgres_instant_eq(
+        session.absolute_expires_at,
+        now + DEVICE_SESSION_ABSOLUTE_TTL,
+    );
+    IssuedDeviceSession {
+        session: session.value,
+        enrollment_raw,
+        access_raw,
+        refresh_raw,
+    }
+}
+
+fn auth_request(method: &str, uri: &str, bearer: &str, body: Option<Value>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
+    builder
+        .body(body.map_or_else(Body::empty, |value| Body::from(value.to_string())))
+        .unwrap()
+}
+
+async fn response_json(response: Response<Body>) -> Value {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 fn token(kind: CredentialKind, marker: u8) -> String {

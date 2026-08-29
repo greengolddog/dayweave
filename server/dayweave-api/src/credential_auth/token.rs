@@ -18,6 +18,65 @@ pub enum CredentialKind {
     Enrollment,
 }
 
+/// A newly generated credential whose plaintext is erased when dropped.
+///
+/// It intentionally has no `Clone`, `Serialize`, or plaintext-bearing `Debug`
+/// implementation. HTTP issuance code may expose it exactly once in a
+/// no-store response before allowing this value to drop.
+pub struct GeneratedCredential {
+    kind: CredentialKind,
+    raw: String,
+}
+
+impl fmt::Debug for GeneratedCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeneratedCredential")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for GeneratedCredential {
+    fn drop(&mut self) {
+        self.raw.zeroize();
+    }
+}
+
+impl GeneratedCredential {
+    /// Generates 256 bits with the operating system CSPRNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the operating system RNG is unavailable.
+    pub fn generate(kind: CredentialKind) -> Result<Self, TokenGenerationError> {
+        let mut random = [0_u8; TOKEN_RANDOM_BYTES];
+        if getrandom::fill(&mut random).is_err() {
+            random.zeroize();
+            return Err(TokenGenerationError::Unavailable);
+        }
+        let mut raw = String::with_capacity(kind.prefix().len() + TOKEN_PAYLOAD_LENGTH);
+        raw.push_str(kind.prefix());
+        raw.push_str(&URL_SAFE_NO_PAD.encode(random));
+        random.zeroize();
+        Ok(Self { kind, raw })
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.raw
+    }
+
+    /// Revalidates the generated value as a borrowed persistence credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted error if the generator/parser invariant is violated.
+    pub fn parsed(&self) -> Result<OpaqueCredential<'_>, TokenParseError> {
+        OpaqueCredential::parse(self.kind, &self.raw)
+    }
+}
+
 impl CredentialKind {
     #[must_use]
     pub const fn prefix(self) -> &'static str {
@@ -141,6 +200,12 @@ pub enum TokenParseError {
     InvalidCredential,
 }
 
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum TokenGenerationError {
+    #[error("credential generation failed")]
+    Unavailable,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +292,19 @@ mod tests {
         let debug = format!("{access:?} {matching_refresh:?}");
         assert!(!debug.contains(&access_raw));
         assert!(!debug.contains(&matching_refresh_raw));
+    }
+
+    #[test]
+    fn generates_exact_redacted_credentials() {
+        let generated = GeneratedCredential::generate(CredentialKind::Enrollment)
+            .expect("operating system CSPRNG");
+        let raw = generated.expose().to_owned();
+        assert_eq!(raw.len(), CredentialKind::Enrollment.prefix().len() + 43);
+        assert!(generated.parsed().is_ok());
+        assert!(!format!("{generated:?}").contains(&raw));
+
+        let other = GeneratedCredential::generate(CredentialKind::Enrollment)
+            .expect("operating system CSPRNG");
+        assert_ne!(generated.expose(), other.expose());
     }
 }

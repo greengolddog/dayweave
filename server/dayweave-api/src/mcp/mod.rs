@@ -8,7 +8,7 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{ACCEPT, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE},
+        header::{ACCEPT, CACHE_CONTROL, CONTENT_TYPE, ORIGIN, PRAGMA, WWW_AUTHENTICATE},
     },
     response::{IntoResponse, Response},
 };
@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 
 pub use tools::{McpRequestContext, McpService};
 
-use crate::{AppState, auth::bearer_token_from_headers};
+use crate::{
+    AppState,
+    auth::{PrincipalAudience, bearer_token_from_headers},
+};
 use protocol::{
     CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION, RpcError, RpcRequest,
     SUPPORTED_PROTOCOL_VERSIONS, attach_response_meta, discover_result, initialize_result, success,
@@ -42,10 +45,27 @@ pub async fn handle_post(
     body: Bytes,
 ) -> Response {
     let request_id = request_id(&headers);
+    let Some(token) = bearer_token_from_headers(&headers) else {
+        return unauthorized(&request_id);
+    };
+    let Ok(principal) = state.authenticator.authenticate(token).await else {
+        return unauthorized(&request_id);
+    };
+    if !matches!(
+        principal.audience,
+        PrincipalAudience::Legacy | PrincipalAudience::Mcp
+    ) {
+        return unauthorized(&request_id);
+    }
     if let Some(origin) = headers.get(ORIGIN) {
-        let allowed = origin
-            .to_str()
-            .is_ok_and(|origin| state.mcp.is_origin_allowed(origin));
+        let allowed = origin.to_str().is_ok_and(|origin| {
+            state.mcp.is_origin_allowed(origin)
+                && (principal.audience == PrincipalAudience::Legacy
+                    || principal
+                        .allowed_origins
+                        .iter()
+                        .any(|allowed| allowed == origin))
+        });
         if !allowed {
             return rpc_error_response(
                 StatusCode::FORBIDDEN,
@@ -54,13 +74,6 @@ pub async fn handle_post(
             );
         }
     }
-
-    let Some(token) = bearer_token_from_headers(&headers) else {
-        return unauthorized(&request_id);
-    };
-    let Ok(principal) = state.authenticator.authenticate(token).await else {
-        return unauthorized(&request_id);
-    };
 
     if !has_media_type(&headers, CONTENT_TYPE, "application/json") {
         return rpc_error_response(
@@ -436,7 +449,7 @@ fn unauthorized(request_id: &str) -> Response {
     response.headers_mut().insert(
         WWW_AUTHENTICATE,
         HeaderValue::from_static(
-            "Bearer scope=\"schedule:read schedule:simulate suggestions:submit\"",
+            "Bearer realm=\"dayweave-native-mcp\", scope=\"schedule:read schedule:simulate suggestions:submit\"",
         ),
     );
     response
@@ -451,7 +464,14 @@ fn rpc_error_response(status: StatusCode, error: RpcError, request_id: &str) -> 
 fn json_response(status: StatusCode, body: Value) -> Response {
     (
         status,
-        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            (
+                CACHE_CONTROL,
+                HeaderValue::from_static("no-store, max-age=0"),
+            ),
+            (PRAGMA, HeaderValue::from_static("no-cache")),
+        ],
         body.to_string(),
     )
         .into_response()

@@ -65,11 +65,12 @@ effects must flow through an auditable proposal or outbox boundary.
 
 ### Service and protocol
 
-- Non-health HTTP and MCP operations currently require a strict, statically
-  configured bearer credential. Runtime configuration retains only SHA-256
-  digests and compares them in constant time, but every accepted bootstrap
-  credential still receives the same five broad schedule/Suggestions scopes.
-- A not-yet-wired durable credential repository now provides version-fenced,
+- Non-health HTTP and MCP operations require strict bearer credentials. The
+  backwards-compatible `legacy_static` mode retains only SHA-256 digests and
+  compares them in constant time. Explicit `hybrid` mode accepts both static
+  and durable credentials for a bounded migration; `credential_only` requires
+  PostgreSQL and refuses any non-empty static-token configuration.
+- The wired durable credential runtime provides version-fenced,
   revocable device sessions, one-time device enrollment, rotating access and
   refresh credentials, and separately scoped MCP credentials. It accepts only
   exact `dw_da1_`, `dw_dr1_`, `dw_en1_`, and `dw_mc1_` formats carrying 32-byte
@@ -82,11 +83,31 @@ effects must flow through an auditable proposal or outbox boundary.
   10-minute enrollment and
   90-day-default/365-day-maximum MCP lifetimes. Database failures, invalid
   durable metadata, expiry, revocation, reuse, and cross-tenant lookups fail
-  closed.
+  closed. Enrollment and refresh also support crash/network-loss recovery for
+  only the exact client-journaled credential tuple; competing tuples fail.
+- REST and MCP credentials have separate audiences and stable session/client
+  subjects. REST endpoints enforce an explicit read/write scope matrix. MCP
+  credentials are limited to schedule read, simulation, and proposal
+  submission, and browser requests must satisfy both the global and per-client
+  exact Origin allowlists. Reserved `dw_` credentials never downgrade to static
+  authentication after a durable failure.
+- The current `dw_mc1_` mechanism is only a native bearer for first-party or
+  local MCP clients capable of securely storing a custom credential. It is not
+  the MCP OAuth 2.1 authorization flow required for published ChatGPT/Codex
+  account linking. The server intentionally advertises no OAuth security scheme
+  or protected-resource metadata and sends no `resource_metadata` challenge.
+  Publishing remains blocked until authorization code with PKCE, client
+  identification/registration, resource/audience binding, consent, and OAuth
+  token lifecycle behavior are implemented and separately security-reviewed.
+- Credential issuance, list, rotation, and revocation APIs are redacted and
+  carry no-store headers. Enrollment/MCP secrets are generated with the OS
+  CSPRNG and returned once; persistence contains only domain-separated hashes.
+  Successful credential lifecycle mutations write content-free audit rows in
+  the same database transaction.
 - PostgreSQL adapters are explicitly scoped by the configured user/workspace,
   and every version-1 credential row carries that user/workspace/client scope.
-  The current static bearer principal does not independently prove that scope;
-  runtime session issuance and audience-aware authorization remain a gate.
+  Static bootstrap principals do not independently prove that scope and must be
+  removed after the reviewed hybrid migration.
 - Mutation retries use hashed idempotency keys. Canonical changes, audit rows,
   and external-effect outbox rows are designed to commit transactionally.
 - MCP validates protocol version, media type, request size, origin, bearer
@@ -196,15 +217,9 @@ taken, and any remaining decision.
 The following controls are required before DayWeave is treated as production
 ready:
 
-- wire enrollment, refresh, revoke, and operator recovery APIs plus both app
-  clients to the durable credential repository, add audience-aware REST/MCP
-  authorization and rate limits, then remove the bootstrap static credential
-  without a fallback; every credential issuer must use an OS CSPRNG for each
-  independent 32-byte payload;
-- define and migrate endpoint-level REST scopes before that cutover. The current
-  five-value scope allowlist is intentionally limited to the existing
-  schedule/Suggestions foundation and is not a complete app authorization
-  vocabulary;
+- migrate both app clients to client-journaled exact enrollment/refresh and
+  atomic secure-store replacement, rehearse the hybrid rollout, then remove
+  the bootstrap static credential without a fallback;
 - complete SEC-007 sensitive-item enforcement for lock-screen notifications,
   widgets while locked, external MCP access, proactive assistant context, and
   attachment analysis on both clients;

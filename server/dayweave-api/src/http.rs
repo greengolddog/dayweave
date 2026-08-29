@@ -70,6 +70,15 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::google_sync::http::sync_status,
         crate::google_sync::http::manual_refresh,
         crate::google_sync::http::enqueue_outbound,
+        crate::credential_auth::http::create_device_enrollment,
+        crate::credential_auth::http::consume_device_enrollment,
+        crate::credential_auth::http::refresh_session,
+        crate::credential_auth::http::list_sessions,
+        crate::credential_auth::http::revoke_session,
+        crate::credential_auth::http::revoke_device_enrollment,
+        crate::credential_auth::http::create_mcp_client,
+        crate::credential_auth::http::list_mcp_clients,
+        crate::credential_auth::http::revoke_mcp_client,
     ),
     components(schemas(
         HealthResponse,
@@ -155,7 +164,8 @@ const MAX_LIST_LIMIT: usize = 200;
         (name = "schedule", description = "Deterministic side-effect-free planning previews"),
         (name = "execution", description = "Server-authoritative cross-device timers and breaks"),
         (name = "google", description = "Google Calendar and Tasks identity authorization"),
-        (name = "google_sync", description = "Durable Google Calendar and Tasks reconciliation")
+        (name = "google_sync", description = "Durable Google Calendar and Tasks reconciliation"),
+        (name = "authentication", description = "Device enrollment, credential rotation, and MCP client management")
     )
 )]
 pub struct ApiDoc;
@@ -192,6 +202,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::execution::http::routes())
         .merge(crate::google_oauth::http::protected_routes())
         .merge(crate::google_sync::http::routes())
+        .merge(crate::credential_auth::http::protected_routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -207,6 +218,7 @@ pub fn router(state: AppState) -> Router {
         .route("/openapi.json", get(openapi))
         .route("/mcp", post(crate::mcp::handle_post))
         .merge(crate::google_oauth::http::public_routes())
+        .merge(crate::credential_auth::http::public_routes())
         .nest("/v1", protected)
         .fallback(not_found)
         .with_state(state)

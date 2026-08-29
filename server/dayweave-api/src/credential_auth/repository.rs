@@ -3,7 +3,10 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 use uuid::Uuid;
 
-use super::{DeviceEnrollmentSpec, DeviceSession, McpClient, McpClientSpec, OpaqueCredential};
+use super::{
+    CredentialMutation, DeviceEnrollmentSpec, DeviceSession, McpClient, McpClientSpec,
+    OpaqueCredential,
+};
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum CredentialRepositoryError {
@@ -32,7 +35,7 @@ pub trait CredentialRepository: Send + Sync {
         access_token: &OpaqueCredential<'_>,
         refresh_token: &OpaqueCredential<'_>,
         now: DateTime<Utc>,
-    ) -> Result<DeviceSession, CredentialRepositoryError>;
+    ) -> Result<CredentialMutation<DeviceSession>, CredentialRepositoryError>;
 
     async fn revoke_device_enrollment(
         &self,
@@ -52,7 +55,12 @@ pub trait CredentialRepository: Send + Sync {
         next_access_token: &OpaqueCredential<'_>,
         next_refresh_token: &OpaqueCredential<'_>,
         now: DateTime<Utc>,
-    ) -> Result<DeviceSession, CredentialRepositoryError>;
+    ) -> Result<CredentialMutation<DeviceSession>, CredentialRepositoryError>;
+
+    async fn list_device_sessions(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<DeviceSession>, CredentialRepositoryError>;
 
     async fn revoke_device_session(
         &self,
@@ -71,6 +79,11 @@ pub trait CredentialRepository: Send + Sync {
         credential: &OpaqueCredential<'_>,
         now: DateTime<Utc>,
     ) -> Result<McpClient, CredentialRepositoryError>;
+
+    async fn list_mcp_clients(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<McpClient>, CredentialRepositoryError>;
 
     async fn revoke_mcp_client(
         &self,

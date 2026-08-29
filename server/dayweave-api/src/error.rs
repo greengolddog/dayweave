@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::rejection::JsonRejection,
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -23,6 +23,15 @@ impl ApiError {
             StatusCode::UNAUTHORIZED,
             "unauthorized",
             "A valid bearer token is required",
+        )
+    }
+
+    #[must_use]
+    pub fn forbidden() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "The authenticated credential is not permitted to perform this operation",
         )
     }
 
@@ -119,6 +128,20 @@ impl IntoResponse for ApiError {
                 details: self.details,
             },
         };
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-store, max-age=0"),
+        );
+        response
+            .headers_mut()
+            .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+        if response.status() == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"dayweave\""),
+            );
+        }
+        response
     }
 }

@@ -27,7 +27,7 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),

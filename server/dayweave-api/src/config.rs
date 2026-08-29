@@ -98,6 +98,26 @@ pub enum Environment {
     Production,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthMode {
+    LegacyStatic,
+    Hybrid,
+    CredentialOnly,
+}
+
+impl FromStr for AuthMode {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "legacy_static" => Ok(Self::LegacyStatic),
+            "hybrid" => Ok(Self::Hybrid),
+            "credential_only" => Ok(Self::CredentialOnly),
+            _ => Err(ConfigError::InvalidAuthMode(value.to_owned())),
+        }
+    }
+}
+
 impl FromStr for Environment {
     type Err = ConfigError;
 
@@ -143,6 +163,7 @@ pub struct DatabaseConfig {
 pub struct Config {
     pub bind_address: SocketAddr,
     pub environment: Environment,
+    pub auth_mode: AuthMode,
     pub api_token_hashes: Arc<Vec<TokenHash>>,
     pub proposal_ttl: Duration,
     pub mcp_allowed_origins: Arc<Vec<String>>,
@@ -172,10 +193,14 @@ impl Config {
     ///
     /// Returns [`ConfigError`] when required credentials are absent or a value
     /// cannot be parsed or fails the security constraints.
+    #[allow(clippy::too_many_lines)] // Keeps cross-field security validation in one parse boundary.
     pub fn from_map(values: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let environment = values
             .get("DAYWEAVE_ENVIRONMENT")
             .map_or(Ok(Environment::Development), |value| value.parse())?;
+        let auth_mode = values
+            .get("DAYWEAVE_AUTH_MODE")
+            .map_or(Ok(AuthMode::LegacyStatic), |value| value.parse())?;
 
         let bind_address = values
             .get("DAYWEAVE_BIND_ADDRESS")
@@ -196,14 +221,23 @@ impl Config {
 
         let raw_tokens = values
             .get("DAYWEAVE_API_TOKENS")
-            .or_else(|| values.get("DAYWEAVE_API_TOKEN"))
-            .ok_or(ConfigError::MissingApiTokens)?;
-        let tokens: Vec<_> = raw_tokens
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .collect();
-        if tokens.is_empty() {
+            .or_else(|| values.get("DAYWEAVE_API_TOKEN"));
+        if auth_mode == AuthMode::CredentialOnly
+            && ["DAYWEAVE_API_TOKENS", "DAYWEAVE_API_TOKEN"]
+                .iter()
+                .filter_map(|key| values.get(*key))
+                .any(|value| !value.trim().is_empty())
+        {
+            return Err(ConfigError::StaticTokensForbidden);
+        }
+        let tokens: Vec<_> = raw_tokens.map_or_else(Vec::new, |raw_tokens| {
+            raw_tokens
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect()
+        });
+        if auth_mode != AuthMode::CredentialOnly && tokens.is_empty() {
             return Err(ConfigError::MissingApiTokens);
         }
         if tokens
@@ -211,6 +245,9 @@ impl Config {
             .any(|token| token.len() < MINIMUM_TOKEN_LENGTH)
         {
             return Err(ConfigError::ApiTokenTooShort(MINIMUM_TOKEN_LENGTH));
+        }
+        if tokens.iter().any(|token| token.starts_with("dw_")) {
+            return Err(ConfigError::ReservedApiTokenPrefix);
         }
         let api_token_hashes = Arc::new(tokens.into_iter().map(hash_token).collect());
 
@@ -253,6 +290,9 @@ impl Config {
         {
             return Err(ConfigError::MissingDatabaseUrl);
         }
+        if auth_mode != AuthMode::LegacyStatic && database.is_none() {
+            return Err(ConfigError::AuthModeRequiresDatabase);
+        }
         let google_oauth = google_oauth_config(values)?;
         if google_oauth.is_some() && database.is_none() {
             return Err(ConfigError::MissingGoogleOAuthDatabase);
@@ -261,6 +301,7 @@ impl Config {
         Ok(Self {
             bind_address,
             environment,
+            auth_mode,
             api_token_hashes,
             proposal_ttl: Duration::from_secs(ttl_seconds),
             mcp_allowed_origins,
@@ -278,6 +319,14 @@ pub enum ConfigError {
     MissingApiTokens,
     #[error("each API token must contain at least {0} characters")]
     ApiTokenTooShort(usize),
+    #[error("static API tokens cannot use the reserved durable-credential prefix")]
+    ReservedApiTokenPrefix,
+    #[error("invalid DAYWEAVE_AUTH_MODE: {0}")]
+    InvalidAuthMode(String),
+    #[error("hybrid and credential_only authentication require DAYWEAVE_DATABASE_URL")]
+    AuthModeRequiresDatabase,
+    #[error("static API token configuration is forbidden in credential_only mode")]
+    StaticTokensForbidden,
     #[error("invalid DAYWEAVE_BIND_ADDRESS: {0}")]
     InvalidBindAddress(String),
     #[error("invalid DAYWEAVE_ENVIRONMENT: {0}")]
@@ -557,6 +606,7 @@ mod tests {
 
         assert_eq!(config.bind_address.port(), 8080);
         assert_eq!(config.environment, Environment::Development);
+        assert_eq!(config.auth_mode, AuthMode::LegacyStatic);
         assert_eq!(config.proposal_ttl, Duration::from_hours(7 * 24));
         assert_eq!(config.api_token_hashes.len(), 1);
         assert!(config.mcp_allowed_origins.is_empty());
@@ -576,6 +626,62 @@ mod tests {
             )]))
             .expect_err("short token must fail"),
             ConfigError::ApiTokenTooShort(MINIMUM_TOKEN_LENGTH)
+        );
+        assert_eq!(
+            Config::from_map(&HashMap::from([(
+                "DAYWEAVE_API_TOKEN".to_owned(),
+                "dw_reserved-static-token-that-is-long-enough".to_owned(),
+            )]))
+            .expect_err("reserved prefixes cannot enter static authority"),
+            ConfigError::ReservedApiTokenPrefix
+        );
+    }
+
+    #[test]
+    fn validates_authentication_rollout_modes() {
+        let mut hybrid = valid_values();
+        hybrid.insert("DAYWEAVE_AUTH_MODE".to_owned(), "hybrid".to_owned());
+        assert_eq!(
+            Config::from_map(&hybrid).expect_err("hybrid requires durable storage"),
+            ConfigError::AuthModeRequiresDatabase
+        );
+        hybrid.insert(
+            "DAYWEAVE_DATABASE_URL".to_owned(),
+            "postgres://dayweave:redacted@database/dayweave".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&hybrid).expect("hybrid config").auth_mode,
+            AuthMode::Hybrid
+        );
+
+        let credential_only = HashMap::from([
+            (
+                "DAYWEAVE_AUTH_MODE".to_owned(),
+                "credential_only".to_owned(),
+            ),
+            (
+                "DAYWEAVE_DATABASE_URL".to_owned(),
+                "postgres://dayweave:redacted@database/dayweave".to_owned(),
+            ),
+        ]);
+        let config = Config::from_map(&credential_only).expect("credential-only config");
+        assert_eq!(config.auth_mode, AuthMode::CredentialOnly);
+        assert!(config.api_token_hashes.is_empty());
+
+        let mut forbidden = credential_only;
+        forbidden.insert(
+            "DAYWEAVE_API_TOKEN".to_owned(),
+            "a-static-token-that-must-not-remain".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&forbidden).expect_err("credential-only rejects fallback"),
+            ConfigError::StaticTokensForbidden
+        );
+        forbidden.insert("DAYWEAVE_API_TOKENS".to_owned(), String::new());
+        assert_eq!(
+            Config::from_map(&forbidden)
+                .expect_err("an empty preferred variable cannot hide a legacy token"),
+            ConfigError::StaticTokensForbidden
         );
     }
 
