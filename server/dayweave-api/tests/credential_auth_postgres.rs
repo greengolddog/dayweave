@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dayweave_api::{
     auth::Scope,
     credential_auth::{
@@ -252,14 +252,14 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
     };
     assert_eq!(rotation_loser, CredentialRepositoryError::InvalidCredential);
     assert_eq!(rotated.revision, 2);
-    assert_eq!(rotated.credential_issued_at, refresh_at);
-    assert_eq!(
+    assert_postgres_instant_eq(rotated.credential_issued_at, refresh_at);
+    assert_postgres_instant_eq(
         rotated.access_expires_at,
-        refresh_at + ChronoDuration::minutes(15)
+        refresh_at + ChronoDuration::minutes(15),
     );
-    assert_eq!(
+    assert_postgres_instant_eq(
         rotated.refresh_idle_expires_at,
-        refresh_at + ChronoDuration::days(30)
+        refresh_at + ChronoDuration::days(30),
     );
     let rotated_access = if first_rotation_won {
         &rotated_access_one
@@ -540,7 +540,7 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
         )
         .await
         .expect("MCP client registered");
-    assert_eq!(client.expires_at, now + ChronoDuration::days(90));
+    assert_postgres_instant_eq(client.expires_at, now + ChronoDuration::days(90));
     assert_eq!(
         client.scopes,
         vec![Scope::ScheduleRead, Scope::SuggestionsSubmit]
@@ -554,8 +554,10 @@ async fn mcp_credentials_enforce_scopes_ttl_revocation_and_hash_only_storage() {
         .expect("active MCP credential");
     assert_eq!(authenticated.id, client_id);
     assert_eq!(
-        authenticated.last_seen_at,
-        Some(now + ChronoDuration::minutes(1))
+        authenticated
+            .last_seen_at
+            .map(|value| value.timestamp_micros()),
+        Some((now + ChronoDuration::minutes(1)).timestamp_micros())
     );
     assert_eq!(
         other_repository
@@ -705,6 +707,14 @@ fn assert_postgres_code(error: &sqlx::Error, expected: &str) {
             .and_then(sqlx::error::DatabaseError::code)
             .is_some_and(|code| code == expected),
         "unexpected PostgreSQL error classification"
+    );
+}
+
+fn assert_postgres_instant_eq(actual: DateTime<Utc>, expected: DateTime<Utc>) {
+    assert_eq!(
+        actual.timestamp_micros(),
+        expected.timestamp_micros(),
+        "PostgreSQL timestamps round to microsecond precision"
     );
 }
 
