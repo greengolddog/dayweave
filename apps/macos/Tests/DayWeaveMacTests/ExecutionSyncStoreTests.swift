@@ -442,7 +442,10 @@ struct ExecutionSyncStoreTests {
         sync.startForegroundPolling(every: .seconds(60))
         try await Task.sleep(for: .milliseconds(20))
         sync.startForegroundPolling(every: .seconds(60))
-        try await Task.sleep(for: .milliseconds(250))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !planner.executionState.historyVerified, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         sync.stopForegroundPolling()
 
         #expect(await transport.snapshotRequestCount() == 2)
