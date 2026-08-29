@@ -100,12 +100,13 @@ Actions weekly, and Dependabot security updates are enabled. Findings are
 updates to review, not authorization to bypass the normal build, test,
 migration, or external-effect checks.
 
-The public repository also has GitHub secret scanning, push protection, and
-CodeQL default setup enabled. Those hosted controls supplement the checked-in
-scanner; they are not a reason to place a credential in a commit, example file,
-issue, build log, or artifact. Dependency Review is not yet a release gate. The
-existing workflow remains plan-independent so its core checks do not depend on
-an optional hosted security product.
+The public repository also has GitHub secret scanning and push protection
+enabled. A checked-in, build-aware CodeQL workflow analyzes Actions, Rust,
+Kotlin, and Swift with extended security queries. Those controls supplement the
+checked-in scanner; they are not a reason to place a credential in a commit,
+example file, issue, build log, or artifact. Dependency Review is not yet a
+release gate. The existing scanner remains plan-independent so its core checks
+do not depend on an optional hosted security product.
 
 ## Sensitive-item disclosure policy
 

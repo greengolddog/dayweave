@@ -1,0 +1,81 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+  security-events: write
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: actions
+            build-mode: none
+            runner: ubuntu-latest
+          - language: rust
+            build-mode: manual
+            runner: ubuntu-latest
+          - language: java-kotlin
+            build-mode: manual
+            runner: ubuntu-latest
+          - language: swift
+            build-mode: manual
+            runner: macos-26
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: matrix.language == 'rust'
+
+      - uses: actions/setup-java@v6
+        if: matrix.language == 'java-kotlin'
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v6
+        if: matrix.language == 'java-kotlin'
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      - name: Build Rust under CodeQL tracing
+        if: matrix.language == 'rust'
+        run: cargo build --workspace --all-targets --all-features
+
+      - name: Build Android under CodeQL tracing
+        if: matrix.language == 'java-kotlin'
+        run: >-
+          apps/android/gradlew --project-dir apps/android
+          --no-daemon --no-build-cache --no-configuration-cache
+          clean assembleDebug
+
+      - name: Build macOS under CodeQL tracing
+        if: matrix.language == 'swift'
+        run: swift build --package-path apps/macos -Xswiftc -warnings-as-errors
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
