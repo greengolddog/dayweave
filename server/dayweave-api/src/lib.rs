@@ -17,6 +17,7 @@ pub mod http;
 pub mod integrations;
 pub mod items;
 pub mod mcp;
+pub mod mcp_oauth;
 pub mod persistence;
 pub mod proposals;
 pub mod readiness;
@@ -36,6 +37,7 @@ use google_oauth::{
 use google_sync::{GoogleSyncRepository, GoogleSyncService, ProductionGoogleSyncProvider};
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
+use mcp_oauth::McpOAuthVerifier;
 use persistence::{
     Database, PersistenceError, PostgresCredentialRepository, PostgresExecutionRepository,
     PostgresGoogleOAuthRepository, PostgresGoogleSyncRepository, PostgresItemRepository,
@@ -127,6 +129,7 @@ pub struct AppState {
     pub auth_mode: AuthMode,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
+    pub mcp_oauth: Option<Arc<McpOAuthVerifier>>,
     pub google_oauth: Option<Arc<GoogleOAuthService>>,
     pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
     execution_repository: Arc<dyn ExecutionRepository>,
@@ -185,6 +188,13 @@ impl AppState {
             proposals.clone(),
             config.mcp_allowed_origins.clone(),
         ));
+        let mcp_oauth = config
+            .mcp_oauth
+            .clone()
+            .map(McpOAuthVerifier::production)
+            .transpose()
+            .map_err(|_| PersistenceError::AuthenticationInitializationFailed)?
+            .map(Arc::new);
         let mut google_sync = None;
         let google_oauth = if let Some(google) = config.google_oauth.as_ref() {
             use secrecy::ExposeSecret as _;
@@ -271,6 +281,7 @@ impl AppState {
             auth_mode: config.auth_mode,
             readiness,
             mcp,
+            mcp_oauth,
             google_oauth,
             google_sync,
             execution_repository,
@@ -311,6 +322,7 @@ impl AppState {
             auth_mode: AuthMode::LegacyStatic,
             readiness,
             mcp,
+            mcp_oauth: None,
             google_oauth: None,
             google_sync: None,
             execution_repository,
@@ -342,6 +354,12 @@ impl AppState {
             self.proposals.clone(),
             allowed_origins,
         ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_mcp_oauth(mut self, verifier: Arc<McpOAuthVerifier>) -> Self {
+        self.mcp_oauth = Some(verifier);
         self
     }
 

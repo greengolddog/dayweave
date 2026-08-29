@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
@@ -8,7 +8,7 @@ use std::{
 
 use secrecy::SecretString;
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -28,6 +28,8 @@ const MIN_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 5;
 const MAX_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 30;
 const DEFAULT_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 10;
 const MAX_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 30;
+const MAX_MCP_OAUTH_CLIENT_IDS: usize = 32;
+const MAX_MCP_OAUTH_VALUE_LENGTH: usize = 2_048;
 
 pub const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
@@ -79,6 +81,44 @@ pub struct GoogleOAuthConfig {
     /// key, this version must be retained for the lifetime of published items.
     pub identity_key_version: u32,
     pub session_ttl: Duration,
+}
+
+/// Disabled-by-default Auth0 resource-server policy for published MCP clients.
+///
+/// This contains only public identifiers and allowlists. Auth0 remains the
+/// authorization server; `DayWeave` never receives a client secret through this
+/// configuration surface.
+#[derive(Clone)]
+pub struct McpOAuthConfig {
+    pub resource: Url,
+    pub issuer: Url,
+    pub jwks_uri: Url,
+    pub resource_metadata_uri: Url,
+    pub owner_subject: String,
+    pub allowed_client_ids: Arc<Vec<String>>,
+    pub allowed_origins: Arc<Vec<String>>,
+    pub user_id: Uuid,
+    pub workspace_id: Uuid,
+}
+
+impl std::fmt::Debug for McpOAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpOAuthConfig")
+            .field("resource", &self.resource.as_str())
+            .field("issuer", &self.issuer.as_str())
+            .field("jwks_uri", &self.jwks_uri.as_str())
+            .field(
+                "resource_metadata_uri",
+                &self.resource_metadata_uri.as_str(),
+            )
+            .field("owner_subject", &"[REDACTED]")
+            .field("allowed_client_ids_count", &self.allowed_client_ids.len())
+            .field("allowed_origins_count", &self.allowed_origins.len())
+            .field("user_id", &"[REDACTED]")
+            .field("workspace_id", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for GoogleOAuthConfig {
@@ -173,6 +213,7 @@ pub struct Config {
     pub api_token_hashes: Arc<Vec<TokenHash>>,
     pub proposal_ttl: Duration,
     pub mcp_allowed_origins: Arc<Vec<String>>,
+    pub mcp_oauth: Option<McpOAuthConfig>,
     pub database: Option<DatabaseConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
     /// External Google writes require both this explicit deployment opt-in and
@@ -300,6 +341,12 @@ impl Config {
         {
             return Err(ConfigError::MissingDatabaseUrl);
         }
+        let mcp_oauth = mcp_oauth_config(
+            values,
+            auth_mode,
+            database.as_ref(),
+            mcp_allowed_origins.as_ref(),
+        )?;
         if auth_mode != AuthMode::LegacyStatic && database.is_none() {
             return Err(ConfigError::AuthModeRequiresDatabase);
         }
@@ -338,6 +385,7 @@ impl Config {
             api_token_hashes,
             proposal_ttl: Duration::from_secs(ttl_seconds),
             mcp_allowed_origins,
+            mcp_oauth,
             database,
             google_oauth,
             google_outbound_enabled,
@@ -372,6 +420,28 @@ pub enum ConfigError {
     InvalidProposalTtl(String),
     #[error("invalid DAYWEAVE_MCP_ALLOWED_ORIGINS entry: {0}")]
     InvalidMcpOrigin(String),
+    #[error("DAYWEAVE_MCP_OAUTH_ENABLED must be true or false")]
+    InvalidMcpOAuthEnabled,
+    #[error("MCP OAuth settings were supplied while DAYWEAVE_MCP_OAUTH_ENABLED is not true")]
+    DisabledMcpOAuthConfiguration,
+    #[error("MCP OAuth requires credential_only authentication")]
+    McpOAuthRequiresCredentialOnly,
+    #[error("MCP OAuth requires DAYWEAVE_DATABASE_URL")]
+    McpOAuthRequiresDatabase,
+    #[error("MCP OAuth is enabled but a required setting is missing: {0}")]
+    MissingMcpOAuthSetting(&'static str),
+    #[error("DAYWEAVE_MCP_OAUTH_RESOURCE must be the exact public HTTPS /mcp URL")]
+    InvalidMcpOAuthResource,
+    #[error("DAYWEAVE_MCP_OAUTH_ISSUER must be an exact HTTPS Auth0 issuer ending in '/'")]
+    InvalidMcpOAuthIssuer,
+    #[error("DAYWEAVE_MCP_OAUTH_OWNER_SUBJECT is invalid")]
+    InvalidMcpOAuthOwnerSubject,
+    #[error("DAYWEAVE_MCP_OAUTH_CLIENT_IDS must contain unique bounded client identifiers")]
+    InvalidMcpOAuthClientIds,
+    #[error(
+        "DAYWEAVE_MCP_OAUTH_ALLOWED_ORIGINS must be exact HTTPS origins from DAYWEAVE_MCP_ALLOWED_ORIGINS"
+    )]
+    InvalidMcpOAuthOrigins,
     #[error("DAYWEAVE_DATABASE_URL is required in staging and production")]
     MissingDatabaseUrl,
     #[error("DAYWEAVE_DATABASE_URL must be a non-empty PostgreSQL URL")]
@@ -412,6 +482,173 @@ pub enum ConfigError {
     GoogleOutboundRequiresOAuth,
     #[error("invalid DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")]
     InvalidGoogleOutboundApprovalTtl,
+}
+
+fn mcp_oauth_config(
+    values: &HashMap<String, String>,
+    auth_mode: AuthMode,
+    database: Option<&DatabaseConfig>,
+    global_allowed_origins: &[String],
+) -> Result<Option<McpOAuthConfig>, ConfigError> {
+    let enabled = match values.get("DAYWEAVE_MCP_OAUTH_ENABLED").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ConfigError::InvalidMcpOAuthEnabled),
+    };
+    let oauth_settings_present = values
+        .keys()
+        .any(|key| key.starts_with("DAYWEAVE_MCP_OAUTH_") && key != "DAYWEAVE_MCP_OAUTH_ENABLED");
+    if !enabled {
+        if oauth_settings_present {
+            return Err(ConfigError::DisabledMcpOAuthConfiguration);
+        }
+        return Ok(None);
+    }
+    if auth_mode != AuthMode::CredentialOnly {
+        return Err(ConfigError::McpOAuthRequiresCredentialOnly);
+    }
+    let database = database.ok_or(ConfigError::McpOAuthRequiresDatabase)?;
+    let required = |key: &'static str| {
+        values
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingMcpOAuthSetting(key))
+    };
+
+    let resource = parse_mcp_oauth_resource(required("DAYWEAVE_MCP_OAUTH_RESOURCE")?)?;
+    let issuer = parse_mcp_oauth_issuer(required("DAYWEAVE_MCP_OAUTH_ISSUER")?)?;
+    let jwks_uri = issuer
+        .join(".well-known/jwks.json")
+        .map_err(|_| ConfigError::InvalidMcpOAuthIssuer)?;
+    let mut resource_metadata_uri = resource.clone();
+    resource_metadata_uri.set_path("/.well-known/oauth-protected-resource/mcp");
+
+    let owner_subject = required("DAYWEAVE_MCP_OAUTH_OWNER_SUBJECT")?;
+    if owner_subject.len() > 255
+        || !owner_subject.is_ascii()
+        || owner_subject.chars().any(char::is_whitespace)
+        || owner_subject.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidMcpOAuthOwnerSubject);
+    }
+
+    let allowed_client_ids = parse_mcp_oauth_list(
+        required("DAYWEAVE_MCP_OAUTH_CLIENT_IDS")?,
+        MAX_MCP_OAUTH_CLIENT_IDS,
+        MAX_MCP_OAUTH_VALUE_LENGTH,
+    )
+    .map_err(|()| ConfigError::InvalidMcpOAuthClientIds)?;
+    let allowed_origins =
+        values
+            .get("DAYWEAVE_MCP_OAUTH_ALLOWED_ORIGINS")
+            .map_or(Ok(Vec::new()), |raw| {
+                if raw.trim().is_empty() {
+                    return Ok(Vec::new());
+                }
+                let origins = parse_mcp_oauth_list(raw, MAX_MCP_OAUTH_CLIENT_IDS, 512)
+                    .map_err(|()| ConfigError::InvalidMcpOAuthOrigins)?;
+                if origins.iter().any(|origin| {
+                    !is_exact_https_origin(origin) || !global_allowed_origins.contains(origin)
+                }) {
+                    return Err(ConfigError::InvalidMcpOAuthOrigins);
+                }
+                Ok(origins)
+            })?;
+
+    Ok(Some(McpOAuthConfig {
+        resource,
+        issuer,
+        jwks_uri,
+        resource_metadata_uri,
+        owner_subject: owner_subject.to_owned(),
+        allowed_client_ids: Arc::new(allowed_client_ids),
+        allowed_origins: Arc::new(allowed_origins),
+        user_id: database.user_id,
+        workspace_id: database.workspace_id,
+    }))
+}
+
+fn parse_mcp_oauth_resource(value: &str) -> Result<Url, ConfigError> {
+    let resource = Url::parse(value).map_err(|_| ConfigError::InvalidMcpOAuthResource)?;
+    if resource.as_str() != value
+        || resource.scheme() != "https"
+        || resource.username() != ""
+        || resource.password().is_some()
+        || resource.host_str().is_none()
+        || resource.query().is_some()
+        || resource.fragment().is_some()
+        || resource.path() != "/mcp"
+    {
+        return Err(ConfigError::InvalidMcpOAuthResource);
+    }
+    Ok(resource)
+}
+
+fn parse_mcp_oauth_issuer(value: &str) -> Result<Url, ConfigError> {
+    let issuer = Url::parse(value).map_err(|_| ConfigError::InvalidMcpOAuthIssuer)?;
+    let public_domain = match issuer.host() {
+        Some(Host::Domain(host)) => {
+            host.contains('.')
+                && !host.split('.').next_back().is_some_and(|label| {
+                    label.eq_ignore_ascii_case("localhost") || label.eq_ignore_ascii_case("local")
+                })
+        }
+        Some(Host::Ipv4(_) | Host::Ipv6(_)) | None => false,
+    };
+    if issuer.as_str() != value
+        || !value.ends_with('/')
+        || issuer.scheme() != "https"
+        || issuer.username() != ""
+        || issuer.password().is_some()
+        || issuer.host_str().is_none()
+        || issuer.query().is_some()
+        || issuer.fragment().is_some()
+        || issuer.path() != "/"
+        || issuer.port().is_some()
+        || !public_domain
+    {
+        return Err(ConfigError::InvalidMcpOAuthIssuer);
+    }
+    Ok(issuer)
+}
+
+fn parse_mcp_oauth_list(
+    value: &str,
+    maximum_entries: usize,
+    maximum_entry_length: usize,
+) -> Result<Vec<String>, ()> {
+    let entries = value.split(',').map(str::trim).collect::<Vec<_>>();
+    if entries.is_empty() || entries.len() > maximum_entries {
+        return Err(());
+    }
+    let mut unique = BTreeSet::new();
+    for entry in entries {
+        if entry.is_empty()
+            || entry.len() > maximum_entry_length
+            || !entry.is_ascii()
+            || entry.chars().any(char::is_whitespace)
+            || entry.chars().any(char::is_control)
+            || !unique.insert(entry.to_owned())
+        {
+            return Err(());
+        }
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn is_exact_https_origin(value: &str) -> bool {
+    let Ok(url) = Url::parse(value) else {
+        return false;
+    };
+    url.as_str() == format!("{value}/")
+        && url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.host_str().is_some()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn google_oauth_config(
@@ -669,9 +906,183 @@ mod tests {
         assert_eq!(config.proposal_ttl, Duration::from_hours(7 * 24));
         assert_eq!(config.api_token_hashes.len(), 1);
         assert!(config.mcp_allowed_origins.is_empty());
+        assert!(config.mcp_oauth.is_none());
         assert!(config.google_oauth.is_none());
         assert!(!config.google_outbound_enabled);
         assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(10));
+    }
+
+    fn valid_mcp_oauth_values() -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "DAYWEAVE_AUTH_MODE".to_owned(),
+                "credential_only".to_owned(),
+            ),
+            (
+                "DAYWEAVE_DATABASE_URL".to_owned(),
+                "postgres://dayweave:redacted@database/dayweave".to_owned(),
+            ),
+            ("DAYWEAVE_MCP_OAUTH_ENABLED".to_owned(), "true".to_owned()),
+            (
+                "DAYWEAVE_MCP_OAUTH_RESOURCE".to_owned(),
+                "https://api.example.test/mcp".to_owned(),
+            ),
+            (
+                "DAYWEAVE_MCP_OAUTH_ISSUER".to_owned(),
+                "https://tenant.eu.auth0.com/".to_owned(),
+            ),
+            (
+                "DAYWEAVE_MCP_OAUTH_OWNER_SUBJECT".to_owned(),
+                "auth0|personal-owner".to_owned(),
+            ),
+            (
+                "DAYWEAVE_MCP_OAUTH_CLIENT_IDS".to_owned(),
+                "https://chatgpt.com/oauth/client.json".to_owned(),
+            ),
+            (
+                "DAYWEAVE_MCP_ALLOWED_ORIGINS".to_owned(),
+                "https://chatgpt.com".to_owned(),
+            ),
+            (
+                "DAYWEAVE_MCP_OAUTH_ALLOWED_ORIGINS".to_owned(),
+                "https://chatgpt.com".to_owned(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn mcp_oauth_is_disabled_by_default_and_rejects_latent_configuration() {
+        let mut disabled = valid_values();
+        disabled.insert(
+            "DAYWEAVE_MCP_OAUTH_RESOURCE".to_owned(),
+            "https://api.example.test/mcp".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&disabled).expect_err("disabled settings must not be latent"),
+            ConfigError::DisabledMcpOAuthConfiguration
+        );
+
+        let mut ambiguous = valid_values();
+        ambiguous.insert("DAYWEAVE_MCP_OAUTH_ENABLED".to_owned(), "yes".to_owned());
+        assert_eq!(
+            Config::from_map(&ambiguous).expect_err("switch must be exact"),
+            ConfigError::InvalidMcpOAuthEnabled
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_requires_credential_only_and_durable_scope() {
+        let mut legacy = valid_mcp_oauth_values();
+        legacy.insert("DAYWEAVE_AUTH_MODE".to_owned(), "legacy_static".to_owned());
+        legacy.insert(
+            "DAYWEAVE_API_TOKEN".to_owned(),
+            "a-secure-development-token-123".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&legacy).expect_err("legacy fallback must be impossible"),
+            ConfigError::McpOAuthRequiresCredentialOnly
+        );
+
+        let mut no_database = valid_mcp_oauth_values();
+        no_database.remove("DAYWEAVE_DATABASE_URL");
+        assert_eq!(
+            Config::from_map(&no_database).expect_err("durable identity is mandatory"),
+            ConfigError::McpOAuthRequiresDatabase
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_pins_exact_resource_issuer_clients_and_origin_intersection() {
+        let config = Config::from_map(&valid_mcp_oauth_values()).expect("valid OAuth policy");
+        let oauth = config.mcp_oauth.expect("OAuth enabled");
+        assert_eq!(oauth.resource.as_str(), "https://api.example.test/mcp");
+        assert_eq!(
+            oauth.jwks_uri.as_str(),
+            "https://tenant.eu.auth0.com/.well-known/jwks.json"
+        );
+        assert_eq!(
+            oauth.resource_metadata_uri.as_str(),
+            "https://api.example.test/.well-known/oauth-protected-resource/mcp"
+        );
+        assert_eq!(
+            oauth.allowed_client_ids.as_slice(),
+            ["https://chatgpt.com/oauth/client.json"]
+        );
+        assert_eq!(oauth.allowed_origins.as_slice(), ["https://chatgpt.com"]);
+        let debug = format!("{oauth:?}");
+        assert!(debug.contains("https://api.example.test/mcp"));
+        assert!(debug.contains("https://tenant.eu.auth0.com/"));
+        assert!(debug.contains("allowed_client_ids_count: 1"));
+        assert!(debug.contains("allowed_origins_count: 1"));
+        for private_identifier in [
+            "auth0|personal-owner",
+            "https://chatgpt.com/oauth/client.json",
+            "https://chatgpt.com\"",
+            &oauth.user_id.to_string(),
+            &oauth.workspace_id.to_string(),
+        ] {
+            assert!(
+                !debug.contains(private_identifier),
+                "OAuth Debug must redact identity and allowlist values"
+            );
+        }
+
+        let mut bad_resource = valid_mcp_oauth_values();
+        bad_resource.insert(
+            "DAYWEAVE_MCP_OAUTH_RESOURCE".to_owned(),
+            "https://api.example.test/mcp/".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&bad_resource).expect_err("resource is exact"),
+            ConfigError::InvalidMcpOAuthResource
+        );
+
+        let mut bad_issuer = valid_mcp_oauth_values();
+        bad_issuer.insert(
+            "DAYWEAVE_MCP_OAUTH_ISSUER".to_owned(),
+            "https://tenant.eu.auth0.com/oauth/".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&bad_issuer).expect_err("issuer is exact root"),
+            ConfigError::InvalidMcpOAuthIssuer
+        );
+
+        for issuer in [
+            "https://127.0.0.1/",
+            "https://[::1]/",
+            "https://localhost/",
+            "https://auth.local/",
+            "https://single-label/",
+            "https://tenant.eu.auth0.com:8443/",
+        ] {
+            let mut local_issuer = valid_mcp_oauth_values();
+            local_issuer.insert("DAYWEAVE_MCP_OAUTH_ISSUER".to_owned(), issuer.to_owned());
+            assert_eq!(
+                Config::from_map(&local_issuer).expect_err("issuer must be a public HTTPS origin"),
+                ConfigError::InvalidMcpOAuthIssuer,
+                "{issuer}"
+            );
+        }
+
+        let mut duplicate_client = valid_mcp_oauth_values();
+        duplicate_client.insert(
+            "DAYWEAVE_MCP_OAUTH_CLIENT_IDS".to_owned(),
+            "client-a,client-a".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&duplicate_client).expect_err("client allowlist is strict"),
+            ConfigError::InvalidMcpOAuthClientIds
+        );
+
+        let mut disjoint_origin = valid_mcp_oauth_values();
+        disjoint_origin.insert(
+            "DAYWEAVE_MCP_OAUTH_ALLOWED_ORIGINS".to_owned(),
+            "https://evil.example".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&disjoint_origin).expect_err("both origin policies must allow"),
+            ConfigError::InvalidMcpOAuthOrigins
+        );
     }
 
     #[test]

@@ -162,7 +162,15 @@ pub fn response_meta(request_id: &str) -> Value {
 
 pub fn attach_response_meta(result: &mut Value, request_id: &str) {
     if let Some(object) = result.as_object_mut() {
-        object.insert("_meta".to_owned(), response_meta(request_id));
+        let server_meta = response_meta(request_id);
+        let metadata = object
+            .entry("_meta".to_owned())
+            .or_insert_with(|| json!({}));
+        if let (Some(metadata), Some(server_meta)) =
+            (metadata.as_object_mut(), server_meta.as_object())
+        {
+            metadata.extend(server_meta.clone());
+        }
     }
 }
 

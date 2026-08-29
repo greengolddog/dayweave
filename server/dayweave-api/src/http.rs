@@ -194,6 +194,19 @@ impl Modify for SecurityAddon {
 }
 
 pub fn router(state: AppState) -> Router {
+    let oauth_metadata = if state.mcp_oauth.is_some() {
+        Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(crate::mcp_oauth::protected_resource_metadata),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/mcp",
+                get(crate::mcp_oauth::protected_resource_metadata),
+            )
+    } else {
+        Router::new()
+    };
     let protected = Router::new()
         .route(
             "/suggestions",
@@ -227,6 +240,7 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/openapi.json", get(openapi))
         .route("/mcp", post(crate::mcp::handle_post))
+        .merge(oauth_metadata)
         .merge(crate::google_oauth::http::public_routes())
         .merge(crate::credential_auth::http::public_routes())
         .nest("/v1", protected)

@@ -91,14 +91,17 @@ effects must flow through an auditable proposal or outbox boundary.
   submission, and browser requests must satisfy both the global and per-client
   exact Origin allowlists. Reserved `dw_` credentials never downgrade to static
   authentication after a durable failure.
-- The current `dw_mc1_` mechanism is only a native bearer for first-party or
-  local MCP clients capable of securely storing a custom credential. It is not
-  the MCP OAuth 2.1 authorization flow required for published ChatGPT/Codex
-  account linking. The server intentionally advertises no OAuth security scheme
-  or protected-resource metadata and sends no `resource_metadata` challenge.
-  Publishing remains blocked until authorization code with PKCE, client
-  identification/registration, resource/audience binding, consent, and OAuth
-  token lifecycle behavior are implemented and separately security-reviewed.
+- The `dw_mc1_` mechanism remains a native bearer for first-party or local MCP
+  clients capable of securely storing a custom credential. Published
+  ChatGPT/Codex clients use a separate Auth0-backed OAuth 2.1 resource-server
+  boundary that is disabled by default. When explicitly enabled, the server
+  publishes protected-resource metadata, exact `resource_metadata` challenges,
+  and per-tool OAuth security schemes; verifies only bounded RS256 access tokens
+  for the exact owner, client, issuer, and MCP resource; and never accepts those
+  tokens at REST. The complete activation, preflight, and rollback contract is
+  documented in [`mcp-oauth.md`](mcp-oauth.md). Publication remains blocked on
+  that reviewed Auth0/tunnel preflight and on replacing the production MCP
+  schedule-query and simulation placeholders with audited live ports.
 - Credential issuance, list, rotation, and revocation APIs are redacted and
   carry no-store headers. The enrollment initiator generates and journals the
   enrollment identifier and secret with the OS CSPRNG before I/O; the server

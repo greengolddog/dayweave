@@ -81,24 +81,14 @@ All management endpoints below are under `/v1` and require their named scope.
    `suggestions_submit`. A browser Origin must match both the global server
    allowlist and the exact per-client origin list.
 
-### Published ChatGPT/Codex MCP account linking is not implemented
+### Published ChatGPT/Codex MCP account linking
 
-The `dw_mc1_` credential is a native bearer for first-party and local MCP
-clients that can store and present a custom credential. It is not an OAuth
-access token and does not make this server linkable as a published
-ChatGPT/Codex MCP integration. Those clients require the MCP OAuth 2.1 surface,
-including protected-resource and authorization-server metadata, authorization
-code with PKCE, client identification/registration, resource/audience binding,
-consent, and OAuth access/refresh lifecycle behavior. ChatGPT cannot be
-configured to send this custom bearer as an API key.
-
-The server therefore does not advertise an OAuth `securitySchemes` entry,
-protected-resource metadata, or a `resource_metadata` parameter in its 401
-challenge. Do not register or publish this endpoint as a ChatGPT/Codex account
-link until that complete surface has been implemented and independently
-security-reviewed. Reusing the Google OAuth implementation or merely adding
-metadata would be unsafe: it is a provider-client flow, not an authorization
-server for DayWeave.
+The `dw_mc1_` credential remains a native bearer for first-party and local MCP
+clients. Published clients use a separate, disabled-by-default Auth0 OAuth 2.1
+resource-server boundary. Follow [`mcp-oauth.md`](mcp-oauth.md) for its exact
+metadata, token, scope, allowlist, deployment, preflight, and rollback contract.
+Google OAuth is unrelated provider-client authorization and is never reused as
+the DayWeave authorization server.
 
 REST rejects MCP credentials, and MCP rejects device credentials. Static
 credentials work in both audiences only while legacy or hybrid mode is active.
@@ -142,6 +132,7 @@ approval; it must not happen automatically.
 The server slice does not configure ingress/per-principal rate limiting or
 suspicious-authentication alerts, and the first-party clients must still adopt
 the exact journal/atomic-store protocol. Published ChatGPT/Codex account linking
-also remains blocked on the complete MCP OAuth 2.1 authorization-server surface
-described above. Until those gates and a real-device cutover rehearsal pass,
-keep the deployment classified as a development artifact.
+remains blocked until the documented Auth0 activation preflight passes and
+production MCP schedule-query/simulation ports replace their unavailable
+placeholders. Until those gates and a real-device cutover rehearsal pass, keep
+the deployment classified as a development artifact.

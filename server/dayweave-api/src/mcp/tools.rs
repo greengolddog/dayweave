@@ -8,7 +8,11 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
-    auth::{Principal, Scope},
+    auth::{Principal, PrincipalAudience, Scope},
+    mcp_oauth::{
+        SCOPE_SCHEDULE_READ as SCOPE_FOR_READ, SCOPE_SCHEDULE_SIMULATE as SCOPE_FOR_SIMULATE,
+        SCOPE_SUGGESTIONS_SUBMIT as SCOPE_FOR_SUBMIT, scope_name,
+    },
     proposals::{NewProposal, ProposalKind, ProposalService, ProposalSource},
     scheduling::{
         ConflictQuery, ItemSearchQuery, PlanOperation, PlanOperationKind, PlanningSimulationPort,
@@ -102,9 +106,7 @@ impl McpService {
         name: &str,
         arguments: Value,
     ) -> Result<ToolOutput, ToolCallError> {
-        if !tool_is_visible(&context.principal, name) {
-            return Err(ToolCallError::UnknownTool(name.to_owned()));
-        }
+        self.authorize_tool(&context.principal, name)?;
         let access = ScheduleAccess {
             subject: context.principal.subject.clone(),
             include_sensitive: false,
@@ -210,6 +212,28 @@ impl McpService {
         }
     }
 
+    /// Performs tool authorization before argument processing or any port call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an unknown-tool error for unknown or native-hidden tools, or an
+    /// insufficient-scope error for a known OAuth tool needing step-up consent.
+    pub fn authorize_tool(&self, principal: &Principal, name: &str) -> Result<(), ToolCallError> {
+        let Some(required) = required_tool_scope(name) else {
+            return Err(ToolCallError::UnknownTool(name.to_owned()));
+        };
+        if principal.has_scope(required) {
+            return Ok(());
+        }
+        if principal.audience == PrincipalAudience::McpOAuth {
+            let Some(scope) = scope_name(required) else {
+                return Err(ToolCallError::UnknownTool(name.to_owned()));
+            };
+            return Err(ToolCallError::InsufficientScope { scope });
+        }
+        Err(ToolCallError::UnknownTool(name.to_owned()))
+    }
+
     async fn submit_proposal(
         &self,
         context: &McpRequestContext,
@@ -311,6 +335,9 @@ impl McpService {
 #[derive(Clone, Debug)]
 pub enum ToolCallError {
     UnknownTool(String),
+    InsufficientScope {
+        scope: &'static str,
+    },
     Execution {
         code: &'static str,
         message: String,
@@ -324,6 +351,9 @@ impl std::fmt::Display for ToolCallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownTool(name) => write!(formatter, "unknown tool: {name}"),
+            Self::InsufficientScope { scope } => {
+                write!(formatter, "additional OAuth scope is required: {scope}")
+            }
             Self::Execution { message, .. } => formatter.write_str(message),
         }
     }
@@ -364,6 +394,7 @@ impl ToolCallError {
     pub fn code(&self) -> &str {
         match self {
             Self::UnknownTool(_) => "unknown_tool",
+            Self::InsufficientScope { .. } => "insufficient_scope",
             Self::Execution { code, .. } => code,
         }
     }
@@ -371,7 +402,7 @@ impl ToolCallError {
     #[must_use]
     pub fn details(&self) -> Option<&Value> {
         match self {
-            Self::UnknownTool(_) => None,
+            Self::UnknownTool(_) | Self::InsufficientScope { .. } => None,
             Self::Execution { details, .. } => details.as_ref(),
         }
     }
@@ -379,6 +410,14 @@ impl ToolCallError {
     #[must_use]
     pub const fn is_unknown_tool(&self) -> bool {
         matches!(self, Self::UnknownTool(_))
+    }
+
+    #[must_use]
+    pub const fn insufficient_scope(&self) -> Option<&'static str> {
+        match self {
+            Self::InsufficientScope { scope } => Some(scope),
+            _ => None,
+        }
     }
 }
 
@@ -616,14 +655,14 @@ fn output(summary: &str, value: &impl Serialize) -> Result<ToolOutput, ToolCallE
     })
 }
 
-fn tool_is_visible(principal: &Principal, name: &str) -> bool {
+fn required_tool_scope(name: &str) -> Option<Scope> {
     match name {
         "get_schedule" | "search_items" | "explain_placement" | "get_conflicts" => {
-            principal.has_scope(Scope::ScheduleRead)
+            Some(Scope::ScheduleRead)
         }
-        "simulate_plan" => principal.has_scope(Scope::ScheduleSimulate),
-        "submit_proposal" => principal.has_scope(Scope::SuggestionsSubmit),
-        _ => false,
+        "simulate_plan" => Some(Scope::ScheduleSimulate),
+        "submit_proposal" => Some(Scope::SuggestionsSubmit),
+        _ => None,
     }
 }
 
@@ -634,7 +673,8 @@ pub fn requires_idempotency_header(name: &str) -> bool {
 
 fn tool_definitions(principal: &Principal) -> Vec<Value> {
     let mut tools = Vec::new();
-    if principal.has_scope(Scope::ScheduleRead) {
+    let oauth = principal.audience == PrincipalAudience::McpOAuth;
+    if oauth || principal.has_scope(Scope::ScheduleRead) {
         tools.extend([
             tool(
                 "get_schedule",
@@ -642,6 +682,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
                 "Read a bounded schedule interval. Sensitive content is redacted by server policy. This tool never changes schedule state.",
                 &interval_schema(true),
                 &read_annotations(),
+                oauth.then_some(SCOPE_FOR_READ),
             ),
             tool(
                 "search_items",
@@ -649,6 +690,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
                 "Find non-sensitive tasks, habits, routines, goals, breaks, or events by text and filters without changing them.",
                 &search_schema(),
                 &read_annotations(),
+                oauth.then_some(SCOPE_FOR_READ),
             ),
             tool(
                 "explain_placement",
@@ -659,6 +701,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
                     &["block_id"],
                 ),
                 &read_annotations(),
+                oauth.then_some(SCOPE_FOR_READ),
             ),
             tool(
                 "get_conflicts",
@@ -666,19 +709,21 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
                 "Read hard violations, soft penalties, overload, and deadline risk in a bounded interval without changing the schedule.",
                 &interval_schema(false),
                 &read_annotations(),
+                oauth.then_some(SCOPE_FOR_READ),
             ),
         ]);
     }
-    if principal.has_scope(Scope::ScheduleSimulate) {
+    if oauth || principal.has_scope(Scope::ScheduleSimulate) {
         tools.push(tool(
             "simulate_plan",
             "Simulate plan",
             "Run a side-effect-free what-if plan against a specific schedule revision. Returns an explicit simulation token; canonical state is never changed.",
             &simulation_schema(),
             &read_annotations(),
+            oauth.then_some(SCOPE_FOR_SIMULATE),
         ));
     }
-    if principal.has_scope(Scope::SuggestionsSubmit) {
+    if oauth || principal.has_scope(Scope::SuggestionsSubmit) {
         tools.push(tool(
             "submit_proposal",
             "Submit proposal",
@@ -690,6 +735,7 @@ fn tool_definitions(principal: &Principal) -> Vec<Value> {
                 "idempotentHint": true,
                 "openWorldHint": false,
             }),
+            oauth.then_some(SCOPE_FOR_SUBMIT),
         ));
     }
     tools
@@ -701,8 +747,9 @@ fn tool(
     description: &str,
     input_schema: &Value,
     annotations: &Value,
+    oauth_scope: Option<&str>,
 ) -> Value {
-    json!({
+    let mut definition = json!({
         "name": name,
         "title": title,
         "description": description,
@@ -712,7 +759,14 @@ fn tool(
             "additionalProperties": true
         },
         "annotations": annotations,
-    })
+    });
+    if let Some(scope) = oauth_scope {
+        definition["securitySchemes"] = json!([{
+            "type": "oauth2",
+            "scopes": [scope],
+        }]);
+    }
+    definition
 }
 
 fn read_annotations() -> Value {

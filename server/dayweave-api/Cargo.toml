@@ -21,6 +21,8 @@ dayweave-core = { path = "../../crates/dayweave-core" }
 dayweave-google = { path = "../../crates/dayweave-google" }
 getrandom = "0.4"
 hmac = "0.12"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+mime = "0.3"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
@@ -42,3 +44,5 @@ zeroize = "1"
 
 [dev-dependencies]
 http-body-util = "0.1"
+rand = "0.8"
+rsa = "0.9"

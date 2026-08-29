@@ -1,8 +1,6 @@
 mod protocol;
 mod tools;
 
-use std::sync::Arc;
-
 use axum::{
     body::Bytes,
     extract::State,
@@ -20,6 +18,8 @@ pub use tools::{McpRequestContext, McpService};
 use crate::{
     AppState,
     auth::{PrincipalAudience, bearer_token_from_headers},
+    credential_auth::CredentialKind,
+    mcp_oauth::McpOAuthVerifier,
 };
 use protocol::{
     CURRENT_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION, RpcError, RpcRequest,
@@ -46,16 +46,37 @@ pub async fn handle_post(
 ) -> Response {
     let request_id = request_id(&headers);
     let Some(token) = bearer_token_from_headers(&headers) else {
-        return unauthorized(&request_id);
+        return unauthorized(&request_id, state.mcp_oauth.as_deref(), false);
     };
-    let Ok(principal) = state.authenticator.authenticate(token).await else {
-        return unauthorized(&request_id);
+    let principal = if let Some(verifier) = state.mcp_oauth.as_deref() {
+        if token.starts_with(CredentialKind::McpClient.prefix()) {
+            let Ok(principal) = state.authenticator.authenticate(token).await else {
+                return unauthorized(&request_id, None, true);
+            };
+            principal
+        } else {
+            let Ok(principal) = verifier.authenticate(token).await else {
+                return unauthorized(&request_id, Some(verifier), true);
+            };
+            principal
+        }
+    } else {
+        let Ok(principal) = state.authenticator.authenticate(token).await else {
+            return unauthorized(&request_id, None, true);
+        };
+        principal
     };
     if !matches!(
         principal.audience,
-        PrincipalAudience::Legacy | PrincipalAudience::Mcp
+        PrincipalAudience::Legacy | PrincipalAudience::Mcp | PrincipalAudience::McpOAuth
     ) {
-        return unauthorized(&request_id);
+        return unauthorized(
+            &request_id,
+            (principal.audience == PrincipalAudience::McpOAuth)
+                .then_some(state.mcp_oauth.as_deref())
+                .flatten(),
+            true,
+        );
     }
     if let Some(origin) = headers.get(ORIGIN) {
         let allowed = origin.to_str().is_ok_and(|origin| {
@@ -189,7 +210,7 @@ pub async fn handle_post(
             }
             json_response(StatusCode::OK, success(request.id.as_ref(), &result))
         }
-        "tools/call" => handle_tool_call(&state.mcp, &headers, request, era, &context).await,
+        "tools/call" => handle_tool_call(&state, &headers, request, era, &context).await,
         _ => rpc_error_response(
             StatusCode::NOT_FOUND,
             RpcError::new(-32601, "Method not found", request.id),
@@ -199,7 +220,7 @@ pub async fn handle_post(
 }
 
 async fn handle_tool_call(
-    service: &Arc<McpService>,
+    state: &AppState,
     headers: &HeaderMap,
     request: RpcRequest,
     era: ProtocolEra,
@@ -212,6 +233,24 @@ async fn handle_tool_call(
             &context.request_id,
         );
     };
+    if let Err(error) = state.mcp.authorize_tool(&context.principal, name) {
+        return if error.is_unknown_tool() {
+            rpc_error_response(
+                StatusCode::OK,
+                RpcError::new(-32602, error.to_string(), request.id),
+                &context.request_id,
+            )
+        } else {
+            tool_error_response(
+                request.id.as_ref(),
+                error,
+                era,
+                &context.request_id,
+                state.mcp_oauth.as_deref(),
+                context.principal.audience,
+            )
+        };
+    }
     let arguments = match request.params.get("arguments") {
         None => json!({}),
         Some(Value::Object(arguments)) => Value::Object(arguments.clone()),
@@ -230,7 +269,7 @@ async fn handle_tool_call(
         return rpc_error_response(StatusCode::BAD_REQUEST, error, &context.request_id);
     }
 
-    match service.call_tool(context, name, arguments).await {
+    match state.mcp.call_tool(context, name, arguments).await {
         Ok(output) => {
             let mut result = json!({
                 "content": [{ "type": "text", "text": output.summary }],
@@ -248,7 +287,14 @@ async fn handle_tool_call(
             RpcError::new(-32602, error.to_string(), request.id),
             &context.request_id,
         ),
-        Err(error) => tool_error_response(request.id.as_ref(), error, era, &context.request_id),
+        Err(error) => tool_error_response(
+            request.id.as_ref(),
+            error,
+            era,
+            &context.request_id,
+            state.mcp_oauth.as_deref(),
+            context.principal.audience,
+        ),
     }
 }
 
@@ -258,6 +304,8 @@ fn tool_error_response(
     error: ToolCallError,
     era: ProtocolEra,
     request_id: &str,
+    oauth: Option<&McpOAuthVerifier>,
+    audience: PrincipalAudience,
 ) -> Response {
     let mut structured = json!({
         "code": error.code(),
@@ -271,6 +319,13 @@ fn tool_error_response(
         "structuredContent": structured,
         "isError": true,
     });
+    if audience == PrincipalAudience::McpOAuth
+        && let (Some(scope), Some(oauth)) = (error.insufficient_scope(), oauth)
+    {
+        result["_meta"] = json!({
+            "mcp/www_authenticate": [oauth.insufficient_scope_challenge(scope)],
+        });
+    }
     if era == ProtocolEra::Modern {
         result["resultType"] = json!("complete");
         attach_response_meta(&mut result, request_id);
@@ -440,18 +495,31 @@ fn has_media_type(headers: &HeaderMap, name: axum::http::HeaderName, expected: &
         })
 }
 
-fn unauthorized(request_id: &str) -> Response {
+fn unauthorized(
+    request_id: &str,
+    oauth: Option<&McpOAuthVerifier>,
+    invalid_token: bool,
+) -> Response {
     let mut response = rpc_error_response(
         StatusCode::UNAUTHORIZED,
         RpcError::new(-33001, "A valid bearer token is required", None),
         request_id,
     );
-    response.headers_mut().insert(
-        WWW_AUTHENTICATE,
-        HeaderValue::from_static(
-            "Bearer realm=\"dayweave-native-mcp\", scope=\"schedule:read schedule:simulate suggestions:submit\"",
-        ),
+    let challenge = oauth.map_or_else(
+        || {
+            "Bearer realm=\"dayweave-native-mcp\", scope=\"schedule:read schedule:simulate suggestions:submit\""
+                .to_owned()
+        },
+        |oauth| {
+            oauth.challenge(
+                Some("schedule:read schedule:simulate suggestions:submit"),
+                invalid_token,
+            )
+        },
     );
+    if let Ok(challenge) = HeaderValue::from_str(&challenge) {
+        response.headers_mut().insert(WWW_AUTHENTICATE, challenge);
+    }
     response
 }
 

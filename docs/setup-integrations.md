@@ -352,6 +352,16 @@ the plugin manifest, an `.env` file, shell history, or chat. That bearer path is
 for local Codex/ChatGPT desktop development only; it is not ChatGPT web account
 linking.
 
+Published ChatGPT/Codex clients instead use the server's separate Auth0-backed
+OAuth 2.1 resource-server boundary. It is disabled by default and handles no
+Auth0 client secret or token issuance. When enabled through the reviewed Compose
+overlay, it publishes both protected-resource metadata paths and exact OAuth
+challenges, advertises one required OAuth scope per tool, and accepts only the
+configured owner, client, issuer, and exact `/mcp` audience. Follow
+[`mcp-oauth.md`](mcp-oauth.md) for the fixed token/JWKS contract, stable ChatGPT
+CIMD registration, guarded DCR alternative, configuration, preflight, and
+rollback.
+
 The deployed endpoint will use the Nebius Tunnel HTTPS URL.
 Its external contract is intentionally asymmetric:
 
@@ -360,18 +370,23 @@ Its external contract is intentionally asymmetric:
 - `submit_proposal` may add a reviewable Suggestions Inbox proposal;
 - no external conversation can mutate canonical schedule/calendar/task state.
 
-ChatGPT web does not accept a custom DayWeave API key. After the deployed MCP
-server supports the complete OAuth 2.1 MCP authorization contract:
+ChatGPT web does not accept a custom DayWeave API key. Remote activation still
+requires the stable Nebius Tunnel HTTPS URL, the complete Auth0 preflight, and
+replacement plus independent audit of the production MCP schedule-query and
+simulation placeholders. OAuth account linking alone must not be presented as
+live schedule access. After those gates pass:
 
-1. enable ChatGPT Developer mode;
-2. register the MCP HTTPS URL and complete its OAuth connection;
-3. copy the resulting `plugin_asdk_app…` technical ID;
-4. add that ID to the plugin's `.app.json` and manifest using the plugin creator;
-5. validate, install from the private repository source, and test in a new chat.
+1. activate the explicit OAuth Compose overlay and run every preflight in
+   [`mcp-oauth.md`](mcp-oauth.md);
+2. enable ChatGPT Developer mode;
+3. register the exact public `/mcp` HTTPS URL and complete its Auth0 connection;
+4. copy the resulting `plugin_asdk_app…` technical ID;
+5. add that ID to the plugin's `.app.json` and manifest using the plugin creator;
+6. validate, install from the repository source, and test in a new chat.
 
 The repo plugin already contains its validated skill and local `.mcp.json`.
-Remote registration cannot be completed before the stable tunnel URL and OAuth
-metadata exist.
+Do not perform remote registration or claim schedule access before the activation
+gates above pass.
 
 Official references:
 

@@ -49,6 +49,7 @@ pub enum PrincipalAudience {
     Legacy,
     Device,
     Mcp,
+    McpOAuth,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -25,6 +25,8 @@ The implemented controls and explicit production security gates are documented
 in [`docs/security.md`](docs/security.md).
 The deterministic preview request and strict canonical scheduling metadata are
 documented in [`docs/scheduling-api.md`](docs/scheduling-api.md).
+The disabled-by-default Auth0 account-linking boundary for published MCP
+clients is documented in [`docs/mcp-oauth.md`](docs/mcp-oauth.md).
 
 ## Status
 
