@@ -2163,6 +2163,55 @@ struct CanonicalSyncStoreTests {
         }
     }
 
+    @Test("canonical reconciliation waits for a shared mutation fence instead of dropping")
+    func canonicalReconciliationWaitsForSharedMutationFence() async throws {
+        let token = "canonical-shared-fence-token"
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"after-shared-fence","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        let planner = PlannerStore(restoreFromPersistence: false, now: { now })
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+        #expect(planner.beginCanonicalSync())
+
+        let reconciliation = Task { @MainActor in
+            await sync.sync()
+        }
+        try await Task.sleep(for: .milliseconds(75))
+        #expect(URLProtocolStub.storage.requests(for: token).isEmpty)
+
+        planner.endCanonicalSync()
+        await reconciliation.value
+
+        #expect(planner.canonicalDeltaCursor == "after-shared-fence")
+        #expect(
+            URLProtocolStub.storage.requests(
+                for: token,
+                includingSchedulePublication: true
+            ).map(\.url.path) == [
+                "/gateway/v1/items/delta",
+                "/gateway/v1/schedule/preview",
+                "/gateway/v1/schedule/publish",
+            ]
+        )
+        if case .online = sync.status {} else {
+            Issue.record("Expected queued canonical reconciliation to complete")
+        }
+    }
+
     private static func itemObject(
         id: UUID,
         revision: UInt64,

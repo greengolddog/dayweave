@@ -503,6 +503,13 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     /// Emitted only for the exact, endpoint-bound stale-publication contract.
     /// Generic 409 errors never become a destructive local-state signal.
     case trustedSchedulePublicationStale
+    /// Emitted only for the exact authenticated proposal-application endpoint,
+    /// media type, cache policy, and typed `not_found` envelope. Generic 404s
+    /// never become evidence that an ambiguous mutation had no effect.
+    case trustedProposalApplicationAbsent
+    /// Emitted only for an endpoint-specific typed conflict that the server
+    /// guarantees was detected before any proposal mutation committed.
+    case trustedProposalApplicationNoEffect(conflictCode: String)
     case server(statusCode: Int, code: String?, message: String?, requestID: String?)
     case responseDecodingFailed
 }
@@ -534,6 +541,10 @@ extension DayWeaveAPIError: LocalizedError {
             return "The DayWeave API response exceeded the safe \(limitBytes / 1_048_576) MiB limit."
         case .trustedSchedulePublicationStale:
             return "Canonical items changed before this schedule could be published."
+        case .trustedProposalApplicationAbsent:
+            return "The exact proposal application resource is absent on the authenticated server."
+        case .trustedProposalApplicationNoEffect:
+            return "The authenticated server proved that the exact proposal request had no effect."
         case let .server(statusCode, code, message, requestID):
             let safeCode = DayWeaveDiagnosticSanitizer.code(code, secrets: [])
             let safeMessage = DayWeaveDiagnosticSanitizer.text(
@@ -782,6 +793,196 @@ struct DayWeaveAPIClient: Sendable {
             body: body
         )
         return envelope.suggestion
+    }
+
+    func previewSuggestionApplication(
+        _ request: DayWeaveProposalPreviewRequest
+    ) async throws -> DayWeaveProposalApplicationPreview {
+        guard (1...20).contains(request.proposals.count),
+              Set(request.proposals.map(\.proposalID)).count == request.proposals.count,
+              request.proposals.allSatisfy({ $0.expectedRevision > 0 }) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        return try await send(
+            method: "POST",
+            pathComponents: ["v1", "suggestions", "application-previews"],
+            body: try encode(request),
+            requiredStatusCode: 201
+        )
+    }
+
+    func applySuggestionApplication(
+        previewID: UUID,
+        expectedReviewHash: String,
+        idempotencyKey: String
+    ) async throws -> DayWeaveProposalApplyResponse {
+        let body = try prepareSuggestionApplicationApplyBody(
+            expectedReviewHash: expectedReviewHash
+        )
+        return try await applySuggestionApplication(
+            previewID: previewID,
+            expectedReviewHash: expectedReviewHash,
+            requestBody: body,
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    func prepareSuggestionApplicationApplyBody(
+        expectedReviewHash: String
+    ) throws -> Data {
+        guard Self.isValidProposalReviewHash(expectedReviewHash) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        return try encode(DayWeaveProposalApplyRequest(
+            expectedReviewHash: expectedReviewHash
+        ))
+    }
+
+    func applySuggestionApplication(
+        previewID: UUID,
+        expectedReviewHash: String,
+        requestBody: Data,
+        idempotencyKey: String
+    ) async throws -> DayWeaveProposalApplyResponse {
+        guard Self.isValidProposalIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        try validateSuggestionApplicationApplyBody(
+            requestBody,
+            expectedReviewHash: expectedReviewHash
+        )
+        return try await send(
+            method: "POST",
+            pathComponents: [
+                "v1", "suggestions", "application-previews",
+                previewID.uuidString.lowercased(), "apply",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: requestBody,
+            requiredStatusCode: 200
+        )
+    }
+
+    func suggestionApplication(
+        applicationID: UUID
+    ) async throws -> DayWeaveProposalApplicationReceipt {
+        try await send(
+            method: "GET",
+            pathComponents: [
+                "v1", "suggestions", "applications", applicationID.uuidString.lowercased(),
+            ],
+            requiredStatusCode: 200
+        )
+    }
+
+    func suggestionApplication(
+        forProposalID proposalID: UUID
+    ) async throws -> DayWeaveProposalApplicationReceipt {
+        try await send(
+            method: "GET",
+            pathComponents: [
+                "v1", "suggestions", proposalID.uuidString.lowercased(), "application",
+            ],
+            requiredStatusCode: 200
+        )
+    }
+
+    func undoSuggestionApplication(
+        applicationID: UUID,
+        expectedApplicationRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> DayWeaveProposalUndoResponse {
+        let body = try prepareSuggestionApplicationUndoBody(
+            expectedApplicationRevision: expectedApplicationRevision
+        )
+        return try await undoSuggestionApplication(
+            applicationID: applicationID,
+            expectedApplicationRevision: expectedApplicationRevision,
+            requestBody: body,
+            idempotencyKey: idempotencyKey
+        )
+    }
+
+    func prepareSuggestionApplicationUndoBody(
+        expectedApplicationRevision: UInt64
+    ) throws -> Data {
+        guard expectedApplicationRevision > 0 else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        return try encode(DayWeaveProposalUndoRequest(
+            expectedApplicationRevision: expectedApplicationRevision
+        ))
+    }
+
+    func undoSuggestionApplication(
+        applicationID: UUID,
+        expectedApplicationRevision: UInt64,
+        requestBody: Data,
+        idempotencyKey: String
+    ) async throws -> DayWeaveProposalUndoResponse {
+        guard Self.isValidProposalIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        try validateSuggestionApplicationUndoBody(
+            requestBody,
+            expectedApplicationRevision: expectedApplicationRevision
+        )
+        return try await send(
+            method: "POST",
+            pathComponents: [
+                "v1", "suggestions", "applications",
+                applicationID.uuidString.lowercased(), "undo",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: requestBody,
+            requiredStatusCode: 200
+        )
+    }
+
+    private func validateSuggestionApplicationApplyBody(
+        _ body: Data,
+        expectedReviewHash: String
+    ) throws {
+        let expected = DayWeaveProposalApplyRequest(expectedReviewHash: expectedReviewHash)
+        guard body.count <= Self.maximumRequestBytes,
+              (try? makeDecoder().decode(DayWeaveProposalApplyRequest.self, from: body)) == expected,
+              (try? encode(expected)) == body else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
+    private func validateSuggestionApplicationUndoBody(
+        _ body: Data,
+        expectedApplicationRevision: UInt64
+    ) throws {
+        let expected = DayWeaveProposalUndoRequest(
+            expectedApplicationRevision: expectedApplicationRevision
+        )
+        guard body.count <= Self.maximumRequestBytes,
+              (try? makeDecoder().decode(DayWeaveProposalUndoRequest.self, from: body)) == expected,
+              (try? encode(expected)) == body else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
+    private static func isValidProposalReviewHash(_ value: String) -> Bool {
+        value.hasPrefix("sha256:")
+            && value.utf8.count == 71
+            && value.utf8.dropFirst(7).allSatisfy { byte in
+                (byte >= 48 && byte <= 57)
+                    || (byte >= 65 && byte <= 70)
+                    || (byte >= 97 && byte <= 102)
+            }
+    }
+
+    private static func isValidProposalIdempotencyKey(_ value: String) -> Bool {
+        (8...128).contains(value.utf8.count)
+            && value.utf8.allSatisfy { byte in
+                (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122)
+                    || (byte >= 48 && byte <= 57)
+                    || [45, 46, 95, 126].contains(byte)
+            }
     }
 
     func executionSnapshot() async throws -> DayWeaveExecutionSnapshot {
@@ -1141,8 +1342,18 @@ struct DayWeaveAPIClient: Sendable {
                    statusCode: httpResponse.statusCode,
                    contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
                    body: data
-               ) {
+            ) {
                 throw DayWeaveAPIError.trustedSchedulePublicationStale
+            }
+            if let trusted = Self.trustedProposalApplicationError(
+                pathComponents: pathComponents,
+                statusCode: httpResponse.statusCode,
+                contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                body: data
+            ) {
+                throw trusted
             }
             let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
             throw DayWeaveAPIError.server(
@@ -1168,6 +1379,100 @@ struct DayWeaveAPIClient: Sendable {
         } catch {
             throw DayWeaveAPIError.responseDecodingFailed
         }
+    }
+
+    private enum ProposalApplicationEndpoint: Equatable {
+        case lookup
+        case apply
+        case undo
+    }
+
+    private static func trustedProposalApplicationError(
+        pathComponents: [String],
+        statusCode: Int,
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> DayWeaveAPIError? {
+        guard body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              cacheControl?.lowercased() == "no-store, max-age=0",
+              pragma?.lowercased() == "no-cache",
+              let endpoint = proposalApplicationEndpoint(pathComponents),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              let code = error["code"] as? String,
+              let message = error["message"] as? String else {
+            return nil
+        }
+
+        if statusCode == 404,
+           Set(error.keys) == ["code", "message"],
+           code == "not_found",
+           message == "proposal application was not found" {
+            return .trustedProposalApplicationAbsent
+        }
+
+        guard statusCode == 409,
+              endpoint != .lookup,
+              Set(error.keys) == ["code", "message", "details"],
+              code == "conflict",
+              message == "Proposal application is stale or unsafe",
+              let details = error["details"] as? [String: Any],
+              Set(details.keys) == ["conflict_code"],
+              let conflictCode = details["conflict_code"] as? String else {
+            return nil
+        }
+        let applyNoEffect = Set([
+            "proposal_not_pending", "proposal_expired", "proposal_revision_mismatch",
+            "item_already_exists", "item_not_found", "item_revision_mismatch",
+            "parent_not_found", "hierarchy_cycle", "invalid_parent_state",
+            "non_leaf_executable", "has_children", "deleted_parent", "invalid_item",
+            "provider_managed_item", "preview_expired", "preview_mismatch",
+            "preview_not_applicable",
+        ])
+        let undoNoEffect = Set([
+            "provider_managed_item", "undo_expired", "undo_diverged",
+        ])
+        let isNoEffect = switch endpoint {
+        case .lookup:
+            false
+        case .apply:
+            applyNoEffect.contains(conflictCode)
+        case .undo:
+            undoNoEffect.contains(conflictCode)
+        }
+        return isNoEffect
+            ? .trustedProposalApplicationNoEffect(conflictCode: conflictCode)
+            : nil
+    }
+
+    private static func proposalApplicationEndpoint(
+        _ components: [String]
+    ) -> ProposalApplicationEndpoint? {
+        if components.count == 4,
+           components[0] == "v1", components[1] == "suggestions",
+           ((components[2] == "applications" && UUID(uuidString: components[3]) != nil)
+               || (UUID(uuidString: components[2]) != nil && components[3] == "application")) {
+            return .lookup
+        }
+        if components.count == 5,
+           components[0] == "v1", components[1] == "suggestions",
+           components[2] == "application-previews",
+           UUID(uuidString: components[3]) != nil,
+           components[4] == "apply" {
+            return .apply
+        }
+        if components.count == 5,
+           components[0] == "v1", components[1] == "suggestions",
+           components[2] == "applications",
+           UUID(uuidString: components[3]) != nil,
+           components[4] == "undo" {
+            return .undo
+        }
+        return nil
     }
 
     private static func isTrustedSchedulePublicationStale(

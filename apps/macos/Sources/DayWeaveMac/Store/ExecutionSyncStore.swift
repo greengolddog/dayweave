@@ -907,10 +907,32 @@ final class ExecutionSyncStore: ObservableObject {
         _ operation: @escaping (UUID, UInt64) async throws -> ExecutionSyncOutcome
     ) async -> ExecutionSyncOutcome {
         guard operationID == nil else { return .invalidLocalState }
+        guard planner.pendingProposalApplicationMutation == nil else {
+            return report(ExecutionSyncControllerError.invalidLocalState(
+                "Recover the exact pending proposal application or undo before changing cross-device execution."
+            ))
+        }
         guard planner.canPersistPlan, planner.hasEncryptedPersistence else {
             return report(PlannerExecutionStateError.encryptedPersistenceRequired)
         }
-        guard planner.beginCanonicalSync() else { return .invalidLocalState }
+        while !planner.beginCanonicalSync() {
+            guard !Task.isCancelled else { return .configurationChanged }
+            guard operationID == nil else { return .invalidLocalState }
+            guard planner.pendingProposalApplicationMutation == nil else {
+                return report(ExecutionSyncControllerError.invalidLocalState(
+                    "Recover the exact pending proposal application or undo before changing cross-device execution."
+                ))
+            }
+            guard planner.canPersistPlan, planner.hasEncryptedPersistence else {
+                return report(PlannerExecutionStateError.encryptedPersistenceRequired)
+            }
+            guard planner.isCanonicalSyncLocked else { return .invalidLocalState }
+            do {
+                try await Task.sleep(for: .milliseconds(25))
+            } catch {
+                return .configurationChanged
+            }
+        }
         let id = UUID()
         let generation = configurationGeneration
         operationID = id

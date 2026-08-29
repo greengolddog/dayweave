@@ -9,14 +9,13 @@ struct DayWeaveMacApp: App {
     @StateObject private var codex: CodexAppServerClient
     @StateObject private var codexConversation: CodexConversationController
     @StateObject private var suggestionSync: SuggestionSyncStore
+    @StateObject private var proposalApplications: ProposalApplicationStore
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
+    @StateObject private var serviceCoordinator: DayWeaveServiceCoordinator
     @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
     @StateObject private var appearance: AppearanceController
-    @State private var activationTask: Task<Void, Never>?
-    @State private var servicesAreActive = false
-
     init() {
         let store = PlannerStore.live()
         _store = StateObject(wrappedValue: store)
@@ -31,16 +30,29 @@ struct DayWeaveMacApp: App {
             contextProvider: store,
             suggestionRouter: CodexSuggestionInboxRouter(planner: store)
         ))
-        _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore(
+        let suggestionSync = SuggestionSyncStore(
             authCoordinator: authCoordinator
-        ))
-        _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(
+        )
+        _suggestionSync = StateObject(wrappedValue: suggestionSync)
+        let proposalApplications = ProposalApplicationStore(
+            suggestions: suggestionSync,
+            journal: store
+        )
+        _proposalApplications = StateObject(wrappedValue: proposalApplications)
+        let canonicalSync = CanonicalSyncStore(
             planner: store,
             authCoordinator: authCoordinator
-        ))
-        _executionSync = StateObject(wrappedValue: ExecutionSyncStore(
+        )
+        _canonicalSync = StateObject(wrappedValue: canonicalSync)
+        let executionSync = ExecutionSyncStore(
             planner: store,
             authCoordinator: authCoordinator
+        )
+        _executionSync = StateObject(wrappedValue: executionSync)
+        _serviceCoordinator = StateObject(wrappedValue: DayWeaveServiceCoordinator(
+            proposalApplications: proposalApplications,
+            executionSync: executionSync,
+            canonicalSync: canonicalSync
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
@@ -59,8 +71,10 @@ struct DayWeaveMacApp: App {
                 .environmentObject(codex)
                 .environmentObject(codexConversation)
                 .environmentObject(suggestionSync)
+                .environmentObject(proposalApplications)
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
+                .environmentObject(serviceCoordinator)
                 .environmentObject(durableAuth)
                 .environmentObject(appLock)
                 .environmentObject(appearance)
@@ -169,6 +183,7 @@ struct DayWeaveMacApp: App {
                         .environmentObject(store)
                         .environmentObject(codex)
                         .environmentObject(suggestionSync)
+                        .environmentObject(proposalApplications)
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
                         .environmentObject(durableAuth)
@@ -185,27 +200,15 @@ struct DayWeaveMacApp: App {
     }
 
     private func activateServices() {
-        guard appLock.isContentAvailable, !servicesAreActive else { return }
-        servicesAreActive = true
+        guard appLock.isContentAvailable else { return }
         codex.startIfNeeded()
-        activationTask = Task { @MainActor in
-            let executionOutcome = await executionSync.refresh()
-            guard !Task.isCancelled, servicesAreActive else { return }
-            if executionOutcome == .success, canonicalSync.isConfigured {
-                await canonicalSync.sync()
-            }
-            guard !Task.isCancelled, servicesAreActive else { return }
-            executionSync.startForegroundPolling()
-            activationTask = nil
-        }
+        serviceCoordinator.activate()
     }
 
     private func deactivateServices() {
-        servicesAreActive = false
-        activationTask?.cancel()
-        activationTask = nil
-        executionSync.stopForegroundPolling()
+        serviceCoordinator.deactivate()
         codexConversation.suspendForPrivacyBoundary()
+        proposalApplications.suspendForPrivacyBoundary()
     }
 
     private func updateAppLock(for phase: ScenePhase) {

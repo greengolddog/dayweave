@@ -57,6 +57,35 @@ enum PlannerSchedulePublicationError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerProposalApplicationJournalError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case invalidMutation
+    case remoteCanonicalMutationInProgress
+    case operationAlreadyPending
+    case mutationDoesNotMatchJournal
+    case invalidReceipt
+    case receiptConflict
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Encrypted planner persistence is required before a proposal can be applied or undone."
+        case .invalidMutation:
+            "The exact proposal application request is invalid or belongs to another API configuration."
+        case .remoteCanonicalMutationInProgress:
+            "Wait for canonical synchronization or execution to finish before applying or undoing a proposal."
+        case .operationAlreadyPending:
+            "An earlier proposal application or undo has an ambiguous result and must be recovered first."
+        case .mutationDoesNotMatchJournal:
+            "The proposal application result does not match the exact encrypted request awaiting recovery."
+        case .invalidReceipt:
+            "The proposal application receipt is invalid or does not match the pending operation."
+        case .receiptConflict:
+            "The proposal application receipt conflicts with retained application history."
+        }
+    }
+}
+
 enum CanonicalSensitivityPresentation: Equatable, Sendable {
     case standard
     case own
@@ -125,6 +154,14 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var pendingSchedulePublication: PendingSchedulePublication? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var pendingProposalApplicationMutation:
+        DayWeavePendingProposalApplicationMutation? {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var proposalApplicationReceipts:
+        [DayWeaveStoredProposalApplicationReceipt] {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localCaptureDiagnostics: [UUID: String] {
         didSet { scheduleAutosave() }
     }
@@ -169,6 +206,8 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
+        pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
+        proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt] = [],
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
         previewValidatedForCurrentLaunch: Bool = false,
@@ -213,6 +252,22 @@ final class PlannerStore: ObservableObject {
             ?? schedulePreviewProvenance
         self.pendingSchedulePublication = restoredSnapshot?.pendingSchedulePublication
             ?? pendingSchedulePublication
+        let initialPendingProposalApplicationMutation = restoredSnapshot == nil
+            ? pendingProposalApplicationMutation
+            : restoredSnapshot?.pendingProposalApplicationMutation
+        let initialProposalApplicationReceipts = restoredSnapshot?.proposalApplicationReceipts
+            ?? proposalApplicationReceipts
+        let sortedProposalApplicationReceipts = Self.sortedProposalApplicationReceipts(
+            initialProposalApplicationReceipts
+        )
+        self.pendingProposalApplicationMutation = initialPendingProposalApplicationMutation
+        self.proposalApplicationReceipts = sortedProposalApplicationReceipts
+        if !PlannerProposalApplicationJournalValidator.isValidState(
+            pending: initialPendingProposalApplicationMutation,
+            receipts: sortedProposalApplicationReceipts
+        ) {
+            restorationError = .snapshotDecodingFailed
+        }
         self.localCaptureDiagnostics = restoredSnapshot?.localCaptureDiagnostics
             ?? localCaptureDiagnostics
         let initialExecutionState = restoredSnapshot?.executionState ?? executionState
@@ -274,7 +329,9 @@ final class PlannerStore: ObservableObject {
 
     @discardableResult
     func beginCanonicalSync() -> Bool {
-        guard canPersistPlan, !isCanonicalSyncLocked else { return false }
+        guard canPersistPlan,
+              !isCanonicalSyncLocked,
+              pendingProposalApplicationMutation == nil else { return false }
         isCanonicalSyncLocked = true
         return true
     }
@@ -347,6 +404,8 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         pendingSchedulePublication = nil
+        pendingProposalApplicationMutation = nil
+        proposalApplicationReceipts = []
         localCaptureDiagnostics = localCaptureDiagnostics.filter { id, _ in
             blocks.contains { $0.id == id && $0.isLocallyAuthored && $0.sourceItemID == nil }
         }
@@ -425,6 +484,8 @@ final class PlannerStore: ObservableObject {
             || !recurrenceSessionOutcomes.isEmpty
             || schedulePreviewProvenance != nil
             || pendingSchedulePublication != nil
+            || pendingProposalApplicationMutation != nil
+            || !proposalApplicationReceipts.isEmpty
             || blocks.contains {
                 $0.syncOrigin == .canonicalPreview
                     || $0.syncOrigin == .externalPreview
@@ -742,6 +803,257 @@ final class PlannerStore: ObservableObject {
             // atomic acknowledgement could not be persisted.
             isCanonicalPreviewValidatedForCurrentLaunch = false
             throw persistenceError
+        }
+    }
+
+    /// Flushes the complete apply/undo request and its retry key before the
+    /// caller may send any bytes. Exactly one ambiguous proposal mutation is
+    /// retained because application and undo share one canonical write fence.
+    func persistPendingProposalApplicationMutation(
+        _ mutation: DayWeavePendingProposalApplicationMutation
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerProposalApplicationJournalError.encryptedPersistenceRequired
+        }
+        guard canMutatePlan else {
+            throw PlannerProposalApplicationJournalError.remoteCanonicalMutationInProgress
+        }
+        guard PlannerProposalApplicationJournalValidator.isValid(mutation),
+              proposalApplicationConfigurationMatches(mutation.configurationIdentifier),
+              PlannerProposalApplicationJournalValidator.isValidState(
+                  pending: mutation,
+                  receipts: proposalApplicationReceipts
+              ) else {
+            throw PlannerProposalApplicationJournalError.invalidMutation
+        }
+        guard pendingProposalApplicationMutation == nil else {
+            throw PlannerProposalApplicationJournalError.operationAlreadyPending
+        }
+
+        pendingProposalApplicationMutation = mutation
+        flushPersistence()
+        if let persistenceError {
+            pendingProposalApplicationMutation = nil
+            throw persistenceError
+        }
+    }
+
+    /// Atomically replaces an exact pending request with its content-free
+    /// receipt. A lost response can therefore be recovered with the same
+    /// mutation and committed through this path after a receipt lookup.
+    func commitPendingProposalApplicationMutation(
+        _ mutation: DayWeavePendingProposalApplicationMutation,
+        receipt: DayWeaveStoredProposalApplicationReceipt
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerProposalApplicationJournalError.encryptedPersistenceRequired
+        }
+        guard pendingProposalApplicationMutation == mutation else {
+            throw PlannerProposalApplicationJournalError.mutationDoesNotMatchJournal
+        }
+        guard proposalApplicationReceipt(receipt, matches: mutation) else {
+            throw PlannerProposalApplicationJournalError.invalidReceipt
+        }
+
+        let priorReceipts = proposalApplicationReceipts
+        let nextReceipts = try Self.receiptsByRecording(
+            receipt,
+            in: proposalApplicationReceipts
+        )
+        guard PlannerProposalApplicationJournalValidator.isValidState(
+            pending: nil,
+            receipts: nextReceipts
+        ) else {
+            throw PlannerProposalApplicationJournalError.invalidReceipt
+        }
+
+        pendingProposalApplicationMutation = nil
+        proposalApplicationReceipts = nextReceipts
+        flushPersistence()
+        if let persistenceError {
+            pendingProposalApplicationMutation = mutation
+            proposalApplicationReceipts = priorReceipts
+            throw persistenceError
+        }
+    }
+
+    /// Clears a journal only after the caller has authoritative evidence that
+    /// the exact request had no effect. Transport failure alone is not enough.
+    func clearPendingProposalApplicationMutation(
+        _ mutation: DayWeavePendingProposalApplicationMutation
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerProposalApplicationJournalError.encryptedPersistenceRequired
+        }
+        guard pendingProposalApplicationMutation == mutation else {
+            throw PlannerProposalApplicationJournalError.mutationDoesNotMatchJournal
+        }
+
+        pendingProposalApplicationMutation = nil
+        flushPersistence()
+        if let persistenceError {
+            pendingProposalApplicationMutation = mutation
+            throw persistenceError
+        }
+    }
+
+    /// Retains a recovered application receipt when no exact local mutation is
+    /// outstanding. Receipts are monotonic and bounded newest-first.
+    func recordProposalApplicationReceipt(
+        _ receipt: DayWeaveStoredProposalApplicationReceipt
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerProposalApplicationJournalError.encryptedPersistenceRequired
+        }
+        guard PlannerProposalApplicationJournalValidator.isValid(receipt),
+              proposalApplicationConfigurationMatches(receipt.configurationIdentifier) else {
+            throw PlannerProposalApplicationJournalError.invalidReceipt
+        }
+
+        let priorReceipts = proposalApplicationReceipts
+        let nextReceipts = try Self.receiptsByRecording(
+            receipt,
+            in: proposalApplicationReceipts
+        )
+        guard PlannerProposalApplicationJournalValidator.isValidState(
+            pending: pendingProposalApplicationMutation,
+            receipts: nextReceipts
+        ) else {
+            throw PlannerProposalApplicationJournalError.receiptConflict
+        }
+        guard nextReceipts != priorReceipts else { return }
+
+        proposalApplicationReceipts = nextReceipts
+        flushPersistence()
+        if let persistenceError {
+            proposalApplicationReceipts = priorReceipts
+            throw persistenceError
+        }
+    }
+
+    func proposalApplicationReceipt(
+        for proposalID: UUID,
+        configurationIdentifier: String
+    ) -> DayWeaveStoredProposalApplicationReceipt? {
+        proposalApplicationReceipts.first {
+            $0.configurationIdentifier == configurationIdentifier
+                && $0.application.contains(proposalID: proposalID)
+        }
+    }
+
+    func proposalApplicationReceipt(
+        applicationID: UUID,
+        configurationIdentifier: String
+    ) -> DayWeaveStoredProposalApplicationReceipt? {
+        proposalApplicationReceipts.first {
+            $0.configurationIdentifier == configurationIdentifier
+                && $0.application.applicationID == applicationID
+        }
+    }
+
+    private func proposalApplicationConfigurationMatches(_ value: String) -> Bool {
+        guard let normalized = Self.canonicalConfigurationIdentifier(value),
+              normalized == value else {
+            return false
+        }
+        if let canonicalConfigurationIdentifier,
+           Self.canonicalConfigurationIdentifier(canonicalConfigurationIdentifier)
+            != normalized {
+            return false
+        }
+        let retained = Set(proposalApplicationReceipts.map(\.configurationIdentifier))
+            .union(pendingProposalApplicationMutation.map { [$0.configurationIdentifier] } ?? [])
+        return retained.isEmpty || retained == [value]
+    }
+
+    private func proposalApplicationReceipt(
+        _ receipt: DayWeaveStoredProposalApplicationReceipt,
+        matches mutation: DayWeavePendingProposalApplicationMutation
+    ) -> Bool {
+        guard PlannerProposalApplicationJournalValidator.isValid(receipt),
+              receipt.configurationIdentifier == mutation.configurationIdentifier,
+              receipt.application.proposals.map(\.proposalID) == mutation.proposalIDs,
+              receipt.application.commandIDs == mutation.expectedCommandIDs else {
+            return false
+        }
+        switch mutation.operation {
+        case .apply:
+            let appliedRevisions = mutation.proposalRevisions.map {
+                $0.addingReportingOverflow(1)
+            }
+            let isResolvedApplication =
+                (receipt.application.status == .applied
+                    && receipt.application.applicationRevision == 1)
+                || (receipt.application.status == .undone
+                    && receipt.application.applicationRevision == 2)
+            return isResolvedApplication
+                && appliedRevisions.allSatisfy { !$0.overflow }
+                && receipt.application.proposals.map(\.appliedRevision)
+                    == appliedRevisions.map(\.partialValue)
+        case .undo:
+            guard let applicationID = mutation.applicationID,
+                  let expectedRevision = mutation.expectedApplicationRevision else {
+                return false
+            }
+            let nextRevision = expectedRevision.addingReportingOverflow(1)
+            return receipt.application.applicationID == applicationID
+                && receipt.application.status == .undone
+                && !nextRevision.overflow
+                && receipt.application.applicationRevision == nextRevision.partialValue
+                && receipt.application.proposals.map(\.appliedRevision)
+                    == mutation.proposalRevisions
+        }
+    }
+
+    private static func receiptsByRecording(
+        _ receipt: DayWeaveStoredProposalApplicationReceipt,
+        in current: [DayWeaveStoredProposalApplicationReceipt]
+    ) throws -> [DayWeaveStoredProposalApplicationReceipt] {
+        guard PlannerProposalApplicationJournalValidator.isValid(receipt) else {
+            throw PlannerProposalApplicationJournalError.invalidReceipt
+        }
+        var next = current
+        if let index = next.firstIndex(where: { $0.id == receipt.id }) {
+            let prior = next[index]
+            guard prior.configurationIdentifier == receipt.configurationIdentifier else {
+                throw PlannerProposalApplicationJournalError.receiptConflict
+            }
+            if prior == receipt { return next }
+            guard prior.application.status == .applied,
+                  prior.application.applicationRevision == 1,
+                  receipt.application.status == .undone,
+                  receipt.application.applicationRevision == 2,
+                  prior.application.proposals == receipt.application.proposals,
+                  prior.application.commandIDs == receipt.application.commandIDs,
+                  prior.application.affectedItemIDs == receipt.application.affectedItemIDs,
+                  prior.application.appliedAt == receipt.application.appliedAt,
+                  prior.application.undoExpiresAt == receipt.application.undoExpiresAt else {
+                throw PlannerProposalApplicationJournalError.receiptConflict
+            }
+            next[index] = receipt
+        } else {
+            let proposalIDs = Set(receipt.application.proposals.map(\.proposalID))
+            guard current.allSatisfy({ stored in
+                proposalIDs.isDisjoint(with: stored.application.proposals.map(\.proposalID))
+            }) else {
+                throw PlannerProposalApplicationJournalError.receiptConflict
+            }
+            next.append(receipt)
+        }
+        return Array(
+            sortedProposalApplicationReceipts(next)
+                .prefix(PlannerProposalApplicationJournalValidator.maximumStoredReceipts)
+        )
+    }
+
+    private static func sortedProposalApplicationReceipts(
+        _ receipts: [DayWeaveStoredProposalApplicationReceipt]
+    ) -> [DayWeaveStoredProposalApplicationReceipt] {
+        receipts.sorted { left, right in
+            let leftDate = left.application.undoneAt ?? left.application.appliedAt
+            let rightDate = right.application.undoneAt ?? right.application.appliedAt
+            if leftDate != rightDate { return leftDate > rightDate }
+            return left.id.uuidString < right.id.uuidString
         }
     }
 
@@ -1322,6 +1634,7 @@ final class PlannerStore: ObservableObject {
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
             || pendingSchedulePublication != nil
+            || pendingProposalApplicationMutation != nil
     }
 
     /// Binds the encrypted execution cache to an opaque URL+credential digest.
@@ -1453,6 +1766,8 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         pendingSchedulePublication = nil
+        pendingProposalApplicationMutation = nil
+        proposalApplicationReceipts = []
         isCanonicalPreviewValidatedForCurrentLaunch = false
         var empty = DayWeaveExecutionDurableState.empty
         empty.deviceID = deviceID
@@ -2035,6 +2350,8 @@ final class PlannerStore: ObservableObject {
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
             pendingSchedulePublication: pendingSchedulePublication,
+            pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+            proposalApplicationReceipts: proposalApplicationReceipts,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )

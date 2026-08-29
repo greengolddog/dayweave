@@ -182,16 +182,142 @@ private struct PlannerSnapshotSchemaProbe: Decodable {
     let schemaVersion: Int
 }
 
+enum PlannerProposalApplicationJournalValidator {
+    static let maximumStoredReceipts = 100
+    static let maximumAffectedItemIDsPerReceipt = 10_000
+
+    private struct ApplyBody: Decodable {
+        let expectedReviewHash: String
+
+        private enum CodingKeys: String, CodingKey {
+            case expectedReviewHash = "expected_review_hash"
+        }
+    }
+
+    private struct UndoBody: Decodable {
+        let expectedApplicationRevision: UInt64
+
+        private enum CodingKeys: String, CodingKey {
+            case expectedApplicationRevision = "expected_application_revision"
+        }
+    }
+
+    static func isValid(_ mutation: DayWeavePendingProposalApplicationMutation) -> Bool {
+        guard mutation.hasValidShape,
+              mutation.expectedCommandIDs.count <= 100,
+              let object = try? JSONSerialization.jsonObject(with: mutation.requestBody),
+              let fields = object as? [String: Any] else {
+            return false
+        }
+        switch mutation.operation {
+        case .apply:
+            guard Set(fields.keys) == ["expected_review_hash"],
+                  let expectedReviewHash = mutation.expectedReviewHash,
+                  expectedReviewHash.hasPrefix("sha256:"),
+                  expectedReviewHash.count == 71,
+                  expectedReviewHash.dropFirst(7).allSatisfy(\.isHexDigit),
+                  let decoded = try? JSONDecoder().decode(
+                      ApplyBody.self,
+                      from: mutation.requestBody
+                  ) else {
+                return false
+            }
+            return decoded.expectedReviewHash == expectedReviewHash
+        case .undo:
+            guard Set(fields.keys) == ["expected_application_revision"],
+                  let expectedRevision = mutation.expectedApplicationRevision,
+                  let decoded = try? JSONDecoder().decode(
+                      UndoBody.self,
+                      from: mutation.requestBody
+                  ) else {
+                return false
+            }
+            return decoded.expectedApplicationRevision == expectedRevision
+        }
+    }
+
+    static func isValid(_ receipt: DayWeaveStoredProposalApplicationReceipt) -> Bool {
+        let application = receipt.application
+        guard receipt.hasValidShape,
+              (1...20).contains(application.proposals.count),
+              application.proposals.allSatisfy({ $0.appliedRevision > 0 }),
+              (1...100).contains(application.commandIDs.count),
+              application.affectedItemIDs.count <= maximumAffectedItemIDsPerReceipt,
+              application.appliedAt.timeIntervalSinceReferenceDate.isFinite,
+              application.undoExpiresAt.timeIntervalSinceReferenceDate.isFinite,
+              application.undoneAt?.timeIntervalSinceReferenceDate.isFinite != false else {
+            return false
+        }
+        switch application.status {
+        case .applied:
+            return application.applicationRevision == 1
+        case .undone:
+            return application.applicationRevision == 2
+        }
+    }
+
+    static func isValidState(
+        pending: DayWeavePendingProposalApplicationMutation?,
+        receipts: [DayWeaveStoredProposalApplicationReceipt]
+    ) -> Bool {
+        guard receipts.count <= maximumStoredReceipts,
+              pending.map(isValid) ?? true,
+              receipts.allSatisfy(isValid),
+              Set(receipts.map(\.application.applicationID)).count == receipts.count else {
+            return false
+        }
+
+        var claimedProposalIDs = Set<UUID>()
+        for receipt in receipts {
+            guard receipt.application.proposals.allSatisfy({
+                claimedProposalIDs.insert($0.proposalID).inserted
+            }) else {
+                return false
+            }
+        }
+
+        let storedConfigurationIdentifiers = Set(receipts.map(\.configurationIdentifier))
+        guard storedConfigurationIdentifiers.count <= 1 else { return false }
+        guard let pending else { return true }
+        guard storedConfigurationIdentifiers.isEmpty
+                || storedConfigurationIdentifiers == [pending.configurationIdentifier] else {
+            return false
+        }
+
+        switch pending.operation {
+        case .apply:
+            return claimedProposalIDs.isDisjoint(with: pending.proposalIDs)
+        case .undo:
+            guard let applicationID = pending.applicationID,
+                  let expectedRevision = pending.expectedApplicationRevision,
+                  let receipt = receipts.first(where: {
+                      $0.application.applicationID == applicationID
+                  }),
+                  receipt.application.status == .applied,
+                  receipt.application.applicationRevision == expectedRevision,
+                  receipt.application.proposals.map(\.proposalID) == pending.proposalIDs,
+                  receipt.application.proposals.map(\.appliedRevision)
+                    == pending.proposalRevisions,
+                  receipt.application.commandIDs == pending.expectedCommandIDs else {
+                return false
+            }
+            return true
+        }
+    }
+}
+
 struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Version 2 added canonical sync state, version 3 added persistent local
     /// capture quarantine diagnostics, version 4 added the encrypted execution
     /// replay fence and immutable terminal ledger, version 5 adds explicit
     /// sensitivity to canonical items and derived schedule blocks, version 6
     /// adds durable, revision-bound sensitivity edits, version 7 adds the
-    /// submitted-request and follow-up fence, and version 8 adds the exact
-    /// schedule-publication replay journal. Older binaries reject the newer
-    /// schema instead of rewriting fields they do not understand.
-    static let currentSchemaVersion = 8
+    /// submitted-request and follow-up fence, version 8 adds the exact
+    /// schedule-publication replay journal, and version 9 adds exact pending
+    /// proposal-application/undo requests plus bounded content-free receipts.
+    /// Older binaries reject the newer schema instead of rewriting fields they
+    /// do not understand.
+    static let currentSchemaVersion = 9
 
     let schemaVersion: Int
     let savedAt: Date
@@ -214,6 +340,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
     let pendingSchedulePublication: PendingSchedulePublication?
+    let pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation?
+    let proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
 
@@ -239,6 +367,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
+        pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
+        proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]? = [],
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty
     ) {
@@ -263,6 +393,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
         self.pendingSchedulePublication = pendingSchedulePublication
+        self.pendingProposalApplicationMutation = pendingProposalApplicationMutation
+        self.proposalApplicationReceipts = proposalApplicationReceipts
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
     }
@@ -271,10 +403,45 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         switch schemaVersion {
         case Self.currentSchemaVersion:
             guard executionState != nil,
-                  pendingCanonicalSensitivityMutations != nil else {
+                  pendingCanonicalSensitivityMutations != nil,
+                  let proposalApplicationReceipts,
+                  PlannerProposalApplicationJournalValidator.isValidState(
+                      pending: pendingProposalApplicationMutation,
+                      receipts: proposalApplicationReceipts
+                  ) else {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 8:
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil else {
+                throw .snapshotDecodingFailed
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: nil,
+                proposalApplicationReceipts: [],
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 7:
             guard executionState != nil,
                   pendingCanonicalSensitivityMutations != nil else {

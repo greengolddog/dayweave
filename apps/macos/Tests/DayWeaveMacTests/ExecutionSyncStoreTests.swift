@@ -456,6 +456,31 @@ struct ExecutionSyncStoreTests {
         #expect(planner.executionState.activeSession?.status == .paused)
     }
 
+    @Test("execution refresh waits for the shared canonical mutation fence")
+    func executionRefreshWaitsForSharedMutationFence() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(planner: planner, transport: transport)
+        #expect(planner.beginCanonicalSync())
+
+        let refresh = Task { @MainActor in
+            await sync.refresh()
+        }
+        try await Task.sleep(for: .milliseconds(75))
+        #expect(await transport.snapshotRequestCount() == 0)
+
+        planner.endCanonicalSync()
+        #expect(await refresh.value == .success)
+        #expect(await transport.snapshotRequestCount() == 2)
+        #expect(planner.executionState.historyVerified)
+    }
+
     @Test("concurrent foreground operations are rejected before duplicate network I/O")
     func concurrentRefreshIsSerialized() async throws {
         let context = try Self.persistenceContext()

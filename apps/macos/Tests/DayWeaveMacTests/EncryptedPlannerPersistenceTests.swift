@@ -687,6 +687,92 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func proposalApplicationJournalRoundTrip() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let receipt = proposalApplicationReceipt()
+        let mutation = DayWeavePendingProposalApplicationMutation.undo(
+            configurationIdentifier: receipt.configurationIdentifier,
+            proposalIDs: receipt.application.proposals.map(\.proposalID),
+            proposalRevisions: receipt.application.proposals.map(\.appliedRevision),
+            expectedCommandIDs: receipt.application.commandIDs,
+            applicationID: receipt.application.applicationID,
+            expectedApplicationRevision: receipt.application.applicationRevision,
+            requestBody: Data(#"{"expected_application_revision":1}"#.utf8),
+            idempotencyKey: "proposal-undo-retry-key-0001",
+            createdAt: base.savedAt.addingTimeInterval(60)
+        )
+        let snapshot = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalConfigurationIdentifier: receipt.configurationIdentifier,
+            pendingProposalApplicationMutation: mutation,
+            proposalApplicationReceipts: [receipt]
+        )
+
+        try context.persistence.save(snapshot)
+        let restored = try requireValue(
+            context.persistence.load(),
+            "Proposal application journal was not restored"
+        )
+        try require(
+            restored.pendingProposalApplicationMutation == mutation,
+            "Exact pending undo bytes or evidence changed during encrypted round-trip"
+        )
+        try require(
+            restored.proposalApplicationReceipts == [receipt],
+            "Content-free application receipt changed during encrypted round-trip"
+        )
+        let encrypted = try Data(contentsOf: context.fileURL)
+        try require(
+            encrypted.range(of: Data(mutation.idempotencyKey.utf8)) == nil,
+            "Proposal retry key leaked outside encrypted snapshot content"
+        )
+    }
+
+    static func schemaEightAddsNoProposalApplicationIntent() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 8,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            pendingCanonicalSensitivityMutations: [],
+            executionState: .empty
+        )
+
+        let migrated = try legacy.migratedToCurrentSchema()
+
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema-8 snapshot did not migrate to the current schema"
+        )
+        try require(
+            migrated.pendingProposalApplicationMutation == nil,
+            "Schema-8 migration invented a pending proposal mutation"
+        )
+        try require(
+            migrated.proposalApplicationReceipts == [],
+            "Schema-8 migration invented proposal application receipts"
+        )
+    }
+
     private static func require(
         _ condition: @autoclosure () -> Bool,
         _ message: String
@@ -803,6 +889,27 @@ private enum EncryptedPlannerPersistenceScenarios {
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(DayWeaveCanonicalItem.self, from: data)
     }
+
+    private static func proposalApplicationReceipt() -> DayWeaveStoredProposalApplicationReceipt {
+        let appliedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        return DayWeaveStoredProposalApplicationReceipt(
+            configurationIdentifier: "https://api.example.com/gateway|auth=static-v1:\(String(repeating: "a", count: 64))",
+            application: DayWeaveProposalApplicationReceipt(
+                applicationID: UUID(uuidString: "91000000-0000-4000-8000-000000000001")!,
+                proposals: [DayWeaveProposalAppliedMember(
+                    proposalID: UUID(uuidString: "92000000-0000-4000-8000-000000000002")!,
+                    appliedRevision: 5
+                )],
+                applicationRevision: 1,
+                status: .applied,
+                commandIDs: [UUID(uuidString: "93000000-0000-4000-8000-000000000003")!],
+                affectedItemIDs: [UUID(uuidString: "94000000-0000-4000-8000-000000000004")!],
+                appliedAt: appliedAt,
+                undoExpiresAt: appliedAt.addingTimeInterval(86_400),
+                undoneAt: nil
+            )
+        )
+    }
 }
 
 #if canImport(XCTest)
@@ -866,6 +973,14 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
 
     func testSchemaSevenPublicationMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaSevenAddsNoPublicationIntent()
+    }
+
+    func testProposalApplicationJournalRoundTrip() throws {
+        try EncryptedPlannerPersistenceScenarios.proposalApplicationJournalRoundTrip()
+    }
+
+    func testSchemaEightProposalApplicationMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaEightAddsNoProposalApplicationIntent()
     }
 }
 #elseif canImport(Testing)
@@ -945,6 +1060,16 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Schema 7 migrates without inventing a schedule publication")
     func schemaSevenPublicationMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaSevenAddsNoPublicationIntent()
+    }
+
+    @Test("Proposal application recovery state is encrypted and round-trips exactly")
+    func proposalApplicationJournalRoundTrip() throws {
+        try EncryptedPlannerPersistenceScenarios.proposalApplicationJournalRoundTrip()
+    }
+
+    @Test("Schema 8 migrates without inventing proposal application state")
+    func schemaEightProposalApplicationMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaEightAddsNoProposalApplicationIntent()
     }
 }
 #endif

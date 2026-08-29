@@ -1662,7 +1662,11 @@ private struct AssistantBubble: View {
 private struct SuggestionsInboxView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+    @EnvironmentObject private var proposalApplications: ProposalApplicationStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var serviceCoordinator: DayWeaveServiceCoordinator
     @State private var proposalBeingEdited: DayWeaveProposal?
+    @State private var proposalBeingReviewed: DayWeaveProposal?
 
     private var pendingLocalSuggestions: [PlanningSuggestion] {
         store.suggestions.filter { $0.state == .pending }
@@ -1672,7 +1676,7 @@ private struct SuggestionsInboxView: View {
         List {
             Section {
                 Label {
-                    Text("External tools can submit proposals, but they cannot change this schedule directly. Approval records a server-side decision only.")
+                    Text("External tools can only submit proposals. Executable changes are simulated first, require your explicit approval, and apply atomically from this device.")
                 } icon: {
                     Image(systemName: "shield.checkered")
                         .foregroundStyle(.green)
@@ -1698,7 +1702,31 @@ private struct SuggestionsInboxView: View {
                         !suggestionSync.isConfigured
                             || suggestionSync.isRefreshing
                             || !suggestionSync.activeProposalIDs.isEmpty
+                            || proposalApplications.hasPendingRecovery
                     )
+                }
+
+                HStack(spacing: 8) {
+                    Image(systemName: proposalApplications.hasPendingRecovery
+                        ? "arrow.clockwise.circle.fill"
+                        : "checkmark.shield")
+                        .foregroundStyle(proposalApplications.status.isFailure ? .red : .secondary)
+                    Text(proposalApplications.status.message)
+                        .font(.caption)
+                        .foregroundStyle(proposalApplications.status.isFailure ? .red : .secondary)
+                    Spacer()
+                    if proposalApplications.status.isWorking {
+                        ProgressView().controlSize(.small)
+                    }
+                    if proposalApplications.hasPendingRecovery {
+                        Button("Recover safely") {
+                            Task {
+                                await serviceCoordinator.recoverPendingProposalAndResume()
+                            }
+                        }
+                        .controlSize(.small)
+                        .disabled(proposalApplications.status.isWorking)
+                    }
                 }
             }
 
@@ -1744,21 +1772,39 @@ private struct SuggestionsInboxView: View {
                     ForEach(suggestionSync.proposals) { proposal in
                         RemoteSuggestionRow(
                             proposal: proposal,
-                            isWorking: suggestionSync.activeProposalIDs.contains(proposal.id),
-                            edit: { proposalBeingEdited = proposal }
+                            isWorking: suggestionSync.activeProposalIDs.contains(proposal.id)
+                                || proposalApplications.activeProposalID == proposal.id
+                                || proposalApplications.hasPendingRecovery,
+                            edit: { proposalBeingEdited = proposal },
+                            review: { proposalBeingReviewed = proposal }
                         )
+                    }
+                }
+            }
+
+            if !proposalApplications.recentReceipts.isEmpty {
+                Section("Recent applications") {
+                    ForEach(Array(proposalApplications.recentReceipts.prefix(5))) { receipt in
+                        ProposalApplicationReceiptRow(storedReceipt: receipt)
                     }
                 }
             }
         }
         .navigationTitle("Inbox")
         .task {
-            guard suggestionSync.isConfigured else { return }
+            guard suggestionSync.isConfigured,
+                  !proposalApplications.hasPendingRecovery else { return }
             await suggestionSync.refresh()
         }
         .sheet(item: $proposalBeingEdited) { proposal in
             EditRemoteSuggestionView(proposal: proposal)
                 .environmentObject(suggestionSync)
+                .environmentObject(proposalApplications)
+        }
+        .sheet(item: $proposalBeingReviewed) { proposal in
+            ProposalApplicationReviewView(proposal: proposal)
+                .environmentObject(proposalApplications)
+                .environmentObject(canonicalSync)
         }
     }
 
@@ -1799,6 +1845,7 @@ private struct RemoteSuggestionRow: View {
     let proposal: DayWeaveProposal
     let isWorking: Bool
     let edit: () -> Void
+    let review: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1829,11 +1876,30 @@ private struct RemoteSuggestionRow: View {
             .font(.caption)
             .foregroundStyle(.secondary)
 
+            if proposal.advertisesApplicationReadyChangeSet {
+                Label("Executable typed changes · review and device approval required", systemImage: "checkmark.shield")
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+            } else if proposal.advertisesReservedChangeSetSchema {
+                Label("Protected change-set version requires a newer DayWeave build", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            } else {
+                Label("Advisory proposal · accepting records a decision without changing items", systemImage: "text.bubble")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             HStack {
-                Button("Approve proposal") {
-                    Task { await suggestionSync.accept(proposal) }
+                if proposal.advertisesApplicationReadyChangeSet {
+                    Button("Review changes…", action: review)
+                        .buttonStyle(.borderedProminent)
+                } else if !proposal.advertisesReservedChangeSetSchema {
+                    Button("Accept advisory") {
+                        Task { await suggestionSync.accept(proposal) }
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
                 Button("Reject") {
                     Task { await suggestionSync.reject(proposal) }
                 }
@@ -1852,6 +1918,7 @@ private struct RemoteSuggestionRow: View {
 private struct EditRemoteSuggestionView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+    @EnvironmentObject private var proposalApplications: ProposalApplicationStore
 
     let proposal: DayWeaveProposal
     @State private var title: String
@@ -1897,6 +1964,7 @@ private struct EditRemoteSuggestionView: View {
                             title: title,
                             explanation: explanation
                         ) {
+                            proposalApplications.discardPreview(for: proposal.id)
                             dismiss()
                         }
                     }
@@ -1916,6 +1984,604 @@ private struct EditRemoteSuggestionView: View {
         guard !title.isEmpty else { return false }
         if proposal.explanation != nil, explanation.isEmpty { return false }
         return title != proposal.title || explanation != (proposal.explanation ?? "")
+    }
+}
+
+private struct ProposalApplicationReviewView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var proposalApplications: ProposalApplicationStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+
+    let proposal: DayWeaveProposal
+    @State private var approvedReview: DayWeaveProposalReviewApproval?
+    @State private var isRefreshingCanonicalState = false
+
+    private var review: DayWeaveProposalApplicationPreview? {
+        proposalApplications.preview(for: proposal)
+    }
+
+    private var storedReceipt: DayWeaveStoredProposalApplicationReceipt? {
+        proposalApplications.recentReceipts.first {
+            $0.application.contains(proposalID: proposal.id)
+        }
+    }
+
+    private var currentApproval: DayWeaveProposalReviewApproval? {
+        proposalApplications.approval(for: proposal)
+    }
+
+    private var approvalBinding: Binding<Bool> {
+        Binding(
+            get: { approvedReview != nil && approvedReview == currentApproval },
+            set: { isApproved in
+                approvedReview = isApproved ? currentApproval : nil
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 16) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Review proposed changes")
+                        .font(.title2.weight(.semibold))
+                    Text(proposal.title)
+                        .font(.headline)
+                    Text("The simulation is read-only. Apply uses the exact review hash and either commits every change or none.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done") { dismiss() }
+            }
+            .padding(24)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if let storedReceipt {
+                        ProposalApplicationReceiptRow(storedReceipt: storedReceipt)
+                            .padding(.vertical, 4)
+                    } else if let review {
+                        reviewContent(review)
+                    } else {
+                        HStack(spacing: 12) {
+                            if proposalApplications.status.isWorking {
+                                ProgressView()
+                            } else {
+                                Image(systemName: proposalApplications.status.isFailure
+                                    ? "exclamationmark.triangle.fill"
+                                    : "shield")
+                                    .foregroundStyle(proposalApplications.status.isFailure ? .red : .secondary)
+                            }
+                            Text(proposalApplications.status.message)
+                                .foregroundStyle(proposalApplications.status.isFailure ? .red : .secondary)
+                            Spacer()
+                            if !proposalApplications.status.isWorking {
+                                Button(proposalApplications.status.isFailure
+                                    ? "Try review again" : "Generate review") {
+                                    Task { await proposalApplications.prepareReview(for: proposal) }
+                                }
+                                .disabled(proposalApplications.status.isWorking)
+                            }
+                        }
+                        .padding(18)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .padding(24)
+            }
+        }
+        .frame(minWidth: 720, idealWidth: 820, minHeight: 620, idealHeight: 760)
+        .task(id: proposal.revision) {
+            guard storedReceipt == nil, review == nil else { return }
+            await proposalApplications.prepareReview(for: proposal)
+        }
+    }
+
+    @ViewBuilder
+    private func reviewContent(_ review: DayWeaveProposalApplicationPreview) -> some View {
+        HStack(spacing: 18) {
+            Label(review.maximumRisk.capitalized + " risk", systemImage: "gauge.with.dots.needle.50percent")
+                .foregroundStyle(proposalRiskColor(review.maximumRisk))
+            Label(
+                "Expires \(review.expiresAt.formatted(date: .omitted, time: .shortened))",
+                systemImage: "clock"
+            )
+            Label(
+                "\(review.commandIDs.count) atomic change\(review.commandIDs.count == 1 ? "" : "s")",
+                systemImage: "square.stack.3d.up"
+            )
+            Spacer()
+            Button("Refresh simulation") {
+                approvedReview = nil
+                Task { await proposalApplications.prepareReview(for: proposal) }
+            }
+            .disabled(proposalApplications.status.isWorking)
+        }
+        .font(.subheadline)
+
+        if !review.conflicts.isEmpty {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(review.conflicts) { conflict in
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(proposalFieldLabel(conflict.code)).fontWeight(.medium)
+                                Text(conflict.summary).foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: "exclamationmark.octagon.fill")
+                                .foregroundStyle(.red)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Text("Blocking conflicts")
+                    .font(.headline)
+            }
+        }
+
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                ForEach(review.diffs) { diff in
+                    ProposalItemDiffCard(diff: diff)
+                    if diff.id != review.diffs.last?.id { Divider() }
+                }
+                if review.diffs.isEmpty {
+                    Text("No direct item diff could be produced because the simulation is blocked.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Text("Direct changes")
+                .font(.headline)
+        }
+
+        if !review.implicitDiffs.isEmpty {
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(review.implicitDiffs) { diff in
+                        ProposalImplicitItemDiffCard(diff: diff)
+                        if diff.id != review.implicitDiffs.last?.id { Divider() }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Text("Implicit hierarchy changes")
+                    .font(.headline)
+            }
+        }
+
+        GroupBox {
+            VStack(alignment: .leading, spacing: 10) {
+                ForEach(review.risks) { risk in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: risk.requiresExplicitApproval
+                            ? "exclamationmark.shield.fill"
+                            : "info.circle.fill")
+                            .foregroundStyle(proposalRiskColor(risk.level))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(proposalFieldLabel(risk.code)) · \(risk.level.capitalized)")
+                                .fontWeight(.medium)
+                            Text(risk.summary)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        } label: {
+            Text("Risks and reversibility")
+                .font(.headline)
+        }
+
+        VStack(alignment: .leading, spacing: 12) {
+            Toggle(isOn: approvalBinding) {
+                Text("I reviewed the direct changes, hierarchy side effects, risks, and conflicts.")
+            }
+            .toggleStyle(.checkbox)
+
+            HStack {
+                Text(proposalApplications.status.message)
+                    .font(.caption)
+                    .foregroundStyle(proposalApplications.status.isFailure ? .red : .secondary)
+                Spacer()
+                if proposalApplications.status.isWorking || isRefreshingCanonicalState {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Apply exact changes") {
+                    Task {
+                        let applied = await proposalApplications.apply(
+                            proposal,
+                            approval: approvedReview
+                        )
+                        if applied { approvedReview = nil }
+                        if applied, canonicalSync.isConfigured {
+                            isRefreshingCanonicalState = true
+                            await canonicalSync.sync()
+                            isRefreshingCanonicalState = false
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(
+                    approvedReview == nil
+                        || approvedReview != currentApproval
+                        || !review.canApply
+                        || proposalApplications.status.isWorking
+                        || isRefreshingCanonicalState
+                )
+            }
+        }
+        .padding(16)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+private struct ProposalItemDiffCard: View {
+    let diff: DayWeaveProposalItemDiff
+    @State private var revealsSensitiveValues = false
+
+    private var containsSensitiveValues: Bool {
+        diff.before?.isSensitive == true || diff.after?.isSensitive == true
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(proposalFieldLabel(diff.operation), systemImage: operationSymbol)
+                    .font(.headline)
+                Spacer()
+                Text("Item \(diff.itemID.uuidString.prefix(8))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(alignment: .top, spacing: 12) {
+                ProposalItemSnapshotView(
+                    label: "Before",
+                    item: diff.before,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                )
+                Image(systemName: "arrow.right")
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 22)
+                ProposalItemSnapshotView(
+                    label: "After",
+                    item: diff.after,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                )
+            }
+
+            if containsSensitiveValues {
+                Toggle("Reveal sensitive before/after values", isOn: $revealsSensitiveValues)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+            }
+
+            ProposalChangedValuesView(
+                fields: diff.changedFields,
+                before: diff.before,
+                after: diff.after,
+                hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+            )
+        }
+    }
+
+    private var operationSymbol: String {
+        switch diff.operation {
+        case "create_item": "plus.circle.fill"
+        case "replace_item": "pencil.circle.fill"
+        case "trash_item": "trash.circle.fill"
+        case "restore_item": "arrow.uturn.backward.circle.fill"
+        default: "questionmark.circle"
+        }
+    }
+}
+
+private struct ProposalImplicitItemDiffCard: View {
+    let diff: DayWeaveProposalImplicitItemDiff
+    @State private var revealsSensitiveValues = false
+
+    private var containsSensitiveValues: Bool {
+        diff.before.isSensitive || diff.after.isSensitive
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Hierarchy side effect", systemImage: "arrow.triangle.branch")
+                    .font(.headline)
+                Spacer()
+                Text("Item \(diff.itemID.uuidString.prefix(8))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            HStack(alignment: .top, spacing: 12) {
+                ProposalItemSnapshotView(
+                    label: "Before",
+                    item: diff.before,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                )
+                Image(systemName: "arrow.right")
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 22)
+                ProposalItemSnapshotView(
+                    label: "After",
+                    item: diff.after,
+                    hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+                )
+            }
+            if containsSensitiveValues {
+                Toggle("Reveal sensitive before/after values", isOn: $revealsSensitiveValues)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+            }
+            ProposalChangedValuesView(
+                fields: diff.changedFields,
+                before: diff.before,
+                after: diff.after,
+                hidesSensitiveContent: containsSensitiveValues && !revealsSensitiveValues
+            )
+        }
+    }
+}
+
+private struct ProposalItemSnapshotView: View {
+    let label: String
+    let item: DayWeaveCanonicalItem?
+    let hidesSensitiveContent: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let item {
+                HStack(spacing: 5) {
+                    if item.isSensitive {
+                        Image(systemName: "lock.fill").foregroundStyle(.orange)
+                    }
+                    Text(proposalItemSnapshotTitle(
+                        item,
+                        hidesSensitiveContent: hidesSensitiveContent
+                    ))
+                        .fontWeight(.medium)
+                }
+                Text("\(proposalFieldLabel(item.kind.wireValue)) · \(proposalFieldLabel(item.status.wireValue)) · revision \(item.revision)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let duration = item.durationSeconds {
+                    Text("\(duration / 60) min · importance \(item.importance) · urgency \(item.urgency)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("None")
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+func proposalItemSnapshotTitle(
+    _ item: DayWeaveCanonicalItem,
+    hidesSensitiveContent: Bool
+) -> String {
+    hidesSensitiveContent ? "Sensitive item" : item.title
+}
+
+private struct ProposalChangedValuesView: View {
+    let fields: [String]
+    let before: DayWeaveCanonicalItem?
+    let after: DayWeaveCanonicalItem?
+    let hidesSensitiveContent: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("Exact changed values")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            ForEach(fields, id: \.self) { field in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(proposalFieldLabel(field))
+                        .font(.caption.weight(.semibold))
+                    HStack(alignment: .top, spacing: 8) {
+                        proposalValueCell(
+                            label: "Before",
+                            value: proposalItemFieldValue(
+                                field,
+                                item: before,
+                                hidesSensitiveContent: hidesSensitiveContent
+                            )
+                        )
+                        Image(systemName: "arrow.right")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 13)
+                        proposalValueCell(
+                            label: "After",
+                            value: proposalItemFieldValue(
+                                field,
+                                item: after,
+                                hidesSensitiveContent: hidesSensitiveContent
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func proposalValueCell(label: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased())
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.tertiary)
+            Text(value)
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+private func proposalItemFieldValue(
+    _ field: String,
+    item: DayWeaveCanonicalItem?,
+    hidesSensitiveContent: Bool
+) -> String {
+    guard let item else { return "Item absent" }
+    if hidesSensitiveContent,
+       ["title", "notes", "recurrence", "flexible_constraints"].contains(field) {
+        return "Hidden — use Reveal sensitive before/after values"
+    }
+    return switch field {
+    case "is_sensitive": item.isSensitive ? "Yes" : "No"
+    case "kind": item.kind.wireValue
+    case "status": item.status.wireValue
+    case "title": item.title
+    case "notes": item.notes ?? "None"
+    case "timezone_name": item.timezoneName
+    case "duration_seconds": item.durationSeconds.map { "\($0) seconds" } ?? "None"
+    case "deadline_at": proposalDateValue(item.deadlineAt)
+    case "earliest_start_at": proposalDateValue(item.earliestStartAt)
+    case "recurrence": item.recurrence.map(proposalJSONValue) ?? "None"
+    case "flexible_constraints": proposalJSONValue(item.flexibleConstraints)
+    case "split_policy": proposalSplitPolicyValue(item.splitPolicy)
+    case "importance": String(item.importance)
+    case "urgency": String(item.urgency)
+    case "parent_id": item.parentID?.uuidString.lowercased() ?? "None"
+    case "sibling_order": String(item.siblingOrder)
+    case "is_executable": item.isExecutable ? "Yes" : "No"
+    case "revision": String(item.revision)
+    case "completed_at": proposalDateValue(item.completedAt)
+    case "deleted_at": proposalDateValue(item.deletedAt)
+    default: "Unsupported field"
+    }
+}
+
+private func proposalDateValue(_ date: Date?) -> String {
+    guard let date else { return "None" }
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: date)
+}
+
+private func proposalJSONValue(_ value: JSONValue) -> String {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    guard let data = try? encoder.encode(value),
+          let string = String(data: data, encoding: .utf8) else {
+        return "Unsupported JSON value"
+    }
+    return string
+}
+
+private func proposalSplitPolicyValue(_ policy: DayWeaveSplitPolicy) -> String {
+    return switch policy {
+    case .indivisible:
+        "Indivisible"
+    case let .splittable(minimum, maximum):
+        "Splittable · minimum \(minimum) seconds · maximum \(maximum) seconds"
+    case let .unknown(raw):
+        proposalJSONValue(.object(raw))
+    }
+}
+
+private struct ProposalApplicationReceiptRow: View {
+    @EnvironmentObject private var proposalApplications: ProposalApplicationStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+
+    let storedReceipt: DayWeaveStoredProposalApplicationReceipt
+    @State private var isRefreshingCanonicalState = false
+
+    private var receipt: DayWeaveProposalApplicationReceipt {
+        storedReceipt.application
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: receipt.status == .applied
+                    ? "checkmark.seal.fill"
+                    : "arrow.uturn.backward.circle.fill")
+                    .foregroundStyle(receipt.status == .applied ? .green : .blue)
+                Text(receipt.status == .applied ? "Changes applied" : "Application undone")
+                    .font(.headline)
+                Spacer()
+                Text(receipt.appliedAt.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 14) {
+                Label("\(receipt.proposals.count) proposal\(receipt.proposals.count == 1 ? "" : "s")", systemImage: "sparkles")
+                Label("\(receipt.commandIDs.count) command\(receipt.commandIDs.count == 1 ? "" : "s")", systemImage: "square.stack.3d.up")
+                Label("\(receipt.affectedItemIDs.count) affected item\(receipt.affectedItemIDs.count == 1 ? "" : "s")", systemImage: "list.bullet.rectangle")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if receipt.status == .applied {
+                HStack {
+                    Text("Undo available until \(receipt.undoExpiresAt.formatted(date: .abbreviated, time: .shortened)); later item changes can make undo unsafe.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if proposalApplications.status.isWorking || isRefreshingCanonicalState {
+                        ProgressView().controlSize(.small)
+                    }
+                    Button("Undo application") {
+                        Task {
+                            let undone = await proposalApplications.undo(storedReceipt)
+                            if undone, canonicalSync.isConfigured {
+                                isRefreshingCanonicalState = true
+                                await canonicalSync.sync()
+                                isRefreshingCanonicalState = false
+                            }
+                        }
+                    }
+                    .disabled(
+                        Date() >= receipt.undoExpiresAt
+                            || proposalApplications.status.isWorking
+                            || isRefreshingCanonicalState
+                    )
+                }
+            } else if let undoneAt = receipt.undoneAt {
+                Text("Undone \(undoneAt.formatted(date: .abbreviated, time: .shortened)). Proposal history remains accepted and auditable.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 8)
+    }
+}
+
+private func proposalFieldLabel(_ value: String) -> String {
+    value.replacingOccurrences(of: "_", with: " ").capitalized
+}
+
+private func proposalRiskColor(_ level: String) -> Color {
+    switch level {
+    case "low": .green
+    case "medium": .orange
+    case "high": .red
+    case "critical": .purple
+    default: .secondary
     }
 }
 
@@ -2274,6 +2940,8 @@ struct SettingsView: View {
                                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             || !durableAuth.presentation.canConsumeEnrollmentCode
                             || durableAuth.isBusy
+                            || suggestionSync.isRefreshing
+                            || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
                             || canonicalSync.isSyncing
                             || !store.canMutatePlan
@@ -2361,6 +3029,8 @@ struct SettingsView: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         durableAuth.isBusy
+                            || suggestionSync.isRefreshing
+                            || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
                             || canonicalSync.isSyncing
                             || !store.canMutatePlan

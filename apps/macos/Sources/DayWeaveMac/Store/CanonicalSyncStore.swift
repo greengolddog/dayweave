@@ -109,7 +109,7 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     func sync() async {
-        guard activeSyncID == nil, planner.beginCanonicalSync() else { return }
+        guard await waitForCanonicalMutationFence() else { return }
         // Invalidate before reading configuration or Keychain state. An
         // out-of-process change must not leave an old preview actionable just
         // because client construction fails.
@@ -153,6 +153,37 @@ final class CanonicalSyncStore: ObservableObject {
         }
         activeSyncTask = task
         await task.value
+    }
+
+    /// A proposal completion must not lose its required pull/recomposition just
+    /// because execution reconciliation owns the shared canonical mutation
+    /// fence for a moment. Existing canonical work is also awaited and followed
+    /// by this request, so every caller is either cancelled explicitly or gets a
+    /// synchronization attempt after the work that caused contention.
+    private func waitForCanonicalMutationFence() async -> Bool {
+        while !Task.isCancelled {
+            guard planner.pendingProposalApplicationMutation == nil else {
+                status = .failed(
+                    "Recover the exact pending proposal application or undo before synchronizing canonical items."
+                )
+                return false
+            }
+            guard planner.canPersistPlan else { return false }
+            if let activeSyncTask {
+                await activeSyncTask.value
+                continue
+            }
+            if planner.beginCanonicalSync() {
+                return true
+            }
+            guard planner.isCanonicalSyncLocked else { return false }
+            do {
+                try await Task.sleep(for: .milliseconds(25))
+            } catch {
+                return false
+            }
+        }
+        return false
     }
 
     private func performSync(

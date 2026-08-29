@@ -87,6 +87,7 @@ final class SuggestionSyncStore: ObservableObject {
     private var refreshID: UUID?
     private var configurationGeneration: UInt64 = 0
     private var proposalsConfigurationIdentifier: String?
+    private var applicationConfigurationChangeHandler: (() -> Void)?
 
     init(
         configurationStore: any SuggestionAPIConfigurationStoring = UserDefaultsSuggestionAPIConfigurationStore(),
@@ -131,6 +132,30 @@ final class SuggestionSyncStore: ObservableObject {
         refreshID != nil
     }
 
+    var currentApplicationConfigurationIdentifier: String? {
+        guard tokenConfigured,
+              let baseURL = try? DayWeaveAPIBaseURL(baseURLString) else {
+            return nil
+        }
+        if let authCoordinator {
+            guard authCoordinator.hasUsableCredential(boundTo: baseURL) else { return nil }
+            return DayWeaveAPIClient(
+                baseURL: baseURL,
+                session: session,
+                authCoordinator: authCoordinator
+            ).configurationIdentifier
+        }
+        guard let token = try? tokenStore.loadToken(boundTo: baseURL),
+              !token.isEmpty else {
+            return nil
+        }
+        return DayWeaveAPIClient(
+            baseURL: baseURL,
+            session: session,
+            bearerToken: token
+        ).configurationIdentifier
+    }
+
     @discardableResult
     func applyConfiguration(baseURL: String, newToken: String) -> Bool {
         guard refreshID == nil, activeProposalIDs.isEmpty else {
@@ -163,7 +188,7 @@ final class SuggestionSyncStore: ObservableObject {
             configurationStore.saveBaseURL(validatedURL.url.absoluteString)
             baseURLString = validatedURL.url.absoluteString
             tokenConfigured = true
-            configurationGeneration &+= 1
+            advanceConfigurationGeneration()
             refreshID = nil
             proposals = []
             proposalsConfigurationIdentifier = nil
@@ -186,7 +211,7 @@ final class SuggestionSyncStore: ObservableObject {
             }
             try tokenStore.deleteCredential()
             tokenConfigured = false
-            configurationGeneration &+= 1
+            advanceConfigurationGeneration()
             refreshID = nil
             proposals = []
             proposalsConfigurationIdentifier = nil
@@ -201,7 +226,7 @@ final class SuggestionSyncStore: ObservableObject {
             status = .failed("Wait for the current proposal operation before refreshing authentication state.")
             return
         }
-        configurationGeneration &+= 1
+        advanceConfigurationGeneration()
         proposals = []
         proposalsConfigurationIdentifier = nil
         if let baseURL = try? DayWeaveAPIBaseURL(baseURLString) {
@@ -251,7 +276,26 @@ final class SuggestionSyncStore: ObservableObject {
         }
     }
 
+    func installApplicationConfigurationChangeHandler(
+        _ handler: @escaping () -> Void
+    ) {
+        applicationConfigurationChangeHandler = handler
+    }
+
+    private func advanceConfigurationGeneration() {
+        configurationGeneration &+= 1
+        applicationConfigurationChangeHandler?()
+    }
+
     func accept(_ proposal: DayWeaveProposal) async {
+        guard !proposal.advertisesReservedChangeSetSchema else {
+            if proposal.advertisesApplicationReadyChangeSet {
+                status = .failed("Review and apply this proposal's exact changes. Typed proposals cannot use legacy approval.")
+            } else {
+                status = .failed("This proposal uses a newer protected change-set format. Update DayWeave before reviewing it.")
+            }
+            return
+        }
         guard let client = makeClient() else { return }
         guard let proposal = beginOperation(
             proposal,
@@ -371,6 +415,56 @@ final class SuggestionSyncStore: ObservableObject {
             status = .failed(error.localizedDescription)
             return false
         }
+    }
+
+    func beginApplicationOperation(
+        for proposal: DayWeaveProposal
+    ) -> DayWeaveAPIClient? {
+        guard let client = makeClient() else { return nil }
+        guard beginOperation(
+            proposal,
+            configurationIdentifier: client.configurationIdentifier
+        ) != nil else {
+            return nil
+        }
+        return client
+    }
+
+    func beginApplicationRecovery(
+        proposalIDs: [UUID],
+        configurationIdentifier: String
+    ) -> DayWeaveAPIClient? {
+        guard refreshID == nil else {
+            status = .failed("Wait for the proposal refresh to finish before recovering an application.")
+            return nil
+        }
+        guard !proposalIDs.isEmpty,
+              Set(proposalIDs).count == proposalIDs.count,
+              activeProposalIDs.isDisjoint(with: proposalIDs),
+              let client = makeClient(),
+              client.configurationIdentifier == configurationIdentifier else {
+            status = .failed(
+                "The pending proposal application belongs to different API credentials. Restore that authenticated session to recover it safely."
+            )
+            return nil
+        }
+        activeProposalIDs.formUnion(proposalIDs)
+        return client
+    }
+
+    func finishApplicationOperation(proposalIDs: [UUID]) {
+        activeProposalIDs.subtract(proposalIDs)
+    }
+
+    func applicationDidCommit(
+        proposalIDs: [UUID],
+        configurationIdentifier: String,
+        message: String
+    ) {
+        guard proposalsConfigurationIdentifier == configurationIdentifier else { return }
+        let proposalIDSet = Set(proposalIDs)
+        proposals.removeAll { proposalIDSet.contains($0.id) }
+        status = .online(updatedAt: now(), message: message)
     }
 
     private func beginOperation(
