@@ -1,0 +1,2565 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration as StdDuration,
+};
+
+use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
+use thiserror::Error;
+use uuid::Uuid;
+
+use crate::{
+    items::{Item, ItemRepositoryError},
+    proposals::{
+        Clock, DecisionKind, MAX_PROPOSAL_COMMANDS, MAX_PROPOSALS_PER_PREVIEW, Proposal,
+        ProposalApplicationReceipt, ProposalApplicationStatus, ProposalAppliedMember,
+        ProposalApplyRequest, ProposalApplyResponse, ProposalChangeSet, ProposalChangeSetPreview,
+        ProposalChangeSetSchema, ProposalCommand, ProposalConflict, ProposalConflictCode,
+        ProposalImplicitChangeReason, ProposalImplicitItemDiff, ProposalItemDiff,
+        ProposalItemField, ProposalKind, ProposalOperation, ProposalPreviewRequest, ProposalRisk,
+        ProposalRiskCode, ProposalRiskLevel, ProposalStatus, ProposalUndoRequest,
+        ProposalUndoResponse,
+    },
+};
+
+use super::{
+    DatabaseScope, TransactionalItemCommand, TransactionalItemEffect, apply_item_command_tx,
+    fetch_item_batch_tx, list_item_batch_tx, lock_item_batch_tx, proposal_from_row,
+};
+
+const PREVIEW_TTL: StdDuration = StdDuration::from_mins(15);
+const UNDO_TTL: StdDuration = StdDuration::from_hours(24);
+const MAINTENANCE_INTERVAL: StdDuration = StdDuration::from_hours(1);
+const MAX_REVIEW_HASH_LENGTH: usize = 80;
+const MAX_ACTIVE_PREVIEWS: i64 = 100;
+
+const LOCKED_PROPOSAL_SELECT: &str = "SELECT id, revision, submitted_by_subject, source, \
+    source_reference, kind, status, title, explanation, payload, decision_note, created_at, \
+    updated_at, expires_at, decided_at FROM proposals WHERE workspace_id=$1 AND id=$2 \
+    AND trashed_at IS NULL FOR UPDATE";
+
+#[derive(Clone)]
+pub struct PostgresProposalApplicationRepository {
+    pool: PgPool,
+    scope: DatabaseScope,
+    test_clock: Option<Arc<dyn Clock>>,
+}
+
+impl std::fmt::Debug for PostgresProposalApplicationRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresProposalApplicationRepository")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PostgresProposalApplicationRepository {
+    #[must_use]
+    pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
+        Self {
+            pool,
+            scope,
+            test_clock: None,
+        }
+    }
+
+    /// Installs a deterministic time source for integration tests that need to
+    /// exercise long retention windows without sleeping. Production callers
+    /// must use [`Self::new`] so PostgreSQL remains the single clock authority.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_test_clock(pool: PgPool, scope: DatabaseScope, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            pool,
+            scope,
+            test_clock: Some(clock),
+        }
+    }
+
+    #[must_use]
+    pub const fn scope(&self) -> DatabaseScope {
+        self.scope
+    }
+
+    pub(crate) const fn uses_test_clock(&self) -> bool {
+        self.test_clock.is_some()
+    }
+
+    /// Scrubs expired undo snapshots and prunes expired unapplied previews.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage or owner-scope error. The transaction is all-or-none.
+    pub async fn maintain_retention(&self) -> Result<(), ProposalApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        lock_owner(&mut transaction, self.scope).await?;
+        let now = self.authoritative_now(&mut transaction).await?;
+        scrub_expired_effect_snapshots(&mut transaction, self.scope, now).await?;
+        prune_expired_previews(&mut transaction, self.scope, now).await?;
+        transaction.commit().await.map_err(internal)
+    }
+
+    pub(crate) fn spawn_maintenance_worker(self: &Arc<Self>) {
+        let repository = Arc::clone(self);
+        tokio::spawn(async move {
+            let interval = tokio::time::Instant::now() + MAINTENANCE_INTERVAL;
+            let mut interval = tokio::time::interval_at(interval, MAINTENANCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = repository.maintain_retention().await {
+                    tracing::warn!(%error, "proposal retention maintenance failed");
+                }
+            }
+        });
+    }
+
+    /// Simulates a complete proposal group with ordinary item rules, rolls the
+    /// canonical transaction back, and stores an immutable content-bound
+    /// preview. Generic or legacy proposal payloads never cross this boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, stale-state, owner-scope, or storage error.
+    #[allow(clippy::too_many_lines)] // Keeps simulation, review hashing, and persistence in one visible lock boundary.
+    pub async fn preview(
+        &self,
+        request: ProposalPreviewRequest,
+    ) -> Result<ProposalChangeSetPreview, ProposalApplicationError> {
+        validate_preview_request(&request)?;
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        lock_owner(&mut transaction, self.scope).await?;
+        let maintenance_now = self.authoritative_now(&mut transaction).await?;
+        scrub_expired_effect_snapshots(&mut transaction, self.scope, maintenance_now).await?;
+        prune_and_limit_previews(&mut transaction, self.scope, maintenance_now).await?;
+        let canonical_hash = canonical_item_hash(&mut transaction, self.scope.workspace_id).await?;
+
+        let proposals = lock_requested_proposals(&mut transaction, self.scope, &request).await?;
+        let now = self.authoritative_now(&mut transaction).await?;
+        let prepared = prepare_change_set(&proposals, now)?;
+        let before_items = list_item_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        sqlx::query("SAVEPOINT dayweave_proposal_preview_simulation")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        let simulated =
+            simulate_commands(&mut transaction, self.scope, &prepared.commands, now, false).await;
+        let (effects, implicit_diffs, mut conflicts) = match simulated {
+            Ok(mut effects) => {
+                let after_items = list_item_batch_tx(&mut transaction, self.scope.workspace_id)
+                    .await
+                    .map_err(map_item_error)?;
+                let initial_by_id = before_items
+                    .iter()
+                    .map(|item| (item.id, item))
+                    .collect::<HashMap<_, _>>();
+                for effect in &mut effects {
+                    effect.before = initial_by_id
+                        .get(&effect.after.id)
+                        .map(|item| (*item).clone());
+                }
+                let implicit_diffs =
+                    implicit_item_diffs(&before_items, &after_items, &prepared.commands);
+                let affected_item_ids =
+                    affected_preview_item_ids(&prepared.commands, &effects, &implicit_diffs);
+                let conflicts = provider_managed_conflicts(
+                    &mut transaction,
+                    self.scope,
+                    &prepared.commands,
+                    &affected_item_ids,
+                )
+                .await?;
+                (effects, implicit_diffs, conflicts)
+            }
+            Err(conflict) => (Vec::new(), Vec::new(), vec![conflict]),
+        };
+        sqlx::query("ROLLBACK TO SAVEPOINT dayweave_proposal_preview_simulation")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        sqlx::query("RELEASE SAVEPOINT dayweave_proposal_preview_simulation")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+
+        let diffs = effects
+            .iter()
+            .zip(&prepared.commands)
+            .map(|(effect, command)| item_diff(command, effect))
+            .collect::<Vec<_>>();
+        let risks = proposal_risks(&prepared.commands, &effects);
+        let maximum_risk = risks
+            .iter()
+            .map(|risk| risk.level)
+            .max()
+            .unwrap_or(ProposalRiskLevel::Low);
+        let requires_explicit_approval = risks.iter().any(|risk| risk.requires_explicit_approval);
+
+        let preview_id = Uuid::new_v4();
+        let preview_ttl = Duration::from_std(PREVIEW_TTL).map_err(|_| internal(()))?;
+        let proposal_expiry = proposals
+            .iter()
+            .map(|proposal| proposal.expires_at)
+            .min()
+            .ok_or_else(|| validation("at least one proposal is required"))?;
+        let expires_at = (now + preview_ttl).min(proposal_expiry);
+        if expires_at <= now {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalExpired,
+            ));
+        }
+
+        let commands_hash = hash_json(&prepared.commands)?;
+        let members = proposals
+            .iter()
+            .map(|proposal| StoredPreviewMember {
+                proposal_id: proposal.id,
+                proposal_revision: proposal.revision,
+                payload_hash: hash_json(&proposal.payload).unwrap_or([0; 32]),
+            })
+            .collect::<Vec<_>>();
+        if members.iter().any(|member| member.payload_hash == [0; 32]) {
+            return Err(ProposalApplicationError::Internal);
+        }
+        conflicts.sort_by_key(|conflict| (conflict.item_id, conflict.command_id));
+        let can_apply = conflicts.is_empty();
+        let review_content_hash = hash_domain_json(
+            b"dayweave.proposal.review-content.v1\0",
+            &json!({
+                "change_set_schema": ProposalChangeSetSchema::V1,
+                "command_ids": prepared.commands.iter().map(ProposalCommand::command_id).collect::<Vec<_>>(),
+                "can_apply": can_apply,
+                "maximum_risk": maximum_risk,
+                "requires_explicit_approval": requires_explicit_approval,
+                "diffs": &diffs,
+                "implicit_diffs": &implicit_diffs,
+                "risks": &risks,
+                "conflicts": &conflicts,
+            }),
+        )?;
+        let preview_hash = calculate_preview_hash(
+            preview_id,
+            self.scope,
+            &members,
+            prepared.commands.len(),
+            commands_hash,
+            canonical_hash,
+            review_content_hash,
+            can_apply,
+            now,
+            expires_at,
+        );
+
+        persist_preview(
+            &mut transaction,
+            self.scope,
+            preview_id,
+            &members,
+            prepared.commands.len(),
+            commands_hash,
+            canonical_hash,
+            review_content_hash,
+            preview_hash,
+            can_apply,
+            now,
+            expires_at,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(map_preview_insert_error)?;
+
+        Ok(ProposalChangeSetPreview {
+            preview_id,
+            proposals: request.proposals,
+            change_set_schema: ProposalChangeSetSchema::V1,
+            command_ids: prepared
+                .commands
+                .iter()
+                .map(ProposalCommand::command_id)
+                .collect(),
+            review_hash: encoded_hash(preview_hash),
+            expires_at,
+            can_apply,
+            maximum_risk,
+            requires_explicit_approval,
+            diffs,
+            implicit_diffs,
+            risks,
+            conflicts,
+        })
+    }
+
+    /// Applies one exact live preview and records its inverse evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, conflict, idempotency, owner-scope, or storage error.
+    #[allow(clippy::too_many_lines)] // The transaction is intentionally visible as one ordered safety boundary.
+    pub async fn apply(
+        &self,
+        preview_id: Uuid,
+        request: ProposalApplyRequest,
+        idempotency_key: &str,
+        actor_session_id: Option<Uuid>,
+    ) -> Result<ProposalApplyResponse, ProposalApplicationError> {
+        validate_idempotency_key(idempotency_key)?;
+        let expected_hash = decode_hash(&request.expected_review_hash)?;
+        let mut request_evidence = Vec::with_capacity(96);
+        request_evidence.extend_from_slice(b"dayweave.proposal.apply.v1\0");
+        request_evidence.extend_from_slice(preview_id.as_bytes());
+        request_evidence.extend_from_slice(&expected_hash);
+        let request_hash = hash_bytes(&request_evidence);
+        let key_hash = hash_bytes(idempotency_key.as_bytes());
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        lock_owner(&mut transaction, self.scope).await?;
+
+        if let Some(application_id) = replay_request(
+            &mut transaction,
+            self.scope,
+            "apply",
+            key_hash,
+            request_hash,
+        )
+        .await?
+        {
+            let application = load_receipt_tx(&mut transaction, self.scope, application_id).await?;
+            transaction.commit().await.map_err(internal)?;
+            return Ok(ProposalApplyResponse {
+                application,
+                replayed: true,
+            });
+        }
+
+        let preview = lock_preview(&mut transaction, self.scope, preview_id).await?;
+        if preview.preview_hash != expected_hash {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewMismatch,
+            ));
+        }
+        if !preview.can_apply {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewNotApplicable,
+            ));
+        }
+        let members = load_preview_members(&mut transaction, self.scope, preview_id).await?;
+        let proposals = lock_preview_proposals(&mut transaction, self.scope, &members).await?;
+        let now = self.authoritative_now(&mut transaction).await?;
+        if preview.expires_at <= now {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewExpired,
+            ));
+        }
+        let commands = prepare_change_set(&proposals, now)?.commands;
+        validate_stored_preview(&preview, self.scope, &members, &proposals, &commands)?;
+        if canonical_item_hash(&mut transaction, self.scope.workspace_id).await?
+            != preview.canonical_hash
+        {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::PreviewMismatch,
+            ));
+        }
+        let watermark = item_change_watermark(&mut transaction, self.scope.workspace_id).await?;
+        let effects = execute_commands(&mut transaction, self.scope, &commands, now, true).await?;
+        let affected_item_ids =
+            changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
+        reject_provider_managed_items(&mut transaction, self.scope, &affected_item_ids).await?;
+        let final_items = fetch_items(
+            &mut transaction,
+            self.scope.workspace_id,
+            &affected_item_ids,
+        )
+        .await?;
+
+        let application_id = Uuid::new_v4();
+        let undo_ttl = Duration::from_std(UNDO_TTL).map_err(|_| internal(()))?;
+        let undo_expires_at = now + undo_ttl;
+        let apply_audit_id = Uuid::new_v4();
+        insert_application_audit(
+            &mut transaction,
+            self.scope,
+            actor_session_id,
+            apply_audit_id,
+            application_id,
+            "proposal.application.applied",
+            None,
+            Some(1),
+            commands.len(),
+            affected_item_ids.len(),
+        )
+        .await?;
+        insert_application_header(
+            &mut transaction,
+            self.scope,
+            application_id,
+            &preview,
+            apply_audit_id,
+            commands.len(),
+            affected_item_ids.len(),
+            now,
+            undo_expires_at,
+        )
+        .await?;
+        insert_application_members(&mut transaction, self.scope, application_id, &members).await?;
+        insert_effects(
+            &mut transaction,
+            self.scope,
+            application_id,
+            &commands,
+            &effects,
+            &final_items,
+            now,
+        )
+        .await?;
+        insert_fences(&mut transaction, self.scope, application_id, &final_items).await?;
+        accept_proposals(
+            &mut transaction,
+            self.scope,
+            &proposals,
+            actor_session_id,
+            now,
+        )
+        .await?;
+        insert_request_receipt(
+            &mut transaction,
+            self.scope,
+            "apply",
+            key_hash,
+            request_hash,
+            application_id,
+            now,
+        )
+        .await?;
+        insert_application_outbox(
+            &mut transaction,
+            self.scope,
+            application_id,
+            1,
+            "proposal.application.applied",
+        )
+        .await?;
+        let application = load_receipt_tx(&mut transaction, self.scope, application_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(ProposalApplyResponse {
+            application,
+            replayed: false,
+        })
+    }
+
+    /// Loads a content-free durable application receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound`, owner-scope, or storage errors.
+    pub async fn get(
+        &self,
+        application_id: Uuid,
+    ) -> Result<ProposalApplicationReceipt, ProposalApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_owner(&mut transaction, self.scope).await?;
+        lock_receipt_application(&mut transaction, self.scope, application_id).await?;
+        let receipt = load_receipt_tx(&mut transaction, self.scope, application_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(receipt)
+    }
+
+    /// Finds the durable application linked to one accepted proposal. This is
+    /// the cross-device reconciliation path after a lost apply response.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound`, owner-scope, or storage errors.
+    pub async fn get_for_proposal(
+        &self,
+        proposal_id: Uuid,
+    ) -> Result<ProposalApplicationReceipt, ProposalApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_owner(&mut transaction, self.scope).await?;
+        let application_id: Uuid = sqlx::query_scalar(
+            "SELECT application.id FROM proposal_applications AS application \
+             JOIN proposal_application_members AS member \
+               ON member.workspace_id=application.workspace_id \
+              AND member.user_id=application.user_id \
+              AND member.application_id=application.id \
+             WHERE application.workspace_id=$1 AND application.user_id=$2 \
+               AND member.proposal_id=$3 FOR SHARE OF application",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(proposal_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        .ok_or(ProposalApplicationError::NotFound)?;
+        let receipt = load_receipt_tx(&mut transaction, self.scope, application_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(receipt)
+    }
+
+    /// Reverses a still-fenced application as one canonical transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation, stale-state, idempotency, owner-scope, or storage error.
+    #[allow(clippy::too_many_lines)] // The inverse lock/fence/commit ordering is intentionally kept together.
+    pub async fn undo(
+        &self,
+        application_id: Uuid,
+        request: ProposalUndoRequest,
+        idempotency_key: &str,
+        actor_session_id: Option<Uuid>,
+    ) -> Result<ProposalUndoResponse, ProposalApplicationError> {
+        validate_idempotency_key(idempotency_key)?;
+        if request.expected_application_revision == 0 {
+            return Err(validation("expected_application_revision must be positive"));
+        }
+        let request_hash = hash_bytes(
+            format!(
+                "dayweave.proposal.undo.v1:{application_id}:{}",
+                request.expected_application_revision
+            )
+            .as_bytes(),
+        );
+        let key_hash = hash_bytes(idempotency_key.as_bytes());
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(map_item_error)?;
+        lock_owner(&mut transaction, self.scope).await?;
+
+        if let Some(replayed_id) =
+            replay_request(&mut transaction, self.scope, "undo", key_hash, request_hash).await?
+        {
+            let application = load_receipt_tx(&mut transaction, self.scope, replayed_id).await?;
+            transaction.commit().await.map_err(internal)?;
+            return Ok(ProposalUndoResponse {
+                application,
+                replayed: true,
+            });
+        }
+
+        let application = lock_application(&mut transaction, self.scope, application_id).await?;
+        let now = self.authoritative_now(&mut transaction).await?;
+        if application.status != ProposalApplicationStatus::Applied {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::AlreadyApplied,
+            ));
+        }
+        if application.revision != request.expected_application_revision {
+            return Err(ProposalApplicationError::RevisionConflict {
+                expected: request.expected_application_revision,
+                actual: application.revision,
+            });
+        }
+        if application.undo_expires_at <= now {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::UndoExpired,
+            ));
+        }
+        let fences = lock_fences(&mut transaction, self.scope, application_id).await?;
+        validate_fences(&mut transaction, self.scope, &fences).await?;
+        reject_provider_managed_items(
+            &mut transaction,
+            self.scope,
+            &fences.iter().map(|fence| fence.item_id).collect::<Vec<_>>(),
+        )
+        .await?;
+        let effects = load_effects_reverse(&mut transaction, self.scope, application_id).await?;
+        let watermark = item_change_watermark(&mut transaction, self.scope.workspace_id).await?;
+        for effect in effects {
+            let current = fetch_item_batch_tx(
+                &mut transaction,
+                self.scope.workspace_id,
+                effect.item_id,
+                true,
+            )
+            .await
+            .map_err(map_item_error)?;
+            let inverse = inverse_command(&effect, &current)?;
+            apply_item_command_tx(&mut transaction, self.scope, inverse, now, true)
+                .await
+                .map_err(map_item_error)?;
+        }
+        let undo_item_ids =
+            changed_item_ids_since(&mut transaction, self.scope.workspace_id, watermark).await?;
+        let undo_items =
+            fetch_items(&mut transaction, self.scope.workspace_id, &undo_item_ids).await?;
+        let undo_audit_id = Uuid::new_v4();
+        insert_application_audit(
+            &mut transaction,
+            self.scope,
+            actor_session_id,
+            undo_audit_id,
+            application_id,
+            "proposal.application.undone",
+            Some(1),
+            Some(2),
+            application.effect_count,
+            application.fence_count,
+        )
+        .await?;
+        update_fences_after_undo(
+            &mut transaction,
+            self.scope,
+            application_id,
+            &fences,
+            &undo_items,
+        )
+        .await?;
+        mark_application_undone(
+            &mut transaction,
+            self.scope,
+            application_id,
+            undo_audit_id,
+            now,
+        )
+        .await?;
+        insert_request_receipt(
+            &mut transaction,
+            self.scope,
+            "undo",
+            key_hash,
+            request_hash,
+            application_id,
+            now,
+        )
+        .await?;
+        insert_application_outbox(
+            &mut transaction,
+            self.scope,
+            application_id,
+            2,
+            "proposal.application.undone",
+        )
+        .await?;
+        let application = load_receipt_tx(&mut transaction, self.scope, application_id).await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(ProposalUndoResponse {
+            application,
+            replayed: false,
+        })
+    }
+
+    async fn authoritative_now(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+    ) -> Result<DateTime<Utc>, ProposalApplicationError> {
+        if let Some(clock) = self.test_clock.as_ref() {
+            return Ok(clock.now());
+        }
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(internal)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ProposalApplicationError {
+    #[error("proposal application input is invalid: {0}")]
+    Validation(String),
+    #[error("proposal application resource was not found")]
+    NotFound,
+    #[error("proposal application owner scope is unavailable")]
+    OwnerUnavailable,
+    #[error("proposal application state is stale: {0:?}")]
+    Stale(ProposalConflictCode),
+    #[error("revision conflict: expected {expected}, found {actual}")]
+    RevisionConflict { expected: u64, actual: u64 },
+    #[error("idempotency key was used for different content")]
+    IdempotencyConflict,
+    #[error("proposal application failed")]
+    Internal,
+}
+
+struct PreparedChangeSet {
+    commands: Vec<ProposalCommand>,
+}
+
+#[derive(Clone)]
+struct StoredPreviewMember {
+    proposal_id: Uuid,
+    proposal_revision: u64,
+    payload_hash: [u8; 32],
+}
+
+struct StoredPreview {
+    id: Uuid,
+    proposal_count: usize,
+    command_count: usize,
+    commands_hash: [u8; 32],
+    canonical_hash: [u8; 32],
+    review_content_hash: [u8; 32],
+    preview_hash: [u8; 32],
+    can_apply: bool,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+struct StoredApplication {
+    revision: u64,
+    status: ProposalApplicationStatus,
+    effect_count: usize,
+    fence_count: usize,
+    undo_expires_at: DateTime<Utc>,
+}
+
+struct StoredEffect {
+    operation: ProposalOperation,
+    item_id: Uuid,
+    before: Option<Item>,
+}
+
+struct StoredFence {
+    item_id: Uuid,
+    applied_revision: u64,
+    applied_deleted: bool,
+}
+
+fn validate_preview_request(
+    request: &ProposalPreviewRequest,
+) -> Result<(), ProposalApplicationError> {
+    if request.proposals.is_empty() || request.proposals.len() > MAX_PROPOSALS_PER_PREVIEW {
+        return Err(validation(format!(
+            "proposals must contain between 1 and {MAX_PROPOSALS_PER_PREVIEW} members"
+        )));
+    }
+    let mut ids = HashSet::with_capacity(request.proposals.len());
+    for member in &request.proposals {
+        if member.expected_revision == 0 {
+            return Err(validation("expected_revision must be positive"));
+        }
+        if !ids.insert(member.proposal_id) {
+            return Err(validation("proposal ids must be unique"));
+        }
+    }
+    Ok(())
+}
+
+async fn lock_owner(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<(), ProposalApplicationError> {
+    let active: Option<bool> = sqlx::query_scalar(
+        "SELECT role = 'owner' AND removed_at IS NULL FROM workspace_members \
+         WHERE workspace_id = $1 AND user_id = $2 FOR NO KEY UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if active == Some(true) {
+        Ok(())
+    } else {
+        Err(ProposalApplicationError::OwnerUnavailable)
+    }
+}
+
+async fn lock_requested_proposals(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    request: &ProposalPreviewRequest,
+) -> Result<Vec<Proposal>, ProposalApplicationError> {
+    let mut sorted = request.proposals.clone();
+    sorted.sort_by_key(|member| member.proposal_id);
+    let mut by_id = std::collections::HashMap::with_capacity(sorted.len());
+    for member in sorted {
+        let row = sqlx::query(LOCKED_PROPOSAL_SELECT)
+            .bind(scope.workspace_id)
+            .bind(member.proposal_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(internal)?
+            .ok_or(ProposalApplicationError::NotFound)?;
+        let proposal = proposal_from_row(&row).map_err(|_| ProposalApplicationError::Internal)?;
+        if proposal.revision != member.expected_revision {
+            return Err(ProposalApplicationError::RevisionConflict {
+                expected: member.expected_revision,
+                actual: proposal.revision,
+            });
+        }
+        by_id.insert(proposal.id, proposal);
+    }
+    request
+        .proposals
+        .iter()
+        .map(|member| {
+            by_id
+                .remove(&member.proposal_id)
+                .ok_or(ProposalApplicationError::Internal)
+        })
+        .collect()
+}
+
+fn prepare_change_set(
+    proposals: &[Proposal],
+    now: DateTime<Utc>,
+) -> Result<PreparedChangeSet, ProposalApplicationError> {
+    let mut commands = Vec::new();
+    for proposal in proposals {
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalNotPending,
+            ));
+        }
+        if proposal.expires_at <= now {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalExpired,
+            ));
+        }
+        let change_set = ProposalChangeSet::from_payload(&proposal.payload)
+            .map_err(|error| validation(error.to_string()))?;
+        validate_kind_contract(proposal.kind, &change_set.commands)?;
+        commands.extend(change_set.commands);
+    }
+    let combined =
+        ProposalChangeSet::new(commands).map_err(|error| validation(error.to_string()))?;
+    if combined.commands.len() > MAX_PROPOSAL_COMMANDS {
+        return Err(validation("proposal group contains too many commands"));
+    }
+    Ok(PreparedChangeSet {
+        commands: combined.commands,
+    })
+}
+
+fn validate_kind_contract(
+    kind: ProposalKind,
+    commands: &[ProposalCommand],
+) -> Result<(), ProposalApplicationError> {
+    let valid = match kind {
+        ProposalKind::CreateItem => {
+            commands.len() == 1
+                && matches!(commands.first(), Some(ProposalCommand::CreateItem { .. }))
+        }
+        ProposalKind::GoalBreakdown => commands
+            .iter()
+            .all(|command| matches!(command, ProposalCommand::CreateItem { .. })),
+        ProposalKind::CalendarEvent => commands.iter().all(|command| {
+            matches!(command, ProposalCommand::CreateItem { item, .. } if item.kind == crate::items::ItemKind::Event)
+        }),
+        ProposalKind::UpdateItem | ProposalKind::ConstraintChange => commands.iter().all(
+            |command| {
+                matches!(
+                    command,
+                    ProposalCommand::ReplaceItem { .. }
+                        | ProposalCommand::TrashItem { .. }
+                        | ProposalCommand::RestoreItem { .. }
+                )
+            },
+        ),
+        ProposalKind::SchedulePlan | ProposalKind::Recommendation => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(validation(
+            "proposal kind is not compatible with its typed item commands",
+        ))
+    }
+}
+
+async fn simulate_commands(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    commands: &[ProposalCommand],
+    now: DateTime<Utc>,
+    record: bool,
+) -> Result<Vec<TransactionalItemEffect>, ProposalConflict> {
+    let mut effects = Vec::with_capacity(commands.len());
+    for command in commands {
+        let transactional = transactional_command(command.clone());
+        match apply_item_command_tx(transaction, scope, transactional, now, record).await {
+            Ok(effect) => effects.push(effect),
+            Err(error) => return Err(item_conflict(command, &error)),
+        }
+    }
+    // A later hierarchy command can advance an earlier command target (for
+    // example, creating a child refreshes its newly created goal). Review must
+    // show the final post-batch state, exactly like durable effect evidence.
+    for effect in &mut effects {
+        effect.after =
+            match fetch_item_batch_tx(transaction, scope.workspace_id, effect.after.id, true).await
+            {
+                Ok(item) => item,
+                Err(error) => {
+                    let command = commands
+                        .iter()
+                        .find(|command| command.target_item_id() == effect.after.id)
+                        .expect("each effect has one validated command target");
+                    return Err(item_conflict(command, &error));
+                }
+            };
+    }
+    Ok(effects)
+}
+
+async fn execute_commands(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    commands: &[ProposalCommand],
+    now: DateTime<Utc>,
+    record: bool,
+) -> Result<Vec<TransactionalItemEffect>, ProposalApplicationError> {
+    simulate_commands(transaction, scope, commands, now, record)
+        .await
+        .map_err(|conflict| ProposalApplicationError::Stale(conflict.code))
+}
+
+fn transactional_command(command: ProposalCommand) -> TransactionalItemCommand {
+    match command {
+        ProposalCommand::CreateItem { item, .. } => TransactionalItemCommand::Create(item),
+        ProposalCommand::ReplaceItem {
+            item_id,
+            expected_revision,
+            item,
+            ..
+        } => TransactionalItemCommand::Replace {
+            item_id,
+            expected_revision,
+            replacement: item,
+        },
+        ProposalCommand::TrashItem {
+            item_id,
+            expected_revision,
+            ..
+        } => TransactionalItemCommand::Trash {
+            item_id,
+            expected_revision,
+        },
+        ProposalCommand::RestoreItem {
+            item_id,
+            expected_revision,
+            ..
+        } => TransactionalItemCommand::Restore {
+            item_id,
+            expected_revision,
+        },
+    }
+}
+
+fn item_conflict(command: &ProposalCommand, error: &ItemRepositoryError) -> ProposalConflict {
+    let (code, expected, actual) = match error {
+        ItemRepositoryError::Duplicate(_) => (ProposalConflictCode::ItemAlreadyExists, None, None),
+        ItemRepositoryError::NotFound(_) => (ProposalConflictCode::ItemNotFound, None, None),
+        ItemRepositoryError::RevisionConflict { expected, actual } => (
+            ProposalConflictCode::ItemRevisionMismatch,
+            Some(*expected),
+            Some(*actual),
+        ),
+        ItemRepositoryError::ParentNotFound(_) => {
+            (ProposalConflictCode::ParentNotFound, None, None)
+        }
+        ItemRepositoryError::HierarchyCycle | ItemRepositoryError::SelfParent => {
+            (ProposalConflictCode::HierarchyCycle, None, None)
+        }
+        ItemRepositoryError::InvalidParentState => {
+            (ProposalConflictCode::InvalidParentState, None, None)
+        }
+        ItemRepositoryError::NonLeafExecutable => {
+            (ProposalConflictCode::NonLeafExecutable, None, None)
+        }
+        ItemRepositoryError::HasChildren => (ProposalConflictCode::HasChildren, None, None),
+        ItemRepositoryError::DeletedParent => (ProposalConflictCode::DeletedParent, None, None),
+        _ => (ProposalConflictCode::InvalidItem, None, None),
+    };
+    ProposalConflict {
+        code,
+        command_id: Some(command.command_id()),
+        item_id: Some(command.target_item_id()),
+        expected_revision: expected,
+        actual_revision: actual,
+        summary: "This change no longer satisfies the current item constraints.".to_owned(),
+    }
+}
+
+fn item_diff(command: &ProposalCommand, effect: &TransactionalItemEffect) -> ProposalItemDiff {
+    ProposalItemDiff {
+        command_id: command.command_id(),
+        operation: command.operation(),
+        item_id: command.target_item_id(),
+        changed_fields: changed_fields(effect.before.as_ref(), Some(&effect.after)),
+        before: effect.before.clone(),
+        after: Some(effect.after.clone()),
+    }
+}
+
+fn implicit_item_diffs(
+    before_items: &[Item],
+    after_items: &[Item],
+    commands: &[ProposalCommand],
+) -> Vec<ProposalImplicitItemDiff> {
+    let direct_targets = commands
+        .iter()
+        .map(ProposalCommand::target_item_id)
+        .collect::<HashSet<_>>();
+    let after_by_id = after_items
+        .iter()
+        .map(|item| (item.id, item))
+        .collect::<HashMap<_, _>>();
+    before_items
+        .iter()
+        .filter(|before| !direct_targets.contains(&before.id))
+        .filter_map(|before| {
+            let after = after_by_id.get(&before.id)?;
+            (before != *after).then(|| ProposalImplicitItemDiff {
+                item_id: before.id,
+                reason: ProposalImplicitChangeReason::HierarchyRefresh,
+                changed_fields: changed_fields(Some(before), Some(after)),
+                before: before.clone(),
+                after: (*after).clone(),
+            })
+        })
+        .collect()
+}
+
+fn affected_preview_item_ids(
+    commands: &[ProposalCommand],
+    effects: &[TransactionalItemEffect],
+    implicit_diffs: &[ProposalImplicitItemDiff],
+) -> Vec<Uuid> {
+    let mut ids = commands
+        .iter()
+        .map(ProposalCommand::target_item_id)
+        .chain(effects.iter().map(|effect| effect.after.id))
+        .chain(implicit_diffs.iter().map(|diff| diff.item_id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn changed_fields(before: Option<&Item>, after: Option<&Item>) -> Vec<ProposalItemField> {
+    let Some(before) = before else {
+        return vec![
+            ProposalItemField::IsSensitive,
+            ProposalItemField::Kind,
+            ProposalItemField::Status,
+            ProposalItemField::Title,
+            ProposalItemField::Notes,
+            ProposalItemField::TimezoneName,
+            ProposalItemField::DurationSeconds,
+            ProposalItemField::DeadlineAt,
+            ProposalItemField::EarliestStartAt,
+            ProposalItemField::Recurrence,
+            ProposalItemField::FlexibleConstraints,
+            ProposalItemField::SplitPolicy,
+            ProposalItemField::Importance,
+            ProposalItemField::Urgency,
+            ProposalItemField::ParentId,
+            ProposalItemField::SiblingOrder,
+            ProposalItemField::IsExecutable,
+            ProposalItemField::Revision,
+            ProposalItemField::CompletedAt,
+            ProposalItemField::DeletedAt,
+        ];
+    };
+    let Some(after) = after else {
+        return vec![ProposalItemField::DeletedAt];
+    };
+    let mut fields = Vec::new();
+    macro_rules! changed {
+        ($field:ident, $variant:ident) => {
+            if before.$field != after.$field {
+                fields.push(ProposalItemField::$variant);
+            }
+        };
+    }
+    changed!(is_sensitive, IsSensitive);
+    changed!(kind, Kind);
+    changed!(status, Status);
+    changed!(title, Title);
+    changed!(notes, Notes);
+    changed!(timezone_name, TimezoneName);
+    changed!(duration_seconds, DurationSeconds);
+    changed!(deadline_at, DeadlineAt);
+    changed!(earliest_start_at, EarliestStartAt);
+    changed!(recurrence, Recurrence);
+    changed!(flexible_constraints, FlexibleConstraints);
+    changed!(split_policy, SplitPolicy);
+    changed!(importance, Importance);
+    changed!(urgency, Urgency);
+    changed!(parent_id, ParentId);
+    changed!(sibling_order, SiblingOrder);
+    changed!(is_executable, IsExecutable);
+    changed!(revision, Revision);
+    changed!(completed_at, CompletedAt);
+    changed!(deleted_at, DeletedAt);
+    fields
+}
+
+#[allow(clippy::too_many_lines)] // Each material field class is deliberately explicit in the approval model.
+fn proposal_risks(
+    commands: &[ProposalCommand],
+    effects: &[TransactionalItemEffect],
+) -> Vec<ProposalRisk> {
+    let mut risks = commands
+        .iter()
+        .enumerate()
+        .map(|(index, command)| {
+            let (code, level, approval, summary) = match command {
+                ProposalCommand::CreateItem { .. } => (
+                    ProposalRiskCode::CreatesItem,
+                    ProposalRiskLevel::Low,
+                    false,
+                    "Creates a reversible local item.",
+                ),
+                ProposalCommand::ReplaceItem { .. } => (
+                    ProposalRiskCode::ReplacesItem,
+                    ProposalRiskLevel::Medium,
+                    true,
+                    "Replaces the current local item fields.",
+                ),
+                ProposalCommand::TrashItem { .. } => (
+                    ProposalRiskCode::TrashesItem,
+                    ProposalRiskLevel::High,
+                    true,
+                    "Moves a local item to Trash.",
+                ),
+                ProposalCommand::RestoreItem { .. } => (
+                    ProposalRiskCode::RestoresItem,
+                    ProposalRiskLevel::Medium,
+                    true,
+                    "Restores a previously trashed local item.",
+                ),
+            };
+            let sensitive = effects.get(index).is_some_and(|effect| {
+                effect.after.is_sensitive
+                    || effect
+                        .before
+                        .as_ref()
+                        .is_some_and(|before| before.is_sensitive)
+            });
+            ProposalRisk {
+                code: if sensitive {
+                    ProposalRiskCode::SensitiveContent
+                } else {
+                    code
+                },
+                level: if sensitive {
+                    level.max(ProposalRiskLevel::Medium)
+                } else {
+                    level
+                },
+                command_id: Some(command.command_id()),
+                item_id: Some(command.target_item_id()),
+                requires_explicit_approval: approval || sensitive,
+                summary: if sensitive {
+                    "Changes an item marked sensitive. Content remains inside the owner boundary."
+                        .to_owned()
+                } else {
+                    summary.to_owned()
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    for (command, effect) in commands.iter().zip(effects) {
+        if matches!(command, ProposalCommand::CreateItem { item, .. } if item.parent_id.is_some()) {
+            risks.push(ProposalRisk {
+                code: ProposalRiskCode::ChangesHierarchy,
+                level: ProposalRiskLevel::High,
+                command_id: Some(command.command_id()),
+                item_id: Some(command.target_item_id()),
+                requires_explicit_approval: true,
+                summary: "Adds an item beneath an existing or proposed hierarchy parent."
+                    .to_owned(),
+            });
+        }
+        let Some(before) = effect.before.as_ref() else {
+            continue;
+        };
+        let after = &effect.after;
+        let mut material = Vec::new();
+        if before.deadline_at != after.deadline_at {
+            let relaxed = before.deadline_at.is_some()
+                && after
+                    .deadline_at
+                    .is_none_or(|deadline| before.deadline_at.is_some_and(|old| deadline > old));
+            material.push((
+                if relaxed {
+                    ProposalRiskCode::RelaxesDeadline
+                } else {
+                    ProposalRiskCode::ChangesDeadline
+                },
+                ProposalRiskLevel::Medium,
+                if relaxed {
+                    "Relaxes or removes the current deadline."
+                } else {
+                    "Changes the current deadline."
+                },
+            ));
+        }
+        if before.parent_id != after.parent_id || before.sibling_order != after.sibling_order {
+            material.push((
+                ProposalRiskCode::ChangesHierarchy,
+                ProposalRiskLevel::High,
+                "Moves the item within the goal hierarchy.",
+            ));
+        }
+        if before.recurrence != after.recurrence {
+            material.push((
+                ProposalRiskCode::ChangesRecurrence,
+                ProposalRiskLevel::High,
+                "Changes the recurrence definition.",
+            ));
+        }
+        if before.status != after.status {
+            material.push((
+                ProposalRiskCode::ChangesExecutionState,
+                ProposalRiskLevel::Medium,
+                "Changes the item's execution state.",
+            ));
+        }
+        if before.is_sensitive != after.is_sensitive {
+            material.push((
+                ProposalRiskCode::ChangesSensitivity,
+                ProposalRiskLevel::High,
+                "Changes the item's sensitivity boundary.",
+            ));
+        }
+        risks.extend(
+            material
+                .into_iter()
+                .map(|(code, level, summary)| ProposalRisk {
+                    code,
+                    level,
+                    command_id: Some(command.command_id()),
+                    item_id: Some(command.target_item_id()),
+                    requires_explicit_approval: true,
+                    summary: summary.to_owned(),
+                }),
+        );
+    }
+    if commands.len() > 1 {
+        risks.push(ProposalRisk {
+            code: ProposalRiskCode::BulkChange,
+            level: ProposalRiskLevel::Medium,
+            command_id: None,
+            item_id: None,
+            requires_explicit_approval: true,
+            summary: format!("Applies {} changes as one atomic group.", commands.len()),
+        });
+    }
+    risks
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_preview(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    preview_id: Uuid,
+    members: &[StoredPreviewMember],
+    command_count: usize,
+    commands_hash: [u8; 32],
+    canonical_hash: [u8; 32],
+    review_content_hash: [u8; 32],
+    preview_hash: [u8; 32],
+    can_apply: bool,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "INSERT INTO proposal_apply_previews (id, workspace_id, user_id, proposal_count, \
+         command_count, commands_hash, canonical_hash, review_content_hash, preview_hash, \
+         can_apply, created_at, expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+    )
+    .bind(preview_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(i16::try_from(members.len()).map_err(|_| ProposalApplicationError::Internal)?)
+    .bind(i16::try_from(command_count).map_err(|_| ProposalApplicationError::Internal)?)
+    .bind(commands_hash.as_slice())
+    .bind(canonical_hash.as_slice())
+    .bind(review_content_hash.as_slice())
+    .bind(preview_hash.as_slice())
+    .bind(can_apply)
+    .bind(created_at)
+    .bind(expires_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_preview_insert_error)?;
+    for (ordinal, member) in members.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO proposal_apply_preview_members (workspace_id,user_id,preview_id,ordinal, \
+             proposal_id,proposal_revision,proposal_payload_hash) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(preview_id)
+        .bind(i16::try_from(ordinal).map_err(|_| ProposalApplicationError::Internal)?)
+        .bind(member.proposal_id)
+        .bind(revision_i64(member.proposal_revision)?)
+        .bind(member.payload_hash.as_slice())
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_preview_insert_error)?;
+    }
+    Ok(())
+}
+
+async fn lock_preview(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    preview_id: Uuid,
+) -> Result<StoredPreview, ProposalApplicationError> {
+    let row = sqlx::query(
+        "SELECT id, proposal_count, command_count, commands_hash, canonical_hash, \
+         review_content_hash, preview_hash, can_apply, created_at, expires_at FROM proposal_apply_previews \
+         WHERE workspace_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(preview_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ProposalApplicationError::NotFound)?;
+    stored_preview(&row)
+}
+
+fn stored_preview(row: &PgRow) -> Result<StoredPreview, ProposalApplicationError> {
+    Ok(StoredPreview {
+        id: row.try_get("id").map_err(internal)?,
+        proposal_count: positive_usize(row.try_get::<i16, _>("proposal_count").map_err(internal)?)?,
+        command_count: positive_usize(row.try_get::<i16, _>("command_count").map_err(internal)?)?,
+        commands_hash: bytes32(row.try_get("commands_hash").map_err(internal)?)?,
+        canonical_hash: bytes32(row.try_get("canonical_hash").map_err(internal)?)?,
+        review_content_hash: bytes32(row.try_get("review_content_hash").map_err(internal)?)?,
+        preview_hash: bytes32(row.try_get("preview_hash").map_err(internal)?)?,
+        can_apply: row.try_get("can_apply").map_err(internal)?,
+        created_at: row.try_get("created_at").map_err(internal)?,
+        expires_at: row.try_get("expires_at").map_err(internal)?,
+    })
+}
+
+async fn load_preview_members(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    preview_id: Uuid,
+) -> Result<Vec<StoredPreviewMember>, ProposalApplicationError> {
+    let rows = sqlx::query(
+        "SELECT proposal_id, proposal_revision, proposal_payload_hash \
+         FROM proposal_apply_preview_members WHERE workspace_id=$1 AND user_id=$2 \
+         AND preview_id=$3 ORDER BY ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(preview_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    rows.iter()
+        .map(|row| {
+            Ok(StoredPreviewMember {
+                proposal_id: row.try_get("proposal_id").map_err(internal)?,
+                proposal_revision: revision_u64(
+                    row.try_get::<i64, _>("proposal_revision")
+                        .map_err(internal)?,
+                )?,
+                payload_hash: bytes32(row.try_get("proposal_payload_hash").map_err(internal)?)?,
+            })
+        })
+        .collect()
+}
+
+async fn lock_preview_proposals(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    members: &[StoredPreviewMember],
+) -> Result<Vec<Proposal>, ProposalApplicationError> {
+    let mut sorted = members.to_vec();
+    sorted.sort_by_key(|member| member.proposal_id);
+    let mut by_id = std::collections::HashMap::with_capacity(sorted.len());
+    for member in sorted {
+        let row = sqlx::query(LOCKED_PROPOSAL_SELECT)
+            .bind(scope.workspace_id)
+            .bind(member.proposal_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(internal)?
+            .ok_or(ProposalApplicationError::NotFound)?;
+        let proposal = proposal_from_row(&row).map_err(|_| ProposalApplicationError::Internal)?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalNotPending,
+            ));
+        }
+        if proposal.revision != member.proposal_revision {
+            return Err(ProposalApplicationError::RevisionConflict {
+                expected: member.proposal_revision,
+                actual: proposal.revision,
+            });
+        }
+        if hash_json(&proposal.payload)? != member.payload_hash {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalRevisionMismatch,
+            ));
+        }
+        by_id.insert(proposal.id, proposal);
+    }
+    members
+        .iter()
+        .map(|member| {
+            by_id
+                .remove(&member.proposal_id)
+                .ok_or(ProposalApplicationError::Internal)
+        })
+        .collect()
+}
+
+fn validate_stored_preview(
+    preview: &StoredPreview,
+    scope: DatabaseScope,
+    members: &[StoredPreviewMember],
+    proposals: &[Proposal],
+    commands: &[ProposalCommand],
+) -> Result<(), ProposalApplicationError> {
+    if members.len() != preview.proposal_count
+        || proposals.len() != preview.proposal_count
+        || commands.len() != preview.command_count
+    {
+        return Err(ProposalApplicationError::Internal);
+    }
+    if hash_json(commands)? != preview.commands_hash {
+        return Err(ProposalApplicationError::Internal);
+    }
+    let expected_preview_hash = calculate_preview_hash(
+        preview.id,
+        scope,
+        members,
+        preview.command_count,
+        preview.commands_hash,
+        preview.canonical_hash,
+        preview.review_content_hash,
+        preview.can_apply,
+        preview.created_at,
+        preview.expires_at,
+    );
+    if expected_preview_hash != preview.preview_hash {
+        return Err(ProposalApplicationError::Internal);
+    }
+    for proposal in proposals {
+        let change_set = ProposalChangeSet::from_payload(&proposal.payload)
+            .map_err(|_| ProposalApplicationError::Internal)?;
+        validate_kind_contract(proposal.kind, &change_set.commands)?;
+    }
+    Ok(())
+}
+
+async fn provider_managed_conflicts(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    commands: &[ProposalCommand],
+    item_ids: &[Uuid],
+) -> Result<Vec<ProposalConflict>, ProposalApplicationError> {
+    if item_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let managed: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT local_entity_id FROM provider_sync_mappings WHERE workspace_id=$1 \
+         AND local_entity_id = ANY($2) AND tombstoned_at IS NULL \
+         AND entity_kind IN ('item','calendar_occurrence') ORDER BY local_entity_id",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_ids)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(managed
+        .into_iter()
+        .map(|item_id| ProposalConflict {
+            code: ProposalConflictCode::ProviderManagedItem,
+            command_id: commands
+                .iter()
+                .find(|command| command.target_item_id() == item_id)
+                .map(ProposalCommand::command_id),
+            item_id: Some(item_id),
+            expected_revision: None,
+            actual_revision: None,
+            summary: "This item is managed by an external calendar and cannot be changed by an AI proposal."
+                .to_owned(),
+        })
+        .collect())
+}
+
+async fn reject_provider_managed_items(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    item_ids: &[Uuid],
+) -> Result<(), ProposalApplicationError> {
+    if item_ids.is_empty() {
+        return Ok(());
+    }
+    if provider_managed_conflicts(transaction, scope, &[], item_ids)
+        .await?
+        .is_empty()
+    {
+        Ok(())
+    } else {
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::ProviderManagedItem,
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Every approval capability binding is explicit and domain-separated.
+fn calculate_preview_hash(
+    preview_id: Uuid,
+    scope: DatabaseScope,
+    members: &[StoredPreviewMember],
+    command_count: usize,
+    commands_hash: [u8; 32],
+    canonical_hash: [u8; 32],
+    review_content_hash: [u8; 32],
+    can_apply: bool,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dayweave.proposal.preview.v2\0");
+    digest.update(preview_id.as_bytes());
+    digest.update(scope.workspace_id.as_bytes());
+    digest.update(scope.user_id.as_bytes());
+    digest.update(
+        u64::try_from(command_count)
+            .unwrap_or(u64::MAX)
+            .to_be_bytes(),
+    );
+    digest.update(commands_hash);
+    digest.update(canonical_hash);
+    digest.update(review_content_hash);
+    digest.update([u8::from(can_apply)]);
+    digest.update(created_at.timestamp_micros().to_be_bytes());
+    digest.update(expires_at.timestamp_micros().to_be_bytes());
+    for member in members {
+        digest.update(member.proposal_id.as_bytes());
+        digest.update(member.proposal_revision.to_be_bytes());
+        digest.update(member.payload_hash);
+    }
+    digest.finalize().into()
+}
+
+async fn canonical_item_hash(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<[u8; 32], ProposalApplicationError> {
+    let rows = sqlx::query(
+        "SELECT id,revision,trashed_at IS NOT NULL AS deleted FROM items \
+         WHERE workspace_id=$1 ORDER BY id",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let mut digest = Sha256::new();
+    digest.update(b"dayweave.proposal.canonical-items.v2\0items\0");
+    digest.update(workspace_id.as_bytes());
+    for row in rows {
+        let item_id: Uuid = row.try_get("id").map_err(internal)?;
+        let revision: i64 = row.try_get("revision").map_err(internal)?;
+        let deleted: bool = row.try_get("deleted").map_err(internal)?;
+        digest.update(item_id.as_bytes());
+        digest.update(revision.to_be_bytes());
+        digest.update([u8::from(deleted)]);
+    }
+    let managed_item_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT local_entity_id FROM provider_sync_mappings \
+         WHERE workspace_id=$1 AND local_entity_id IS NOT NULL AND tombstoned_at IS NULL \
+         AND entity_kind IN ('item','calendar_occurrence') ORDER BY local_entity_id",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    digest.update(b"\0provider-managed-items\0");
+    for item_id in managed_item_ids {
+        digest.update(item_id.as_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn hash_json<T: Serialize + ?Sized>(value: &T) -> Result<[u8; 32], ProposalApplicationError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| ProposalApplicationError::Internal)?;
+    Ok(hash_bytes(&encoded))
+}
+
+fn hash_domain_json<T: Serialize + ?Sized>(
+    domain: &[u8],
+    value: &T,
+) -> Result<[u8; 32], ProposalApplicationError> {
+    let encoded = serde_json::to_vec(value).map_err(|_| ProposalApplicationError::Internal)?;
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+fn hash_bytes(value: &[u8]) -> [u8; 32] {
+    Sha256::digest(value).into()
+}
+
+fn encoded_hash(hash: [u8; 32]) -> String {
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in hash {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_hash(value: &str) -> Result<[u8; 32], ProposalApplicationError> {
+    if value.len() > MAX_REVIEW_HASH_LENGTH {
+        return Err(validation("expected_review_hash is invalid"));
+    }
+    let encoded = value
+        .strip_prefix("sha256:")
+        .ok_or_else(|| validation("expected_review_hash is invalid"))?;
+    if encoded.len() != 64 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(validation("expected_review_hash is invalid"));
+    }
+    let mut decoded = [0_u8; 32];
+    for (index, output) in decoded.iter_mut().enumerate() {
+        let offset = index * 2;
+        *output = u8::from_str_radix(&encoded[offset..offset + 2], 16)
+            .map_err(|_| validation("expected_review_hash is invalid"))?;
+    }
+    Ok(decoded)
+}
+
+async fn replay_request(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    operation: &str,
+    key_hash: [u8; 32],
+    request_hash: [u8; 32],
+) -> Result<Option<Uuid>, ProposalApplicationError> {
+    let row = sqlx::query(
+        "SELECT request_hash, application_id FROM proposal_application_requests \
+         WHERE workspace_id=$1 AND user_id=$2 AND operation=$3 AND key_hash=$4 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(operation)
+    .bind(key_hash.as_slice())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let stored_hash = bytes32(row.try_get("request_hash").map_err(internal)?)?;
+    if stored_hash != request_hash {
+        return Err(ProposalApplicationError::IdempotencyConflict);
+    }
+    Ok(Some(row.try_get("application_id").map_err(internal)?))
+}
+
+async fn item_change_watermark(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<i64, ProposalApplicationError> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(sequence),0) FROM item_changes WHERE workspace_id=$1")
+        .bind(workspace_id)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)
+}
+
+async fn scrub_expired_effect_snapshots(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "UPDATE proposal_application_effects AS effect \
+         SET before_snapshot=NULL,after_snapshot=NULL,snapshots_scrubbed_at=$3 \
+         FROM proposal_applications AS application \
+         WHERE effect.workspace_id=$1 AND effect.user_id=$2 \
+         AND application.workspace_id=effect.workspace_id \
+         AND application.user_id=effect.user_id AND application.id=effect.application_id \
+         AND application.undo_expires_at <= $3 AND effect.snapshots_scrubbed_at IS NULL",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn prune_and_limit_previews(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    prune_expired_previews(transaction, scope, now).await?;
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM proposal_apply_previews WHERE workspace_id=$1 \
+         AND user_id=$2 AND expires_at > $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if active >= MAX_ACTIVE_PREVIEWS {
+        Err(validation(
+            "too many active proposal previews; wait for an existing preview to expire",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+async fn prune_expired_previews(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "DELETE FROM proposal_apply_previews AS preview WHERE preview.workspace_id=$1 \
+         AND preview.user_id=$2 AND preview.expires_at <= $3 AND NOT EXISTS ( \
+             SELECT 1 FROM proposal_applications AS application \
+             WHERE application.workspace_id=preview.workspace_id \
+             AND application.user_id=preview.user_id AND application.preview_id=preview.id)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn changed_item_ids_since(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    watermark: i64,
+) -> Result<Vec<Uuid>, ProposalApplicationError> {
+    let ids = sqlx::query_scalar(
+        "SELECT DISTINCT item_id FROM item_changes WHERE workspace_id=$1 AND sequence>$2 \
+         ORDER BY item_id",
+    )
+    .bind(workspace_id)
+    .bind(watermark)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if ids.is_empty() {
+        Err(ProposalApplicationError::Internal)
+    } else {
+        Ok(ids)
+    }
+}
+
+async fn fetch_items(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_ids: &[Uuid],
+) -> Result<Vec<Item>, ProposalApplicationError> {
+    let mut items = Vec::with_capacity(item_ids.len());
+    for item_id in item_ids {
+        items.push(
+            fetch_item_batch_tx(transaction, workspace_id, *item_id, true)
+                .await
+                .map_err(map_item_error)?,
+        );
+    }
+    Ok(items)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_application_audit(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    actor_session_id: Option<Uuid>,
+    audit_id: Uuid,
+    application_id: Uuid,
+    operation: &str,
+    base_revision: Option<u64>,
+    result_revision: Option<u64>,
+    command_count: usize,
+    affected_count: usize,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "INSERT INTO audit_operations (id,workspace_id,actor_user_id,actor_session_id, \
+         operation_type,entity_type,entity_id,base_revision,result_revision,outcome,metadata) \
+         VALUES ($1,$2,$3,$4,$5,'proposal_application',$6,$7,$8,'succeeded',$9)",
+    )
+    .bind(audit_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(actor_session_id)
+    .bind(operation)
+    .bind(application_id)
+    .bind(base_revision.map(revision_i64).transpose()?)
+    .bind(result_revision.map(revision_i64).transpose()?)
+    .bind(json!({
+        "command_count": command_count,
+        "affected_item_count": affected_count,
+    }))
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_application_header(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    preview: &StoredPreview,
+    audit_id: Uuid,
+    effect_count: usize,
+    fence_count: usize,
+    applied_at: DateTime<Utc>,
+    undo_expires_at: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "INSERT INTO proposal_applications (id,workspace_id,user_id,preview_id,preview_hash, \
+         status,revision,effect_count,fence_count,apply_audit_id,applied_at,undo_expires_at) \
+         VALUES ($1,$2,$3,$4,$5,'applied',1,$6,$7,$8,$9,$10)",
+    )
+    .bind(application_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(preview.id)
+    .bind(preview.preview_hash.as_slice())
+    .bind(i16::try_from(effect_count).map_err(|_| ProposalApplicationError::Internal)?)
+    .bind(i32::try_from(fence_count).map_err(|_| ProposalApplicationError::Internal)?)
+    .bind(audit_id)
+    .bind(applied_at)
+    .bind(undo_expires_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_application_insert_error)?;
+    Ok(())
+}
+
+async fn insert_application_members(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    members: &[StoredPreviewMember],
+) -> Result<(), ProposalApplicationError> {
+    for (ordinal, member) in members.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO proposal_application_members (workspace_id,user_id,application_id, \
+             ordinal,proposal_id) VALUES ($1,$2,$3,$4,$5)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(application_id)
+        .bind(i16::try_from(ordinal).map_err(|_| ProposalApplicationError::Internal)?)
+        .bind(member.proposal_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_application_insert_error)?;
+    }
+    Ok(())
+}
+
+async fn insert_effects(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    commands: &[ProposalCommand],
+    effects: &[TransactionalItemEffect],
+    final_items: &[Item],
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    if commands.len() != effects.len() {
+        return Err(ProposalApplicationError::Internal);
+    }
+    for (ordinal, (command, effect)) in commands.iter().zip(effects).enumerate() {
+        let final_item = final_items
+            .iter()
+            .find(|item| item.id == command.target_item_id())
+            .ok_or(ProposalApplicationError::Internal)?;
+        let command_hash = hash_json(command)?;
+        let before_snapshot = effect
+            .before
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|_| ProposalApplicationError::Internal)?;
+        let after_snapshot =
+            serde_json::to_value(final_item).map_err(|_| ProposalApplicationError::Internal)?;
+        let before_snapshot_hash = effect
+            .before
+            .as_ref()
+            .map(|item| hash_domain_json(b"dayweave.proposal.item-snapshot.v1\0", item))
+            .transpose()?;
+        let after_snapshot_hash =
+            hash_domain_json(b"dayweave.proposal.item-snapshot.v1\0", final_item)?;
+        sqlx::query(
+            "INSERT INTO proposal_application_effects (workspace_id,user_id,application_id,ordinal, \
+             action_id,operation,command_hash,item_id,expected_revision,before_revision, \
+             after_revision,before_deleted,after_deleted,before_snapshot_hash,after_snapshot_hash, \
+             before_snapshot,after_snapshot,created_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(application_id)
+        .bind(i16::try_from(ordinal).map_err(|_| ProposalApplicationError::Internal)?)
+        .bind(command.command_id())
+        .bind(operation_name(command.operation()))
+        .bind(command_hash.as_slice())
+        .bind(command.target_item_id())
+        .bind(command.expected_revision().map(revision_i64).transpose()?)
+        .bind(effect.before.as_ref().map(|item| revision_i64(item.revision)).transpose()?)
+        .bind(revision_i64(final_item.revision)?)
+        .bind(effect.before.as_ref().map(|item| item.deleted_at.is_some()))
+        .bind(final_item.deleted_at.is_some())
+        .bind(before_snapshot_hash.map(|hash| hash.to_vec()))
+        .bind(after_snapshot_hash.as_slice())
+        .bind(before_snapshot)
+        .bind(after_snapshot)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+async fn insert_fences(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    items: &[Item],
+) -> Result<(), ProposalApplicationError> {
+    for item in items {
+        sqlx::query(
+            "INSERT INTO proposal_application_fences (workspace_id,user_id,application_id,item_id, \
+             applied_revision,applied_deleted) VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(application_id)
+        .bind(item.id)
+        .bind(revision_i64(item.revision)?)
+        .bind(item.deleted_at.is_some())
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+async fn accept_proposals(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    proposals: &[Proposal],
+    actor_session_id: Option<Uuid>,
+    now: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    for proposal in proposals {
+        let mut accepted = proposal.clone();
+        accepted
+            .decide(DecisionKind::Accept, None, now)
+            .map_err(|_| ProposalApplicationError::Internal)?;
+        let updated = sqlx::query(
+            "UPDATE proposals SET status='accepted', revision=$3, decision_note=NULL, \
+             updated_at=$4, decided_at=$4 WHERE workspace_id=$1 AND id=$2 \
+             AND revision=$5 AND status='pending' AND trashed_at IS NULL",
+        )
+        .bind(scope.workspace_id)
+        .bind(proposal.id)
+        .bind(revision_i64(accepted.revision)?)
+        .bind(now)
+        .bind(revision_i64(proposal.revision)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::ProposalRevisionMismatch,
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO outbox_messages (id,workspace_id,aggregate_type,aggregate_id, \
+             aggregate_revision,event_type,deduplication_key,payload) \
+             VALUES ($1,$2,'proposal',$3,$4,'proposal.accepted',$5,$6)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(scope.workspace_id)
+        .bind(proposal.id)
+        .bind(revision_i64(accepted.revision)?)
+        .bind(format!(
+            "proposal.accepted:{}:{}",
+            proposal.id, accepted.revision
+        ))
+        .bind(json!({
+            "proposal_id": proposal.id,
+            "revision": accepted.revision,
+            "status": "accepted",
+        }))
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        sqlx::query(
+            "INSERT INTO audit_operations (id,workspace_id,actor_user_id,actor_session_id, \
+             operation_type,entity_type,entity_id,base_revision,result_revision,outcome) \
+             VALUES ($1,$2,$3,$4,'proposal.accepted','proposal',$5,$6,$7,'succeeded')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(actor_session_id)
+        .bind(proposal.id)
+        .bind(revision_i64(proposal.revision)?)
+        .bind(revision_i64(accepted.revision)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_request_receipt(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    operation: &str,
+    key_hash: [u8; 32],
+    request_hash: [u8; 32],
+    application_id: Uuid,
+    completed_at: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "INSERT INTO proposal_application_requests (workspace_id,user_id,operation,key_hash, \
+         request_hash,application_id,completed_at) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(operation)
+    .bind(key_hash.as_slice())
+    .bind(request_hash.as_slice())
+    .bind(application_id)
+    .bind(completed_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(map_request_insert_error)?;
+    Ok(())
+}
+
+async fn insert_application_outbox(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    revision: u64,
+    event_type: &str,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query(
+        "INSERT INTO outbox_messages (id,workspace_id,aggregate_type,aggregate_id, \
+         aggregate_revision,event_type,deduplication_key,payload) \
+         VALUES ($1,$2,'proposal_application',$3,$4,$5,$6,$7)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(application_id)
+    .bind(revision_i64(revision)?)
+    .bind(event_type)
+    .bind(format!("{event_type}:{application_id}:{revision}"))
+    .bind(json!({
+        "application_id": application_id,
+        "revision": revision,
+    }))
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn load_receipt_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+) -> Result<ProposalApplicationReceipt, ProposalApplicationError> {
+    let row = sqlx::query(
+        "SELECT preview_id,status,revision,applied_at,undo_expires_at,undone_at \
+         FROM proposal_applications WHERE workspace_id=$1 AND user_id=$2 AND id=$3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ProposalApplicationError::NotFound)?;
+    let preview_id: Uuid = row.try_get("preview_id").map_err(internal)?;
+    let status = parse_application_status(&row.try_get::<String, _>("status").map_err(internal)?)?;
+    let revision = revision_u64(row.try_get::<i16, _>("revision").map_err(internal)?)?;
+    let member_rows = sqlx::query(
+        "SELECT member.proposal_id,preview_member.proposal_revision \
+         FROM proposal_application_members AS member \
+         JOIN proposal_apply_preview_members AS preview_member \
+           ON preview_member.workspace_id=member.workspace_id \
+          AND preview_member.user_id=member.user_id \
+          AND preview_member.preview_id=$3 \
+          AND preview_member.ordinal=member.ordinal \
+          AND preview_member.proposal_id=member.proposal_id \
+         WHERE member.workspace_id=$1 AND member.user_id=$2 \
+           AND member.application_id=$4 ORDER BY member.ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(preview_id)
+    .bind(application_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let proposals = member_rows
+        .iter()
+        .map(|member| {
+            let base = revision_u64(
+                member
+                    .try_get::<i64, _>("proposal_revision")
+                    .map_err(internal)?,
+            )?;
+            Ok(ProposalAppliedMember {
+                proposal_id: member.try_get("proposal_id").map_err(internal)?,
+                applied_revision: base
+                    .checked_add(1)
+                    .ok_or(ProposalApplicationError::Internal)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ProposalApplicationError>>()?;
+    let command_ids = sqlx::query_scalar(
+        "SELECT action_id FROM proposal_application_effects WHERE workspace_id=$1 AND user_id=$2 \
+         AND application_id=$3 ORDER BY ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let affected_item_ids = sqlx::query_scalar(
+        "SELECT item_id FROM proposal_application_fences WHERE workspace_id=$1 AND user_id=$2 \
+         AND application_id=$3 ORDER BY item_id",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(ProposalApplicationReceipt {
+        application_id,
+        proposals,
+        application_revision: revision,
+        status,
+        command_ids,
+        affected_item_ids,
+        applied_at: row.try_get("applied_at").map_err(internal)?,
+        undo_expires_at: row.try_get("undo_expires_at").map_err(internal)?,
+        undone_at: row.try_get("undone_at").map_err(internal)?,
+    })
+}
+
+async fn lock_application(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+) -> Result<StoredApplication, ProposalApplicationError> {
+    let row = sqlx::query(
+        "SELECT status,revision,effect_count,fence_count,undo_expires_at FROM proposal_applications \
+         WHERE workspace_id=$1 AND user_id=$2 AND id=$3 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ProposalApplicationError::NotFound)?;
+    Ok(StoredApplication {
+        revision: revision_u64(row.try_get::<i16, _>("revision").map_err(internal)?)?,
+        status: parse_application_status(&row.try_get::<String, _>("status").map_err(internal)?)?,
+        effect_count: positive_usize(row.try_get::<i16, _>("effect_count").map_err(internal)?)?,
+        fence_count: positive_usize(row.try_get::<i32, _>("fence_count").map_err(internal)?)?,
+        undo_expires_at: row.try_get("undo_expires_at").map_err(internal)?,
+    })
+}
+
+async fn lock_receipt_application(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+) -> Result<(), ProposalApplicationError> {
+    sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM proposal_applications WHERE workspace_id=$1 AND user_id=$2 AND id=$3 \
+         FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ProposalApplicationError::NotFound)?;
+    Ok(())
+}
+
+async fn lock_fences(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+) -> Result<Vec<StoredFence>, ProposalApplicationError> {
+    let rows = sqlx::query(
+        "SELECT item_id,applied_revision,applied_deleted FROM proposal_application_fences \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY item_id FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    rows.iter()
+        .map(|row| {
+            Ok(StoredFence {
+                item_id: row.try_get("item_id").map_err(internal)?,
+                applied_revision: revision_u64(
+                    row.try_get::<i64, _>("applied_revision")
+                        .map_err(internal)?,
+                )?,
+                applied_deleted: row.try_get("applied_deleted").map_err(internal)?,
+            })
+        })
+        .collect()
+}
+
+async fn validate_fences(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    fences: &[StoredFence],
+) -> Result<(), ProposalApplicationError> {
+    for fence in fences {
+        let item = fetch_item_batch_tx(transaction, scope.workspace_id, fence.item_id, true)
+            .await
+            .map_err(map_item_error)?;
+        if item.revision != fence.applied_revision
+            || item.deleted_at.is_some() != fence.applied_deleted
+        {
+            return Err(ProposalApplicationError::Stale(
+                ProposalConflictCode::UndoDiverged,
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn load_effects_reverse(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+) -> Result<Vec<StoredEffect>, ProposalApplicationError> {
+    let rows = sqlx::query(
+        "SELECT operation,item_id,before_snapshot,before_snapshot_hash FROM proposal_application_effects \
+         WHERE workspace_id=$1 AND user_id=$2 AND application_id=$3 ORDER BY ordinal DESC",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    rows.iter()
+        .map(|row| {
+            let before_value: Option<Value> = row.try_get("before_snapshot").map_err(internal)?;
+            let before = before_value
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| ProposalApplicationError::Internal)?;
+            let before_hash: Option<Vec<u8>> =
+                row.try_get("before_snapshot_hash").map_err(internal)?;
+            match (&before, before_hash) {
+                (Some(item), Some(hash))
+                    if bytes32(hash.clone())?
+                        == hash_domain_json(b"dayweave.proposal.item-snapshot.v1\0", item)? => {}
+                (None, None) => {}
+                _ => return Err(ProposalApplicationError::Internal),
+            }
+            Ok(StoredEffect {
+                operation: parse_operation(
+                    &row.try_get::<String, _>("operation").map_err(internal)?,
+                )?,
+                item_id: row.try_get("item_id").map_err(internal)?,
+                before,
+            })
+        })
+        .collect()
+}
+
+fn inverse_command(
+    effect: &StoredEffect,
+    current: &Item,
+) -> Result<TransactionalItemCommand, ProposalApplicationError> {
+    match effect.operation {
+        ProposalOperation::CreateItem => Ok(TransactionalItemCommand::Trash {
+            item_id: effect.item_id,
+            expected_revision: current.revision,
+        }),
+        ProposalOperation::ReplaceItem
+        | ProposalOperation::TrashItem
+        | ProposalOperation::RestoreItem => {
+            let before = effect
+                .before
+                .as_ref()
+                .ok_or(ProposalApplicationError::Internal)?;
+            Ok(TransactionalItemCommand::RestoreSnapshot {
+                item_id: effect.item_id,
+                expected_revision: current.revision,
+                snapshot: Box::new(before.clone()),
+            })
+        }
+    }
+}
+
+async fn update_fences_after_undo(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    fences: &[StoredFence],
+    undo_items: &[Item],
+) -> Result<(), ProposalApplicationError> {
+    for fence in fences {
+        let item = undo_items
+            .iter()
+            .find(|item| item.id == fence.item_id)
+            .ok_or(ProposalApplicationError::Internal)?;
+        let updated = sqlx::query(
+            "UPDATE proposal_application_fences SET undo_revision=$5 WHERE workspace_id=$1 \
+             AND user_id=$2 AND application_id=$3 AND item_id=$4 AND undo_revision IS NULL",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(application_id)
+        .bind(fence.item_id)
+        .bind(revision_i64(item.revision)?)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(ProposalApplicationError::Internal);
+        }
+    }
+    Ok(())
+}
+
+async fn mark_application_undone(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    application_id: Uuid,
+    undo_audit_id: Uuid,
+    undone_at: DateTime<Utc>,
+) -> Result<(), ProposalApplicationError> {
+    let updated = sqlx::query(
+        "UPDATE proposal_applications SET status='undone',revision=2,undo_audit_id=$4,undone_at=$5 \
+         WHERE workspace_id=$1 AND user_id=$2 AND id=$3 AND status='applied' AND revision=1",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(application_id)
+    .bind(undo_audit_id)
+    .bind(undone_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if updated == 1 {
+        Ok(())
+    } else {
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::UndoDiverged,
+        ))
+    }
+}
+
+fn validate_idempotency_key(value: &str) -> Result<(), ProposalApplicationError> {
+    if (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+    {
+        Ok(())
+    } else {
+        Err(validation(
+            "Idempotency-Key must be 8-128 URL-safe ASCII characters",
+        ))
+    }
+}
+
+const fn operation_name(operation: ProposalOperation) -> &'static str {
+    match operation {
+        ProposalOperation::CreateItem => "create_item",
+        ProposalOperation::ReplaceItem => "replace_item",
+        ProposalOperation::TrashItem => "trash_item",
+        ProposalOperation::RestoreItem => "restore_item",
+    }
+}
+
+fn parse_operation(value: &str) -> Result<ProposalOperation, ProposalApplicationError> {
+    match value {
+        "create_item" => Ok(ProposalOperation::CreateItem),
+        "replace_item" => Ok(ProposalOperation::ReplaceItem),
+        "trash_item" => Ok(ProposalOperation::TrashItem),
+        "restore_item" => Ok(ProposalOperation::RestoreItem),
+        _ => Err(ProposalApplicationError::Internal),
+    }
+}
+
+fn parse_application_status(
+    value: &str,
+) -> Result<ProposalApplicationStatus, ProposalApplicationError> {
+    match value {
+        "applied" => Ok(ProposalApplicationStatus::Applied),
+        "undone" => Ok(ProposalApplicationStatus::Undone),
+        _ => Err(ProposalApplicationError::Internal),
+    }
+}
+
+fn revision_i64(value: u64) -> Result<i64, ProposalApplicationError> {
+    i64::try_from(value).map_err(|_| ProposalApplicationError::Internal)
+}
+
+fn revision_u64<T>(value: T) -> Result<u64, ProposalApplicationError>
+where
+    T: TryInto<u64>,
+{
+    value
+        .try_into()
+        .map_err(|_| ProposalApplicationError::Internal)
+}
+
+fn positive_usize<T>(value: T) -> Result<usize, ProposalApplicationError>
+where
+    T: TryInto<usize>,
+{
+    let value = value
+        .try_into()
+        .map_err(|_| ProposalApplicationError::Internal)?;
+    if value == 0 {
+        Err(ProposalApplicationError::Internal)
+    } else {
+        Ok(value)
+    }
+}
+
+fn bytes32(value: Vec<u8>) -> Result<[u8; 32], ProposalApplicationError> {
+    value
+        .try_into()
+        .map_err(|_| ProposalApplicationError::Internal)
+}
+
+#[allow(clippy::needless_pass_by_value)] // Used directly as a `Result::map_err` adapter.
+fn map_item_error(error: ItemRepositoryError) -> ProposalApplicationError {
+    match error {
+        ItemRepositoryError::RevisionConflict { expected, actual } => {
+            ProposalApplicationError::RevisionConflict { expected, actual }
+        }
+        ItemRepositoryError::NotFound(_) => ProposalApplicationError::NotFound,
+        ItemRepositoryError::Duplicate(_) => {
+            ProposalApplicationError::Stale(ProposalConflictCode::ItemAlreadyExists)
+        }
+        ItemRepositoryError::ParentNotFound(_) => {
+            ProposalApplicationError::Stale(ProposalConflictCode::ParentNotFound)
+        }
+        ItemRepositoryError::HierarchyCycle | ItemRepositoryError::SelfParent => {
+            ProposalApplicationError::Stale(ProposalConflictCode::HierarchyCycle)
+        }
+        ItemRepositoryError::InvalidParentState => {
+            ProposalApplicationError::Stale(ProposalConflictCode::InvalidParentState)
+        }
+        ItemRepositoryError::NonLeafExecutable => {
+            ProposalApplicationError::Stale(ProposalConflictCode::NonLeafExecutable)
+        }
+        ItemRepositoryError::HasChildren => {
+            ProposalApplicationError::Stale(ProposalConflictCode::HasChildren)
+        }
+        ItemRepositoryError::DeletedParent => {
+            ProposalApplicationError::Stale(ProposalConflictCode::DeletedParent)
+        }
+        ItemRepositoryError::InvalidItem(_) => {
+            ProposalApplicationError::Stale(ProposalConflictCode::InvalidItem)
+        }
+        _ => ProposalApplicationError::Internal,
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Used directly as a `Result::map_err` adapter.
+fn map_preview_insert_error(error: sqlx::Error) -> ProposalApplicationError {
+    if is_constraint_error(&error) {
+        ProposalApplicationError::Stale(ProposalConflictCode::ProposalRevisionMismatch)
+    } else {
+        ProposalApplicationError::Internal
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Used directly as a `Result::map_err` adapter.
+fn map_application_insert_error(error: sqlx::Error) -> ProposalApplicationError {
+    if is_unique_violation(&error) {
+        ProposalApplicationError::Stale(ProposalConflictCode::AlreadyApplied)
+    } else {
+        ProposalApplicationError::Internal
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Used directly as a `Result::map_err` adapter.
+fn map_request_insert_error(error: sqlx::Error) -> ProposalApplicationError {
+    if is_unique_violation(&error) {
+        ProposalApplicationError::IdempotencyConflict
+    } else {
+        ProposalApplicationError::Internal
+    }
+}
+
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| code == "23505")
+}
+
+fn is_constraint_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .is_some_and(|code| matches!(code.as_ref(), "23503" | "23505" | "23514"))
+}
+
+fn validation(message: impl Into<String>) -> ProposalApplicationError {
+    ProposalApplicationError::Validation(message.into())
+}
+
+fn internal<T>(_error: T) -> ProposalApplicationError {
+    ProposalApplicationError::Internal
+}

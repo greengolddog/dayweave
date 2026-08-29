@@ -150,6 +150,38 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
         .unwrap();
     let document = body_json(openapi).await;
     assert!(document["paths"]["/v1/suggestions"].is_object());
+    assert!(document["paths"]["/v1/suggestions/application-previews"].is_object());
+    assert!(document["paths"]["/v1/suggestions/application-previews/{id}/apply"].is_object());
+    assert!(document["paths"]["/v1/suggestions/applications/{id}"].is_object());
+    assert!(document["paths"]["/v1/suggestions/applications/{id}/undo"].is_object());
+    assert!(document["paths"]["/v1/suggestions/{id}/application"].is_object());
+    for schema in [
+        "ProposalChangeSet",
+        "ProposalChangeSetSchema",
+        "ProposalCommand",
+        "ProposalImplicitChangeReason",
+        "ProposalImplicitItemDiff",
+        "ProposalOperation",
+    ] {
+        assert!(
+            document["components"]["schemas"][schema].is_object(),
+            "OpenAPI must declare the {schema} schema"
+        );
+    }
+    for path in [
+        "/v1/suggestions/application-previews/{id}/apply",
+        "/v1/suggestions/applications/{id}/undo",
+    ] {
+        let parameters = document["paths"][path]["post"]["parameters"]
+            .as_array()
+            .expect("mutating proposal application route parameters");
+        let idempotency_key = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "Idempotency-Key")
+            .expect("Idempotency-Key header parameter");
+        assert_eq!(idempotency_key["in"], "header");
+        assert_eq!(idempotency_key["required"], true);
+    }
     assert!(document["paths"]["/v1/schedule/preview"].is_object());
     assert!(document["paths"]["/v1/schedule/publish"].is_object());
     assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["200"].is_object());
@@ -300,6 +332,34 @@ async fn rest_scopes_and_credential_audiences_are_enforced_before_handlers() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn device_rest_derives_first_party_suggestion_provenance() {
+    let subject = "device-session:synthetic";
+    let device = Principal {
+        subject: subject.to_owned(),
+        scopes: vec![Scope::SuggestionsWrite],
+        audience: PrincipalAudience::Device,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+    let created = app_with_principal(device)
+        .oneshot(request(
+            "POST",
+            "/v1/suggestions",
+            Some(new_suggestion()),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await;
+    assert_eq!(created["suggestion"]["source"], "app_assistant");
+    assert_eq!(created["suggestion"]["source_reference"], Value::Null);
+    assert_eq!(created["suggestion"]["submitted_by"], subject);
 }
 
 #[tokio::test]
@@ -527,6 +587,235 @@ async fn suggestion_lifecycle_supports_review_edit_decision_and_delete() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn actionable_suggestions_cannot_bypass_atomic_application_or_owner_credentials() {
+    let (app, _) = test_app(true);
+    let proposal_id = "00000000-0000-4000-8000-000000000101";
+    let command_id = "00000000-0000-4000-8000-000000000102";
+    let item_id = "00000000-0000-4000-8000-000000000103";
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/suggestions",
+            Some(json!({
+                "source": "codex",
+                "kind": "create_item",
+                "title": "Create a review task",
+                "payload": {
+                    "schema": "dayweave.proposal-change-set/1",
+                    "commands": [{
+                        "operation": "create_item",
+                        "command_id": command_id,
+                        "item": {
+                            "id": item_id,
+                            "is_sensitive": false,
+                            "kind": "task",
+                            "status": "inbox",
+                            "title": "Review the plan",
+                            "notes": null,
+                            "timezone_name": "Europe/Madrid",
+                            "duration_seconds": 1800,
+                            "deadline_at": null,
+                            "earliest_start_at": null,
+                            "recurrence": null,
+                            "flexible_constraints": {},
+                            "split_policy": {"type": "indivisible"},
+                            "importance": 50,
+                            "urgency": 40,
+                            "parent_id": null,
+                            "sibling_order": 0
+                        }
+                    }]
+                }
+            })),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = body_json(created).await;
+    let created_id = created["suggestion"]["id"].as_str().unwrap();
+    assert_ne!(created_id, proposal_id);
+
+    let bypass = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/v1/suggestions/{created_id}/accept"),
+            Some(json!({"expected_revision": 1})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(bypass.status(), StatusCode::CONFLICT);
+
+    let legacy_preview = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/suggestions/application-previews",
+            Some(json!({
+                "proposals": [{
+                    "proposal_id": created_id,
+                    "expected_revision": 1
+                }]
+            })),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy_preview.status(), StatusCode::FORBIDDEN);
+
+    let unchanged = app
+        .oneshot(request(
+            "GET",
+            &format!("/v1/suggestions/{created_id}"),
+            None,
+            true,
+        ))
+        .await
+        .unwrap();
+    let unchanged = body_json(unchanged).await;
+    assert_eq!(unchanged["suggestion"]["status"], "pending");
+    assert_eq!(unchanged["suggestion"]["revision"], 1);
+}
+
+#[tokio::test]
+async fn malformed_and_future_change_set_namespaces_cannot_use_legacy_accept() {
+    let (app, _) = test_app(true);
+    let reserved_payloads = [
+        json!({
+            "schema": "dayweave.proposal-change-set/1",
+            "commands": "malformed"
+        }),
+        json!({
+            "schema": "dayweave.proposal-change-set/1",
+            "commands": [],
+            "future_field": true
+        }),
+        json!({
+            "schema": "dayweave.proposal-change-set/2",
+            "commands": []
+        }),
+        json!({
+            "schema": "dayweave.proposal-change-set/",
+            "commands": []
+        }),
+    ];
+
+    for (index, payload) in reserved_payloads.into_iter().enumerate() {
+        let created = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/suggestions",
+                Some(json!({
+                    "source": "codex",
+                    "kind": "recommendation",
+                    "title": format!("Reserved proposal {index}"),
+                    "payload": payload
+                })),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = body_json(created).await;
+        let id = created["suggestion"]["id"].as_str().unwrap();
+
+        let bypass = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                &format!("/v1/suggestions/{id}/accept"),
+                Some(json!({"expected_revision": 1})),
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bypass.status(), StatusCode::CONFLICT);
+
+        let unchanged = app
+            .clone()
+            .oneshot(request("GET", &format!("/v1/suggestions/{id}"), None, true))
+            .await
+            .unwrap();
+        let unchanged = body_json(unchanged).await;
+        assert_eq!(unchanged["suggestion"]["status"], "pending");
+        assert_eq!(unchanged["suggestion"]["revision"], 1);
+    }
+}
+
+#[tokio::test]
+async fn legacy_accept_is_revision_bound_to_the_payload_it_classifies() {
+    let (app, _) = test_app(true);
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/suggestions",
+            Some(new_suggestion()),
+            true,
+        ))
+        .await
+        .unwrap();
+    let created = body_json(created).await;
+    let id = created["suggestion"]["id"].as_str().unwrap();
+
+    let edited = app
+        .clone()
+        .oneshot(request(
+            "PATCH",
+            &format!("/v1/suggestions/{id}"),
+            Some(json!({
+                "expected_revision": 1,
+                "payload": {
+                    "schema": "dayweave.proposal-change-set/2",
+                    "commands": []
+                }
+            })),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(edited.status(), StatusCode::OK);
+
+    let stale_accept = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/v1/suggestions/{id}/accept"),
+            Some(json!({"expected_revision": 1})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_accept.status(), StatusCode::CONFLICT);
+    let stale_accept = body_json(stale_accept).await;
+    assert_eq!(stale_accept["error"]["details"]["actual_revision"], 2);
+
+    let current_accept = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/v1/suggestions/{id}/accept"),
+            Some(json!({"expected_revision": 2})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current_accept.status(), StatusCode::CONFLICT);
+
+    let unchanged = app
+        .oneshot(request("GET", &format!("/v1/suggestions/{id}"), None, true))
+        .await
+        .unwrap();
+    let unchanged = body_json(unchanged).await;
+    assert_eq!(unchanged["suggestion"]["status"], "pending");
+    assert_eq!(unchanged["suggestion"]["revision"], 2);
 }
 
 #[tokio::test]

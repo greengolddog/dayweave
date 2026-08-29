@@ -29,7 +29,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     let schema = [
@@ -47,6 +47,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0012_schedule_publication.sql"),
         include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
         include_str!("../migrations/0014_google_calendar_projection.sql"),
+        include_str!("../migrations/0015_transactional_proposal_applications.sql"),
     ]
     .join("\n");
     for table in [
@@ -85,6 +86,13 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_calendar_projection_rejections",
         "google_outbound_previews",
         "google_provider_identity_roots",
+        "proposal_apply_previews",
+        "proposal_apply_preview_members",
+        "proposal_applications",
+        "proposal_application_members",
+        "proposal_application_effects",
+        "proposal_application_fences",
+        "proposal_application_requests",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }

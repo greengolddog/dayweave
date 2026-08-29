@@ -41,7 +41,7 @@ use mcp_oauth::McpOAuthVerifier;
 use persistence::{
     Database, PersistenceError, PostgresCredentialRepository, PostgresExecutionRepository,
     PostgresGoogleOAuthRepository, PostgresGoogleSyncRepository, PostgresItemRepository,
-    PostgresProposalRepository,
+    PostgresProposalApplicationRepository, PostgresProposalRepository,
 };
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
@@ -60,6 +60,7 @@ type Repositories = (
     Arc<dyn GoogleOAuthRepository>,
     Option<Arc<dyn GoogleSyncRepository>>,
     Option<Arc<dyn CredentialRepository>>,
+    Option<Arc<PostgresProposalApplicationRepository>>,
     Option<Arc<PostgresSchedulingRepository>>,
     OAuthScope,
     Readiness,
@@ -72,6 +73,14 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             database.pool().clone(),
             database.scope(),
         ));
+        let proposal_applications = Arc::new(PostgresProposalApplicationRepository::new(
+            database.pool().clone(),
+            database.scope(),
+        ));
+        proposal_applications
+            .maintain_retention()
+            .await
+            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
         return Ok((
             Arc::new(PostgresProposalRepository::new(
                 database.pool().clone(),
@@ -97,6 +106,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             ))),
+            Some(proposal_applications),
             Some(scheduling),
             OAuthScope {
                 workspace_id: database.scope().workspace_id,
@@ -114,6 +124,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         Arc::new(InMemoryItemRepository::default()),
         Arc::new(InMemoryExecutionRepository::default()),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
+        None,
         None,
         None,
         None,
@@ -139,6 +150,7 @@ pub struct AppState {
     pub mcp_oauth: Option<Arc<McpOAuthVerifier>>,
     pub google_oauth: Option<Arc<GoogleOAuthService>>,
     pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
+    pub(crate) proposal_applications: Option<Arc<PostgresProposalApplicationRepository>>,
     pub(crate) scheduling: Option<Arc<PostgresSchedulingRepository>>,
     execution_repository: Arc<dyn ExecutionRepository>,
     pub(crate) clock: Arc<dyn Clock>,
@@ -156,6 +168,7 @@ impl AppState {
     /// connect, migrate, or initialize its personal workspace scope.
     #[allow(clippy::too_many_lines)] // Constructs and recovers the complete fail-closed dependency graph.
     pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let (
             repository,
             item_repository,
@@ -163,11 +176,11 @@ impl AppState {
             google_oauth_repository,
             google_sync_repository,
             credential_repository,
+            proposal_applications,
             scheduling,
             oauth_scope,
             readiness,
         ): Repositories = repositories(config).await?;
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let proposals = Arc::new(ProposalService::new(
             repository,
             clock.clone(),
@@ -291,6 +304,9 @@ impl AppState {
             None
         };
 
+        if let Some(repository) = proposal_applications.as_ref() {
+            repository.spawn_maintenance_worker();
+        }
         Ok(Self {
             proposals,
             items,
@@ -303,6 +319,7 @@ impl AppState {
             mcp_oauth,
             google_oauth,
             google_sync,
+            proposal_applications,
             scheduling,
             execution_repository,
             clock,
@@ -345,6 +362,7 @@ impl AppState {
             mcp_oauth: None,
             google_oauth: None,
             google_sync: None,
+            proposal_applications: None,
             scheduling: None,
             execution_repository,
             clock,
@@ -395,6 +413,26 @@ impl AppState {
             allowed_origins,
         ));
         self.scheduling = Some(repository);
+        self
+    }
+
+    /// Installs the durable proposal-application adapter in an explicitly
+    /// assembled HTTP dependency graph.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the repository uses its deterministic integration-test
+    /// clock. HTTP application state must always use `PostgreSQL` time.
+    #[must_use]
+    pub fn with_proposal_applications(
+        mut self,
+        repository: Arc<PostgresProposalApplicationRepository>,
+    ) -> Self {
+        assert!(
+            !repository.uses_test_clock(),
+            "a deterministic test clock cannot be installed in an HTTP AppState"
+        );
+        self.proposal_applications = Some(repository);
         self
     }
 

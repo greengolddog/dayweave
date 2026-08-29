@@ -208,6 +208,10 @@ integrations are proposal-only. AI may interpret intent and explain solver
 evidence, but it cannot weaken authentication, authorization, hard constraints,
 or the confirmation policy.
 
+The concrete device-only, content-bound proposal application protocol,
+provider-managed boundary, exact undo fences, and snapshot-retention policy are
+documented in [proposal-applications.md](proposal-applications.md).
+
 ## Secrets and key handling
 
 Production values belong in device key stores, Nebius secret/identity services,

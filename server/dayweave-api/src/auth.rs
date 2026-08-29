@@ -352,13 +352,22 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
     let matched_path = matched_path?;
     let path = matched_path.strip_prefix("/v1").unwrap_or(matched_path);
     match (method, path) {
-        (&Method::GET, "/suggestions" | "/suggestions/{id}") => Some(Scope::SuggestionsRead),
+        (
+            &Method::GET,
+            "/suggestions"
+            | "/suggestions/{id}"
+            | "/suggestions/{id}/application"
+            | "/suggestions/applications/{id}",
+        ) => Some(Scope::SuggestionsRead),
         (
             &Method::POST | &Method::PATCH | &Method::DELETE,
             "/suggestions"
             | "/suggestions/{id}"
             | "/suggestions/{id}/accept"
-            | "/suggestions/{id}/reject",
+            | "/suggestions/{id}/reject"
+            | "/suggestions/application-previews"
+            | "/suggestions/application-previews/{id}/apply"
+            | "/suggestions/applications/{id}/undo",
         ) => Some(Scope::SuggestionsWrite),
         (&Method::GET, "/items" | "/items/delta" | "/items/{id}") => Some(Scope::ItemsRead),
         (

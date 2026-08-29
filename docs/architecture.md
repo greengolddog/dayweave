@@ -275,6 +275,9 @@ All assistant behavior follows three stages:
 
 Schedule explanations use solver trace facts. The model may rewrite those facts in plain language but cannot add unverified reasons.
 
+The implemented typed, grouped review and exact-undo contract is documented in
+[proposal-applications.md](proposal-applications.md).
+
 ### 9.3 Memory and proactive work
 
 Assistant memory is a separate user-editable store with explicit provenance and delete/disable controls. Proactive jobs first run deterministic eligibility checks for quiet hours, category, sensitivity, urgency, and daily cap; only then may they invoke a model. Sensitive items do not enter proactive context unless the user opted in.
@@ -291,6 +294,10 @@ The private plugin under `integrations/dayweave` packages a scheduling skill and
 - side-effect-free simulation plus `submit_proposal` tools.
 
 There is deliberately no direct canonical mutation tool for external assistants. `submit_proposal` validates schema and permissions, stores provenance and expiry, and returns an Inbox reference. Accepting a proposal in DayWeave translates it into ordinary commands and confirmation policy. Each MCP client has a separate revocable credential and field-level access policy.
+
+MCP submissions themselves remain non-executable; the device-only translation
+and application boundary is described in
+[proposal-applications.md](proposal-applications.md).
 
 ## 11. Security architecture
 

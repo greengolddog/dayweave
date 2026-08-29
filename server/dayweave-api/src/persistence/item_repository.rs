@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use crate::items::{
     DeltaChange, IdempotencyContext, Item, ItemDeltaPage, ItemKind, ItemMutation, ItemQuery,
-    ItemRepository, ItemRepositoryError, ItemStatus, ItemTombstone, ReplaceItem, SplitPolicy,
+    ItemRepository, ItemRepositoryError, ItemStatus, ItemTombstone, NewItem, ReplaceItem,
+    SplitPolicy,
 };
 
 use super::{DatabaseScope, database::lock_canonical_item_space};
@@ -32,6 +33,42 @@ const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.st
 pub struct PostgresItemRepository {
     pool: PgPool,
     scope: DatabaseScope,
+}
+
+/// A canonical item command executed as part of a caller-owned `PostgreSQL`
+/// transaction. Proposal application uses this boundary so a group of changes
+/// can commit or roll back as one unit without nesting per-item transactions.
+#[derive(Clone, Debug)]
+pub(crate) enum TransactionalItemCommand {
+    Create(NewItem),
+    Replace {
+        item_id: Uuid,
+        expected_revision: u64,
+        replacement: ReplaceItem,
+    },
+    Trash {
+        item_id: Uuid,
+        expected_revision: u64,
+    },
+    Restore {
+        item_id: Uuid,
+        expected_revision: u64,
+    },
+    /// Restores a trusted database snapshot while still advancing the
+    /// canonical revision. This is intentionally unavailable to API callers;
+    /// proposal undo uses it to recover fields such as the original
+    /// `completed_at` and tombstone timestamp that `ReplaceItem` cannot carry.
+    RestoreSnapshot {
+        item_id: Uuid,
+        expected_revision: u64,
+        snapshot: Box<Item>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TransactionalItemEffect {
+    pub before: Option<Item>,
+    pub after: Item,
 }
 
 impl PostgresItemRepository {
@@ -303,20 +340,17 @@ impl ItemRepository for PostgresItemRepository {
             return Err(ItemRepositoryError::NotFound(id));
         }
         ensure_revision(&current, expected_revision)?;
-        if let Some(parent_id) = current.parent_id {
-            let active: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM items WHERE workspace_id = $1 AND id = $2 \
-                 AND trashed_at IS NULL)",
-            )
-            .bind(self.scope.workspace_id)
-            .bind(parent_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(internal)?;
-            if !active {
-                return Err(ItemRepositoryError::DeletedParent);
-            }
-        }
+        validate_parent(
+            &mut transaction,
+            self.scope.workspace_id,
+            id,
+            current.parent_id,
+        )
+        .await
+        .map_err(|error| match error {
+            ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
+            other => other,
+        })?;
         let item = current.restored(now)?;
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await?
             && item.status.is_executing_state()
@@ -402,6 +436,327 @@ impl ItemRepository for PostgresItemRepository {
             has_more,
         })
     }
+}
+
+pub(crate) async fn lock_item_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    lock_workspace_items(transaction, workspace_id).await
+}
+
+pub(crate) async fn fetch_item_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Uuid,
+    include_deleted: bool,
+) -> Result<Item, ItemRepositoryError> {
+    fetch_item_transaction(transaction, workspace_id, item_id, include_deleted).await
+}
+
+pub(crate) async fn list_item_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Vec<Item>, ItemRepositoryError> {
+    let mut builder = QueryBuilder::<Postgres>::new(ITEM_SELECT);
+    builder
+        .push(" WHERE item.workspace_id = ")
+        .push_bind(workspace_id)
+        .push(" ORDER BY item.id");
+    builder
+        .build()
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(internal)?
+        .iter()
+        .map(item_from_row)
+        .collect()
+}
+
+/// Executes one item command inside a transaction that already owns the
+/// canonical workspace lock. `record` is false for rolled-back previews and
+/// true for committed application/undo transactions.
+#[allow(clippy::too_many_lines)] // Mirrors all four ordinary item mutation invariants in one atomic boundary.
+pub(crate) async fn apply_item_command_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    command: TransactionalItemCommand,
+    now: DateTime<Utc>,
+    record: bool,
+) -> Result<TransactionalItemEffect, ItemRepositoryError> {
+    match command {
+        TransactionalItemCommand::Create(input) => {
+            let item = Item::new(input, now)?;
+            validate_parent(transaction, scope.workspace_id, item.id, item.parent_id).await?;
+            insert_item(transaction, scope, &item).await?;
+            replace_hierarchy_edge(
+                transaction,
+                scope.workspace_id,
+                item.id,
+                item.parent_id,
+                item.sibling_order,
+            )
+            .await?;
+            let item =
+                fetch_item_transaction(transaction, scope.workspace_id, item.id, false).await?;
+            if record {
+                record_mutation(
+                    transaction,
+                    scope,
+                    &item,
+                    "item.created",
+                    None,
+                    ChangeKind::Upsert,
+                )
+                .await?;
+            }
+            refresh_parents_with_mode(
+                transaction,
+                scope,
+                [item.parent_id],
+                item.updated_at,
+                record,
+            )
+            .await?;
+            Ok(TransactionalItemEffect {
+                before: None,
+                after: item,
+            })
+        }
+        TransactionalItemCommand::Replace {
+            item_id,
+            expected_revision,
+            replacement,
+        } => {
+            let current =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
+            ensure_revision(&current, expected_revision)?;
+            let previous_parent_id = current.parent_id;
+            let previous_sibling_order = current.sibling_order;
+            let item = current.replaced(replacement, now)?;
+            validate_parent(transaction, scope.workspace_id, item_id, item.parent_id).await?;
+            if has_active_children(transaction, scope.workspace_id, item_id).await?
+                && item.status.is_executing_state()
+            {
+                return Err(ItemRepositoryError::NonLeafExecutable);
+            }
+            update_item(transaction, scope.workspace_id, &item).await?;
+            replace_hierarchy_edge(
+                transaction,
+                scope.workspace_id,
+                item_id,
+                item.parent_id,
+                item.sibling_order,
+            )
+            .await?;
+            let item =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
+            if record {
+                record_mutation(
+                    transaction,
+                    scope,
+                    &item,
+                    "item.updated",
+                    Some(expected_revision),
+                    ChangeKind::Upsert,
+                )
+                .await?;
+            }
+            if previous_parent_id != item.parent_id || previous_sibling_order != item.sibling_order
+            {
+                refresh_parents_with_mode(
+                    transaction,
+                    scope,
+                    [previous_parent_id, item.parent_id],
+                    item.updated_at,
+                    record,
+                )
+                .await?;
+            }
+            Ok(TransactionalItemEffect {
+                before: Some(current),
+                after: item,
+            })
+        }
+        TransactionalItemCommand::Trash {
+            item_id,
+            expected_revision,
+        } => {
+            let current =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
+            ensure_revision(&current, expected_revision)?;
+            if has_active_children(transaction, scope.workspace_id, item_id).await? {
+                return Err(ItemRepositoryError::HasChildren);
+            }
+            let item = current.trashed(now)?;
+            update_item(transaction, scope.workspace_id, &item).await?;
+            let item =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
+            if record {
+                record_mutation(
+                    transaction,
+                    scope,
+                    &item,
+                    "item.trashed",
+                    Some(expected_revision),
+                    ChangeKind::Tombstone,
+                )
+                .await?;
+            }
+            refresh_parents_with_mode(
+                transaction,
+                scope,
+                [item.parent_id],
+                item.updated_at,
+                record,
+            )
+            .await?;
+            Ok(TransactionalItemEffect {
+                before: Some(current),
+                after: item,
+            })
+        }
+        TransactionalItemCommand::Restore {
+            item_id,
+            expected_revision,
+        } => {
+            let current =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
+            if current.deleted_at.is_none() {
+                return Err(ItemRepositoryError::NotFound(item_id));
+            }
+            ensure_revision(&current, expected_revision)?;
+            validate_parent(transaction, scope.workspace_id, item_id, current.parent_id)
+                .await
+                .map_err(|error| match error {
+                    ItemRepositoryError::ParentNotFound(_) => ItemRepositoryError::DeletedParent,
+                    other => other,
+                })?;
+            let item = current.restored(now)?;
+            if has_active_children(transaction, scope.workspace_id, item_id).await?
+                && item.status.is_executing_state()
+            {
+                return Err(ItemRepositoryError::NonLeafExecutable);
+            }
+            update_item(transaction, scope.workspace_id, &item).await?;
+            let item =
+                fetch_item_transaction(transaction, scope.workspace_id, item_id, false).await?;
+            if record {
+                record_mutation(
+                    transaction,
+                    scope,
+                    &item,
+                    "item.restored",
+                    Some(expected_revision),
+                    ChangeKind::Upsert,
+                )
+                .await?;
+            }
+            refresh_parents_with_mode(
+                transaction,
+                scope,
+                [item.parent_id],
+                item.updated_at,
+                record,
+            )
+            .await?;
+            Ok(TransactionalItemEffect {
+                before: Some(current),
+                after: item,
+            })
+        }
+        TransactionalItemCommand::RestoreSnapshot {
+            item_id,
+            expected_revision,
+            snapshot,
+        } => {
+            restore_item_snapshot_tx(
+                transaction,
+                scope,
+                item_id,
+                expected_revision,
+                *snapshot,
+                now,
+                record,
+            )
+            .await
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restore_item_snapshot_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    expected_revision: u64,
+    mut snapshot: Item,
+    now: DateTime<Utc>,
+    record: bool,
+) -> Result<TransactionalItemEffect, ItemRepositoryError> {
+    let current = fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
+    ensure_revision(&current, expected_revision)?;
+    if snapshot.id != item_id || snapshot.created_at != current.created_at {
+        return Err(ItemRepositoryError::Internal);
+    }
+    if snapshot.deleted_at.is_none() {
+        validate_parent(transaction, scope.workspace_id, item_id, snapshot.parent_id).await?;
+        if has_active_children(transaction, scope.workspace_id, item_id).await?
+            && snapshot.status.is_executing_state()
+        {
+            return Err(ItemRepositoryError::NonLeafExecutable);
+        }
+    }
+
+    snapshot.revision = current
+        .revision
+        .checked_add(1)
+        .ok_or(ItemRepositoryError::Internal)?;
+    snapshot.updated_at = now;
+    update_item(transaction, scope.workspace_id, &snapshot).await?;
+    replace_hierarchy_edge(
+        transaction,
+        scope.workspace_id,
+        item_id,
+        snapshot.parent_id,
+        snapshot.sibling_order,
+    )
+    .await?;
+    let restored = fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
+    if record {
+        let (operation, change_kind) =
+            match (current.deleted_at.is_some(), restored.deleted_at.is_some()) {
+                (_, true) => ("item.trashed", ChangeKind::Tombstone),
+                (true, false) => ("item.restored", ChangeKind::Upsert),
+                (false, false) => ("item.updated", ChangeKind::Upsert),
+            };
+        record_mutation(
+            transaction,
+            scope,
+            &restored,
+            operation,
+            Some(expected_revision),
+            change_kind,
+        )
+        .await?;
+    }
+    if current.parent_id != restored.parent_id
+        || current.sibling_order != restored.sibling_order
+        || current.deleted_at.is_some() != restored.deleted_at.is_some()
+    {
+        refresh_parents_with_mode(
+            transaction,
+            scope,
+            [current.parent_id, restored.parent_id],
+            now,
+            record,
+        )
+        .await?;
+    }
+    Ok(TransactionalItemEffect {
+        before: Some(current),
+        after: restored,
+    })
 }
 
 async fn insert_item(
@@ -646,6 +1001,16 @@ async fn refresh_parents(
     parent_ids: impl IntoIterator<Item = Option<Uuid>>,
     now: DateTime<Utc>,
 ) -> Result<(), ItemRepositoryError> {
+    refresh_parents_with_mode(transaction, scope, parent_ids, now, true).await
+}
+
+async fn refresh_parents_with_mode(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    parent_ids: impl IntoIterator<Item = Option<Uuid>>,
+    now: DateTime<Utc>,
+    record: bool,
+) -> Result<(), ItemRepositoryError> {
     let mut parent_ids: Vec<_> = parent_ids.into_iter().flatten().collect();
     parent_ids.sort_unstable();
     parent_ids.dedup();
@@ -658,15 +1023,17 @@ async fn refresh_parents(
         update_item(transaction, scope.workspace_id, &parent).await?;
         let parent =
             fetch_item_transaction(transaction, scope.workspace_id, parent_id, false).await?;
-        record_mutation(
-            transaction,
-            scope,
-            &parent,
-            "item.hierarchy_changed",
-            Some(current.revision),
-            ChangeKind::Upsert,
-        )
-        .await?;
+        if record {
+            record_mutation(
+                transaction,
+                scope,
+                &parent,
+                "item.hierarchy_changed",
+                Some(current.revision),
+                ChangeKind::Upsert,
+            )
+            .await?;
+        }
     }
     Ok(())
 }

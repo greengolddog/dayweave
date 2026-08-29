@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection},
-    http::{HeaderName, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -22,11 +24,19 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::{Principal, require_authentication},
+    auth::{Principal, PrincipalAudience, Scope, require_authentication},
     error::{ApiError, ErrorEnvelope},
+    persistence::{PostgresProposalApplicationRepository, ProposalApplicationError},
     proposals::{
-        DecisionKind, EditProposal, NewProposal, Proposal, ProposalDomainError, ProposalKind,
-        ProposalQuery, ProposalServiceError, ProposalSource, ProposalStatus, RepositoryError,
+        DecisionKind, EditProposal, NewProposal, Proposal, ProposalApplicationReceipt,
+        ProposalApplicationStatus, ProposalAppliedMember, ProposalApplyRequest,
+        ProposalApplyResponse, ProposalChangeSet, ProposalChangeSetPreview,
+        ProposalChangeSetSchema, ProposalCommand, ProposalConflict, ProposalConflictCode,
+        ProposalDomainError, ProposalImplicitChangeReason, ProposalImplicitItemDiff,
+        ProposalItemDiff, ProposalItemField, ProposalKind, ProposalOperation,
+        ProposalPreviewMember, ProposalPreviewRequest, ProposalQuery, ProposalRisk,
+        ProposalRiskCode, ProposalRiskLevel, ProposalServiceError, ProposalSource, ProposalStatus,
+        ProposalUndoRequest, ProposalUndoResponse, RepositoryError,
     },
 };
 
@@ -46,6 +56,11 @@ const MAX_LIST_LIMIT: usize = 200;
         accept_suggestion,
         reject_suggestion,
         delete_suggestion,
+        create_suggestion_application_preview,
+        apply_suggestion_application_preview,
+        get_suggestion_application,
+        get_suggestion_application_for_proposal,
+        undo_suggestion_application,
         crate::items::http::create_item,
         crate::items::http::list_items,
         crate::items::http::item_delta,
@@ -91,6 +106,29 @@ const MAX_LIST_LIMIT: usize = 200;
         DecisionRequest,
         SuggestionEnvelope,
         SuggestionListEnvelope,
+        ProposalChangeSet,
+        ProposalChangeSetSchema,
+        ProposalCommand,
+        ProposalConflict,
+        ProposalConflictCode,
+        ProposalImplicitChangeReason,
+        ProposalImplicitItemDiff,
+        ProposalItemDiff,
+        ProposalItemField,
+        ProposalOperation,
+        ProposalPreviewMember,
+        ProposalPreviewRequest,
+        ProposalChangeSetPreview,
+        ProposalRisk,
+        ProposalRiskCode,
+        ProposalRiskLevel,
+        ProposalApplyRequest,
+        ProposalApplyResponse,
+        ProposalApplicationReceipt,
+        ProposalApplicationStatus,
+        ProposalAppliedMember,
+        ProposalUndoRequest,
+        ProposalUndoResponse,
         Proposal,
         ProposalSource,
         ProposalKind,
@@ -224,6 +262,26 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
+        .route(
+            "/suggestions/application-previews",
+            post(create_suggestion_application_preview),
+        )
+        .route(
+            "/suggestions/application-previews/{id}/apply",
+            post(apply_suggestion_application_preview),
+        )
+        .route(
+            "/suggestions/applications/{id}",
+            get(get_suggestion_application),
+        )
+        .route(
+            "/suggestions/{id}/application",
+            get(get_suggestion_application_for_proposal),
+        )
+        .route(
+            "/suggestions/applications/{id}/undo",
+            post(undo_suggestion_application),
+        )
         .merge(crate::items::http::routes())
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())
@@ -333,6 +391,8 @@ async fn openapi() -> Json<Value> {
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateSuggestionRequest {
+    /// Legacy provenance hint. Device REST submissions are always stored as
+    /// `app_assistant`, regardless of this caller-controlled value.
     pub source: ProposalSource,
     pub source_reference: Option<String>,
     pub kind: ProposalKind,
@@ -401,12 +461,19 @@ async fn create_suggestion(
     let request = request
         .map_err(|error| ApiError::from_json_rejection(&error))?
         .0;
+    let (source, source_reference) = match principal.audience {
+        PrincipalAudience::Device => (ProposalSource::AppAssistant, None),
+        PrincipalAudience::Legacy => (request.source, request.source_reference),
+        PrincipalAudience::Mcp | PrincipalAudience::McpOAuth => {
+            return Err(ApiError::forbidden());
+        }
+    };
     let proposal = state
         .proposals
         .create(NewProposal {
             submitted_by: principal.subject,
-            source: request.source,
-            source_reference: request.source_reference,
+            source,
+            source_reference,
             kind: request.kind,
             title: request.title,
             explanation: request.explanation,
@@ -524,7 +591,7 @@ async fn edit_suggestion(
     request_body = DecisionRequest,
     responses(
         (status = 200, description = "Suggestion approved", body = SuggestionEnvelope),
-        (status = 409, description = "Stale revision or terminal suggestion", body = ErrorEnvelope)
+        (status = 409, description = "Stale revision, terminal suggestion, or reserved atomic change set", body = ErrorEnvelope)
     )
 )]
 async fn accept_suggestion(
@@ -532,7 +599,20 @@ async fn accept_suggestion(
     Path(id): Path<Uuid>,
     request: Result<Json<DecisionRequest>, JsonRejection>,
 ) -> Result<Json<SuggestionEnvelope>, ApiError> {
-    decide_suggestion(state, id, DecisionKind::Accept, request).await
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let suggestion = state
+        .proposals
+        .decide(
+            id,
+            request.expected_revision,
+            DecisionKind::Accept,
+            request.note,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(Json(SuggestionEnvelope { suggestion }))
 }
 
 #[utoipa::path(
@@ -573,6 +653,238 @@ async fn decide_suggestion(
 }
 
 #[utoipa::path(
+    post,
+    path = "/v1/suggestions/application-previews",
+    tag = "suggestions",
+    security(("bearer_token" = [])),
+    request_body = ProposalPreviewRequest,
+    responses(
+        (status = 201, description = "Content-bound atomic application preview", body = ProposalChangeSetPreview),
+        (status = 409, description = "Proposal or canonical item changed", body = ErrorEnvelope),
+        (status = 422, description = "Legacy, untyped, or invalid proposal", body = ErrorEnvelope)
+    )
+)]
+async fn create_suggestion_application_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    request: Result<Json<ProposalPreviewRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let repository = application_repository(
+        &state,
+        &principal,
+        &[
+            Scope::SuggestionsRead,
+            Scope::SuggestionsWrite,
+            Scope::ItemsRead,
+        ],
+    )?;
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let preview = repository
+        .preview(request)
+        .await
+        .map_err(map_application_error)?;
+    Ok((StatusCode::CREATED, Json(preview)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/suggestions/application-previews/{id}/apply",
+    tag = "suggestions",
+    security(("bearer_token" = [])),
+    params(
+        ("id" = Uuid, Path, description = "Application preview identifier"),
+        ("Idempotency-Key" = String, Header, description = "8-128 character retry key")
+    ),
+    request_body = ProposalApplyRequest,
+    responses(
+        (status = 200, description = "Atomic proposal application receipt", body = ProposalApplyResponse),
+        (status = 409, description = "Stale preview, conflict, or idempotency mismatch", body = ErrorEnvelope)
+    )
+)]
+async fn apply_suggestion_application_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(preview_id): Path<Uuid>,
+    headers: HeaderMap,
+    request: Result<Json<ProposalApplyRequest>, JsonRejection>,
+) -> Result<Json<ProposalApplyResponse>, ApiError> {
+    let repository = application_repository(
+        &state,
+        &principal,
+        &[Scope::SuggestionsWrite, Scope::ItemsWrite],
+    )?;
+    let idempotency_key = idempotency_header(&headers)?;
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let response = repository
+        .apply(
+            preview_id,
+            request,
+            idempotency_key,
+            principal.credential_id,
+        )
+        .await
+        .map_err(map_application_error)?;
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/suggestions/applications/{id}",
+    tag = "suggestions",
+    security(("bearer_token" = [])),
+    params(("id" = Uuid, Path, description = "Proposal application identifier")),
+    responses(
+        (status = 200, description = "Durable proposal application receipt", body = ProposalApplicationReceipt),
+        (status = 404, description = "Application not found", body = ErrorEnvelope)
+    )
+)]
+async fn get_suggestion_application(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(application_id): Path<Uuid>,
+) -> Result<Json<ProposalApplicationReceipt>, ApiError> {
+    let repository = application_repository(
+        &state,
+        &principal,
+        &[Scope::SuggestionsRead, Scope::ItemsRead],
+    )?;
+    let response = repository
+        .get(application_id)
+        .await
+        .map_err(map_application_error)?;
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/suggestions/{id}/application",
+    tag = "suggestions",
+    security(("bearer_token" = [])),
+    params(("id" = Uuid, Path, description = "Applied proposal identifier")),
+    responses(
+        (status = 200, description = "Application receipt linked to this proposal", body = ProposalApplicationReceipt),
+        (status = 404, description = "Proposal has no application", body = ErrorEnvelope)
+    )
+)]
+async fn get_suggestion_application_for_proposal(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(proposal_id): Path<Uuid>,
+) -> Result<Json<ProposalApplicationReceipt>, ApiError> {
+    let repository = application_repository(
+        &state,
+        &principal,
+        &[Scope::SuggestionsRead, Scope::ItemsRead],
+    )?;
+    let response = repository
+        .get_for_proposal(proposal_id)
+        .await
+        .map_err(map_application_error)?;
+    Ok(Json(response))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/suggestions/applications/{id}/undo",
+    tag = "suggestions",
+    security(("bearer_token" = [])),
+    params(
+        ("id" = Uuid, Path, description = "Proposal application identifier"),
+        ("Idempotency-Key" = String, Header, description = "8-128 character retry key")
+    ),
+    request_body = ProposalUndoRequest,
+    responses(
+        (status = 200, description = "Atomic undo receipt", body = ProposalUndoResponse),
+        (status = 409, description = "Undo expired or affected canonical state diverged", body = ErrorEnvelope)
+    )
+)]
+async fn undo_suggestion_application(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(application_id): Path<Uuid>,
+    headers: HeaderMap,
+    request: Result<Json<ProposalUndoRequest>, JsonRejection>,
+) -> Result<Json<ProposalUndoResponse>, ApiError> {
+    let repository = application_repository(
+        &state,
+        &principal,
+        &[Scope::SuggestionsWrite, Scope::ItemsWrite],
+    )?;
+    let idempotency_key = idempotency_header(&headers)?;
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let response = repository
+        .undo(
+            application_id,
+            request,
+            idempotency_key,
+            principal.credential_id,
+        )
+        .await
+        .map_err(map_application_error)?;
+    Ok(Json(response))
+}
+
+fn application_repository(
+    state: &AppState,
+    principal: &Principal,
+    required: &[Scope],
+) -> Result<Arc<PostgresProposalApplicationRepository>, ApiError> {
+    if principal.audience != PrincipalAudience::Device
+        || required.iter().any(|scope| !principal.has_scope(*scope))
+    {
+        return Err(ApiError::forbidden());
+    }
+    let repository = state
+        .proposal_applications
+        .clone()
+        .ok_or_else(|| ApiError::unavailable("Proposal application requires PostgreSQL"))?;
+    let scope = repository.scope();
+    if principal.workspace_id != Some(scope.workspace_id)
+        || principal.user_id != Some(scope.user_id)
+    {
+        return Err(ApiError::not_found("proposal application"));
+    }
+    Ok(repository)
+}
+
+fn idempotency_header(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::validation("Idempotency-Key header is required"))
+}
+
+fn map_application_error(error: ProposalApplicationError) -> ApiError {
+    match error {
+        ProposalApplicationError::Validation(message) => ApiError::validation(message),
+        ProposalApplicationError::NotFound | ProposalApplicationError::OwnerUnavailable => {
+            ApiError::not_found("proposal application")
+        }
+        ProposalApplicationError::Stale(code) => {
+            ApiError::conflict("Proposal application is stale or unsafe").with_details(json!({
+                "conflict_code": code,
+            }))
+        }
+        ProposalApplicationError::RevisionConflict { expected, actual } => {
+            ApiError::conflict("Proposal application revision changed").with_details(json!({
+                "expected_revision": expected,
+                "actual_revision": actual,
+            }))
+        }
+        ProposalApplicationError::IdempotencyConflict => {
+            ApiError::conflict("Idempotency-Key was already used for different content")
+        }
+        ProposalApplicationError::Internal => ApiError::internal(),
+    }
+}
+
+#[utoipa::path(
     delete,
     path = "/v1/suggestions/{id}",
     tag = "suggestions",
@@ -605,6 +917,9 @@ async fn not_found() -> ApiError {
 
 fn map_service_error(error: ProposalServiceError) -> ApiError {
     match error {
+        ProposalServiceError::ReservedChangeSetRequiresApplication => {
+            ApiError::conflict("Actionable suggestions must be previewed and applied atomically")
+        }
         ProposalServiceError::Domain(ProposalDomainError::NotPending(status)) => {
             ApiError::conflict(format!("suggestion is already {status:?}"))
         }

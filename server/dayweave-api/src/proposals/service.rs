@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration as StdDuration};
 
 use chrono::{DateTime, Duration, Utc};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -141,8 +142,10 @@ impl ProposalService {
     ///
     /// # Errors
     ///
-    /// Returns a domain error for invalid transitions or a repository error for
-    /// missing proposals, stale revisions, and persistence failures.
+    /// Returns a domain error for invalid transitions, a reserved-change-set
+    /// error when legacy acceptance would bypass atomic application, or a
+    /// repository error for missing proposals, stale revisions, and persistence
+    /// failures.
     pub async fn decide(
         &self,
         id: Uuid,
@@ -152,6 +155,13 @@ impl ProposalService {
     ) -> Result<Proposal, ProposalServiceError> {
         let mut proposal = self.get(id).await?;
         ensure_revision(&proposal, expected_revision)?;
+        // The repository's compare-and-replace binds this classification to
+        // the same revision that is accepted. Any intervening payload edit
+        // increments the revision and makes the replacement fail closed.
+        if decision == DecisionKind::Accept && uses_reserved_change_set_namespace(&proposal.payload)
+        {
+            return Err(ProposalServiceError::ReservedChangeSetRequiresApplication);
+        }
         proposal.decide(decision, note, self.clock.now())?;
         Ok(self.repository.replace(proposal, expected_revision).await?)
     }
@@ -190,6 +200,13 @@ impl ProposalService {
     }
 }
 
+fn uses_reserved_change_set_namespace(payload: &Value) -> bool {
+    payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema.starts_with("dayweave.proposal-change-set/"))
+}
+
 fn ensure_revision(
     proposal: &Proposal,
     expected_revision: u64,
@@ -207,6 +224,8 @@ fn ensure_revision(
 
 #[derive(Debug, Error)]
 pub enum ProposalServiceError {
+    #[error("reserved proposal change sets must use atomic application")]
+    ReservedChangeSetRequiresApplication,
     #[error(transparent)]
     Domain(#[from] ProposalDomainError),
     #[error(transparent)]
