@@ -31,7 +31,7 @@ jobs:
             build-mode: none
             runner: ubuntu-latest
           - language: rust
-            build-mode: manual
+            build-mode: none
             runner: ubuntu-latest
           - language: java-kotlin
             build-mode: manual
@@ -42,9 +42,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: matrix.language == 'rust'
 
       - uses: actions/setup-java@v6
         if: matrix.language == 'java-kotlin'
@@ -60,10 +57,6 @@ jobs:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
           queries: security-extended
-
-      - name: Build Rust under CodeQL tracing
-        if: matrix.language == 'rust'
-        run: cargo build --workspace --all-targets --all-features
 
       - name: Build Android under CodeQL tracing
         if: matrix.language == 'java-kotlin'
