@@ -90,6 +90,8 @@ pub enum PersistenceError {
     MigrationFailed,
     #[error("database personal scope initialization failed")]
     ScopeBootstrapFailed,
+    #[error("external integration initialization failed")]
+    IntegrationInitializationFailed,
 }
 
 async fn bootstrap_personal_scope(

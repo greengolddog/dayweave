@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use tower::ServiceBuilder;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
-    trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer},
+    trace::{DefaultOnResponse, TraceLayer},
 };
 use utoipa::{
     IntoParams, Modify, OpenApi, ToSchema,
@@ -57,6 +57,13 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::execution::http::get_execution,
         crate::execution::http::apply_execution_command,
         crate::execution::http::execution_history,
+        crate::google_oauth::http::start,
+        crate::google_oauth::http::accounts,
+        crate::google_oauth::http::pause,
+        crate::google_oauth::http::resume,
+        crate::google_oauth::http::disconnect,
+        crate::google_oauth::http::acknowledge_recovery,
+        crate::google_oauth::http::callback,
     ),
     components(schemas(
         HealthResponse,
@@ -108,6 +115,15 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::execution::http::ExecutionSnapshotEnvelope,
         crate::execution::http::ExecutionMutationEnvelope,
         crate::execution::http::ExecutionHistoryEnvelope,
+        crate::google_oauth::GoogleAccount,
+        crate::google_oauth::GoogleAccountStatus,
+        crate::google_oauth::GoogleOAuthCleanupStatus,
+        crate::google_oauth::http::StartGoogleOAuthRequest,
+        crate::google_oauth::http::StartGoogleOAuthResponse,
+        crate::google_oauth::http::GoogleAccountsResponse,
+        crate::google_oauth::http::AccountRevisionRequest,
+        crate::google_oauth::http::AcknowledgeGoogleOAuthRecoveryRequest,
+        crate::google_oauth::http::AcknowledgeGoogleOAuthRecoveryResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -115,7 +131,8 @@ const MAX_LIST_LIMIT: usize = 200;
         (name = "suggestions", description = "Reviewable proposals from AI and external tools"),
         (name = "items", description = "Canonical offline-first planner items and delta sync"),
         (name = "schedule", description = "Deterministic side-effect-free planning previews"),
-        (name = "execution", description = "Server-authoritative cross-device timers and breaks")
+        (name = "execution", description = "Server-authoritative cross-device timers and breaks"),
+        (name = "google", description = "Google Calendar and Tasks identity authorization")
     )
 )]
 pub struct ApiDoc;
@@ -150,6 +167,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::items::http::routes())
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())
+        .merge(crate::google_oauth::http::protected_routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,
@@ -164,6 +182,7 @@ pub fn router(state: AppState) -> Router {
         .route("/version", get(version))
         .route("/openapi.json", get(openapi))
         .route("/mcp", post(crate::mcp::handle_post))
+        .merge(crate::google_oauth::http::public_routes())
         .nest("/v1", protected)
         .fallback(not_found)
         .with_state(state)
@@ -175,7 +194,11 @@ pub fn router(state: AppState) -> Router {
                 ))
                 .layer(
                     TraceLayer::new_for_http()
-                        .make_span_with(DefaultMakeSpan::new().include_headers(false))
+                        .make_span_with(|request: &axum::http::Request<_>| {
+                            // OAuth callbacks carry state and an authorization code in the
+                            // query. Deliberately omit every URI from request spans.
+                            tracing::info_span!("http_request", method = %request.method())
+                        })
                         .on_response(
                             DefaultOnResponse::new()
                                 .include_headers(false)

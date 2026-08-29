@@ -9,6 +9,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod execution;
+pub mod google_oauth;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
@@ -23,12 +24,17 @@ use std::sync::Arc;
 
 use auth::{Authenticator, StaticTokenAuthenticator};
 use config::Config;
+use dayweave_google::oauth::{OAuthClient, OAuthConfig};
 use execution::{ExecutionRepository, ExecutionService, InMemoryExecutionRepository};
+use google_oauth::{
+    GoogleOAuthRepository, GoogleOAuthService, InMemoryGoogleOAuthRepository, OAuthScope,
+    ProductionGoogleOAuthTransport, SecretCipher,
+};
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
 use persistence::{
-    Database, PersistenceError, PostgresExecutionRepository, PostgresItemRepository,
-    PostgresProposalRepository,
+    Database, PersistenceError, PostgresExecutionRepository, PostgresGoogleOAuthRepository,
+    PostgresItemRepository, PostgresProposalRepository,
 };
 use proposals::{
     Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
@@ -38,13 +44,60 @@ use scheduling::{
     PlanningSimulationPort, ScheduleQueryPort, UnavailableScheduleQueryPort,
     UnavailableSimulationPort,
 };
+use uuid::Uuid;
 
 type Repositories = (
     Arc<dyn ProposalRepository>,
     Arc<dyn ItemRepository>,
     Arc<dyn ExecutionRepository>,
+    Arc<dyn GoogleOAuthRepository>,
+    OAuthScope,
     Readiness,
 );
+
+async fn repositories(config: &Config) -> Result<Repositories, PersistenceError> {
+    if let Some(database_config) = &config.database {
+        let database = Database::connect(database_config).await?;
+        return Ok((
+            Arc::new(PostgresProposalRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            )),
+            Arc::new(PostgresItemRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            )),
+            Arc::new(PostgresExecutionRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            )),
+            Arc::new(PostgresGoogleOAuthRepository::new(
+                database.pool().clone(),
+                database.scope(),
+            )),
+            OAuthScope {
+                workspace_id: database.scope().workspace_id,
+                user_id: database.scope().user_id,
+            },
+            Readiness::with_database(
+                database.pool().clone(),
+                database.scope().workspace_id,
+                database.scope().user_id,
+            ),
+        ));
+    }
+    Ok((
+        Arc::new(InMemoryProposalRepository::default()),
+        Arc::new(InMemoryItemRepository::default()),
+        Arc::new(InMemoryExecutionRepository::default()),
+        Arc::new(InMemoryGoogleOAuthRepository::default()),
+        OAuthScope {
+            workspace_id: Uuid::from_u128(2),
+            user_id: Uuid::from_u128(1),
+        },
+        Readiness::default(),
+    ))
+}
 
 /// Shared dependencies used by HTTP handlers.
 #[derive(Clone)]
@@ -55,6 +108,7 @@ pub struct AppState {
     pub authenticator: Arc<dyn Authenticator>,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
+    pub google_oauth: Option<Arc<GoogleOAuthService>>,
     execution_repository: Arc<dyn ExecutionRepository>,
     clock: Arc<dyn Clock>,
 }
@@ -70,32 +124,14 @@ impl AppState {
     /// Returns a redacted persistence error if the configured database cannot
     /// connect, migrate, or initialize its personal workspace scope.
     pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
-        let (repository, item_repository, execution_repository, readiness): Repositories =
-            if let Some(database_config) = &config.database {
-                let database = Database::connect(database_config).await?;
-                (
-                    Arc::new(PostgresProposalRepository::new(
-                        database.pool().clone(),
-                        database.scope(),
-                    )),
-                    Arc::new(PostgresItemRepository::new(
-                        database.pool().clone(),
-                        database.scope(),
-                    )),
-                    Arc::new(PostgresExecutionRepository::new(
-                        database.pool().clone(),
-                        database.scope(),
-                    )),
-                    Readiness::with_database(database.pool().clone()),
-                )
-            } else {
-                (
-                    Arc::new(InMemoryProposalRepository::default()),
-                    Arc::new(InMemoryItemRepository::default()),
-                    Arc::new(InMemoryExecutionRepository::default()),
-                    Readiness::default(),
-                )
-            };
+        let (
+            repository,
+            item_repository,
+            execution_repository,
+            google_oauth_repository,
+            oauth_scope,
+            readiness,
+        ): Repositories = repositories(config).await?;
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let proposals = Arc::new(ProposalService::new(
             repository,
@@ -117,6 +153,40 @@ impl AppState {
             proposals.clone(),
             config.mcp_allowed_origins.clone(),
         ));
+        let google_oauth = if let Some(google) = config.google_oauth.as_ref() {
+            use secrecy::ExposeSecret as _;
+
+            let oauth_config = OAuthConfig::production(
+                google.client_id.clone(),
+                google.client_secret.expose_secret().to_owned(),
+                google.redirect_uri.as_str(),
+            )
+            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+            let client = OAuthClient::new(oauth_config)
+                .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+            let service = Arc::new(
+                GoogleOAuthService::new(
+                    google_oauth_repository,
+                    Arc::new(
+                        ProductionGoogleOAuthTransport::new(client)
+                            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?,
+                    ),
+                    SecretCipher::new(google.keys.clone(), google.active_key_version),
+                    oauth_scope,
+                    clock.clone(),
+                    google.session_ttl,
+                )
+                .with_readiness(readiness.clone()),
+            );
+            service
+                .recover_startup()
+                .await
+                .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+            service.spawn_recovery_worker();
+            Some(service)
+        } else {
+            None
+        };
 
         Ok(Self {
             proposals,
@@ -125,6 +195,7 @@ impl AppState {
             authenticator,
             readiness,
             mcp,
+            google_oauth,
             execution_repository,
             clock,
         })
@@ -161,6 +232,7 @@ impl AppState {
             authenticator,
             readiness,
             mcp,
+            google_oauth: None,
             execution_repository,
             clock,
         }
@@ -190,6 +262,12 @@ impl AppState {
             self.proposals.clone(),
             allowed_origins,
         ));
+        self
+    }
+
+    #[must_use]
+    pub fn with_google_oauth(mut self, google_oauth: Arc<GoogleOAuthService>) -> Self {
+        self.google_oauth = Some(google_oauth);
         self
     }
 }

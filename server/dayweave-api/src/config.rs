@@ -1,13 +1,16 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
 
+use secrecy::SecretString;
 use thiserror::Error;
+use url::{Host, Url};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::auth::{TokenHash, hash_token};
 
@@ -20,6 +23,69 @@ const DEFAULT_DATABASE_MIN_CONNECTIONS: u32 = 1;
 const DEFAULT_DATABASE_ACQUIRE_TIMEOUT_SECONDS: u32 = 10;
 const DEFAULT_USER_ID: &str = "00000000-0000-4000-8000-000000000001";
 const DEFAULT_WORKSPACE_ID: &str = "00000000-0000-4000-8000-000000000002";
+const DEFAULT_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 10;
+const MIN_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 5;
+const MAX_GOOGLE_OAUTH_SESSION_TTL_MINUTES: u64 = 30;
+
+pub const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
+pub const GOOGLE_TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
+pub const GOOGLE_OPENID_SCOPE: &str = "openid";
+pub const GOOGLE_EMAIL_SCOPE: &str = "email";
+
+pub struct CredentialKey([u8; 32]);
+
+impl CredentialKey {
+    pub(crate) const fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_test_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl Clone for CredentialKey {
+    fn clone(&self) -> Self {
+        Self(self.0)
+    }
+}
+
+impl std::fmt::Debug for CredentialKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialKey([REDACTED])")
+    }
+}
+
+impl Drop for CredentialKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Clone)]
+pub struct GoogleOAuthConfig {
+    pub client_id: String,
+    pub client_secret: SecretString,
+    pub redirect_uri: Url,
+    pub keys: Arc<BTreeMap<u32, CredentialKey>>,
+    pub active_key_version: u32,
+    pub session_ttl: Duration,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoogleOAuthConfig")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"[REDACTED]")
+            .field("redirect_uri", &self.redirect_uri)
+            .field("key_versions", &self.keys.keys().collect::<Vec<_>>())
+            .field("active_key_version", &self.active_key_version)
+            .field("session_ttl", &self.session_ttl)
+            .finish()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Environment {
@@ -78,6 +144,7 @@ pub struct Config {
     pub proposal_ttl: Duration,
     pub mcp_allowed_origins: Arc<Vec<String>>,
     pub database: Option<DatabaseConfig>,
+    pub google_oauth: Option<GoogleOAuthConfig>,
     pub log_filter: String,
     pub json_logs: bool,
 }
@@ -183,6 +250,10 @@ impl Config {
         {
             return Err(ConfigError::MissingDatabaseUrl);
         }
+        let google_oauth = google_oauth_config(values, environment)?;
+        if google_oauth.is_some() && database.is_none() {
+            return Err(ConfigError::MissingGoogleOAuthDatabase);
+        }
 
         Ok(Self {
             bind_address,
@@ -191,6 +262,7 @@ impl Config {
             proposal_ttl: Duration::from_secs(ttl_seconds),
             mcp_allowed_origins,
             database,
+            google_oauth,
             log_filter,
             json_logs,
         })
@@ -223,6 +295,160 @@ pub enum ConfigError {
     InvalidTimezone,
     #[error("invalid DAYWEAVE_OWNER_SUBJECT")]
     InvalidOwnerSubject,
+    #[error("DAYWEAVE_GOOGLE_OAUTH_ENABLED must be true or false")]
+    InvalidGoogleOAuthEnabled,
+    #[error("Google OAuth settings were supplied while DAYWEAVE_GOOGLE_OAUTH_ENABLED is not true")]
+    DisabledGoogleOAuthConfiguration,
+    #[error("Google OAuth is enabled but a required setting is missing: {0}")]
+    MissingGoogleOAuthSetting(&'static str),
+    #[error("DAYWEAVE_DATABASE_URL is required whenever Google OAuth is enabled")]
+    MissingGoogleOAuthDatabase,
+    #[error(
+        "DAYWEAVE_GOOGLE_REDIRECT_URI must be an exact HTTPS callback URI (loopback HTTP is development/test only)"
+    )]
+    InvalidGoogleRedirectUri,
+    #[error(
+        "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS must contain unique entries formatted vN:<64 lowercase hex characters>"
+    )]
+    InvalidGoogleCredentialKeys,
+    #[error("DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION must name a configured key as vN")]
+    InvalidGoogleActiveCredentialKeyVersion,
+    #[error("invalid DAYWEAVE_GOOGLE_OAUTH_SESSION_TTL_MINUTES")]
+    InvalidGoogleOAuthSessionTtl,
+}
+
+fn google_oauth_config(
+    values: &HashMap<String, String>,
+    environment: Environment,
+) -> Result<Option<GoogleOAuthConfig>, ConfigError> {
+    let enabled = match values
+        .get("DAYWEAVE_GOOGLE_OAUTH_ENABLED")
+        .map(String::as_str)
+    {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ConfigError::InvalidGoogleOAuthEnabled),
+    };
+    let google_settings_present = values
+        .keys()
+        .any(|key| key.starts_with("DAYWEAVE_GOOGLE_") && key != "DAYWEAVE_GOOGLE_OAUTH_ENABLED");
+    if !enabled {
+        if google_settings_present {
+            return Err(ConfigError::DisabledGoogleOAuthConfiguration);
+        }
+        return Ok(None);
+    }
+
+    let required = |key: &'static str| {
+        values
+            .get(key)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ConfigError::MissingGoogleOAuthSetting(key))
+    };
+    let client_id = required("DAYWEAVE_GOOGLE_CLIENT_ID")?.to_owned();
+    let client_secret = SecretString::from(required("DAYWEAVE_GOOGLE_CLIENT_SECRET")?.to_owned());
+    let redirect_uri =
+        parse_google_redirect_uri(required("DAYWEAVE_GOOGLE_REDIRECT_URI")?, environment)?;
+    let keys = parse_credential_keys(required("DAYWEAVE_GOOGLE_CREDENTIAL_KEYS")?)?;
+    let active_key_version =
+        parse_key_version(required("DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION")?)
+            .ok_or(ConfigError::InvalidGoogleActiveCredentialKeyVersion)?;
+    if !keys.contains_key(&active_key_version) {
+        return Err(ConfigError::InvalidGoogleActiveCredentialKeyVersion);
+    }
+    let ttl_minutes = values
+        .get("DAYWEAVE_GOOGLE_OAUTH_SESSION_TTL_MINUTES")
+        .map_or(Ok(DEFAULT_GOOGLE_OAUTH_SESSION_TTL_MINUTES), |value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidGoogleOAuthSessionTtl)
+        })?;
+    if !(MIN_GOOGLE_OAUTH_SESSION_TTL_MINUTES..=MAX_GOOGLE_OAUTH_SESSION_TTL_MINUTES)
+        .contains(&ttl_minutes)
+    {
+        return Err(ConfigError::InvalidGoogleOAuthSessionTtl);
+    }
+
+    Ok(Some(GoogleOAuthConfig {
+        client_id,
+        client_secret,
+        redirect_uri,
+        keys: Arc::new(keys),
+        active_key_version,
+        session_ttl: Duration::from_secs(ttl_minutes * 60),
+    }))
+}
+
+fn parse_google_redirect_uri(value: &str, environment: Environment) -> Result<Url, ConfigError> {
+    let uri = Url::parse(value).map_err(|_| ConfigError::InvalidGoogleRedirectUri)?;
+    if uri.username() != ""
+        || uri.password().is_some()
+        || uri.query().is_some()
+        || uri.fragment().is_some()
+        || uri.host().is_none()
+        || uri.path() != "/v1/integrations/google/oauth/callback"
+    {
+        return Err(ConfigError::InvalidGoogleRedirectUri);
+    }
+    let loopback_host = match uri.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    };
+    if uri.scheme() == "https"
+        && (!loopback_host || matches!(environment, Environment::Development | Environment::Test))
+    {
+        return Ok(uri);
+    }
+    let loopback = matches!(environment, Environment::Development | Environment::Test)
+        && uri.scheme() == "http"
+        && loopback_host;
+    loopback
+        .then_some(uri)
+        .ok_or(ConfigError::InvalidGoogleRedirectUri)
+}
+
+fn parse_credential_keys(value: &str) -> Result<BTreeMap<u32, CredentialKey>, ConfigError> {
+    let mut keys = BTreeMap::new();
+    for entry in value.split(',').map(str::trim) {
+        let (raw_version, raw_key) = entry
+            .split_once(':')
+            .ok_or(ConfigError::InvalidGoogleCredentialKeys)?;
+        let version =
+            parse_key_version(raw_version).ok_or(ConfigError::InvalidGoogleCredentialKeys)?;
+        if raw_key.len() != 64
+            || !raw_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ConfigError::InvalidGoogleCredentialKeys);
+        }
+        let mut decoded = [0_u8; 32];
+        for (index, pair) in raw_key.as_bytes().chunks_exact(2).enumerate() {
+            let pair =
+                std::str::from_utf8(pair).map_err(|_| ConfigError::InvalidGoogleCredentialKeys)?;
+            decoded[index] = u8::from_str_radix(pair, 16)
+                .map_err(|_| ConfigError::InvalidGoogleCredentialKeys)?;
+        }
+        if keys.insert(version, CredentialKey(decoded)).is_some() {
+            return Err(ConfigError::InvalidGoogleCredentialKeys);
+        }
+    }
+    if keys.is_empty() {
+        return Err(ConfigError::InvalidGoogleCredentialKeys);
+    }
+    Ok(keys)
+}
+
+fn parse_key_version(value: &str) -> Option<u32> {
+    let digits = value.strip_prefix('v')?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let version = digits.parse().ok()?;
+    (version > 0 && i32::try_from(version).is_ok() && !digits.starts_with('0')).then_some(version)
 }
 
 fn database_config(
@@ -348,6 +574,7 @@ mod tests {
         assert_eq!(config.proposal_ttl, Duration::from_hours(7 * 24));
         assert_eq!(config.api_token_hashes.len(), 1);
         assert!(config.mcp_allowed_origins.is_empty());
+        assert!(config.google_oauth.is_none());
     }
 
     #[test]
@@ -456,5 +683,141 @@ mod tests {
             Config::from_map(&production).expect_err("invalid timezone"),
             ConfigError::InvalidTimezone
         );
+    }
+
+    #[test]
+    fn google_oauth_is_explicit_strict_and_redacted() {
+        let mut disabled = valid_values();
+        disabled.insert(
+            "DAYWEAVE_GOOGLE_CLIENT_ID".to_owned(),
+            "ignored-client-id".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&disabled).expect_err("partial disabled settings must fail"),
+            ConfigError::DisabledGoogleOAuthConfiguration
+        );
+
+        let mut enabled = valid_values();
+        enabled.extend([
+            (
+                "DAYWEAVE_GOOGLE_OAUTH_ENABLED".to_owned(),
+                "true".to_owned(),
+            ),
+            (
+                "DAYWEAVE_GOOGLE_CLIENT_ID".to_owned(),
+                "client.apps.googleusercontent.com".to_owned(),
+            ),
+            (
+                "DAYWEAVE_GOOGLE_CLIENT_SECRET".to_owned(),
+                "never-print-this-client-secret".to_owned(),
+            ),
+            (
+                "DAYWEAVE_GOOGLE_REDIRECT_URI".to_owned(),
+                "https://api.example.test/v1/integrations/google/oauth/callback".to_owned(),
+            ),
+            (
+                "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS".to_owned(),
+                format!("v1:{},v2:{}", "11".repeat(32), "22".repeat(32)),
+            ),
+            (
+                "DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION".to_owned(),
+                "v2".to_owned(),
+            ),
+        ]);
+        assert_eq!(
+            Config::from_map(&enabled).expect_err("OAuth credentials require durable storage"),
+            ConfigError::MissingGoogleOAuthDatabase
+        );
+        enabled.insert(
+            "DAYWEAVE_DATABASE_URL".to_owned(),
+            "postgres://dayweave:redacted@db/dayweave".to_owned(),
+        );
+        let config = Config::from_map(&enabled).expect("complete OAuth config");
+        let google = config.google_oauth.expect("enabled");
+        assert_eq!(google.active_key_version, 2);
+        assert_eq!(google.keys.len(), 2);
+        let debug = format!("{google:?}");
+        assert!(!debug.contains("never-print-this-client-secret"));
+        assert!(!debug.contains(&"11".repeat(32)));
+    }
+
+    #[test]
+    fn google_redirect_and_key_formats_fail_closed() {
+        let base = |redirect: &str| {
+            let mut values = valid_values();
+            values.extend([
+                (
+                    "DAYWEAVE_DATABASE_URL".to_owned(),
+                    "postgres://dayweave:redacted@db/dayweave".to_owned(),
+                ),
+                (
+                    "DAYWEAVE_GOOGLE_OAUTH_ENABLED".to_owned(),
+                    "true".to_owned(),
+                ),
+                ("DAYWEAVE_GOOGLE_CLIENT_ID".to_owned(), "client".to_owned()),
+                (
+                    "DAYWEAVE_GOOGLE_CLIENT_SECRET".to_owned(),
+                    "secret".to_owned(),
+                ),
+                (
+                    "DAYWEAVE_GOOGLE_REDIRECT_URI".to_owned(),
+                    redirect.to_owned(),
+                ),
+                (
+                    "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS".to_owned(),
+                    format!("v1:{}", "ab".repeat(32)),
+                ),
+                (
+                    "DAYWEAVE_GOOGLE_ACTIVE_CREDENTIAL_KEY_VERSION".to_owned(),
+                    "v1".to_owned(),
+                ),
+            ]);
+            values
+        };
+
+        Config::from_map(&base(
+            "http://127.0.0.1:8080/v1/integrations/google/oauth/callback",
+        ))
+        .expect("loopback HTTP is allowed in development");
+        let mut production = base("http://localhost:8080/v1/integrations/google/oauth/callback");
+        production.insert("DAYWEAVE_ENVIRONMENT".to_owned(), "production".to_owned());
+        production.insert(
+            "DAYWEAVE_DATABASE_URL".to_owned(),
+            "postgres://dayweave:redacted@db/dayweave".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&production).expect_err("production HTTP must fail"),
+            ConfigError::InvalidGoogleRedirectUri
+        );
+        production.insert(
+            "DAYWEAVE_GOOGLE_REDIRECT_URI".to_owned(),
+            "https://localhost/v1/integrations/google/oauth/callback".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&production).expect_err("production loopback must fail"),
+            ConfigError::InvalidGoogleRedirectUri
+        );
+        assert_eq!(
+            Config::from_map(&base(
+                "http://localhost.evil.test/v1/integrations/google/oauth/callback",
+            ))
+            .expect_err("lookalike loopback must fail"),
+            ConfigError::InvalidGoogleRedirectUri
+        );
+
+        let mut ambiguous = base("https://api.example.test/v1/integrations/google/oauth/callback");
+        ambiguous.insert(
+            "DAYWEAVE_GOOGLE_CREDENTIAL_KEYS".to_owned(),
+            "v1:YWJjZA==".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&ambiguous).expect_err("base64 is not accepted as hex"),
+            ConfigError::InvalidGoogleCredentialKeys
+        );
+
+        assert_eq!(parse_key_version("v2147483647"), Some(2_147_483_647));
+        for invalid in ["v2147483648", "v4294967295", "v+1", "v01", "v0", "v", "1"] {
+            assert_eq!(parse_key_version(invalid), None, "{invalid}");
+        }
     }
 }

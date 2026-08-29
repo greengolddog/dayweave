@@ -118,6 +118,21 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     let document = body_json(openapi).await;
     assert!(document["paths"]["/v1/suggestions"].is_object());
     assert!(document["paths"]["/v1/schedule/preview"].is_object());
+    assert!(document["paths"]["/v1/integrations/google/oauth/start"].is_object());
+    assert!(document["paths"]["/v1/integrations/google/oauth/callback"].is_object());
+    assert!(
+        document["paths"]["/v1/integrations/google/oauth/recovery/acknowledge"]["post"].is_object()
+    );
+    assert!(
+        document["components"]["schemas"]["GoogleOAuthCleanupStatus"]["properties"]
+            ["operator_recovery_required"]
+            .is_object()
+    );
+    assert!(
+        document["components"]["schemas"]["GoogleOAuthCleanupStatus"]["properties"]
+            ["legacy_recovery_required"]
+            .is_object()
+    );
     assert!(document["components"]["securitySchemes"].is_object());
 }
 
@@ -140,6 +155,56 @@ async fn protected_routes_require_a_valid_bearer_token() {
         .unwrap();
     let wrong = app.oneshot(wrong).await.unwrap();
     assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn google_oauth_is_fail_closed_when_disabled_and_callback_is_non_cacheable() {
+    let (app, _) = test_app(true);
+    let unauthenticated = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/integrations/google/oauth/start",
+            Some(json!({"services": ["calendar", "tasks"]})),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let disabled = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/integrations/google/oauth/start",
+            Some(json!({"services": ["calendar", "tasks"]})),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let callback = app
+        .oneshot(request(
+            "GET",
+            "/v1/integrations/google/oauth/callback?state=do-not-reflect-this-state&code=do-not-reflect-this-code",
+            None,
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(callback.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(callback.headers()[header::REFERRER_POLICY], "no-referrer");
+    assert!(
+        callback
+            .headers()
+            .contains_key(header::CONTENT_SECURITY_POLICY)
+    );
+    let body = callback.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!body.contains("do-not-reflect-this-state"));
+    assert!(!body.contains("do-not-reflect-this-code"));
 }
 
 #[tokio::test]

@@ -11,12 +11,17 @@ description = "Private sync, integration, and Suggestions Inbox API for DayWeave
 workspace = true
 
 [dependencies]
+aes-gcm = "0.10"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 dayweave-core = { path = "../../crates/dayweave-core" }
+dayweave-google = { path = "../../crates/dayweave-google" }
+getrandom = "0.4"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+secrecy = "0.10.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -30,7 +35,9 @@ tower-http = { version = "0.6", features = ["request-id", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
+url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
 
 [dev-dependencies]
 http-body-util = "0.1"
