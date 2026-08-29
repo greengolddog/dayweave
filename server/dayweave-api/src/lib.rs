@@ -8,6 +8,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod execution;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
@@ -22,24 +23,40 @@ use std::sync::Arc;
 
 use auth::{Authenticator, StaticTokenAuthenticator};
 use config::Config;
+use execution::{ExecutionRepository, ExecutionService, InMemoryExecutionRepository};
 use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
-use persistence::{Database, PersistenceError, PostgresItemRepository, PostgresProposalRepository};
-use proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock};
+use persistence::{
+    Database, PersistenceError, PostgresExecutionRepository, PostgresItemRepository,
+    PostgresProposalRepository,
+};
+use proposals::{
+    Clock, InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock,
+};
 use readiness::Readiness;
 use scheduling::{
     PlanningSimulationPort, ScheduleQueryPort, UnavailableScheduleQueryPort,
     UnavailableSimulationPort,
 };
 
+type Repositories = (
+    Arc<dyn ProposalRepository>,
+    Arc<dyn ItemRepository>,
+    Arc<dyn ExecutionRepository>,
+    Readiness,
+);
+
 /// Shared dependencies used by HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub proposals: Arc<ProposalService>,
     pub items: Arc<ItemService>,
+    pub execution: Arc<ExecutionService>,
     pub authenticator: Arc<dyn Authenticator>,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
+    execution_repository: Arc<dyn ExecutionRepository>,
+    clock: Arc<dyn Clock>,
 }
 
 impl AppState {
@@ -53,33 +70,44 @@ impl AppState {
     /// Returns a redacted persistence error if the configured database cannot
     /// connect, migrate, or initialize its personal workspace scope.
     pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
-        let (repository, item_repository, readiness): (
-            Arc<dyn ProposalRepository>,
-            Arc<dyn ItemRepository>,
-            Readiness,
-        ) = if let Some(database_config) = &config.database {
-            let database = Database::connect(database_config).await?;
-            (
-                Arc::new(PostgresProposalRepository::new(
-                    database.pool().clone(),
-                    database.scope(),
-                )),
-                Arc::new(PostgresItemRepository::new(
-                    database.pool().clone(),
-                    database.scope(),
-                )),
-                Readiness::with_database(database.pool().clone()),
-            )
-        } else {
-            (
-                Arc::new(InMemoryProposalRepository::default()),
-                Arc::new(InMemoryItemRepository::default()),
-                Readiness::default(),
-            )
-        };
-        let clock = Arc::new(SystemClock);
-        let proposals = Arc::new(ProposalService::new(repository, clock, config.proposal_ttl));
-        let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
+        let (repository, item_repository, execution_repository, readiness): Repositories =
+            if let Some(database_config) = &config.database {
+                let database = Database::connect(database_config).await?;
+                (
+                    Arc::new(PostgresProposalRepository::new(
+                        database.pool().clone(),
+                        database.scope(),
+                    )),
+                    Arc::new(PostgresItemRepository::new(
+                        database.pool().clone(),
+                        database.scope(),
+                    )),
+                    Arc::new(PostgresExecutionRepository::new(
+                        database.pool().clone(),
+                        database.scope(),
+                    )),
+                    Readiness::with_database(database.pool().clone()),
+                )
+            } else {
+                (
+                    Arc::new(InMemoryProposalRepository::default()),
+                    Arc::new(InMemoryItemRepository::default()),
+                    Arc::new(InMemoryExecutionRepository::default()),
+                    Readiness::default(),
+                )
+            };
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let proposals = Arc::new(ProposalService::new(
+            repository,
+            clock.clone(),
+            config.proposal_ttl,
+        ));
+        let items = Arc::new(ItemService::new(item_repository, clock.clone()));
+        let execution = Arc::new(ExecutionService::new(
+            execution_repository.clone(),
+            items.clone(),
+            clock.clone(),
+        ));
         let authenticator = Arc::new(StaticTokenAuthenticator::from_hashes(
             config.api_token_hashes.clone(),
         ));
@@ -93,9 +121,12 @@ impl AppState {
         Ok(Self {
             proposals,
             items,
+            execution,
             authenticator,
             readiness,
             mcp,
+            execution_repository,
+            clock,
         })
     }
 
@@ -111,21 +142,38 @@ impl AppState {
             proposals.clone(),
             Arc::new(Vec::new()),
         ));
+        let execution_repository: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::default());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let items = Arc::new(ItemService::new(
+            Arc::new(InMemoryItemRepository::default()),
+            clock.clone(),
+        ));
+        let execution = Arc::new(ExecutionService::new(
+            execution_repository.clone(),
+            items.clone(),
+            clock.clone(),
+        ));
         Self {
             proposals,
-            items: Arc::new(ItemService::new(
-                Arc::new(InMemoryItemRepository::default()),
-                Arc::new(SystemClock),
-            )),
+            items,
+            execution,
             authenticator,
             readiness,
             mcp,
+            execution_repository,
+            clock,
         }
     }
 
     #[must_use]
     pub fn with_items(mut self, items: Arc<ItemService>) -> Self {
         self.items = items;
+        self.execution = Arc::new(ExecutionService::new(
+            self.execution_repository.clone(),
+            self.items.clone(),
+            self.clock.clone(),
+        ));
         self
     }
 

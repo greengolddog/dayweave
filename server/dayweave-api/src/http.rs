@@ -54,6 +54,9 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::delete_item,
         crate::items::http::restore_item,
         crate::scheduling::http::preview_schedule,
+        crate::execution::http::get_execution,
+        crate::execution::http::apply_execution_command,
+        crate::execution::http::execution_history,
     ),
     components(schemas(
         HealthResponse,
@@ -92,13 +95,27 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::scheduling::SchedulerConfigInput,
         crate::scheduling::RejectedScheduleItem,
         crate::scheduling::IgnoredPreviousAssignment,
+        crate::execution::ExecutionStatus,
+        crate::execution::ExecutionSession,
+        crate::execution::ExecutionCommand,
+        crate::execution::StartExecution,
+        crate::execution::PauseExecution,
+        crate::execution::ResumeExecution,
+        crate::execution::FinishExecution,
+        crate::execution::ExecutionSnapshot,
+        crate::execution::ExecutionMutation,
+        crate::execution::http::ExecutionCommandRequest,
+        crate::execution::http::ExecutionSnapshotEnvelope,
+        crate::execution::http::ExecutionMutationEnvelope,
+        crate::execution::http::ExecutionHistoryEnvelope,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Liveness, readiness, and build identity"),
         (name = "suggestions", description = "Reviewable proposals from AI and external tools"),
         (name = "items", description = "Canonical offline-first planner items and delta sync"),
-        (name = "schedule", description = "Deterministic side-effect-free planning previews")
+        (name = "schedule", description = "Deterministic side-effect-free planning previews"),
+        (name = "execution", description = "Server-authoritative cross-device timers and breaks")
     )
 )]
 pub struct ApiDoc;
@@ -132,6 +149,7 @@ pub fn router(state: AppState) -> Router {
         .route("/suggestions/{id}/reject", post(reject_suggestion))
         .merge(crate::items::http::routes())
         .merge(crate::scheduling::http::routes())
+        .merge(crate::execution::http::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,

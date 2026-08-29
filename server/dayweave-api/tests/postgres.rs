@@ -20,13 +20,14 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5]);
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),
         include_str!("../migrations/0002_schedule_sync_and_audit.sql"),
         include_str!("../migrations/0003_proposals_mcp_idempotency_outbox.sql"),
         include_str!("../migrations/0004_item_delta_sync.sql"),
+        include_str!("../migrations/0005_execution_sessions.sql"),
     ]
     .join("\n");
     for table in [
@@ -47,6 +48,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "mcp_clients",
         "idempotency_keys",
         "item_changes",
+        "execution_sessions",
+        "execution_state",
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }
