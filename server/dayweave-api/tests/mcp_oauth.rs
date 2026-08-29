@@ -7,6 +7,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use aws_lc_rs::{
+    rand::SystemRandom,
+    rsa::KeySize,
+    signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaKeyPair},
+};
 use axum::{
     Router,
     body::Body,
@@ -24,9 +29,7 @@ use dayweave_api::{
     scheduling::{UnavailableScheduleQueryPort, UnavailableSimulationPort},
 };
 use http_body_util::BodyExt as _;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, get_current_timestamp};
-use rand::rngs::OsRng;
-use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+use jsonwebtoken::{Algorithm, Header, get_current_timestamp};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 use url::Url;
@@ -36,25 +39,26 @@ const NATIVE_TOKEN: &str = "dw_mc1_native-test-token";
 const CURRENT_VERSION: &str = "2026-07-28";
 
 struct RuntimeKey {
-    private: RsaPrivateKey,
+    private: RsaKeyPair,
 }
 
 impl RuntimeKey {
     fn generate() -> Self {
         Self {
-            private: RsaPrivateKey::new(&mut OsRng, 2_048).expect("runtime-only RSA key"),
+            private: RsaKeyPair::generate(KeySize::Rsa2048).expect("runtime-only RSA key"),
         }
     }
 
     fn jwks(&self) -> Vec<u8> {
+        let public = self.private.public_key();
         serde_json::to_vec(&json!({
             "keys": [{
                 "kty": "RSA",
                 "use": "sig",
                 "alg": "RS256",
                 "kid": "route-key",
-                "n": URL_SAFE_NO_PAD.encode(self.private.n().to_bytes_be()),
-                "e": URL_SAFE_NO_PAD.encode(self.private.e().to_bytes_be()),
+                "n": URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),
+                "e": URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero()),
             }]
         }))
         .unwrap()
@@ -75,8 +79,23 @@ impl RuntimeKey {
         let mut header = Header::new(Algorithm::RS256);
         header.typ = Some("at+jwt".to_owned());
         header.kid = Some("route-key".to_owned());
-        let der = self.private.to_pkcs1_der().expect("PKCS#1 DER");
-        encode(&header, &claims, &EncodingKey::from_rsa_der(der.as_bytes())).unwrap()
+        let encoded_header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&header).expect("serializable synthetic access-token header"),
+        );
+        let encoded_claims = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&claims).expect("serializable synthetic access-token claims"),
+        );
+        let signing_input = format!("{encoded_header}.{encoded_claims}");
+        let mut signature = vec![0_u8; self.private.public_modulus_len()];
+        self.private
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut signature,
+            )
+            .expect("signed synthetic access token");
+        format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
     }
 }
 

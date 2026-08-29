@@ -593,9 +593,12 @@ mod tests {
         },
     };
 
-    use jsonwebtoken::{EncodingKey, Header, encode, get_current_timestamp};
-    use rand::rngs::OsRng;
-    use rsa::{RsaPrivateKey, pkcs1::EncodeRsaPrivateKey, traits::PublicKeyParts};
+    use aws_lc_rs::{
+        rand::SystemRandom,
+        rsa::KeySize,
+        signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaKeyPair},
+    };
+    use jsonwebtoken::{Header, get_current_timestamp};
     use serde_json::{Map, json};
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -669,25 +672,26 @@ mod tests {
 
     struct KeyMaterial {
         kid: String,
-        private: RsaPrivateKey,
+        private: RsaKeyPair,
     }
 
     impl KeyMaterial {
         fn generate(kid: &str) -> Self {
             Self {
                 kid: kid.to_owned(),
-                private: RsaPrivateKey::new(&mut OsRng, 2_048).expect("runtime RSA key"),
+                private: RsaKeyPair::generate(KeySize::Rsa2048).expect("runtime RSA key"),
             }
         }
 
         fn jwk(&self) -> Value {
+            let public = self.private.public_key();
             json!({
                 "kty": "RSA",
                 "use": "sig",
                 "alg": "RS256",
                 "kid": self.kid,
-                "n": URL_SAFE_NO_PAD.encode(self.private.n().to_bytes_be()),
-                "e": URL_SAFE_NO_PAD.encode(self.private.e().to_bytes_be()),
+                "n": URL_SAFE_NO_PAD.encode(public.modulus().big_endian_without_leading_zero()),
+                "e": URL_SAFE_NO_PAD.encode(public.exponent().big_endian_without_leading_zero()),
             })
         }
 
@@ -696,9 +700,23 @@ mod tests {
             header.typ = Some("at+jwt".to_owned());
             header.kid = Some(self.kid.clone());
             mutate(&mut header);
-            let der = self.private.to_pkcs1_der().expect("PKCS#1 DER");
-            encode(&header, claims, &EncodingKey::from_rsa_der(der.as_bytes()))
-                .expect("signed test token")
+            let encoded_header = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&header).expect("serializable synthetic access-token header"),
+            );
+            let encoded_claims = URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(claims).expect("serializable synthetic access-token claims"),
+            );
+            let signing_input = format!("{encoded_header}.{encoded_claims}");
+            let mut signature = vec![0_u8; self.private.public_modulus_len()];
+            self.private
+                .sign(
+                    &RSA_PKCS1_SHA256,
+                    &SystemRandom::new(),
+                    signing_input.as_bytes(),
+                    &mut signature,
+                )
+                .expect("signed synthetic access token");
+            format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
         }
     }
 
