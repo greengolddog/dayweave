@@ -10,6 +10,10 @@ use crate::{GoogleClient, GoogleError};
 pub struct EventListOptions {
     pub page_token: Option<String>,
     pub sync_token: Option<String>,
+    /// Expands recurring series into concrete occurrences when `true`.
+    ///
+    /// The default is `false`, which returns recurring series resources.
+    pub single_events: bool,
     pub time_min: Option<String>,
     pub time_max: Option<String>,
     pub max_results: Option<u16>,
@@ -100,7 +104,7 @@ impl EventListOptions {
         }
         let mut query = vec![
             ("showDeleted", "true".to_owned()),
-            ("singleEvents", "false".to_owned()),
+            ("singleEvents", self.single_events.to_string()),
             (
                 "maxResults",
                 self.max_results.unwrap_or(2500).min(2500).to_string(),
@@ -434,7 +438,11 @@ impl GoogleClient {
         self.json(Self::body(request, request_body)).await
     }
 
-    /// Lists complete event series and deletion tombstones for incremental sync.
+    /// Lists event resources and deletion tombstones for incremental sync.
+    ///
+    /// Set [`EventListOptions::single_events`] to expand recurring series into
+    /// concrete occurrences. Keep that setting unchanged when continuing an
+    /// incremental sync with a returned sync token.
     ///
     /// # Errors
     ///

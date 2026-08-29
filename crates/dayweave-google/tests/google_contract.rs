@@ -16,7 +16,7 @@ use dayweave_google::{
 use serde_json::json;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
-    matchers::{body_json, header, method, path, query_param},
+    matchers::{body_json, header, method, path, query_param, query_param_is_missing},
 };
 
 fn client(server: &MockServer) -> GoogleClient {
@@ -182,15 +182,16 @@ async fn malformed_task_create_success_is_an_ambiguous_post_send_error() {
 }
 
 #[tokio::test]
-async fn lists_events_with_encoded_calendar_id_and_sync_contract() {
+async fn lists_bounded_expanded_events_with_encoded_calendar_id() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/calendar/v3/calendars/team%2Fprimary/events"))
         .and(header("authorization", "Bearer test-access-token"))
         .and(query_param("showDeleted", "true"))
-        .and(query_param("singleEvents", "false"))
+        .and(query_param("singleEvents", "true"))
         .and(query_param("maxResults", "2500"))
         .and(query_param("timeMin", "2026-08-29T00:00:00Z"))
+        .and(query_param("timeMax", "2026-09-05T00:00:00Z"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [
                 {
@@ -219,7 +220,9 @@ async fn lists_events_with_encoded_calendar_id_and_sync_contract() {
         .list_events(
             "team/primary",
             &EventListOptions {
+                single_events: true,
                 time_min: Some("2026-08-29T00:00:00Z".to_owned()),
+                time_max: Some("2026-09-05T00:00:00Z".to_owned()),
                 ..EventListOptions::default()
             },
         )
@@ -234,6 +237,38 @@ async fn lists_events_with_encoded_calendar_id_and_sync_contract() {
 }
 
 #[tokio::test]
+async fn lists_incremental_expanded_events_without_time_bounds() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/calendar/v3/calendars/primary/events"))
+        .and(query_param("showDeleted", "true"))
+        .and(query_param("singleEvents", "true"))
+        .and(query_param("syncToken", "sync-1"))
+        .and(query_param_is_missing("timeMin"))
+        .and(query_param_is_missing("timeMax"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [],
+            "nextSyncToken": "sync-2"
+        })))
+        .mount(&server)
+        .await;
+
+    let page = client(&server)
+        .list_events(
+            "primary",
+            &EventListOptions {
+                sync_token: Some("sync-1".to_owned()),
+                single_events: true,
+                ..EventListOptions::default()
+            },
+        )
+        .await
+        .expect("incremental event page parses");
+
+    assert_eq!(page.next_sync_token.as_deref(), Some("sync-2"));
+}
+
+#[tokio::test]
 async fn rejects_invalid_incremental_sync_before_network_access() {
     let server = MockServer::start().await;
     let error = client(&server)
@@ -241,6 +276,7 @@ async fn rejects_invalid_incremental_sync_before_network_access() {
             "primary",
             &EventListOptions {
                 sync_token: Some("sync-1".to_owned()),
+                single_events: true,
                 time_max: Some("2026-09-01T00:00:00Z".to_owned()),
                 ..EventListOptions::default()
             },
@@ -263,6 +299,7 @@ async fn maps_expired_sync_token_to_bounded_resync_signal() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/calendar/v3/calendars/primary/events"))
+        .and(query_param("singleEvents", "false"))
         .and(query_param("syncToken", "expired"))
         .respond_with(ResponseTemplate::new(410))
         .mount(&server)
