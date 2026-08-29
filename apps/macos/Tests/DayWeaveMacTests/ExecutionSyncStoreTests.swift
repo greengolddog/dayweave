@@ -21,6 +21,56 @@ struct ExecutionSyncStoreTests {
     nonisolated private static let canonicalConfiguration = "https://api.example.test"
     nonisolated private static let baseDate = Date(timeIntervalSince1970: 1_800_000_000)
 
+    @Test("production execution connection preserves the auth-bound canonical identity")
+    func productionConnectionUsesAuthBoundConfiguration() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let token = "synthetic-execution-configuration-token"
+        let baseURL = try DayWeaveAPIBaseURL("https://api.example.com/gateway")
+        let expectedConfiguration = DayWeaveAPIClient(
+            baseURL: baseURL,
+            bearerToken: token
+        ).configurationIdentifier
+        let planner = PlannerStore(
+            canonicalConfigurationIdentifier: expectedConfiguration,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Self.baseDate }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"execution":{"revision":0,"active_session":null}}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"sessions":[],"next_offset":null}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"execution":{"revision":0,"active_session":null}}"#.utf8)
+            )
+        )
+        let sync = ExecutionSyncStore(
+            planner: planner,
+            configurationStore: TestSuggestionConfigurationStore(
+                baseURL: baseURL.url.absoluteString
+            ),
+            tokenStore: TestBearerTokenStore(
+                token: token,
+                origin: baseURL.credentialOriginIdentifier
+            ),
+            session: URLProtocolStub.makeSession(),
+            now: { Self.baseDate }
+        )
+
+        #expect(await sync.refresh() == .success)
+        #expect(planner.canonicalConfigurationIdentifier == expectedConfiguration)
+        #expect(URLProtocolStub.storage.requests(for: token).count == 3)
+    }
+
     @Test("fresh clients page through more than 100 rows and prove the complete revision sum")
     func fullHistoryBootstrapExceedsOnePage() async throws {
         let context = try Self.persistenceContext()

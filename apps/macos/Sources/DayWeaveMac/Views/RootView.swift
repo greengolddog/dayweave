@@ -2150,11 +2150,14 @@ struct SettingsView: View {
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var durableAuth: DurableAuthSettingsModel
     @EnvironmentObject private var appLock: AppLockController
     @EnvironmentObject private var appearance: AppearanceController
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
+    @State private var dayWeaveEnrollmentCode = ""
     @State private var isCanonicalResetConfirmationPresented = false
+    @State private var isLocalOnlyForgetConfirmationPresented = false
     @State private var apiSettingsError: String?
 
     var body: some View {
@@ -2244,10 +2247,42 @@ struct SettingsView: View {
             Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
                     .textContentType(.URL)
+                    .disabled(durableAuth.isBusy)
                 SecureField(
-                    suggestionSync.tokenConfigured ? "New bearer token (blank only for the same API origin)" : "Bearer token",
+                    durableAuth.presentation.phase == .active
+                        ? "Revoke current session before replacement"
+                        : (durableAuth.presentation.canReenroll
+                            ? "Bootstrap bearer for explicit re-enrollment"
+                            : (suggestionSync.tokenConfigured
+                                ? "New bootstrap bearer (blank for the same API origin)"
+                                : "Bootstrap bearer")),
                     text: $dayWeaveBearerToken
                 )
+                .disabled(durableAuth.isBusy || !authReplacementControlsEnabled)
+                SecureField(
+                    "One-time enrollment code (dw_en1_…)",
+                    text: $dayWeaveEnrollmentCode
+                )
+                .disabled(durableAuth.isBusy || !authReplacementControlsEnabled)
+                HStack {
+                    Button("Use one-time enrollment code") {
+                        consumeOneTimeEnrollmentCode()
+                    }
+                    .disabled(
+                        dayWeaveEnrollmentCode.isEmpty
+                            || dayWeaveAPIBaseURL
+                                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || !durableAuth.presentation.canConsumeEnrollmentCode
+                            || durableAuth.isBusy
+                            || executionSync.isSyncing
+                            || canonicalSync.isSyncing
+                            || !store.canMutatePlan
+                            || executionSync.credentialReplacementIsBlocked
+                    )
+                    Text("Directly consumes an already-minted code; it is never sent as a legacy bearer.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
 
                 HStack {
                     Button("Save API settings") {
@@ -2262,27 +2297,88 @@ struct SettingsView: View {
                             || !suggestionSync.activeProposalIDs.isEmpty
                             || executionSync.isSyncing
                             || canonicalSync.isSyncing
+                            || durableAuth.isBusy
+                            || (!authReplacementControlsEnabled
+                                && !dayWeaveBearerToken.isEmpty)
                             || !store.canMutatePlan
                             || (apiCredentialReplacementRequired
                                 && executionSync.credentialReplacementIsBlocked)
                     )
 
-                    if suggestionSync.tokenConfigured {
-                        Button("Remove saved token", role: .destructive) {
-                            removeBearerToken()
+                    if durableAuth.presentation.canForget || suggestionSync.tokenConfigured {
+                        if durableAuth.presentation.canRevokeRemotely {
+                            Button("Revoke this Mac & sign out", role: .destructive) {
+                                revokeAndRemoveAuthentication()
+                            }
+                            .disabled(
+                                suggestionSync.isRefreshing
+                                    || !suggestionSync.activeProposalIDs.isEmpty
+                                    || executionSync.isSyncing
+                                    || canonicalSync.isSyncing
+                                    || durableAuth.isBusy
+                                    || !store.canMutatePlan
+                                    || executionSync.credentialReplacementIsBlocked
+                            )
+                        }
+                        Button("Forget only on this Mac…", role: .destructive) {
+                            isLocalOnlyForgetConfirmationPresented = true
                         }
                         .disabled(
                             suggestionSync.isRefreshing
                                 || !suggestionSync.activeProposalIDs.isEmpty
                                 || executionSync.isSyncing
                                 || canonicalSync.isSyncing
+                                || durableAuth.isBusy
                                 || !store.canMutatePlan
                                 || executionSync.credentialReplacementIsBlocked
                         )
                     }
                 }
 
-                LabeledContent("Credential", value: suggestionSync.tokenConfigured ? "Stored in Keychain" : "Not saved")
+                LabeledContent("Authentication", value: durableAuth.presentation.title)
+                Text(durableAuth.presentation.detail)
+                    .font(.caption)
+                    .foregroundStyle(
+                        durableAuth.presentation.phase == .incompatible
+                            || durableAuth.presentation.phase == .reauthenticationRequired
+                            ? .orange : .secondary
+                    )
+                if let expiresAt = durableAuth.presentation.accessExpiresAt {
+                    LabeledContent(
+                        "Current access expires",
+                        value: expiresAt.formatted(date: .abbreviated, time: .shortened)
+                    )
+                }
+                if durableAuth.presentation.canUpgrade {
+                    Button(
+                        durableAuth.presentation.phase == .enrollmentPending
+                            || durableAuth.presentation.phase == .enrollmentCreationPending
+                            ? "Resume exact enrollment"
+                            : "Upgrade to rotating session"
+                    ) {
+                        upgradeDurableAuthentication()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(
+                        durableAuth.isBusy
+                            || executionSync.isSyncing
+                            || canonicalSync.isSyncing
+                            || !store.canMutatePlan
+                            || executionSync.credentialReplacementIsBlocked
+                    )
+                }
+                if durableAuth.isBusy {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Updating the atomic Keychain session…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let message = durableAuth.errorMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                }
                 Text(suggestionSync.status.message)
                     .font(.caption)
                     .foregroundStyle(suggestionSync.status.isFailure ? .red : .secondary)
@@ -2297,7 +2393,7 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. Changing the API origin requires re-entering the token, which is never saved in the planner snapshot.")
+                Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. Rotating access and refresh credentials stay in one atomic, device-only Keychain envelope and are never saved in the planner snapshot. DayWeave never falls back to a legacy bearer after durable activation.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 LabeledContent("Planner sync", value: canonicalSync.status.message)
@@ -2340,10 +2436,35 @@ struct SettingsView: View {
         } message: {
             Text("This removes cached canonical items, preview blocks, recurrence history, and pending/conflicted canonical edits from this Mac. It does not change the server or locally authored captures.")
         }
+        .confirmationDialog(
+            "Forget authentication only on this Mac?",
+            isPresented: $isLocalOnlyForgetConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Forget locally without revoking", role: .destructive) {
+                forgetAuthenticationLocally()
+            }
+        } message: {
+            Text("This destroys the local Keychain credentials without contacting the server. A server-side device session, one-time enrollment, or legacy bootstrap bearer may remain active. Use this only when remote revocation is impossible.")
+        }
         .formStyle(.grouped)
         .padding()
         .onAppear {
             dayWeaveAPIBaseURL = suggestionSync.baseURLString
+            durableAuth.reload()
+        }
+        .onChange(of: dayWeaveAPIBaseURL) { _, value in
+            durableAuth.reload(boundTo: try? DayWeaveAPIBaseURL(value))
+        }
+    }
+
+    private var authReplacementControlsEnabled: Bool {
+        switch durableAuth.presentation.phase {
+        case .notConfigured, .legacy, .reauthenticationRequired:
+            true
+        case .enrollmentCreationPending, .enrollmentPending, .active,
+             .refreshPending, .incompatible:
+            false
         }
     }
 
@@ -2398,41 +2519,149 @@ struct SettingsView: View {
     private func saveAPISettings() {
         apiSettingsError = nil
         do {
-            _ = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            let capturedBaseURL = baseURL.url.absoluteString
             let replacementRequired = apiCredentialReplacementRequired
             if replacementRequired {
                 try executionSync.prepareForCredentialReplacement()
             }
-            guard suggestionSync.applyConfiguration(
-                baseURL: dayWeaveAPIBaseURL,
-                newToken: dayWeaveBearerToken
-            ) else {
-                apiSettingsError = suggestionSync.status.message
-                return
+            let bootstrap = dayWeaveBearerToken
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            Task { @MainActor in
+                if !bootstrap.isEmpty {
+                    let saved: Bool
+                    if durableAuth.presentation.canReenroll {
+                        saved = await durableAuth.enroll(
+                            baseURL: baseURL,
+                            bootstrapToken: bootstrap
+                        )
+                    } else {
+                        saved = await durableAuth.installLegacy(
+                            baseURL: baseURL,
+                            token: bootstrap
+                        )
+                    }
+                    guard saved else {
+                        apiSettingsError = durableAuth.errorMessage
+                        return
+                    }
+                }
+                guard suggestionSync.applyConfiguration(
+                    baseURL: capturedBaseURL,
+                    newToken: ""
+                ) else {
+                    apiSettingsError = suggestionSync.status.message
+                    return
+                }
+                dayWeaveBearerToken = ""
+                dayWeaveAPIBaseURL = suggestionSync.baseURLString
+                suggestionSync.durableAuthenticationDidChange()
+                guard replacementRequired || !bootstrap.isEmpty else { return }
+                canonicalSync.configurationDidChange()
+                executionSync.configurationDidChange()
+                executionSync.startForegroundPolling()
             }
-            dayWeaveBearerToken = ""
-            dayWeaveAPIBaseURL = suggestionSync.baseURLString
-            guard replacementRequired else { return }
-            canonicalSync.configurationDidChange()
-            executionSync.configurationDidChange()
-            executionSync.startForegroundPolling()
         } catch {
             apiSettingsError = error.localizedDescription
         }
     }
 
-    private func removeBearerToken() {
+    private func revokeAndRemoveAuthentication() {
         apiSettingsError = nil
         do {
             try executionSync.prepareForCredentialReplacement()
-            suggestionSync.clearBearerToken()
-            guard !suggestionSync.tokenConfigured else {
-                apiSettingsError = suggestionSync.status.message
-                return
+            let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            Task { @MainActor in
+                guard await durableAuth.revokeAndForget(baseURL: baseURL) else {
+                    apiSettingsError = durableAuth.errorMessage
+                    return
+                }
+                suggestionSync.durableAuthenticationDidChange()
+                canonicalSync.configurationDidChange()
+                executionSync.configurationDidChange()
+                dayWeaveBearerToken = ""
             }
-            canonicalSync.configurationDidChange()
-            executionSync.configurationDidChange()
-            dayWeaveBearerToken = ""
+        } catch {
+            apiSettingsError = error.localizedDescription
+        }
+    }
+
+    private func forgetAuthenticationLocally() {
+        apiSettingsError = nil
+        do {
+            try executionSync.prepareForCredentialReplacement()
+            let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            Task { @MainActor in
+                guard await durableAuth.forgetLocally(baseURL: baseURL) else {
+                    apiSettingsError = durableAuth.errorMessage
+                    return
+                }
+                suggestionSync.durableAuthenticationDidChange()
+                canonicalSync.configurationDidChange()
+                executionSync.configurationDidChange()
+                dayWeaveBearerToken = ""
+                dayWeaveEnrollmentCode = ""
+            }
+        } catch {
+            apiSettingsError = error.localizedDescription
+        }
+    }
+
+    private func consumeOneTimeEnrollmentCode() {
+        apiSettingsError = nil
+        do {
+            let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            let capturedBaseURL = baseURL.url.absoluteString
+            try executionSync.prepareForCredentialReplacement()
+            let code = dayWeaveEnrollmentCode
+            Task { @MainActor in
+                guard await durableAuth.consumeEnrollmentCode(baseURL: baseURL, code: code) else {
+                    apiSettingsError = durableAuth.errorMessage
+                    return
+                }
+                dayWeaveEnrollmentCode = ""
+                guard suggestionSync.applyConfiguration(
+                    baseURL: capturedBaseURL,
+                    newToken: ""
+                ) else {
+                    apiSettingsError = suggestionSync.status.message
+                    return
+                }
+                dayWeaveAPIBaseURL = suggestionSync.baseURLString
+                suggestionSync.durableAuthenticationDidChange()
+                canonicalSync.configurationDidChange()
+                executionSync.configurationDidChange()
+                executionSync.startForegroundPolling()
+            }
+        } catch {
+            apiSettingsError = error.localizedDescription
+        }
+    }
+
+    private func upgradeDurableAuthentication() {
+        apiSettingsError = nil
+        do {
+            let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+            let capturedBaseURL = baseURL.url.absoluteString
+            try executionSync.prepareForCredentialReplacement()
+            Task { @MainActor in
+                guard await durableAuth.enroll(baseURL: baseURL) else {
+                    apiSettingsError = durableAuth.errorMessage
+                    return
+                }
+                guard suggestionSync.applyConfiguration(
+                    baseURL: capturedBaseURL,
+                    newToken: ""
+                ) else {
+                    apiSettingsError = suggestionSync.status.message
+                    return
+                }
+                dayWeaveAPIBaseURL = suggestionSync.baseURLString
+                suggestionSync.durableAuthenticationDidChange()
+                canonicalSync.configurationDidChange()
+                executionSync.configurationDidChange()
+                executionSync.startForegroundPolling()
+            }
         } catch {
             apiSettingsError = error.localizedDescription
         }

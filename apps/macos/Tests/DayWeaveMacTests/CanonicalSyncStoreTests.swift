@@ -180,7 +180,7 @@ struct CanonicalSyncStoreTests {
         )
         let planner = PlannerStore(
             canonicalDeltaCursor: "expired-cursor",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -241,7 +241,7 @@ struct CanonicalSyncStoreTests {
             blocks: [block],
             canonicalItems: [item],
             canonicalDeltaCursor: "before-conflict",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -289,7 +289,7 @@ struct CanonicalSyncStoreTests {
             blocks: [block],
             canonicalItems: [item],
             canonicalDeltaCursor: "privacy-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -351,7 +351,7 @@ struct CanonicalSyncStoreTests {
         let planner = PlannerStore(
             canonicalItems: [item],
             canonicalDeltaCursor: "privacy-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -405,7 +405,7 @@ struct CanonicalSyncStoreTests {
         let planner = PlannerStore(
             canonicalItems: [item],
             canonicalDeltaCursor: "privacy-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -517,7 +517,7 @@ struct CanonicalSyncStoreTests {
             canonicalDeltaCursor: "privacy-cap-before",
             pendingCanonicalMutations: [statusMutation],
             pendingCanonicalSensitivityMutations: [privacyMutation],
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -555,7 +555,7 @@ struct CanonicalSyncStoreTests {
         )
         let sync = CanonicalSyncStore(
             planner: planner,
-            configurationStore: FixedAPIConfigurationStore(baseURL: Self.configurationIdentifier),
+            configurationStore: FixedAPIConfigurationStore(baseURL: Self.baseURLString),
             tokenStore: TestBearerTokenStore(token: token),
             session: URLProtocolStub.makeSession(),
             statusPushLimit: 1,
@@ -614,7 +614,7 @@ struct CanonicalSyncStoreTests {
             blocks: [block],
             canonicalItems: [parent, child],
             canonicalDeltaCursor: "status-parent-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -655,7 +655,7 @@ struct CanonicalSyncStoreTests {
             blocks: [block],
             canonicalItems: [item],
             canonicalDeltaCursor: "status-jump-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -699,7 +699,7 @@ struct CanonicalSyncStoreTests {
             blocks: [block],
             canonicalItems: [item],
             canonicalDeltaCursor: "split-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -767,8 +767,8 @@ struct CanonicalSyncStoreTests {
                     occurrenceFullyScheduled: true
                 ),
             ],
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
-            schedulePreviewProvenance: Self.provenance(now: now),
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
             previewValidatedForCurrentLaunch: true,
             restoreFromPersistence: false,
             now: { now }
@@ -818,7 +818,7 @@ struct CanonicalSyncStoreTests {
         let planner = PlannerStore(
             canonicalItems: [initial],
             canonicalDeltaCursor: "revision-1",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
             restoreFromPersistence: false,
             now: { now }
         )
@@ -858,8 +858,8 @@ struct CanonicalSyncStoreTests {
             blocks: [staleBlock],
             canonicalItems: [item],
             canonicalDeltaCursor: "before-invalid-preview",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
-            schedulePreviewProvenance: Self.provenance(now: now),
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
             previewValidatedForCurrentLaunch: true,
             restoreFromPersistence: false,
             now: { now }
@@ -913,8 +913,8 @@ struct CanonicalSyncStoreTests {
             blocks: [priorBlock],
             canonicalItems: [item],
             canonicalDeltaCursor: "sensitivity-before",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
-            schedulePreviewProvenance: Self.provenance(now: now),
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
             previewValidatedForCurrentLaunch: true,
             restoreFromPersistence: false,
             now: { now }
@@ -1131,6 +1131,27 @@ struct CanonicalSyncStoreTests {
         #expect(URLProtocolStub.storage.requests(for: token).isEmpty)
     }
 
+    @Test("canonical cache cannot cross credentials at the same API origin")
+    func testCanonicalCacheSameOriginCredentialBinding() async throws {
+        let oldToken = "canonical-same-origin-old-token"
+        let newToken = "canonical-same-origin-new-token"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let planner = PlannerStore(
+            canonicalDeltaCursor: "old-credential-cursor",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: oldToken),
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: newToken)
+        let sync = Self.makeSync(planner: planner, token: newToken, now: now)
+
+        await sync.sync()
+
+        #expect(sync.status.isFailure)
+        #expect(planner.canonicalDeltaCursor == "old-credential-cursor")
+        #expect(URLProtocolStub.storage.requests(for: newToken).isEmpty)
+    }
+
     @Test("invalid legacy captures are quarantined without wedging valid publication")
     func testInvalidLegacyCaptureIsSkippedWithRecoveryDiagnostic() async throws {
         let token = "canonical-invalid-capture-token"
@@ -1211,7 +1232,7 @@ struct CanonicalSyncStoreTests {
         )
         let sync = CanonicalSyncStore(
             planner: planner,
-            configurationStore: FixedAPIConfigurationStore(baseURL: Self.configurationIdentifier),
+            configurationStore: FixedAPIConfigurationStore(baseURL: Self.baseURLString),
             tokenStore: TestBearerTokenStore(token: token),
             session: URLProtocolStub.makeSession(),
             createPushLimit: 1,
@@ -1262,8 +1283,8 @@ struct CanonicalSyncStoreTests {
             canonicalItems: items,
             canonicalDeltaCursor: "before-caps",
             pendingCanonicalMutations: mutations,
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
-            schedulePreviewProvenance: Self.provenance(now: now),
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
             previewValidatedForCurrentLaunch: true,
             restoreFromPersistence: false,
             now: { now }
@@ -1277,7 +1298,7 @@ struct CanonicalSyncStoreTests {
         )
         let sync = CanonicalSyncStore(
             planner: planner,
-            configurationStore: FixedAPIConfigurationStore(baseURL: Self.configurationIdentifier),
+            configurationStore: FixedAPIConfigurationStore(baseURL: Self.baseURLString),
             tokenStore: TestBearerTokenStore(token: token),
             session: URLProtocolStub.makeSession(),
             statusPushLimit: 1,
@@ -1342,14 +1363,15 @@ struct CanonicalSyncStoreTests {
 
     @Test("client construction failure invalidates old preview actionability first")
     func testFailedClientConstructionInvalidatesPreview() async throws {
+        let token = "canonical-prior-valid-binding-token"
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
         let itemID = UUID(uuidString: "27300000-2222-4333-8444-200000000000")!
         let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
         let block = Self.block(itemID: itemID, revision: 1, start: now.addingTimeInterval(3_600))
         let planner = PlannerStore(
             blocks: [block], canonicalItems: [item], canonicalDeltaCursor: "actionable",
-            canonicalConfigurationIdentifier: Self.configurationIdentifier,
-            schedulePreviewProvenance: Self.provenance(now: now),
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            schedulePreviewProvenance: Self.provenance(now: now, token: token),
             previewValidatedForCurrentLaunch: true,
             restoreFromPersistence: false,
             now: { now }
@@ -1357,7 +1379,7 @@ struct CanonicalSyncStoreTests {
         #expect(planner.canMutate(block))
         let sync = CanonicalSyncStore(
             planner: planner,
-            configurationStore: FixedAPIConfigurationStore(baseURL: Self.configurationIdentifier),
+            configurationStore: FixedAPIConfigurationStore(baseURL: Self.baseURLString),
             tokenStore: TestBearerTokenStore(token: "wrong-origin", origin: "https://other.example.com"),
             session: URLProtocolStub.makeSession(),
             now: { now }
@@ -1382,7 +1404,7 @@ struct CanonicalSyncStoreTests {
             let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
             let planner = PlannerStore(
                 canonicalItems: [item], canonicalDeltaCursor: "invalid-\(variant)",
-                canonicalConfigurationIdentifier: Self.configurationIdentifier,
+                canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
                 restoreFromPersistence: false,
                 now: { now }
             )
@@ -1539,20 +1561,28 @@ struct CanonicalSyncStoreTests {
     ) -> CanonicalSyncStore {
         CanonicalSyncStore(
             planner: planner,
-            configurationStore: FixedAPIConfigurationStore(baseURL: "https://api.example.com/gateway"),
+            configurationStore: FixedAPIConfigurationStore(baseURL: baseURLString),
             tokenStore: TestBearerTokenStore(token: token),
             session: URLProtocolStub.makeSession(),
             now: { now }
         )
     }
 
-    private static let configurationIdentifier = "https://api.example.com/gateway"
+    private static let baseURLString = "https://api.example.com/gateway"
 
-    private static func provenance(now: Date) -> SchedulePreviewProvenance {
+    private static func configurationIdentifier(token: String) -> String {
+        DayWeaveAPIClient(
+            baseURL: try! DayWeaveAPIBaseURL(baseURLString),
+            session: URLProtocolStub.makeSession(),
+            bearerToken: token
+        ).configurationIdentifier
+    }
+
+    private static func provenance(now: Date, token: String) -> SchedulePreviewProvenance {
         let calendar = Calendar.autoupdatingCurrent
         let horizonStart = calendar.startOfDay(for: now)
         return .init(
-            configurationIdentifier: configurationIdentifier,
+            configurationIdentifier: configurationIdentifier(token: token),
             generatedAt: now,
             asOf: now,
             horizonStart: horizonStart,

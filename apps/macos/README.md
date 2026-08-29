@@ -36,19 +36,59 @@ Open **Settings → DayWeave API** and provide:
 - the server root URL, such as `https://dayweave.example.com` or the local
   development endpoint `http://127.0.0.1:8787`; the app appends
   versioned endpoint paths itself;
-- a bearer token configured on the DayWeave API.
+- either a legacy bootstrap bearer for a one-time upgrade or an already-minted
+  one-time enrollment code beginning with `dw_en1_`.
 
 Remote URLs must use HTTPS. Plain HTTP is limited to loopback development, and
 redirects are not followed so a credential cannot be redirected to another
-origin. The base URL is ordinary configuration stored in `UserDefaults`. The
-Keychain's authoritative value is one atomically replaced, versioned record
-containing both the bearer token and its normalized API origin. Suggestions and
-canonical sync refuse to construct a client unless that binding exactly matches
-the configured URL. This remains fail-closed if the process stops between the
-Keychain and `UserDefaults` writes during an origin change. Legacy raw-token
-records have no trustworthy origin and require explicit re-entry. Credentials
-are device-only and are never added to the Codable planner snapshot or
-application messages.
+origin. The base URL is ordinary configuration stored in `UserDefaults`.
+Authentication authority lives in one canonical, versioned Keychain envelope
+bound to the normalized API origin and stable client/session identity. Explicit
+states cover legacy upgrade, enrollment creation prepared for retry, enrollment
+consumption prepared for retry, active rotating credentials, refresh prepared
+for retry, reauthentication, and incompatible recovery. Every
+credential-bearing transition is compare-and-swap protected across app
+processes and verified by an exact Keychain readback.
+
+The bootstrap path generates a stable client ID, enrollment ID, one-time
+`dw_en1_` credential, session ID, and access/refresh pair locally. Before its
+first network send, it journals the complete enrollment-creation request: the
+canonical full URL including base path, method, security headers, exact body
+bytes and digest, bootstrap authority binding, and preparation time. A first
+`201` response must exactly echo the proposed ID and credential with
+`replayed:false`; an exact retry must return the same public fields as `200`
+with `replayed:true`. Only then does the app journal and consume the proposed
+session tuple. The direct-code path remains distinct: it skips enrollment
+creation and journals the supplied `dw_en1_` credential with its locally
+generated tuple before its first consume request.
+
+A crash, timeout, cancellation, or lost response retains the exact pending
+request. Restart recovery uses the journaled target and bytes, never a newly
+entered same-origin base path and never a replacement tuple. Older pending
+records without a complete request fence are quarantined instead of being
+retargeted. Access refresh follows the same persist-before-send rule for a
+material-distinct next pair. Proactive refresh and a strictly validated API 401
+share one coordinator and one in-flight rotation. The original API request is
+replayed with only its Authorization value changed, and only while its stable
+authentication binding remains unchanged.
+
+After durable activation, DayWeave never falls back to a legacy bearer. A live,
+pending, ambiguous, or incompatible session cannot be replaced—even at another
+origin—until the existing authority is handled. Normal sign-out first refreshes
+if necessary and sends an authenticated `DELETE /v1/auth/sessions/{session_id}`;
+only a strict `204` response permits exact local deletion. If the server cannot
+be reached, **Forget only on this Mac** is a separate destructive confirmation.
+It retains a no-secret tombstone that records the local-only decision and warns
+that server session or bootstrap authority may still exist. Same-origin
+re-enrollment is also available after a definitive expired/rejected state;
+cross-origin replacement requires the explicit local-only tombstone.
+
+Suggestions, canonical cache/cursors/mutations, and execution recovery are
+fenced to the authentication binding as well as the URL. Replacing a session at
+the same origin therefore quarantines stale work instead of sending it under a
+new identity. Legacy raw-token records have no trustworthy origin and require
+explicit re-entry. Credentials are device-only and are never added to the
+Codable planner snapshot or application diagnostics.
 
 The Inbox fetches pending proposals and supports refresh, edit, accept, and
 reject with the proposal's optimistic `expected_revision`. Remote proposals

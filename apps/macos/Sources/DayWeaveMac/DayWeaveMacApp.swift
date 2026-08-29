@@ -11,6 +11,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var suggestionSync: SuggestionSyncStore
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
+    @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
     @StateObject private var appearance: AppearanceController
     @State private var activationTask: Task<Void, Never>?
@@ -21,14 +22,26 @@ struct DayWeaveMacApp: App {
         _store = StateObject(wrappedValue: store)
         let codex = CodexAppServerClient()
         _codex = StateObject(wrappedValue: codex)
+        let authCoordinator = DurableAuthCoordinator()
+        _durableAuth = StateObject(wrappedValue: DurableAuthSettingsModel(
+            coordinator: authCoordinator
+        ))
         _codexConversation = StateObject(wrappedValue: CodexConversationController(
             client: codex,
             contextProvider: store,
             suggestionRouter: CodexSuggestionInboxRouter(planner: store)
         ))
-        _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
-        _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
-        _executionSync = StateObject(wrappedValue: ExecutionSyncStore(planner: store))
+        _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore(
+            authCoordinator: authCoordinator
+        ))
+        _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(
+            planner: store,
+            authCoordinator: authCoordinator
+        ))
+        _executionSync = StateObject(wrappedValue: ExecutionSyncStore(
+            planner: store,
+            authCoordinator: authCoordinator
+        ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
     }
@@ -48,6 +61,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(suggestionSync)
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
+                .environmentObject(durableAuth)
                 .environmentObject(appLock)
                 .environmentObject(appearance)
                 .preferredColorScheme(appearance.preferredColorScheme)
@@ -136,6 +150,7 @@ struct DayWeaveMacApp: App {
                     MenuBarView()
                         .environmentObject(store)
                         .environmentObject(executionSync)
+                        .environmentObject(durableAuth)
                 } else {
                     AppLockMenuBarView()
                 }
@@ -156,6 +171,7 @@ struct DayWeaveMacApp: App {
                         .environmentObject(suggestionSync)
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
+                        .environmentObject(durableAuth)
                 } else {
                     AppLockedView()
                 }

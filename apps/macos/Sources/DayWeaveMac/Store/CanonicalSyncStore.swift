@@ -39,6 +39,7 @@ final class CanonicalSyncStore: ObservableObject {
     private let planner: PlannerStore
     private let configurationStore: any SuggestionAPIConfigurationStoring
     private let tokenStore: any BearerTokenStoring
+    private let authCoordinator: DurableAuthCoordinator?
     private let session: URLSession
     private let now: @Sendable () -> Date
     private let createPushLimit: Int
@@ -53,6 +54,7 @@ final class CanonicalSyncStore: ObservableObject {
         planner: PlannerStore,
         configurationStore: any SuggestionAPIConfigurationStoring = UserDefaultsSuggestionAPIConfigurationStore(),
         tokenStore: any BearerTokenStoring = KeychainBearerTokenStore(),
+        authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         createPushLimit: Int = CanonicalSyncStore.maximumCreatePushesPerSync,
         statusPushLimit: Int = CanonicalSyncStore.maximumStatusPushesPerSync,
@@ -63,6 +65,7 @@ final class CanonicalSyncStore: ObservableObject {
         self.planner = planner
         self.configurationStore = configurationStore
         self.tokenStore = tokenStore
+        self.authCoordinator = authCoordinator
         self.session = session
         self.createPushLimit = max(0, createPushLimit)
         self.statusPushLimit = max(0, statusPushLimit)
@@ -1232,6 +1235,19 @@ final class CanonicalSyncStore: ObservableObject {
                 return nil
             }
             let baseURL = try DayWeaveAPIBaseURL(configuredURL)
+            if let authCoordinator {
+                guard authCoordinator.hasUsableCredential(boundTo: baseURL) else {
+                    if reportFailure {
+                        status = .configurationRequired("Authenticate this Mac in Settings before syncing.")
+                    }
+                    return nil
+                }
+                return DayWeaveAPIClient(
+                    baseURL: baseURL,
+                    session: session,
+                    authCoordinator: authCoordinator
+                )
+            }
             guard let token = try tokenStore.loadToken(boundTo: baseURL),
                   !token.isEmpty else {
                 if reportFailure {

@@ -408,9 +408,45 @@ final class PlannerStore: ObservableObject {
     }
 
     private static func canonicalConfigurationIdentifier(_ value: String) -> String? {
-        guard let baseURL = try? DayWeaveAPIBaseURL(value) else { return nil }
+        let separator = "|auth="
+        let baseValue: String
+        let authBinding: String?
+        if let range = value.range(of: separator) {
+            baseValue = String(value[..<range.lowerBound])
+            let binding = String(value[range.upperBound...])
+            guard !binding.isEmpty,
+                  binding.utf8.count <= 2_048,
+                  binding.range(of: separator) == nil,
+                  isValidAuthBinding(binding) else { return nil }
+            authBinding = binding
+        } else {
+            baseValue = value
+            authBinding = nil
+        }
+        guard let baseURL = try? DayWeaveAPIBaseURL(baseValue) else { return nil }
         let identifier = baseURL.canonicalConfigurationIdentifier
-        return identifier.isEmpty ? nil : identifier
+        guard !identifier.isEmpty else { return nil }
+        return authBinding.map { "\(identifier)\(separator)\($0)" } ?? identifier
+    }
+
+    private static func isValidAuthBinding(_ value: String) -> Bool {
+        let components = value.split(separator: ":", omittingEmptySubsequences: false)
+        switch components.first {
+        case "static-v1", "legacy-v1":
+            guard components.count == 2 else { return false }
+            let digest = components[1]
+            return digest.utf8.count == 64 && digest.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+        case "device-v1":
+            guard components.count == 3,
+                  let clientID = UUID(uuidString: String(components[1])),
+                  let sessionID = UUID(uuidString: String(components[2])) else { return false }
+            return components[1] == Substring(clientID.uuidString.lowercased())
+                && components[2] == Substring(sessionID.uuidString.lowercased())
+        default:
+            return false
+        }
     }
 
     var selectedBlock: ScheduleBlock? {

@@ -96,6 +96,7 @@ final class ExecutionSyncStore: ObservableObject {
         configurationStore: any SuggestionAPIConfigurationStoring =
             UserDefaultsSuggestionAPIConfigurationStore(),
         tokenStore: any BearerTokenStoring = KeychainBearerTokenStore(),
+        authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         now: @escaping @Sendable () -> Date = Date.init,
         makeUUID: @escaping @Sendable () -> UUID = UUID.init
@@ -108,20 +109,34 @@ final class ExecutionSyncStore: ObservableObject {
                 throw ExecutionSyncControllerError.notConfigured
             }
             let baseURL = try DayWeaveAPIBaseURL(configuredURL)
+            if let authCoordinator {
+                let bindingIdentifier = try authCoordinator.bindingIdentifier(boundTo: baseURL)
+                let client = DayWeaveAPIClient(
+                    baseURL: baseURL,
+                    session: session,
+                    authCoordinator: authCoordinator
+                )
+                return DayWeaveExecutionConnection(
+                    canonicalConfigurationIdentifier: client.configurationIdentifier,
+                    bindingIdentifier: bindingIdentifier,
+                    transport: client
+                )
+            }
             guard let token = try tokenStore.loadToken(boundTo: baseURL), !token.isEmpty else {
                 throw DayWeaveAPIError.credentialUnavailable
             }
             let tokenDigest = SHA256.hash(data: Data(token.utf8))
                 .map { String(format: "%02x", $0) }
                 .joined()
+            let client = DayWeaveAPIClient(
+                baseURL: baseURL,
+                session: session,
+                bearerToken: token
+            )
             return DayWeaveExecutionConnection(
-                canonicalConfigurationIdentifier: baseURL.canonicalConfigurationIdentifier,
+                canonicalConfigurationIdentifier: client.configurationIdentifier,
                 bindingIdentifier: "execution-v1:\(baseURL.canonicalConfigurationIdentifier):\(tokenDigest)",
-                transport: DayWeaveAPIClient(
-                    baseURL: baseURL,
-                    session: session,
-                    bearerToken: token
-                )
+                transport: client
             )
         }
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
@@ -930,6 +945,40 @@ final class ExecutionSyncStore: ObservableObject {
                 ? "Enter the bearer token to reconcile execution."
                 : "Authentication failed; the exact pending command remains fenced."
             outcome = .authenticationRequired
+        case let DayWeaveAPIError.durableAuthentication(authError):
+            switch authError {
+            case .notConfigured, .originMismatch, .invalidBootstrapCredential,
+                 .invalidEnrollmentCode,
+                 .durableSessionRequiresExplicitReenrollment, .remoteRevocationUnavailable,
+                 .activeSessionMustBeRevoked,
+                 .enrollmentRequired,
+                 .reauthenticationRequired, .rejected:
+                phase = .authenticationRequired
+                message = planner.executionState.pendingCommand == nil
+                    ? authError.localizedDescription
+                    : "Authentication needs attention; the exact pending command remains fenced."
+                outcome = .authenticationRequired
+            case .transport:
+                phase = .offline
+                message = "Offline; the exact authentication and execution recovery state was retained."
+                outcome = .transientNetworkFailure
+            case .retryableServer:
+                phase = .offline
+                message = "Authentication is temporarily unavailable; exact recovery state was retained."
+                outcome = .retryableServerFailure
+            case .localStateUnavailable, .concurrentStateChange:
+                phase = .failed
+                message = "Atomic Keychain authentication state is unavailable; execution remains fenced."
+                outcome = .localStorageFailure
+            case .incompatibleState, .invalidResponse, .responseTooLarge:
+                phase = .failed
+                message = "The durable authentication contract is incompatible; execution remains fenced."
+                outcome = .protocolFailure
+            case .randomnessUnavailable, .requestEncodingFailed:
+                phase = .failed
+                message = "A safe authentication request could not be prepared; no network action was attempted."
+                outcome = .invalidLocalState
+            }
         case let DayWeaveAPIError.server(statusCode, _, _, _):
             if statusCode == 401 {
                 phase = .authenticationRequired

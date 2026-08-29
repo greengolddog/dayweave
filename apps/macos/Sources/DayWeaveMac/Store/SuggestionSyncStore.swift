@@ -2,11 +2,14 @@ import Foundation
 
 private enum SuggestionConfigurationError: LocalizedError {
     case tokenRequiredForOriginChange
+    case durableCredentialManagedSeparately
 
     var errorDescription: String? {
         switch self {
         case .tokenRequiredForOriginChange:
             "Enter the bearer token again when changing the API origin. A saved credential is never forwarded to a different origin."
+        case .durableCredentialManagedSeparately:
+            "Use the rotating-session controls to replace this credential."
         }
     }
 }
@@ -78,19 +81,23 @@ final class SuggestionSyncStore: ObservableObject {
 
     private let configurationStore: any SuggestionAPIConfigurationStoring
     private let tokenStore: any BearerTokenStoring
+    private let authCoordinator: DurableAuthCoordinator?
     private let session: URLSession
     private let now: @Sendable () -> Date
     private var refreshID: UUID?
     private var configurationGeneration: UInt64 = 0
+    private var proposalsConfigurationIdentifier: String?
 
     init(
         configurationStore: any SuggestionAPIConfigurationStoring = UserDefaultsSuggestionAPIConfigurationStore(),
         tokenStore: any BearerTokenStoring = KeychainBearerTokenStore(),
+        authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.configurationStore = configurationStore
         self.tokenStore = tokenStore
+        self.authCoordinator = authCoordinator
         self.session = session
         self.now = now
 
@@ -98,7 +105,12 @@ final class SuggestionSyncStore: ObservableObject {
         self.baseURLString = baseURLString
         if let baseURL = try? DayWeaveAPIBaseURL(baseURLString) {
             do {
-                let hasToken = try tokenStore.loadToken(boundTo: baseURL) != nil
+                let hasToken: Bool
+                if let authCoordinator {
+                    hasToken = authCoordinator.hasUsableCredential(boundTo: baseURL)
+                } else {
+                    hasToken = try tokenStore.loadToken(boundTo: baseURL) != nil
+                }
                 tokenConfigured = hasToken
                 status = Self.initialStatus(baseURLString: baseURLString, tokenConfigured: hasToken)
             } catch {
@@ -129,12 +141,21 @@ final class SuggestionSyncStore: ObservableObject {
             let validatedURL = try DayWeaveAPIBaseURL(baseURL)
             let trimmedToken = newToken.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedToken.isEmpty {
+                guard authCoordinator == nil else {
+                    throw SuggestionConfigurationError.durableCredentialManagedSeparately
+                }
                 try tokenStore.saveCredential(.init(
                     token: trimmedToken,
                     origin: validatedURL.credentialOriginIdentifier
                 ))
             } else {
-                guard try tokenStore.loadToken(boundTo: validatedURL) != nil else {
+                let hasCredential: Bool
+                if let authCoordinator {
+                    hasCredential = authCoordinator.hasUsableCredential(boundTo: validatedURL)
+                } else {
+                    hasCredential = try tokenStore.loadToken(boundTo: validatedURL) != nil
+                }
+                guard hasCredential else {
                     throw SuggestionConfigurationError.tokenRequiredForOriginChange
                 }
             }
@@ -145,6 +166,7 @@ final class SuggestionSyncStore: ObservableObject {
             configurationGeneration &+= 1
             refreshID = nil
             proposals = []
+            proposalsConfigurationIdentifier = nil
             status = .ready
             return true
         } catch {
@@ -159,15 +181,39 @@ final class SuggestionSyncStore: ObservableObject {
             return
         }
         do {
+            guard authCoordinator == nil else {
+                throw SuggestionConfigurationError.durableCredentialManagedSeparately
+            }
             try tokenStore.deleteCredential()
             tokenConfigured = false
             configurationGeneration &+= 1
             refreshID = nil
             proposals = []
+            proposalsConfigurationIdentifier = nil
             status = .configurationRequired("Add a bearer token in Settings to load external proposals.")
         } catch {
             status = .failed(error.localizedDescription)
         }
+    }
+
+    func durableAuthenticationDidChange() {
+        guard refreshID == nil, activeProposalIDs.isEmpty else {
+            status = .failed("Wait for the current proposal operation before refreshing authentication state.")
+            return
+        }
+        configurationGeneration &+= 1
+        proposals = []
+        proposalsConfigurationIdentifier = nil
+        if let baseURL = try? DayWeaveAPIBaseURL(baseURLString) {
+            tokenConfigured = authCoordinator?.hasUsableCredential(boundTo: baseURL)
+                ?? ((try? tokenStore.loadToken(boundTo: baseURL))??.isEmpty == false)
+        } else {
+            tokenConfigured = false
+        }
+        status = Self.initialStatus(
+            baseURLString: baseURLString,
+            tokenConfigured: tokenConfigured
+        )
     }
 
     func refresh() async {
@@ -194,6 +240,7 @@ final class SuggestionSyncStore: ObservableObject {
             proposals = fetched
                 .filter { $0.status == .pending }
                 .sorted { $0.createdAt > $1.createdAt }
+            proposalsConfigurationIdentifier = client.configurationIdentifier
             status = .online(
                 updatedAt: now(),
                 message: "Loaded \(proposals.count) pending external proposal\(proposals.count == 1 ? "" : "s")"
@@ -205,9 +252,12 @@ final class SuggestionSyncStore: ObservableObject {
     }
 
     func accept(_ proposal: DayWeaveProposal) async {
-        guard let proposal = beginOperation(proposal) else { return }
-        defer { activeProposalIDs.remove(proposal.id) }
         guard let client = makeClient() else { return }
+        guard let proposal = beginOperation(
+            proposal,
+            configurationIdentifier: client.configurationIdentifier
+        ) else { return }
+        defer { activeProposalIDs.remove(proposal.id) }
         let generation = configurationGeneration
 
         do {
@@ -216,7 +266,8 @@ final class SuggestionSyncStore: ObservableObject {
                 expectedRevision: proposal.revision,
                 note: "Approved in the macOS Suggestions Inbox; schedule unchanged"
             )
-            guard configurationGeneration == generation else { return }
+            guard configurationGeneration == generation,
+                  proposalsConfigurationIdentifier == client.configurationIdentifier else { return }
             guard updated.id == proposal.id,
                   updated.revision > proposal.revision,
                   updated.status == .accepted else {
@@ -234,9 +285,12 @@ final class SuggestionSyncStore: ObservableObject {
     }
 
     func reject(_ proposal: DayWeaveProposal) async {
-        guard let proposal = beginOperation(proposal) else { return }
-        defer { activeProposalIDs.remove(proposal.id) }
         guard let client = makeClient() else { return }
+        guard let proposal = beginOperation(
+            proposal,
+            configurationIdentifier: client.configurationIdentifier
+        ) else { return }
+        defer { activeProposalIDs.remove(proposal.id) }
         let generation = configurationGeneration
 
         do {
@@ -245,7 +299,8 @@ final class SuggestionSyncStore: ObservableObject {
                 expectedRevision: proposal.revision,
                 note: "Rejected in the macOS Suggestions Inbox"
             )
-            guard configurationGeneration == generation else { return }
+            guard configurationGeneration == generation,
+                  proposalsConfigurationIdentifier == client.configurationIdentifier else { return }
             guard updated.id == proposal.id,
                   updated.revision > proposal.revision,
                   updated.status == .rejected else {
@@ -260,7 +315,11 @@ final class SuggestionSyncStore: ObservableObject {
     }
 
     func edit(_ proposal: DayWeaveProposal, title: String, explanation: String) async -> Bool {
-        guard let proposal = beginOperation(proposal) else { return false }
+        guard let client = makeClient() else { return false }
+        guard let proposal = beginOperation(
+            proposal,
+            configurationIdentifier: client.configurationIdentifier
+        ) else { return false }
         defer { activeProposalIDs.remove(proposal.id) }
 
         let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -280,7 +339,6 @@ final class SuggestionSyncStore: ObservableObject {
             status = .failed("Edit the title or explanation before saving.")
             return false
         }
-        guard let client = makeClient() else { return false }
         let generation = configurationGeneration
 
         do {
@@ -292,7 +350,10 @@ final class SuggestionSyncStore: ObservableObject {
                     explanation: changedExplanation
                 )
             )
-            guard configurationGeneration == generation else { return false }
+            guard configurationGeneration == generation,
+                  proposalsConfigurationIdentifier == client.configurationIdentifier else {
+                return false
+            }
             guard updated.id == proposal.id,
                   updated.revision > proposal.revision,
                   updated.status == .pending,
@@ -312,16 +373,20 @@ final class SuggestionSyncStore: ObservableObject {
         }
     }
 
-    private func beginOperation(_ proposal: DayWeaveProposal) -> DayWeaveProposal? {
+    private func beginOperation(
+        _ proposal: DayWeaveProposal,
+        configurationIdentifier: String
+    ) -> DayWeaveProposal? {
         guard refreshID == nil else {
             status = .failed("Wait for the proposal refresh to finish before taking action.")
             return nil
         }
         guard let current = proposals.first(where: { $0.id == proposal.id }),
               current == proposal,
-              current.status == .pending else {
+              current.status == .pending,
+              proposalsConfigurationIdentifier == configurationIdentifier else {
             status = .failed(
-                "This proposal is no longer the current pending revision. Refresh the inbox before taking action."
+                "This proposal is no longer bound to the current authenticated session. Refresh the inbox before taking action."
             )
             return nil
         }
@@ -337,6 +402,17 @@ final class SuggestionSyncStore: ObservableObject {
         }
         do {
             let baseURL = try DayWeaveAPIBaseURL(baseURLString)
+            if let authCoordinator {
+                guard authCoordinator.hasUsableCredential(boundTo: baseURL) else {
+                    status = .configurationRequired("Authenticate this Mac in Settings to load external proposals.")
+                    return nil
+                }
+                return DayWeaveAPIClient(
+                    baseURL: baseURL,
+                    session: session,
+                    authCoordinator: authCoordinator
+                )
+            }
             guard let token = try tokenStore.loadToken(boundTo: baseURL), !token.isEmpty else {
                 status = .configurationRequired("Add a bearer token in Settings to load external proposals.")
                 return nil

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct JSONNumber: Codable, Equatable, Sendable, ExpressibleByIntegerLiteral, ExpressibleByFloatLiteral {
@@ -493,6 +494,7 @@ struct DayWeaveAPIBaseURL: Equatable, Sendable {
 
 enum DayWeaveAPIError: Error, Equatable, Sendable {
     case credentialUnavailable
+    case durableAuthentication(DurableAuthError)
     case requestEncodingFailed
     case invalidEndpoint
     case transport(URLError.Code)
@@ -507,6 +509,8 @@ extension DayWeaveAPIError: LocalizedError {
         switch self {
         case .credentialUnavailable:
             return "The API bearer token is unavailable. Save it again in Settings."
+        case let .durableAuthentication(error):
+            return error.localizedDescription
         case .requestEncodingFailed:
             return "DayWeave could not encode the API request."
         case .invalidEndpoint:
@@ -526,25 +530,103 @@ extension DayWeaveAPIError: LocalizedError {
         case let .responseTooLarge(limitBytes):
             return "The DayWeave API response exceeded the safe \(limitBytes / 1_048_576) MiB limit."
         case let .server(statusCode, code, message, requestID):
+            let safeCode = DayWeaveDiagnosticSanitizer.code(code, secrets: [])
+            let safeMessage = DayWeaveDiagnosticSanitizer.text(
+                message,
+                secrets: [],
+                maximumCharacters: 500
+            )
+            let safeRequestID = DayWeaveDiagnosticSanitizer.requestID(
+                requestID,
+                secrets: []
+            )
             var result: String
             if statusCode == 401 {
                 result = "The DayWeave API rejected the bearer token. Replace it in Settings."
             } else if statusCode == 409 {
                 result = "This data changed on the server. Refresh before trying again."
-            } else if let message, !message.isEmpty {
-                result = "DayWeave API error \(statusCode): \(message)"
-            } else if let code, !code.isEmpty {
-                result = "DayWeave API error \(statusCode) (\(code))."
+            } else if let safeMessage {
+                result = "DayWeave API error \(statusCode): \(safeMessage)"
+            } else if let safeCode {
+                result = "DayWeave API error \(statusCode) (\(safeCode))."
             } else {
                 result = "The DayWeave API returned HTTP \(statusCode)."
             }
-            if let requestID, !requestID.isEmpty {
-                result += " Request ID: \(requestID)."
+            if let safeRequestID {
+                result += " Request ID: \(safeRequestID)."
             }
             return result
         case .responseDecodingFailed:
             return "The DayWeave API response did not match this app’s supported contract."
         }
+    }
+}
+
+extension DayWeaveAPIError: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    var description: String { errorDescription ?? "DayWeave API error" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["summary": description], displayStyle: .enum)
+    }
+}
+
+enum DayWeaveDiagnosticSanitizer {
+    static func text(
+        _ value: String?,
+        secrets: [String],
+        maximumCharacters: Int
+    ) -> String? {
+        guard var value else { return nil }
+        for secret in secrets.filter({ !$0.isEmpty }).sorted(by: { $0.count > $1.count }) {
+            value = value.replacingOccurrences(of: secret, with: "[redacted]")
+        }
+        value = replacingPattern(
+            #"(?i)\bBearer\s+[^\s,;]+"#,
+            in: value,
+            with: "Bearer [redacted]"
+        )
+        value = replacingPattern(
+            #"\bdw_(?:en1|da1|dr1|mc1)_[A-Za-z0-9_-]{20,}\b"#,
+            in: value,
+            with: "[redacted]"
+        )
+        guard !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        return String(value.prefix(maximumCharacters))
+    }
+
+    static func code(_ value: String?, secrets: [String]) -> String? {
+        guard let value = text(value, secrets: secrets, maximumCharacters: 100) else { return nil }
+        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyz0123456789_")
+        guard value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return value
+    }
+
+    static func requestID(_ value: String?, secrets: [String]) -> String? {
+        guard let value = text(value, secrets: secrets, maximumCharacters: 200) else { return nil }
+        let allowed = CharacterSet(
+            charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:-"
+        )
+        guard value.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return value
+    }
+
+    private static func replacingPattern(
+        _ pattern: String,
+        in value: String,
+        with replacement: String
+    ) -> String {
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return value }
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return expression.stringByReplacingMatches(
+            in: value,
+            range: range,
+            withTemplate: replacement
+        )
     }
 }
 
@@ -609,8 +691,10 @@ struct DayWeaveAPIClient: Sendable {
     private let baseURL: DayWeaveAPIBaseURL
     private let session: URLSession
     private let bearerToken: String?
+    private let authCoordinator: DurableAuthCoordinator?
+    private let expectedBindingIdentifier: String
 
-    var configurationIdentifier: String { baseURL.canonicalConfigurationIdentifier }
+    let configurationIdentifier: String
 
     init(
         baseURL: DayWeaveAPIBaseURL,
@@ -620,6 +704,25 @@ struct DayWeaveAPIClient: Sendable {
         self.baseURL = baseURL
         self.session = session
         self.bearerToken = bearerToken
+        authCoordinator = nil
+        let binding = Self.staticBindingIdentifier(token: bearerToken)
+        expectedBindingIdentifier = binding
+        configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
+    }
+
+    init(
+        baseURL: DayWeaveAPIBaseURL,
+        session: URLSession = makeDayWeaveEphemeralSession(),
+        authCoordinator: DurableAuthCoordinator
+    ) {
+        self.baseURL = baseURL
+        self.session = session
+        bearerToken = nil
+        self.authCoordinator = authCoordinator
+        let binding = (try? authCoordinator.bindingIdentifier(boundTo: baseURL))
+            ?? "device-v1-unavailable:\(baseURL.canonicalConfigurationIdentifier)"
+        expectedBindingIdentifier = binding
+        configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
     }
 
     func listSuggestions(
@@ -868,9 +971,6 @@ struct DayWeaveAPIClient: Sendable {
         headers: [String: String] = [:],
         body: Data? = nil
     ) async throws -> Response {
-        guard let token = bearerToken, !token.isEmpty else {
-            throw DayWeaveAPIError.credentialUnavailable
-        }
         if let body, body.count > Self.maximumRequestBytes {
             throw DayWeaveAPIError.requestEncodingFailed
         }
@@ -882,30 +982,160 @@ struct DayWeaveAPIClient: Sendable {
             throw DayWeaveAPIError.invalidEndpoint
         }
 
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = method
-        request.httpBody = body
-        request.timeoutInterval = 20
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
-        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        var pristineRequest = URLRequest(url: endpoint)
+        pristineRequest.httpMethod = method
+        pristineRequest.httpBody = body
+        pristineRequest.timeoutInterval = 20
+        pristineRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        pristineRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        pristineRequest.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        pristineRequest.setValue("no-cache", forHTTPHeaderField: "Pragma")
         for (name, value) in headers {
-            request.setValue(value, forHTTPHeaderField: name)
+            pristineRequest.setValue(value, forHTTPHeaderField: name)
         }
         if body != nil {
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            pristineRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
-        let data: Data
-        let response: URLResponse
+        let initialAuthorization: DurableAuthorization
+        if let authCoordinator {
+            do {
+                initialAuthorization = try await authCoordinator.authorization(boundTo: baseURL)
+            } catch let error as DurableAuthError {
+                throw DayWeaveAPIError.durableAuthentication(error)
+            } catch {
+                throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+            }
+        } else {
+            guard let token = bearerToken, !token.isEmpty else {
+                throw DayWeaveAPIError.credentialUnavailable
+            }
+            initialAuthorization = .init(
+                bearerToken: token,
+                bindingIdentifier: expectedBindingIdentifier,
+                isDurable: false
+            )
+        }
+        guard initialAuthorization.bindingIdentifier == expectedBindingIdentifier else {
+            throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+        }
+
+        var tokensToRedact = [initialAuthorization.bearerToken]
+        var replayedAuthorization: DurableAuthorization?
+        var result = try await perform(
+            pristineRequest,
+            bearer: initialAuthorization.bearerToken
+        )
+        if result.response.statusCode == 401, let authCoordinator,
+           DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+               statusCode: result.response.statusCode,
+               headers: Self.normalizedHeaders(result.response),
+               body: result.data
+           ) {
+            let recovered: DurableAuthorization
+            do {
+                recovered = try await authCoordinator.recoverFromUnauthorized(
+                    rejectedBearer: initialAuthorization.bearerToken,
+                    boundTo: baseURL
+                )
+            } catch let error as DurableAuthError {
+                throw DayWeaveAPIError.durableAuthentication(error)
+            } catch {
+                throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+            }
+            guard recovered.bindingIdentifier == initialAuthorization.bindingIdentifier,
+                  recovered.bindingIdentifier == expectedBindingIdentifier else {
+                throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+            }
+            tokensToRedact.append(recovered.bearerToken)
+            replayedAuthorization = recovered
+            // `pristineRequest` is retained untouched. The replay changes only
+            // Authorization; method, URL, headers, and body bytes are identical.
+            result = try await perform(pristineRequest, bearer: recovered.bearerToken)
+        }
+        if result.response.statusCode == 401,
+           let replayedAuthorization,
+           let authCoordinator,
+           DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+               statusCode: result.response.statusCode,
+               headers: Self.normalizedHeaders(result.response),
+               body: result.data
+           ) {
+            do {
+                try await authCoordinator.retireDefinitivelyRejectedAuthorization(
+                    replayedAuthorization,
+                    boundTo: baseURL
+                )
+                throw DayWeaveAPIError.durableAuthentication(.reauthenticationRequired)
+            } catch let error as DayWeaveAPIError {
+                throw error
+            } catch let error as DurableAuthError {
+                throw DayWeaveAPIError.durableAuthentication(error)
+            } catch {
+                throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+            }
+        }
+        try validatePostResponseBinding(initialAuthorization.bindingIdentifier)
+
+        let data = result.data
+        let httpResponse = result.response
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
+            throw DayWeaveAPIError.server(
+                statusCode: httpResponse.statusCode,
+                code: DayWeaveDiagnosticSanitizer.code(
+                    envelope?.error.code,
+                    secrets: tokensToRedact
+                ),
+                message: DayWeaveDiagnosticSanitizer.text(
+                    envelope?.error.message,
+                    secrets: tokensToRedact,
+                    maximumCharacters: 500
+                ),
+                requestID: DayWeaveDiagnosticSanitizer.requestID(
+                    httpResponse.value(forHTTPHeaderField: "x-request-id"),
+                    secrets: tokensToRedact
+                )
+            )
+        }
+
+        do {
+            return try makeDecoder().decode(Response.self, from: data)
+        } catch {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+    }
+
+    private func validatePostResponseBinding(_ initialBinding: String) throws {
+        guard let authCoordinator else { return }
+        do {
+            let current = try authCoordinator.bindingIdentifier(boundTo: baseURL)
+            guard current == initialBinding, current == expectedBindingIdentifier else {
+                throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+            }
+        } catch let error as DayWeaveAPIError {
+            throw error
+        } catch let error as DurableAuthError {
+            throw DayWeaveAPIError.durableAuthentication(error)
+        } catch {
+            throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+        }
+    }
+
+    private func perform(
+        _ pristineRequest: URLRequest,
+        bearer: String
+    ) async throws -> (data: Data, response: HTTPURLResponse) {
+        var request = pristineRequest
+        request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         do {
             let (bytes, receivedResponse) = try await session.bytes(
                 for: request,
                 delegate: RejectRedirectDelegate.shared
             )
-            response = receivedResponse
+            guard let httpResponse = receivedResponse as? HTTPURLResponse else {
+                throw DayWeaveAPIError.nonHTTPResponse
+            }
             if receivedResponse.expectedContentLength > Int64(Self.maximumResponseBytes) {
                 bytes.task.cancel()
                 throw DayWeaveAPIError.responseTooLarge(limitBytes: Self.maximumResponseBytes)
@@ -921,36 +1151,13 @@ struct DayWeaveAPIClient: Sendable {
                 }
                 boundedData.append(byte)
             }
-            data = boundedData
+            return (boundedData, httpResponse)
         } catch let error as DayWeaveAPIError {
             throw error
         } catch let error as URLError {
             throw DayWeaveAPIError.transport(error.code)
         } catch {
             throw DayWeaveAPIError.transport(.unknown)
-        }
-
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw DayWeaveAPIError.nonHTTPResponse
-        }
-        guard (200..<300).contains(httpResponse.statusCode) else {
-            let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
-            let safeMessage = envelope?.error.message
-                .prefix(500)
-                .description
-                .replacingOccurrences(of: token, with: "[redacted]")
-            throw DayWeaveAPIError.server(
-                statusCode: httpResponse.statusCode,
-                code: envelope?.error.code,
-                message: safeMessage,
-                requestID: httpResponse.value(forHTTPHeaderField: "x-request-id")
-            )
-        }
-
-        do {
-            return try makeDecoder().decode(Response.self, from: data)
-        } catch {
-            throw DayWeaveAPIError.responseDecodingFailed
         }
     }
 
@@ -985,6 +1192,29 @@ struct DayWeaveAPIClient: Sendable {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
+    }
+
+    private static func normalizedHeaders(_ response: HTTPURLResponse) -> [String: String] {
+        var result: [String: String] = [:]
+        for (key, value) in response.allHeaderFields {
+            guard let key = key as? String else { continue }
+            result[key.lowercased()] = String(describing: value)
+        }
+        return result
+    }
+
+    private static func staticBindingIdentifier(token: String?) -> String {
+        let digest = SHA256.hash(data: Data((token ?? "").utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "static-v1:\(digest)"
+    }
+
+    private static func configurationIdentifier(
+        baseURL: DayWeaveAPIBaseURL,
+        binding: String
+    ) -> String {
+        "\(baseURL.canonicalConfigurationIdentifier)|auth=\(binding)"
     }
 }
 
