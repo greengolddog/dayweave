@@ -141,6 +141,13 @@ impl Default for SchedulerConfigInput {
 pub struct ComposeScheduleResult {
     pub input_digest: String,
     pub source_item_count: usize,
+    /// Exact active repository snapshot used to compose this response.
+    ///
+    /// Clients that pulled deltas immediately before previewing must compare this map with their
+    /// cache. Item reads and preview composition are separate HTTP operations, so counts alone
+    /// cannot detect a same-cardinality concurrent replacement.
+    #[schema(value_type = Object)]
+    pub source_item_revisions: BTreeMap<Uuid, u64>,
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
@@ -386,6 +393,10 @@ fn compose_items(
     request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     let source_item_count = source_items.len();
+    let source_item_revisions = source_items
+        .iter()
+        .map(|item| (item.id, item.revision))
+        .collect();
     let mut rejected_items = Vec::new();
     let mut accepted = Vec::with_capacity(source_items.len());
     for item in source_items {
@@ -451,6 +462,7 @@ fn compose_items(
     Ok(ComposeScheduleResult {
         input_digest,
         source_item_count,
+        source_item_revisions,
         accepted_item_count: plan_request.items.len(),
         rejected_items,
         ignored_previous_assignments,
@@ -1152,6 +1164,10 @@ mod tests {
         let second = compose_items(vec![item], preview_request()).unwrap();
         assert_eq!(first.input_digest, second.input_digest);
         assert_eq!(first.accepted_item_count, 1);
+        assert_eq!(
+            first.source_item_revisions.get(&Uuid::from_u128(1)),
+            Some(&3)
+        );
         assert_eq!(first.plan.blocks.len(), 1);
         assert!(first.input_digest.starts_with("sha256:"));
     }

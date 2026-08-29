@@ -157,6 +157,8 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
     assert_eq!(first.status(), StatusCode::OK);
     let first = body_json(first).await;
     assert_eq!(first["source_item_count"], 2);
+    assert_eq!(first["source_item_revisions"][valid_id.to_string()], 1);
+    assert_eq!(first["source_item_revisions"][invalid_id.to_string()], 1);
     assert_eq!(first["accepted_item_count"], 1);
     assert_eq!(
         first["rejected_items"][0]["item_id"],

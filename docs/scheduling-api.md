@@ -5,6 +5,13 @@ writing items, schedule blocks, or provider state. It requires the ordinary
 DayWeave bearer token. The same canonical revisions and request produce the
 same `input_digest` and plan.
 
+Every response includes `source_item_revisions`, an object mapping every active
+canonical item UUID to the exact revision used for composition (including items
+reported as rejected). A client must compare the complete map with its delta
+cache before persisting a preview. If it differs, the item delta and preview
+were taken from different repository snapshots; discard the preview and retry
+the pull/compose cycle.
+
 All timestamps at the HTTP boundary are RFC 3339. The API resolves local day
 boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
