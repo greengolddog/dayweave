@@ -23,12 +23,12 @@ async fn main() -> ExitCode {
         None => {}
     }
 
-    let config = match Config::from_env() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("configuration error: {error}");
-            return ExitCode::FAILURE;
-        }
+    let Ok(config) = Config::from_env() else {
+        // Environment-derived values may include credentials. Keep the
+        // pre-tracing startup diagnostic content-free; detailed validation
+        // belongs in local configuration tooling, not process logs.
+        eprintln!("configuration error; validate the DayWeave environment settings");
+        return ExitCode::FAILURE;
     };
     initialize_tracing(&config);
 
