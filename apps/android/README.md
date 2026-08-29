@@ -32,6 +32,59 @@ The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signe
 
 The supported floor is Android 9 / API 28, so the direct-download release APK intentionally uses APK Signature Scheme v3 only. Gradle disables v1, v2, and the uncopied v4 sidecar; the release script runs verbose `apksigner` verification before copying `dist/android/DayWeave-release.apk`. Release acceptance requires v3 `true`, v1/v2 `false`, and exactly one signer in that output.
 
+## App lock
+
+**More → Appearance & privacy → App lock** enables an opt-in presentation lock.
+Both enabling and disabling it require a fresh, successful system-owned
+AndroidX BiometricPrompt; reaching an already-unlocked settings screen is not
+enough to remove protection. The prompt accepts a compatible biometric or the
+enrolled device PIN, pattern, or password. The implementation follows the
+[official BiometricPrompt guide](https://developer.android.com/identity/sign-in/biometric-auth)
+and uses the [current stable AndroidX Biometric 1.1.0 release](https://developer.android.com/jetpack/androidx/releases/biometric)
+with its API-28-compatible `BIOMETRIC_WEAK | DEVICE_CREDENTIAL` combination.
+DayWeave never receives or stores biometric or device-credential material.
+
+When enabled, every cold start is locked. Leaving the app locks immediately or
+after the selected 1, 5, 15, or 30 minute timeout measured by the monotonic
+clock. Generation-bound state rejects late callbacks and timer/foreground-return
+races. A process-wide single-flight fence
+keeps a cancelled platform attempt occupied until its terminal callback drains;
+every platform callback retains its immutable attempt identity, so it cannot
+complete a replacement request. Configuration changes recreate BiometricPrompt
+early and transfer ownership of the same attempt without marking a background
+transition or starting a second prompt. The launcher Activity is `singleTask`,
+so one owner accounts for real foreground/background transitions; a stale
+recreated Activity cannot cancel the transferred prompt.
+
+A real Activity stop during device-credential fallback immediately replaces an
+unlocked protected composition with the lock screen while retaining the exact
+prompt. A terminal success is never applied while stopped and expires unless
+the prompt returns to the foreground within a short one-shot handoff; a delayed
+or missing terminal result cannot restore content, and cancellation keeps or
+restores the lock. The locked composition is created before the planner
+ViewModel and contains no task, calendar, assistant, title, dialog, or account
+content. `FLAG_SECURE` protects the activity from screenshots, screen sharing,
+non-secure displays, and recent-app thumbnails throughout protection and every
+authentication transition.
+
+Only the non-secret enabled flag and timeout live in a strict, versioned
+`AtomicFile` under `noBackupFilesDir`; planner data remains in the existing
+device-bound SQLCipher store. A genuinely absent atomic and legacy record means
+the first-install opt-in feature is off. Zero-length, truncated, malformed,
+unknown-schema, trailing-data, and partial legacy records fail closed. A
+complete legacy preferences record is copied durably before its source is
+cleared. Any corrupt record can be repaired only after successful device
+authentication and a durable atomic rewrite; recovery never clears or replaces
+the encrypted planner database.
+
+The JVM tests use only a fake authenticator, fake monotonic clock, and synthetic
+settings. Final acceptance on the target Pixel must enable the lock, exercise a
+biometric and device-credential fallback, cancel and retry the prompt, rotate
+or recreate the activity during a prompt, verify every timeout/background path,
+remove and re-enroll device authentication, and inspect the recent-apps surface.
+Do not record, screenshot, or commit real biometric, device, account, or planner
+data during that pass.
+
 ## Health Connect energy context
 
 **More → Health & context** provides an opt-in Health Connect connection using

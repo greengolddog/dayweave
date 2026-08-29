@@ -33,6 +33,12 @@ effects must flow through an auditable proposal or outbox boundary.
 
 - macOS planner snapshots use AES-GCM. The encryption key is stored in the
   login Keychain, and snapshot replacement is atomic.
+- macOS has an opt-in app-wide presentation lock backed by device-owner
+  authentication (Touch ID or the Mac login password). It fails closed on cold
+  start, supports immediate or configured inactivity timeouts, gates the main,
+  Settings, and menu-bar scenes plus keyboard commands, and pauses Codex and
+  sync presentation while locked. Its versioned preferences contain no user
+  content and malformed settings fail closed.
 - Android planner state is held in a SQLCipher Room database. A random database
   passphrase is wrapped by a non-exportable Android Keystore AES-GCM key.
 - First-party API bearer credentials use Keychain on macOS and a
@@ -41,8 +47,21 @@ effects must flow through an auditable proposal or outbox boundary.
 - Both clients fail closed when encrypted storage cannot be restored; they do
   not silently replace an unreadable real data store with sample data.
 - Android backup rules exclude the encrypted database, authentication material,
-  and recovery preference files that are bound to the source device's
-  Keystore.
+  and legacy app-lock preferences during migration. The authoritative app-lock
+  record is a strict versioned `AtomicFile` in `noBackupFilesDir`, which is
+  outside backup and device-transfer domains.
+- Android has an opt-in app-wide presentation lock backed by the system
+  BiometricPrompt. It accepts an enrolled biometric or device credential,
+  locks on cold start and after a configurable background timeout, replaces the
+  whole planner composition while locked, and keeps `FLAG_SECURE` set whenever
+  protection is enabled or changing. Enabling and disabling both require a
+  fresh generation-bound device authentication. Platform authentication is
+  process-wide single-flight across Activity recreation; cancellation retains
+  the slot until the exact terminal callback drains, and leaving during an
+  authenticated settings transition immediately restores the locked
+  presentation. App-lock settings contain no user content; malformed existing
+  settings fail closed and require device authentication before a durable
+  repair, without deleting the encrypted planner database.
 
 ### Service and protocol
 
@@ -164,8 +183,9 @@ ready:
 
 - replace bootstrap static API credentials with revocable, expiring device
   sessions and scoped MCP client credentials;
-- add biometric app lock and sensitive notification/widget behavior on both
-  clients;
+- complete SEC-007 sensitive-item enforcement for lock-screen notifications,
+  widgets while locked, external MCP access, proactive assistant context, and
+  attachment analysis on both clients;
 - add server-side envelope encryption for provider tokens and especially
   sensitive fields with a key held separately from PostgreSQL and backups;
 - enforce ingress and per-principal rate limits and suspicious-authentication

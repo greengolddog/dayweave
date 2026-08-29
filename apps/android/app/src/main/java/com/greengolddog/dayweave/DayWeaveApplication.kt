@@ -1,26 +1,31 @@
 package com.greengolddog.dayweave
 
 import android.app.Application
+import android.os.SystemClock
 import android.util.Log
-import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
-import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
-import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
-import com.greengolddog.dayweave.network.OkHttpExecutionTransport
-import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.health.EnergySignalManager
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
+import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
+import com.greengolddog.dayweave.network.OkHttpExecutionTransport
+import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
+import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
+import com.greengolddog.dayweave.security.AppAuthenticationProcessFence
+import com.greengolddog.dayweave.security.AppLockController
+import com.greengolddog.dayweave.security.AtomicFileAppLockSettingsStore
+import com.greengolddog.dayweave.security.MonotonicClock
 import com.greengolddog.dayweave.state.PlannerStore
-import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
-import com.greengolddog.dayweave.sync.SuggestionConnectionController
-import com.greengolddog.dayweave.sync.SuggestionSyncManager
-import com.greengolddog.dayweave.sync.CanonicalSyncManager
-import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalActionGate
+import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
+import com.greengolddog.dayweave.sync.CanonicalSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.GoogleAccountManager
+import com.greengolddog.dayweave.sync.SuggestionConnectionController
+import com.greengolddog.dayweave.sync.SuggestionSyncManager
+import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +35,15 @@ import kotlinx.coroutines.launch
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val canonicalActionGate = CanonicalActionGate()
+
+    val appAuthenticationProcessFence = AppAuthenticationProcessFence()
+
+    val appLockController: AppLockController by lazy {
+        AppLockController(
+            settingsStore = AtomicFileAppLockSettingsStore(this),
+            clock = MonotonicClock(SystemClock::elapsedRealtime),
+        )
+    }
 
     val plannerStore: PlannerStore by lazy {
         PlannerStore(

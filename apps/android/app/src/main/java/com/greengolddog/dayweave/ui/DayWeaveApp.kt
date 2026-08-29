@@ -49,10 +49,14 @@ import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.health.EnergyProviderAvailability
 import com.greengolddog.dayweave.health.HealthConnectIntents
+import com.greengolddog.dayweave.security.AppLockController
+import com.greengolddog.dayweave.security.AppLockState
+import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.state.DayWeaveViewModel
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
 import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
+import com.greengolddog.dayweave.ui.components.AppLockedScreen
 import com.greengolddog.dayweave.ui.components.BreakEndedDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
@@ -71,13 +75,70 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
 @Composable
-fun DayWeaveApp(viewModel: DayWeaveViewModel = viewModel()) {
+fun DayWeaveApp(
+    appLockController: AppLockController,
+    onRequestUnlock: () -> Unit,
+    onSetAppLockEnabled: (Boolean) -> Unit,
+    onSetAppLockTimeout: (AppLockTimeout) -> Unit,
+    onLockNow: () -> Unit,
+    onOpenDeviceSecuritySettings: () -> Unit,
+) {
+    val appLockState by appLockController.state.collectAsStateWithLifecycle()
+    AppLockPresentationGate(
+        appLockState = appLockState,
+        lockedContent = {
+            DayWeaveTheme(useDynamicColor = false) {
+                AppLockedScreen(
+                    state = appLockState,
+                    onUnlock = onRequestUnlock,
+                    onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+                )
+            }
+        },
+        unlockedContent = {
+            UnlockedDayWeaveApp(
+                appLockState = appLockState,
+                onSetAppLockEnabled = onSetAppLockEnabled,
+                onSetAppLockTimeout = onSetAppLockTimeout,
+                onLockNow = onLockNow,
+                onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+            )
+        },
+    )
+}
+
+/** Keeps every unlocked subtree, including any open Dialog window, below one lock boundary. */
+@Composable
+internal fun AppLockPresentationGate(
+    appLockState: AppLockState,
+    lockedContent: @Composable () -> Unit,
+    unlockedContent: @Composable () -> Unit,
+) {
+    if (appLockState.isLocked) lockedContent() else unlockedContent()
+}
+
+@Composable
+private fun UnlockedDayWeaveApp(
+    appLockState: AppLockState,
+    onSetAppLockEnabled: (Boolean) -> Unit,
+    onSetAppLockTimeout: (AppLockTimeout) -> Unit,
+    onLockNow: () -> Unit,
+    onOpenDeviceSecuritySettings: () -> Unit,
+    viewModel: DayWeaveViewModel = viewModel(),
+) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val loadState by viewModel.loadState.collectAsStateWithLifecycle()
     DayWeaveTheme(useDynamicColor = state.useDynamicColor) {
         when (loadState) {
             PlannerLoadState.LOADING -> PlannerRestoreScreen()
-            PlannerLoadState.READY -> DayWeaveRoot(viewModel = viewModel)
+            PlannerLoadState.READY -> DayWeaveRoot(
+                viewModel = viewModel,
+                appLockState = appLockState,
+                onSetAppLockEnabled = onSetAppLockEnabled,
+                onSetAppLockTimeout = onSetAppLockTimeout,
+                onLockNow = onLockNow,
+                onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+            )
             PlannerLoadState.PERSISTENCE_FAILED -> PlannerPersistenceFailureScreen()
         }
     }
@@ -119,7 +180,14 @@ private fun PlannerPersistenceFailureScreen() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
+private fun DayWeaveRoot(
+    viewModel: DayWeaveViewModel,
+    appLockState: AppLockState,
+    onSetAppLockEnabled: (Boolean) -> Unit,
+    onSetAppLockTimeout: (AppLockTimeout) -> Unit,
+    onLockNow: () -> Unit,
+    onOpenDeviceSecuritySettings: () -> Unit,
+) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by viewModel.state.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
@@ -305,6 +373,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 canonicalSyncState = effectiveCanonicalSyncState,
                 googleAccountState = googleAccountState,
                 energySignalState = energySignalState,
+                appLockState = appLockState,
                 onConfigureApiConnection = { showApiConnection = true },
                 onConnectGoogle = viewModel::connectGoogleAccount,
                 onRefreshGoogle = viewModel::refreshGoogleAccounts,
@@ -340,6 +409,10 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                         HealthConnectIntents.browserFallback(),
                     )
                 },
+                onSetAppLockEnabled = onSetAppLockEnabled,
+                onSetAppLockTimeout = onSetAppLockTimeout,
+                onLockNow = onLockNow,
+                onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
                 modifier = Modifier.padding(innerPadding),
             )
         }

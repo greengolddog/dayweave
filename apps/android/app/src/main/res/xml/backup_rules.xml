@@ -4,6 +4,9 @@
     <exclude domain="sharedpref" path="auth.xml.bak" />
     <exclude domain="sharedpref" path="dayweave_api_credentials.xml" />
     <exclude domain="sharedpref" path="dayweave_api_credentials.xml.bak" />
+    <!-- Upgrade-only source; the authoritative app-lock AtomicFile is in noBackupFilesDir. -->
+    <exclude domain="sharedpref" path="dayweave_app_lock.xml" />
+    <exclude domain="sharedpref" path="dayweave_app_lock.xml.bak" />
     <exclude domain="database" path="encrypted.db" />
     <exclude domain="database" path="encrypted.db-journal" />
     <exclude domain="database" path="encrypted.db-wal" />

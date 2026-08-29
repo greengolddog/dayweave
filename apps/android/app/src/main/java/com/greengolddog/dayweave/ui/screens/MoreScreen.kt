@@ -41,6 +41,8 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.health.EnergySignalPhase
 import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.security.AppLockState
+import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
@@ -48,6 +50,7 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
 
 @Composable
 fun MoreScreen(
@@ -59,6 +62,7 @@ fun MoreScreen(
     canonicalSyncState: CanonicalSyncState,
     googleAccountState: GoogleAccountState,
     energySignalState: EnergySignalState,
+    appLockState: AppLockState,
     onConfigureApiConnection: () -> Unit,
     onConnectGoogle: () -> Unit,
     onRefreshGoogle: () -> Unit,
@@ -71,6 +75,10 @@ fun MoreScreen(
     onRefreshHealthConnect: () -> Unit,
     onManageHealthConnectAccess: () -> Unit,
     onInstallHealthConnect: () -> Unit,
+    onSetAppLockEnabled: (Boolean) -> Unit,
+    onSetAppLockTimeout: (AppLockTimeout) -> Unit,
+    onLockNow: () -> Unit,
+    onOpenDeviceSecuritySettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -207,8 +215,26 @@ fun MoreScreen(
                     state.useDynamicColor,
                     onToggleDynamicColor,
                 )
-                HorizontalDivider()
-                SettingsInfo(Icons.Outlined.PrivacyTip, "Privacy & sensitive items", "AI access, lock screen, and MCP permissions")
+            }
+        }
+
+        item {
+            AppLockSettingsCard(
+                state = appLockState,
+                onSetEnabled = onSetAppLockEnabled,
+                onSetTimeout = onSetAppLockTimeout,
+                onLockNow = onLockNow,
+                onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+            )
+        }
+
+        item {
+            Card {
+                SettingsInfo(
+                    Icons.Outlined.PrivacyTip,
+                    "Privacy & sensitive items",
+                    "AI access, notification detail, widgets, and MCP permissions",
+                )
             }
         }
 
