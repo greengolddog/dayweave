@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct RootView: View {
@@ -692,16 +693,27 @@ private struct AssistantView: View {
         VStack(spacing: 0) {
             HStack(spacing: 7) {
                 Circle()
-                    .fill(codex.state.isConnected ? Color.green : Color.orange)
+                    .fill(codexStatusColor)
                     .frame(width: 7, height: 7)
                 Text(codex.state.title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                if !codex.state.isConnected {
-                    Button("Connect") { codex.signInWithBrowser() }
+                switch codex.state {
+                case .signedOut:
+                    Button("Sign in") { codex.signInWithDeviceCode() }
                         .buttonStyle(.link)
                         .font(.caption)
+                case .signingIn where codex.verificationURL != nil:
+                    Button("Open sign-in") { codex.openVerificationPage() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                case .unavailable:
+                    Button("Retry") { codex.retry() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                default:
+                    EmptyView()
                 }
             }
             .padding(.horizontal, 14)
@@ -748,6 +760,15 @@ private struct AssistantView: View {
     private func send() {
         store.sendAssistantMessage(draft)
         draft = ""
+    }
+
+    private var codexStatusColor: Color {
+        switch codex.state {
+        case .signedIn: .green
+        case .starting, .signingIn, .cancellingSignIn: .orange
+        case .unavailable: .red
+        case .stopped, .signedOut: .secondary
+        }
     }
 }
 
@@ -1117,7 +1138,6 @@ struct SettingsView: View {
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
-    @State private var apiKey = ""
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
     @State private var isCanonicalResetConfirmationPresented = false
@@ -1132,32 +1152,7 @@ struct SettingsView: View {
             .disabled(!store.canMutatePlan)
             Section("Accounts") {
                 LabeledContent("Google", value: "Not connected")
-                LabeledContent("Codex", value: codex.state.title)
-
-                if case let .signedIn(email, _) = codex.state {
-                    if let email { Text(email).foregroundStyle(.secondary) }
-                    Button("Sign out of Codex", role: .destructive) { codex.signOut() }
-                } else {
-                    HStack {
-                        Button("Sign in with ChatGPT") { codex.signInWithBrowser() }
-                            .buttonStyle(.borderedProminent)
-                        Button("Use device code") { codex.signInWithDeviceCode() }
-                    }
-
-                    if let code = codex.deviceCode {
-                        LabeledContent("Device code", value: code)
-                            .textSelection(.enabled)
-                    }
-
-                    DisclosureGroup("API key fallback") {
-                        SecureField("OpenAI API key", text: $apiKey)
-                        Button("Connect with API key") {
-                            codex.signInWithAPIKey(apiKey)
-                            apiKey = ""
-                        }
-                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    }
-                }
+                codexAccountControls
             }
             Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
@@ -1250,5 +1245,107 @@ struct SettingsView: View {
         .onAppear {
             dayWeaveAPIBaseURL = suggestionSync.baseURLString
         }
+    }
+
+    @ViewBuilder
+    private var codexAccountControls: some View {
+        LabeledContent {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(codexStatusColor)
+                    .frame(width: 8, height: 8)
+                Text(codex.state.title)
+            }
+        } label: {
+            Text("Codex")
+        }
+
+        switch codex.state {
+        case .stopped:
+            Text("A verified, contained Codex runtime is bundled with DayWeave.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Start Codex") { codex.retry() }
+
+        case .starting:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Starting the contained Codex runtime…")
+                    .foregroundStyle(.secondary)
+            }
+
+        case .signedOut:
+            Text("Connect your ChatGPT account with a one-time device code. Only managed ChatGPT sign-in is enabled.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Sign in with ChatGPT") { codex.signInWithDeviceCode() }
+                .buttonStyle(.borderedProminent)
+
+        case .signingIn:
+            if let code = codex.deviceCode {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Enter this one-time code on the OpenAI sign-in page")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(code)
+                        .font(.system(.title3, design: .monospaced).weight(.semibold))
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Device code \(code)")
+                    HStack {
+                        Button("Open OpenAI sign-in") { codex.openVerificationPage() }
+                            .buttonStyle(.borderedProminent)
+                        Button("Copy code") { copyCodexDeviceCode(code) }
+                        Button("Cancel", role: .cancel) { codex.cancelSignIn() }
+                    }
+                }
+                .padding(.vertical, 4)
+            } else {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Preparing a one-time device code…")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel", role: .cancel) { codex.cancelSignIn() }
+                }
+            }
+
+        case .cancellingSignIn:
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Canceling the sign-in ceremony…")
+                    .foregroundStyle(.secondary)
+            }
+
+        case let .signedIn(email, _):
+            if let email {
+                LabeledContent("ChatGPT account", value: email)
+                    .textSelection(.enabled)
+            }
+            Text("Credentials are managed by Codex inside DayWeave’s isolated local storage.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Sign out of Codex", role: .destructive) { codex.signOut() }
+
+        case let .unavailable(message):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+                .textSelection(.enabled)
+            Button("Retry Codex") { codex.retry() }
+        }
+    }
+
+    private var codexStatusColor: Color {
+        switch codex.state {
+        case .signedIn: .green
+        case .starting, .signingIn, .cancellingSignIn: .orange
+        case .unavailable: .red
+        case .stopped, .signedOut: .secondary
+        }
+    }
+
+    private func copyCodexDeviceCode(_ code: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
     }
 }

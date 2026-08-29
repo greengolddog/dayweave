@@ -35,6 +35,7 @@ struct DayWeaveMacApp: App {
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
                     store.flushPersistence()
+                    codex.shutDown()
                 }
         }
         .defaultSize(width: 1_420, height: 900)
