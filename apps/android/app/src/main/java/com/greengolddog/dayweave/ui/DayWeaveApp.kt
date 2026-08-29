@@ -12,6 +12,7 @@ import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -19,6 +20,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -30,6 +32,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -55,6 +58,7 @@ import com.greengolddog.dayweave.ui.screens.TodayScreen
 import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
+import com.greengolddog.dayweave.sync.GoogleAccountSummary
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -113,6 +117,8 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
+    val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
+    val uriHandler = LocalUriHandler.current
     val effectiveCanonicalSyncState = if (
         executionSyncState.phase in setOf(
             CanonicalSyncPhase.AUTH_REQUIRED,
@@ -135,11 +141,13 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
     var showPauseChooser by remember { mutableStateOf(false) }
     var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
+    var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
 
     LaunchedEffect(lifecycleOwner, viewModel) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshExecution()
+            viewModel.refreshGoogleAccounts()
             while (isActive) {
                 delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
                 viewModel.refreshExecution()
@@ -278,6 +286,17 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
+                googleAccountState = googleAccountState,
+                onConfigureApiConnection = { showApiConnection = true },
+                onConnectGoogle = viewModel::connectGoogleAccount,
+                onRefreshGoogle = viewModel::refreshGoogleAccounts,
+                onOpenGoogleAuthorization = { url ->
+                    runCatching { uriHandler.openUri(url) }
+                        .onFailure { viewModel.googleBrowserOpenFailed() }
+                },
+                onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
+                onSetGooglePaused = viewModel::setGoogleAccountPaused,
+                onRequestGoogleDisconnect = { disconnectingGoogleAccount = it },
                 modifier = Modifier.padding(innerPadding),
             )
         }
@@ -352,6 +371,33 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
             onForget = {
                 viewModel.clearSuggestionConnection()
                 showApiConnection = false
+            },
+        )
+    }
+
+    disconnectingGoogleAccount?.let { account ->
+        AlertDialog(
+            onDismissRequest = { disconnectingGoogleAccount = null },
+            title = { Text("Disconnect Google?") },
+            text = {
+                Text(
+                    "DayWeave will revoke its Google grant for ${account.label} and stop Calendar and Tasks sync. Your Google data will not be deleted.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        viewModel.disconnectGoogleAccount(account.id)
+                        disconnectingGoogleAccount = null
+                    },
+                ) {
+                    Text("Disconnect")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { disconnectingGoogleAccount = null }) {
+                    Text("Cancel")
+                }
             },
         )
     }

@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
+import com.greengolddog.dayweave.sync.GoogleAccountState
 import java.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -24,12 +25,14 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val suggestionConnectionController = dayWeaveApplication.suggestionConnectionController
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
+    private val googleAccountManager = dayWeaveApplication.googleAccountManager
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
+    val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
 
     init {
         viewModelScope.launch {
@@ -142,6 +145,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.launchCanonicalAction {
             if (suggestionConnectionController.update(baseUrl, bearerToken)) {
                 dayWeaveApplication.refreshCanonicalState()
+                googleAccountManager.refresh()
             }
         }
     }
@@ -150,9 +154,32 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.launchCanonicalAction {
             if (suggestionConnectionController.forget()) {
                 dayWeaveApplication.refreshCanonicalState()
+                googleAccountManager.refresh()
             }
         }
     }
+
+    fun refreshGoogleAccounts() {
+        viewModelScope.launch { googleAccountManager.refresh() }
+    }
+
+    fun connectGoogleAccount() {
+        viewModelScope.launch { googleAccountManager.connectNew() }
+    }
+
+    fun reauthorizeGoogleAccount(accountId: String) {
+        viewModelScope.launch { googleAccountManager.reauthorize(accountId) }
+    }
+
+    fun setGoogleAccountPaused(accountId: String, paused: Boolean) {
+        viewModelScope.launch { googleAccountManager.setPaused(accountId, paused) }
+    }
+
+    fun disconnectGoogleAccount(accountId: String) {
+        viewModelScope.launch { googleAccountManager.disconnect(accountId) }
+    }
+
+    fun googleBrowserOpenFailed() = googleAccountManager.browserOpenFailed()
 
     fun sendAssistantMessage(text: String): Boolean = plannerStore.sendAssistantMessage(text)
     fun toggleCompleted() = plannerStore.toggleCompleted()

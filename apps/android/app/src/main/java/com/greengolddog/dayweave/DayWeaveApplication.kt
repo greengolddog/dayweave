@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
+import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.state.PlannerStore
@@ -17,6 +18,7 @@ import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
+import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -69,6 +71,13 @@ class DayWeaveApplication : Application() {
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpExecutionTransport(),
+        )
+    }
+
+    val googleAccountManager: GoogleAccountManager by lazy {
+        GoogleAccountManager(
+            credentialStore = apiCredentialStore,
+            transport = OkHttpGoogleAccountsTransport(),
         )
     }
 
