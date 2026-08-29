@@ -100,10 +100,13 @@ effects must flow through an auditable proposal or outbox boundary.
   identification/registration, resource/audience binding, consent, and OAuth
   token lifecycle behavior are implemented and separately security-reviewed.
 - Credential issuance, list, rotation, and revocation APIs are redacted and
-  carry no-store headers. Enrollment/MCP secrets are generated with the OS
-  CSPRNG and returned once; persistence contains only domain-separated hashes.
-  Successful credential lifecycle mutations write content-free audit rows in
-  the same database transaction.
+  carry no-store headers. The enrollment initiator generates and journals the
+  enrollment identifier and secret with the OS CSPRNG before I/O; the server
+  echoes them only for a first creation or its exact still-pending replay. MCP
+  secrets are server-generated with the OS CSPRNG and returned once.
+  Persistence contains only domain-separated hashes. Successful credential
+  lifecycle mutations write content-free audit rows in the same database
+  transaction.
 - PostgreSQL adapters are explicitly scoped by the configured user/workspace,
   and every version-1 credential row carries that user/workspace/client scope.
   Static bootstrap principals do not independently prove that scope and must be

@@ -21,8 +21,8 @@ use crate::{
 
 use super::{
     AUTH_CLIENT_CONTRACT_VERSION, CredentialKind, CredentialRepository, CredentialRepositoryError,
-    DeviceClientKind, DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL,
-    GeneratedCredential, McpClient, McpClientSpec, OpaqueCredential,
+    DeviceClientKind, DeviceEnrollmentSpec, DeviceSession, GeneratedCredential, McpClient,
+    McpClientSpec, OpaqueCredential,
 };
 
 const AUTH_BODY_LIMIT: usize = 32 * 1024;
@@ -59,6 +59,8 @@ pub(crate) fn public_routes() -> Router<AppState> {
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateDeviceEnrollmentRequest {
+    id: Uuid,
+    enrollment_token: SecretInput,
     client_instance_id: Uuid,
     client_kind: DeviceClientKind,
     device_label: String,
@@ -77,6 +79,7 @@ pub(crate) struct DeviceEnrollmentResponse {
     enrollment_token: String,
     expires_at: DateTime<Utc>,
     client_contract_version: u16,
+    replayed: bool,
 }
 
 impl Drop for DeviceEnrollmentResponse {
@@ -198,6 +201,7 @@ pub(crate) struct McpClientListResponse {
     request_body = CreateDeviceEnrollmentRequest,
     responses(
         (status = 201, description = "One-time enrollment credential issued", body = DeviceEnrollmentResponse),
+        (status = 200, description = "Exact still-pending enrollment creation replayed", body = DeviceEnrollmentResponse),
         (status = 401, description = "Missing or invalid management credential", body = crate::error::ErrorEnvelope),
         (status = 403, description = "Scope delegation is not allowed", body = crate::error::ErrorEnvelope),
         (status = 409, description = "Enrollment conflicts with existing state", body = crate::error::ErrorEnvelope),
@@ -209,7 +213,7 @@ pub(crate) async fn create_device_enrollment(
     Extension(principal): Extension<Principal>,
     request: Result<Json<CreateDeviceEnrollmentRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
-    let request = request
+    let mut request = request
         .map_err(|error| ApiError::from_json_rejection(&error))?
         .0;
     validate_requested_scopes(&request.scopes, Scope::is_rest)?;
@@ -222,37 +226,42 @@ pub(crate) async fn create_device_enrollment(
     }
     let repository = active_repository(&state)?;
     let now = state.clock.now();
-    let id = Uuid::new_v4();
-    let generated = GeneratedCredential::generate(CredentialKind::Enrollment)
-        .map_err(|_| ApiError::internal())?;
-    let credential = generated.parsed().map_err(|_| ApiError::internal())?;
-    repository
-        .create_device_enrollment(
-            DeviceEnrollmentSpec {
-                id,
-                client_instance_id: request.client_instance_id,
-                client_kind: request.client_kind,
-                device_label: request.device_label,
-                scopes: request.scopes,
-                client_contract_version: request.client_contract_version,
-                client_version: request.client_version,
-                client_capabilities: request.client_capabilities,
-                created_at: now,
-            },
-            &credential,
-        )
-        .await
-        .map_err(map_repository_error)?;
-    let expires_at = now
-        .checked_add_signed(ENROLLMENT_TOKEN_TTL)
-        .ok_or_else(ApiError::internal)?;
+    let result = {
+        let credential =
+            OpaqueCredential::parse(CredentialKind::Enrollment, &request.enrollment_token.0)
+                .map_err(|_| ApiError::validation("Invalid enrollment credential"))?;
+        repository
+            .create_or_replay_device_enrollment(
+                DeviceEnrollmentSpec {
+                    id: request.id,
+                    client_instance_id: request.client_instance_id,
+                    client_kind: request.client_kind,
+                    device_label: request.device_label,
+                    scopes: request.scopes,
+                    client_contract_version: request.client_contract_version,
+                    client_version: request.client_version,
+                    client_capabilities: request.client_capabilities,
+                    created_at: now,
+                },
+                &credential,
+            )
+            .await
+            .map_err(map_repository_error)?
+    };
+    let enrollment_raw = std::mem::take(&mut request.enrollment_token.0);
+    let status = if result.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
     Ok((
-        StatusCode::CREATED,
+        status,
         Json(DeviceEnrollmentResponse {
-            id,
-            enrollment_token: generated.expose().to_owned(),
-            expires_at,
+            id: request.id,
+            enrollment_token: enrollment_raw,
+            expires_at: result.expires_at,
             client_contract_version: AUTH_CLIENT_CONTRACT_VERSION,
+            replayed: result.replayed,
         }),
     )
         .into_response())

@@ -66,6 +66,11 @@ pub struct DeviceEnrollmentSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceEnrollmentCreation {
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSession {
     pub id: Uuid,
     pub workspace_id: Uuid,

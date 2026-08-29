@@ -121,6 +121,7 @@ fn new_suggestion() -> Value {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keeps the public system and OpenAPI surface in one contract test.
 async fn system_endpoints_are_public_and_readiness_is_honest() {
     let (app, _) = test_app(false);
 
@@ -214,6 +215,12 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     );
     assert!(document["components"]["securitySchemes"].is_object());
     assert!(document["paths"]["/v1/auth/device-enrollments"]["post"].is_object());
+    assert!(
+        document["paths"]["/v1/auth/device-enrollments"]["post"]["responses"]["200"].is_object()
+    );
+    assert!(
+        document["paths"]["/v1/auth/device-enrollments"]["post"]["responses"]["201"].is_object()
+    );
     assert!(document["paths"]["/v1/auth/device-enrollments/consume"]["post"].is_object());
     assert!(document["paths"]["/v1/auth/sessions/refresh"]["post"].is_object());
     assert!(document["paths"]["/v1/auth/sessions"]["get"].is_object());
@@ -294,6 +301,8 @@ async fn legacy_mode_does_not_activate_durable_issuance_and_auth_errors_are_no_s
             "POST",
             "/v1/auth/device-enrollments",
             Some(json!({
+                "id": "00000000-0000-4000-8000-000000000122",
+                "enrollment_token": "synthetic-enrollment-token",
                 "client_instance_id": "00000000-0000-4000-8000-000000000123",
                 "client_kind": "macos",
                 "device_label": "Synthetic Mac",

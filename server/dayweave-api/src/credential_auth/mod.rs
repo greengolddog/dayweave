@@ -8,8 +8,8 @@ mod token;
 pub use domain::{
     ACCESS_TOKEN_TTL, AUTH_CLIENT_CONTRACT_VERSION, CredentialMutation,
     DEVICE_SESSION_ABSOLUTE_TTL, DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind,
-    DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_MCP_CREDENTIAL_TTL,
-    MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec,
+    DeviceEnrollmentCreation, DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL,
+    MAX_MCP_CREDENTIAL_TTL, MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec,
 };
 pub use repository::{CredentialRepository, CredentialRepositoryError};
 pub use token::{

@@ -30,6 +30,211 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keeps the concurrent and terminal exact-replay boundaries together.
+async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-create-replay-owner", "auth-create-replay").await;
+    let other_scope =
+        seed_scope(pool, "auth-create-replay-other", "auth-create-replay-other").await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let other_repository = PostgresCredentialRepository::new(pool.clone(), other_scope);
+    let now = Utc::now();
+    let enrollment_id = Uuid::new_v4();
+    let enrollment_raw = token(CredentialKind::Enrollment, 90);
+    let enrollment = OpaqueCredential::parse(CredentialKind::Enrollment, &enrollment_raw).unwrap();
+    let spec = DeviceEnrollmentSpec {
+        id: enrollment_id,
+        client_instance_id: Uuid::new_v4(),
+        client_kind: DeviceClientKind::Macos,
+        device_label: "Exact replay Mac".to_owned(),
+        scopes: vec![Scope::ScheduleRead, Scope::SuggestionsWrite],
+        client_contract_version: 1,
+        client_version: "test-create-replay-1".to_owned(),
+        client_capabilities: vec!["exact-request-replay".to_owned()],
+        created_at: now,
+    };
+
+    let (first, second) = tokio::join!(
+        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment),
+        repository.create_or_replay_device_enrollment(spec.clone(), &enrollment),
+    );
+    let first = first.expect("first concurrent create succeeds");
+    let second = second.expect("second concurrent create succeeds");
+    assert_ne!(first.replayed, second.replayed);
+    assert_postgres_instant_eq(first.expires_at, now + ChronoDuration::minutes(10));
+    assert_postgres_instant_eq(second.expires_at, first.expires_at);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM device_enrollments WHERE id = $1",)
+            .bind(enrollment_id)
+            .fetch_one(pool)
+            .await
+            .expect("one enrollment row"),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM audit_operations WHERE entity_type = 'device_enrollment' AND entity_id = $1 AND operation_type = 'auth.device_enrollment.created'",
+        )
+        .bind(enrollment_id)
+        .fetch_one(pool)
+        .await
+        .expect("one enrollment audit row"),
+        1
+    );
+
+    let changed_semantic_tuples = [
+        DeviceEnrollmentSpec {
+            client_instance_id: Uuid::new_v4(),
+            ..spec.clone()
+        },
+        DeviceEnrollmentSpec {
+            client_kind: DeviceClientKind::Android,
+            ..spec.clone()
+        },
+        DeviceEnrollmentSpec {
+            device_label: "Changed label".to_owned(),
+            ..spec.clone()
+        },
+        DeviceEnrollmentSpec {
+            scopes: vec![Scope::ScheduleRead],
+            ..spec.clone()
+        },
+        DeviceEnrollmentSpec {
+            client_version: "test-create-replay-2".to_owned(),
+            ..spec.clone()
+        },
+        DeviceEnrollmentSpec {
+            client_capabilities: vec!["different-capability".to_owned()],
+            ..spec.clone()
+        },
+    ];
+    for changed in changed_semantic_tuples {
+        assert_eq!(
+            repository
+                .create_or_replay_device_enrollment(changed, &enrollment)
+                .await,
+            Err(CredentialRepositoryError::Conflict),
+            "every changed semantic field must make the creation non-replayable"
+        );
+    }
+    let different_enrollment_raw = token(CredentialKind::Enrollment, 91);
+    let different_enrollment =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &different_enrollment_raw).unwrap();
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(spec.clone(), &different_enrollment)
+            .await,
+        Err(CredentialRepositoryError::Conflict)
+    );
+    let mut changed_id = spec.clone();
+    changed_id.id = Uuid::new_v4();
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(changed_id, &enrollment)
+            .await,
+        Err(CredentialRepositoryError::Conflict)
+    );
+    assert_eq!(
+        other_repository
+            .create_or_replay_device_enrollment(spec.clone(), &enrollment)
+            .await,
+        Err(CredentialRepositoryError::Conflict),
+        "a global token or identifier collision cannot cross a workspace boundary"
+    );
+
+    let access_raw = token(CredentialKind::DeviceAccess, 92);
+    let refresh_raw = token(CredentialKind::DeviceRefresh, 93);
+    let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
+    let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_raw).unwrap();
+    repository
+        .consume_device_enrollment(
+            &enrollment,
+            Uuid::new_v4(),
+            &access,
+            &refresh,
+            now + ChronoDuration::seconds(1),
+        )
+        .await
+        .expect("consume pending enrollment");
+    let mut consumed_retry = spec;
+    consumed_retry.created_at = now + ChronoDuration::seconds(2);
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(consumed_retry, &enrollment)
+            .await,
+        Err(CredentialRepositoryError::Conflict),
+        "a consumed one-time enrollment is never recreated or replayed"
+    );
+
+    let expired_raw = token(CredentialKind::Enrollment, 94);
+    let expired = OpaqueCredential::parse(CredentialKind::Enrollment, &expired_raw).unwrap();
+    let expired_created_at = now - ChronoDuration::minutes(10) - ChronoDuration::seconds(1);
+    let expired_spec = DeviceEnrollmentSpec {
+        id: Uuid::new_v4(),
+        client_instance_id: Uuid::new_v4(),
+        client_kind: DeviceClientKind::Android,
+        device_label: "Expired replay Pixel".to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        client_contract_version: 1,
+        client_version: "test-create-replay-1".to_owned(),
+        client_capabilities: vec!["exact-request-replay".to_owned()],
+        created_at: expired_created_at,
+    };
+    repository
+        .create_or_replay_device_enrollment(expired_spec.clone(), &expired)
+        .await
+        .expect("historical fixture created");
+    let mut expired_retry = expired_spec;
+    expired_retry.created_at = now;
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(expired_retry, &expired)
+            .await,
+        Err(CredentialRepositoryError::Conflict),
+        "expiry is exclusive and an expired issuance cannot be recovered"
+    );
+
+    let revoked_raw = token(CredentialKind::Enrollment, 95);
+    let revoked = OpaqueCredential::parse(CredentialKind::Enrollment, &revoked_raw).unwrap();
+    let revoked_spec = DeviceEnrollmentSpec {
+        id: Uuid::new_v4(),
+        client_instance_id: Uuid::new_v4(),
+        client_kind: DeviceClientKind::Macos,
+        device_label: "Revoked replay Mac".to_owned(),
+        scopes: vec![Scope::ScheduleRead],
+        client_contract_version: 1,
+        client_version: "test-create-replay-1".to_owned(),
+        client_capabilities: vec!["exact-request-replay".to_owned()],
+        created_at: now,
+    };
+    repository
+        .create_or_replay_device_enrollment(revoked_spec.clone(), &revoked)
+        .await
+        .expect("revocation fixture created");
+    assert!(
+        repository
+            .revoke_device_enrollment(revoked_spec.id, now + ChronoDuration::seconds(1))
+            .await
+            .expect("pending enrollment revoked")
+    );
+    let mut revoked_retry = revoked_spec;
+    revoked_retry.created_at = now + ChronoDuration::seconds(2);
+    assert_eq!(
+        repository
+            .create_or_replay_device_enrollment(revoked_retry, &revoked)
+            .await,
+        Err(CredentialRepositoryError::Conflict),
+        "a revoked enrollment can never be recreated or replayed"
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // Covers the complete issuance/rotation/revocation lifecycle.
 async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only() {
     let Some(test_database) = TestDatabase::from_environment().await else {
@@ -1099,20 +1304,26 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
                 .with_credential_auth(repository, authenticator, AuthMode::Hybrid),
         );
 
+    let enrollment_id = Uuid::new_v4();
+    let client_instance_id = Uuid::new_v4();
+    let proposed_enrollment_token = token(CredentialKind::Enrollment, 80);
+    let enrollment_body = json!({
+        "id": enrollment_id,
+        "enrollment_token": proposed_enrollment_token,
+        "client_instance_id": client_instance_id,
+        "client_kind": "macos",
+        "device_label": "Synthetic HTTP Mac",
+        "client_contract_version": 1,
+        "client_version": "test-1",
+        "client_capabilities": ["exact-replay"]
+    });
     let enrollment_response = app
         .clone()
         .oneshot(auth_request(
             "POST",
             "/v1/auth/device-enrollments",
             STATIC_TOKEN,
-            Some(json!({
-                "client_instance_id": Uuid::new_v4(),
-                "client_kind": "macos",
-                "device_label": "Synthetic HTTP Mac",
-                "client_contract_version": 1,
-                "client_version": "test-1",
-                "client_capabilities": ["exact-replay"]
-            })),
+            Some(enrollment_body.clone()),
         ))
         .await
         .unwrap();
@@ -1123,7 +1334,66 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
     );
     let enrollment = response_json(enrollment_response).await;
     let enrollment_token = enrollment["enrollment_token"].as_str().unwrap().to_owned();
-    assert!(enrollment_token.starts_with(CredentialKind::Enrollment.prefix()));
+    assert_eq!(enrollment["id"], enrollment_id.to_string());
+    assert_eq!(enrollment["replayed"], false);
+    assert_eq!(enrollment["client_contract_version"], 1);
+    assert_eq!(enrollment_token, proposed_enrollment_token);
+    let enrollment_expires_at = enrollment["expires_at"].clone();
+
+    let replayed_creation = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments",
+            STATIC_TOKEN,
+            Some(enrollment_body.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed_creation.status(), StatusCode::OK);
+    let replayed_creation = response_json(replayed_creation).await;
+    assert_eq!(replayed_creation["id"], enrollment_id.to_string());
+    assert_eq!(replayed_creation["enrollment_token"], enrollment_token);
+    assert_eq!(replayed_creation["expires_at"], enrollment_expires_at);
+    assert_eq!(replayed_creation["client_contract_version"], 1);
+    assert_eq!(replayed_creation["replayed"], true);
+
+    let mut conflicting_enrollment_body = enrollment_body;
+    conflicting_enrollment_body["device_label"] = json!("Different synthetic Mac");
+    let conflicting_creation = app
+        .clone()
+        .oneshot(auth_request(
+            "POST",
+            "/v1/auth/device-enrollments",
+            STATIC_TOKEN,
+            Some(conflicting_enrollment_body),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflicting_creation.status(), StatusCode::CONFLICT);
+    let conflicting_creation_text = String::from_utf8(
+        conflicting_creation
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(!conflicting_creation_text.contains(&enrollment_token));
+
+    let stored_enrollment_hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT token_hash FROM device_enrollments WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(enrollment_id)
+    .fetch_one(pool)
+    .await
+    .expect("proposed enrollment stored by digest");
+    assert_eq!(stored_enrollment_hash.len(), 32);
+    assert_ne!(stored_enrollment_hash, enrollment_token.as_bytes());
 
     let session_id = Uuid::new_v4();
     let access = token(CredentialKind::DeviceAccess, 81);

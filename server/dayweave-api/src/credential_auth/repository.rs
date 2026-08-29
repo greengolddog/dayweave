@@ -4,8 +4,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    CredentialMutation, DeviceEnrollmentSpec, DeviceSession, McpClient, McpClientSpec,
-    OpaqueCredential,
+    CredentialMutation, DeviceEnrollmentCreation, DeviceEnrollmentSpec, DeviceSession,
+    ENROLLMENT_TOKEN_TTL, McpClient, McpClientSpec, OpaqueCredential,
 };
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -27,6 +27,28 @@ pub trait CredentialRepository: Send + Sync {
         spec: DeviceEnrollmentSpec,
         enrollment_token: &OpaqueCredential<'_>,
     ) -> Result<(), CredentialRepositoryError>;
+
+    /// Creates a client-journaled enrollment or recovers only the exact same
+    /// still-pending issuance after a lost response.
+    ///
+    /// The default preserves compatibility for repository test doubles. The
+    /// durable `PostgreSQL` adapter overrides it with exact tuple comparison.
+    async fn create_or_replay_device_enrollment(
+        &self,
+        spec: DeviceEnrollmentSpec,
+        enrollment_token: &OpaqueCredential<'_>,
+    ) -> Result<CredentialMutation<DeviceEnrollmentCreation>, CredentialRepositoryError> {
+        let expires_at = spec
+            .created_at
+            .checked_add_signed(ENROLLMENT_TOKEN_TTL)
+            .ok_or(CredentialRepositoryError::InvalidInput)?;
+        self.create_device_enrollment(spec, enrollment_token)
+            .await?;
+        Ok(CredentialMutation {
+            value: DeviceEnrollmentCreation { expires_at },
+            replayed: false,
+        })
+    }
 
     async fn consume_device_enrollment(
         &self,

@@ -11,9 +11,9 @@ use crate::{
     credential_auth::{
         ACCESS_TOKEN_TTL, AUTH_CLIENT_CONTRACT_VERSION, CredentialKind, CredentialMutation,
         CredentialRepository, CredentialRepositoryError, DEVICE_SESSION_ABSOLUTE_TTL,
-        DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
-        ENROLLMENT_TOKEN_TTL, MAX_MCP_CREDENTIAL_TTL, MCP_CREDENTIAL_DEFAULT_TTL, McpClient,
-        McpClientSpec, OpaqueCredential,
+        DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentCreation,
+        DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_MCP_CREDENTIAL_TTL,
+        MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec, OpaqueCredential,
     },
 };
 
@@ -86,6 +86,102 @@ impl CredentialRepository for PostgresCredentialRepository {
         .await?;
         transaction.commit().await.map_err(storage_error)?;
         Ok(())
+    }
+
+    async fn create_or_replay_device_enrollment(
+        &self,
+        spec: DeviceEnrollmentSpec,
+        enrollment_token: &OpaqueCredential<'_>,
+    ) -> Result<CredentialMutation<DeviceEnrollmentCreation>, CredentialRepositoryError> {
+        require_kind(enrollment_token, CredentialKind::Enrollment)?;
+        validate_device_enrollment(&spec)?;
+        let expires_at = checked_add(spec.created_at, ENROLLMENT_TOKEN_TTL)?;
+        let token_hash = enrollment_token.persistence_digest();
+        let scopes = scope_names(&spec.scopes);
+        let mut transaction = self.pool.begin().await.map_err(storage_error)?;
+        let inserted = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "INSERT INTO device_enrollments (id, workspace_id, user_id, client_instance_id, \
+             client_kind, device_label, token_hash, scopes, created_at, expires_at, \
+             client_contract_version, client_version, client_capabilities) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+             ON CONFLICT DO NOTHING RETURNING expires_at",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.client_instance_id)
+        .bind(spec.client_kind.as_storage_name())
+        .bind(&spec.device_label)
+        .bind(token_hash.as_slice())
+        .bind(&scopes)
+        .bind(spec.created_at)
+        .bind(expires_at)
+        .bind(
+            i16::try_from(spec.client_contract_version)
+                .map_err(|_| CredentialRepositoryError::InvalidInput)?,
+        )
+        .bind(&spec.client_version)
+        .bind(&spec.client_capabilities)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(write_error)?;
+        if let Some(expires_at) = inserted {
+            insert_auth_audit(
+                &mut transaction,
+                self.scope,
+                "auth.device_enrollment.created",
+                "device_enrollment",
+                spec.id,
+                None,
+                Some(1),
+                spec.created_at,
+            )
+            .await?;
+            transaction.commit().await.map_err(storage_error)?;
+            return Ok(CredentialMutation {
+                value: DeviceEnrollmentCreation { expires_at },
+                replayed: false,
+            });
+        }
+
+        // PostgreSQL's uniqueness checks serialize concurrent attempts. Only
+        // the same still-pending, unexpired semantic tuple is a recoverable
+        // response-loss replay; every other conflict stays fail-closed.
+        let replayed_expires_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+            "SELECT expires_at FROM device_enrollments WHERE id = $1 \
+             AND workspace_id = $2 AND user_id = $3 AND client_instance_id = $4 \
+             AND client_kind = $5 AND device_label = $6 AND token_hash = $7 AND scopes = $8 \
+             AND client_contract_version = $9 AND client_version = $10 \
+             AND client_capabilities = $11 AND consumed_at IS NULL AND revoked_at IS NULL \
+             AND created_at <= $12 AND expires_at > $12 \
+             AND expires_at <= created_at + interval '600 seconds' FOR SHARE",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(spec.client_instance_id)
+        .bind(spec.client_kind.as_storage_name())
+        .bind(&spec.device_label)
+        .bind(token_hash.as_slice())
+        .bind(&scopes)
+        .bind(
+            i16::try_from(spec.client_contract_version)
+                .map_err(|_| CredentialRepositoryError::InvalidInput)?,
+        )
+        .bind(&spec.client_version)
+        .bind(&spec.client_capabilities)
+        .bind(spec.created_at)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(storage_error)?;
+        let Some(expires_at) = replayed_expires_at else {
+            return Err(CredentialRepositoryError::Conflict);
+        };
+        transaction.commit().await.map_err(storage_error)?;
+        Ok(CredentialMutation {
+            value: DeviceEnrollmentCreation { expires_at },
+            replayed: true,
+        })
     }
 
     #[allow(clippy::too_many_lines)] // Keeps the one-time claim and session issue transaction together.
@@ -743,7 +839,9 @@ fn checked_add(
 fn validate_device_enrollment(
     spec: &DeviceEnrollmentSpec,
 ) -> Result<(), CredentialRepositoryError> {
-    if !valid_label(&spec.device_label, 200)
+    if spec.id.is_nil()
+        || spec.client_instance_id.is_nil()
+        || !valid_label(&spec.device_label, 200)
         || !valid_scopes(&spec.scopes)
         || !spec.scopes.iter().all(|scope| scope.is_rest())
         || !valid_client_metadata(

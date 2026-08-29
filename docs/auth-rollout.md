@@ -23,11 +23,20 @@ variables but intentionally contain no credential values.
 - Native MCP client: `dw_mc1_` plus independent random material; 90-day default
   and 365-day maximum.
 
-The server generates enrollment and MCP credentials with the operating-system
-CSPRNG and returns each plaintext once in a response carrying `Cache-Control:
-no-store` and `Pragma: no-cache`. Device clients generate and durably journal a
-session UUID and each next access/refresh pair before enrollment or refresh.
-The server never returns those device-generated plaintexts.
+The enrollment initiator generates the enrollment UUID and credential with the
+operating-system CSPRNG, then durably journals the exact creation request before
+network I/O. The server stores only its domain-separated digest. It returns
+`201 Created` for the first insert and `200 OK` only when an identical semantic
+request recovers the same still-pending, unexpired creation after response
+loss. Both responses echo the proposed identifier and enrollment credential
+and carry `Cache-Control: no-store` and `Pragma: no-cache`; a changed tuple,
+consumed or expired enrollment, or tenant collision returns a conflict.
+
+The server generates native MCP credentials with the operating-system CSPRNG
+and returns each plaintext once. Device clients also generate and durably
+journal a session UUID and each next access/refresh pair before enrollment
+consumption or refresh. The server never returns those device-generated session
+plaintexts.
 
 Enrollment and refresh are exact-retry operations. If a response is lost after
 commit, the same enrollment token/session UUID/access/refresh tuple or the same
@@ -44,14 +53,18 @@ client, and MCP-only submission scope on a device session fail closed.
 
 All management endpoints below are under `/v1` and require their named scope.
 
-1. In hybrid mode, call `POST /auth/device-enrollments` with a stable
-   `client_instance_id`, `client_kind`, label, desired REST scopes,
-   `client_contract_version: 1`, client version, and capabilities. It requires
-   `auth_sessions_write` and returns the enrollment credential once.
-2. Transfer that credential out of band to the intended device. The device
-   journals its proposed session UUID and new access/refresh credentials, then
-   calls `POST /auth/device-enrollments/consume` with the enrollment credential
-   as bearer authentication.
+1. In hybrid mode, generate an enrollment `id` and independent `dw_en1_`
+   credential. Journal the exact request before calling `POST
+   /auth/device-enrollments` with those fields, a stable `client_instance_id`,
+   `client_kind`, label, desired REST scopes, `client_contract_version: 1`,
+   client version, and capabilities. It requires `auth_sessions_write`. Retry
+   an ambiguous result only with the exact journaled request; discard the
+   journal only after validating the status and exact echoed fields.
+2. If a separate administrator initiated enrollment, transfer the credential
+   out of band to the intended device. The device journals its proposed session
+   UUID and new access/refresh credentials, then calls `POST
+   /auth/device-enrollments/consume` with the enrollment credential as bearer
+   authentication.
 3. The device journals every next pair before calling `POST
    /auth/sessions/refresh` with the current refresh credential as bearer
    authentication. It atomically replaces its secure-store pair only after a
