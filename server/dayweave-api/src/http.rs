@@ -46,6 +46,13 @@ const MAX_LIST_LIMIT: usize = 200;
         accept_suggestion,
         reject_suggestion,
         delete_suggestion,
+        crate::items::http::create_item,
+        crate::items::http::list_items,
+        crate::items::http::item_delta,
+        crate::items::http::get_item,
+        crate::items::http::replace_item,
+        crate::items::http::delete_item,
+        crate::items::http::restore_item,
     ),
     components(schemas(
         HealthResponse,
@@ -60,11 +67,25 @@ const MAX_LIST_LIMIT: usize = 200;
         ProposalKind,
         ProposalStatus,
         ErrorEnvelope,
+        crate::items::NewItem,
+        crate::items::ReplaceItem,
+        crate::items::Item,
+        crate::items::SplitPolicy,
+        crate::items::ItemKind,
+        crate::items::ItemStatus,
+        crate::items::DeltaChange,
+        crate::items::ItemTombstone,
+        crate::items::http::ReplaceItemRequest,
+        crate::items::http::RevisionRequest,
+        crate::items::http::ItemEnvelope,
+        crate::items::http::ItemListEnvelope,
+        crate::items::http::ItemDeltaEnvelope,
     )),
     modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Liveness, readiness, and build identity"),
-        (name = "suggestions", description = "Reviewable proposals from AI and external tools")
+        (name = "suggestions", description = "Reviewable proposals from AI and external tools"),
+        (name = "items", description = "Canonical offline-first planner items and delta sync")
     )
 )]
 pub struct ApiDoc;
@@ -96,6 +117,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/suggestions/{id}/accept", post(accept_suggestion))
         .route("/suggestions/{id}/reject", post(reject_suggestion))
+        .merge(crate::items::http::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_authentication,

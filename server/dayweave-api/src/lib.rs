@@ -11,6 +11,7 @@ pub mod error;
 pub mod healthcheck;
 pub mod http;
 pub mod integrations;
+pub mod items;
 pub mod mcp;
 pub mod persistence;
 pub mod proposals;
@@ -21,8 +22,9 @@ use std::sync::Arc;
 
 use auth::{Authenticator, StaticTokenAuthenticator};
 use config::Config;
+use items::{InMemoryItemRepository, ItemRepository, ItemService};
 use mcp::McpService;
-use persistence::{Database, PersistenceError, PostgresProposalRepository};
+use persistence::{Database, PersistenceError, PostgresItemRepository, PostgresProposalRepository};
 use proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock};
 use readiness::Readiness;
 use scheduling::{
@@ -34,6 +36,7 @@ use scheduling::{
 #[derive(Clone)]
 pub struct AppState {
     pub proposals: Arc<ProposalService>,
+    pub items: Arc<ItemService>,
     pub authenticator: Arc<dyn Authenticator>,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
@@ -50,24 +53,33 @@ impl AppState {
     /// Returns a redacted persistence error if the configured database cannot
     /// connect, migrate, or initialize its personal workspace scope.
     pub async fn from_config(config: &Config) -> Result<Self, PersistenceError> {
-        let (repository, readiness): (Arc<dyn ProposalRepository>, Readiness) =
-            if let Some(database_config) = &config.database {
-                let database = Database::connect(database_config).await?;
-                (
-                    Arc::new(PostgresProposalRepository::new(
-                        database.pool().clone(),
-                        database.scope(),
-                    )),
-                    Readiness::with_database(database.pool().clone()),
-                )
-            } else {
-                (
-                    Arc::new(InMemoryProposalRepository::default()),
-                    Readiness::default(),
-                )
-            };
+        let (repository, item_repository, readiness): (
+            Arc<dyn ProposalRepository>,
+            Arc<dyn ItemRepository>,
+            Readiness,
+        ) = if let Some(database_config) = &config.database {
+            let database = Database::connect(database_config).await?;
+            (
+                Arc::new(PostgresProposalRepository::new(
+                    database.pool().clone(),
+                    database.scope(),
+                )),
+                Arc::new(PostgresItemRepository::new(
+                    database.pool().clone(),
+                    database.scope(),
+                )),
+                Readiness::with_database(database.pool().clone()),
+            )
+        } else {
+            (
+                Arc::new(InMemoryProposalRepository::default()),
+                Arc::new(InMemoryItemRepository::default()),
+                Readiness::default(),
+            )
+        };
         let clock = Arc::new(SystemClock);
         let proposals = Arc::new(ProposalService::new(repository, clock, config.proposal_ttl));
+        let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
         let authenticator = Arc::new(StaticTokenAuthenticator::from_hashes(
             config.api_token_hashes.clone(),
         ));
@@ -80,6 +92,7 @@ impl AppState {
 
         Ok(Self {
             proposals,
+            items,
             authenticator,
             readiness,
             mcp,
@@ -100,10 +113,20 @@ impl AppState {
         ));
         Self {
             proposals,
+            items: Arc::new(ItemService::new(
+                Arc::new(InMemoryItemRepository::default()),
+                Arc::new(SystemClock),
+            )),
             authenticator,
             readiness,
             mcp,
         }
+    }
+
+    #[must_use]
+    pub fn with_items(mut self, items: Arc<ItemService>) -> Self {
+        self.items = items;
+        self
     }
 
     #[must_use]
