@@ -5,7 +5,7 @@
 - Rust 1.95 with `rustfmt` and `clippy`
 - Swift 6.2 or newer; full Xcode for UI tests, widgets, entitlements, and
   extension targets
-- JDK 21 and the Android SDK for the Android client
+- JDK 17 or newer and the Android SDK for the Android client
 - Docker Engine/Compose for the local backend stack
 - Codex CLI for embedded App Server development
 - Nebius CLI only for deployment work
@@ -43,6 +43,22 @@ open dist/macos/DayWeave.app
 
 The output uses an ad-hoc signature because no Apple Developer membership is in
 scope. Do not mistake that for notarization.
+
+Create the private Android release key once, outside the repository, then build
+the signed direct-install APK with:
+
+```sh
+scripts/create-android-signing-key.sh
+scripts/build-android-apk.sh
+```
+
+The first script refuses to overwrite an existing key and stores its PKCS#12
+keystore plus build properties with mode `0600` under the user's configuration
+directory. Back up both files securely. The release build disables Gradle's
+configuration cache so signing passwords are not retained there, verifies the
+APK signature, and writes the ignored artifact to
+`dist/android/DayWeave-release.apk`. Signing material and generated binaries
+must never be committed.
 
 ## Local API
 

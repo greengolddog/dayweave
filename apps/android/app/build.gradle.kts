@@ -1,5 +1,8 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import java.net.URI
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermission
+import java.util.Properties
 
 fun String.asBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
@@ -8,6 +11,37 @@ val dayWeaveApiBaseUrl = providers.gradleProperty("dayweaveApiBaseUrl")
     .orElse("")
     .get()
     .trim()
+
+fun requirePrivateRegularFile(candidate: File, description: String) {
+    require(candidate.isFile && !Files.isSymbolicLink(candidate.toPath())) {
+        "$description must be a regular, non-symlink file"
+    }
+    val permissions = runCatching {
+        Files.getPosixFilePermissions(candidate.toPath())
+    }.getOrNull()
+    if (permissions != null) {
+        require(
+            permissions == setOf(
+                PosixFilePermission.OWNER_READ,
+                PosixFilePermission.OWNER_WRITE,
+            ),
+        ) { "$description must have mode 0600" }
+    }
+}
+
+val releaseSigningProperties = providers.environmentVariable(
+    "DAYWEAVE_ANDROID_SIGNING_PROPERTIES",
+).orNull?.let { rawPath ->
+    val propertiesFile = file(rawPath)
+    requirePrivateRegularFile(propertiesFile, "Android signing properties")
+    Properties().apply {
+        propertiesFile.inputStream().use(::load)
+    }
+}
+
+fun Properties.requiredSigningValue(name: String): String =
+    getProperty(name)?.trim()?.takeIf(String::isNotEmpty)
+        ?: error("Missing Android signing property: $name")
 
 if (dayWeaveApiBaseUrl.isNotEmpty()) {
     val configuredUri = URI(dayWeaveApiBaseUrl)
@@ -52,6 +86,24 @@ android {
         vectorDrawables.useSupportLibrary = true
     }
 
+    signingConfigs {
+        if (releaseSigningProperties != null) {
+            create("dayWeaveRelease") {
+                val keyStorePath = releaseSigningProperties.requiredSigningValue("storeFile")
+                val keyStoreFile = file(keyStorePath)
+                requirePrivateRegularFile(keyStoreFile, "Android release keystore")
+                storeFile = keyStoreFile
+                storePassword = releaseSigningProperties.requiredSigningValue("storePassword")
+                keyAlias = releaseSigningProperties.requiredSigningValue("keyAlias")
+                keyPassword = releaseSigningProperties.requiredSigningValue("keyPassword")
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -60,6 +112,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            releaseSigningProperties?.let {
+                signingConfig = signingConfigs.getByName("dayWeaveRelease")
+            }
         }
     }
 
