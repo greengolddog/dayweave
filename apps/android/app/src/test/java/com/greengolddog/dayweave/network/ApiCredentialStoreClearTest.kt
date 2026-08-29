@@ -83,6 +83,32 @@ class ApiCredentialStoreClearTest {
         assertEquals(0, backend.enqueueCount)
     }
 
+    @Test
+    fun changingUrlRequiresAndAtomicallyBindsAReplacementToken() {
+        val store = testStore(
+            InMemoryCredentialKeyAccess(),
+            clearPreferenceRecords = { preferences.edit().clear().commit() },
+        )
+        store.update(TEST_BASE_URL, TEST_TOKEN)
+        val first = store.snapshot()
+
+        store.update("$TEST_BASE_URL/", null)
+        assertEquals(first.baseUrl, store.snapshot().baseUrl)
+        assertEquals(TEST_TOKEN, store.authenticatedConfiguration()?.bearerToken)
+
+        assertThrows(InvalidApiConfigurationException::class.java) {
+            store.update("https://other.example.test/", null)
+        }
+        assertEquals(first.baseUrl, store.snapshot().baseUrl)
+        assertEquals(TEST_TOKEN, store.authenticatedConfiguration()?.bearerToken)
+
+        store.update("https://other.example.test/", "replacement-secret")
+        val replaced = store.snapshot()
+        assertEquals("https://other.example.test/", replaced.baseUrl)
+        assertTrue(replaced.configurationId != first.configurationId)
+        assertEquals("replacement-secret", store.authenticatedConfiguration()?.bearerToken)
+    }
+
     private fun testStore(
         keys: ApiCredentialKeyAccess,
         clearPreferenceRecords: () -> Boolean,

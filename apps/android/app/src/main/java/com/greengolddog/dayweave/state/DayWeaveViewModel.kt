@@ -7,7 +7,10 @@ import com.greengolddog.dayweave.DayWeaveApplication
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.sync.SuggestionSyncState
+import com.greengolddog.dayweave.sync.CanonicalSyncState
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 class DayWeaveViewModel(application: Application) : AndroidViewModel(application) {
@@ -15,18 +18,97 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val plannerStore = dayWeaveApplication.plannerStore
     private val suggestionSyncManager = dayWeaveApplication.suggestionSyncManager
     private val suggestionConnectionController = dayWeaveApplication.suggestionConnectionController
+    private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
+    val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
+
+    private var observedTimedResumeDeadline: Long? = null
+    private var timedResumeRetryAfterEpochMillis: Long = 0
+
+    init {
+        viewModelScope.launch {
+            while (isActive) {
+                delay(1_000)
+                plannerStore.tickActiveSession()
+                val deadline = plannerStore.state.value.activeSession?.pauseUntilEpochMillis
+                if (deadline == null) {
+                    observedTimedResumeDeadline = null
+                    timedResumeRetryAfterEpochMillis = 0
+                } else {
+                    if (observedTimedResumeDeadline != deadline) {
+                        observedTimedResumeDeadline = deadline
+                        timedResumeRetryAfterEpochMillis = 0
+                    }
+                    val now = System.currentTimeMillis()
+                    if (
+                        plannerStore.timedPauseReady() &&
+                        now >= timedResumeRetryAfterEpochMillis &&
+                        !canonicalSyncManager.state.value.isBusy &&
+                        resumeActiveIfAvailable()
+                    ) {
+                        // A successful resume clears the deadline. If the async action fails, retry
+                        // at a bounded cadence instead of suppressing this break forever.
+                        timedResumeRetryAfterEpochMillis = now + TIMED_RESUME_RETRY_MILLIS
+                    }
+                }
+            }
+        }
+    }
 
     fun navigate(destination: AppDestination) = plannerStore.navigate(destination)
-    fun startItem(id: String) = plannerStore.startItem(id)
-    fun pauseActive(minutes: Int? = null) = plannerStore.pauseActive(minutes)
-    fun resumeActive() = plannerStore.resumeActive()
-    fun completeActive() = plannerStore.completeActive()
-    fun skipActive() = plannerStore.skipActive()
-    fun doActiveLater() = plannerStore.doActiveLater()
+    fun startItem(id: String) {
+        if (isCanonicalBlock(id)) {
+            if (!plannerStore.state.value.isCanonicalPlanCurrent()) {
+                recompose()
+                return
+            }
+            if (canonicalSyncManager.state.value.isBusy) return
+            dayWeaveApplication.launchCanonicalAction { canonicalSyncManager.start(id) }
+        } else {
+            plannerStore.startItem(id)
+        }
+    }
+
+    fun pauseActive(minutes: Int? = null) {
+        withActiveBlock(
+            canonicalAction = { id -> canonicalSyncManager.pause(id, minutes) },
+            localAction = { plannerStore.pauseActive(minutes) },
+        )
+    }
+
+    fun resumeActive() {
+        resumeActiveIfAvailable()
+    }
+
+    private fun resumeActiveIfAvailable(): Boolean =
+        withActiveBlock(
+            canonicalAction = canonicalSyncManager::resume,
+            localAction = plannerStore::resumeActive,
+        )
+
+    fun completeActive() {
+        withActiveBlock(
+            canonicalAction = canonicalSyncManager::complete,
+            localAction = plannerStore::completeActive,
+        )
+    }
+
+    fun skipActive() {
+        withActiveBlock(
+            canonicalAction = canonicalSyncManager::skip,
+            localAction = plannerStore::skipActive,
+        )
+    }
+
+    fun doActiveLater() {
+        withActiveBlock(
+            canonicalAction = canonicalSyncManager::doLater,
+            localAction = plannerStore::doActiveLater,
+        )
+    }
     fun quickCapture(title: String, kind: ItemKind): Boolean = plannerStore.quickCapture(title, kind)
     fun approveSuggestion(id: String) {
         viewModelScope.launch { suggestionSyncManager.accept(id) }
@@ -45,14 +127,18 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun updateSuggestionConnection(baseUrl: String, bearerToken: String?) {
-        viewModelScope.launch {
-            suggestionConnectionController.update(baseUrl, bearerToken)
+        dayWeaveApplication.launchCanonicalAction {
+            if (suggestionConnectionController.update(baseUrl, bearerToken)) {
+                canonicalSyncManager.refreshAndCompose()
+            }
         }
     }
 
     fun clearSuggestionConnection() {
-        viewModelScope.launch {
-            suggestionConnectionController.forget()
+        dayWeaveApplication.launchCanonicalAction {
+            if (suggestionConnectionController.forget()) {
+                canonicalSyncManager.refreshAndCompose()
+            }
         }
     }
 
@@ -60,5 +146,29 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun toggleCompleted() = plannerStore.toggleCompleted()
     fun toggleQuietSuggestions() = plannerStore.toggleQuietSuggestions()
     fun toggleDynamicColor() = plannerStore.toggleDynamicColor()
-    fun recompose() = plannerStore.recompose()
+    fun recompose() {
+        if (canonicalSyncManager.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction { canonicalSyncManager.refreshAndCompose() }
+    }
+
+    private fun isCanonicalBlock(id: String): Boolean =
+        plannerStore.state.value.schedule.firstOrNull { it.id == id }?.canonicalItemId != null
+
+    private fun withActiveBlock(
+        canonicalAction: suspend (String) -> Unit,
+        localAction: () -> Unit,
+    ): Boolean {
+        val activeId = plannerStore.state.value.activeSession?.itemId ?: return false
+        if (isCanonicalBlock(activeId)) {
+            if (canonicalSyncManager.state.value.isBusy) return false
+            return dayWeaveApplication.launchCanonicalAction { canonicalAction(activeId) }
+        } else {
+            localAction()
+            return true
+        }
+    }
+
+    private companion object {
+        const val TIMED_RESUME_RETRY_MILLIS = 60_000L
+    }
 }

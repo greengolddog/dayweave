@@ -2,10 +2,14 @@ package com.greengolddog.dayweave.state
 
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.ActiveSession
+import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
 import kotlinx.coroutines.CancellationException
@@ -327,6 +331,102 @@ class PlannerStoreTest {
     }
 
     @Test
+    fun elapsedTimerAndTimedPauseUseMonotonicExecutionFields() {
+        var now = 0L
+        val block = ScheduleItem(
+            id = "timed",
+            title = "Timed focus",
+            kind = ItemKind.TASK,
+            startMinute = 9 * 60,
+            durationMinutes = 30,
+            status = ItemStatus.ACTIVE,
+        )
+        val store = PlannerStore(
+            initialState = DayWeaveUiState(
+                schedule = listOf(block),
+                activeSession = ActiveSession(
+                    itemId = block.id,
+                    elapsedMinutes = 0,
+                    isPaused = false,
+                    accumulatedSeconds = 0,
+                    runningSinceEpochMillis = 0,
+                ),
+            ),
+            nowEpochMillis = { now },
+        )
+
+        now = 61_000
+        assertTrue(store.tickActiveSession())
+        assertEquals(1, store.state.value.activeSession?.elapsedMinutes)
+        store.pauseActive(1)
+        assertFalse(store.timedPauseReady())
+
+        now = 121_000
+        assertTrue(store.timedPauseReady())
+        store.resumeActive()
+        now = 181_000
+        store.tickActiveSession()
+
+        assertEquals(2, store.state.value.activeSession?.elapsedMinutes)
+        assertFalse(store.state.value.activeSession?.isPaused ?: true)
+        assertNull(store.state.value.activeSession?.pauseUntilEpochMillis)
+    }
+
+    @Test
+    fun authoritativePlanStatusTransitionsPreserveAContinuouslyCorrectTimer() {
+        var now = 0L
+        val activeItem = canonicalItem(status = "in_progress", revision = 7)
+        val activeBlock = canonicalBlock(ItemStatus.ACTIVE, revision = 7)
+        val store = PlannerStore(
+            initialState = DayWeaveUiState(
+                canonicalItems = listOf(activeItem),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalDeltaCursor = "cursor-0",
+                schedule = listOf(activeBlock),
+                activeSession = ActiveSession(
+                    itemId = CANONICAL_BLOCK_ID,
+                    elapsedMinutes = 0,
+                    isPaused = false,
+                    accumulatedSeconds = 0,
+                    runningSinceEpochMillis = 0,
+                ),
+            ),
+            nowEpochMillis = { now },
+        )
+
+        now = 61_000
+        store.replaceCanonicalPlan(
+            canonicalUpdate(
+                item = canonicalItem(status = "paused", revision = 8),
+                block = canonicalBlock(ItemStatus.PAUSED, revision = 8),
+                cursor = "cursor-1",
+            ),
+        )
+
+        val paused = requireNotNull(store.state.value.activeSession)
+        assertTrue(paused.isPaused)
+        assertEquals(61L, paused.accumulatedSeconds)
+        assertEquals(1, paused.elapsedMinutes)
+        assertNull(paused.runningSinceEpochMillis)
+
+        now = 121_000
+        store.replaceCanonicalPlan(
+            canonicalUpdate(
+                item = canonicalItem(status = "in_progress", revision = 9),
+                block = canonicalBlock(ItemStatus.ACTIVE, revision = 9),
+                cursor = "cursor-2",
+            ),
+        )
+        assertFalse(requireNotNull(store.state.value.activeSession).isPaused)
+        assertEquals(121_000L, store.state.value.activeSession?.runningSinceEpochMillis)
+
+        now = 181_000
+        store.tickActiveSession()
+        assertEquals(2, store.state.value.activeSession?.elapsedMinutes)
+        assertEquals(61L, store.state.value.activeSession?.accumulatedSeconds)
+    }
+
+    @Test
     fun willDoLaterEndsSessionAndMovesItemOneHour() {
         val store = PlannerStore(DayWeaveUiState.preview())
         val original = store.state.value.activeItem ?: error("Preview must have an active item")
@@ -349,4 +449,67 @@ class PlannerStoreTest {
         remoteRevision = 1,
         remotePayloadJson = "{}",
     )
+
+    private fun canonicalItem(status: String, revision: Long) = CanonicalItemSnapshot(
+        id = CANONICAL_ITEM_ID,
+        kind = "task",
+        status = status,
+        title = "Canonical timer",
+        timezoneName = "UTC",
+        durationSeconds = 3_600,
+        flexibleConstraintsJson = "{}",
+        splitPolicyJson = "{\"type\":\"indivisible\"}",
+        importance = 50,
+        urgency = 50,
+        siblingOrder = 0,
+        isExecutable = true,
+        revision = revision,
+        createdAt = "1970-01-01T00:00:00Z",
+        updatedAt = "1970-01-01T00:00:00Z",
+    )
+
+    private fun canonicalBlock(status: ItemStatus, revision: Long) = ScheduleItem(
+        id = CANONICAL_BLOCK_ID,
+        title = "Canonical timer",
+        kind = ItemKind.TASK,
+        startMinute = 60,
+        durationMinutes = 60,
+        status = status,
+        canonicalItemId = CANONICAL_ITEM_ID,
+        canonicalRevision = revision,
+        absoluteStartAt = "1970-01-01T01:00:00Z",
+        absoluteEndAt = "1970-01-01T02:00:00Z",
+        planningZoneId = "UTC",
+        canonicalBlockKind = "planned",
+    )
+
+    private fun canonicalUpdate(
+        item: CanonicalItemSnapshot,
+        block: ScheduleItem,
+        cursor: String,
+    ) = CanonicalPlanUpdate(
+        items = listOf(item),
+        schedule = listOf(block),
+        syncOrigin = CANONICAL_ORIGIN,
+        deltaCursor = cursor,
+        inputDigest = "sha256:${"a".repeat(64)}",
+        generatedAt = "1970-01-01T00:00:00Z",
+        planningZoneId = "UTC",
+        rejectedItemCount = 0,
+        unscheduledItemCount = 0,
+        protectedFreeMinutes = 0,
+        dayScore = 100,
+        violationMessages = emptyList(),
+        violationCount = 0,
+        errorViolationCount = 0,
+        unscheduledWork = emptyList(),
+        occurrenceSeriesItemIds = emptyMap(),
+        message = "Updated",
+    )
+
+    private companion object {
+        const val CANONICAL_ORIGIN = "https://api.example.test/"
+        const val CANONICAL_ITEM_ID = "11111111-1111-4111-8111-111111111111"
+        const val CANONICAL_BLOCK_ID = "22222222-2222-4222-8222-222222222222"
+    }
 }

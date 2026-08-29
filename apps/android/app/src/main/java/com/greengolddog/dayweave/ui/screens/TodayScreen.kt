@@ -24,12 +24,14 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.ui.components.ActiveItemActions
 import com.greengolddog.dayweave.ui.components.MetricCard
 import com.greengolddog.dayweave.ui.components.ScheduleItemCard
+import com.greengolddog.dayweave.sync.CanonicalSyncState
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 
 @Composable
 fun TodayScreen(
     state: DayWeaveUiState,
+    syncState: CanonicalSyncState,
     onStart: (String) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -38,6 +40,8 @@ fun TodayScreen(
     onLater: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val isCurrentPlan = state.isCanonicalPlanCurrent()
+    val visibleTimeline = if (isCurrentPlan) state.visibleSchedule else emptyList()
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
@@ -50,10 +54,34 @@ fun TodayScreen(
                     style = MaterialTheme.typography.headlineSmall,
                 )
                 Text(
-                    state.scheduleMessage,
+                    if (isCurrentPlan) state.scheduleMessage else syncState.message,
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+            }
+        }
+
+        if (!isCurrentPlan) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text("Today’s plan is not available", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            state.canonicalPlanningDate()?.let { cachedDate ->
+                                "The encrypted plan is from $cachedDate and is hidden until today is recomposed."
+                            } ?: "No canonical plan has been composed for today yet.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
             }
         }
 
@@ -63,23 +91,25 @@ fun TodayScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 MetricCard(
-                    value = "${state.completedCount}/${state.schedule.size}",
+                    value = "${visibleTimeline.count { it.status == com.greengolddog.dayweave.model.ItemStatus.COMPLETED }}/${visibleTimeline.size}",
                     label = "done",
                     modifier = Modifier.weight(1f),
                 )
                 MetricCard(
-                    value = "${state.protectedFreeMinutes}m",
+                    value = if (isCurrentPlan) "${state.protectedFreeMinutes}m" else "—",
                     label = "protected",
                     modifier = Modifier.weight(1f),
                 )
                 MetricCard(
-                    value = state.dayScore.toString(),
+                    value = if (isCurrentPlan) state.dayScore.toString() else "—",
                     label = "day score",
                     modifier = Modifier.weight(1f),
                 )
             }
         }
 
+        // An already-running cross-midnight session remains resolvable, but stale scheduled work
+        // is quarantined and cannot be started.
         val activeItem = state.activeItem
         val activeSession = state.activeSession
         if (activeItem != null && activeSession != null) {
@@ -135,22 +165,56 @@ fun TodayScreen(
                     Icon(
                         Icons.Outlined.Shield,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.secondary,
+                        tint = if (state.scheduleErrorViolationCount > 0) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.secondary
+                        },
                     )
                     Text(
-                        "Hard limits protected",
+                        when {
+                            state.scheduleErrorViolationCount > 0 ->
+                                "${state.scheduleErrorViolationCount} hard conflict(s) need review"
+                            state.scheduleViolationCount > 0 ->
+                                "${state.scheduleViolationCount} planning warning(s)"
+                            else -> "No planner conflicts reported"
+                        },
                         style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (state.scheduleErrorViolationCount > 0) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
                     )
                 }
             }
         }
 
-        items(state.visibleSchedule, key = { it.id }) { item ->
+        if (state.scheduleViolationMessages.isNotEmpty()) {
+            item {
+                Card {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text("Planner review", style = MaterialTheme.typography.titleSmall)
+                        state.scheduleViolationMessages.take(3).forEach { warning ->
+                            Text(
+                                "• $warning",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        items(visibleTimeline, key = { it.id }) { item ->
             ScheduleItemCard(item = item, onStart = { onStart(item.id) })
         }
 
-        if (state.visibleSchedule.isEmpty()) {
+        if (visibleTimeline.isEmpty() && isCurrentPlan) {
             item {
                 Card {
                     Row(

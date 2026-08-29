@@ -12,7 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.CloudDone
+import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -37,6 +37,8 @@ fun CalendarScreen(
     state: DayWeaveUiState,
     modifier: Modifier = Modifier,
 ) {
+    val isCurrentPlan = state.isCanonicalPlanCurrent()
+    val visibleTimeline = if (isCurrentPlan) state.visibleSchedule else emptyList()
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(16.dp),
@@ -51,13 +53,17 @@ fun CalendarScreen(
                 Column {
                     Text("This week", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        "Firm plan · synced to Google Calendar",
+                        if (isCurrentPlan) {
+                            "Canonical schedule preview · Google connection is configured separately"
+                        } else {
+                            "Cached schedule is stale and hidden until today is recomposed"
+                        },
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
                 Icon(
-                    Icons.Outlined.CloudDone,
-                    contentDescription = "Synced",
+                    Icons.Outlined.CalendarMonth,
+                    contentDescription = "Canonical schedule preview",
                     tint = MaterialTheme.colorScheme.secondary,
                 )
             }
@@ -77,9 +83,12 @@ fun CalendarScreen(
                 ) {
                     Icon(Icons.Outlined.Lock, contentDescription = null)
                     Column {
-                        Text("2-hour freeze horizon", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            "Near-term blocks stay stable unless a hard conflict appears.",
+                            "2-hour near-term stability",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            "Assignments entirely inside the horizon are pinned; longer split plans use soft stability.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -99,7 +108,7 @@ fun CalendarScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(11.dp),
                 ) {
-                    state.visibleSchedule.forEach { item ->
+                    visibleTimeline.forEach { item ->
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,

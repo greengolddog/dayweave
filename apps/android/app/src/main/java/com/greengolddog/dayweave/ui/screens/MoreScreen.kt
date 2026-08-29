@@ -33,6 +33,8 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
+import com.greengolddog.dayweave.sync.CanonicalSyncPhase
+import com.greengolddog.dayweave.sync.CanonicalSyncState
 
 @Composable
 fun MoreScreen(
@@ -41,6 +43,7 @@ fun MoreScreen(
     onToggleQuietSuggestions: () -> Unit,
     onToggleDynamicColor: () -> Unit,
     suggestionSyncState: SuggestionSyncState,
+    canonicalSyncState: CanonicalSyncState,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -53,35 +56,57 @@ fun MoreScreen(
                 ListItem(
                     headlineContent = { Text("Personal workspace") },
                     supportingContent = {
-                        Text(
-                            when (suggestionSyncState.phase) {
+                        Column {
+                            Text(
+                                when (canonicalSyncState.phase) {
+                                    CanonicalSyncPhase.CONNECTED ->
+                                        "Canonical items and schedule connected"
+                                    CanonicalSyncPhase.SYNCING ->
+                                        "Syncing items and composing Today"
+                                    CanonicalSyncPhase.AUTH_REQUIRED ->
+                                        "Planner API authentication required"
+                                    CanonicalSyncPhase.NOT_CONFIGURED ->
+                                        "Planner API not configured"
+                                    CanonicalSyncPhase.OFFLINE ->
+                                        "Offline · encrypted cached plan available"
+                                    CanonicalSyncPhase.ERROR ->
+                                        "Canonical planner sync error"
+                                    CanonicalSyncPhase.READY ->
+                                        "Canonical planner sync ready"
+                                },
+                            )
+                            Text(
+                                when (suggestionSyncState.phase) {
                                 SuggestionSyncPhase.CONNECTED ->
-                                    "Encrypted offline · suggestions connected"
+                                    "Suggestions connected"
                                 SuggestionSyncPhase.SYNCING ->
-                                    "Encrypted offline · refreshing suggestions"
+                                    "Refreshing suggestions"
                                 SuggestionSyncPhase.AUTH_REQUIRED ->
-                                    "Encrypted offline · API authentication required"
+                                    "Suggestion authentication required"
                                 SuggestionSyncPhase.NOT_CONFIGURED ->
-                                    "Encrypted offline · API not configured"
+                                    "Suggestion API not configured"
                                 SuggestionSyncPhase.OFFLINE ->
-                                    "Encrypted offline · cached suggestions available"
+                                    "Cached suggestions available"
                                 SuggestionSyncPhase.ERROR ->
-                                    "Encrypted offline · suggestion sync error"
+                                    "Suggestion sync error"
                                 SuggestionSyncPhase.READY ->
-                                    "Encrypted offline · suggestion sync ready"
-                            },
-                        )
+                                    "Suggestion sync ready"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
                     },
                     leadingContent = { Icon(Icons.Outlined.AccountCircle, contentDescription = null) },
                     trailingContent = {
                         Icon(
-                            if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                            if (canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED) {
                                 Icons.Outlined.CloudDone
                             } else {
                                 Icons.Outlined.CloudOff
                             },
-                            contentDescription = suggestionSyncState.message,
-                            tint = if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                            contentDescription = canonicalSyncState.message,
+                            tint = if (canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED) {
                                 MaterialTheme.colorScheme.primary
                             } else {
                                 MaterialTheme.colorScheme.onSurfaceVariant

@@ -7,6 +7,7 @@ import android.security.keystore.KeyProperties
 import android.util.Base64
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
+import java.util.UUID
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
@@ -18,6 +19,7 @@ data class ApiConnectionSnapshot(
     val baseUrl: String?,
     val hasBearerToken: Boolean,
     val lastSuccessfulSyncEpochMillis: Long?,
+    val configurationId: String? = null,
 )
 
 /**
@@ -27,6 +29,7 @@ data class ApiConnectionSnapshot(
 class AuthenticatedApiConfiguration private constructor(
     val baseUrl: HttpUrl,
     internal val bearerToken: String,
+    internal val configurationId: String? = null,
 ) {
     override fun toString(): String =
         "AuthenticatedApiConfiguration(baseUrl=$baseUrl, bearerToken=<redacted>)"
@@ -44,6 +47,16 @@ class AuthenticatedApiConfiguration private constructor(
         ): AuthenticatedApiConfiguration = AuthenticatedApiConfiguration(
             baseUrl = normalizeBaseUrl(baseUrl, allowCleartextLoopback = true),
             bearerToken = validateBearerToken(bearerToken),
+        )
+
+        internal fun createBound(
+            baseUrl: String,
+            bearerToken: String,
+            configurationId: String,
+        ): AuthenticatedApiConfiguration = AuthenticatedApiConfiguration(
+            baseUrl = normalizeBaseUrl(baseUrl, allowCleartextLoopback = false),
+            bearerToken = validateBearerToken(bearerToken),
+            configurationId = configurationId,
         )
     }
 }
@@ -113,6 +126,7 @@ class KeystoreApiCredentialStore private constructor(
             lastSuccessfulSyncEpochMillis = preferences
                 .getLong(LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS, NO_SYNC_RECORDED)
                 .takeUnless { it == NO_SYNC_RECORDED },
+            configurationId = preferences.getString(CONFIGURATION_ID, null),
         )
     }
 
@@ -121,7 +135,13 @@ class KeystoreApiCredentialStore private constructor(
             val baseUrl = effectiveBaseUrl() ?: return@synchronized null
             val wrappedToken = preferences.getString(WRAPPED_BEARER_TOKEN, null)
                 ?: return@synchronized null
-            AuthenticatedApiConfiguration.create(baseUrl, unwrap(wrappedToken))
+            val configurationId = preferences.getString(CONFIGURATION_ID, null)
+                ?: throw SecureCredentialException("The API credential binding is unavailable")
+            AuthenticatedApiConfiguration.createBound(
+                baseUrl = baseUrl,
+                bearerToken = unwrap(wrappedToken),
+                configurationId = configurationId,
+            )
         }
 
     @SuppressLint("UseKtx")
@@ -130,12 +150,20 @@ class KeystoreApiCredentialStore private constructor(
             baseUrl.trim(),
             allowCleartextLoopback = false,
         ).toString()
+        val previousBaseUrl = effectiveBaseUrl()
+        if (bearerToken == null && previousBaseUrl != normalizedBaseUrl) {
+            throw InvalidApiConfigurationException(
+                "Enter a replacement bearer token when changing the API URL",
+            )
+        }
         val encodedToken = bearerToken?.let { token ->
             val validated = validateBearerToken(token)
             wrap(validated, getOrCreateWrappingKey())
         }
 
-        val editor = preferences.edit().putString(BASE_URL, normalizedBaseUrl)
+        val editor = preferences.edit()
+            .putString(BASE_URL, normalizedBaseUrl)
+            .putString(CONFIGURATION_ID, UUID.randomUUID().toString())
         if (encodedToken != null) editor.putString(WRAPPED_BEARER_TOKEN, encodedToken)
         check(editor.commit()) { "Unable to persist API connection settings" }
     }
@@ -237,6 +265,7 @@ class KeystoreApiCredentialStore private constructor(
             .remove(BASE_URL)
             .remove(WRAPPED_BEARER_TOKEN)
             .remove(LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS)
+            .remove(CONFIGURATION_ID)
             .commit()
 
     private fun hasWrappingKey(): Boolean = try {
@@ -282,6 +311,7 @@ class KeystoreApiCredentialStore private constructor(
         private const val BASE_URL = "base_url"
         private const val WRAPPED_BEARER_TOKEN = "wrapped_bearer_token"
         private const val LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS = "last_successful_sync_epoch_millis"
+        private const val CONFIGURATION_ID = "configuration_id"
         private const val NO_SYNC_RECORDED = -1L
         private const val WRAP_FORMAT = "v1"
         private const val KEY_SIZE_BITS = 256
@@ -357,6 +387,9 @@ private fun normalizeBaseUrl(rawBaseUrl: String, allowCleartextLoopback: Boolean
         parsed.newBuilder().addPathSegment("").build()
     }
 }
+
+internal fun normalizedHttpsApiBaseUrl(rawBaseUrl: String): String =
+    normalizeBaseUrl(rawBaseUrl.trim(), allowCleartextLoopback = false).toString()
 
 private fun validateBearerToken(token: String): String {
     if (token.isBlank() || token.any(Char::isWhitespace)) {

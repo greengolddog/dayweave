@@ -1,6 +1,8 @@
 package com.greengolddog.dayweave.model
 
 import java.time.LocalTime
+import java.time.Instant
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.serialization.Serializable
 
@@ -57,10 +59,43 @@ data class ScheduleItem(
     val isSplittable: Boolean = false,
     val note: String = "",
     val actualMinutes: Int? = null,
+    /** Canonical server identity. Null only for external fixed blocks or legacy local previews. */
+    val canonicalItemId: String? = null,
+    val occurrenceId: String? = null,
+    val canonicalRevision: Long? = null,
+    val sessionIndex: Int = 0,
+    /** Exact composed instants retained for DST-safe stability and overlap calculations. */
+    val absoluteStartAt: String? = null,
+    val absoluteEndAt: String? = null,
+    val planningZoneId: String? = null,
+    /** Server block kind, kept separate from UI flexibility for stability replay. */
+    val canonicalBlockKind: String? = null,
 ) {
     val endMinute: Int get() = startMinute + durationMinutes
 
-    fun timeRange(): String = "${formatMinutes(startMinute)}–${formatMinutes(endMinute)}"
+    fun timeRange(): String {
+        val startInstant = timelineInstant()
+        val endInstant = absoluteEndAt?.let { raw ->
+            runCatching { Instant.parse(raw) }.getOrNull()
+        }
+        val zone = planningZoneId?.let { raw ->
+            runCatching { ZoneId.of(raw) }.getOrNull()
+        }
+        if (startInstant != null && endInstant != null && zone != null) {
+            val start = startInstant.atZone(zone)
+            val end = endInstant.atZone(zone)
+            return if (start.offset != end.offset) {
+                "${start.toLocalTime().format(TIME_FORMAT)} ${start.offset}–" +
+                    "${end.toLocalTime().format(TIME_FORMAT)} ${end.offset}"
+            } else {
+                "${start.toLocalTime().format(TIME_FORMAT)}–${end.toLocalTime().format(TIME_FORMAT)}"
+            }
+        }
+        return "${formatMinutes(startMinute)}–${formatMinutes(endMinute)}"
+    }
+
+    fun timelineInstant(): Instant? =
+        absoluteStartAt?.let { raw -> runCatching { Instant.parse(raw) }.getOrNull() }
 
     private fun formatMinutes(total: Int): String {
         val normalized = total.coerceIn(0, 24 * 60 - 1)
@@ -72,12 +107,114 @@ data class ScheduleItem(
     }
 }
 
+/**
+ * Lossless encrypted cache of the canonical item wire contract.
+ *
+ * Structured recurrence and constraint documents remain raw JSON so a newer server field is not
+ * silently discarded by an older presentation model. They are interpreted only by the server
+ * scheduler; Android extracts a small, validated display subset after composition.
+ */
+@Serializable
+data class CanonicalItemSnapshot(
+    val id: String,
+    val kind: String,
+    val status: String,
+    val title: String,
+    val notes: String? = null,
+    val timezoneName: String,
+    val durationSeconds: Long? = null,
+    val deadlineAt: String? = null,
+    val earliestStartAt: String? = null,
+    val recurrenceJson: String? = null,
+    val flexibleConstraintsJson: String,
+    val splitPolicyJson: String,
+    val importance: Int,
+    val urgency: Int,
+    val parentId: String? = null,
+    val siblingOrder: Long,
+    val isExecutable: Boolean,
+    val revision: Long,
+    val createdAt: String,
+    val updatedAt: String,
+    val completedAt: String? = null,
+    val deletedAt: String? = null,
+)
+
+@Serializable
+data class RecurrenceOutcomeSnapshot(
+    val itemId: String,
+    val status: ItemStatus,
+    val resolvedAt: String,
+)
+
+@Serializable
+data class RecurrenceMoveSnapshot(
+    val itemId: String,
+    val startAt: String,
+    val endAt: String,
+    val movedAt: String,
+)
+
+/**
+ * Durable uncertainty fence for a canonical item replacement.
+ *
+ * It is written before the request leaves the device and cleared only by an exact response or a
+ * later authoritative delta+preview cycle. This lets startup reconcile a request whose response
+ * was lost without inventing local success or issuing a different idempotency key.
+ */
+@Serializable
+data class PendingCanonicalMutation(
+    val idempotencyKey: String,
+    val syncOrigin: String,
+    val itemId: String,
+    val expectedRevision: Long,
+    val targetStatus: String,
+    val startedAt: String,
+    val replacementRequestJson: String,
+    val focusedBlockId: String,
+    val displayStatus: ItemStatus,
+    val pauseLabel: String? = null,
+    val pauseMinutes: Int? = null,
+)
+
+@Serializable
+data class UnscheduledWorkSnapshot(
+    val itemId: String,
+    val occurrenceId: String? = null,
+    val remainingMinutes: Long,
+    val reason: String,
+)
+
+/** One atomically persisted server reconciliation. */
+data class CanonicalPlanUpdate(
+    val items: List<CanonicalItemSnapshot>,
+    val schedule: List<ScheduleItem>,
+    val syncOrigin: String,
+    val deltaCursor: String,
+    val inputDigest: String,
+    val generatedAt: String,
+    val planningZoneId: String,
+    val rejectedItemCount: Int,
+    val unscheduledItemCount: Int,
+    val protectedFreeMinutes: Int,
+    val dayScore: Int,
+    val violationMessages: List<String>,
+    val violationCount: Int,
+    val errorViolationCount: Int,
+    val unscheduledWork: List<UnscheduledWorkSnapshot>,
+    val occurrenceSeriesItemIds: Map<String, String>,
+    val message: String,
+)
+
 @Serializable
 data class ActiveSession(
     val itemId: String,
     val elapsedMinutes: Int,
     val isPaused: Boolean,
     val pauseLabel: String? = null,
+    val accumulatedSeconds: Long = elapsedMinutes.toLong() * 60L,
+    val runningSinceEpochMillis: Long? = null,
+    val pauseUntilEpochMillis: Long? = null,
 )
 
 @Serializable
@@ -151,11 +288,39 @@ data class DayWeaveUiState(
     val showCompleted: Boolean = true,
     val quietSuggestions: Boolean = true,
     val useDynamicColor: Boolean = false,
+    val canonicalItems: List<CanonicalItemSnapshot> = emptyList(),
+    val canonicalSyncOrigin: String? = null,
+    val canonicalDeltaCursor: String? = null,
+    val scheduleInputDigest: String? = null,
+    val scheduleGeneratedAt: String? = null,
+    val schedulePlanningZoneId: String? = null,
+    val rejectedCanonicalItemCount: Int = 0,
+    val unscheduledCanonicalItemCount: Int = 0,
+    val scheduleViolationMessages: List<String> = emptyList(),
+    val scheduleViolationCount: Int = 0,
+    val scheduleErrorViolationCount: Int = 0,
+    /** Per-occurrence outcomes retained until the API exposes cross-device occurrence mutations. */
+    val recurrenceOutcomes: Map<String, RecurrenceOutcomeSnapshot> = emptyMap(),
+    val recurrenceMoves: Map<String, RecurrenceMoveSnapshot> = emptyMap(),
+    /** Last real completion instant by recurring canonical item. */
+    val recurrenceCompletionAnchors: Map<String, String> = emptyMap(),
+    val pendingCanonicalMutation: PendingCanonicalMutation? = null,
+    val unscheduledWork: List<UnscheduledWorkSnapshot> = emptyList(),
+    /** Materialized occurrence id to the recurring root that owns its context/actions. */
+    val occurrenceSeriesItemIds: Map<String, String> = emptyMap(),
 ) {
     val visibleSchedule: List<ScheduleItem>
         get() = schedule
             .filter { showCompleted || it.status != ItemStatus.COMPLETED }
-            .sortedBy(ScheduleItem::startMinute)
+            .sortedWith { left, right ->
+                val leftInstant = left.timelineInstant()
+                val rightInstant = right.timelineInstant()
+                if (leftInstant != null && rightInstant != null) {
+                    leftInstant.compareTo(rightInstant)
+                } else {
+                    left.startMinute.compareTo(right.startMinute)
+                }
+            }
 
     val activeItem: ScheduleItem?
         get() = activeSession?.let { session -> schedule.firstOrNull { it.id == session.itemId } }
@@ -163,6 +328,26 @@ data class DayWeaveUiState(
     val completedCount: Int get() = schedule.count { it.status == ItemStatus.COMPLETED }
     val pendingSuggestionCount: Int
         get() = suggestions.count { it.disposition == SuggestionDisposition.PENDING }
+
+    fun canonicalPlanningDate(): java.time.LocalDate? {
+        val generated = scheduleGeneratedAt ?: return null
+        val zone = schedulePlanningZoneId ?: return null
+        return runCatching {
+            Instant.parse(generated).atZone(ZoneId.of(zone)).toLocalDate()
+        }.getOrNull()
+    }
+
+    fun isCanonicalPlanCurrent(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): Boolean {
+        if (canonicalSyncOrigin == null) return true
+        val zone = schedulePlanningZoneId?.let { raw ->
+            runCatching { ZoneId.of(raw) }.getOrNull()
+        } ?: return false
+        return zone == currentZone &&
+            canonicalPlanningDate() == reference.atZone(currentZone).toLocalDate()
+    }
 
     companion object {
         fun preview(): DayWeaveUiState = DayWeaveUiState(

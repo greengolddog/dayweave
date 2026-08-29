@@ -27,10 +27,15 @@ class RoomPlannerStateRepository(
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
-        check(snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V1) {
-            "Unsupported planner snapshot format"
+        when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V2 -> SNAPSHOT_JSON.decodeFromString(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V1 -> {
+                val migrated = LEGACY_SNAPSHOT_JSON.decodeFromString<DayWeaveUiState>(snapshot.payload)
+                save(migrated)
+                migrated
+            }
+            else -> error("Unsupported planner snapshot format")
         }
-        SNAPSHOT_JSON.decodeFromString<DayWeaveUiState>(snapshot.payload)
     }
 
     override suspend fun save(state: DayWeaveUiState) {
@@ -39,13 +44,17 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(state),
                 updatedAtEpochMillis = nowEpochMillis(),
-                payloadFormat = PlannerSnapshotFormats.JSON_V1,
+                payloadFormat = PlannerSnapshotFormats.JSON_V2,
             ),
         )
     }
 
     private companion object {
         val SNAPSHOT_JSON = Json {
+            encodeDefaults = true
+            ignoreUnknownKeys = false
+        }
+        val LEGACY_SNAPSHOT_JSON = Json {
             encodeDefaults = true
             ignoreUnknownKeys = true
         }

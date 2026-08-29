@@ -4,19 +4,24 @@ import android.app.Application
 import android.util.Log
 import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
+import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.SuggestionConnectionController
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
+import com.greengolddog.dayweave.sync.CanonicalSyncManager
+import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val canonicalActionGate = CanonicalActionGate()
 
     val plannerStore: PlannerStore by lazy {
         PlannerStore(
@@ -47,6 +52,14 @@ class DayWeaveApplication : Application() {
         )
     }
 
+    val canonicalSyncManager: CanonicalSyncManager by lazy {
+        CanonicalSyncManager(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpCanonicalPlannerTransport(),
+        )
+    }
+
     val suggestionSyncSchedulingCoordinator: SuggestionSyncSchedulingCoordinator by lazy {
         SuggestionSyncSchedulingCoordinator(
             credentialStore = apiCredentialStore,
@@ -58,12 +71,27 @@ class DayWeaveApplication : Application() {
         SuggestionConnectionController(
             syncManager = suggestionSyncManager,
             schedulingCoordinator = suggestionSyncSchedulingCoordinator,
+            canonicalSyncManager = canonicalSyncManager,
         )
     }
 
     override fun onCreate() {
         super.onCreate()
         suggestionSyncSchedulingCoordinator.onAppStart()
+        persistenceScope.launch { canonicalSyncManager.refreshAndCompose() }
+    }
+
+    /** Canonical actions outlive a transient screen/ViewModel so responses are always reconciled. */
+    fun launchCanonicalAction(action: suspend () -> Unit): Boolean {
+        if (!canonicalActionGate.tryEnter()) return false
+        persistenceScope.launch {
+            try {
+                action()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+        return true
     }
 
     private companion object {

@@ -167,6 +167,31 @@ fun ApiConnectionDialog(
 ) {
     var baseUrl by remember(currentBaseUrl) { mutableStateOf(currentBaseUrl) }
     var bearerToken by remember { mutableStateOf("") }
+    var confirmForget by remember { mutableStateOf(false) }
+    if (confirmForget) {
+        AlertDialog(
+            onDismissRequest = { confirmForget = false },
+            title = { Text("Forget API connection?") },
+            text = {
+                Text(
+                    "This removes the device-bound bearer token and quarantines the cached canonical plan. If an item action is still in flight, its server outcome may remain unknown.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        bearerToken = ""
+                        confirmForget = false
+                        onForget()
+                    },
+                ) { Text("Forget connection") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmForget = false }) { Text("Keep connection") }
+            },
+        )
+        return
+    }
     AlertDialog(
         onDismissRequest = {
             bearerToken = ""
@@ -198,7 +223,15 @@ fun ApiConnectionDialog(
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text(if (hasStoredToken) "Replacement bearer token" else "Bearer token") },
                     supportingText = {
-                        if (hasStoredToken) Text("Leave blank to keep the encrypted token already on this device.")
+                        if (hasStoredToken) {
+                            Text(
+                                if (baseUrl.trim() == currentBaseUrl.trim()) {
+                                    "Leave blank to keep the encrypted token already on this device."
+                                } else {
+                                    "Changing the API URL requires a replacement token."
+                                },
+                            )
+                        }
                     },
                     singleLine = true,
                     visualTransformation = PasswordVisualTransformation(),
@@ -217,7 +250,10 @@ fun ApiConnectionDialog(
                     onSave(baseUrl, submittedToken)
                 },
                 enabled = baseUrl.trim().startsWith("https://", ignoreCase = true) &&
-                    (hasStoredToken || bearerToken.isNotBlank()),
+                    (
+                        bearerToken.isNotBlank() ||
+                            (hasStoredToken && baseUrl.trim() == currentBaseUrl.trim())
+                    ),
             ) { Text("Save & refresh") }
         },
         dismissButton = {
@@ -225,8 +261,7 @@ fun ApiConnectionDialog(
                 if (hasStoredToken) {
                     TextButton(
                         onClick = {
-                            bearerToken = ""
-                            onForget()
+                            confirmForget = true
                         },
                     ) { Text("Forget") }
                 }

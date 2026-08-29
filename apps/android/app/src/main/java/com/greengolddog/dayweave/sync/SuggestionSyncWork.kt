@@ -74,27 +74,64 @@ class SuggestionSyncSchedulingCoordinator(
 class SuggestionConnectionController(
     private val syncManager: SuggestionSyncManager,
     private val schedulingCoordinator: SuggestionSyncSchedulingCoordinator,
+    private val canonicalSyncManager: CanonicalSyncManager? = null,
 ) {
     private val settingsMutex = Mutex()
 
     suspend fun update(baseUrl: String, bearerToken: String?): Boolean = settingsMutex.withLock {
-        if (!syncManager.updateConnection(baseUrl, bearerToken)) return@withLock false
-        schedulingCoordinator.onConfigurationSaved()
-        true
+        try {
+            withCanonicalConfigurationUpdateLock(baseUrl) {
+                if (!syncManager.updateConnection(baseUrl, bearerToken)) {
+                    return@withCanonicalConfigurationUpdateLock false
+                }
+                schedulingCoordinator.onConfigurationSaved()
+                true
+            }
+        } catch (_: CanonicalConfigurationChangeBlockedException) {
+            false
+        } catch (_: CanonicalAbandonmentPersistenceException) {
+            false
+        }
     }
 
     suspend fun forget(): Boolean = settingsMutex.withLock {
         try {
+            canonicalSyncManager?.forgetConfiguration(
+                cancelBackgroundWork = {
+                    try {
+                        schedulingCoordinator.cancelBeforeCredentialClear()
+                        true
+                    } catch (error: CancellationException) {
+                        throw error
+                    } catch (error: Exception) {
+                        syncManager.reportCredentialClearBlocked()
+                        false
+                    }
+                },
+                clearCredentials = syncManager::clearConnection,
+            ) ?: forgetWithoutCanonicalManager()
+        } catch (_: CanonicalConfigurationChangeBlockedException) {
+            false
+        } catch (_: CanonicalAbandonmentPersistenceException) {
+            false
+        }
+    }
+
+    private suspend fun <T> withCanonicalConfigurationUpdateLock(
+        baseUrl: String,
+        block: suspend () -> T,
+    ): T = canonicalSyncManager?.withConfigurationUpdateLock(baseUrl, block) ?: block()
+
+    private suspend fun forgetWithoutCanonicalManager(): Boolean {
+        return try {
             schedulingCoordinator.cancelBeforeCredentialClear()
+            syncManager.clearConnection()
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             syncManager.reportCredentialClearBlocked()
-            return@withLock false
+            false
         }
-        // Clear is intentionally second. Even a partial Keystore/preferences failure therefore
-        // leaves both unique work paths cancelled rather than able to race with half-cleared data.
-        syncManager.clearConnection()
     }
 }
 

@@ -37,11 +37,12 @@ private object PlannerSnapshotEntityIds {
 
 object PlannerSnapshotFormats {
     const val JSON_V1 = "json-v1"
+    const val JSON_V2 = "json-v2-canonical-execution"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -56,6 +57,14 @@ object PlannerDatabaseMigrations {
                     "ADD COLUMN payloadFormat TEXT NOT NULL DEFAULT '${PlannerSnapshotFormats.JSON_V1}'",
             )
         }
+    }
+
+    /**
+     * No columns change. Advancing the database version makes rollback fail closed while the
+     * repository migrates each encrypted JSON payload from v1 to the strict v2 contract.
+     */
+    val MIGRATION_2_3 = object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
 }
 
@@ -96,7 +105,10 @@ object PlannerDatabaseFactory {
         )
             .openHelperFactory(sqlCipherFactory)
             .setJournalMode(RoomDatabase.JournalMode.WRITE_AHEAD_LOGGING)
-            .addMigrations(PlannerDatabaseMigrations.MIGRATION_1_2)
+            .addMigrations(
+                PlannerDatabaseMigrations.MIGRATION_1_2,
+                PlannerDatabaseMigrations.MIGRATION_2_3,
+            )
             .build()
     }
 }

@@ -48,6 +48,7 @@ import com.greengolddog.dayweave.ui.screens.MoreScreen
 import com.greengolddog.dayweave.ui.screens.TodayScreen
 import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
+import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 
 @Composable
 fun DayWeaveApp(viewModel: DayWeaveViewModel = viewModel()) {
@@ -101,6 +102,7 @@ private fun PlannerPersistenceFailureScreen() {
 private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
+    val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
     var showApiConnection by remember { mutableStateOf(false) }
@@ -129,15 +131,30 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                             Icon(Icons.Outlined.AutoAwesome, contentDescription = "Recompose schedule")
                         }
                     }
-                    val syncIcon = when (suggestionSyncState.phase) {
-                        SuggestionSyncPhase.CONNECTED -> Icons.Outlined.CloudDone
-                        SuggestionSyncPhase.SYNCING -> Icons.Outlined.Sync
+                    val planningSurface = state.destination == AppDestination.TODAY ||
+                        state.destination == AppDestination.CALENDAR
+                    val syncIcon = when {
+                        planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED ->
+                            Icons.Outlined.CloudDone
+                        planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.SYNCING ->
+                            Icons.Outlined.Sync
+                        !planningSurface && suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED ->
+                            Icons.Outlined.CloudDone
+                        !planningSurface && suggestionSyncState.phase == SuggestionSyncPhase.SYNCING ->
+                            Icons.Outlined.Sync
                         else -> Icons.Outlined.CloudOff
                     }
                     Icon(
                         syncIcon,
-                        contentDescription = suggestionSyncState.message,
-                        tint = if (suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED) {
+                        contentDescription = if (planningSurface) {
+                            canonicalSyncState.message
+                        } else {
+                            suggestionSyncState.message
+                        },
+                        tint = if (
+                            (planningSurface && canonicalSyncState.phase == CanonicalSyncPhase.CONNECTED) ||
+                            (!planningSurface && suggestionSyncState.phase == SuggestionSyncPhase.CONNECTED)
+                        ) {
                             MaterialTheme.colorScheme.primary
                         } else {
                             MaterialTheme.colorScheme.onSurfaceVariant
@@ -182,6 +199,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         when (state.destination) {
             AppDestination.TODAY -> TodayScreen(
                 state = state,
+                syncState = canonicalSyncState,
                 onStart = viewModel::startItem,
                 onPause = { showPauseChooser = true },
                 onResume = viewModel::resumeActive,
@@ -215,6 +233,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onToggleQuietSuggestions = viewModel::toggleQuietSuggestions,
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
                 suggestionSyncState = suggestionSyncState,
+                canonicalSyncState = canonicalSyncState,
                 modifier = Modifier.padding(innerPadding),
             )
         }
