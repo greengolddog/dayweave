@@ -96,13 +96,16 @@ request, weekly schedule, and manual invocation. It fails on:
 - high or critical vulnerabilities or embedded secrets in the built API image.
 
 Dependabot checks Cargo, Gradle, Swift Package Manager, Docker, and GitHub
-Actions weekly. Findings are updates to review, not authorization to bypass the
-normal build, test, migration, or external-effect checks.
+Actions weekly, and Dependabot security updates are enabled. Findings are
+updates to review, not authorization to bypass the normal build, test,
+migration, or external-effect checks.
 
-GitHub CodeQL and Dependency Review are intentionally not configured: GitHub
-does not make those Code Security features available to an ordinary personal
-private repository. The repository uses plan-independent scanners so a green
-security workflow does not depend on a paid GitHub security product.
+The public repository also has GitHub secret scanning, push protection, and
+CodeQL default setup enabled. Those hosted controls supplement the checked-in
+scanner; they are not a reason to place a credential in a commit, example file,
+issue, build log, or artifact. Dependency Review is not yet a release gate. The
+existing workflow remains plan-independent so its core checks do not depend on
+an optional hosted security product.
 
 ## Sensitive-item disclosure policy
 

@@ -28,5 +28,5 @@ documented in [`docs/scheduling-api.md`](docs/scheduling-api.md).
 
 ## Status
 
-Active implementation. The private repository is intentionally unlicensed for
-public reuse; see `LICENSE.md`.
+Active implementation. The source is publicly visible for inspection, but it
+is proprietary and is not licensed for reuse; see `LICENSE.md`.

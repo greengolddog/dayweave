@@ -315,7 +315,7 @@ The conversation briefly reused question numbers 164 and 165 before returning to
 - **Google notification source:** notification ownership may be app, Google, or both, configurable by category.
 - **Background behavior:** macOS uses a launch-at-login helper where needed; Android uses normal background and push mechanisms.
 - **Network scope:** the product is allowed to use full remote AI and Google services under explicit account/privacy controls.
-- **License:** private and proprietary; no public open-source license grant.
+- **License:** publicly visible and proprietary; no open-source license grant.
 - **Performance targets:** cold launch under 2 seconds on target hardware; smooth 60 fps interaction; typical day recomposition under 1 second; complex 90-day recomposition under 10 seconds; online changes visible across devices within 10 seconds under normal connectivity.
 - **Documentation:** architecture, setup, operations, recovery, security, and user documentation are part of the product—not optional handoff work.
 - **Definition of complete:** backend, polished macOS and Android clients, deterministic scheduler, Google Calendar and Tasks, embedded Codex assistant, external MCP/skill integration, deployment, automated tests, documentation, and the seven-day trial. WHOOP is explicitly deferred; Android Health Connect is not.
