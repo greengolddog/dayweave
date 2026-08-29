@@ -13,8 +13,11 @@ struct CalendarDestinationView: View {
     }
 
     private var selectedBlocks: [ScheduleBlock] {
-        store.blocks
-            .filter { calendar.isDate($0.start, inSameDayAs: selectedDate) }
+        let start = calendar.startOfDay(for: selectedDate)
+        let end = calendar.date(byAdding: .day, value: 1, to: start)
+            ?? start.addingTimeInterval(86_400)
+        return store.blocks
+            .filter { $0.end > start && $0.start < end }
             .sorted { $0.start < $1.start }
     }
 
@@ -100,13 +103,13 @@ private struct CalendarAgendaRow: View {
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .trailing, spacing: 3) {
-                Text(block.start.formatted(date: .omitted, time: .shortened))
+                Text(block.startTimeLabel)
                     .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                Text(block.end.formatted(date: .omitted, time: .shortened))
+                Text(block.endTimeLabel)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            .frame(width: 70)
+            .frame(width: 108)
             RoundedRectangle(cornerRadius: 3)
                 .fill(block.kind.color)
                 .frame(width: 5, height: 48)
@@ -139,7 +142,13 @@ struct HabitsDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
 
     private var habits: [ScheduleBlock] {
-        store.blocks.filter { $0.kind == .habit }.sorted { $0.start < $1.start }
+        let calendar = Calendar.autoupdatingCurrent
+        let start = calendar.startOfDay(for: Date())
+        let end = calendar.date(byAdding: .day, value: 1, to: start)
+            ?? start.addingTimeInterval(86_400)
+        return store.blocks
+            .filter { $0.kind == .habit && $0.end > start && $0.start < end }
+            .sorted { $0.start < $1.start }
     }
 
     var body: some View {
@@ -158,8 +167,15 @@ struct HabitsDestinationView: View {
                 ForEach(habits) { habit in
                     PlanningCard(block: habit, detail: habit.notes) {
                         Button("Complete") { store.complete(habit.id) }
+                            .disabled(!store.canMutate(habit))
                         Button("Skipped") { store.skip(habit.id) }
+                            .disabled(!store.canMutate(habit))
                         Button("Will do later") { store.doLater(habit.id) }
+                            .disabled(
+                                !store.canMutate(habit)
+                                    || !habit.isFlexible
+                                    || habit.isHardConstraint
+                            )
                     }
                 }
             }
@@ -232,6 +248,7 @@ struct GoalsDestinationView: View {
                     PlanningCard(block: goal, detail: goal.notes) {
                         Button("Open") { store.select(goal) }
                         Button("Complete") { store.complete(goal.id) }
+                            .disabled(!store.canMutate(goal))
                     }
                 }
             }

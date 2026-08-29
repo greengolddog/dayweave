@@ -1,10 +1,102 @@
 import Foundation
 
+struct JSONNumber: Codable, Equatable, Sendable, ExpressibleByIntegerLiteral, ExpressibleByFloatLiteral {
+    private enum Storage: Sendable {
+        case signed(Int64, locallyExact: Bool)
+        case unsigned(UInt64, locallyExact: Bool)
+        case decimal(Decimal)
+    }
+
+    private let storage: Storage
+
+    init(integerLiteral value: Int64) {
+        storage = .signed(value, locallyExact: true)
+    }
+
+    init(floatLiteral value: Double) {
+        storage = .decimal(Decimal(value))
+    }
+
+    init(_ value: UInt64) {
+        storage = .unsigned(value, locallyExact: true)
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let value = try? container.decode(Int64.self) {
+            // Decoder APIs do not reveal whether the wire token was `1`,
+            // `1.0`, or `1e0`. Preserve the exact numeric value for display,
+            // but conservatively deny arbitrary-JSON replacement.
+            storage = .signed(value, locallyExact: false)
+        } else if let value = try? container.decode(UInt64.self) {
+            storage = .unsigned(value, locallyExact: false)
+        } else if let value = try? container.decode(Decimal.self) {
+            // JSONDecoder does not expose a decimal's original token. Retain it
+            // for display/cache purposes, but never claim it can be rewritten
+            // byte-for-byte by a full-item replacement.
+            storage = .decimal(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON number"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch storage {
+        case let .signed(value, _): try container.encode(value)
+        case let .unsigned(value, _): try container.encode(value)
+        case let .decimal(value): try container.encode(value)
+        }
+    }
+
+    var exactUInt32: UInt32? {
+        switch storage {
+        case let .signed(value, _) where value >= 0 && value <= Int64(UInt32.max):
+            UInt32(value)
+        case let .unsigned(value, _) where value <= UInt64(UInt32.max):
+            UInt32(value)
+        default:
+            nil
+        }
+    }
+
+    var supportsLosslessRoundTrip: Bool {
+        switch storage {
+        case let .signed(_, locallyExact), let .unsigned(_, locallyExact): locallyExact
+        case .decimal: false
+        }
+    }
+
+    var displayDescription: String {
+        switch storage {
+        case let .signed(value, _): String(value)
+        case let .unsigned(value, _): String(value)
+        case let .decimal(value): NSDecimalNumber(decimal: value).stringValue
+        }
+    }
+
+    static func == (left: Self, right: Self) -> Bool {
+        switch (left.storage, right.storage) {
+        case let (.signed(left, _), .signed(right, _)): left == right
+        case let (.unsigned(left, _), .unsigned(right, _)): left == right
+        case let (.signed(left, _), .unsigned(right, _)) where left >= 0:
+            UInt64(left) == right
+        case let (.unsigned(left, _), .signed(right, _)) where right >= 0:
+            left == UInt64(right)
+        case let (.decimal(left), .decimal(right)): left == right
+        default: false
+        }
+    }
+}
+
 enum JSONValue: Codable, Equatable, Sendable {
     case object([String: JSONValue])
     case array([JSONValue])
     case string(String)
-    case number(Double)
+    case number(JSONNumber)
     case bool(Bool)
     case null
 
@@ -14,7 +106,7 @@ enum JSONValue: Codable, Equatable, Sendable {
             self = .null
         } else if let value = try? container.decode(Bool.self) {
             self = .bool(value)
-        } else if let value = try? container.decode(Double.self) {
+        } else if let value = try? container.decode(JSONNumber.self) {
             self = .number(value)
         } else if let value = try? container.decode(String.self) {
             self = .string(value)
@@ -41,6 +133,42 @@ enum JSONValue: Codable, Equatable, Sendable {
         case .null: try container.encodeNil()
         }
     }
+
+    var supportsLosslessRoundTrip: Bool {
+        switch self {
+        case let .object(value): value.values.allSatisfy(\.supportsLosslessRoundTrip)
+        case let .array(value): value.allSatisfy(\.supportsLosslessRoundTrip)
+        case let .number(value): value.supportsLosslessRoundTrip
+        case .string, .bool, .null: true
+        }
+    }
+
+    var displayDescription: String {
+        switch self {
+        case let .object(value):
+            let rendered = value.keys.sorted().map { key in
+                let description = value[key]?.displayDescription ?? "null"
+                return "\(key): \(description)"
+            }
+            return "{" + rendered.joined(separator: ", ") + "}"
+        case let .array(value):
+            return "[" + value.map(\.displayDescription).joined(separator: ", ") + "]"
+        case let .string(value): return value
+        case let .number(value): return value.displayDescription
+        case let .bool(value): return value ? "true" : "false"
+        case .null: return "null"
+        }
+    }
+}
+
+func makeDayWeaveEphemeralSession() -> URLSession {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.urlCredentialStorage = nil
+    return URLSession(configuration: configuration)
 }
 
 enum DayWeaveProposalSource: Codable, Equatable, Hashable, Sendable {
@@ -250,10 +378,18 @@ extension DayWeaveAPIBaseURLError: LocalizedError {
 struct DayWeaveAPIBaseURL: Equatable, Sendable {
     let url: URL
 
+    var credentialOriginIdentifier: String {
+        canonicalComponents(includeBasePath: false)?.string ?? ""
+    }
+
+    var canonicalConfigurationIdentifier: String {
+        canonicalComponents(includeBasePath: true)?.string ?? ""
+    }
+
     init(_ value: String) throws {
         let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { throw DayWeaveAPIBaseURLError.empty }
-        guard var components = URLComponents(string: value),
+        guard let components = URLComponents(string: value),
               let scheme = components.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
               let host = components.host?.lowercased(),
@@ -266,13 +402,10 @@ struct DayWeaveAPIBaseURL: Equatable, Sendable {
         guard components.query == nil, components.fragment == nil else {
             throw DayWeaveAPIBaseURLError.queryOrFragmentNotAllowed
         }
-        if scheme == "http", !Self.isLoopback(host) {
+        if scheme == "http", !Self.isLoopback(Self.unbracketExactlyOnce(host)) {
             throw DayWeaveAPIBaseURLError.insecureRemoteHTTP
         }
 
-        while components.path.count > 1, components.path.hasSuffix("/") {
-            components.path.removeLast()
-        }
         guard let normalizedURL = components.url else {
             throw DayWeaveAPIBaseURLError.notAbsoluteHTTPURL
         }
@@ -296,8 +429,65 @@ struct DayWeaveAPIBaseURL: Equatable, Sendable {
         return endpoint
     }
 
+    func hasSameOrigin(as other: Self) -> Bool {
+        credentialOriginIdentifier == other.credentialOriginIdentifier
+            && !credentialOriginIdentifier.isEmpty
+    }
+
     private static func isLoopback(_ host: String) -> Bool {
-        host == "localhost" || host == "127.0.0.1" || host == "::1"
+        let address = host.split(separator: "%", maxSplits: 1, omittingEmptySubsequences: false)[0]
+        return address == "localhost" || address == "127.0.0.1" || address == "::1"
+    }
+
+    private static func unbracketExactlyOnce(_ host: String) -> String {
+        guard host.first == "[", host.last == "]", host.count >= 2 else { return host }
+        return String(host.dropFirst().dropLast())
+    }
+
+    private static func effectivePort(for url: URL, scheme: String) -> Int? {
+        if let port = url.port { return port }
+        return defaultPort(for: scheme)
+    }
+
+    private static func defaultPort(for scheme: String) -> Int? {
+        switch scheme {
+        case "http": 80
+        case "https": 443
+        default: nil
+        }
+    }
+
+    private func canonicalComponents(includeBasePath: Bool) -> URLComponents? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              let encodedHost = components.percentEncodedHost,
+              !encodedHost.isEmpty else { return nil }
+        components.scheme = scheme
+        // Reassign only URLComponents' already validated encoded spelling.
+        // Constructing `[\(url.host)]` can fatal for scoped IPv6 because the
+        // decoded `%` is not legal in `percentEncodedHost`.
+        components.percentEncodedHost = encodedHost.lowercased()
+        if Self.effectivePort(for: url, scheme: scheme) == Self.defaultPort(for: scheme) {
+            components.port = nil
+        }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        if includeBasePath {
+            var path = components.percentEncodedPath
+            if path == "/" {
+                path = ""
+            } else if path.hasSuffix("/") {
+                // Treat one conventional trailing separator as spelling, but
+                // preserve additional empty path segments as real identity.
+                path.removeLast()
+            }
+            components.percentEncodedPath = path
+        } else {
+            components.percentEncodedPath = ""
+        }
+        return components
     }
 }
 
@@ -307,6 +497,7 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     case invalidEndpoint
     case transport(URLError.Code)
     case nonHTTPResponse
+    case responseTooLarge(limitBytes: Int)
     case server(statusCode: Int, code: String?, message: String?, requestID: String?)
     case responseDecodingFailed
 }
@@ -317,9 +508,9 @@ extension DayWeaveAPIError: LocalizedError {
         case .credentialUnavailable:
             return "The API bearer token is unavailable. Save it again in Settings."
         case .requestEncodingFailed:
-            return "DayWeave could not encode the proposal request."
+            return "DayWeave could not encode the API request."
         case .invalidEndpoint:
-            return "The configured API URL could not form a suggestions endpoint."
+            return "The configured API URL could not form the requested endpoint."
         case let .transport(code):
             if code == .notConnectedToInternet {
                 return "The Mac is offline. Local planning still works."
@@ -332,12 +523,14 @@ extension DayWeaveAPIError: LocalizedError {
             }
         case .nonHTTPResponse:
             return "The DayWeave API returned an invalid response."
+        case let .responseTooLarge(limitBytes):
+            return "The DayWeave API response exceeded the safe \(limitBytes / 1_048_576) MiB limit."
         case let .server(statusCode, code, message, requestID):
             var result: String
             if statusCode == 401 {
                 result = "The DayWeave API rejected the bearer token. Replace it in Settings."
             } else if statusCode == 409 {
-                result = "This proposal changed on the server. Refresh before trying again."
+                result = "This data changed on the server. Refresh before trying again."
             } else if let message, !message.isEmpty {
                 result = "DayWeave API error \(statusCode): \(message)"
             } else if let code, !code.isEmpty {
@@ -350,18 +543,47 @@ extension DayWeaveAPIError: LocalizedError {
             }
             return result
         case .responseDecodingFailed:
-            return "The DayWeave API response did not match the supported suggestions contract."
+            return "The DayWeave API response did not match this app’s supported contract."
         }
     }
 }
 
 struct DayWeaveAPIClient: Sendable {
+    static let maximumResponseBytes = 16 * 1_048_576
+    static let maximumRequestBytes = 16 * 1_048_576
+
     private struct SuggestionListEnvelope: Decodable {
         let suggestions: [DayWeaveProposal]
     }
 
     private struct SuggestionEnvelope: Decodable {
         let suggestion: DayWeaveProposal
+    }
+
+    private struct ItemEnvelope: Decodable {
+        let item: DayWeaveCanonicalItem
+    }
+
+    private struct ItemDeltaEnvelope: Decodable {
+        let changes: [DayWeaveItemDeltaChange]
+        let nextCursor: String
+        let hasMore: Bool
+
+        private enum CodingKeys: String, CodingKey {
+            case changes
+            case nextCursor = "next_cursor"
+            case hasMore = "has_more"
+        }
+    }
+
+    private struct ReplaceItemRequest: Encodable {
+        let expectedRevision: UInt64
+        let item: DayWeaveCanonicalItemFields
+
+        private enum CodingKeys: String, CodingKey {
+            case expectedRevision = "expected_revision"
+            case item
+        }
     }
 
     private struct DecisionRequest: Encodable {
@@ -385,16 +607,18 @@ struct DayWeaveAPIClient: Sendable {
 
     private let baseURL: DayWeaveAPIBaseURL
     private let session: URLSession
-    private let tokenStore: any BearerTokenStoring
+    private let bearerToken: String?
+
+    var configurationIdentifier: String { baseURL.canonicalConfigurationIdentifier }
 
     init(
         baseURL: DayWeaveAPIBaseURL,
-        session: URLSession = .shared,
-        tokenStore: any BearerTokenStoring
+        session: URLSession = makeDayWeaveEphemeralSession(),
+        bearerToken: String?
     ) {
         self.baseURL = baseURL
         self.session = session
-        self.tokenStore = tokenStore
+        self.bearerToken = bearerToken
     }
 
     func listSuggestions(
@@ -451,6 +675,61 @@ struct DayWeaveAPIClient: Sendable {
         return envelope.suggestion
     }
 
+    func itemDelta(cursor: String?, limit: Int = 200) async throws -> DayWeaveItemDeltaPage {
+        var queryItems = [URLQueryItem(name: "limit", value: String(limit))]
+        if let cursor, !cursor.isEmpty {
+            queryItems.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        let envelope: ItemDeltaEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "items", "delta"],
+            queryItems: queryItems
+        )
+        return DayWeaveItemDeltaPage(
+            changes: envelope.changes,
+            nextCursor: envelope.nextCursor,
+            hasMore: envelope.hasMore
+        )
+    }
+
+    func createCanonicalItem(
+        _ item: DayWeaveNewCanonicalItem,
+        idempotencyKey: String
+    ) async throws -> DayWeaveCanonicalItem {
+        let envelope: ItemEnvelope = try await send(
+            method: "POST",
+            pathComponents: ["v1", "items"],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(item)
+        )
+        return envelope.item
+    }
+
+    func replaceCanonicalItem(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        item: DayWeaveCanonicalItemFields,
+        idempotencyKey: String
+    ) async throws -> DayWeaveCanonicalItem {
+        let envelope: ItemEnvelope = try await send(
+            method: "PUT",
+            pathComponents: ["v1", "items", id.uuidString.lowercased()],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(ReplaceItemRequest(expectedRevision: expectedRevision, item: item))
+        )
+        return envelope.item
+    }
+
+    func previewSchedule(
+        _ request: DayWeaveSchedulePreviewRequest
+    ) async throws -> DayWeaveSchedulePreview {
+        try await send(
+            method: "POST",
+            pathComponents: ["v1", "schedule", "preview"],
+            body: try encode(request)
+        )
+    }
+
     private func encode(_ value: some Encodable) throws -> Data {
         do {
             let encoder = JSONEncoder()
@@ -469,18 +748,14 @@ struct DayWeaveAPIClient: Sendable {
         method: String,
         pathComponents: [String],
         queryItems: [URLQueryItem] = [],
+        headers: [String: String] = [:],
         body: Data? = nil
     ) async throws -> Response {
-        let token: String
-        do {
-            guard let savedToken = try tokenStore.loadToken(), !savedToken.isEmpty else {
-                throw DayWeaveAPIError.credentialUnavailable
-            }
-            token = savedToken
-        } catch let error as DayWeaveAPIError {
-            throw error
-        } catch {
+        guard let token = bearerToken, !token.isEmpty else {
             throw DayWeaveAPIError.credentialUnavailable
+        }
+        if let body, body.count > Self.maximumRequestBytes {
+            throw DayWeaveAPIError.requestEncodingFailed
         }
 
         let endpoint: URL
@@ -494,9 +769,14 @@ struct DayWeaveAPIClient: Sendable {
         request.httpMethod = method
         request.httpBody = body
         request.timeoutInterval = 20
-        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        for (name, value) in headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
         if body != nil {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
@@ -504,10 +784,29 @@ struct DayWeaveAPIClient: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(
+            let (bytes, receivedResponse) = try await session.bytes(
                 for: request,
                 delegate: RejectRedirectDelegate.shared
             )
+            response = receivedResponse
+            if receivedResponse.expectedContentLength > Int64(Self.maximumResponseBytes) {
+                bytes.task.cancel()
+                throw DayWeaveAPIError.responseTooLarge(limitBytes: Self.maximumResponseBytes)
+            }
+            var boundedData = Data()
+            if receivedResponse.expectedContentLength > 0 {
+                boundedData.reserveCapacity(Int(receivedResponse.expectedContentLength))
+            }
+            for try await byte in bytes {
+                guard boundedData.count < Self.maximumResponseBytes else {
+                    bytes.task.cancel()
+                    throw DayWeaveAPIError.responseTooLarge(limitBytes: Self.maximumResponseBytes)
+                }
+                boundedData.append(byte)
+            }
+            data = boundedData
+        } catch let error as DayWeaveAPIError {
+            throw error
         } catch let error as URLError {
             throw DayWeaveAPIError.transport(error.code)
         } catch {
@@ -519,10 +818,14 @@ struct DayWeaveAPIClient: Sendable {
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
             let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
+            let safeMessage = envelope?.error.message
+                .prefix(500)
+                .description
+                .replacingOccurrences(of: token, with: "[redacted]")
             throw DayWeaveAPIError.server(
                 statusCode: httpResponse.statusCode,
                 code: envelope?.error.code,
-                message: envelope?.error.message.prefix(500).description,
+                message: safeMessage,
                 requestID: httpResponse.value(forHTTPHeaderField: "x-request-id")
             )
         }

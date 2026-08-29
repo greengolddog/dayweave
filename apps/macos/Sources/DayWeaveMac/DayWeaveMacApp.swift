@@ -8,12 +8,15 @@ struct DayWeaveMacApp: App {
     @StateObject private var store: PlannerStore
     @StateObject private var codex: CodexAppServerClient
     @StateObject private var suggestionSync: SuggestionSyncStore
+    @StateObject private var canonicalSync: CanonicalSyncStore
 
     init() {
-        _store = StateObject(wrappedValue: PlannerStore.live())
+        let store = PlannerStore.live()
+        _store = StateObject(wrappedValue: store)
         let codex = CodexAppServerClient()
         _codex = StateObject(wrappedValue: codex)
         _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
+        _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
         codex.startIfNeeded()
     }
 
@@ -23,6 +26,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(store)
                 .environmentObject(codex)
                 .environmentObject(suggestionSync)
+                .environmentObject(canonicalSync)
                 .frame(minWidth: 1_080, minHeight: 720)
                 .onChange(of: scenePhase) { _, phase in
                     if phase != .active {
@@ -46,7 +50,7 @@ struct DayWeaveMacApp: App {
                     store.recomposeSchedule()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .option])
-                .disabled(!store.canMutatePlan)
+                .disabled(!store.canRecomposeSchedule)
             }
         }
 
@@ -61,6 +65,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(store)
                 .environmentObject(codex)
                 .environmentObject(suggestionSync)
+                .environmentObject(canonicalSync)
                 .frame(width: 660, height: 620)
         }
     }

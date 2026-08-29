@@ -2,14 +2,31 @@ import Foundation
 import Security
 
 protocol BearerTokenStoring: Sendable {
-    func loadToken() throws -> String?
-    func saveToken(_ token: String) throws
-    func deleteToken() throws
+    func loadCredential() throws -> OriginBoundBearerCredential?
+    func saveCredential(_ credential: OriginBoundBearerCredential) throws
+    func deleteCredential() throws
+}
+
+struct OriginBoundBearerCredential: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let token: String
+    let origin: String
+
+    init(token: String, origin: String) {
+        version = Self.currentVersion
+        self.token = token
+        self.origin = origin
+    }
 }
 
 enum BearerTokenStoreError: Error, Equatable, Sendable {
     case emptyToken
     case invalidStoredToken
+    case legacyUnboundToken
+    case unsupportedCredentialVersion(Int)
+    case credentialOriginMismatch
     case readFailed(status: OSStatus)
     case writeFailed(status: OSStatus)
     case deleteFailed(status: OSStatus)
@@ -21,7 +38,13 @@ extension BearerTokenStoreError: LocalizedError {
         case .emptyToken:
             "The bearer token is empty."
         case .invalidStoredToken:
-            "The saved bearer token is invalid. Replace it in Settings."
+            "The saved bearer credential is invalid. Replace it in Settings."
+        case .legacyUnboundToken:
+            "The saved bearer token predates origin binding. Re-enter it in Settings before connecting."
+        case let .unsupportedCredentialVersion(version):
+            "Bearer credential version \(version) is not supported. Re-enter it in Settings."
+        case .credentialOriginMismatch:
+            "The saved bearer credential belongs to a different API origin. Re-enter it in Settings before connecting."
         case let .readFailed(status):
             "The bearer token could not be read from Keychain (status \(status))."
         case let .writeFailed(status):
@@ -114,41 +137,100 @@ struct SystemKeychainSecretAccess: KeychainSecretAccessing {
 
 struct KeychainBearerTokenStore: BearerTokenStoring {
     static let defaultService = "com.greengolddog.dayweave.suggestions-api"
-    static let defaultAccount = "bearer-token-v1"
+    static let defaultAccount = "bearer-credential-v2"
+    static let defaultLegacyAccount = "bearer-token-v1"
 
     let service: String
     let account: String
+    let legacyAccount: String?
     private let keychain: any KeychainSecretAccessing
 
     init(
         service: String = Self.defaultService,
         account: String = Self.defaultAccount,
+        legacyAccount: String? = Self.defaultLegacyAccount,
         keychain: any KeychainSecretAccessing = SystemKeychainSecretAccess()
     ) {
         self.service = service
         self.account = account
+        self.legacyAccount = legacyAccount
         self.keychain = keychain
     }
 
-    func loadToken() throws -> String? {
+    func loadCredential() throws -> OriginBoundBearerCredential? {
         guard let data = try keychain.read(service: service, account: account) else {
+            if let legacyAccount,
+               try keychain.read(service: service, account: legacyAccount) != nil {
+                throw BearerTokenStoreError.legacyUnboundToken
+            }
             return nil
         }
-        guard let token = String(data: data, encoding: .utf8), !token.isEmpty else {
+        let credential: OriginBoundBearerCredential
+        do {
+            credential = try JSONDecoder().decode(OriginBoundBearerCredential.self, from: data)
+        } catch {
             throw BearerTokenStoreError.invalidStoredToken
         }
-        return token
+        guard credential.version == OriginBoundBearerCredential.currentVersion else {
+            throw BearerTokenStoreError.unsupportedCredentialVersion(credential.version)
+        }
+        try validate(credential)
+        return credential
     }
 
-    func saveToken(_ token: String) throws {
-        let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
+    func saveCredential(_ credential: OriginBoundBearerCredential) throws {
+        guard credential.version == OriginBoundBearerCredential.currentVersion else {
+            throw BearerTokenStoreError.unsupportedCredentialVersion(credential.version)
+        }
+        try validate(credential)
+        let encoded: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encoded = try encoder.encode(credential)
+        } catch {
+            throw BearerTokenStoreError.invalidStoredToken
+        }
+        // The version, normalized origin, and token are one Keychain value;
+        // SecItemUpdate replaces that value atomically.
+        try keychain.save(encoded, service: service, account: account)
+        if let legacyAccount, legacyAccount != account,
+           try keychain.read(service: service, account: legacyAccount) != nil {
+            try keychain.delete(service: service, account: legacyAccount)
+        }
+    }
+
+    func deleteCredential() throws {
+        try keychain.delete(service: service, account: account)
+        if let legacyAccount, legacyAccount != account {
+            try keychain.delete(service: service, account: legacyAccount)
+        }
+    }
+
+    private func validate(_ credential: OriginBoundBearerCredential) throws {
+        let trimmedToken = credential.token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToken.isEmpty, trimmedToken == credential.token else {
             throw BearerTokenStoreError.emptyToken
         }
-        try keychain.save(Data(token.utf8), service: service, account: account)
+        guard credential.token.utf8.count <= 64 * 1_024,
+              credential.token.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0)
+              }) else {
+            throw BearerTokenStoreError.invalidStoredToken
+        }
+        guard let baseURL = try? DayWeaveAPIBaseURL(credential.origin),
+              baseURL.credentialOriginIdentifier == credential.origin else {
+            throw BearerTokenStoreError.invalidStoredToken
+        }
     }
+}
 
-    func deleteToken() throws {
-        try keychain.delete(service: service, account: account)
+extension BearerTokenStoring {
+    func loadToken(boundTo baseURL: DayWeaveAPIBaseURL) throws -> String? {
+        guard let credential = try loadCredential() else { return nil }
+        guard credential.origin == baseURL.credentialOriginIdentifier else {
+            throw BearerTokenStoreError.credentialOriginMismatch
+        }
+        return credential.token
     }
 }

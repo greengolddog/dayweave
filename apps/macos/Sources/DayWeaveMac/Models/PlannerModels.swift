@@ -78,6 +78,12 @@ enum EnergyLevel: String, Codable, CaseIterable, Identifiable, Sendable {
     var title: String { rawValue.capitalized }
 }
 
+enum ScheduleBlockOrigin: String, Codable, Sendable {
+    case local
+    case canonicalPreview
+    case externalPreview
+}
+
 struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
     let id: UUID
     var title: String
@@ -91,16 +97,128 @@ struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
     var isFlexible: Bool
     var isHardConstraint: Bool
     var actualMinutes: Int?
+    var sourceItemID: UUID? = nil
+    var sourceItemRevision: UInt64? = nil
+    var occurrenceID: UUID? = nil
+    var sessionIndex: UInt16? = nil
+    var syncOrigin: ScheduleBlockOrigin? = nil
+    var placementReason: String? = nil
+    /// The scheduler's wire kind (for example `planned`, `pinned`, or
+    /// `calendar_event`). Keeping it avoids guessing stability eligibility.
+    var previewKind: String? = nil
+    /// False when the server reports remaining work for this occurrence.
+    /// A partial preview must never advance a recurrence completion anchor.
+    var occurrenceFullyScheduled: Bool = true
 
     var durationMinutes: Int {
         max(1, Int(end.timeIntervalSince(start) / 60))
     }
 
     var timeRange: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return "\(formatter.string(from: start))–\(formatter.string(from: end))"
+        "\(startTimeLabel)–\(endTimeLabel)"
     }
+
+    var startTimeLabel: String {
+        Self.offsetTimeLabel(for: start)
+    }
+
+    var endTimeLabel: String {
+        Self.offsetTimeLabel(for: end)
+    }
+
+    var isLocallyAuthored: Bool {
+        syncOrigin == nil || syncOrigin == .local
+    }
+
+    private static func offsetTimeLabel(for date: Date) -> String {
+        // The numeric offset disambiguates the repeated local hour during a
+        // DST fall-back even when a zone happens to reuse an abbreviation.
+        var style = Date.FormatStyle()
+            .hour(.twoDigits(amPM: .omitted))
+            .minute(.twoDigits)
+            .timeZone(.iso8601(.long))
+        style.timeZone = .autoupdatingCurrent
+        return date.formatted(style)
+    }
+}
+
+extension ScheduleBlock {
+    private enum CodingKeys: String, CodingKey {
+        case id, title, kind, start, end, status, project, notes, energy
+        case isFlexible, isHardConstraint, actualMinutes
+        case sourceItemID, sourceItemRevision, occurrenceID, sessionIndex
+        case syncOrigin, placementReason, previewKind, occurrenceFullyScheduled
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        kind = try container.decode(PlannerItemKind.self, forKey: .kind)
+        start = try container.decode(Date.self, forKey: .start)
+        end = try container.decode(Date.self, forKey: .end)
+        status = try container.decode(PlannerItemStatus.self, forKey: .status)
+        project = try container.decodeIfPresent(String.self, forKey: .project)
+        notes = try container.decode(String.self, forKey: .notes)
+        energy = try container.decode(EnergyLevel.self, forKey: .energy)
+        isFlexible = try container.decode(Bool.self, forKey: .isFlexible)
+        isHardConstraint = try container.decode(Bool.self, forKey: .isHardConstraint)
+        actualMinutes = try container.decodeIfPresent(Int.self, forKey: .actualMinutes)
+        sourceItemID = try container.decodeIfPresent(UUID.self, forKey: .sourceItemID)
+        sourceItemRevision = try container.decodeIfPresent(UInt64.self, forKey: .sourceItemRevision)
+        occurrenceID = try container.decodeIfPresent(UUID.self, forKey: .occurrenceID)
+        sessionIndex = try container.decodeIfPresent(UInt16.self, forKey: .sessionIndex)
+        syncOrigin = try container.decodeIfPresent(ScheduleBlockOrigin.self, forKey: .syncOrigin)
+        placementReason = try container.decodeIfPresent(String.self, forKey: .placementReason)
+        previewKind = try container.decodeIfPresent(String.self, forKey: .previewKind)
+        // Schema 1 predates this recurrence safety marker. Defaulting to true
+        // preserves the old block shape so migration can reset terminal
+        // recurrence state before it is exposed.
+        occurrenceFullyScheduled = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .occurrenceFullyScheduled
+        ) ?? true
+    }
+}
+
+enum CanonicalMutationDisposition: String, Codable, Hashable, Sendable {
+    case pending
+    case conflicted
+}
+
+struct PendingCanonicalMutation: Identifiable, Hashable, Codable, Sendable {
+    let id: UUID
+    let itemID: UUID
+    let occurrenceID: UUID?
+    let sessionIndex: UInt16?
+    var desiredStatus: PlannerItemStatus
+    var baseRevision: UInt64
+    let createdAt: Date
+    var disposition: CanonicalMutationDisposition
+    var diagnostic: String?
+}
+
+enum RecurrenceSessionDisposition: String, Codable, Hashable, Sendable {
+    case completed
+    case skipped
+}
+
+struct RecurrenceSessionOutcome: Hashable, Codable, Sendable {
+    let itemID: UUID
+    let occurrenceID: UUID
+    let sessionIndex: UInt16
+    var disposition: RecurrenceSessionDisposition
+    var occurredAt: Date
+    var occurrenceFullyScheduled: Bool
+}
+
+struct SchedulePreviewProvenance: Equatable, Codable, Sendable {
+    let configurationIdentifier: String
+    let generatedAt: Date
+    let asOf: Date
+    let horizonStart: Date
+    let horizonEnd: Date
+    let timezoneName: String
 }
 
 enum SidebarDestination: String, Codable, CaseIterable, Identifiable, Sendable {

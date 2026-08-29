@@ -3,6 +3,7 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     var body: some View {
@@ -23,15 +24,27 @@ struct RootView: View {
         .onAppear {
             codex.startIfNeeded()
         }
+        .task {
+            guard canonicalSync.isConfigured else { return }
+            await canonicalSync.sync()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    Task { await canonicalSync.sync() }
+                } label: {
+                    Label("Sync & compose", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .help("Pull canonical items, publish safe local changes, and compose a preview")
+                .disabled(!canonicalSync.isConfigured || canonicalSync.isSyncing || !store.canMutatePlan)
+
                 Button {
                     store.recomposeSchedule()
                 } label: {
                     Label("Recompose", systemImage: "wand.and.stars")
                 }
-                .help("Recompose around current constraints")
-                .disabled(!store.canMutatePlan)
+                .help("Reorder local flexible blocks; sync validates server constraints")
+                .disabled(!store.canRecomposeSchedule)
 
                 Button {
                     store.isQuickAddPresented = true
@@ -67,6 +80,7 @@ struct RootView: View {
 
 private struct SidebarView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
 
     var body: some View {
         List(selection: $store.destination) {
@@ -87,15 +101,22 @@ private struct SidebarView: View {
             Section("Status") {
                 HStack(spacing: 8) {
                     Circle()
-                        .fill(store.persistenceError == nil ? .green : .red)
+                        .fill(persistenceColor)
                         .frame(width: 8, height: 8)
-                    Text(store.persistenceError == nil ? "Encrypted local plan" : "Local save needs attention")
+                    Text(persistenceLabel)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                .help(store.persistenceError?.localizedDescription ?? "Planner state is encrypted on this Mac")
+                .help(persistenceHelp)
                 Label("Google Calendar · not connected", systemImage: "circle.dashed")
                     .foregroundStyle(.secondary)
+                Label {
+                    Text(canonicalSync.status.message).lineLimit(2)
+                } icon: {
+                    Image(systemName: canonicalSync.isSyncing ? "arrow.triangle.2.circlepath" : "network")
+                }
+                .font(.caption)
+                .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
             }
         }
         .listStyle(.sidebar)
@@ -106,6 +127,23 @@ private struct SidebarView: View {
             }
         }
         .navigationTitle("DayWeave")
+    }
+
+    private var persistenceColor: Color {
+        if store.persistenceError != nil { return .red }
+        return store.hasEncryptedPersistence ? .green : .secondary
+    }
+
+    private var persistenceLabel: String {
+        if store.persistenceError != nil { return "Local save needs attention" }
+        return store.hasEncryptedPersistence ? "Encrypted local plan" : "Local persistence unavailable"
+    }
+
+    private var persistenceHelp: String {
+        store.persistenceError?.localizedDescription
+            ?? (store.hasEncryptedPersistence
+                ? "Planner state is encrypted on this Mac"
+                : "This store has no encrypted persistence backend")
     }
 }
 
@@ -132,6 +170,7 @@ private struct ActiveMiniPlayer: View {
                     Image(systemName: "pause.fill")
                 }
                 .buttonStyle(.borderless)
+                .disabled(!store.canMutate(block))
             }
         }
         .padding(12)
@@ -141,16 +180,22 @@ private struct ActiveMiniPlayer: View {
 
 private struct TodayView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
 
     var body: some View {
         VStack(spacing: 0) {
             TodayHeader()
+            CanonicalSyncBanner()
+            PreviewDiagnosticsStrip()
             Divider()
             if store.visibleBlocks.isEmpty {
                 ContentUnavailableView {
-                    Label("No plan yet", systemImage: "calendar.badge.plus")
+                    Label(
+                        emptyTitle,
+                        systemImage: store.canonicalItems.isEmpty ? "calendar.badge.plus" : "calendar.badge.exclamationmark"
+                    )
                 } description: {
-                    Text("Start with Quick Add. Nothing is scheduled until you add it.")
+                    Text(emptyDescription)
                 } actions: {
                     Button("Quick Add") { store.isQuickAddPresented = true }
                         .buttonStyle(.borderedProminent)
@@ -172,10 +217,156 @@ private struct TodayView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle("Today")
     }
+
+    private var emptyTitle: String {
+        if store.canonicalItems.isEmpty { return "No plan yet" }
+        return store.blocks.isEmpty ? "No blocks fit this preview" : "No blocks scheduled today"
+    }
+
+    private var emptyDescription: String {
+        if store.canonicalItems.isEmpty {
+            return "Start with Quick Add. Nothing is scheduled until you add it."
+        }
+        if store.blocks.isEmpty {
+            return "\(store.canonicalItems.count) canonical items are safely cached. Review the preview diagnostics or adjust availability."
+        }
+        return "The canonical plan has work on later days. Open Calendar to review the full seven-day preview."
+    }
+}
+
+private struct PreviewDiagnosticsStrip: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+
+    var body: some View {
+        let messages = diagnosticMessages
+        if !messages.isEmpty {
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(messages.enumerated()), id: \.offset) { _, message in
+                        Text(message)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                    ForEach(conflictedMutations) { mutation in
+                        Button("Retry \(title(for: mutation.itemID)) edit on current revision") {
+                            store.retryConflictedCanonicalMutation(mutation.id)
+                        }
+                        .buttonStyle(.link)
+                        .disabled(!store.canRetryCanonicalMutation(mutation))
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.top, 6)
+            } label: {
+                Label("\(messages.count) preview and sync diagnostic\(messages.count == 1 ? "" : "s")", systemImage: "exclamationmark.triangle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 7)
+        }
+    }
+
+    private var diagnosticMessages: [String] {
+        var result = canonicalSync.warnings
+        if store.blocks.contains(where: {
+            $0.syncOrigin == .canonicalPreview || $0.syncOrigin == .externalPreview
+        }), let issue = store.canonicalPreviewFreshnessIssue {
+            result.append("Canonical preview actions are locked: \(issue)")
+        }
+        result.append(contentsOf: store.pendingCanonicalMutations.map { mutation in
+            let title = store.canonicalItem(id: mutation.itemID)?.title ?? mutation.itemID.uuidString
+            let state = mutation.disposition == .conflicted ? "conflict" : "pending edit"
+            return "\(title): \(state) → \(mutation.desiredStatus.title). \(mutation.diagnostic ?? "Retained in encrypted local storage.")"
+        })
+        result.append(contentsOf: store.recurrenceSessionOutcomes.map { outcome in
+            let title = store.canonicalItem(id: outcome.itemID)?.title ?? outcome.itemID.uuidString
+            return "\(title): session \(outcome.sessionIndex) \(outcome.disposition.rawValue) at \(outcome.occurredAt.formatted()). Start the retained block to correct this outcome."
+        })
+        result.append(contentsOf: store.localCaptureDiagnostics
+            .sorted { $0.key.uuidString < $1.key.uuidString }
+            .map { id, diagnostic in
+                let title = store.blocks.first(where: { $0.id == id })?.title ?? "Local capture"
+                return "\(title): \(diagnostic)"
+            })
+        guard let preview = canonicalSync.lastPreview else { return result }
+        result.append(contentsOf: preview.plan.unscheduled.map {
+            "\(title(for: $0.itemID)): \($0.remaining)m unscheduled (\($0.reason)). \($0.message)"
+        })
+        result.append(contentsOf: preview.rejectedItems.map {
+            "\($0.title): rejected from preview (\($0.reason))."
+        })
+        result.append(contentsOf: preview.ignoredPreviousAssignments.map {
+            "Previous assignment for \(title(for: $0.itemID)) was ignored: \($0.reason)."
+        })
+        result.append(contentsOf: preview.plan.decisions.map {
+            "Decision: \($0.displayDescription)"
+        })
+        result.append(contentsOf: preview.plan.violations.map {
+            "Violation: \($0.displayDescription)"
+        })
+        return result
+    }
+
+    private func title(for itemID: UUID) -> String {
+        store.canonicalItem(id: itemID)?.title ?? "Item"
+    }
+
+    private var conflictedMutations: [PendingCanonicalMutation] {
+        store.pendingCanonicalMutations.filter { $0.disposition == .conflicted }
+    }
+}
+
+private struct CanonicalSyncBanner: View {
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+
+    var body: some View {
+        HStack(spacing: 9) {
+            if canonicalSync.isSyncing {
+                ProgressView().controlSize(.small)
+            } else {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+            }
+            Text(canonicalSync.status.message)
+                .font(.caption)
+                .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
+                .lineLimit(2)
+            Spacer()
+            if !canonicalSync.warnings.isEmpty {
+                Label("\(canonicalSync.warnings.count) to review", systemImage: "exclamationmark.triangle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                    .help(canonicalSync.warnings.joined(separator: "\n"))
+            }
+            Button("Sync now") {
+                Task { await canonicalSync.sync() }
+            }
+            .controlSize(.small)
+            .disabled(!canonicalSync.isConfigured || canonicalSync.isSyncing)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 9)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+    }
+
+    private var statusColor: Color {
+        switch canonicalSync.status {
+        case .configurationRequired: .secondary
+        case .ready: .orange
+        case .syncing: .blue
+        case .online: .green
+        case .failed: .red
+        }
+    }
 }
 
 private struct TodayHeader: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
 
     var body: some View {
         HStack(alignment: .top, spacing: 24) {
@@ -187,11 +378,22 @@ private struct TodayHeader: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            MetricChip(value: "\(store.completedCount)/\(store.blocks.count)", label: "done", symbol: "checkmark")
+            MetricChip(
+                value: "\(store.todaysBlocks.count(where: { $0.status == .completed }))/\(store.todaysBlocks.count)",
+                label: "done",
+                symbol: "checkmark"
+            )
             MetricChip(value: "\(store.protectedFreeMinutes)m", label: "protected", symbol: "shield")
-            MetricChip(value: "82", label: "day score", symbol: "sparkles")
+            MetricChip(value: previewCoverage, label: "preview coverage", symbol: "chart.pie")
         }
         .padding(20)
+    }
+
+    private var previewCoverage: String {
+        guard let score = canonicalSync.lastPreview?.plan.score else { return "—" }
+        let total = score.scheduledMinutes + score.unscheduledMinutes
+        guard total > 0 else { return "100%" }
+        return "\(Int((Double(score.scheduledMinutes) / Double(total) * 100).rounded()))%"
     }
 }
 
@@ -224,13 +426,13 @@ private struct ScheduleBlockView: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .trailing, spacing: 2) {
-                Text(block.start.formatted(date: .omitted, time: .shortened))
+                Text(block.startTimeLabel)
                     .font(.system(.caption, design: .monospaced).weight(.medium))
                 Text("\(block.durationMinutes)m")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
             }
-            .frame(width: 58, alignment: .trailing)
+            .frame(width: 102, alignment: .trailing)
 
             RoundedRectangle(cornerRadius: 3)
                 .fill(block.kind.color)
@@ -247,7 +449,7 @@ private struct ScheduleBlockView: View {
                         Image(systemName: "lock.fill")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                            .help("Hard constraint")
+                            .help("Fixed by the scheduler preview")
                     }
                     Spacer()
                     Text(block.status.title)
@@ -273,9 +475,10 @@ private struct ScheduleBlockView: View {
                         .buttonStyle(.borderedProminent)
                         Button("Complete") { store.complete(block.id) }
                         Button("Later") { store.doLater(block.id) }
+                            .disabled(!block.isFlexible || block.isHardConstraint)
                     }
                     .controlSize(.small)
-                    .disabled(!store.canMutatePlan)
+                    .disabled(!store.canMutate(block))
                 }
             }
             .opacity(block.status == .completed ? 0.55 : 1)
@@ -291,11 +494,12 @@ private struct ScheduleBlockView: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .contextMenu {
-            Button("Start") { store.start(block.id) }
-            Button("Mark Complete") { store.complete(block.id) }
+            Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
+            Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
             Divider()
             Button("Do Later") { store.doLater(block.id) }
-            Button("Skip") { store.skip(block.id) }
+                .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
+            Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
         }
     }
 }
@@ -318,6 +522,7 @@ private struct InspectorView: View {
             if tab == 0 {
                 if let block = store.selectedBlock {
                     BlockInspector(block: block)
+                        .id(block.id)
                 } else {
                     ContentUnavailableView("Select an item", systemImage: "sidebar.right")
                 }
@@ -332,6 +537,12 @@ private struct InspectorView: View {
 private struct BlockInspector: View {
     @EnvironmentObject private var store: PlannerStore
     let block: ScheduleBlock
+    @State private var recoveryTitle: String
+
+    init(block: ScheduleBlock) {
+        self.block = block
+        _recoveryTitle = State(initialValue: block.title)
+    }
 
     var body: some View {
         ScrollView {
@@ -352,11 +563,28 @@ private struct BlockInspector: View {
                     LabeledContent("Time", value: block.timeRange)
                     LabeledContent("Duration", value: "\(block.durationMinutes) minutes")
                     LabeledContent("Energy", value: block.energy.title)
-                    LabeledContent("Constraint", value: block.isHardConstraint ? "Hard" : "Soft")
+                    LabeledContent("Placement", value: block.isHardConstraint ? "Fixed in preview" : "Flexible in preview")
+                    if let itemID = block.sourceItemID,
+                       let item = store.canonicalItem(id: itemID) {
+                        LabeledContent("Revision", value: String(item.revision))
+                        if let deadline = item.deadlineAt {
+                            LabeledContent(
+                                "Deadline",
+                                value: deadline.formatted(date: .abbreviated, time: .shortened)
+                            )
+                        }
+                        LabeledContent("Split", value: splitDescription(item.splitPolicy))
+                        if item.parentID != nil {
+                            LabeledContent("Hierarchy", value: block.project ?? "Nested item")
+                        }
+                        if item.recurrence != nil {
+                            LabeledContent("Recurrence", value: "Canonical rule cached; outcome context applied on preview")
+                        }
+                    }
                 }
 
                 InspectorSection(title: "Why here?") {
-                    Text(reason(for: block))
+                    Text(block.placementReason ?? "The scheduler did not provide a placement explanation.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -367,25 +595,76 @@ private struct BlockInspector: View {
                     }
                 }
 
+                if let mutation = store.canonicalMutation(for: block),
+                   mutation.disposition == .conflicted {
+                    InspectorSection(title: "Conflict recovery") {
+                        Text(mutation.diagnostic ?? "The server revision changed while this local edit was pending.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Button("Retry edit on current revision") {
+                            store.retryConflictedCanonicalMutation(mutation.id)
+                        }
+                        .disabled(!store.canRetryCanonicalMutation(mutation))
+                        Text("This keeps the requested status, rebases it onto the currently cached revision, and leaves it pending until the next sync.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                if block.isLocallyAuthored, block.sourceItemID == nil {
+                    InspectorSection(title: "Local capture recovery") {
+                        TextField("Title", text: $recoveryTitle)
+                            .textFieldStyle(.roundedBorder)
+                        Text("\(recoveryTitle.unicodeScalars.count)/\(PlannerStore.maximumCanonicalTitleScalars) Unicode characters")
+                            .font(.caption)
+                            .foregroundStyle(localCaptureTitleIsValid ? Color.secondary : Color.red)
+                        if let diagnostic = store.localCaptureDiagnostics[block.id] {
+                            Text(diagnostic)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
+                        HStack {
+                            Button("Save title") {
+                                _ = store.updateLocalCapture(block.id, title: recoveryTitle)
+                            }
+                            .disabled(!localCaptureTitleIsValid || !store.canMutatePlan)
+                            Button("Delete local capture", role: .destructive) {
+                                store.deleteLocalCapture(block.id)
+                            }
+                            .disabled(!store.canMutatePlan)
+                        }
+                        Text("Editing or deleting this unpublished capture changes encrypted local state only.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
                 HStack {
                     Button("Start") { store.start(block.id) }
                         .buttonStyle(.borderedProminent)
                     Button("Complete") { store.complete(block.id) }
                     Menu("More") {
                         Button("Do Later") { store.doLater(block.id) }
+                            .disabled(!block.isFlexible || block.isHardConstraint)
                         Button("Skip") { store.skip(block.id) }
                     }
                 }
-                .disabled(!store.canMutatePlan)
+                .disabled(!store.canMutate(block))
             }
             .padding(18)
         }
     }
 
-    private func reason(for block: ScheduleBlock) -> String {
-        if block.isHardConstraint { return "This block is fixed because it protects a hard commitment." }
-        if block.energy == .deep { return "Placed in a high-focus window with transition space before the next hard commitment." }
-        return "Placed in the earliest opening that matches its energy and context preferences."
+    private var localCaptureTitleIsValid: Bool {
+        PlannerStore.normalizedCanonicalTitle(recoveryTitle) != nil
+    }
+
+    private func splitDescription(_ policy: DayWeaveSplitPolicy) -> String {
+        switch policy {
+        case .indivisible: "Indivisible"
+        case let .splittable(minimum, maximum): "\(minimum / 60)–\(maximum / 60) minute sessions"
+        case .unknown: "Unsupported — read only"
+        }
     }
 }
 
@@ -448,7 +727,7 @@ private struct AssistantView: View {
 
             Divider()
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Ask about your day…", text: $draft, axis: .vertical)
+                TextField("Save a local planner note…", text: $draft, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(1...5)
                     .onSubmit(send)
@@ -759,7 +1038,7 @@ private struct QuickAddView: View {
             HStack {
                 VStack(alignment: .leading) {
                     Text("Quick Add").font(.title2.weight(.semibold))
-                    Text("DayWeave will place it in the next safe opening.")
+                    Text("Captured locally first; sync validates and composes its placement.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -769,6 +1048,10 @@ private struct QuickAddView: View {
             TextField("What needs to happen?", text: $title)
                 .textFieldStyle(.roundedBorder)
                 .font(.title3)
+
+            Text("\(title.unicodeScalars.count)/\(PlannerStore.maximumCanonicalTitleScalars) Unicode characters")
+                .font(.caption)
+                .foregroundStyle(titleIsValid ? Color.secondary : Color.red)
 
             Picker("Type", selection: $kind) {
                 ForEach(PlannerItemKind.allCases) { itemKind in
@@ -780,20 +1063,24 @@ private struct QuickAddView: View {
 
             HStack {
                 Spacer()
-                Button("Add & schedule") {
-                    store.quickAdd(title: title, kind: kind, minutes: minutes)
-                    dismiss()
+                Button("Add locally") {
+                    if store.quickAdd(title: title, kind: kind, minutes: minutes) {
+                        dismiss()
+                    }
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 .disabled(
-                    title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        || !store.canMutatePlan
+                    !titleIsValid || !store.canMutatePlan
                 )
             }
         }
         .padding(24)
         .frame(width: 520)
+    }
+
+    private var titleIsValid: Bool {
+        PlannerStore.normalizedCanonicalTitle(title) != nil
     }
 }
 
@@ -810,7 +1097,7 @@ struct MenuBarView: View {
                     Button("Pause") { store.pauseActive() }
                     Button("Complete") { store.complete(active.id) }
                 }
-                .disabled(!store.canMutatePlan)
+                .disabled(!store.canMutate(active))
             } else {
                 ContentUnavailableView("Nothing active", systemImage: "checkmark.circle")
             }
@@ -818,7 +1105,7 @@ struct MenuBarView: View {
             Button("Quick Add…") { store.isQuickAddPresented = true }
                 .disabled(!store.canMutatePlan)
             Button("Recompose") { store.recomposeSchedule() }
-                .disabled(!store.canMutatePlan)
+                .disabled(!store.canRecomposeSchedule)
         }
         .padding(14)
         .frame(width: 300)
@@ -829,9 +1116,11 @@ struct SettingsView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @State private var apiKey = ""
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
+    @State private var isCanonicalResetConfirmationPresented = false
 
     var body: some View {
         Form {
@@ -842,7 +1131,7 @@ struct SettingsView: View {
             }
             .disabled(!store.canMutatePlan)
             Section("Accounts") {
-                LabeledContent("Google", value: "Ready to connect")
+                LabeledContent("Google", value: "Not connected")
                 LabeledContent("Codex", value: codex.state.title)
 
                 if case let .signedIn(email, _) = codex.state {
@@ -870,11 +1159,11 @@ struct SettingsView: View {
                     }
                 }
             }
-            Section("DayWeave suggestions API") {
+            Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
                     .textContentType(.URL)
                 SecureField(
-                    suggestionSync.tokenConfigured ? "New bearer token (leave blank to keep saved token)" : "Bearer token",
+                    suggestionSync.tokenConfigured ? "New bearer token (blank only for the same API origin)" : "Bearer token",
                     text: $dayWeaveBearerToken
                 )
 
@@ -886,6 +1175,7 @@ struct SettingsView: View {
                         ) {
                             dayWeaveBearerToken = ""
                             dayWeaveAPIBaseURL = suggestionSync.baseURLString
+                            canonicalSync.configurationDidChange()
                         }
                     }
                     .buttonStyle(.borderedProminent)
@@ -893,13 +1183,20 @@ struct SettingsView: View {
                         dayWeaveAPIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                             || (!suggestionSync.tokenConfigured
                                 && dayWeaveBearerToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            || suggestionSync.isRefreshing
+                            || !suggestionSync.activeProposalIDs.isEmpty
                     )
 
                     if suggestionSync.tokenConfigured {
                         Button("Remove saved token", role: .destructive) {
                             suggestionSync.clearBearerToken()
+                            canonicalSync.configurationDidChange()
                             dayWeaveBearerToken = ""
                         }
+                        .disabled(
+                            suggestionSync.isRefreshing
+                                || !suggestionSync.activeProposalIDs.isEmpty
+                        )
                     }
                 }
 
@@ -907,21 +1204,46 @@ struct SettingsView: View {
                 Text(suggestionSync.status.message)
                     .font(.caption)
                     .foregroundStyle(suggestionSync.status.isFailure ? .red : .secondary)
-                Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. The token is never saved in the planner snapshot.")
+                Text("Remote HTTP is rejected; plain HTTP is accepted only for localhost development. Changing the API origin requires re-entering the token, which is never saved in the planner snapshot.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                LabeledContent("Planner sync", value: canonicalSync.status.message)
+                    .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
+                Button("Reset local canonical cache…", role: .destructive) {
+                    isCanonicalResetConfirmationPresented = true
+                }
+                .disabled(!store.canMutatePlan)
             }
             Section("Local data") {
-                LabeledContent("Planner storage", value: store.persistenceError == nil ? "Encrypted" : "Needs attention")
+                LabeledContent(
+                    "Planner storage",
+                    value: store.persistenceError != nil
+                        ? "Needs attention"
+                        : (store.hasEncryptedPersistence ? "Encrypted" : "Not configured")
+                )
                 if let error = store.persistenceError {
                     Text(error.localizedDescription)
                         .foregroundStyle(.red)
                         .textSelection(.enabled)
-                } else {
+                } else if store.hasEncryptedPersistence {
                     Text("Schedule content is sealed with AES-GCM. Its device key is stored in this Mac’s Keychain.")
                         .foregroundStyle(.secondary)
+                } else {
+                    Text("No encrypted persistence backend is attached; changes are memory-only.")
+                        .foregroundStyle(.orange)
                 }
             }
+        }
+        .confirmationDialog(
+            "Reset the local canonical cache?",
+            isPresented: $isCanonicalResetConfirmationPresented,
+            titleVisibility: .visible
+        ) {
+            Button("Reset local cache", role: .destructive) {
+                canonicalSync.resetCanonicalSyncState()
+            }
+        } message: {
+            Text("This removes cached canonical items, preview blocks, recurrence history, and pending/conflicted canonical edits from this Mac. It does not change the server or locally authored captures.")
         }
         .formStyle(.grouped)
         .padding()

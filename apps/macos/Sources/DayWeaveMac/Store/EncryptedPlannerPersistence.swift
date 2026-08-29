@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -11,6 +12,7 @@ enum PlannerPersistenceError: Error, Equatable, Sendable {
     case directoryPreparationFailed(cocoaCode: Int?)
     case fileReadFailed(cocoaCode: Int?)
     case fileWriteFailed(cocoaCode: Int?)
+    case snapshotTooLarge(limitBytes: Int)
     case snapshotEncodingFailed
     case snapshotDecodingFailed
     case malformedEnvelope
@@ -20,6 +22,8 @@ enum PlannerPersistenceError: Error, Equatable, Sendable {
     case encryptionFailed
     case invalidCiphertext
     case authenticationFailed
+    case lockUnavailable(errnoCode: Int32)
+    case concurrentModification
 }
 
 extension PlannerPersistenceError: LocalizedError {
@@ -41,6 +45,8 @@ extension PlannerPersistenceError: LocalizedError {
             "The encrypted planner snapshot could not be read\(Self.codeSuffix(code))."
         case let .fileWriteFailed(code):
             "The encrypted planner snapshot could not be written\(Self.codeSuffix(code))."
+        case let .snapshotTooLarge(limitBytes):
+            "The encrypted planner snapshot exceeds the safe \(limitBytes / 1_048_576) MiB limit."
         case .snapshotEncodingFailed:
             "The planner snapshot could not be encoded."
         case .snapshotDecodingFailed:
@@ -59,12 +65,21 @@ extension PlannerPersistenceError: LocalizedError {
             "The encrypted planner payload is malformed."
         case .authenticationFailed:
             "The encrypted planner payload failed authentication."
+        case let .lockUnavailable(errnoCode):
+            "The encrypted planner snapshot lock is unavailable (errno \(errnoCode))."
+        case .concurrentModification:
+            "Another DayWeave process changed the encrypted planner snapshot. Reload before making more changes; this process will not overwrite it."
         }
     }
 
     private static func codeSuffix(_ code: Int?) -> String {
         code.map { " (Cocoa error \($0))" } ?? ""
     }
+}
+
+struct PlannerPersistenceRevision: Equatable, Sendable {
+    static let missing = Self(digest: nil)
+    fileprivate let digest: Data?
 }
 
 struct PlannerEncryptionKey: Equatable, Sendable {
@@ -164,7 +179,10 @@ struct KeychainPlannerKeyProvider: PlannerEncryptionKeyProviding {
 }
 
 struct PlannerSnapshot: Codable, Equatable, Sendable {
-    static let currentSchemaVersion = 1
+    /// Version 2 added canonical sync state. Version 3 adds persistent local
+    /// capture quarantine diagnostics. Older binaries reject the newer schema
+    /// instead of rewriting fields they do not understand.
+    static let currentSchemaVersion = 3
 
     let schemaVersion: Int
     let savedAt: Date
@@ -177,6 +195,15 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let protectedFreeMinutes: Int
     let freezeHours: Int
     let showCompleted: Bool
+    let canonicalItems: [DayWeaveCanonicalItem]?
+    let canonicalDeltaCursor: String?
+    let canonicalTombstoneRevisions: [UUID: UInt64]?
+    let completedOccurrenceIDs: Set<UUID>?
+    let pendingCanonicalMutations: [PendingCanonicalMutation]?
+    let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]?
+    let canonicalConfigurationIdentifier: String?
+    let schedulePreviewProvenance: SchedulePreviewProvenance?
+    let localCaptureDiagnostics: [UUID: String]?
 
     init(
         schemaVersion: Int = Self.currentSchemaVersion,
@@ -189,7 +216,16 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         lastScheduleMessage: String,
         protectedFreeMinutes: Int,
         freezeHours: Int,
-        showCompleted: Bool
+        showCompleted: Bool,
+        canonicalItems: [DayWeaveCanonicalItem]? = nil,
+        canonicalDeltaCursor: String? = nil,
+        canonicalTombstoneRevisions: [UUID: UInt64]? = nil,
+        completedOccurrenceIDs: Set<UUID>? = nil,
+        pendingCanonicalMutations: [PendingCanonicalMutation]? = nil,
+        recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
+        canonicalConfigurationIdentifier: String? = nil,
+        schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
+        localCaptureDiagnostics: [UUID: String]? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.savedAt = savedAt
@@ -202,12 +238,88 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.protectedFreeMinutes = protectedFreeMinutes
         self.freezeHours = freezeHours
         self.showCompleted = showCompleted
+        self.canonicalItems = canonicalItems
+        self.canonicalDeltaCursor = canonicalDeltaCursor
+        self.canonicalTombstoneRevisions = canonicalTombstoneRevisions
+        self.completedOccurrenceIDs = completedOccurrenceIDs
+        self.pendingCanonicalMutations = pendingCanonicalMutations
+        self.recurrenceSessionOutcomes = recurrenceSessionOutcomes
+        self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
+        self.schedulePreviewProvenance = schedulePreviewProvenance
+        self.localCaptureDiagnostics = localCaptureDiagnostics
+    }
+
+    func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
+        switch schemaVersion {
+        case Self.currentSchemaVersion:
+            return self
+        case 2:
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localCaptureDiagnostics: [:]
+            )
+        case 1:
+            let migratedBlocks = blocks.map { block in
+                var migrated = block
+                if migrated.occurrenceID != nil
+                    && (migrated.status == .completed || migrated.status == .skipped) {
+                    migrated.status = .scheduled
+                    migrated.actualMinutes = nil
+                }
+                return migrated
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: migratedBlocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: completedOccurrenceIDs?.isEmpty == false
+                    ? "\(lastScheduleMessage) · recurrence outcomes will be revalidated after storage upgrade"
+                    : lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: [:],
+                // Schema 1 marked skips and partial split sessions as completed
+                // and stored no completion timestamp. Reusing those IDs could
+                // suppress valid work or advance an after-completion rule.
+                completedOccurrenceIDs: [],
+                pendingCanonicalMutations: [],
+                recurrenceSessionOutcomes: [],
+                canonicalConfigurationIdentifier: nil,
+                schedulePreviewProvenance: nil,
+                localCaptureDiagnostics: [:]
+            )
+        default:
+            throw .unsupportedSnapshotVersion(schemaVersion)
+        }
     }
 }
 
 struct EncryptedPlannerPersistence: Sendable {
     static let currentEnvelopeVersion = 1
     static let cipherName = "AES.GCM.256"
+    static let maximumPlaintextBytes = 16 * 1_048_576
+    static let maximumEnvelopeBytes = 24 * 1_048_576
 
     let fileURL: URL
     private let keyProvider: any PlannerEncryptionKeyProviding
@@ -235,17 +347,34 @@ struct EncryptedPlannerPersistence: Sendable {
     }
 
     func load() throws(PlannerPersistenceError) -> PlannerSnapshot? {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else {
-            return nil
-        }
+        try loadRevisioned().snapshot
+    }
 
-        let envelopeData: Data
-        do {
-            envelopeData = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-        } catch {
-            throw .fileReadFailed(cocoaCode: Self.cocoaCode(for: error))
+    func loadRevisioned() throws(PlannerPersistenceError) -> (
+        snapshot: PlannerSnapshot?,
+        revision: PlannerPersistenceRevision
+    ) {
+        try prepareParentDirectory()
+        return try withExclusiveLock { () throws(PlannerPersistenceError) -> (
+            PlannerSnapshot?, PlannerPersistenceRevision
+        ) in
+            guard let envelopeData = try readEnvelopeDataIfPresent() else {
+                return (nil, .missing)
+            }
+            let snapshot = try decodeSnapshot(from: envelopeData)
+            let migrated = try snapshot.migratedToCurrentSchema()
+            if snapshot.schemaVersion != PlannerSnapshot.currentSchemaVersion {
+                // Migration and replacement happen under the same sibling-file
+                // lock so a second process cannot be silently overwritten.
+                let migratedData = try encodeEnvelope(for: migrated)
+                try writeEnvelopeData(migratedData)
+                return (migrated, Self.revision(for: migratedData))
+            }
+            return (migrated, Self.revision(for: envelopeData))
         }
+    }
 
+    private func decodeSnapshot(from envelopeData: Data) throws(PlannerPersistenceError) -> PlannerSnapshot {
         let envelope: EncryptedEnvelope
         do {
             envelope = try JSONDecoder().decode(EncryptedEnvelope.self, from: envelopeData)
@@ -281,6 +410,9 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .authenticationFailed
         }
+        guard plaintext.count <= Self.maximumPlaintextBytes else {
+            throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
+        }
 
         let snapshot: PlannerSnapshot
         do {
@@ -290,13 +422,31 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .snapshotDecodingFailed
         }
-        guard snapshot.schemaVersion == PlannerSnapshot.currentSchemaVersion else {
-            throw .unsupportedSnapshotVersion(snapshot.schemaVersion)
-        }
         return snapshot
     }
 
     func save(_ snapshot: PlannerSnapshot) throws(PlannerPersistenceError) {
+        _ = try save(snapshot, expectedRevision: .missing)
+    }
+
+    @discardableResult
+    func save(
+        _ snapshot: PlannerSnapshot,
+        expectedRevision: PlannerPersistenceRevision
+    ) throws(PlannerPersistenceError) -> PlannerPersistenceRevision {
+        let data = try encodeEnvelope(for: snapshot)
+        try prepareParentDirectory()
+        return try withExclusiveLock { () throws(PlannerPersistenceError) -> PlannerPersistenceRevision in
+            let currentData = try readEnvelopeDataIfPresent()
+            guard Self.revision(for: currentData) == expectedRevision else {
+                throw PlannerPersistenceError.concurrentModification
+            }
+            try writeEnvelopeData(data)
+            return Self.revision(for: data)
+        }
+    }
+
+    private func encodeEnvelope(for snapshot: PlannerSnapshot) throws(PlannerPersistenceError) -> Data {
         guard snapshot.schemaVersion == PlannerSnapshot.currentSchemaVersion else {
             throw .unsupportedSnapshotVersion(snapshot.schemaVersion)
         }
@@ -309,6 +459,9 @@ struct EncryptedPlannerPersistence: Sendable {
             plaintext = try encoder.encode(snapshot)
         } catch {
             throw .snapshotEncodingFailed
+        }
+        guard plaintext.count <= Self.maximumPlaintextBytes else {
+            throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
         }
 
         let key = try keyProvider.loadOrCreateKey()
@@ -340,8 +493,14 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .snapshotEncodingFailed
         }
+        guard data.count <= Self.maximumEnvelopeBytes else {
+            throw .snapshotTooLarge(limitBytes: Self.maximumEnvelopeBytes)
+        }
 
-        try prepareParentDirectory()
+        return data
+    }
+
+    private func writeEnvelopeData(_ data: Data) throws(PlannerPersistenceError) {
         do {
             // Data's atomic option writes a sibling temporary file and renames it,
             // preventing a partial snapshot from replacing the last good one.
@@ -353,6 +512,60 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .fileWriteFailed(cocoaCode: Self.cocoaCode(for: error))
         }
+    }
+
+    private func readEnvelopeDataIfPresent() throws(PlannerPersistenceError) -> Data? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+            if let size = (attributes[.size] as? NSNumber)?.uint64Value,
+               size > UInt64(Self.maximumEnvelopeBytes) {
+                throw PlannerPersistenceError.snapshotTooLarge(
+                    limitBytes: Self.maximumEnvelopeBytes
+                )
+            }
+            let handle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? handle.close() }
+            var bounded = Data()
+            while bounded.count <= Self.maximumEnvelopeBytes {
+                let remaining = Self.maximumEnvelopeBytes + 1 - bounded.count
+                guard let chunk = try handle.read(upToCount: min(64 * 1_024, remaining)),
+                      !chunk.isEmpty else { break }
+                bounded.append(chunk)
+            }
+            guard bounded.count <= Self.maximumEnvelopeBytes else {
+                throw PlannerPersistenceError.snapshotTooLarge(
+                    limitBytes: Self.maximumEnvelopeBytes
+                )
+            }
+            return bounded
+        } catch let error as PlannerPersistenceError {
+            throw error
+        } catch {
+            throw .fileReadFailed(cocoaCode: Self.cocoaCode(for: error))
+        }
+    }
+
+    private func withExclusiveLock<T>(
+        _ body: () throws(PlannerPersistenceError) -> T
+    ) throws(PlannerPersistenceError) -> T {
+        let lockURL = fileURL.appendingPathExtension("lock")
+        let descriptor = lockURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_CREAT | O_RDWR, mode_t(S_IRUSR | S_IWUSR))
+        }
+        guard descriptor >= 0 else { throw .lockUnavailable(errnoCode: errno) }
+        defer { Darwin.close(descriptor) }
+        guard flock(descriptor, LOCK_EX) == 0 else {
+            throw .lockUnavailable(errnoCode: errno)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        return try body()
+    }
+
+    private static func revision(for data: Data?) -> PlannerPersistenceRevision {
+        guard let data else { return .missing }
+        return PlannerPersistenceRevision(digest: Data(SHA256.hash(data: data)))
     }
 
     private func prepareParentDirectory() throws(PlannerPersistenceError) {

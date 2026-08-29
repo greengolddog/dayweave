@@ -41,6 +41,8 @@ struct DayWeaveAPIClientTests {
         ]))
         #expect(request.headers["Authorization"] == "Bearer test-secret-token")
         #expect(request.headers["Accept"] == "application/json")
+        #expect(request.headers["Cache-Control"] == "no-store")
+        #expect(request.headers["Pragma"] == "no-cache")
     }
 
     @Test("decision and edit requests carry optimistic revisions")
@@ -134,11 +136,37 @@ struct DayWeaveAPIClientTests {
         #expect(URLProtocolStub.storage.requests(for: Self.apiToken).isEmpty)
     }
 
+    @Test("declared oversized responses are rejected before buffering")
+    func testOversizedResponseIsRejected() async throws {
+        URLProtocolStub.storage.enqueue(key: Self.apiToken, .init(
+            statusCode: 200,
+            headers: ["Content-Length": String(DayWeaveAPIClient.maximumResponseBytes + 1)],
+            body: Data(#"{"suggestions":[]}"#.utf8)
+        ))
+        let client = makeClient(token: "test-secret-token")
+
+        do {
+            _ = try await client.listSuggestions()
+            Issue.record("Expected the response size gate to fail")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .responseTooLarge(limitBytes: DayWeaveAPIClient.maximumResponseBytes))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
     @Test("base URL enforces transport security")
     func testBaseURLRequiresHTTPSExceptForLoopbackDevelopment() throws {
-        _ = try DayWeaveAPIBaseURL("https://api.example.com/root/")
+        let normalized = try DayWeaveAPIBaseURL("HTTPS://API.EXAMPLE.COM:443/root/")
+        #expect(normalized.credentialOriginIdentifier == "https://api.example.com")
+        #expect(normalized.canonicalConfigurationIdentifier == "https://api.example.com/root")
         _ = try DayWeaveAPIBaseURL("http://127.0.0.1:8787")
         _ = try DayWeaveAPIBaseURL("http://localhost:8080")
+        let ipv6 = try DayWeaveAPIBaseURL("http://[::1]:8787/root")
+        #expect(ipv6.credentialOriginIdentifier == "http://[::1]:8787")
+        let scopedIPv6 = try DayWeaveAPIBaseURL("http://[::1%25lo0]:8787/root")
+        #expect(scopedIPv6.credentialOriginIdentifier == "http://[::1%25lo0]:8787")
+        #expect(scopedIPv6.canonicalConfigurationIdentifier == "http://[::1%25lo0]:8787/root")
         do {
             _ = try DayWeaveAPIBaseURL("http://api.example.com")
             Issue.record("Expected insecure remote HTTP to fail")
@@ -153,16 +181,283 @@ struct DayWeaveAPIClientTests {
         }
     }
 
+    @Test("full configuration identifiers normalize only safe spelling variants")
+    func testCanonicalFullConfigurationIdentifier() throws {
+        let rootA = try DayWeaveAPIBaseURL("https://API.EXAMPLE.COM:443/")
+        let rootB = try DayWeaveAPIBaseURL("https://api.example.com")
+        #expect(rootA.canonicalConfigurationIdentifier == rootB.canonicalConfigurationIdentifier)
+
+        let pathA = try DayWeaveAPIBaseURL("https://API.EXAMPLE.COM:443/gateway/")
+        let pathB = try DayWeaveAPIBaseURL("https://api.example.com/gateway")
+        #expect(pathA.canonicalConfigurationIdentifier == pathB.canonicalConfigurationIdentifier)
+        #expect(
+            try DayWeaveAPIBaseURL("https://api.example.com/a%2Fb").canonicalConfigurationIdentifier
+                != DayWeaveAPIBaseURL("https://api.example.com/a/b").canonicalConfigurationIdentifier
+        )
+        #expect(
+            try DayWeaveAPIBaseURL("https://api.example.com/a/../b").canonicalConfigurationIdentifier
+                != DayWeaveAPIBaseURL("https://api.example.com/b").canonicalConfigurationIdentifier
+        )
+        #expect(
+            try DayWeaveAPIBaseURL("https://api.example.com/gateway//").canonicalConfigurationIdentifier
+                != pathA.canonicalConfigurationIdentifier
+        )
+        #expect(
+            try DayWeaveAPIBaseURL("https://other.example.com/gateway").canonicalConfigurationIdentifier
+                != pathA.canonicalConfigurationIdentifier
+        )
+    }
+
+    @Test("default API transport is ephemeral and credential-free")
+    func testEphemeralTransportConfiguration() {
+        let session = makeDayWeaveEphemeralSession()
+        #expect(session.configuration.urlCache == nil)
+        #expect(session.configuration.httpCookieStorage == nil)
+        #expect(!session.configuration.httpShouldSetCookies)
+        #expect(session.configuration.urlCredentialStorage == nil)
+        #expect(session.configuration.requestCachePolicy == .reloadIgnoringLocalAndRemoteCacheData)
+    }
+
+    @Test("canonical delta preserves scheduling fields and cursor semantics")
+    func testCanonicalDeltaPreservesSchedulingFields() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("""
+                {"changes":[{"type":"upsert","item":\(Self.canonicalItemObject(revision: 7, includeFutureField: true))}],
+                 "next_cursor":"opaque-cursor-7","has_more":false}
+                """.utf8)
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        let page = try await client.itemDelta(cursor: "opaque-cursor-6", limit: 37)
+
+        #expect(page.nextCursor == "opaque-cursor-7")
+        #expect(!page.hasMore)
+        let item: DayWeaveCanonicalItem
+        switch try #require(page.changes.first) {
+        case let .upsert(value): item = value
+        case .tombstone:
+            Issue.record("Expected an item upsert")
+            return
+        }
+        #expect(item.id == Self.itemID)
+        #expect(item.revision == 7)
+        #expect(item.deadlineAt != nil)
+        #expect(item.parentID == Self.parentID)
+        #expect(item.recurrence == .object([
+            "type": .string("weekly"),
+            "times_per_week": .number(2),
+            "weekdays": .array([.string("monday"), .string("thursday")]),
+        ]))
+        #expect(item.splitPolicy == .splittable(minimumChunkSeconds: 900, maximumChunkSeconds: 2_700))
+        #expect(item.flexibleConstraints == .object([
+            "energy": .string("deep"),
+            "tags": .array([.string("client")]),
+        ]))
+        #expect(item.unsupportedFields == [
+            "future_scheduling_rule": .object(["mode": .string("server_defined")]),
+        ])
+        #expect(!item.supportsLosslessReplacement)
+
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
+        #expect(request.url.path == "/gateway/v1/items/delta")
+        let query = try #require(URLComponents(url: request.url, resolvingAgainstBaseURL: false))
+        #expect(Set(query.queryItems ?? []) == Set([
+            URLQueryItem(name: "cursor", value: "opaque-cursor-6"),
+            URLQueryItem(name: "limit", value: "37"),
+        ]))
+    }
+
+    @Test("canonical create and replacement are idempotent and revision guarded")
+    func testCanonicalMutationsCarryExactContracts() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 201, body: Data("{\"item\":\(Self.canonicalItemObject(revision: 1, deadlineAt: "null", recurrence: "null"))}".utf8)),
+            .init(statusCode: 200, body: Data("{\"item\":\(Self.canonicalItemObject(revision: 2, status: "paused", deadlineAt: "null", recurrence: "null"))}".utf8))
+        )
+        let client = makeClient(token: Self.apiToken)
+        let fields = DayWeaveCanonicalItemFields(
+            kind: .task,
+            status: .scheduled,
+            title: "Canonical deep work",
+            notes: "Keep exact constraints",
+            timezoneName: "Europe/Madrid",
+            durationSeconds: 3_600,
+            deadlineAt: Self.date("2026-09-01T17:00:00Z"),
+            recurrence: .object([
+                "type": .string("weekly"),
+                "times_per_week": .number(2),
+                "weekdays": .array([.string("monday"), .string("thursday")]),
+            ]),
+            flexibleConstraints: .object([
+                "energy": .string("deep"),
+                "tags": .array([.string("client")]),
+            ]),
+            splitPolicy: .splittable(minimumChunkSeconds: 900, maximumChunkSeconds: 2_700),
+            importance: 90,
+            urgency: 70,
+            parentID: Self.parentID,
+            siblingOrder: 3
+        )
+
+        let created = try await client.createCanonicalItem(
+            .init(id: Self.itemID, fields: fields),
+            idempotencyKey: "mac-create-stable"
+        )
+        let replacement = DayWeaveCanonicalItemFields(item: created, status: .paused)
+        _ = try await client.replaceCanonicalItem(
+            created.id,
+            expectedRevision: created.revision,
+            item: replacement,
+            idempotencyKey: "mac-replace-stable"
+        )
+
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        #expect(requests.map(\.method) == ["POST", "PUT"])
+        #expect(requests[0].headers["Idempotency-Key"] == "mac-create-stable")
+        #expect(requests[1].headers["Idempotency-Key"] == "mac-replace-stable")
+        let create = try #require(requests[0].jsonBody)
+        #expect((create["id"] as? String)?.lowercased() == Self.itemID.uuidString.lowercased())
+        #expect(create["fields"] == nil)
+        #expect((create["duration_seconds"] as? NSNumber)?.uint32Value == 3_600)
+        #expect((create["recurrence"] as? [String: Any])?["type"] as? String == "weekly")
+        #expect((create["split_policy"] as? [String: Any])?["type"] as? String == "splittable")
+        let replace = try #require(requests[1].jsonBody)
+        #expect((replace["expected_revision"] as? NSNumber)?.uint64Value == 1)
+        #expect((replace["item"] as? [String: Any])?["status"] as? String == "paused")
+    }
+
+    @Test("an operation keeps its immutable credential snapshot")
+    func testCredentialSnapshotDoesNotRotateMidOperation() async throws {
+        let originalToken = "credential-before-rotation"
+        let tokenStore = TestBearerTokenStore(token: originalToken)
+        URLProtocolStub.storage.reset(key: originalToken)
+        URLProtocolStub.storage.enqueue(
+            key: originalToken,
+            .init(statusCode: 200, body: Data(#"{"changes":[],"next_cursor":"stable","has_more":false}"#.utf8))
+        )
+        let client = DayWeaveAPIClient(
+            baseURL: try DayWeaveAPIBaseURL("https://old-origin.example/gateway"),
+            session: URLProtocolStub.makeSession(),
+            bearerToken: tokenStore.loadToken()
+        )
+        tokenStore.saveToken("credential-after-rotation")
+
+        _ = try await client.itemDelta(cursor: nil)
+
+        let request = try #require(URLProtocolStub.storage.requests(for: originalToken).first)
+        #expect(request.url.host == "old-origin.example")
+        #expect(request.headers["Authorization"] == "Bearer \(originalToken)")
+        #expect(URLProtocolStub.storage.requests(for: "credential-after-rotation").isEmpty)
+    }
+
+    @Test("future split fields fail closed and unsigned JSON integers round-trip exactly")
+    func testLosslessJSONAndFutureSplitPolicy() throws {
+        let split = try JSONDecoder().decode(
+            DayWeaveSplitPolicy.self,
+            from: Data(#"{"type":"splittable","minimum_chunk_seconds":900,"maximum_chunk_seconds":2700,"future_mode":{"limit":18446744073709551615}}"#.utf8)
+        )
+        if case let .unknown(raw) = split {
+            #expect(raw["future_mode"] == .object([
+                "limit": .number(JSONNumber(UInt64.max)),
+            ]))
+        } else {
+            Issue.record("A known split policy with future nested fields must be read-only")
+        }
+        #expect(!split.isSupportedForWrite)
+
+        let value = try JSONDecoder().decode(
+            JSONValue.self,
+            from: Data("18446744073709551615".utf8)
+        )
+        let encoded = try JSONEncoder().encode(value)
+        #expect(String(decoding: encoded, as: UTF8.self) == "18446744073709551615")
+        #expect(!value.supportsLosslessRoundTrip)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let value = try decoder.singleValueContainer().decode(String.self)
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let whole = ISO8601DateFormatter()
+            whole.formatOptions = [.withInternetDateTime]
+            guard let date = fractional.date(from: value) ?? whole.date(from: value) else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: decoder.codingPath, debugDescription: "Invalid test timestamp")
+                )
+            }
+            return date
+        }
+        let item = try decoder.decode(
+            DayWeaveCanonicalItem.self,
+            from: Data(Self.canonicalItemObject(revision: 9).utf8)
+        )
+        #expect(!item.supportsLosslessReplacement)
+        do {
+            _ = try JSONEncoder().encode(DayWeaveCanonicalItemFields(item: item, status: .paused))
+            Issue.record("A server timestamp must not be normalized by a full replacement")
+        } catch {
+            #expect(error is EncodingError)
+        }
+    }
+
     private func makeClient(token: String?) -> DayWeaveAPIClient {
         DayWeaveAPIClient(
             baseURL: try! DayWeaveAPIBaseURL("https://api.example.com/gateway"),
             session: URLProtocolStub.makeSession(),
-            tokenStore: TestBearerTokenStore(token: token)
+            bearerToken: token
         )
     }
 
     static let apiToken = "test-secret-token"
     static let proposalID = UUID(uuidString: "11111111-2222-4333-8444-555555555555")!
+    static let itemID = UUID(uuidString: "aaaaaaaa-2222-4333-8444-bbbbbbbbbbbb")!
+    static let parentID = UUID(uuidString: "cccccccc-2222-4333-8444-dddddddddddd")!
+
+    static func date(_ value: String) -> Date {
+        ISO8601DateFormatter().date(from: value)!
+    }
+
+    static func canonicalItemObject(
+        revision: UInt64,
+        status: String = "scheduled",
+        deadlineAt: String = "\"2026-09-01T17:00:00Z\"",
+        recurrence: String = #"{"type":"weekly","times_per_week":2,"weekdays":["monday","thursday"]}"#,
+        includeFutureField: Bool = false
+    ) -> String {
+        let futureField = includeFutureField
+            ? ",\"future_scheduling_rule\":{\"mode\":\"server_defined\"}"
+            : ""
+        return """
+        {
+          "id":"\(itemID.uuidString.lowercased())",
+          "kind":"task",
+          "status":"\(status)",
+          "title":"Canonical deep work",
+          "notes":"Keep exact constraints",
+          "timezone_name":"Europe/Madrid",
+          "duration_seconds":3600,
+          "deadline_at":\(deadlineAt),
+          "earliest_start_at":null,
+          "recurrence":\(recurrence),
+          "flexible_constraints":{"energy":"deep","tags":["client"]},
+          "split_policy":{"type":"splittable","minimum_chunk_seconds":900,"maximum_chunk_seconds":2700},
+          "importance":90,
+          "urgency":70,
+          "parent_id":"\(parentID.uuidString.lowercased())",
+          "sibling_order":3,
+          "is_executable":true,
+          "revision":\(revision),
+          "created_at":"2026-08-29T09:00:00Z",
+          "updated_at":"2026-08-29T09:00:00.125Z",
+          "completed_at":null,
+          "deleted_at":null\(futureField)
+        }
+        """
+    }
 
     static func listEnvelope() -> Data {
         Data("{\"suggestions\":[\(proposalObject(status: "pending", revision: 4))]}".utf8)
@@ -198,22 +493,54 @@ struct DayWeaveAPIClientTests {
 
 final class TestBearerTokenStore: BearerTokenStoring, @unchecked Sendable {
     private let lock = NSLock()
-    private var token: String?
+    private var credential: OriginBoundBearerCredential?
+    private var legacyToken: String?
 
-    init(token: String?) {
-        self.token = token
+    init(token: String?, origin: String = "https://api.example.com") {
+        credential = token.map {
+            OriginBoundBearerCredential(
+                token: $0,
+                origin: Self.normalizedOrigin(origin)
+            )
+        }
+    }
+
+    init(legacyToken: String) {
+        credential = nil
+        self.legacyToken = legacyToken
+    }
+
+    func loadCredential() throws -> OriginBoundBearerCredential? {
+        try lock.withLock {
+            if legacyToken != nil { throw BearerTokenStoreError.legacyUnboundToken }
+            return credential
+        }
+    }
+
+    func saveCredential(_ credential: OriginBoundBearerCredential) {
+        lock.withLock {
+            self.credential = credential
+            legacyToken = nil
+        }
+    }
+
+    func deleteCredential() {
+        lock.withLock {
+            credential = nil
+            legacyToken = nil
+        }
     }
 
     func loadToken() -> String? {
-        lock.withLock { token }
+        lock.withLock { credential?.token }
     }
 
-    func saveToken(_ token: String) {
-        lock.withLock { self.token = token }
+    func saveToken(_ token: String, origin: String = "https://api.example.com") {
+        saveCredential(.init(token: token, origin: Self.normalizedOrigin(origin)))
     }
 
-    func deleteToken() {
-        lock.withLock { token = nil }
+    private static func normalizedOrigin(_ value: String) -> String {
+        (try? DayWeaveAPIBaseURL(value).credentialOriginIdentifier) ?? value
     }
 }
 
@@ -222,11 +549,18 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
         let statusCode: Int
         let headers: [String: String]
         let body: Data
+        let delay: TimeInterval
 
-        init(statusCode: Int, headers: [String: String] = [:], body: Data) {
+        init(
+            statusCode: Int,
+            headers: [String: String] = [:],
+            body: Data,
+            delay: TimeInterval = 0
+        ) {
             self.statusCode = statusCode
             self.headers = headers
             self.body = body
+            self.delay = delay
         }
     }
 
@@ -302,6 +636,8 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
     }
 
     static let storage = Storage()
+    private let stateLock = NSLock()
+    private var isStopped = false
 
     static func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
@@ -327,10 +663,20 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
-        client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: response.body)
-        client?.urlProtocolDidFinishLoading(self)
+        let deliver: @Sendable () -> Void = { [weak self] in
+            guard let self, !self.stateLock.withLock({ self.isStopped }) else { return }
+            self.client?.urlProtocol(self, didReceive: httpResponse, cacheStoragePolicy: .notAllowed)
+            self.client?.urlProtocol(self, didLoad: response.body)
+            self.client?.urlProtocolDidFinishLoading(self)
+        }
+        if response.delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + response.delay, execute: deliver)
+        } else {
+            deliver()
+        }
     }
 
-    override func stopLoading() {}
+    override func stopLoading() {
+        stateLock.withLock { isStopped = true }
+    }
 }
