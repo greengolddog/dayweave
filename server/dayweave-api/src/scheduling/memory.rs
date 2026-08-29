@@ -9,8 +9,8 @@ use super::{
     ConflictQuery, ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary,
     PlacementExplanation, PlanOperationKind, PlanningSimulationPort, ScheduleAccess,
     ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
-    ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationIssue, SimulationRequest,
-    SimulationResult, StoredItem, StoredSchedule,
+    ScheduleView, SchedulingPortError, SimulationIssue, SimulationRequest, SimulationResult,
+    StoredItem, StoredSchedule,
 };
 
 #[derive(Clone, Debug)]
@@ -267,7 +267,7 @@ impl PlanningSimulationPort for InMemorySimulationPort {
             return Ok(result.clone());
         }
 
-        let mut moved_blocks = Vec::new();
+        let moved_blocks = Vec::new();
         let mut warnings = Vec::new();
         for operation in &request.operations {
             match operation.kind {
@@ -298,31 +298,22 @@ impl PlanningSimulationPort for InMemorySimulationPort {
                         ));
                         continue;
                     }
-                    let start = operation
-                        .parameters
-                        .get("start")
-                        .and_then(ValueExt::as_datetime)
-                        .ok_or_else(|| {
-                            SchedulingPortError::InvalidQuery(
-                                "move_block parameters.start must be an RFC 3339 instant"
-                                    .to_owned(),
-                            )
-                        })?;
-                    let duration = block.end - block.start;
-                    moved_blocks.push(SimulatedBlockMove {
-                        block_id: block.id.clone(),
-                        previous_start: block.start,
-                        previous_end: block.end,
-                        proposed_start: start,
-                        proposed_end: start + duration,
-                    });
+                    warnings.push(issue(
+                        "not_modeled",
+                        "Move feasibility is not modeled until the scheduler can prove horizon, availability, overlap, and hard-constraint safety.",
+                        vec![block.id.clone()],
+                    ));
                 }
                 PlanOperationKind::DeleteItem => warnings.push(issue(
                     "confirmation_required",
                     "Deletion remains a proposal and requires explicit confirmation in DayWeave.",
                     operation.target_id.clone().into_iter().collect(),
                 )),
-                _ => {}
+                _ => warnings.push(issue(
+                    "not_modeled",
+                    "This operation is not modeled by the current what-if engine; it remains proposal-only.",
+                    operation.target_id.clone().into_iter().collect(),
+                )),
             }
         }
 
@@ -422,15 +413,5 @@ fn issue(code: &str, message: &str, related_ids: Vec<String>) -> SimulationIssue
         code: code.to_owned(),
         message: message.to_owned(),
         related_ids,
-    }
-}
-
-trait ValueExt {
-    fn as_datetime(&self) -> Option<DateTime<Utc>>;
-}
-
-impl ValueExt for serde_json::Value {
-    fn as_datetime(&self) -> Option<DateTime<Utc>> {
-        self.as_str()?.parse().ok()
     }
 }

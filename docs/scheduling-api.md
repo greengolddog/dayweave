@@ -1,9 +1,22 @@
-# Scheduling preview contract
+# Scheduling preview and publication contract
 
 `POST /v1/schedule/preview` composes the active canonical item graph without
 writing items, schedule blocks, or provider state. It requires the ordinary
 DayWeave bearer token. The same canonical revisions and request produce the
 same `input_digest` and plan.
+
+The preview and publication routes each have a 16 MiB request-body ceiling.
+Other API routes retain the service-wide 1 MiB ceiling. A body over its route
+limit receives `413 payload_too_large` rather than being reclassified as
+malformed JSON.
+
+Successful preview is also the publication-persistability boundary. Fixed-block
+titles must contain 1–500 Unicode scalar values and no control characters;
+fixed/output identifiers must be unique; and every persisted JSON string and
+key must satisfy the same bounded control-character rules. The complete durable
+publication snapshot must be no larger than 8 MiB, leaving headroom beneath the
+16 MiB route and database limits. A deterministic violation is rejected as
+`422` during preview, before a client can journal a publish request.
 
 Every response includes `source_item_revisions`, an object mapping every active
 canonical item UUID to the exact revision used for composition (including items
@@ -12,9 +25,153 @@ cache before persisting a preview. If it differs, the item delta and preview
 were taken from different repository snapshots; discard the preview and retry
 the pull/compose cycle.
 
-All timestamps at the HTTP boundary are RFC 3339. The API resolves local day
+The digest also binds that complete active-item revision map. A change to an
+item that is rejected or otherwise produces no block therefore still makes a
+previous preview stale. It also binds the explicit scheduler publication schema
+version, so a preview cached across a solver/schema upgrade cannot acknowledge
+and install different blocks. Effective sensitivity evidence is retained
+internally for publication/redaction; it is deliberately not exposed as a
+whole-item map in the preview JSON or OpenAPI schema.
+
+## Explicit immutable publication
+
+`POST /v1/schedule/publish` requires a native device credential carrying the
+REST-only `schedule_publish` scope. Native MCP and OAuth MCP credentials can
+never receive that scope. The request wraps the exact typed preview input:
+
+```json
+{
+  "idempotency_key": "11111111-1111-4111-8111-111111111111",
+  "expected_input_digest": "sha256:replace-with-the-64-lowercase-hex-preview-digest",
+  "schedule": {
+    "as_of": "2026-09-01T07:00:00Z",
+    "horizon_start": "2026-09-01T00:00:00Z",
+    "horizon_end": "2026-09-02T00:00:00Z",
+    "timezone_name": "Europe/Madrid",
+    "availability": [],
+    "fixed_blocks": [],
+    "previous_assignments": [],
+    "config": {
+      "slot_granularity_minutes": 5,
+      "stability_weight": 4,
+      "default_soft_weight": 100
+    },
+    "recurrence_context": {}
+  }
+}
+```
+
+Before recomposing, the server checks the durable `(workspace, user,
+idempotency_key)` receipt against a domain-separated hash of the typed request.
+This lets a client recover a lost successful response even after later item or
+schedule changes. Exact replay returns the original (possibly superseded)
+receipt and its original `published_at`; changed content under the same key is
+`409 schedule_publication_idempotency_conflict`.
+
+For a new key, the server recomposes from canonical items and compares the
+result with `expected_input_digest`. Inside the publication transaction it
+serializes against item mutations and rechecks the complete active-item
+revision set. It then inserts a draft header, blocks and exactly one detail;
+supersedes the old current revision; seals the draft as published; and writes
+the receipt and audit row, all in one transaction. Content insertion is allowed
+only while the parent is draft, and blocks/details become immutable after the
+seal. A fresh key whose solver-versioned publication content is identical to the
+current revision binds to that existing revision without revision churn.
+An expected-digest mismatch or canonical item change during the transaction is
+`409 schedule_publication_stale`. That stable code proves no publication was
+committed and tells the client to discard the journal and recompose; generic,
+transport, unavailable, and idempotency-conflict failures remain ambiguous and
+must retain the exact journal for operator recovery or retry.
+
+Both first publication and exact idempotent replay return `200`; `replayed` is
+the sole distinction:
+
+```json
+{
+  "revision": {
+    "id": "22222222-2222-4222-8222-222222222222",
+    "revision": "7:22222222-2222-4222-8222-222222222222",
+    "revision_number": 7,
+    "input_digest": "sha256:replace-with-the-64-lowercase-hex-preview-digest",
+    "horizon_start": "2026-09-01T00:00:00Z",
+    "horizon_end": "2026-09-02T00:00:00Z",
+    "timezone_name": "Europe/Madrid",
+    "published_at": "2026-09-01T07:00:03Z"
+  },
+  "replayed": false
+}
+```
+
+The client must journal the complete publish request before I/O and clear it
+only after validating status `200`, the exact digest, and the returned receipt.
+When `replayed` is `true`, that receipt proves the old publication outcome and
+may already be superseded; clear the matching journal, but do not make that
+candidate current or actionable. Fresh-compose and publish again. A
+`replayed:false` response for a new key may legitimately bind identical content
+to the already-current revision and therefore carry an older `published_at`;
+that response remains installable after the same exact validation.
+Preview remains side-effect-free and never creates draft/publication rows.
+
+## Published schedule reads and what-if simulations
+
+With PostgreSQL configured, the production MCP dependency graph reads only the
+current `published` revision. With no published revision it returns an explicit
+not-found result; it never fabricates an empty schedule. Every query and
+simulation requires principal `workspace_id` and `user_id` to equal the
+configured personal database scope. Missing/static-legacy/cross-scope identity
+fails closed.
+
+Schedule blocks preserve `planned`, `pinned`, `calendar_event`, and
+`external_fixed` semantics. Busy-only reads omit every ID/title; inherited
+sensitive blocks become opaque busy intervals, sensitive item search results
+are omitted, sensitive placement evidence is not found, and conflicts involving
+any private or ambiguously related evidence are filtered. Search considers all
+bounded goal links, not only the first.
+
+`simulate_plan` requires the exact current revision. A move of a fixed, pinned,
+calendar, or external block is explicitly `not_movable`; a move of a flexible
+planned block is currently `not_modeled`, because the simulation adapter does
+not yet prove availability, overlap, horizon, and hard-constraint feasibility.
+It never returns a moved block while that proof is absent. Deletion is flagged
+as requiring confirmation; every other unsupported operation receives an
+explicit `not_modeled` warning and remains proposal-only. Simulation
+capabilities use 32 random bytes, are stored only as domain-separated
+token/subject hashes, expire within 15 minutes, are bounded per owner, survive
+restart, and are consumed once under a database row lock. Proposal creation,
+outbox/audit insertion, capability consumption, and the tenant/subject-scoped
+exactly-once submission receipt commit in one PostgreSQL transaction.
+Publication after simulation makes the token stale via an exact revision check.
+Each durable simulation also carries internal, typed item/block reference sets
+and a monotonic `sensitive_at_simulation` bit. This privacy evidence is never
+returned by MCP, and consume/submission rechecks it against both the published
+revision and the current canonical hierarchy. Missing, malformed, unknown, or
+historically sensitive evidence fails closed without consuming the capability
+or committing any proposal, outbox, audit, or receipt row. Active simulation
+records created before this evidence existed must be simulated again.
+
+All timestamps at the HTTP boundary are RFC 3339 and must be aligned to
+microsecond precision, matching PostgreSQL `timestamptz`; finer fractions are
+rejected with `422` before digesting or journaling. The API resolves local day
 boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
+
+Production publication, immutable reads, and transactional MCP proposal
+submission require migrations through
+`0013_schedule_seal_and_mcp_submission.sql`.
+
+An upgrade from migrations 1–11 safely seals any legacy published revision but
+cannot invent the missing durable detail/evidence snapshot. Schedule and item
+reads remain available from its immutable blocks; conflict queries and
+simulation return the stable `republish_required` result until the native app
+previews and publishes one fresh revision. Operators must complete that fresh
+publication before enabling remote MCP access. Legacy drafts remain drafts and
+may be discarded normally; they are never promoted by the migration.
+
+The publication `idempotency_key` is a random client-generated UUID and a
+non-secret correlation identifier, not a bearer capability. It is intentionally
+stored verbatim in the publication receipt and content-free audit metadata.
+MCP simulation capabilities and external string proposal retry keys remain
+domain-hashed and are never persisted raw.
 
 Every current canonical item carries a required `is_sensitive` boolean. It is
 the item's own classification; preview blocks and rejected-item entries carry

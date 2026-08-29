@@ -45,9 +45,15 @@ Another tuple loses and receives the same redacted authentication failure as an
 invalid credential. The replay window advances after the next successful
 rotation.
 
-Current client contract version is `1`. Unknown contract versions, malformed
-client version/capability metadata, duplicate scopes, REST scopes on an MCP
-client, and MCP-only submission scope on a device session fail closed.
+The device client contract is version `2`; it adds the REST-only
+`schedule_publish` capability. Existing version-1 device rows remain usable
+with their exact old scopes, but database and application constraints forbid
+`schedule_publish` on a version-1 enrollment/session and refresh never widens a
+session. A device that needs publication must re-enroll on version 2. Native MCP
+remains contract version `1` and is limited to its unchanged MCP-only scope set.
+Unknown contract versions, malformed client version/capability metadata,
+duplicate scopes, REST scopes on an MCP client, and MCP-only submission scope
+on a device session fail closed.
 
 ## API sequence
 
@@ -56,7 +62,7 @@ All management endpoints below are under `/v1` and require their named scope.
 1. In hybrid mode, generate an enrollment `id` and independent `dw_en1_`
    credential. Journal the exact request before calling `POST
    /auth/device-enrollments` with those fields, a stable `client_instance_id`,
-   `client_kind`, label, desired REST scopes, `client_contract_version: 1`,
+   `client_kind`, label, desired REST scopes, `client_contract_version: 2`,
    client version, and capabilities. It requires `auth_sessions_write`. Retry
    an ambiguous result only with the exact journaled request; discard the
    journal only after validating the status and exact echoed fields.
@@ -99,7 +105,8 @@ is never retried against the static-token authenticator.
 ## Cutover checklist
 
 1. Back up PostgreSQL, restore it in isolation, and apply migrations through
-   `0010_auth_runtime.sql` before changing authentication mode.
+   `0013_schedule_seal_and_mcp_submission.sql` before changing authentication
+   mode.
 2. Deploy in `legacy_static`; verify existing clients and inspect migration and
    audit health.
 3. Set `DAYWEAVE_AUTH_MODE=hybrid` while retaining the existing static token.
@@ -111,8 +118,11 @@ is never retried against the static-token authenticator.
 5. Audit any session, enrollment, or MCP rows created by the earlier foundation
    migration. Reissue rows carrying a scope that is invalid for their audience,
    then validate `sessions_v1_runtime_shape_check`,
-   `device_enrollments_runtime_scopes_check`, and
-   `mcp_clients_v1_runtime_shape_check`.
+   `sessions_schedule_publish_contract_check`,
+   `device_enrollments_runtime_scopes_check`,
+   `device_enrollments_schedule_publish_contract_check`,
+   `mcp_clients_v1_runtime_shape_check`, and
+   `mcp_clients_contract_scopes_check`.
 6. Confirm every device can refresh after restart and after an intentionally
    dropped response. Keep a recoverable offline copy of the static bootstrap
    credential only until this validation is complete.
@@ -130,9 +140,13 @@ approval; it must not happen automatically.
 ## Remaining release gates
 
 The server slice does not configure ingress/per-principal rate limiting or
-suspicious-authentication alerts, and the first-party clients must still adopt
-the exact journal/atomic-store protocol. Published ChatGPT/Codex account linking
-remains blocked until the documented Auth0 activation preflight passes and
-production MCP schedule-query/simulation ports replace their unavailable
-placeholders. Until those gates and a real-device cutover rehearsal pass, keep
-the deployment classified as a development artifact.
+suspicious-authentication alerts. The first-party clients implement the exact
+journal/atomic-store protocol, but it still requires independent audit and a
+real-device cutover rehearsal. Published ChatGPT/Codex account linking remains
+blocked until the documented Auth0/tunnel activation preflight, a
+deployed end-to-end schedule read and simulation rehearsal, and an independent
+security review pass. The PostgreSQL schedule publication/query/simulation and
+transactional proposal-submission ports are wired; a deployment without
+PostgreSQL still fails closed with unavailable adapters.
+Until the remaining gates and a real-device cutover rehearsal pass, keep the
+deployment classified as a development artifact.

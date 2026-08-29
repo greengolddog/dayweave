@@ -27,43 +27,7 @@ impl PostgresProposalRepository {
 impl ProposalRepository for PostgresProposalRepository {
     async fn insert(&self, proposal: Proposal) -> Result<Proposal, RepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        let revision = revision_to_i64(proposal.revision)?;
-        let result = sqlx::query(
-            "INSERT INTO proposals (id, workspace_id, revision, submitted_by_user_id, \
-             submitted_by_subject, source, source_reference, kind, status, title, explanation, \
-             payload, decision_note, created_at, updated_at, expires_at, decided_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
-        )
-        .bind(proposal.id)
-        .bind(self.scope.workspace_id)
-        .bind(revision)
-        .bind(self.scope.user_id)
-        .bind(&proposal.submitted_by)
-        .bind(source_name(proposal.source))
-        .bind(&proposal.source_reference)
-        .bind(kind_name(proposal.kind))
-        .bind(status_name(proposal.status))
-        .bind(&proposal.title)
-        .bind(&proposal.explanation)
-        .bind(&proposal.payload)
-        .bind(&proposal.decision_note)
-        .bind(proposal.created_at)
-        .bind(proposal.updated_at)
-        .bind(proposal.expires_at)
-        .bind(proposal.decided_at)
-        .execute(&mut *transaction)
-        .await;
-        if let Err(error) = result {
-            return Err(map_insert_error(&error, proposal.id));
-        }
-        record_mutation(
-            &mut transaction,
-            self.scope,
-            &proposal,
-            "proposal.created",
-            None,
-        )
-        .await?;
+        insert_proposal_tx(&mut transaction, self.scope, &proposal).await?;
         transaction.commit().await.map_err(internal)?;
         Ok(proposal)
     }
@@ -187,6 +151,43 @@ impl ProposalRepository for PostgresProposalRepository {
         record_deletion(&mut transaction, self.scope, id, expected_revision).await?;
         transaction.commit().await.map_err(internal)
     }
+}
+
+pub(crate) async fn insert_proposal_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    proposal: &Proposal,
+) -> Result<(), RepositoryError> {
+    let revision = revision_to_i64(proposal.revision)?;
+    let result = sqlx::query(
+        "INSERT INTO proposals (id, workspace_id, revision, submitted_by_user_id, \
+         submitted_by_subject, source, source_reference, kind, status, title, explanation, \
+         payload, decision_note, created_at, updated_at, expires_at, decided_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+    )
+    .bind(proposal.id)
+    .bind(scope.workspace_id)
+    .bind(revision)
+    .bind(scope.user_id)
+    .bind(&proposal.submitted_by)
+    .bind(source_name(proposal.source))
+    .bind(&proposal.source_reference)
+    .bind(kind_name(proposal.kind))
+    .bind(status_name(proposal.status))
+    .bind(&proposal.title)
+    .bind(&proposal.explanation)
+    .bind(&proposal.payload)
+    .bind(&proposal.decision_note)
+    .bind(proposal.created_at)
+    .bind(proposal.updated_at)
+    .bind(proposal.expires_at)
+    .bind(proposal.decided_at)
+    .execute(&mut **transaction)
+    .await;
+    if let Err(error) = result {
+        return Err(map_insert_error(&error, proposal.id));
+    }
+    record_mutation(transaction, scope, proposal, "proposal.created", None).await
 }
 
 async fn lock_expected_revision(
@@ -314,7 +315,7 @@ async fn record_audit(
     Ok(())
 }
 
-fn proposal_from_row(row: &PgRow) -> Result<Proposal, RepositoryError> {
+pub(crate) fn proposal_from_row(row: &PgRow) -> Result<Proposal, RepositoryError> {
     let revision: i64 = row.try_get("revision").map_err(internal)?;
     Ok(Proposal {
         id: row.try_get("id").map_err(internal)?,

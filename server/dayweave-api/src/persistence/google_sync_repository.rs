@@ -1095,6 +1095,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             return Err(GoogleSyncRepositoryError::ClaimLost);
         }
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,

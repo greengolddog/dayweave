@@ -151,6 +151,16 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     let document = body_json(openapi).await;
     assert!(document["paths"]["/v1/suggestions"].is_object());
     assert!(document["paths"]["/v1/schedule/preview"].is_object());
+    assert!(document["paths"]["/v1/schedule/publish"].is_object());
+    assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["200"].is_object());
+    assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["201"].is_null());
+    assert!(document["paths"]["/v1/schedule/preview"]["post"]["responses"]["413"].is_object());
+    assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["413"].is_object());
+    assert!(
+        document["components"]["schemas"]["ComposeScheduleResult"]["properties"]
+            .get("source_item_sensitivity")
+            .is_none()
+    );
     assert!(document["paths"]["/v1/integrations/google/oauth/start"].is_object());
     assert!(document["paths"]["/v1/integrations/google/oauth/callback"].is_object());
     assert!(

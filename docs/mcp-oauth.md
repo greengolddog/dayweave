@@ -177,10 +177,13 @@ To roll back, remove the OAuth overlay, set
 the process environment, and restart. Both metadata routes then disappear and
 native MCP behavior remains unchanged.
 
-## Known product release gate
+## Remaining product release gate
 
-OAuth authentication does not itself make schedule data available. The current
-production dependency graph still installs unavailable schedule-query and
-simulation ports for MCP. Published ChatGPT/Codex access therefore remains a
-product release blocker until those ports are wired and independently audited;
-do not claim live schedule access based only on a successful OAuth handshake.
+The PostgreSQL production dependency graph now installs durable, tenant-bound
+schedule-query, simulation, and atomic proposal-submission ports; a no-database
+graph retains unavailable adapters and fails closed. OAuth authentication alone
+still does not prove a live product integration. Published ChatGPT/Codex access
+remains blocked until the exact Auth0/tunnel activation preflight, deployed
+owner-scope schedule read, redaction, simulation, restart/race, and proposal
+flows pass an independent review. Do not claim live schedule access based only
+on a successful OAuth handshake or local PostgreSQL tests.

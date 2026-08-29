@@ -372,9 +372,10 @@ Its external contract is intentionally asymmetric:
 
 ChatGPT web does not accept a custom DayWeave API key. Remote activation still
 requires the stable Nebius Tunnel HTTPS URL, the complete Auth0 preflight, and
-replacement plus independent audit of the production MCP schedule-query and
-simulation placeholders. OAuth account linking alone must not be presented as
-live schedule access. After those gates pass:
+an independent deployed audit of the wired PostgreSQL MCP schedule-query,
+redaction, simulation, and atomic proposal-submission flows. OAuth account
+linking alone must not be presented as live schedule access. After those gates
+pass:
 
 1. activate the explicit OAuth Compose overlay and run every preflight in
    [`mcp-oauth.md`](mcp-oauth.md);

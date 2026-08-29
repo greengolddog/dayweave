@@ -76,11 +76,13 @@ effects must flow through an auditable proposal or outbox boundary.
   exact `dw_da1_`, `dw_dr1_`, `dw_en1_`, and `dw_mc1_` formats carrying 32-byte
   payloads, rejects reuse of the same secret material within a device issuance
   or rotation even when the public prefixes differ, and stores domain-separated
-  SHA-256 digests only. Version-1 session rows retain the current credential
+  SHA-256 digests only. Durable session rows retain the current credential
   issuance time, so the 15-minute access, 30-day refresh-idle, and 180-day
   session-absolute bounds are independently enforced during writes, by database
-  constraints, and again during hydration. The same boundaries enforce the
-  10-minute enrollment and
+  constraints, and again during hydration. Device contract v2 adds the
+  REST-only `schedule_publish` scope; historical v1 device rows cannot carry or
+  acquire it. Native MCP remains contract v1 with its unchanged MCP-only
+  scopes. The same boundaries enforce the 10-minute enrollment and
   90-day-default/365-day-maximum MCP lifetimes. Database failures, invalid
   durable metadata, expiry, revocation, reuse, and cross-tenant lookups fail
   closed. Enrollment and refresh also support crash/network-loss recovery for
@@ -99,9 +101,11 @@ effects must flow through an auditable proposal or outbox boundary.
   and per-tool OAuth security schemes; verifies only bounded RS256 access tokens
   for the exact owner, client, issuer, and MCP resource; and never accepts those
   tokens at REST. The complete activation, preflight, and rollback contract is
-  documented in [`mcp-oauth.md`](mcp-oauth.md). Publication remains blocked on
-  that reviewed Auth0/tunnel preflight and on replacing the production MCP
-  schedule-query and simulation placeholders with audited live ports.
+  documented in [`mcp-oauth.md`](mcp-oauth.md). Remote publication remains
+  blocked on the reviewed Auth0/tunnel live preflight and deployed environment
+  audit; the PostgreSQL schedule-query/redaction/simulation and atomic
+  proposal-submission ports are wired and covered by restart/race/redaction
+  tests.
 - Credential issuance, list, rotation, and revocation APIs are redacted and
   carry no-store headers. The enrollment initiator generates and journals the
   enrollment identifier and secret with the OS CSPRNG before I/O; the server
@@ -111,10 +115,15 @@ effects must flow through an auditable proposal or outbox boundary.
   lifecycle mutations write content-free audit rows in the same database
   transaction.
 - PostgreSQL adapters are explicitly scoped by the configured user/workspace,
-  and every version-1 credential row carries that user/workspace/client scope.
+  and every durable credential row carries that user/workspace/client scope.
   Static bootstrap principals do not independently prove that scope and must be
   removed after the reviewed hybrid migration.
-- Mutation retries use hashed idempotency keys. Canonical changes, audit rows,
+- Secret-bearing MCP capabilities and MCP proposal retry keys use
+  domain-separated hashes. Other non-secret item, execution, and generic
+  mutation retry strings are retained only as SHA-256 hashes under their
+  operation-scoped tables. Schedule publication instead uses a client-generated
+  UUID as an explicitly non-secret correlation identifier; that UUID is stored
+  in its receipt and content-free audit metadata. Canonical changes, audit rows,
   and external-effect outbox rows are designed to commit transactionally.
 - MCP validates protocol version, media type, request size, origin, bearer
   authentication, and request IDs. External assistants can read granted data,
@@ -177,6 +186,12 @@ notifications, widgets while locked, Spotlight or Android indexing, MCP and
 proactive assistant context, diagnostic output, attachment processing, and
 exports. Busy/free projections may preserve time occupancy while removing the
 title, notes, item ID, and type.
+
+MCP simulation responses likewise omit private item and block identifiers.
+Their durable records retain typed, server-internal reference evidence so a
+capability cannot later be consumed or converted into a proposal after either
+current or historical sensitivity makes an operation private. Missing or
+invalid evidence rejects the transaction without consuming the capability.
 
 Tests for every new disclosure surface should use a recognizable canary title
 and notes value and assert that neither appears in the forbidden output.

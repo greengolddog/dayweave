@@ -59,6 +59,20 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn schedule_publication_stale(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "schedule_publication_stale", message)
+    }
+
+    #[must_use]
+    pub(crate) fn schedule_publication_idempotency_conflict(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "schedule_publication_idempotency_conflict",
+            message,
+        )
+    }
+
+    #[must_use]
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -89,6 +103,13 @@ impl ApiError {
 
     #[must_use]
     pub fn from_json_rejection(rejection: &JsonRejection) -> Self {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return Self::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "Request body exceeds the route limit",
+            );
+        }
         Self::new(
             StatusCode::BAD_REQUEST,
             "invalid_json",

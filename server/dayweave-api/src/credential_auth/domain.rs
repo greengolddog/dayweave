@@ -11,7 +11,8 @@ pub const DEVICE_SESSION_ABSOLUTE_TTL: Duration = Duration::days(180);
 pub const ENROLLMENT_TOKEN_TTL: Duration = Duration::minutes(10);
 pub const MCP_CREDENTIAL_DEFAULT_TTL: Duration = Duration::days(90);
 pub const MAX_MCP_CREDENTIAL_TTL: Duration = Duration::days(365);
-pub const AUTH_CLIENT_CONTRACT_VERSION: u16 = 1;
+pub const DEVICE_CLIENT_CONTRACT_VERSION: u16 = 2;
+pub const MCP_CLIENT_CONTRACT_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CredentialMutation<T> {

@@ -239,10 +239,28 @@ impl Proposal {
 }
 
 fn validate_payload(payload: &Value) -> Result<(), ProposalDomainError> {
-    if payload.is_object() {
-        Ok(())
-    } else {
-        Err(ProposalDomainError::PayloadMustBeObject)
+    if !payload.is_object() {
+        return Err(ProposalDomainError::PayloadMustBeObject);
+    }
+    if json_has_unsupported_text(payload, 0) {
+        return Err(ProposalDomainError::UnsupportedText("payload"));
+    }
+    Ok(())
+}
+
+fn json_has_unsupported_text(value: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return true;
+    }
+    match value {
+        Value::String(value) => value.chars().any(char::is_control),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_has_unsupported_text(value, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            key.chars().any(char::is_control) || json_has_unsupported_text(value, depth + 1)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
     }
 }
 
@@ -273,6 +291,9 @@ fn validate_length(
     if value.chars().count() > max_length {
         return Err(ProposalDomainError::TooLong { field, max_length });
     }
+    if value.chars().any(char::is_control) {
+        return Err(ProposalDomainError::UnsupportedText(field));
+    }
     Ok(())
 }
 
@@ -285,6 +306,8 @@ pub enum ProposalDomainError {
         field: &'static str,
         max_length: usize,
     },
+    #[error("{0} contains unsupported control characters")]
+    UnsupportedText(&'static str),
     #[error("payload must be a JSON object")]
     PayloadMustBeObject,
     #[error("expires_at must be in the future")]

@@ -12,8 +12,9 @@ use dayweave_api::{
     config::AuthMode,
     credential_auth::{
         ACCESS_TOKEN_TTL, CredentialKind, CredentialRepository, CredentialRepositoryError,
-        DEVICE_SESSION_ABSOLUTE_TTL, DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind,
-        DeviceEnrollmentSpec, DeviceSession, McpClientSpec, OpaqueCredential,
+        DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
+        DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
+        McpClientSpec, OpaqueCredential,
     },
     http::router,
     persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository},
@@ -52,7 +53,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         client_kind: DeviceClientKind::Macos,
         device_label: "Exact replay Mac".to_owned(),
         scopes: vec![Scope::ScheduleRead, Scope::SuggestionsWrite],
-        client_contract_version: 1,
+        client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
         client_version: "test-create-replay-1".to_owned(),
         client_capabilities: vec!["exact-request-replay".to_owned()],
         created_at: now,
@@ -179,7 +180,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         client_kind: DeviceClientKind::Android,
         device_label: "Expired replay Pixel".to_owned(),
         scopes: vec![Scope::ScheduleRead],
-        client_contract_version: 1,
+        client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
         client_version: "test-create-replay-1".to_owned(),
         client_capabilities: vec!["exact-request-replay".to_owned()],
         created_at: expired_created_at,
@@ -206,7 +207,7 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         client_kind: DeviceClientKind::Macos,
         device_label: "Revoked replay Mac".to_owned(),
         scopes: vec![Scope::ScheduleRead],
-        client_contract_version: 1,
+        client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
         client_version: "test-create-replay-1".to_owned(),
         client_capabilities: vec!["exact-request-replay".to_owned()],
         created_at: now,
@@ -230,6 +231,114 @@ async fn device_enrollment_creation_recovers_only_an_exact_pending_tuple() {
         Err(CredentialRepositoryError::Conflict),
         "a revoked enrollment can never be recreated or replayed"
     );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn historical_v1_device_session_authenticates_and_refreshes_without_scope_widening() {
+    let Some(test_database) = TestDatabase::from_environment().await else {
+        return;
+    };
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool, "auth-device-v1-owner", "auth-device-v1").await;
+    let repository = PostgresCredentialRepository::new(pool.clone(), scope);
+    let now = Utc::now();
+
+    let rejected_enrollment_raw = token(CredentialKind::Enrollment, 81);
+    let rejected_enrollment =
+        OpaqueCredential::parse(CredentialKind::Enrollment, &rejected_enrollment_raw).unwrap();
+    assert_eq!(
+        repository
+            .create_device_enrollment(
+                DeviceEnrollmentSpec {
+                    id: Uuid::new_v4(),
+                    client_instance_id: Uuid::new_v4(),
+                    client_kind: DeviceClientKind::Android,
+                    device_label: "New v1 device".to_owned(),
+                    scopes: vec![Scope::ScheduleRead],
+                    client_contract_version: 1,
+                    client_version: "legacy-client".to_owned(),
+                    client_capabilities: Vec::new(),
+                    created_at: now,
+                },
+                &rejected_enrollment,
+            )
+            .await,
+        Err(CredentialRepositoryError::InvalidInput),
+        "new v1 devices must re-enroll with the current contract"
+    );
+
+    let enrollment_raw = token(CredentialKind::Enrollment, 82);
+    let access_raw = token(CredentialKind::DeviceAccess, 83);
+    let refresh_raw = token(CredentialKind::DeviceRefresh, 84);
+    let enrollment = OpaqueCredential::parse(CredentialKind::Enrollment, &enrollment_raw).unwrap();
+    let access = OpaqueCredential::parse(CredentialKind::DeviceAccess, &access_raw).unwrap();
+    let refresh = OpaqueCredential::parse(CredentialKind::DeviceRefresh, &refresh_raw).unwrap();
+    repository
+        .create_device_enrollment(
+            DeviceEnrollmentSpec {
+                id: Uuid::new_v4(),
+                client_instance_id: Uuid::new_v4(),
+                client_kind: DeviceClientKind::Macos,
+                device_label: "Historical v1 device".to_owned(),
+                scopes: vec![Scope::ScheduleRead, Scope::ScheduleSimulate],
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
+                client_version: "migrated-client".to_owned(),
+                client_capabilities: Vec::new(),
+                created_at: now,
+            },
+            &enrollment,
+        )
+        .await
+        .expect("seed current enrollment");
+    let issued = repository
+        .consume_device_enrollment(&enrollment, Uuid::new_v4(), &access, &refresh, now)
+        .await
+        .expect("seed current session");
+    sqlx::query("UPDATE sessions SET client_contract_version = 1 WHERE id = $1")
+        .bind(issued.id)
+        .execute(pool)
+        .await
+        .expect("represent a pre-v2 stored session");
+
+    let historical = repository
+        .authenticate_device_access(&access, now + ChronoDuration::minutes(1))
+        .await
+        .expect("historical v1 access remains compatible");
+    assert_eq!(historical.client_contract_version, 1);
+    assert!(!historical.scopes.contains(&Scope::SchedulePublish));
+    let widened = sqlx::query(
+        "UPDATE sessions SET scopes = ARRAY['schedule_read', 'schedule_publish']::text[] \
+         WHERE id = $1",
+    )
+    .bind(historical.id)
+    .execute(pool)
+    .await;
+    assert!(widened.is_err(), "the database rejects scope widening");
+
+    let next_access_raw = token(CredentialKind::DeviceAccess, 85);
+    let next_refresh_raw = token(CredentialKind::DeviceRefresh, 86);
+    let next_access =
+        OpaqueCredential::parse(CredentialKind::DeviceAccess, &next_access_raw).unwrap();
+    let next_refresh =
+        OpaqueCredential::parse(CredentialKind::DeviceRefresh, &next_refresh_raw).unwrap();
+    let refreshed = repository
+        .refresh_device_session(
+            &refresh,
+            &next_access,
+            &next_refresh,
+            now + ChronoDuration::minutes(2),
+        )
+        .await
+        .expect("historical v1 refresh remains compatible");
+    assert_eq!(refreshed.client_contract_version, 1);
+    assert!(!refreshed.scopes.contains(&Scope::SchedulePublish));
+    repository
+        .authenticate_device_access(&next_access, now + ChronoDuration::minutes(3))
+        .await
+        .expect("refreshed v1 access authenticates");
 
     test_database.destroy().await;
 }
@@ -259,7 +368,7 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
                 client_kind: DeviceClientKind::Macos,
                 device_label: "Personal Mac".to_owned(),
                 scopes: vec![Scope::ScheduleRead, Scope::SuggestionsWrite],
-                client_contract_version: 1,
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
                 client_version: "test-1".to_owned(),
                 client_capabilities: vec!["exact-replay".to_owned()],
                 created_at: now,
@@ -671,7 +780,7 @@ async fn device_credentials_are_one_time_rotated_scoped_expiring_and_hash_only()
                 client_kind: DeviceClientKind::Android,
                 device_label: "Personal Pixel".to_owned(),
                 scopes: vec![Scope::ScheduleRead],
-                client_contract_version: 1,
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
                 client_version: "test-1".to_owned(),
                 client_capabilities: Vec::new(),
                 created_at: now,
@@ -980,7 +1089,7 @@ async fn device_hydration_rejects_ttl_corruption_without_the_schema_constraint()
                 client_kind: DeviceClientKind::Macos,
                 device_label: "Synthetic hydration audit".to_owned(),
                 scopes: vec![Scope::ScheduleRead],
-                client_contract_version: 1,
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
                 client_version: "test-1".to_owned(),
                 client_capabilities: Vec::new(),
                 created_at: now,
@@ -1313,7 +1422,7 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
         "client_instance_id": client_instance_id,
         "client_kind": "macos",
         "device_label": "Synthetic HTTP Mac",
-        "client_contract_version": 1,
+        "client_contract_version": DEVICE_CLIENT_CONTRACT_VERSION,
         "client_version": "test-1",
         "client_capabilities": ["exact-replay"]
     });
@@ -1336,7 +1445,10 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
     let enrollment_token = enrollment["enrollment_token"].as_str().unwrap().to_owned();
     assert_eq!(enrollment["id"], enrollment_id.to_string());
     assert_eq!(enrollment["replayed"], false);
-    assert_eq!(enrollment["client_contract_version"], 1);
+    assert_eq!(
+        enrollment["client_contract_version"],
+        DEVICE_CLIENT_CONTRACT_VERSION
+    );
     assert_eq!(enrollment_token, proposed_enrollment_token);
     let enrollment_expires_at = enrollment["expires_at"].clone();
 
@@ -1355,7 +1467,10 @@ async fn auth_http_runtime_issues_replays_lists_and_revokes_without_echoing_devi
     assert_eq!(replayed_creation["id"], enrollment_id.to_string());
     assert_eq!(replayed_creation["enrollment_token"], enrollment_token);
     assert_eq!(replayed_creation["expires_at"], enrollment_expires_at);
-    assert_eq!(replayed_creation["client_contract_version"], 1);
+    assert_eq!(
+        replayed_creation["client_contract_version"],
+        DEVICE_CLIENT_CONTRACT_VERSION
+    );
     assert_eq!(replayed_creation["replayed"], true);
 
     let mut conflicting_enrollment_body = enrollment_body;
@@ -1594,7 +1709,7 @@ async fn issue_device_session(
                 client_kind: DeviceClientKind::Macos,
                 device_label: device_label.to_owned(),
                 scopes: vec![Scope::ScheduleRead],
-                client_contract_version: 1,
+                client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
                 client_version: "replay-boundary-test-1".to_owned(),
                 client_capabilities: vec!["exact-replay".to_owned()],
                 created_at: now,

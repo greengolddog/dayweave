@@ -20,9 +20,9 @@ use crate::{
 };
 
 use super::{
-    AUTH_CLIENT_CONTRACT_VERSION, CredentialKind, CredentialRepository, CredentialRepositoryError,
-    DeviceClientKind, DeviceEnrollmentSpec, DeviceSession, GeneratedCredential, McpClient,
-    McpClientSpec, OpaqueCredential,
+    CredentialKind, CredentialRepository, CredentialRepositoryError,
+    DEVICE_CLIENT_CONTRACT_VERSION, DeviceClientKind, DeviceEnrollmentSpec, DeviceSession,
+    GeneratedCredential, MCP_CLIENT_CONTRACT_VERSION, McpClient, McpClientSpec, OpaqueCredential,
 };
 
 const AUTH_BODY_LIMIT: usize = 32 * 1024;
@@ -66,7 +66,7 @@ pub(crate) struct CreateDeviceEnrollmentRequest {
     device_label: String,
     #[serde(default = "default_device_scopes")]
     scopes: Vec<Scope>,
-    #[serde(default = "current_contract_version")]
+    #[serde(default = "current_device_contract_version")]
     client_contract_version: u16,
     client_version: String,
     #[serde(default)]
@@ -152,7 +152,7 @@ pub(crate) struct CreateMcpClientRequest {
     scopes: Vec<Scope>,
     #[serde(default)]
     allowed_origins: Vec<String>,
-    #[serde(default = "current_contract_version")]
+    #[serde(default = "current_mcp_contract_version")]
     client_contract_version: u16,
     client_version: String,
     #[serde(default)]
@@ -260,7 +260,7 @@ pub(crate) async fn create_device_enrollment(
             id: request.id,
             enrollment_token: enrollment_raw,
             expires_at: result.expires_at,
-            client_contract_version: AUTH_CLIENT_CONTRACT_VERSION,
+            client_contract_version: DEVICE_CLIENT_CONTRACT_VERSION,
             replayed: result.replayed,
         }),
     )
@@ -592,8 +592,12 @@ fn default_mcp_scopes() -> Vec<Scope> {
         .collect()
 }
 
-const fn current_contract_version() -> u16 {
-    AUTH_CLIENT_CONTRACT_VERSION
+const fn current_device_contract_version() -> u16 {
+    DEVICE_CLIENT_CONTRACT_VERSION
+}
+
+const fn current_mcp_contract_version() -> u16 {
+    MCP_CLIENT_CONTRACT_VERSION
 }
 
 fn map_repository_error(error: CredentialRepositoryError) -> ApiError {

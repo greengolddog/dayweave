@@ -5,11 +5,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use uuid::Uuid;
+
+use crate::proposals::Proposal;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScheduleAccess {
     pub subject: String,
     pub include_sensitive: bool,
+    pub workspace_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -262,6 +267,42 @@ pub trait PlanningSimulationPort: Send + Sync {
     ) -> Result<SimulationResult, SchedulingPortError>;
 }
 
+#[derive(Clone, Debug)]
+pub struct ProposalSubmissionSpec {
+    pub idempotency_key: String,
+    pub request_fingerprint: [u8; 32],
+    pub expected_simulation_digest: String,
+    pub simulation_token: Option<String>,
+    pub proposal: Proposal,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProposalSubmissionResult {
+    pub proposal: Proposal,
+    pub duplicate: bool,
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum ProposalSubmissionError {
+    #[error("the authenticated principal does not own this proposal scope")]
+    AccessDenied,
+    #[error("the idempotency key was already used for different proposal content")]
+    IdempotencyConflict,
+    #[error(transparent)]
+    Simulation(#[from] SchedulingPortError),
+    #[error("proposal submission storage is temporarily unavailable")]
+    Unavailable,
+}
+
+#[async_trait]
+pub trait ProposalSubmissionPort: Send + Sync {
+    async fn submit_proposal(
+        &self,
+        access: &ScheduleAccess,
+        spec: ProposalSubmissionSpec,
+    ) -> Result<ProposalSubmissionResult, ProposalSubmissionError>;
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum SchedulingPortError {
     #[error("invalid scheduling query: {0}")]
@@ -270,6 +311,8 @@ pub enum SchedulingPortError {
     NotFound,
     #[error("schedule revision changed; current revision is {current_revision}")]
     RevisionConflict { current_revision: String },
+    #[error("the published schedule predates durable evidence; publish a fresh schedule first")]
+    RepublishRequired,
     #[error("scheduling data is temporarily unavailable: {0}")]
     Unavailable(String),
 }

@@ -9,6 +9,7 @@ mod outbox;
 mod proposal_repository;
 
 pub use credential_auth_repository::PostgresCredentialRepository;
+pub(crate) use database::lock_canonical_item_space;
 pub use database::{Database, DatabaseScope, MIGRATOR, PersistenceError};
 pub use execution_repository::PostgresExecutionRepository;
 pub use google_oauth_repository::PostgresGoogleOAuthRepository;
@@ -17,3 +18,4 @@ pub use idempotency::{IdempotencyDecision, IdempotencyError, PostgresIdempotency
 pub use item_repository::PostgresItemRepository;
 pub use outbox::{NewOutboxMessage, OutboxError, OutboxMessage, PostgresOutboxRepository};
 pub use proposal_repository::PostgresProposalRepository;
+pub(crate) use proposal_repository::{insert_proposal_tx, proposal_from_row};

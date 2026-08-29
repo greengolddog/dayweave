@@ -69,8 +69,18 @@ impl ProposalService {
     ///
     /// Returns a domain or repository error when validation or persistence fails.
     pub async fn create(&self, input: NewProposal) -> Result<Proposal, ProposalServiceError> {
-        let now = self.clock.now();
-        let proposal = Proposal::new(input, now)?;
+        let proposal = self.prepare(input)?;
+        self.persist_prepared(proposal).await
+    }
+
+    pub(crate) fn prepare(&self, input: NewProposal) -> Result<Proposal, ProposalServiceError> {
+        Ok(Proposal::new(input, self.clock.now())?)
+    }
+
+    pub(crate) async fn persist_prepared(
+        &self,
+        proposal: Proposal,
+    ) -> Result<Proposal, ProposalServiceError> {
         Ok(self.repository.insert(proposal).await?)
     }
 

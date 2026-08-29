@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header},
 };
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use dayweave_api::{
     AppState,
     auth::StaticTokenAuthenticator,
@@ -57,6 +58,86 @@ fn request(
 async fn body_json(response: Response<Body>) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+}
+
+#[tokio::test]
+async fn schedule_routes_have_a_bounded_16_mib_override_without_widening_other_routes() {
+    let app = test_app();
+    let mut over_global_limit = preview(Uuid::new_v4(), 1);
+    over_global_limit["availability"][0]["contexts"] = json!(["x".repeat(1024 * 1024 + 64 * 1024)]);
+    let schedule = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(over_global_limit.clone()),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(schedule.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let publish = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/publish",
+            Some(json!({
+                "idempotency_key": Uuid::new_v4(),
+                "expected_input_digest": format!("sha256:{}", "0".repeat(64)),
+                "schedule": over_global_limit,
+            })),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(publish.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let unrelated = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/suggestions",
+            Some(json!({"padding": "x".repeat(1024 * 1024 + 64 * 1024)})),
+            true,
+            Some("unrelated-large-body"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unrelated.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let mut over_schedule_limit = preview(Uuid::new_v4(), 1);
+    over_schedule_limit["availability"][0]["contexts"] = json!(["x".repeat(16 * 1024 * 1024 + 1)]);
+    let oversized_schedule = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(over_schedule_limit.clone()),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized_schedule.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let oversized_publish = app
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/publish",
+            Some(json!({
+                "idempotency_key": Uuid::new_v4(),
+                "expected_input_digest": format!("sha256:{}", "0".repeat(64)),
+                "schedule": over_schedule_limit,
+            })),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized_publish.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 fn task(id: Uuid, constraints: &Value) -> Value {
@@ -160,6 +241,7 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
     assert_eq!(first["source_item_count"], 2);
     assert_eq!(first["source_item_revisions"][valid_id.to_string()], 1);
     assert_eq!(first["source_item_revisions"][invalid_id.to_string()], 1);
+    assert!(first.get("source_item_sensitivity").is_none());
     assert_eq!(first["accepted_item_count"], 1);
     assert_eq!(
         first["rejected_items"][0]["item_id"],
@@ -319,4 +401,185 @@ async fn sensitive_fixed_block_is_required_and_preserved_in_preview() {
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One contract test covers every fixed-block persistence fence.
+async fn fixed_block_publishability_is_rejected_before_a_client_can_journal() {
+    let app = test_app();
+    let item_id = Uuid::new_v4();
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(task(item_id, &json!({"energy": "deep"}))),
+            true,
+            Some("publishability-item"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let mut body = preview(item_id, 1);
+    body["previous_assignments"] = json!([]);
+    let fixed_id = Uuid::new_v4();
+    body["fixed_blocks"] = json!([{
+        "id": fixed_id,
+        "is_sensitive": false,
+        "title": "é".repeat(500),
+        "start": "2026-09-01T08:00:00Z",
+        "end": "2026-09-01T09:00:00Z",
+        "source": "manual"
+    }]);
+    let maximum = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(body.clone()),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(maximum.status(), StatusCode::OK);
+    let maximum = body_json(maximum).await;
+
+    for invalid_title in ["é".repeat(501), "contains\0nul".to_owned(), "\n".to_owned()] {
+        let mut invalid = body.clone();
+        invalid["fixed_blocks"][0]["title"] = json!(invalid_title);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/schedule/preview",
+                Some(invalid),
+                true,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let mut duplicate = body.clone();
+    duplicate["fixed_blocks"] = json!([
+        duplicate["fixed_blocks"][0].clone(),
+        duplicate["fixed_blocks"][0].clone()
+    ]);
+    let duplicate = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(duplicate),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let generated_id = maximum["plan"]["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["item_id"] == item_id.to_string())
+        .and_then(|block| block["id"].as_str())
+        .expect("preview contains a generated canonical block");
+    let mut generated_collision = body.clone();
+    generated_collision["fixed_blocks"][0]["id"] = json!(generated_id);
+    let generated_collision = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(generated_collision),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        generated_collision.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let mut nanosecond = body;
+    nanosecond["fixed_blocks"][0]["start"] = json!("2026-09-01T08:00:00.000000001Z");
+    let nanosecond = app
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(nanosecond),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(nanosecond.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn durable_snapshot_limit_rejects_before_publication_journaling() {
+    fn request_with_blocks(block_count: usize) -> Value {
+        let base: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().unwrap();
+        let title = "🧶".repeat(500);
+        let fixed_blocks = (0..block_count)
+            .map(|index| {
+                let start = base + ChronoDuration::minutes(i64::try_from(index).unwrap());
+                let end = start + ChronoDuration::minutes(1);
+                json!({
+                    "id": Uuid::new_v4(),
+                    "is_sensitive": false,
+                    "title": title,
+                    "start": start.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "end": end.to_rfc3339_opts(SecondsFormat::Secs, true),
+                    "source": "manual"
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({
+            "as_of": "2026-09-01T00:00:00Z",
+            "horizon_start": "2026-09-01T00:00:00Z",
+            "horizon_end": "2026-11-30T00:00:00Z",
+            "timezone_name": "Europe/Madrid",
+            "availability": [],
+            "fixed_blocks": fixed_blocks,
+            "previous_assignments": [],
+            "config": {
+                "slot_granularity_minutes": 5,
+                "stability_weight": 4,
+                "default_soft_weight": 100
+            },
+            "recurrence_context": {}
+        })
+    }
+
+    let app = test_app();
+    let near_limit = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(request_with_blocks(3_200)),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(near_limit.status(), StatusCode::OK);
+
+    let over_limit = app
+        .oneshot(request(
+            "POST",
+            "/v1/schedule/preview",
+            Some(request_with_blocks(4_000)),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(over_limit.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

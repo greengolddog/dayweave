@@ -10,7 +10,7 @@ use crate::items::{
     ItemRepository, ItemRepositoryError, ItemStatus, ItemTombstone, ReplaceItem, SplitPolicy,
 };
 
-use super::DatabaseScope;
+use super::{DatabaseScope, database::lock_canonical_item_space};
 
 const ITEM_SELECT: &str = "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
      item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
@@ -529,6 +529,9 @@ async fn lock_workspace_items(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
 ) -> Result<(), ItemRepositoryError> {
+    lock_canonical_item_space(transaction, workspace_id)
+        .await
+        .map_err(internal)?;
     sqlx::query("SELECT id FROM items WHERE workspace_id = $1 ORDER BY id FOR UPDATE")
         .bind(workspace_id)
         .fetch_all(&mut **transaction)

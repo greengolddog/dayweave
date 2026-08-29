@@ -1,7 +1,7 @@
 use std::{str::FromStr, time::Duration};
 
 use sqlx::{
-    ConnectOptions, PgPool,
+    ConnectOptions, PgPool, Postgres, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use thiserror::Error;
@@ -15,6 +15,22 @@ pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 pub struct DatabaseScope {
     pub workspace_id: Uuid,
     pub user_id: Uuid,
+}
+
+/// Serializes every canonical-item mutation and schedule publication for one
+/// workspace, including the empty-table case that row locks cannot protect.
+/// The domain tag prevents collisions with unrelated advisory-lock users.
+pub(crate) async fn lock_canonical_item_space(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('dayweave.items.v1:' || $1::text, 0))",
+    )
+    .bind(workspace_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 #[derive(Clone)]

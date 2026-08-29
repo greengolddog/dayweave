@@ -30,6 +30,7 @@ pub enum Scope {
     SuggestionsWrite,
     ScheduleRead,
     ScheduleSimulate,
+    SchedulePublish,
     SuggestionsSubmit,
     ItemsRead,
     ItemsWrite,
@@ -85,11 +86,12 @@ impl Principal {
 }
 
 impl Scope {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::SuggestionsRead,
         Self::SuggestionsWrite,
         Self::ScheduleRead,
         Self::ScheduleSimulate,
+        Self::SchedulePublish,
         Self::SuggestionsSubmit,
         Self::ItemsRead,
         Self::ItemsWrite,
@@ -123,6 +125,7 @@ impl Scope {
             Self::SuggestionsWrite => "suggestions_write",
             Self::ScheduleRead => "schedule_read",
             Self::ScheduleSimulate => "schedule_simulate",
+            Self::SchedulePublish => "schedule_publish",
             Self::SuggestionsSubmit => "suggestions_submit",
             Self::ItemsRead => "items_read",
             Self::ItemsWrite => "items_write",
@@ -143,6 +146,7 @@ impl Scope {
             "suggestions_write" => Some(Self::SuggestionsWrite),
             "schedule_read" => Some(Self::ScheduleRead),
             "schedule_simulate" => Some(Self::ScheduleSimulate),
+            "schedule_publish" => Some(Self::SchedulePublish),
             "suggestions_submit" => Some(Self::SuggestionsSubmit),
             "items_read" => Some(Self::ItemsRead),
             "items_write" => Some(Self::ItemsWrite),
@@ -362,6 +366,7 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             "/items" | "/items/{id}" | "/items/{id}/restore",
         ) => Some(Scope::ItemsWrite),
         (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
+        (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history") => Some(Scope::ExecutionRead),
         (&Method::POST, "/execution/commands") => Some(Scope::ExecutionWrite),
         (

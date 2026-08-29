@@ -24,8 +24,9 @@ use dayweave_api::{
     readiness::Readiness,
     scheduling::{
         InMemoryScheduleQueryPort, InMemorySimulationPort, PlacementAlternative,
-        PlacementExplanation, PlacementReason, ScheduleConflict, StoredItem, StoredSchedule,
-        StoredScheduleBlock,
+        PlacementExplanation, PlacementReason, PlanningSimulationPort, ScheduleAccess,
+        ScheduleConflict, SchedulingPortError, SimulationRequest, SimulationResult, StoredItem,
+        StoredSchedule, StoredScheduleBlock,
     },
 };
 use http_body_util::BodyExt;
@@ -49,6 +50,29 @@ impl TestClock {
 impl Clock for TestClock {
     fn now(&self) -> DateTime<Utc> {
         *self.0.read().expect("clock lock")
+    }
+}
+
+#[derive(Debug)]
+struct RepublishRequiredSimulationPort;
+
+#[async_trait]
+impl PlanningSimulationPort for RepublishRequiredSimulationPort {
+    async fn simulate(
+        &self,
+        _access: &ScheduleAccess,
+        _request: SimulationRequest,
+    ) -> Result<SimulationResult, SchedulingPortError> {
+        Err(SchedulingPortError::RepublishRequired)
+    }
+
+    async fn consume_simulation(
+        &self,
+        _access: &ScheduleAccess,
+        _token: &str,
+        _expected_request_digest: &str,
+    ) -> Result<SimulationResult, SchedulingPortError> {
+        Err(SchedulingPortError::RepublishRequired)
     }
 }
 
@@ -89,6 +113,35 @@ fn fixture_with_authenticator(authenticator: Arc<dyn Authenticator>) -> McpFixtu
         proposals,
         schedule,
     }
+}
+
+fn republish_required_fixture() -> Router {
+    let stored_schedule = schedule_fixture();
+    let schedule = InMemoryScheduleQueryPort::new(
+        stored_schedule,
+        item_fixture(),
+        explanation_fixture(),
+        conflict_fixture(),
+    );
+    let repository: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        repository,
+        Arc::new(TestClock::new("2026-08-29T08:00:00Z".parse().unwrap())),
+        Duration::from_hours(7 * 24),
+    ));
+    let readiness = Readiness::default();
+    readiness.set_ready(true);
+    let state = AppState::new(
+        proposals,
+        Arc::new(StaticTokenAuthenticator::from_plaintext(&[TOKEN])),
+        readiness,
+    )
+    .with_mcp_ports(
+        Arc::new(schedule),
+        Arc::new(RepublishRequiredSimulationPort),
+        Arc::new(vec!["https://chatgpt.com".to_owned()]),
+    );
+    router(state)
 }
 
 fn schedule_fixture() -> StoredSchedule {
@@ -709,7 +762,126 @@ async fn read_tools_return_grounded_data_without_leaking_sensitive_canaries() {
 }
 
 #[tokio::test]
-async fn simulation_is_deterministic_and_never_mutates_the_stored_schedule() {
+#[allow(clippy::too_many_lines)] // One boundary matrix keeps read and proposal precision aligned.
+async fn timestamp_boundaries_and_proposal_expiry_require_microsecond_precision() {
+    let fixture = fixture();
+    let accepted = send(
+        &fixture.app,
+        tool_request(
+            "get_schedule",
+            json!({
+                "start": "2026-08-29T08:00:00.000001Z",
+                "end": "2026-08-29T12:00:00.000001Z",
+                "detail": "summary"
+            }),
+            1,
+        ),
+    )
+    .await
+    .2;
+    assert_eq!(accepted["result"]["isError"], false);
+
+    for (name, arguments) in [
+        (
+            "get_schedule",
+            json!({
+                "start": "2026-08-29T08:00:00.000000001Z",
+                "end": "2026-08-29T12:00:00Z",
+                "detail": "summary"
+            }),
+        ),
+        (
+            "search_items",
+            json!({"start": "2026-08-29T08:00:00.000000001Z", "limit": 20}),
+        ),
+        (
+            "search_items",
+            json!({"end": "2026-08-29T12:00:00.000000001Z", "limit": 20}),
+        ),
+        (
+            "get_conflicts",
+            json!({
+                "start": "2026-08-29T08:00:00Z",
+                "end": "2026-08-29T12:00:00.000000001Z"
+            }),
+        ),
+    ] {
+        let rejected = send(&fixture.app, tool_request(name, arguments, 2)).await.2;
+        assert_eq!(rejected["result"]["isError"], true, "{name}");
+        assert_eq!(
+            rejected["result"]["structuredContent"]["code"], "invalid_arguments",
+            "{name}"
+        );
+    }
+
+    let operation = json!({
+        "kind": "move_block",
+        "target_id": "block-public",
+        "parameters": { "start": "2026-08-29T12:00:00Z" }
+    });
+    let simulation = send(
+        &fixture.app,
+        tool_request(
+            "simulate_plan",
+            json!({
+                "base_revision": "revision-7",
+                "operations": [operation.clone()]
+            }),
+            3,
+        ),
+    )
+    .await
+    .2;
+    let token = simulation["result"]["structuredContent"]["simulation_token"]
+        .as_str()
+        .unwrap();
+    let key = "timestamp-expiration-precision";
+    let proposal = json!({
+        "idempotency_key": key,
+        "title": "Precision test proposal",
+        "explanation": "Synthetic timestamp precision boundary.",
+        "source_conversation_label": "Synthetic MCP test",
+        "base_revision": "revision-7",
+        "simulation_token": token,
+        "operations": [operation],
+        "expires_at": "2026-08-30T08:00:00.000000001Z"
+    });
+    let rejected = send(
+        &fixture.app,
+        proposal_request(proposal.clone(), 4, Some(key)),
+    )
+    .await
+    .2;
+    assert_eq!(rejected["result"]["isError"], true);
+    assert_eq!(
+        rejected["result"]["structuredContent"]["code"],
+        "invalid_expiration"
+    );
+    assert!(
+        fixture
+            .proposals
+            .list(ProposalQuery {
+                limit: 10,
+                ..ProposalQuery::default()
+            })
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let mut accepted_proposal = proposal;
+    accepted_proposal["expires_at"] = json!("2026-08-30T08:00:00.000001Z");
+    let accepted = send(
+        &fixture.app,
+        proposal_request(accepted_proposal, 5, Some(key)),
+    )
+    .await
+    .2;
+    assert_eq!(accepted["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn simulation_is_deterministic_honest_and_never_mutates_the_stored_schedule() {
     let fixture = fixture();
     let original = fixture.schedule.stored_schedule().clone();
     let arguments = json!({
@@ -738,8 +910,12 @@ async fn simulation_is_deterministic_and_never_mutates_the_stored_schedule() {
         second["result"]["structuredContent"]["simulation_token"]
     );
     assert_eq!(
-        first["result"]["structuredContent"]["moved_blocks"][0]["proposed_start"],
-        "2026-08-29T12:00:00Z"
+        first["result"]["structuredContent"]["moved_blocks"],
+        json!([])
+    );
+    assert_eq!(
+        first["result"]["structuredContent"]["warnings"][0]["code"],
+        "not_modeled"
     );
     assert_eq!(fixture.schedule.stored_schedule(), &original);
     assert_eq!(
@@ -957,6 +1133,35 @@ async fn submit_requires_mirrored_idempotency_header_and_stale_simulation_is_act
     assert_eq!(
         stale["result"]["structuredContent"]["details"]["current_revision"],
         "revision-7"
+    );
+}
+
+#[tokio::test]
+async fn legacy_simulation_requires_a_fresh_publication_on_the_mcp_wire() {
+    let app = republish_required_fixture();
+    let (status, _, body) = send(
+        &app,
+        tool_request(
+            "simulate_plan",
+            json!({
+                "base_revision": "legacy-revision",
+                "operations": [{ "kind": "create_item", "parameters": {} }]
+            }),
+            1,
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "republish_required"
+    );
+    assert!(
+        body["result"]["structuredContent"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("publish a fresh schedule"))
     );
 }
 

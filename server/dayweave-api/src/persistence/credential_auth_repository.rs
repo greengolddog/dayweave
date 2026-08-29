@@ -9,11 +9,12 @@ use uuid::Uuid;
 use crate::{
     auth::Scope,
     credential_auth::{
-        ACCESS_TOKEN_TTL, AUTH_CLIENT_CONTRACT_VERSION, CredentialKind, CredentialMutation,
-        CredentialRepository, CredentialRepositoryError, DEVICE_SESSION_ABSOLUTE_TTL,
+        ACCESS_TOKEN_TTL, CredentialKind, CredentialMutation, CredentialRepository,
+        CredentialRepositoryError, DEVICE_CLIENT_CONTRACT_VERSION, DEVICE_SESSION_ABSOLUTE_TTL,
         DEVICE_SESSION_REFRESH_IDLE_TTL, DeviceClientKind, DeviceEnrollmentCreation,
         DeviceEnrollmentSpec, DeviceSession, ENROLLMENT_TOKEN_TTL, MAX_MCP_CREDENTIAL_TTL,
-        MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec, OpaqueCredential,
+        MCP_CLIENT_CONTRACT_VERSION, MCP_CREDENTIAL_DEFAULT_TTL, McpClient, McpClientSpec,
+        OpaqueCredential,
     },
 };
 
@@ -288,8 +289,9 @@ impl CredentialRepository for PostgresCredentialRepository {
         if !valid_label(&device_label, 200)
             || !valid_scopes(&scopes)
             || !scopes.iter().all(|scope| scope.is_rest())
-            || !valid_client_metadata(
+            || !valid_device_stored_metadata(
                 client_contract_version,
+                &scopes,
                 &client_version,
                 &client_capabilities,
             )
@@ -846,6 +848,7 @@ fn validate_device_enrollment(
         || !spec.scopes.iter().all(|scope| scope.is_rest())
         || !valid_client_metadata(
             spec.client_contract_version,
+            DEVICE_CLIENT_CONTRACT_VERSION,
             &spec.client_version,
             &spec.client_capabilities,
         )
@@ -863,6 +866,7 @@ fn validate_mcp_client(spec: &McpClientSpec) -> Result<(), CredentialRepositoryE
         || spec.allowed_origins.len() > 100
         || !valid_client_metadata(
             spec.client_contract_version,
+            MCP_CLIENT_CONTRACT_VERSION,
             &spec.client_version,
             &spec.client_capabilities,
         )
@@ -886,8 +890,29 @@ fn valid_label(value: &str, maximum_characters: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn valid_client_metadata(contract_version: u16, version: &str, capabilities: &[String]) -> bool {
-    contract_version == AUTH_CLIENT_CONTRACT_VERSION
+fn valid_client_metadata(
+    contract_version: u16,
+    expected_contract_version: u16,
+    version: &str,
+    capabilities: &[String],
+) -> bool {
+    contract_version == expected_contract_version
+        && valid_label(version, 100)
+        && capabilities.len() <= 100
+        && capabilities
+            .iter()
+            .all(|capability| valid_label(capability, 100))
+        && capabilities.iter().collect::<BTreeSet<_>>().len() == capabilities.len()
+}
+
+fn valid_device_stored_metadata(
+    contract_version: u16,
+    scopes: &[Scope],
+    version: &str,
+    capabilities: &[String],
+) -> bool {
+    matches!(contract_version, 1 | DEVICE_CLIENT_CONTRACT_VERSION)
+        && (contract_version != 1 || !scopes.contains(&Scope::SchedulePublish))
         && valid_label(version, 100)
         && capabilities.len() <= 100
         && capabilities
@@ -1020,8 +1045,9 @@ fn device_session_from_row(row: &PgRow) -> Result<DeviceSession, CredentialRepos
     if !valid_label(&session.device_label, 200)
         || !valid_scopes(&session.scopes)
         || !session.scopes.iter().all(|scope| scope.is_rest())
-        || !valid_client_metadata(
+        || !valid_device_stored_metadata(
             session.client_contract_version,
+            &session.scopes,
             &session.client_version,
             &session.client_capabilities,
         )

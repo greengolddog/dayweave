@@ -11,9 +11,9 @@ use dayweave_core::{
     DailyTimeWindow, DurationEstimate, EnergyLevel, FixedBlock, FixedBlockSource, GoalMeasure,
     GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
     PreviousAssignment, PreviousBlock, Priority, Qualified, QuantityTarget, Recurrence,
-    RecurrenceContext, RecurringTaskSpec, RoutineSpec, ScheduleError, SchedulePlan, Scheduler,
-    SchedulerConfig, SchedulingConstraints, SplitPolicy as PlanningSplitPolicy, WorkItem,
-    WorkStatus, ZonedDayBoundary,
+    RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurringTaskSpec,
+    RoutineSpec, ScheduleError, SchedulePlan, Scheduler, SchedulerConfig, SchedulingConstraints,
+    SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus, ZonedDayBoundary,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,6 +37,7 @@ const MAX_RECURRENCE_CONTEXT_ENTRIES: usize = 10_000;
 const MAX_HORIZON_DAYS: i64 = 90;
 const MAX_CALENDAR_DAYS: usize = 92;
 const MAX_WEIGHT: u32 = 1_000_000;
+const MAX_PERSISTED_BLOCK_TITLE_CHARACTERS: usize = 500;
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +150,12 @@ pub struct ComposeScheduleResult {
     /// cannot detect a same-cardinality concurrent replacement.
     #[schema(value_type = Object)]
     pub source_item_revisions: BTreeMap<Uuid, u64>,
+    /// Effective sensitivity, including sensitive ancestors, for the same
+    /// exact canonical snapshot. Durable schedule readers use this evidence to
+    /// redact conflicts and unscheduled work without reinterpreting history.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) source_item_sensitivity: BTreeMap<Uuid, bool>,
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
@@ -396,6 +403,15 @@ fn compose_items(
     source_items: Vec<Item>,
     request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    compose_items_for_schema(source_items, request, super::SCHEDULER_PUBLICATION_SCHEMA)
+}
+
+fn compose_items_for_schema(
+    source_items: Vec<Item>,
+    request: ComposeScheduleRequest,
+    scheduler_publication_schema: &str,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    let publication_timezone = request.timezone_name.clone();
     let source_item_count = source_items.len();
     let source_item_revisions = source_items
         .iter()
@@ -464,17 +480,31 @@ fn compose_items(
         recurrence_context,
     };
 
-    let input_digest = request_digest(&request.timezone_name, &plan_request)?;
+    let input_digest = request_digest(
+        scheduler_publication_schema,
+        &request.timezone_name,
+        &source_item_revisions,
+        &plan_request,
+    )?;
     let plan = Scheduler.plan(&plan_request)?;
-    Ok(ComposeScheduleResult {
+    let result = ComposeScheduleResult {
         input_digest,
         source_item_count,
         source_item_revisions,
+        source_item_sensitivity: effective_sensitivity,
         accepted_item_count: plan_request.items.len(),
         rejected_items,
         ignored_previous_assignments,
         plan: Rfc3339SchedulePlan(plan),
-    })
+    };
+    super::postgres::validate_publishable_compose_result(&publication_timezone, &result).map_err(
+        |_| {
+            ComposeScheduleError::InvalidRequest(
+                "composed schedule exceeds the durable publication contract".to_owned(),
+            )
+        },
+    )?;
+    Ok(result)
 }
 
 /// Resolves effective sensitivity over the already-validated canonical tree.
@@ -513,6 +543,7 @@ fn effective_sensitivity_by_item(items: &[Item]) -> BTreeMap<Uuid, bool> {
     resolved
 }
 
+#[allow(clippy::too_many_lines)] // One validation pass keeps preview and publication acceptance identical.
 fn validate_request_shape(request: &ComposeScheduleRequest) -> Result<(), ComposeScheduleError> {
     let horizon = request.horizon_end - request.horizon_start;
     if horizon <= chrono::Duration::zero() || horizon > chrono::Duration::days(MAX_HORIZON_DAYS) {
@@ -522,6 +553,61 @@ fn validate_request_shape(request: &ComposeScheduleRequest) -> Result<(), Compos
     }
     if request.as_of > request.horizon_end {
         return invalid("as_of must not be later than horizon_end");
+    }
+    let chrono_instant_is_precise =
+        |value: DateTime<Utc>| value.timestamp_subsec_nanos().is_multiple_of(1_000);
+    let offset_instant_is_precise =
+        |value: OffsetDateTime| value.nanosecond().is_multiple_of(1_000);
+    let recurrence_instants_are_precise =
+        request
+            .recurrence_context
+            .completion_anchors
+            .values()
+            .chain(request.recurrence_context.rolling_anchors.values())
+            .all(|value| offset_instant_is_precise(*value))
+            && request.recurrence_context.calendar.days.iter().all(|day| {
+                offset_instant_is_precise(day.start) && offset_instant_is_precise(day.end)
+            })
+            && request.recurrence_context.pauses.iter().all(|pause| {
+                offset_instant_is_precise(pause.start) && offset_instant_is_precise(pause.end)
+            })
+            && request
+                .recurrence_context
+                .exceptions
+                .iter()
+                .all(|exception| {
+                    let selector = match exception.selector {
+                        RecurrenceExceptionSelector::NominalStart { at } => {
+                            offset_instant_is_precise(at)
+                        }
+                        RecurrenceExceptionSelector::Occurrence { .. }
+                        | RecurrenceExceptionSelector::LocalDate { .. } => true,
+                    };
+                    let action = match exception.action {
+                        RecurrenceExceptionAction::Move { start, end } => {
+                            offset_instant_is_precise(start) && offset_instant_is_precise(end)
+                        }
+                        RecurrenceExceptionAction::Skip => true,
+                    };
+                    selector && action
+                });
+    if !chrono_instant_is_precise(request.as_of)
+        || !chrono_instant_is_precise(request.horizon_start)
+        || !chrono_instant_is_precise(request.horizon_end)
+        || request.availability.iter().any(|window| {
+            !chrono_instant_is_precise(window.start) || !chrono_instant_is_precise(window.end)
+        })
+        || request.fixed_blocks.iter().any(|block| {
+            !chrono_instant_is_precise(block.start) || !chrono_instant_is_precise(block.end)
+        })
+        || request.previous_assignments.iter().any(|assignment| {
+            assignment.blocks.iter().any(|block| {
+                !chrono_instant_is_precise(block.start) || !chrono_instant_is_precise(block.end)
+            })
+        })
+        || !recurrence_instants_are_precise
+    {
+        return invalid("schedule instants must use PostgreSQL microsecond precision");
     }
     if request.timezone_name.parse::<Tz>().is_err() {
         return invalid("timezone_name must be a valid IANA timezone");
@@ -535,6 +621,23 @@ fn validate_request_shape(request: &ComposeScheduleRequest) -> Result<(), Compos
         return invalid(format!(
             "fixed_blocks supports at most {MAX_FIXED_BLOCKS} entries"
         ));
+    }
+    if request.fixed_blocks.iter().any(|block| {
+        block.title.trim().is_empty()
+            || block.title.chars().count() > MAX_PERSISTED_BLOCK_TITLE_CHARACTERS
+            || block.title.chars().any(char::is_control)
+    }) {
+        return invalid(format!(
+            "fixed block titles must contain 1-{MAX_PERSISTED_BLOCK_TITLE_CHARACTERS} non-control characters"
+        ));
+    }
+    let mut fixed_ids = BTreeSet::new();
+    if request
+        .fixed_blocks
+        .iter()
+        .any(|block| !fixed_ids.insert(block.id))
+    {
+        return invalid("fixed block ids must be unique");
     }
     if request.previous_assignments.len() > MAX_PREVIOUS_ASSIGNMENTS {
         return invalid(format!(
@@ -1059,17 +1162,23 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
 }
 
 fn request_digest(
+    scheduler_publication_schema: &str,
     timezone_name: &str,
+    source_item_revisions: &BTreeMap<Uuid, u64>,
     request: &PlanRequest,
 ) -> Result<String, ComposeScheduleError> {
     #[derive(Serialize)]
     struct DigestInput<'a> {
+        scheduler_publication_schema: &'a str,
         timezone_name: &'a str,
+        source_item_revisions: &'a BTreeMap<Uuid, u64>,
         request: &'a PlanRequest,
     }
 
     let bytes = serde_json::to_vec(&DigestInput {
+        scheduler_publication_schema,
         timezone_name,
+        source_item_revisions,
         request,
     })
     .map_err(|_| ComposeScheduleError::Encoding)?;
@@ -1217,6 +1326,19 @@ mod tests {
         );
         assert_eq!(first.plan.blocks.len(), 1);
         assert!(first.input_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn preview_digest_is_bound_to_the_scheduler_publication_schema() {
+        let item = canonical_item(Uuid::from_u128(11));
+        let current = compose_items(vec![item.clone()], preview_request()).unwrap();
+        let upgraded = compose_items_for_schema(
+            vec![item],
+            preview_request(),
+            "dayweave-scheduler-publication/test-upgrade",
+        )
+        .unwrap();
+        assert_ne!(current.input_digest, upgraded.input_digest);
     }
 
     #[test]

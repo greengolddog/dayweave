@@ -48,8 +48,8 @@ use proposals::{
 };
 use readiness::Readiness;
 use scheduling::{
-    PlanningSimulationPort, ScheduleQueryPort, UnavailableScheduleQueryPort,
-    UnavailableSimulationPort,
+    PlanningSimulationPort, PostgresSchedulingRepository, ScheduleQueryPort,
+    UnavailableScheduleQueryPort, UnavailableSimulationPort,
 };
 use uuid::Uuid;
 
@@ -60,6 +60,7 @@ type Repositories = (
     Arc<dyn GoogleOAuthRepository>,
     Option<Arc<dyn GoogleSyncRepository>>,
     Option<Arc<dyn CredentialRepository>>,
+    Option<Arc<PostgresSchedulingRepository>>,
     OAuthScope,
     Readiness,
 );
@@ -67,6 +68,10 @@ type Repositories = (
 async fn repositories(config: &Config) -> Result<Repositories, PersistenceError> {
     if let Some(database_config) = &config.database {
         let database = Database::connect(database_config).await?;
+        let scheduling = Arc::new(PostgresSchedulingRepository::new(
+            database.pool().clone(),
+            database.scope(),
+        ));
         return Ok((
             Arc::new(PostgresProposalRepository::new(
                 database.pool().clone(),
@@ -92,6 +97,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             ))),
+            Some(scheduling),
             OAuthScope {
                 workspace_id: database.scope().workspace_id,
                 user_id: database.scope().user_id,
@@ -108,6 +114,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         Arc::new(InMemoryItemRepository::default()),
         Arc::new(InMemoryExecutionRepository::default()),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
+        None,
         None,
         None,
         OAuthScope {
@@ -132,6 +139,7 @@ pub struct AppState {
     pub mcp_oauth: Option<Arc<McpOAuthVerifier>>,
     pub google_oauth: Option<Arc<GoogleOAuthService>>,
     pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
+    pub(crate) scheduling: Option<Arc<PostgresSchedulingRepository>>,
     execution_repository: Arc<dyn ExecutionRepository>,
     pub(crate) clock: Arc<dyn Clock>,
 }
@@ -155,6 +163,7 @@ impl AppState {
             google_oauth_repository,
             google_sync_repository,
             credential_repository,
+            scheduling,
             oauth_scope,
             readiness,
         ): Repositories = repositories(config).await?;
@@ -182,12 +191,22 @@ impl AppState {
                 clock.clone(),
             )),
         };
-        let mcp = Arc::new(McpService::new(
-            Arc::new(UnavailableScheduleQueryPort),
-            Arc::new(UnavailableSimulationPort),
-            proposals.clone(),
-            config.mcp_allowed_origins.clone(),
-        ));
+        let mcp = if let Some(repository) = scheduling.as_ref() {
+            Arc::new(McpService::new_with_submissions(
+                repository.clone(),
+                repository.clone(),
+                proposals.clone(),
+                repository.clone(),
+                config.mcp_allowed_origins.clone(),
+            ))
+        } else {
+            Arc::new(McpService::new(
+                Arc::new(UnavailableScheduleQueryPort),
+                Arc::new(UnavailableSimulationPort),
+                proposals.clone(),
+                config.mcp_allowed_origins.clone(),
+            ))
+        };
         let mcp_oauth = config
             .mcp_oauth
             .clone()
@@ -284,6 +303,7 @@ impl AppState {
             mcp_oauth,
             google_oauth,
             google_sync,
+            scheduling,
             execution_repository,
             clock,
         })
@@ -325,6 +345,7 @@ impl AppState {
             mcp_oauth: None,
             google_oauth: None,
             google_sync: None,
+            scheduling: None,
             execution_repository,
             clock,
         }
@@ -354,6 +375,26 @@ impl AppState {
             self.proposals.clone(),
             allowed_origins,
         ));
+        self
+    }
+
+    /// Installs the durable schedule publication/query adapter in an explicitly
+    /// assembled dependency graph (primarily integration tests and embedded
+    /// deployments). The adapter itself still enforces its fixed DB scope.
+    #[must_use]
+    pub fn with_postgres_scheduling(
+        mut self,
+        repository: Arc<PostgresSchedulingRepository>,
+        allowed_origins: Arc<Vec<String>>,
+    ) -> Self {
+        self.mcp = Arc::new(McpService::new_with_submissions(
+            repository.clone(),
+            repository.clone(),
+            self.proposals.clone(),
+            repository.clone(),
+            allowed_origins,
+        ));
+        self.scheduling = Some(repository);
         self
     }
 

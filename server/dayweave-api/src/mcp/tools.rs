@@ -1,11 +1,11 @@
-use std::{collections::HashMap, fmt::Write, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 use crate::{
     auth::{Principal, PrincipalAudience, Scope},
@@ -16,8 +16,10 @@ use crate::{
     proposals::{NewProposal, ProposalKind, ProposalService, ProposalSource},
     scheduling::{
         ConflictQuery, ItemSearchQuery, PlanOperation, PlanOperationKind, PlanningSimulationPort,
-        ScheduleAccess, ScheduleDetail, ScheduleQuery, ScheduleQueryPort, SchedulingPortError,
-        SimulationRequest, simulation_request_digest,
+        ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
+        ProposalSubmissionSpec, ScheduleAccess, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
+        SchedulingPortError, SimulationRequest, has_postgres_timestamp_precision,
+        simulation_request_digest, truncate_to_postgres_timestamp_precision,
     },
 };
 
@@ -43,7 +45,7 @@ pub struct McpService {
     pub(crate) schedule: Arc<dyn ScheduleQueryPort>,
     pub(crate) simulations: Arc<dyn PlanningSimulationPort>,
     proposals: Arc<ProposalService>,
-    submissions: Arc<Mutex<HashMap<(String, String), SubmissionRecord>>>,
+    submissions: Arc<dyn ProposalSubmissionPort>,
     allowed_origins: Arc<Vec<String>>,
 }
 
@@ -64,11 +66,32 @@ impl McpService {
         proposals: Arc<ProposalService>,
         allowed_origins: Arc<Vec<String>>,
     ) -> Self {
+        let submissions = Arc::new(InMemoryProposalSubmissionPort::new(
+            simulations.clone(),
+            proposals.clone(),
+        ));
+        Self::new_with_submissions(
+            schedule,
+            simulations,
+            proposals,
+            submissions,
+            allowed_origins,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_submissions(
+        schedule: Arc<dyn ScheduleQueryPort>,
+        simulations: Arc<dyn PlanningSimulationPort>,
+        proposals: Arc<ProposalService>,
+        submissions: Arc<dyn ProposalSubmissionPort>,
+        allowed_origins: Arc<Vec<String>>,
+    ) -> Self {
         Self {
             schedule,
             simulations,
             proposals,
-            submissions: Arc::new(Mutex::new(HashMap::new())),
+            submissions,
             allowed_origins,
         }
     }
@@ -110,6 +133,8 @@ impl McpService {
         let access = ScheduleAccess {
             subject: context.principal.subject.clone(),
             include_sensitive: false,
+            workspace_id: context.principal.workspace_id,
+            user_id: context.principal.user_id,
         };
         match name {
             "get_schedule" => {
@@ -131,6 +156,8 @@ impl McpService {
             }
             "search_items" => {
                 let input: SearchItemsInput = decode(arguments)?;
+                validate_optional_instant(input.start)?;
+                validate_optional_instant(input.end)?;
                 if let (Some(start), Some(end)) = (input.start, input.end) {
                     validate_range(start, end)?;
                 }
@@ -244,56 +271,17 @@ impl McpService {
         let expires_at = validate_submission(&input, maximum_expiration)?;
         let request_fingerprint = submission_fingerprint(&input)?;
 
-        let mut submissions = self.submissions.lock().await;
-        let idempotency_scope = (
-            context.principal.subject.clone(),
-            input.idempotency_key.clone(),
-        );
-        if let Some(record) = submissions.get(&idempotency_scope) {
-            if record.request_fingerprint != request_fingerprint {
-                return Err(ToolCallError::execution(
-                    "idempotency_conflict",
-                    "idempotency_key was already used for different proposal content",
-                ));
-            }
-            let proposal = self
-                .proposals
-                .get(record.proposal_id)
-                .await
-                .map_err(|error| {
-                    ToolCallError::execution("proposal_unavailable", error.to_string())
-                })?;
-            return proposal_output(&proposal, true);
-        }
-
-        if let Some(simulation_token) = input.simulation_token.as_deref() {
-            let expected_digest = simulation_request_digest(&SimulationRequest {
-                base_revision: input.base_revision.clone(),
-                operations: input.operations.clone(),
-                assumptions: input.assumptions.clone(),
-            })
-            .map_err(ToolCallError::from_port)?;
-            let simulation = self
-                .simulations
-                .consume_simulation(access, simulation_token, &expected_digest)
-                .await
-                .map_err(ToolCallError::from_port)?;
-            if simulation.base_revision != input.base_revision
-                || simulation.request_digest != expected_digest
-            {
-                return Err(ToolCallError::execution(
-                    "simulation_mismatch",
-                    "simulation token does not match the proposal base revision",
-                ));
-            }
-        }
+        let expected_digest = simulation_request_digest(&SimulationRequest {
+            base_revision: input.base_revision.clone(),
+            operations: input.operations.clone(),
+            assumptions: input.assumptions.clone(),
+        })
+        .map_err(ToolCallError::from_port)?;
 
         let proposal_kind = proposal_kind(&input.operations);
         let payload = json!({
             "schema_version": 1,
-            "idempotency_key": input.idempotency_key,
             "base_revision": input.base_revision,
-            "simulation_token": input.simulation_token,
             "assumptions": input.assumptions,
             "operations": input.operations,
             "source": {
@@ -309,7 +297,7 @@ impl McpService {
         });
         let proposal = self
             .proposals
-            .create(NewProposal {
+            .prepare(NewProposal {
                 submitted_by: context.principal.subject.clone(),
                 source: ProposalSource::ExternalMcp,
                 source_reference: Some(input.source_conversation_label),
@@ -319,16 +307,22 @@ impl McpService {
                 payload,
                 expires_at,
             })
-            .await
             .map_err(|error| ToolCallError::execution("proposal_rejected", error.to_string()))?;
-        submissions.insert(
-            idempotency_scope,
-            SubmissionRecord {
-                proposal_id: proposal.id,
-                request_fingerprint,
-            },
-        );
-        proposal_output(&proposal, false)
+        let result = self
+            .submissions
+            .submit_proposal(
+                access,
+                ProposalSubmissionSpec {
+                    idempotency_key: input.idempotency_key,
+                    request_fingerprint,
+                    expected_simulation_digest: expected_digest,
+                    simulation_token: input.simulation_token,
+                    proposal,
+                },
+            )
+            .await
+            .map_err(ToolCallError::from_submission)?;
+        proposal_output(&result.proposal, result.duplicate)
     }
 }
 
@@ -384,9 +378,30 @@ impl ToolCallError {
                     .to_owned(),
                 details: Some(json!({ "current_revision": current_revision })),
             },
+            SchedulingPortError::RepublishRequired => Self::execution(
+                "republish_required",
+                "This schedule predates durable planning evidence; publish a fresh schedule in DayWeave first",
+            ),
             SchedulingPortError::Unavailable(message) => {
                 Self::execution("temporarily_unavailable", message)
             }
+        }
+    }
+
+    fn from_submission(error: ProposalSubmissionError) -> Self {
+        match error {
+            ProposalSubmissionError::AccessDenied => {
+                Self::execution("not_found", "The proposal submission scope was not found")
+            }
+            ProposalSubmissionError::IdempotencyConflict => Self::execution(
+                "idempotency_conflict",
+                "idempotency_key was already used for different proposal content",
+            ),
+            ProposalSubmissionError::Simulation(error) => Self::from_port(error),
+            ProposalSubmissionError::Unavailable => Self::execution(
+                "proposal_unavailable",
+                "proposal submission storage is temporarily unavailable",
+            ),
         }
     }
 
@@ -481,8 +496,85 @@ struct SubmitProposalInput {
 
 #[derive(Clone, Debug)]
 struct SubmissionRecord {
-    proposal_id: Uuid,
-    request_fingerprint: String,
+    proposal: crate::proposals::Proposal,
+    request_fingerprint: [u8; 32],
+}
+
+/// Deterministic test/local adapter. Production wiring replaces this with the
+/// `PostgreSQL` transaction port; this adapter intentionally makes no restart or
+/// cross-process durability claim.
+struct InMemoryProposalSubmissionPort {
+    simulations: Arc<dyn PlanningSimulationPort>,
+    proposals: Arc<ProposalService>,
+    submissions: Mutex<HashMap<(String, String), SubmissionRecord>>,
+}
+
+impl InMemoryProposalSubmissionPort {
+    fn new(simulations: Arc<dyn PlanningSimulationPort>, proposals: Arc<ProposalService>) -> Self {
+        Self {
+            simulations,
+            proposals,
+            submissions: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ProposalSubmissionPort for InMemoryProposalSubmissionPort {
+    async fn submit_proposal(
+        &self,
+        access: &ScheduleAccess,
+        spec: ProposalSubmissionSpec,
+    ) -> Result<ProposalSubmissionResult, ProposalSubmissionError> {
+        let key = (access.subject.clone(), spec.idempotency_key.clone());
+        let mut submissions = self.submissions.lock().await;
+        if let Some(existing) = submissions.get(&key) {
+            if existing.request_fingerprint != spec.request_fingerprint {
+                return Err(ProposalSubmissionError::IdempotencyConflict);
+            }
+            return Ok(ProposalSubmissionResult {
+                proposal: existing.proposal.clone(),
+                duplicate: true,
+            });
+        }
+        if let Some(token) = spec.simulation_token.as_deref() {
+            let simulation = self
+                .simulations
+                .consume_simulation(access, token, &spec.expected_simulation_digest)
+                .await?;
+            if simulation.base_revision
+                != spec
+                    .proposal
+                    .payload
+                    .get("base_revision")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                || simulation.request_digest != spec.expected_simulation_digest
+            {
+                return Err(ProposalSubmissionError::Simulation(
+                    SchedulingPortError::InvalidQuery(
+                        "simulation token does not match the proposal base revision".to_owned(),
+                    ),
+                ));
+            }
+        }
+        let proposal = self
+            .proposals
+            .persist_prepared(spec.proposal)
+            .await
+            .map_err(|_| ProposalSubmissionError::Unavailable)?;
+        submissions.insert(
+            key,
+            SubmissionRecord {
+                proposal: proposal.clone(),
+                request_fingerprint: spec.request_fingerprint,
+            },
+        );
+        Ok(ProposalSubmissionResult {
+            proposal,
+            duplicate: false,
+        })
+    }
 }
 
 fn decode<T: DeserializeOwned>(arguments: Value) -> Result<T, ToolCallError> {
@@ -495,6 +587,12 @@ fn decode<T: DeserializeOwned>(arguments: Value) -> Result<T, ToolCallError> {
 }
 
 fn validate_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<(), ToolCallError> {
+    if !has_postgres_timestamp_precision(start) || !has_postgres_timestamp_precision(end) {
+        return Err(ToolCallError::execution(
+            "invalid_arguments",
+            "date boundaries must use PostgreSQL microsecond precision",
+        ));
+    }
     if end <= start {
         return Err(ToolCallError::execution(
             "invalid_arguments",
@@ -505,6 +603,16 @@ fn validate_range(start: DateTime<Utc>, end: DateTime<Utc>) -> Result<(), ToolCa
         return Err(ToolCallError::execution(
             "invalid_arguments",
             "date range must not exceed 90 days",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_instant(value: Option<DateTime<Utc>>) -> Result<(), ToolCallError> {
+    if value.is_some_and(|value| !has_postgres_timestamp_precision(value)) {
+        return Err(ToolCallError::execution(
+            "invalid_arguments",
+            "date boundaries must use PostgreSQL microsecond precision",
         ));
     }
     Ok(())
@@ -521,16 +629,45 @@ fn validate_plan_contents(
         ));
     }
     if assumptions.len() > MAX_ASSUMPTIONS
-        || assumptions
-            .iter()
-            .any(|assumption| assumption.chars().count() > 500)
+        || assumptions.iter().any(|assumption| {
+            assumption.chars().count() > 500 || assumption.chars().any(char::is_control)
+        })
     {
         return Err(ToolCallError::execution(
             "invalid_arguments",
             format!("at most {MAX_ASSUMPTIONS} assumptions of 500 characters are allowed"),
         ));
     }
+    if operations.iter().any(|operation| {
+        operation.target_id.as_ref().is_some_and(|target| {
+            target.chars().count() > 100 || target.chars().any(char::is_control)
+        }) || operation
+            .parameters
+            .iter()
+            .any(|(key, value)| key.chars().any(char::is_control) || unsafe_json_text(value, 0))
+    }) {
+        return Err(ToolCallError::execution(
+            "invalid_arguments",
+            "operation targets and parameters contain unsupported text",
+        ));
+    }
     Ok(())
+}
+
+fn unsafe_json_text(value: &Value, depth: usize) -> bool {
+    if depth > 64 {
+        return true;
+    }
+    match value {
+        Value::String(value) => value.chars().any(char::is_control),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| unsafe_json_text(value, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            key.chars().any(char::is_control) || unsafe_json_text(value, depth + 1)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
 }
 
 fn validate_idempotency_key(value: &str) -> Result<(), ToolCallError> {
@@ -563,7 +700,16 @@ fn validate_submission(
     )?;
     validate_bounded_text(&input.base_revision, "base_revision", 200)?;
 
-    let expires_at = input.expires_at.unwrap_or(maximum_expiration);
+    let expires_at = match input.expires_at {
+        Some(value) if !has_postgres_timestamp_precision(value) => {
+            return Err(ToolCallError::execution(
+                "invalid_expiration",
+                "proposal expiry must use PostgreSQL microsecond precision",
+            ));
+        }
+        Some(value) => value,
+        None => truncate_to_postgres_timestamp_precision(maximum_expiration),
+    };
     if expires_at > maximum_expiration {
         return Err(ToolCallError::execution(
             "invalid_expiration",
@@ -578,7 +724,10 @@ fn validate_bounded_text(
     field: &str,
     maximum_length: usize,
 ) -> Result<(), ToolCallError> {
-    if value.trim().is_empty() || value.chars().count() > maximum_length {
+    if value.trim().is_empty()
+        || value.chars().count() > maximum_length
+        || value.chars().any(char::is_control)
+    {
         return Err(ToolCallError::execution(
             "invalid_arguments",
             format!("{field} must contain between 1 and {maximum_length} characters"),
@@ -587,20 +736,14 @@ fn validate_bounded_text(
     Ok(())
 }
 
-fn submission_fingerprint(input: &SubmitProposalInput) -> Result<String, ToolCallError> {
+fn submission_fingerprint(input: &SubmitProposalInput) -> Result<[u8; 32], ToolCallError> {
     let bytes = serde_json::to_vec(input).map_err(|_| {
         ToolCallError::execution(
             "encoding_failed",
             "proposal content could not be fingerprinted",
         )
     })?;
-    let digest = Sha256::digest(bytes);
-    Ok(digest[..16]
-        .iter()
-        .fold(String::with_capacity(32), |mut encoded, byte| {
-            let _ = write!(encoded, "{byte:02x}");
-            encoded
-        }))
+    Ok(Sha256::digest(bytes).into())
 }
 
 fn proposal_kind(operations: &[PlanOperation]) -> ProposalKind {
