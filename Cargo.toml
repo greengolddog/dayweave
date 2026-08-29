@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dayweave-codex",
     "crates/dayweave-core",
     "crates/dayweave-google",
     "server/dayweave-api",

@@ -247,7 +247,20 @@ Google mutations use the server outbox and conditional versions. A version confl
 
 ### 9.1 Boundary
 
-The `AssistantProvider` boundary supports Codex App Server as the primary provider and an API-key provider as fallback. The server-side broker runs the supported login/device-code flow and stores resulting credentials encrypted. Clients never scrape ChatGPT sessions or embed browser cookies.
+The `AssistantProvider` boundary supports a macOS-local Codex App Server process
+as the primary provider and a separately authenticated remote API provider for
+Android or explicit fallback use. The macOS host runs managed browser or
+device-code login through Codex itself; DayWeave never extracts, copies, or
+syncs the resulting ChatGPT credentials. Clients never scrape ChatGPT sessions
+or embed browser cookies.
+
+Production App Server startup is currently disabled. Enabling it requires an
+adapter that pins the exact CLI version and verifies that build's generated
+JSON Schema before launch, plus macOS containment stronger than an escapable
+Unix process group. The test-only contract uses restricted roots, read-only and
+network-denied turns, rejects command/file-change approvals, and bounds protocol
+traffic. A CLI build that cannot prove the complete contract is incompatible,
+even when ordinary login and chat methods work.
 
 Assistant requests consist of an explicit, redacted context package, user request, allowed tool schema, model/reasoning preference, and confirmation policy. Tool calls target application commands or simulations—not database tables.
 

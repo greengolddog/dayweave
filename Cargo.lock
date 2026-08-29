@@ -391,6 +391,7 @@ dependencies = [
  "base64",
  "chrono",
  "chrono-tz",
+ "dayweave-core",
  "http-body-util",
  "serde",
  "serde_json",
@@ -398,6 +399,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "thiserror",
+ "time",
  "tokio",
  "tower",
  "tower-http",
@@ -405,6 +407,19 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "dayweave-codex"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -1246,6 +1261,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -2907,6 +2934,9 @@ name = "zeroize"
 version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "zerotrie"
