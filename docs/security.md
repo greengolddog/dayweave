@@ -64,12 +64,13 @@ effects must flow through an auditable proposal or outbox boundary.
 - Database URLs and storage failures are redacted in application-facing errors.
   HTTP traces carry correlation metadata without deliberately logging request
   bodies, authorization headers, titles, notes, or assistant prompts.
-- Production Codex process startup is disabled until an exact build/schema can
-  be pinned and an escapable Unix process group is replaced by proven macOS
-  containment. The test-only contract uses canonical restricted roots under a
-  read-only, network-denied sandbox; approval and user-input requests fail
-  closed, and protocol/output sizes are bounded. Managed ChatGPT tokens must
-  remain owned by Codex and never be synchronized to DayWeave or its backend.
+- Production Codex process startup remains disabled until the client uses the
+  exact pinned-runtime launcher and handles every server request fail-closed.
+  The verifier uses canonical restricted roots, a private verified runtime copy,
+  no process fork, no inbound or bind permission, and outbound access only for
+  the managed Codex service. Protocol traffic and subprocesses are bounded.
+  Managed ChatGPT device-code tokens must remain inside the isolated Codex home
+  and never be backed up or synchronized to DayWeave or its backend.
 
 ### Deployment
 

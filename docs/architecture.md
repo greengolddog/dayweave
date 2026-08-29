@@ -249,18 +249,19 @@ Google mutations use the server outbox and conditional versions. A version confl
 
 The `AssistantProvider` boundary supports a macOS-local Codex App Server process
 as the primary provider and a separately authenticated remote API provider for
-Android or explicit fallback use. The macOS host runs managed browser or
-device-code login through Codex itself; DayWeave never extracts, copies, or
-syncs the resulting ChatGPT credentials. Clients never scrape ChatGPT sessions
-or embed browser cookies.
+Android or explicit fallback use. The contained macOS host uses managed
+device-code login through Codex itself; it exposes no inbound browser callback.
+DayWeave never extracts, copies, or syncs the resulting ChatGPT credentials.
+Clients never scrape ChatGPT sessions or embed browser cookies.
 
 Production App Server startup is currently disabled. Enabling it requires an
-adapter that pins the exact CLI version and verifies that build's generated
-JSON Schema before launch, plus macOS containment stronger than an escapable
-Unix process group. The test-only contract uses restricted roots, read-only and
-network-denied turns, rejects command/file-change approvals, and bounds protocol
-traffic. A CLI build that cannot prove the complete contract is incompatible,
-even when ordinary login and chat methods work.
+adapter that pins the exact CLI version, verifies that build's generated JSON
+Schema, and launches a private verified copy. The outer profile allows outbound
+Codex service traffic but no process fork, network bind, or inbound connection;
+turn tools cannot spawn commands or reach files outside the isolated home.
+Protocol traffic is bounded and privileged server requests fail closed. A CLI
+build that cannot prove the complete contract is incompatible, even when
+ordinary login and chat methods work.
 
 Assistant requests consist of an explicit, redacted context package, user request, allowed tool schema, model/reasoning preference, and confirmation policy. Tool calls target application commands or simulations—not database tables.
 
@@ -416,7 +417,7 @@ These are gates, not unresolved product questions:
 
 - Full Xcode installation is needed for final macOS extensions, entitlements, UI tests, and packaging; current code can be developed with available Swift tooling where possible.
 - Android SDK/ADB and the physical Pixel 11 are needed for API-level detection and final device verification.
-- The owner must complete Google OAuth consent and Codex/ChatGPT device or browser login when integration reaches that point.
+- The owner must complete Google OAuth consent and Codex/ChatGPT device-code login when integration reaches that point.
 - Stable macOS/Android signing material must be generated and stored outside Git before stable artifacts.
 - WHOOP enters through the existing signal-provider boundary after the core completion gate.
 

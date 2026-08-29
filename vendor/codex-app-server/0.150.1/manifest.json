@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "cli_version_output": "codex-cli 0.150.1",
+  "executable": {
+    "candidate_paths": [
+      "/opt/homebrew/Caskroom/codex/0.150.1/bin/codex"
+    ],
+    "sha256": "a14f9a907c12c8812878b70e6b7d65f81c39ed795513e46a55817d7428c0ca6b",
+    "identifier": "codex",
+    "team_identifier": "2DC432GLL2",
+    "designated_requirement": "identifier codex and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = 2DC432GLL2",
+    "codesign_requirement": "identifier \"codex\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"2DC432GLL2\""
+  },
+  "schemas": [
+    {
+      "path": "codex_app_server_protocol.schemas.json",
+      "sha256": "18ba0e2282f69f7b3a05ffdc8ab0801c1468f25d72de3b4a37f1c8be67432a1d"
+    },
+    {
+      "path": "codex_app_server_protocol.v2.schemas.json",
+      "sha256": "8cdccfc35582696d7141e7f916e0d5a664ab5b5e90b732f104284d2507f369f8"
+    }
+  ],
+  "transport": "stdio",
+  "containment": {
+    "runner": "/usr/bin/sandbox-exec",
+    "profile_version": 1,
+    "deny_by_default": true,
+    "allow_process_fork": false,
+    "writable_scope": "isolated_codex_home_only",
+    "network": "outbound_only",
+    "login": "device_code_only",
+    "same_user_threat_limit": "The verifier detects ordinary replacement and mutation but cannot exclude a malicious concurrent process already running as the same macOS user."
+  }
+}
