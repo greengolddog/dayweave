@@ -858,8 +858,6 @@ struct CanonicalSyncStoreTests {
                 var second = try #require(blocks.first)
                 second["id"] = UUID().uuidString.lowercased()
                 second["session_index"] = 1
-                second["start"] = "2026-08-29T11:30:00+02:00"
-                second["end"] = "2026-08-29T12:15:00+02:00"
                 blocks.append(second)
                 plan["blocks"] = blocks
                 var score = try #require(plan["score"] as? [String: Any])
@@ -907,15 +905,22 @@ struct CanonicalSyncStoreTests {
     }
 
     private static func previewObject(itemID: UUID, blockID: UUID) -> String {
-        """
+        let asOf = Date(timeIntervalSince1970: 1_787_990_400)
+        let calendar = Calendar.autoupdatingCurrent
+        let horizonStart = calendar.startOfDay(for: asOf)
+        let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
+            ?? horizonStart.addingTimeInterval(7 * 86_400)
+        let blockStart = asOf.addingTimeInterval(3_600)
+        let blockEnd = blockStart.addingTimeInterval(2_700)
+        return """
         {"input_digest":"sha256:test","source_item_count":1,"accepted_item_count":1,
          "source_item_revisions":{"\(itemID.uuidString.lowercased())":1},
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
-           "as_of":"2026-08-29T10:00:00+02:00","horizon_start":"2026-08-29T00:00:00+02:00",
-           "horizon_end":"2026-09-05T00:00:00+02:00","blocks":[{
+           "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
+           "horizon_end":"\(wireTimestamp(horizonEnd))","blocks":[{
              "id":"\(blockID.uuidString.lowercased())","item_id":"\(itemID.uuidString.lowercased())",
              "occurrence_id":null,"external_block_id":null,"title":"Write launch plan",
-             "start":"2026-08-29T11:00:00+02:00","end":"2026-08-29T11:45:00+02:00",
+             "start":"\(wireTimestamp(blockStart))","end":"\(wireTimestamp(blockEnd))",
              "session_index":0,"kind":"planned","explanations":[
                {"code":"earliest_available","message":"Placed in the earliest matching opening."}
              ]}],"unscheduled":[],"decisions":[],"violations":[],
@@ -925,6 +930,11 @@ struct CanonicalSyncStoreTests {
     }
 
     private static func emptyPreviewObject(sourceRevisions: [UUID: UInt64]) -> String {
+        let asOf = Date(timeIntervalSince1970: 1_787_990_400)
+        let calendar = Calendar.autoupdatingCurrent
+        let horizonStart = calendar.startOfDay(for: asOf)
+        let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
+            ?? horizonStart.addingTimeInterval(7 * 86_400)
         let revisions = sourceRevisions
             .sorted { $0.key.uuidString < $1.key.uuidString }
             .map { "\"\($0.key.uuidString.lowercased())\":\($0.value)" }
@@ -933,11 +943,17 @@ struct CanonicalSyncStoreTests {
         {"input_digest":"sha256:empty","source_item_count":\(sourceRevisions.count),
          "accepted_item_count":\(sourceRevisions.count),"source_item_revisions":{\(revisions)},
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
-           "as_of":"2026-08-29T10:00:00+02:00","horizon_start":"2026-08-29T00:00:00+02:00",
-           "horizon_end":"2026-09-05T00:00:00+02:00","blocks":[],"unscheduled":[],
+           "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
+           "horizon_end":"\(wireTimestamp(horizonEnd))","blocks":[],"unscheduled":[],
            "decisions":[],"violations":[],"score":{"scheduled_minutes":0,
            "unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}
         """
+    }
+
+    private static func wireTimestamp(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: date)
     }
 
     private static func decodeItem(_ object: String) throws -> DayWeaveCanonicalItem {
