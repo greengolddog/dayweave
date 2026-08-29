@@ -12,7 +12,9 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.SuggestionDisposition
+import java.util.ArrayDeque
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
@@ -25,6 +27,19 @@ enum class PlannerLoadState {
     LOADING,
     READY,
     PERSISTENCE_FAILED,
+}
+
+/**
+ * Acknowledges the exact planner generation produced by a server reconciliation.
+ *
+ * Awaiting is intentionally opt-in: ordinary UI mutations remain synchronous and enqueue their
+ * encrypted save without blocking the caller.
+ */
+class PlannerPersistenceReceipt internal constructor(
+    val generation: Long,
+    private val completion: CompletableDeferred<Boolean>,
+) {
+    suspend fun awaitDurable(): Boolean = completion.await()
 }
 
 /**
@@ -49,6 +64,10 @@ class PlannerStore(
     private val persistenceLock = Any()
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
     private val persistenceReady = CompletableDeferred<Boolean>()
+    private val exactSaveRequests = ArrayDeque<SaveRequest>()
+    private var latestNormalSaveRequest: SaveRequest? = null
+    private var currentGeneration = 0L
+    private var persistedGeneration = 0L
     private var persistenceStatus = if (repository == null) {
         PersistenceStatus.DISABLED
     } else {
@@ -235,11 +254,13 @@ class PlannerStore(
     }
 
     /** Replaces only server-backed proposals; local drafts remain untouched. */
-    fun replaceRemoteSuggestions(suggestions: List<PlanningSuggestion>): Boolean {
+    fun replaceRemoteSuggestions(
+        suggestions: List<PlanningSuggestion>,
+    ): PlannerPersistenceReceipt? {
         require(suggestions.all { it.remoteRevision != null }) {
             "Remote suggestions must include a server revision"
         }
-        return mutate { current ->
+        return mutateDurably { current ->
             val remoteIds = suggestions.asSequence().map(PlanningSuggestion::id).toHashSet()
             val localSuggestions = current.suggestions.filter {
                 it.remoteRevision == null && it.id !in remoteIds
@@ -253,11 +274,13 @@ class PlannerStore(
     }
 
     /** Reconciles a mutation response without ever applying its payload to the schedule. */
-    fun reconcileRemoteSuggestion(suggestion: PlanningSuggestion): Boolean {
+    fun reconcileRemoteSuggestion(
+        suggestion: PlanningSuggestion,
+    ): PlannerPersistenceReceipt? {
         require(suggestion.remoteRevision != null) {
             "A reconciled remote suggestion must include a server revision"
         }
-        return mutate { current ->
+        return mutateDurably { current ->
             val replaced = current.suggestions.any {
                 it.id == suggestion.id && it.remoteRevision != null
             }
@@ -324,18 +347,63 @@ class PlannerStore(
     }
 
     private fun mutate(transform: (DayWeaveUiState) -> DayWeaveUiState): Boolean {
-        val shouldSave = synchronized(persistenceLock) {
-            if (
-                persistenceStatus == PersistenceStatus.LOADING ||
-                persistenceStatus == PersistenceStatus.FAILED
-            ) {
-                return@synchronized null
-            }
-            mutableState.value = transform(mutableState.value)
-            persistenceStatus == PersistenceStatus.READY
-        } ?: return false
-        if (shouldSave) saveRequests.trySend(Unit)
+        val mutation = mutateInternal(requireExactSave = false, transform) ?: return false
+        if (mutation.shouldSignalWriter) saveRequests.trySend(Unit)
         return true
+    }
+
+    private fun mutateDurably(
+        transform: (DayWeaveUiState) -> DayWeaveUiState,
+    ): PlannerPersistenceReceipt? {
+        val mutation = mutateInternal(requireExactSave = true, transform) ?: return null
+        if (mutation.shouldSignalWriter) saveRequests.trySend(Unit)
+        return requireNotNull(mutation.receipt)
+    }
+
+    private fun mutateInternal(
+        requireExactSave: Boolean,
+        transform: (DayWeaveUiState) -> DayWeaveUiState,
+    ): MutationResult? = synchronized(persistenceLock) {
+        if (
+            persistenceStatus == PersistenceStatus.LOADING ||
+            persistenceStatus == PersistenceStatus.FAILED
+        ) {
+            return@synchronized null
+        }
+        val snapshot = transform(mutableState.value)
+        mutableState.value = snapshot
+        currentGeneration += 1
+
+        if (persistenceStatus != PersistenceStatus.READY) {
+            val receipt = if (requireExactSave) {
+                PlannerPersistenceReceipt(
+                    generation = currentGeneration,
+                    completion = CompletableDeferred(true),
+                )
+            } else {
+                null
+            }
+            return@synchronized MutationResult(receipt, shouldSignalWriter = false)
+        }
+
+        val completion = if (requireExactSave) CompletableDeferred<Boolean>() else null
+        val request = SaveRequest(
+            generation = currentGeneration,
+            snapshot = snapshot,
+            completion = completion,
+        )
+        if (requireExactSave) {
+            exactSaveRequests.addLast(request)
+        } else {
+            // Routine UI changes can coalesce, while exact server generations remain ordered.
+            latestNormalSaveRequest = request
+        }
+        MutationResult(
+            receipt = completion?.let {
+                PlannerPersistenceReceipt(currentGeneration, it)
+            },
+            shouldSignalWriter = true,
+        )
     }
 
     private suspend fun restore(repository: PlannerStateRepository) {
@@ -348,9 +416,17 @@ class PlannerStore(
 
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
-            mutableState.value = persistedState ?: initialState
+            val snapshot = persistedState ?: initialState
+            mutableState.value = snapshot
+            currentGeneration += 1
             persistenceStatus = PersistenceStatus.READY
-            persistedState == null
+            if (persistedState == null) {
+                latestNormalSaveRequest = SaveRequest(currentGeneration, snapshot)
+                true
+            } else {
+                persistedGeneration = currentGeneration
+                false
+            }
         }
         persistenceReady.complete(true)
         mutableLoadState.value = PlannerLoadState.READY
@@ -360,22 +436,59 @@ class PlannerStore(
     private suspend fun autosave(repository: PlannerStateRepository) {
         if (!persistenceReady.await()) return
         for (ignored in saveRequests) {
-            val snapshot = mutableState.value
-            val saved = runCatching { repository.save(snapshot) }
-            if (saved.isFailure) {
-                markPersistenceFailed(saved.exceptionOrNull() ?: return)
-                return
+            while (true) {
+                val request = synchronized(persistenceLock) {
+                    exactSaveRequests.pollFirst()
+                        ?: latestNormalSaveRequest?.also { latestNormalSaveRequest = null }
+                } ?: break
+                try {
+                    repository.save(request.snapshot)
+                } catch (error: CancellationException) {
+                    markPersistenceFailed(error, request)
+                    throw error
+                } catch (error: Throwable) {
+                    markPersistenceFailed(error, request)
+                    return
+                }
+                synchronized(persistenceLock) {
+                    persistedGeneration = maxOf(persistedGeneration, request.generation)
+                    request.completion?.complete(true)
+                    if (
+                        latestNormalSaveRequest?.generation?.let { it <= persistedGeneration } == true
+                    ) {
+                        latestNormalSaveRequest = null
+                    }
+                }
             }
         }
     }
 
-    private fun markPersistenceFailed(error: Throwable) {
+    private fun markPersistenceFailed(
+        error: Throwable,
+        failedRequest: SaveRequest? = null,
+    ) {
         synchronized(persistenceLock) {
             persistenceStatus = PersistenceStatus.FAILED
+            failedRequest?.completion?.complete(false)
+            while (exactSaveRequests.isNotEmpty()) {
+                exactSaveRequests.removeFirst().completion?.complete(false)
+            }
+            latestNormalSaveRequest = null
         }
         onPersistenceError(error)
         mutableLoadState.value = PlannerLoadState.PERSISTENCE_FAILED
     }
+
+    private data class MutationResult(
+        val receipt: PlannerPersistenceReceipt?,
+        val shouldSignalWriter: Boolean,
+    )
+
+    private data class SaveRequest(
+        val generation: Long,
+        val snapshot: DayWeaveUiState,
+        val completion: CompletableDeferred<Boolean>? = null,
+    )
 
     private enum class PersistenceStatus {
         DISABLED,

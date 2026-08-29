@@ -188,8 +188,8 @@ class OkHttpSuggestionsTransport(
     private suspend inline fun <reified T> execute(request: Request): T {
         val response = client.newCall(request).await()
         response.use {
-            val responseText = response.body.charStream().use { reader -> reader.readBoundedText() }
             if (!response.isSuccessful) throw response.toApiException()
+            val responseText = response.body.charStream().use { reader -> reader.readBoundedText() }
             try {
                 return json.decodeFromString<T>(responseText)
             } catch (error: SerializationException) {

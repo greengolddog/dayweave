@@ -73,12 +73,28 @@ interface ApiCredentialStore {
  * The non-exportable wrapping key remains in Android Keystore. This preference file is also
  * excluded from cloud backup and device transfer.
  */
-class KeystoreApiCredentialStore(
+class KeystoreApiCredentialStore private constructor(
     context: Context,
     configuredBaseUrl: String,
     private val preferencesName: String = PREFERENCES_NAME,
     private val keyAlias: String = KEY_ALIAS,
+    private val keyAccess: ApiCredentialKeyAccess,
+    private val clearPreferenceRecordsOverride: (() -> Boolean)?,
 ) : ApiCredentialStore {
+    constructor(
+        context: Context,
+        configuredBaseUrl: String,
+        preferencesName: String = PREFERENCES_NAME,
+        keyAlias: String = KEY_ALIAS,
+    ) : this(
+        context = context,
+        configuredBaseUrl = configuredBaseUrl,
+        preferencesName = preferencesName,
+        keyAlias = keyAlias,
+        keyAccess = AndroidApiCredentialKeyAccess,
+        clearPreferenceRecordsOverride = null,
+    )
+
     private val preferences = context.applicationContext.getSharedPreferences(
         preferencesName,
         Context.MODE_PRIVATE,
@@ -91,7 +107,9 @@ class KeystoreApiCredentialStore(
     override fun snapshot(): ApiConnectionSnapshot = synchronized(CREDENTIAL_LOCK) {
         ApiConnectionSnapshot(
             baseUrl = effectiveBaseUrl(),
-            hasBearerToken = preferences.contains(WRAPPED_BEARER_TOKEN),
+            // Ciphertext restored without its device-bound Keystore key is not a credential.
+            // Treating it as configured would resurrect background work after a partial forget.
+            hasBearerToken = preferences.contains(WRAPPED_BEARER_TOKEN) && hasWrappingKey(),
             lastSuccessfulSyncEpochMillis = preferences
                 .getLong(LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS, NO_SYNC_RECORDED)
                 .takeUnless { it == NO_SYNC_RECORDED },
@@ -122,23 +140,32 @@ class KeystoreApiCredentialStore(
         check(editor.commit()) { "Unable to persist API connection settings" }
     }
 
-    @SuppressLint("UseKtx")
     override fun clear() = synchronized(CREDENTIAL_LOCK) {
-        check(
-            preferences.edit()
-                .remove(BASE_URL)
-                .remove(WRAPPED_BEARER_TOKEN)
-                .remove(LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS)
-                .commit(),
-        ) { "Unable to clear API connection settings" }
-
+        var preferenceFailure: Exception? = null
         try {
-            KeyStore.getInstance(ANDROID_KEY_STORE).apply {
-                load(null)
-                if (containsAlias(keyAlias)) deleteEntry(keyAlias)
+            check(clearPreferenceRecords()) {
+                "Unable to durably clear API connection settings"
             }
         } catch (error: Exception) {
-            throw SecureCredentialException("Unable to remove the API credential key", error)
+            preferenceFailure = error
+        }
+
+        var keyFailure: Exception? = null
+        try {
+            keyAccess.delete(keyAlias)
+        } catch (error: Exception) {
+            keyFailure = error
+        }
+
+        if (preferenceFailure != null || keyFailure != null) {
+            val primary = preferenceFailure ?: requireNotNull(keyFailure)
+            if (preferenceFailure != null && keyFailure != null) {
+                primary.addSuppressed(keyFailure)
+            }
+            throw SecureCredentialException(
+                "API credentials could not be completely removed from this device",
+                primary,
+            )
         }
         Unit
     }
@@ -203,30 +230,31 @@ class KeystoreApiCredentialStore(
         }
     }
 
+    // Forget must know whether ciphertext reached durable storage; apply() cannot report failure.
+    @SuppressLint("ApplySharedPref", "UseKtx")
+    private fun clearPreferenceRecords(): Boolean = clearPreferenceRecordsOverride?.invoke()
+        ?: preferences.edit()
+            .remove(BASE_URL)
+            .remove(WRAPPED_BEARER_TOKEN)
+            .remove(LAST_SUCCESSFUL_SYNC_EPOCH_MILLIS)
+            .commit()
+
+    private fun hasWrappingKey(): Boolean = try {
+        existingWrappingKey() != null
+    } catch (_: SecureCredentialException) {
+        // Scheduling must fail closed when Keystore metadata is temporarily or permanently
+        // unavailable. The authenticated request path will surface the actionable error.
+        false
+    }
+
     private fun existingWrappingKey(): SecretKey? = try {
-        KeyStore.getInstance(ANDROID_KEY_STORE).apply { load(null) }
-            .getKey(keyAlias, null) as? SecretKey
+        keyAccess.existing(keyAlias)
     } catch (error: Exception) {
         throw SecureCredentialException("Unable to access the API credential key", error)
     }
 
     private fun getOrCreateWrappingKey(): SecretKey = existingWrappingKey() ?: try {
-        val generator = KeyGenerator.getInstance(
-            KeyProperties.KEY_ALGORITHM_AES,
-            ANDROID_KEY_STORE,
-        )
-        generator.init(
-            KeyGenParameterSpec.Builder(
-                keyAlias,
-                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-            )
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(KEY_SIZE_BITS)
-                .setRandomizedEncryptionRequired(true)
-                .build(),
-        )
-        generator.generateKey()
+        keyAccess.create(keyAlias)
     } catch (error: Exception) {
         throw SecureCredentialException("Unable to create the API credential key", error)
     }
@@ -234,6 +262,22 @@ class KeystoreApiCredentialStore(
     companion object {
         const val PREFERENCES_NAME = "dayweave_api_credentials"
         const val KEY_ALIAS = "com.greengolddog.dayweave.api-token-wrapping-key.v1"
+
+        internal fun createForTest(
+            context: Context,
+            configuredBaseUrl: String,
+            preferencesName: String,
+            keyAlias: String,
+            keyAccess: ApiCredentialKeyAccess,
+            clearPreferenceRecords: () -> Boolean,
+        ) = KeystoreApiCredentialStore(
+            context = context,
+            configuredBaseUrl = configuredBaseUrl,
+            preferencesName = preferencesName,
+            keyAlias = keyAlias,
+            keyAccess = keyAccess,
+            clearPreferenceRecordsOverride = clearPreferenceRecords,
+        )
 
         private const val BASE_URL = "base_url"
         private const val WRAPPED_BEARER_TOKEN = "wrapped_bearer_token"
@@ -245,7 +289,47 @@ class KeystoreApiCredentialStore(
         private const val ANDROID_KEY_STORE = "AndroidKeyStore"
         private const val CIPHER_TRANSFORMATION = "AES/GCM/NoPadding"
         private val CREDENTIAL_LOCK = Any()
+
+        private object AndroidApiCredentialKeyAccess : ApiCredentialKeyAccess {
+            override fun existing(alias: String): SecretKey? =
+                KeyStore.getInstance(ANDROID_KEY_STORE).apply { load(null) }
+                    .getKey(alias, null) as? SecretKey
+
+            override fun create(alias: String): SecretKey {
+                val generator = KeyGenerator.getInstance(
+                    KeyProperties.KEY_ALGORITHM_AES,
+                    ANDROID_KEY_STORE,
+                )
+                generator.init(
+                    KeyGenParameterSpec.Builder(
+                        alias,
+                        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+                    )
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(KEY_SIZE_BITS)
+                        .setRandomizedEncryptionRequired(true)
+                        .build(),
+                )
+                return generator.generateKey()
+            }
+
+            override fun delete(alias: String) {
+                KeyStore.getInstance(ANDROID_KEY_STORE).apply {
+                    load(null)
+                    if (containsAlias(alias)) deleteEntry(alias)
+                }
+            }
+        }
     }
+}
+
+internal interface ApiCredentialKeyAccess {
+    fun existing(alias: String): SecretKey?
+
+    fun create(alias: String): SecretKey
+
+    fun delete(alias: String)
 }
 
 private fun normalizeBaseUrl(rawBaseUrl: String, allowCleartextLoopback: Boolean): HttpUrl {

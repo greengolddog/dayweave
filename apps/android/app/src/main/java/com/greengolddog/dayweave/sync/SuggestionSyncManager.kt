@@ -11,15 +11,16 @@ import com.greengolddog.dayweave.network.RemoteSuggestion
 import com.greengolddog.dayweave.network.SecureCredentialException
 import com.greengolddog.dayweave.network.SuggestionApiException
 import com.greengolddog.dayweave.network.SuggestionsTransport
+import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
 import java.time.DateTimeException
 import java.time.Instant
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -43,6 +44,19 @@ data class SuggestionSyncState(
     val isBusy: Boolean get() = phase == SuggestionSyncPhase.SYNCING
 }
 
+enum class SuggestionRefreshOutcome {
+    SUCCESS,
+    NOT_CONFIGURED,
+    AUTH_REQUIRED,
+    CONFIGURATION_ERROR,
+    TRANSIENT_NETWORK_FAILURE,
+    RETRYABLE_SERVER_FAILURE,
+    PERMANENT_SERVER_FAILURE,
+    PROTOCOL_FAILURE,
+    LOCAL_STORAGE_FAILURE,
+    UNEXPECTED_FAILURE,
+}
+
 class SuggestionSyncManager(
     private val plannerStore: PlannerStore,
     private val credentialStore: ApiCredentialStore,
@@ -50,30 +64,35 @@ class SuggestionSyncManager(
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) {
     private val operationMutex = Mutex()
-    private val initialRefreshStarted = AtomicBoolean(false)
     private val mutableState = MutableStateFlow(stateFrom(credentialStore.snapshot()))
     val state: StateFlow<SuggestionSyncState> = mutableState.asStateFlow()
 
-    suspend fun refreshIfNeeded() {
-        if (initialRefreshStarted.compareAndSet(false, true)) refresh()
-    }
-
-    suspend fun refresh() = operationMutex.withLock {
-        val configuration = authenticatedConfiguration() ?: return@withLock
-        updateBusy("Refreshing Suggestions Inbox…")
-        try {
-            val remoteSuggestions = transport.list(configuration)
-            if (remoteSuggestions.map(RemoteSuggestion::id).distinct().size != remoteSuggestions.size) {
-                throw RemoteSuggestionMappingException()
+    suspend fun refresh(): SuggestionRefreshOutcome {
+        val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+        if (loadState != PlannerLoadState.READY) {
+            updateError("Encrypted planner storage is unavailable; cached proposals were not replaced.")
+            return SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        return operationMutex.withLock {
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            updateBusy("Refreshing Suggestions Inbox…")
+            try {
+                val remoteSuggestions = transport.list(configuration)
+                if (remoteSuggestions.map(RemoteSuggestion::id).distinct().size != remoteSuggestions.size) {
+                    throw RemoteSuggestionMappingException()
+                }
+                val suggestions = remoteSuggestions.map(::toPlanningSuggestion)
+                val persistence = plannerStore.replaceRemoteSuggestions(suggestions)
+                if (persistence == null || !persistence.awaitDurable()) {
+                    updateError("Encrypted planner storage is unavailable; cached proposals were not replaced.")
+                    return@withLock SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE
+                }
+                markSuccessful("Suggestions are up to date.")
+            } catch (error: Throwable) {
+                handleFailure(error, "Suggestions could not be refreshed.")
             }
-            val suggestions = remoteSuggestions.map(::toPlanningSuggestion)
-            if (!plannerStore.replaceRemoteSuggestions(suggestions)) {
-                updateError("Encrypted planner storage is unavailable; cached proposals were not replaced.")
-                return@withLock
-            }
-            markSuccessful("Suggestions are up to date.")
-        } catch (error: Throwable) {
-            handleFailure(error, "Suggestions could not be refreshed.")
         }
     }
 
@@ -172,6 +191,10 @@ class SuggestionSyncManager(
         }
     }
 
+    internal suspend fun reportCredentialClearBlocked() = operationMutex.withLock {
+        updateError("Background refresh could not be stopped, so API credentials were not removed.")
+    }
+
     private suspend fun mutateRemote(
         id: String,
         expectedRevision: Long,
@@ -185,7 +208,9 @@ class SuggestionSyncManager(
             updateError("This proposal changed locally. Refresh before trying again.")
             return@withLock
         }
-        val configuration = authenticatedConfiguration() ?: return@withLock
+        val resolution = authenticatedConfiguration()
+        if (resolution !is ConfigurationResolution.Ready) return@withLock
+        val configuration = resolution.configuration
         updateBusy(progressMessage)
         try {
             val response = operation(configuration)
@@ -197,7 +222,8 @@ class SuggestionSyncManager(
                 throw RemoteSuggestionMappingException()
             }
             val reconciled = toPlanningSuggestion(response)
-            if (!plannerStore.reconcileRemoteSuggestion(reconciled)) {
+            val persistence = plannerStore.reconcileRemoteSuggestion(reconciled)
+            if (persistence == null || !persistence.awaitDurable()) {
                 updateError("Encrypted planner storage is unavailable; the server result was not cached.")
                 return@withLock
             }
@@ -207,19 +233,23 @@ class SuggestionSyncManager(
         }
     }
 
-    private fun authenticatedConfiguration(): AuthenticatedApiConfiguration? {
+    private fun authenticatedConfiguration(): ConfigurationResolution {
         val snapshot = credentialStore.snapshot()
         if (snapshot.baseUrl == null) {
             mutableState.value = stateFrom(snapshot)
-            return null
+            return ConfigurationResolution.Failed(SuggestionRefreshOutcome.NOT_CONFIGURED)
         }
         if (!snapshot.hasBearerToken) {
             mutableState.value = stateFrom(snapshot)
-            return null
+            return ConfigurationResolution.Failed(SuggestionRefreshOutcome.AUTH_REQUIRED)
         }
         return try {
-            credentialStore.authenticatedConfiguration().also { configuration ->
-                if (configuration == null) mutableState.value = stateFrom(snapshot)
+            val configuration = credentialStore.authenticatedConfiguration()
+            if (configuration == null) {
+                mutableState.value = stateFrom(snapshot)
+                ConfigurationResolution.Failed(SuggestionRefreshOutcome.AUTH_REQUIRED)
+            } else {
+                ConfigurationResolution.Ready(configuration)
             }
         } catch (error: SecureCredentialException) {
             mutableState.value = SuggestionSyncState(
@@ -229,23 +259,23 @@ class SuggestionSyncManager(
                 hasStoredToken = snapshot.hasBearerToken,
                 lastSuccessfulSyncEpochMillis = snapshot.lastSuccessfulSyncEpochMillis,
             )
-            null
+            ConfigurationResolution.Failed(SuggestionRefreshOutcome.AUTH_REQUIRED)
         } catch (error: InvalidApiConfigurationException) {
             mutableState.value = failureState(
                 snapshot,
                 "The stored API URL is invalid. Update the connection settings.",
             )
-            null
+            ConfigurationResolution.Failed(SuggestionRefreshOutcome.CONFIGURATION_ERROR)
         } catch (error: IllegalStateException) {
             mutableState.value = failureState(
                 snapshot,
                 "Secure API credentials are unavailable on this device.",
             )
-            null
+            ConfigurationResolution.Failed(SuggestionRefreshOutcome.CONFIGURATION_ERROR)
         }
     }
 
-    private fun markSuccessful(message: String) {
+    private fun markSuccessful(message: String): SuggestionRefreshOutcome {
         val now = nowEpochMillis()
         val metadataSaved = runCatching { credentialStore.recordSuccessfulSync(now) }.isSuccess
         val snapshot = credentialStore.snapshot()
@@ -260,44 +290,67 @@ class SuggestionSyncManager(
             hasStoredToken = snapshot.hasBearerToken,
             lastSuccessfulSyncEpochMillis = now,
         )
+        return if (metadataSaved) {
+            SuggestionRefreshOutcome.SUCCESS
+        } else {
+            SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
     }
 
-    private fun handleFailure(error: Throwable, fallbackMessage: String) {
-        if (error is CancellationException) throw error
+    private fun handleFailure(
+        error: Throwable,
+        fallbackMessage: String,
+    ): SuggestionRefreshOutcome {
+        if (error is CancellationException) {
+            // WorkManager can stop a running worker when constraints change, work is replaced, or
+            // its execution window ends. Never leave the process-wide UI state permanently busy.
+            mutableState.value = stateFrom(credentialStore.snapshot())
+            throw error
+        }
         val snapshot = credentialStore.snapshot()
-        mutableState.value = when (error) {
+        val (state, outcome) = when (error) {
             is SuggestionApiException.Authentication -> SuggestionSyncState(
                 phase = SuggestionSyncPhase.AUTH_REQUIRED,
                 message = "Authentication failed. Check or replace the stored bearer token.",
                 baseUrl = snapshot.baseUrl,
                 hasStoredToken = snapshot.hasBearerToken,
                 lastSuccessfulSyncEpochMillis = snapshot.lastSuccessfulSyncEpochMillis,
-            )
+            ) to SuggestionRefreshOutcome.AUTH_REQUIRED
             is SuggestionApiException.Conflict -> failureState(
                 snapshot,
                 "This proposal changed on the server. Refresh and review the latest version.",
-            )
+            ) to SuggestionRefreshOutcome.PERMANENT_SERVER_FAILURE
             is SuggestionApiException.InvalidResponse -> failureState(
                 snapshot,
                 "The server response was not compatible with this version of DayWeave.",
-            )
+            ) to SuggestionRefreshOutcome.PROTOCOL_FAILURE
             is SuggestionApiException.Http -> failureState(
                 snapshot,
                 "The DayWeave API returned HTTP ${error.statusCode}. Try again later.",
-            )
+            ) to if (
+                error.statusCode == 408 ||
+                error.statusCode == 429 ||
+                error.statusCode in 500..599
+            ) {
+                SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE
+            } else {
+                SuggestionRefreshOutcome.PERMANENT_SERVER_FAILURE
+            }
             is RemoteSuggestionMappingException -> failureState(
                 snapshot,
                 "The server returned a proposal this version of DayWeave cannot read.",
-            )
+            ) to SuggestionRefreshOutcome.PROTOCOL_FAILURE
             is IOException -> SuggestionSyncState(
                 phase = SuggestionSyncPhase.OFFLINE,
                 message = "Offline or unable to reach the API. Showing the encrypted cached Inbox.",
                 baseUrl = snapshot.baseUrl,
                 hasStoredToken = snapshot.hasBearerToken,
                 lastSuccessfulSyncEpochMillis = snapshot.lastSuccessfulSyncEpochMillis,
-            )
-            else -> failureState(snapshot, fallbackMessage)
+            ) to SuggestionRefreshOutcome.TRANSIENT_NETWORK_FAILURE
+            else -> failureState(snapshot, fallbackMessage) to SuggestionRefreshOutcome.UNEXPECTED_FAILURE
         }
+        mutableState.value = state
+        return outcome
     }
 
     private fun updateBusy(message: String) {
@@ -364,6 +417,16 @@ class SuggestionSyncManager(
 
     private class RemoteSuggestionMappingException(cause: Throwable? = null) :
         IllegalArgumentException("Invalid remote suggestion", cause)
+
+    private sealed interface ConfigurationResolution {
+        data class Ready(
+            val configuration: AuthenticatedApiConfiguration,
+        ) : ConfigurationResolution
+
+        data class Failed(
+            val outcome: SuggestionRefreshOutcome,
+        ) : ConfigurationResolution
+    }
 
     companion object {
         private const val MILLIS_PER_DAY = 24L * 60L * 60L * 1_000L

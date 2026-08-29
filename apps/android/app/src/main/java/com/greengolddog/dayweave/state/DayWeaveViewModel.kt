@@ -8,24 +8,17 @@ import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class DayWeaveViewModel(application: Application) : AndroidViewModel(application) {
     private val dayWeaveApplication = application as DayWeaveApplication
     private val plannerStore = dayWeaveApplication.plannerStore
     private val suggestionSyncManager = dayWeaveApplication.suggestionSyncManager
+    private val suggestionConnectionController = dayWeaveApplication.suggestionConnectionController
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
-
-    init {
-        viewModelScope.launch {
-            val restored = loadState.first { it != PlannerLoadState.LOADING }
-            if (restored == PlannerLoadState.READY) suggestionSyncManager.refreshIfNeeded()
-        }
-    }
 
     fun navigate(destination: AppDestination) = plannerStore.navigate(destination)
     fun startItem(id: String) = plannerStore.startItem(id)
@@ -53,14 +46,14 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     fun updateSuggestionConnection(baseUrl: String, bearerToken: String?) {
         viewModelScope.launch {
-            if (suggestionSyncManager.updateConnection(baseUrl, bearerToken)) {
-                suggestionSyncManager.refresh()
-            }
+            suggestionConnectionController.update(baseUrl, bearerToken)
         }
     }
 
     fun clearSuggestionConnection() {
-        viewModelScope.launch { suggestionSyncManager.clearConnection() }
+        viewModelScope.launch {
+            suggestionConnectionController.forget()
+        }
     }
 
     fun sendAssistantMessage(text: String): Boolean = plannerStore.sendAssistantMessage(text)

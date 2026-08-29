@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.sync
 
+import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.PlanningSuggestion
@@ -11,18 +12,161 @@ import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.RemoteSuggestion
 import com.greengolddog.dayweave.network.SuggestionApiException
 import com.greengolddog.dayweave.network.SuggestionsTransport
+import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
 import java.time.Instant
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SuggestionSyncManagerTest {
     private val now = Instant.parse("2026-08-29T09:00:00Z").toEpochMilli()
+
+    @Test
+    fun cancelledBackgroundRefreshRestoresAUsableNonBusyState() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val neverFinish = CompletableDeferred<Unit>()
+        val transport = FakeSuggestionsTransport().apply {
+            listStarted = started
+            listGate = neverFinish
+        }
+        val manager = manager(PlannerStore(DayWeaveUiState()), transport)
+
+        val refresh = async { manager.refresh() }
+        withTimeout(3_000) { started.await() }
+        assertEquals(SuggestionSyncPhase.SYNCING, manager.state.value.phase)
+
+        refresh.cancelAndJoin()
+
+        assertEquals(SuggestionSyncPhase.READY, manager.state.value.phase)
+        assertFalse(manager.state.value.isBusy)
+    }
+
+    @Test
+    fun refreshCannotReportSuccessBeforeItsExactEncryptedSnapshotIsDurable() = runBlocking {
+        val initial = DayWeaveUiState(suggestions = emptyList())
+        val saveStarted = CompletableDeferred<Unit>()
+        val allowSave = CompletableDeferred<Unit>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                saveStarted.complete(Unit)
+                allowSave.await()
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        try {
+            val plannerStore = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) {
+                plannerStore.loadState.first { it == PlannerLoadState.READY }
+            }
+            val transport = FakeSuggestionsTransport().apply {
+                listed = listOf(remoteSuggestion())
+            }
+            val manager = manager(plannerStore, transport)
+
+            val outcome = async { manager.refresh() }
+            withTimeout(3_000) { saveStarted.await() }
+
+            assertTrue(!outcome.isCompleted)
+            assertEquals(SuggestionSyncPhase.SYNCING, manager.state.value.phase)
+            allowSave.complete(Unit)
+
+            assertEquals(SuggestionRefreshOutcome.SUCCESS, withTimeout(3_000) { outcome.await() })
+            assertEquals(SuggestionSyncPhase.CONNECTED, manager.state.value.phase)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun refreshReportsLocalFailureWhenExactEncryptedSnapshotCannotBeSaved() = runBlocking {
+        val initial = DayWeaveUiState(suggestions = emptyList())
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                throw IllegalStateException("synthetic encrypted save failure")
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        try {
+            val plannerStore = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) {
+                plannerStore.loadState.first { it == PlannerLoadState.READY }
+            }
+            val transport = FakeSuggestionsTransport().apply {
+                listed = listOf(remoteSuggestion())
+            }
+
+            val outcome = manager(plannerStore, transport).refresh()
+
+            assertEquals(SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE, outcome)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun remoteDecisionCannotFinishBeforeItsReconciledSnapshotIsDurable() = runBlocking {
+        val initial = DayWeaveUiState(suggestions = listOf(cachedSuggestion(1)))
+        val saveStarted = CompletableDeferred<DayWeaveUiState>()
+        val allowSave = CompletableDeferred<Unit>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                saveStarted.complete(state)
+                allowSave.await()
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        try {
+            val plannerStore = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) {
+                plannerStore.loadState.first { it == PlannerLoadState.READY }
+            }
+            val transport = FakeSuggestionsTransport().apply {
+                acceptResult = remoteSuggestion(revision = 2, status = "accepted")
+            }
+            val manager = manager(plannerStore, transport)
+
+            val decision = async { manager.accept("proposal-id") }
+            val exactSnapshot = withTimeout(3_000) { saveStarted.await() }
+
+            assertTrue(!decision.isCompleted)
+            assertEquals(SuggestionSyncPhase.SYNCING, manager.state.value.phase)
+            assertEquals(
+                SuggestionDisposition.APPROVED_FOR_INBOX,
+                exactSnapshot.suggestions.single().disposition,
+            )
+            assertTrue(exactSnapshot.inbox.any { it.id == "proposal-proposal-id" })
+            allowSave.complete(Unit)
+
+            withTimeout(3_000) { decision.await() }
+            assertEquals(SuggestionSyncPhase.CONNECTED, manager.state.value.phase)
+        } finally {
+            scope.cancel()
+        }
+    }
 
     @Test
     fun refreshAndAcceptReconcileRevisionIntoEncryptedStateWithoutChangingSchedule() = runBlocking {
@@ -34,9 +178,10 @@ class SuggestionSyncManagerTest {
         }
         val manager = manager(plannerStore, transport)
 
-        manager.refresh()
+        val refreshOutcome = manager.refresh()
         manager.accept("proposal-id")
 
+        assertEquals(SuggestionRefreshOutcome.SUCCESS, refreshOutcome)
         assertEquals(1L, transport.acceptedRevision)
         assertEquals(scheduleBefore, plannerStore.state.value.schedule)
         val suggestion = plannerStore.state.value.suggestions.single { it.id == "proposal-id" }
@@ -58,8 +203,9 @@ class SuggestionSyncManagerTest {
             listed = listOf(remoteSuggestion(revision = 2, status = "accepted"))
         }
 
-        manager(plannerStore, transport).refresh()
+        val outcome = manager(plannerStore, transport).refresh()
 
+        assertEquals(SuggestionRefreshOutcome.SUCCESS, outcome)
         assertEquals(scheduleBefore, plannerStore.state.value.schedule)
         assertTrue(plannerStore.state.value.inbox.any { it.id == "proposal-proposal-id" })
     }
@@ -92,8 +238,9 @@ class SuggestionSyncManagerTest {
         }
         val manager = manager(plannerStore, transport)
 
-        manager.refresh()
+        val outcome = manager.refresh()
 
+        assertEquals(SuggestionRefreshOutcome.TRANSIENT_NETWORK_FAILURE, outcome)
         assertEquals(listOf(cached), plannerStore.state.value.suggestions)
         assertEquals(SuggestionSyncPhase.OFFLINE, manager.state.value.phase)
         assertTrue(manager.state.value.message.contains("cached Inbox"))
@@ -113,6 +260,31 @@ class SuggestionSyncManagerTest {
         assertEquals(SuggestionDisposition.PENDING, plannerStore.state.value.suggestions.single().disposition)
         assertTrue(plannerStore.state.value.inbox.isEmpty())
         assertEquals(SuggestionSyncPhase.AUTH_REQUIRED, manager.state.value.phase)
+    }
+
+    @Test
+    fun refreshClassifiesServerAndProtocolFailuresForBackgroundRetry() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeSuggestionsTransport()
+        val manager = manager(plannerStore, transport)
+
+        transport.listFailure = SuggestionApiException.Http(503)
+        assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
+
+        transport.listFailure = SuggestionApiException.Http(408)
+        assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
+
+        transport.listFailure = SuggestionApiException.Http(429)
+        assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
+
+        transport.listFailure = SuggestionApiException.Http(400)
+        assertEquals(SuggestionRefreshOutcome.PERMANENT_SERVER_FAILURE, manager.refresh())
+
+        transport.listFailure = SuggestionApiException.InvalidResponse()
+        assertEquals(SuggestionRefreshOutcome.PROTOCOL_FAILURE, manager.refresh())
+
+        transport.listFailure = SuggestionApiException.Authentication()
+        assertEquals(SuggestionRefreshOutcome.AUTH_REQUIRED, manager.refresh())
     }
 
     private fun manager(
@@ -193,6 +365,8 @@ private class FakeApiCredentialStore : ApiCredentialStore {
 private class FakeSuggestionsTransport : SuggestionsTransport {
     var listed: List<RemoteSuggestion> = emptyList()
     var listFailure: Exception? = null
+    var listStarted: CompletableDeferred<Unit>? = null
+    var listGate: CompletableDeferred<Unit>? = null
     var editResult: RemoteSuggestion? = null
     var acceptResult: RemoteSuggestion? = null
     var rejectResult: RemoteSuggestion? = null
@@ -203,6 +377,8 @@ private class FakeSuggestionsTransport : SuggestionsTransport {
     override suspend fun list(
         configuration: AuthenticatedApiConfiguration,
     ): List<RemoteSuggestion> {
+        listStarted?.complete(Unit)
+        listGate?.await()
         listFailure?.let { throw it }
         return listed
     }
