@@ -18,12 +18,9 @@ if [[ -z "${latest_key}" || "${latest_key}" == "None" ]]; then
 fi
 
 encrypted_path="${verify_dir}/latest.dump.age"
-plain_path="${verify_dir}/latest.dump"
 aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp \
   "s3://${DAYWEAVE_BACKUP_BUCKET}/${latest_key}" "${encrypted_path}" --only-show-errors
 age --decrypt --identity "${DAYWEAVE_BACKUP_IDENTITY_FILE}" \
-  --output "${plain_path}" "${encrypted_path}"
-pg_restore --list "${plain_path}" >/dev/null
+  "${encrypted_path}" | pg_restore --list >/dev/null
 
 echo "Verified decryptability and PostgreSQL archive structure for ${latest_key}"
-

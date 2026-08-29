@@ -12,17 +12,14 @@ trap 'rm -rf "${backup_dir}"' EXIT
 : "${POSTGRES_USER:=dayweave}"
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-plain_path="${backup_dir}/dayweave-${timestamp}.dump"
-encrypted_path="${plain_path}.age"
+encrypted_path="${backup_dir}/dayweave-${timestamp}.dump.age"
 
 docker compose --env-file "${deploy_dir}/.env" -f "${deploy_dir}/compose.yaml" \
   exec -T postgres pg_dump --username "${POSTGRES_USER}" --dbname "${POSTGRES_DB}" \
-  --format custom --no-owner --no-acl > "${plain_path}"
-
-age --recipient "${DAYWEAVE_BACKUP_RECIPIENT}" --output "${encrypted_path}" "${plain_path}"
+  --format custom --no-owner --no-acl \
+  | age --recipient "${DAYWEAVE_BACKUP_RECIPIENT}" --output "${encrypted_path}"
 aws --endpoint-url "${AWS_ENDPOINT_URL}" s3 cp \
   "${encrypted_path}" "s3://${DAYWEAVE_BACKUP_BUCKET}/postgres/$(basename "${encrypted_path}")" \
   --only-show-errors
 
 echo "Uploaded encrypted backup postgres/$(basename "${encrypted_path}")"
-
