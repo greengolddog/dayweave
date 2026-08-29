@@ -182,11 +182,14 @@ class OkHttpSuggestionsTransport(
         url: String,
     ): Request.Builder = Request.Builder()
         .url(url)
+        .tag(AuthenticatedApiConfiguration::class.java, configuration)
         .header("Accept", "application/json")
         .header("Authorization", "Bearer ${configuration.bearerToken}")
 
     private suspend inline fun <reified T> execute(request: Request): T {
-        val response = client.newCall(request).await()
+        val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
+            ?: throw SuggestionApiException.InvalidResponse()
+        val response = configuration.executeAuthenticated(client, request)
         response.use {
             if (!response.isSuccessful) throw response.toApiException()
             val responseText = response.body.charStream().use { reader -> reader.readBoundedText() }

@@ -9,6 +9,8 @@ import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.network.DeviceAuthUiState
+import com.greengolddog.dayweave.network.DeviceAuthActionResult
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
@@ -25,11 +27,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val dayWeaveApplication = application as DayWeaveApplication
     private val plannerStore = dayWeaveApplication.plannerStore
     private val suggestionSyncManager = dayWeaveApplication.suggestionSyncManager
-    private val suggestionConnectionController = dayWeaveApplication.suggestionConnectionController
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
     private val energySignalManager = dayWeaveApplication.energySignalManager
+    private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
@@ -38,6 +40,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
+    val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
 
     init {
@@ -159,21 +162,52 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch { suggestionSyncManager.refresh() }
     }
 
-    fun updateSuggestionConnection(baseUrl: String, bearerToken: String?) {
+    fun upgradeDeviceAuthentication(baseUrl: String, bootstrapToken: String) {
         dayWeaveApplication.launchCanonicalAction {
-            if (suggestionConnectionController.update(baseUrl, bearerToken)) {
+            val result = deviceAuthCoordinator.upgradeWithBootstrap(baseUrl, bootstrapToken)
+            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+            if (result == DeviceAuthActionResult.SUCCESS) {
                 dayWeaveApplication.refreshCanonicalState()
                 googleAccountManager.refresh()
             }
         }
     }
 
-    fun clearSuggestionConnection() {
+    fun consumeDeviceEnrollmentCode(baseUrl: String, enrollmentCode: String) {
         dayWeaveApplication.launchCanonicalAction {
-            if (suggestionConnectionController.forget()) {
+            val result = deviceAuthCoordinator.consumeOneTimeEnrollmentCode(baseUrl, enrollmentCode)
+            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+            if (result == DeviceAuthActionResult.SUCCESS) {
                 dayWeaveApplication.refreshCanonicalState()
                 googleAccountManager.refresh()
             }
+        }
+    }
+
+    fun retryDeviceAuthentication() {
+        dayWeaveApplication.launchCanonicalAction {
+            val result = deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
+            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+            if (result == DeviceAuthActionResult.SUCCESS) {
+                dayWeaveApplication.refreshCanonicalState()
+                googleAccountManager.refresh()
+            }
+        }
+    }
+
+    fun signOutDeviceSession() {
+        dayWeaveApplication.launchCanonicalAction {
+            deviceAuthCoordinator.signOutRevokeFirst()
+            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+            googleAccountManager.refresh()
+        }
+    }
+
+    fun destroyLocalDeviceAuthentication(confirmed: Boolean) {
+        dayWeaveApplication.launchCanonicalAction {
+            deviceAuthCoordinator.destroyLocalOnly(confirmed)
+            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+            googleAccountManager.refresh()
         }
     }
 

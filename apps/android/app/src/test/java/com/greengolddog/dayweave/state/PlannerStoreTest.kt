@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
+import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
@@ -277,6 +278,54 @@ class PlannerStoreTest {
         assertEquals(InboxSource.QUICK_CAPTURE, store.state.value.inbox.first().source)
         assertTrue(store.state.value.inbox.first().requiresReview)
         assertTrue(store.state.value.inbox.first().isSensitive)
+    }
+
+    @Test
+    fun abandoningCredentialBindingQuarantinesOnlyApiDerivedCaches() {
+        val localBlock = canonicalBlock(ItemStatus.SCHEDULED, 1).copy(
+            id = "local-block",
+            title = "Local work",
+            canonicalItemId = null,
+            canonicalRevision = null,
+            canonicalBlockKind = null,
+        )
+        val localSuggestion = remoteSuggestion().copy(
+            id = "local-suggestion",
+            remoteRevision = null,
+            remotePayloadJson = null,
+        )
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(canonicalItem("planned", 1)),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-1",
+                schedule = listOf(
+                    localBlock,
+                    canonicalBlock(ItemStatus.SCHEDULED, 1),
+                ),
+                suggestions = listOf(localSuggestion, remoteSuggestion()),
+                inbox = listOf(
+                    InboxItem("local-draft", title = "Local draft", source = InboxSource.QUICK_CAPTURE),
+                    InboxItem(
+                        "remote-draft",
+                        title = "Remote draft",
+                        source = InboxSource.EXTERNAL_PROPOSAL,
+                    ),
+                ),
+            ),
+        )
+
+        assertNotNull(store.abandonCanonicalConnection())
+
+        val fenced = store.state.value
+        assertEquals(listOf(localBlock), fenced.schedule)
+        assertTrue(fenced.canonicalItems.isEmpty())
+        assertNull(fenced.canonicalSyncOrigin)
+        assertNull(fenced.canonicalConfigurationId)
+        assertNull(fenced.canonicalDeltaCursor)
+        assertEquals(listOf(localSuggestion), fenced.suggestions)
+        assertEquals(listOf("local-draft"), fenced.inbox.map { it.id })
     }
 
     @Test

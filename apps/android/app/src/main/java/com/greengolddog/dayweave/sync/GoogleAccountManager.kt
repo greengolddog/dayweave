@@ -2,6 +2,7 @@ package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
+import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.GoogleAccountsApiException
 import com.greengolddog.dayweave.network.GoogleAccountsTransport
 import com.greengolddog.dayweave.network.RemoteGoogleAccount
@@ -75,6 +76,11 @@ class GoogleAccountManager(
     private val mutableState = MutableStateFlow(initialState(credentialStore.snapshot()))
     val state: StateFlow<GoogleAccountState> = mutableState.asStateFlow()
 
+    /** Drops account labels and pending browser authority under the binding writer. */
+    internal fun quarantineBindingState() {
+        mutableState.value = initialState(ApiConnectionSnapshot(null, false, null, null))
+    }
+
     suspend fun refresh() = operationMutex.withLock {
         val binding = credentialStore.snapshot()
         val configuration = try {
@@ -93,6 +99,13 @@ class GoogleAccountManager(
             return@withLock
         }
         if (!configurationMatchesBinding(configuration, binding)) return@withLock
+        val bindingTicket = try {
+            configuration.beginBindingOperation()
+        } catch (_: ApiBindingChangedException) {
+            mutableState.value = initialState(credentialStore.snapshot())
+            return@withLock
+        }
+        try {
         val previous = stateForBinding(binding)
         mutableState.value = previous.copy(
             phase = GoogleAccountPhase.LOADING,
@@ -113,6 +126,9 @@ class GoogleAccountManager(
         } catch (error: Exception) {
             if (!bindingStillCurrent(binding)) return@withLock
             mutableState.value = failureState(error, previous.copy(isBusy = false))
+        }
+        } finally {
+            bindingTicket.release()
         }
     }
 
@@ -172,19 +188,29 @@ class GoogleAccountManager(
         } catch (_: RuntimeException) {
             null
         }
-        val currentBinding = credentialStore.snapshot()
-        val authorization = current.authorization
-        val trusted =
-            sameBinding(binding, currentBinding) && binding.hasBearerToken &&
-                configuration != null && configurationMatchesBindingValue(configuration, binding) &&
-                current.configurationId == binding.configurationId &&
-                authorization?.url == candidate && authorization.expiresAt > now()
-        if (!trusted) {
-            mutableState.value = initialState(currentBinding)
-            return@withLock false
+        val bindingTicket = try {
+            configuration?.beginBindingOperation()
+        } catch (_: ApiBindingChangedException) {
+            null
         }
-        consumer(candidate)
-        true
+        val currentBinding = credentialStore.snapshot()
+        try {
+            val authorization = current.authorization
+            val trusted =
+                bindingTicket != null && sameBinding(binding, currentBinding) &&
+                    binding.hasBearerToken && configuration != null &&
+                    configurationMatchesBindingValue(configuration, binding) &&
+                    current.configurationId == binding.configurationId &&
+                    authorization?.url == candidate && authorization.expiresAt > now()
+            if (!trusted) {
+                mutableState.value = initialState(currentBinding)
+                return@withLock false
+            }
+            consumer(candidate)
+            true
+        } finally {
+            bindingTicket?.release()
+        }
     }
 
     /** Serializes the only credential update/clear path with all Google requests and URL use. */
@@ -243,6 +269,13 @@ class GoogleAccountManager(
                 return@withLock
             }
             if (!configurationMatchesBinding(configuration, binding)) return@withLock
+            val bindingTicket = try {
+                configuration.beginBindingOperation()
+            } catch (_: ApiBindingChangedException) {
+                mutableState.value = initialState(credentialStore.snapshot())
+                return@withLock
+            }
+            try {
             val previous = stateForBinding(binding)
             val account = accountId?.let { requestedId ->
                 previous.accounts.firstOrNull { it.id == requestedId }
@@ -293,6 +326,9 @@ class GoogleAccountManager(
                 if (!bindingStillCurrent(binding)) return@withLock
                 mutableState.value = failureState(error, previous.copy(isBusy = false))
             }
+            } finally {
+                bindingTicket.release()
+            }
         }
 
     private suspend fun mutateAccount(
@@ -321,6 +357,13 @@ class GoogleAccountManager(
             return@withLock
         }
         if (!configurationMatchesBinding(configuration, binding)) return@withLock
+        val bindingTicket = try {
+            configuration.beginBindingOperation()
+        } catch (_: ApiBindingChangedException) {
+            mutableState.value = initialState(credentialStore.snapshot())
+            return@withLock
+        }
+        try {
         val previous = stateForBinding(binding)
         val account = previous.accounts.firstOrNull { it.id == accountId }
         if (account == null) {
@@ -404,6 +447,9 @@ class GoogleAccountManager(
         } catch (error: Exception) {
             if (!bindingStillCurrent(binding)) return@withLock
             mutableState.value = failureState(error, previous.copy(isBusy = false))
+        }
+        } finally {
+            bindingTicket.release()
         }
     }
 

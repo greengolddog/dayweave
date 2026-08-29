@@ -4,6 +4,7 @@ import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ExecutionApiException
@@ -76,22 +77,32 @@ class ExecutionSyncManager(
     }
     val state: StateFlow<ExecutionSyncState> = mutableState.asStateFlow()
 
+    /** Called only while the process-wide binding writer excludes every old response mutation. */
+    internal fun quarantineBindingState() {
+        mutableState.value = ExecutionSyncState(
+            phase = CanonicalSyncPhase.NOT_CONFIGURED,
+            message = "Connect the DayWeave API to synchronize execution",
+        )
+    }
+
     suspend fun refresh(): ExecutionSyncOutcome = withReadyStore {
         operationMutex.withLock {
             val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
             updateBusy("Reconciling cross-device execution…")
             try {
-                ensureDeviceIdentity()
-                beginHistoryVerification(configuration)
-                val hadPending = plannerStore.state.value.pendingExecutionCommand != null
-                if (hadPending) reconcilePending(configuration)
-                reconcileSnapshot(
-                    configuration,
-                    transport.snapshot(configuration),
-                    "Execution is synchronized across devices",
-                )
-                updateConnected("Execution is synchronized across devices")
-                ExecutionSyncOutcome.SUCCESS
+                configuration.withBindingOperation {
+                    ensureDeviceIdentity()
+                    beginHistoryVerification(configuration)
+                    val hadPending = plannerStore.state.value.pendingExecutionCommand != null
+                    if (hadPending) reconcilePending(configuration)
+                    reconcileSnapshot(
+                        configuration,
+                        transport.snapshot(configuration),
+                        "Execution is synchronized across devices",
+                    )
+                    updateConnected("Execution is synchronized across devices")
+                    ExecutionSyncOutcome.SUCCESS
+                }
             } catch (error: Throwable) {
                 handleFailure(error)
             }
@@ -238,6 +249,7 @@ class ExecutionSyncManager(
             val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
             updateBusy("Checking the cross-device execution lease…")
             try {
+                configuration.withBindingOperation {
                 ensureDeviceIdentity()
                 beginHistoryVerification(configuration)
                 if (plannerStore.state.value.pendingExecutionCommand != null) {
@@ -248,7 +260,7 @@ class ExecutionSyncManager(
                         "Previous execution command reconciled",
                     )
                     updateConnected("Previous execution command reconciled; review state before retrying")
-                    return@withLock ExecutionSyncOutcome.SUCCESS
+                    return@withBindingOperation ExecutionSyncOutcome.SUCCESS
                 }
                 val snapshot = reconcileSnapshot(
                     configuration,
@@ -311,6 +323,7 @@ class ExecutionSyncManager(
                 }
                 updateConnected("Execution updated across devices")
                 ExecutionSyncOutcome.SUCCESS
+                }
             } catch (error: Throwable) {
                 handleFailure(error)
             }
@@ -1336,6 +1349,14 @@ class ExecutionSyncManager(
         if (error is CancellationException) {
             mutableState.value = initialState()
             throw error
+        }
+        if (error is ApiBindingChangedException) {
+            mutableState.value = initialState()
+            return when (mutableState.value.phase) {
+                CanonicalSyncPhase.NOT_CONFIGURED -> ExecutionSyncOutcome.NOT_CONFIGURED
+                CanonicalSyncPhase.AUTH_REQUIRED -> ExecutionSyncOutcome.AUTH_REQUIRED
+                else -> ExecutionSyncOutcome.CONFIGURATION_CHANGED
+            }
         }
         val (phase, message, outcome) = when (error) {
             is ReconciledCommandRejectionException -> Triple(

@@ -1377,6 +1377,8 @@ class PlannerStore(
             .map(ScheduleItem::id)
             .toSet()
         current.copy(
+            suggestions = current.suggestions.filter { it.remoteRevision == null },
+            inbox = current.inbox.filter { it.source != InboxSource.EXTERNAL_PROPOSAL },
             canonicalItems = emptyList(),
             canonicalSyncOrigin = null,
             canonicalConfigurationId = null,

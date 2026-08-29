@@ -1,13 +1,15 @@
 package com.greengolddog.dayweave.ui.components
 
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddTask
 import androidx.compose.material.icons.outlined.Coffee
@@ -35,6 +37,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.network.DeviceAuthPhase
+import com.greengolddog.dayweave.network.DeviceAuthUiState
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -207,130 +211,261 @@ fun EditSuggestionDialog(
 
 @Composable
 fun ApiConnectionDialog(
-    currentBaseUrl: String,
-    hasStoredToken: Boolean,
+    authState: DeviceAuthUiState,
     credentialReplacementBlocked: Boolean,
     onDismiss: () -> Unit,
-    onSave: (baseUrl: String, bearerToken: String?) -> Unit,
-    onForget: () -> Unit,
+    onUpgradeWithBootstrap: (baseUrl: String, bootstrapToken: String) -> Unit,
+    onConsumeEnrollmentCode: (baseUrl: String, enrollmentCode: String) -> Unit,
+    onRetryPending: () -> Unit,
+    onRevokeAndSignOut: () -> Unit,
+    onDestroyLocalOnly: () -> Unit,
 ) {
-    var baseUrl by remember(currentBaseUrl) { mutableStateOf(currentBaseUrl) }
-    var bearerToken by remember { mutableStateOf("") }
-    var confirmForget by remember { mutableStateOf(false) }
-    if (confirmForget) {
+    var baseUrl by remember(authState.baseUrl) { mutableStateOf(authState.baseUrl.orEmpty()) }
+    var secret by remember { mutableStateOf("") }
+    var entryMode by remember { mutableStateOf(DeviceAuthEntryMode.ONE_TIME_CODE) }
+    var confirmSignOut by remember { mutableStateOf(false) }
+    var confirmLocalOnly by remember { mutableStateOf(false) }
+
+    if (confirmSignOut) {
         AlertDialog(
-            onDismissRequest = { confirmForget = false },
-            title = { Text("Forget API connection?") },
+            onDismissRequest = { confirmSignOut = false },
+            title = { Text("Revoke this device session?") },
             text = {
                 Text(
-                    "This removes the device-bound bearer token and quarantines the cached canonical plan. If an item action is still in flight, its server outcome may remain unknown.",
+                    "DayWeave requires the server to confirm revocation with an empty 204 response. Local credentials and API-bound cache are removed only after that succeeds; any failure keeps local state for retry.",
                 )
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        bearerToken = ""
-                        confirmForget = false
-                        onForget()
+                        secret = ""
+                        confirmSignOut = false
+                        onRevokeAndSignOut()
                     },
-                ) { Text("Forget connection") }
+                    enabled = !authState.isBusy,
+                ) { Text("Revoke & sign out") }
             },
             dismissButton = {
-                TextButton(onClick = { confirmForget = false }) { Text("Keep connection") }
+                TextButton(onClick = { confirmSignOut = false }) { Text("Keep session") }
             },
         )
         return
     }
+
+    if (confirmLocalOnly) {
+        AlertDialog(
+            onDismissRequest = { confirmLocalOnly = false },
+            title = { Text("Remove only local authentication?") },
+            text = {
+                Text(
+                    "This cannot confirm server revocation. A device session and reviewed bootstrap authority may remain active on the server. DayWeave will quarantine API-bound cache and destroy this device’s encrypted envelope and wrapping key.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        secret = ""
+                        confirmLocalOnly = false
+                        onDestroyLocalOnly()
+                    },
+                    enabled = !authState.isBusy,
+                ) { Text("Remove local state only") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmLocalOnly = false }) { Text("Cancel") }
+            },
+        )
+        return
+    }
+
+    val acceptsNewEnrollment = authState.phase in setOf(
+        DeviceAuthPhase.UNCONFIGURED,
+        DeviceAuthPhase.LEGACY,
+        DeviceAuthPhase.REAUTH,
+    )
+    val exactRetryAvailable = authState.phase in setOf(
+        DeviceAuthPhase.ENROLLMENT_CREATION_PENDING,
+        DeviceAuthPhase.ENROLLMENT_PENDING,
+        DeviceAuthPhase.REFRESH_PENDING,
+    )
+    val activeSession = authState.phase == DeviceAuthPhase.ACTIVE
+    val bindingChangeBlocked = credentialReplacementBlocked || authState.isBusy
+
     AlertDialog(
         onDismissRequest = {
-            bearerToken = ""
+            secret = ""
             onDismiss()
         },
-        title = { Text("DayWeave API connection") },
+        title = { Text("Durable device authentication") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
                 Text(
-                    "Only HTTPS endpoints are allowed. The bearer token is encrypted with an Android Keystore key and is never added to the planner database.",
+                    authState.message,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (credentialReplacementBlocked) {
                     Text(
-                        "A canonical/execution action is pending. Keep the stored token, " +
-                            "reconcile that action, or explicitly forget the connection before " +
-                            "entering a replacement token.",
+                        "A canonical or execution action must be reconciled before enrollment, sign-out, or local destruction can change the session binding.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
                 }
-                OutlinedTextField(
-                    value = baseUrl,
-                    onValueChange = { baseUrl = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("API base URL") },
-                    placeholder = { Text("https://api.example.com/") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(
-                        autoCorrectEnabled = false,
-                        keyboardType = KeyboardType.Uri,
-                    ),
-                )
-                OutlinedTextField(
-                    value = bearerToken,
-                    onValueChange = { bearerToken = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text(if (hasStoredToken) "Replacement bearer token" else "Bearer token") },
-                    supportingText = {
-                        if (hasStoredToken) {
+
+                authState.baseUrl?.let { endpoint ->
+                    Text("Endpoint", style = MaterialTheme.typography.labelMedium)
+                    SelectionContainer { Text(endpoint, style = MaterialTheme.typography.bodySmall) }
+                }
+                authState.clientInstanceId?.let { clientId ->
+                    Text("This Android client ID", style = MaterialTheme.typography.labelMedium)
+                    SelectionContainer { Text(clientId, style = MaterialTheme.typography.bodySmall) }
+                }
+                authState.sessionId?.let { sessionId ->
+                    Text("Session", style = MaterialTheme.typography.labelMedium)
+                    SelectionContainer { Text(sessionId, style = MaterialTheme.typography.bodySmall) }
+                }
+                authState.accessExpiresAt?.let { expiry ->
+                    Text("Current access expires $expiry", style = MaterialTheme.typography.bodySmall)
+                }
+
+                if (acceptsNewEnrollment) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(
+                            selected = entryMode == DeviceAuthEntryMode.ONE_TIME_CODE,
+                            onClick = {
+                                secret = ""
+                                entryMode = DeviceAuthEntryMode.ONE_TIME_CODE
+                            },
+                            label = { Text("One-time code") },
+                        )
+                        FilterChip(
+                            selected = entryMode == DeviceAuthEntryMode.HYBRID_BOOTSTRAP,
+                            onClick = {
+                                secret = ""
+                                entryMode = DeviceAuthEntryMode.HYBRID_BOOTSTRAP
+                            },
+                            label = { Text("Hybrid bootstrap") },
+                        )
+                    }
+                    Text(
+                        if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
+                            "Mint the dw_en1_ code for the exact client ID shown above on an already authorized device. The code and proposed session credential tuple are journaled before the first consume request."
+                        } else {
+                            "Use only the reviewed migration bootstrap. It authorizes enrollment creation and is never reused as an ordinary API credential after durable activation."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = baseUrl,
+                        onValueChange = { baseUrl = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("HTTPS API base URL") },
+                        placeholder = { Text("https://api.example.com/") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Uri,
+                        ),
+                    )
+                    OutlinedTextField(
+                        value = secret,
+                        onValueChange = { secret = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = {
                             Text(
-                                if (baseUrl.trim() == currentBaseUrl.trim()) {
-                                    "Leave blank to keep the encrypted token already on this device."
+                                if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
+                                    "One-time dw_en1_ code"
                                 } else {
-                                    "Changing the API URL requires a replacement token."
+                                    "Reviewed bootstrap credential"
                                 },
                             )
-                        }
-                    },
-                    singleLine = true,
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(
-                        autoCorrectEnabled = false,
-                        keyboardType = KeyboardType.Password,
-                    ),
-                )
+                        },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            autoCorrectEnabled = false,
+                            keyboardType = KeyboardType.Password,
+                        ),
+                    )
+                }
+
+                if (authState.phase == DeviceAuthPhase.INCOMPATIBLE) {
+                    Text(
+                        "Fail-closed storage cannot be used or replaced in place. Update DayWeave first; local-only destruction is the explicit recovery of last resort.",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
             }
         },
         confirmButton = {
-            TextButton(
-                onClick = {
-                    val submittedToken = bearerToken.takeIf(String::isNotBlank)
-                    bearerToken = ""
-                    onSave(baseUrl, submittedToken)
-                },
-                enabled = baseUrl.trim().startsWith("https://", ignoreCase = true) &&
-                    !(credentialReplacementBlocked && bearerToken.isNotBlank()) &&
-                    (
-                        bearerToken.isNotBlank() ||
-                            (hasStoredToken && baseUrl.trim() == currentBaseUrl.trim())
-                    ),
-            ) { Text("Save & refresh") }
+            when {
+                activeSession -> TextButton(
+                    onClick = { confirmSignOut = true },
+                    enabled = !bindingChangeBlocked,
+                ) { Text("Revoke & sign out") }
+                exactRetryAvailable -> TextButton(
+                    onClick = onRetryPending,
+                    enabled = !authState.isBusy &&
+                        (
+                            authState.phase == DeviceAuthPhase.REFRESH_PENDING ||
+                                !credentialReplacementBlocked
+                            ),
+                ) { Text("Retry exact state") }
+                acceptsNewEnrollment -> TextButton(
+                    onClick = {
+                        val submittedSecret = secret
+                        secret = ""
+                        if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
+                            onConsumeEnrollmentCode(baseUrl, submittedSecret)
+                        } else {
+                            onUpgradeWithBootstrap(baseUrl, submittedSecret)
+                        }
+                    },
+                    enabled = !bindingChangeBlocked &&
+                        baseUrl.trim().startsWith("https://", ignoreCase = true) &&
+                        secret.isNotBlank(),
+                ) {
+                    Text(
+                        if (entryMode == DeviceAuthEntryMode.ONE_TIME_CODE) {
+                            "Consume code"
+                        } else {
+                            "Create enrollment"
+                        },
+                    )
+                }
+            }
         },
         dismissButton = {
             Row {
-                if (hasStoredToken) {
+                if (authState.phase == DeviceAuthPhase.LEGACY) {
                     TextButton(
-                        onClick = {
-                            confirmForget = true
-                        },
-                    ) { Text("Forget") }
+                        onClick = onRetryPending,
+                        enabled = !bindingChangeBlocked,
+                    ) { Text("Retry stored upgrade") }
+                }
+                if (authState.phase != DeviceAuthPhase.UNCONFIGURED) {
+                    TextButton(
+                        onClick = { confirmLocalOnly = true },
+                        enabled = !bindingChangeBlocked,
+                    ) { Text("Local-only removal") }
                 }
                 TextButton(
                     onClick = {
-                        bearerToken = ""
+                        secret = ""
                         onDismiss()
                     },
                 ) { Text("Cancel") }
             }
         },
     )
+}
+
+private enum class DeviceAuthEntryMode {
+    ONE_TIME_CODE,
+    HYBRID_BOOTSTRAP,
 }

@@ -26,6 +26,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
@@ -35,6 +36,76 @@ import org.junit.Test
 
 class SuggestionSyncManagerTest {
     private val now = Instant.parse("2026-08-29T09:00:00Z").toEpochMilli()
+
+    @Test
+    fun delayedOldBindingResponseCannotRepopulateAfterGenerationFence() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val credentials = GenerationBoundCredentialStore()
+        val responseStarted = CompletableDeferred<Unit>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        val transport = FakeSuggestionsTransport().apply {
+            listed = listOf(remoteSuggestion())
+            listStarted = responseStarted
+            listGate = releaseResponse
+        }
+        val manager = manager(plannerStore, transport, credentials)
+
+        val oldRequest = async { manager.refresh() }
+        withTimeout(3_000) { responseStarted.await() }
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                val cleared = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        yield()
+        releaseResponse.complete(Unit)
+
+        assertEquals(SuggestionRefreshOutcome.SUCCESS, withTimeout(3_000) { oldRequest.await() })
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertTrue(plannerStore.state.value.suggestions.isEmpty())
+        assertEquals(SuggestionSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+        assertEquals(SuggestionRefreshOutcome.NOT_CONFIGURED, manager.refresh())
+        assertTrue(plannerStore.state.value.suggestions.isEmpty())
+    }
+
+    @Test
+    fun readerCreatedDuringWriterCannotSendOrRepopulateAfterCredentialCommit() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val credentials = GenerationBoundCredentialStore()
+        val writerEntered = CompletableDeferred<Unit>()
+        val releaseWriter = CompletableDeferred<Unit>()
+        val configurationObserved = CompletableDeferred<Unit>()
+        credentials.configurationObserved = { configurationObserved.complete(Unit) }
+        val transport = FakeSuggestionsTransport().apply {
+            listed = listOf(remoteSuggestion())
+        }
+        val manager = manager(plannerStore, transport, credentials)
+
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                writerEntered.complete(Unit)
+                releaseWriter.await()
+                val cleared = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        withTimeout(3_000) { writerEntered.await() }
+        val refresh = async { manager.refresh() }
+        withTimeout(3_000) { configurationObserved.await() }
+
+        assertTrue(credentials.enabled)
+        assertEquals(0, transport.listCalls)
+        releaseWriter.complete(Unit)
+
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertEquals(SuggestionRefreshOutcome.NOT_CONFIGURED, withTimeout(3_000) { refresh.await() })
+        assertEquals(0, transport.listCalls)
+        assertTrue(plannerStore.state.value.suggestions.isEmpty())
+        assertEquals(SuggestionSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
 
     @Test
     fun cancelledBackgroundRefreshRestoresAUsableNonBusyState() = runBlocking {
@@ -274,6 +345,9 @@ class SuggestionSyncManagerTest {
         transport.listFailure = SuggestionApiException.Http(408)
         assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
 
+        transport.listFailure = SuggestionApiException.Http(425)
+        assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
+
         transport.listFailure = SuggestionApiException.Http(429)
         assertEquals(SuggestionRefreshOutcome.RETRYABLE_SERVER_FAILURE, manager.refresh())
 
@@ -290,9 +364,10 @@ class SuggestionSyncManagerTest {
     private fun manager(
         plannerStore: PlannerStore,
         transport: FakeSuggestionsTransport,
+        credentialStore: ApiCredentialStore = FakeApiCredentialStore(),
     ): SuggestionSyncManager = SuggestionSyncManager(
         plannerStore = plannerStore,
-        credentialStore = FakeApiCredentialStore(),
+        credentialStore = credentialStore,
         transport = transport,
         nowEpochMillis = { now },
     )
@@ -372,11 +447,13 @@ private class FakeSuggestionsTransport : SuggestionsTransport {
     var rejectResult: RemoteSuggestion? = null
     var acceptFailure: Exception? = null
     var acceptedRevision: Long? = null
+    var listCalls = 0
     val mutationRevisions = mutableListOf<Long>()
 
     override suspend fun list(
         configuration: AuthenticatedApiConfiguration,
     ): List<RemoteSuggestion> {
+        listCalls += 1
         listStarted?.complete(Unit)
         listGate?.await()
         listFailure?.let { throw it }

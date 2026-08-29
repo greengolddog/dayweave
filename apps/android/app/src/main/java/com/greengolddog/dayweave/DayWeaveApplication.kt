@@ -1,14 +1,19 @@
 package com.greengolddog.dayweave
 
 import android.app.Application
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.health.EnergySignalManager
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.DayWeaveUiState
-import com.greengolddog.dayweave.network.KeystoreApiCredentialStore
+import com.greengolddog.dayweave.network.DeviceAuthBindingFence
+import com.greengolddog.dayweave.network.ApiBindingOperationGate
+import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
+import com.greengolddog.dayweave.network.KeystoreDeviceAuthEnvelopeStore
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
+import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
@@ -17,13 +22,13 @@ import com.greengolddog.dayweave.security.AppLockController
 import com.greengolddog.dayweave.security.AtomicFileAppLockSettingsStore
 import com.greengolddog.dayweave.security.MonotonicClock
 import com.greengolddog.dayweave.state.PlannerStore
+import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.GoogleAccountManager
-import com.greengolddog.dayweave.sync.SuggestionConnectionController
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
@@ -31,6 +36,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
 
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -59,43 +65,100 @@ class DayWeaveApplication : Application() {
         )
     }
 
-    private val apiCredentialStore by lazy {
-        KeystoreApiCredentialStore(
+    private val deviceAuthEnvelopeStore by lazy {
+        KeystoreDeviceAuthEnvelopeStore(
             context = this,
             configuredBaseUrl = BuildConfig.DAYWEAVE_API_BASE_URL,
         )
     }
 
-    val suggestionSyncManager: SuggestionSyncManager by lazy {
+    private val apiBindingOperationGate = ApiBindingOperationGate()
+
+    internal val deviceAuthCoordinator: DurableDeviceAuthCoordinator by lazy {
+        DurableDeviceAuthCoordinator(
+            store = deviceAuthEnvelopeStore,
+            transport = OkHttpDeviceAuthTransport(),
+            clientVersion = BuildConfig.VERSION_NAME,
+            deviceLabel = listOf(Build.MANUFACTURER, Build.MODEL)
+                .map(String::trim)
+                .filter(String::isNotBlank)
+                .distinct()
+                .joinToString(" ")
+                .take(200)
+                .ifBlank { "Personal Android device" },
+            bindingOperationGate = apiBindingOperationGate,
+            bindingFence = object : DeviceAuthBindingFence {
+                override suspend fun beforeBindingChange(
+                    previousBaseUrl: String?,
+                    previousBindingId: String?,
+                    nextBaseUrl: String?,
+                    nextBindingId: String?,
+                ): Boolean {
+                    val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+                    if (
+                        loaded != PlannerLoadState.READY ||
+                        plannerStore.hasCredentialReplacementBlocker()
+                    ) {
+                        return false
+                    }
+                    val quarantined =
+                        plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                    if (quarantined) {
+                        if (suggestionSyncManagerDelegate.isInitialized()) {
+                            suggestionSyncManager.quarantineBindingState()
+                        }
+                        if (canonicalSyncManagerDelegate.isInitialized()) {
+                            canonicalSyncManager.quarantineBindingState()
+                        }
+                        if (executionSyncManagerDelegate.isInitialized()) {
+                            executionSyncManager.quarantineBindingState()
+                        }
+                        if (googleAccountManagerDelegate.isInitialized()) {
+                            googleAccountManager.quarantineBindingState()
+                        }
+                    }
+                    return quarantined
+                }
+            },
+        )
+    }
+
+    private val apiCredentialStore by lazy { deviceAuthCoordinator }
+
+    private val suggestionSyncManagerDelegate = lazy {
         SuggestionSyncManager(
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpSuggestionsTransport(),
         )
     }
+    val suggestionSyncManager: SuggestionSyncManager get() = suggestionSyncManagerDelegate.value
 
-    val canonicalSyncManager: CanonicalSyncManager by lazy {
+    private val canonicalSyncManagerDelegate = lazy {
         CanonicalSyncManager(
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpCanonicalPlannerTransport(),
         )
     }
+    val canonicalSyncManager: CanonicalSyncManager get() = canonicalSyncManagerDelegate.value
 
-    val executionSyncManager: ExecutionSyncManager by lazy {
+    private val executionSyncManagerDelegate = lazy {
         ExecutionSyncManager(
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpExecutionTransport(),
         )
     }
+    val executionSyncManager: ExecutionSyncManager get() = executionSyncManagerDelegate.value
 
-    val googleAccountManager: GoogleAccountManager by lazy {
+    private val googleAccountManagerDelegate = lazy {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
             transport = OkHttpGoogleAccountsTransport(),
         )
     }
+    val googleAccountManager: GoogleAccountManager get() = googleAccountManagerDelegate.value
 
     val energySignalManager: EnergySignalManager by lazy {
         EnergySignalManager(
@@ -111,19 +174,15 @@ class DayWeaveApplication : Application() {
         )
     }
 
-    val suggestionConnectionController: SuggestionConnectionController by lazy {
-        SuggestionConnectionController(
-            syncManager = suggestionSyncManager,
-            schedulingCoordinator = suggestionSyncSchedulingCoordinator,
-            canonicalSyncManager = canonicalSyncManager,
-            googleAccountManager = googleAccountManager,
-        )
-    }
-
     override fun onCreate() {
         super.onCreate()
-        suggestionSyncSchedulingCoordinator.onAppStart()
-        launchCanonicalAction { refreshCanonicalState() }
+        persistenceScope.launch {
+            deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
+            suggestionSyncSchedulingCoordinator.onAppStart()
+            if (deviceAuthCoordinator.snapshot().hasBearerToken) {
+                launchCanonicalAction { refreshCanonicalState() }
+            }
+        }
     }
 
     /** Canonical actions outlive a transient screen/ViewModel so responses are always reconciled. */

@@ -8,10 +8,16 @@ import android.util.Base64
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
@@ -23,6 +29,158 @@ data class ApiConnectionSnapshot(
 )
 
 /**
+ * Coroutine-safe reader/writer generation gate shared by every authenticated manager.
+ *
+ * Ordinary operations are concurrent readers, so a stalled provider cannot serialize unrelated
+ * API reads. A credential-binding fence is the sole writer: it waits for every prior operation
+ * to finish its final durable mutation, holds exclusivity through cache quarantine and credential
+ * mutation, then advances the generation immediately before releasing waiting readers.
+ */
+internal class ApiBindingOperationGate(initialGeneration: Long = 1) {
+    private val stateMutex = Mutex()
+    private val generation = AtomicLong(initialGeneration)
+    private var activeReaders = 0
+    private var writerActive = false
+    private var waitingWriters = 0
+    private var changed = CompletableDeferred<Unit>()
+
+    init {
+        require(initialGeneration > 0)
+    }
+
+    fun captureGeneration(): Long = generation.get()
+
+    suspend fun <T> withOperation(
+        expectedGeneration: Long,
+        operation: suspend () -> T,
+    ): T {
+        acquireReader(expectedGeneration)
+        return try {
+            operation()
+        } finally {
+            releaseReader()
+        }
+    }
+
+    suspend fun beginOperation(expectedGeneration: Long): ApiBindingOperationTicket {
+        acquireReader(expectedGeneration)
+        return ApiBindingOperationTicket.guarded(this)
+    }
+
+    suspend fun <T> invalidateBeforeQuarantine(quarantine: suspend () -> T): T {
+        acquireWriter()
+        val nextGeneration = try {
+            Math.incrementExact(generation.get())
+        } catch (_: ArithmeticException) {
+            releaseWriter()
+            throw SecureCredentialException("API binding generation is exhausted")
+        }
+        return try {
+            quarantine()
+        } finally {
+            try {
+                generation.set(nextGeneration)
+            } finally {
+                releaseWriter()
+            }
+        }
+    }
+
+    private suspend fun acquireReader(expectedGeneration: Long) {
+        while (true) {
+            var acquired = false
+            val waiter = stateMutex.withLock {
+                if (expectedGeneration != generation.get()) {
+                    throw ApiBindingChangedException()
+                }
+                if (!writerActive && waitingWriters == 0) {
+                    activeReaders = Math.incrementExact(activeReaders)
+                    acquired = true
+                    null
+                } else {
+                    changed
+                }
+            }
+            if (acquired) return
+            requireNotNull(waiter).await()
+        }
+    }
+
+    internal suspend fun releaseReader() {
+        stateMutex.withLock {
+            check(activeReaders > 0)
+            activeReaders -= 1
+            if (activeReaders == 0) signalChangedLocked()
+        }
+    }
+
+    private suspend fun acquireWriter() {
+        stateMutex.withLock {
+            waitingWriters = Math.incrementExact(waitingWriters)
+            signalChangedLocked()
+        }
+        try {
+            while (true) {
+                var acquired = false
+                val waiter = stateMutex.withLock {
+                    if (!writerActive && activeReaders == 0) {
+                        check(waitingWriters > 0)
+                        waitingWriters -= 1
+                        writerActive = true
+                        acquired = true
+                        null
+                    } else {
+                        changed
+                    }
+                }
+                if (acquired) return
+                requireNotNull(waiter).await()
+            }
+        } catch (error: CancellationException) {
+            stateMutex.withLock {
+                if (waitingWriters > 0) {
+                    waitingWriters -= 1
+                    signalChangedLocked()
+                }
+            }
+            throw error
+        }
+    }
+
+    private suspend fun releaseWriter() {
+        stateMutex.withLock {
+            check(writerActive)
+            writerActive = false
+            signalChangedLocked()
+        }
+    }
+
+    private fun signalChangedLocked() {
+        val previous = changed
+        changed = CompletableDeferred()
+        previous.complete(Unit)
+    }
+}
+
+internal class ApiBindingOperationTicket private constructor(
+    private val gate: ApiBindingOperationGate?,
+) {
+    private val released = AtomicBoolean(false)
+
+    suspend fun release() {
+        if (released.compareAndSet(false, true)) gate?.releaseReader()
+    }
+
+    companion object {
+        internal fun guarded(gate: ApiBindingOperationGate) = ApiBindingOperationTicket(gate)
+        internal fun unguarded() = ApiBindingOperationTicket(null)
+    }
+}
+
+internal class ApiBindingChangedException :
+    java.io.IOException("API binding changed while an operation was in flight")
+
+/**
  * Authenticated request material. Its string representation is deliberately redacted so accidental
  * diagnostics cannot expose the bearer token.
  */
@@ -30,6 +188,9 @@ class AuthenticatedApiConfiguration private constructor(
     val baseUrl: HttpUrl,
     internal val bearerToken: String,
     internal val configurationId: String? = null,
+    internal val deviceAuthExecutor: DeviceAuthRequestExecutor? = null,
+    private val bindingGate: ApiBindingOperationGate? = null,
+    private val bindingGeneration: Long? = null,
 ) {
     override fun toString(): String =
         "AuthenticatedApiConfiguration(baseUrl=$baseUrl, bearerToken=<redacted>)"
@@ -58,6 +219,33 @@ class AuthenticatedApiConfiguration private constructor(
             bearerToken = validateBearerToken(bearerToken),
             configurationId = configurationId,
         )
+
+        internal fun createCoordinated(
+            baseUrl: String,
+            bearerToken: String,
+            configurationId: String,
+            executor: DeviceAuthRequestExecutor,
+            bindingGate: ApiBindingOperationGate = ApiBindingOperationGate(),
+            bindingGeneration: Long = bindingGate.captureGeneration(),
+            allowCleartextLoopback: Boolean,
+        ): AuthenticatedApiConfiguration = AuthenticatedApiConfiguration(
+            baseUrl = normalizeBaseUrl(baseUrl, allowCleartextLoopback),
+            bearerToken = validateBearerToken(bearerToken),
+            configurationId = configurationId,
+            deviceAuthExecutor = executor,
+            bindingGate = bindingGate,
+            bindingGeneration = bindingGeneration,
+        )
+    }
+
+    internal suspend fun <T> withBindingOperation(operation: suspend () -> T): T {
+        val gate = bindingGate ?: return operation()
+        return gate.withOperation(requireNotNull(bindingGeneration), operation)
+    }
+
+    internal suspend fun beginBindingOperation(): ApiBindingOperationTicket {
+        val gate = bindingGate ?: return ApiBindingOperationTicket.unguarded()
+        return gate.beginOperation(requireNotNull(bindingGeneration))
     }
 }
 
@@ -364,6 +552,11 @@ internal interface ApiCredentialKeyAccess {
 
     fun delete(alias: String)
 }
+
+internal fun normalizeBaseUrlForDeviceAuth(
+    rawBaseUrl: String,
+    allowCleartextLoopback: Boolean,
+): HttpUrl = normalizeBaseUrl(rawBaseUrl, allowCleartextLoopback)
 
 private fun normalizeBaseUrl(rawBaseUrl: String, allowCleartextLoopback: Boolean): HttpUrl {
     val parsed = rawBaseUrl.toHttpUrlOrNull()

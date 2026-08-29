@@ -215,11 +215,14 @@ class OkHttpGoogleAccountsTransport(
         url: String,
     ): Request.Builder = Request.Builder()
         .url(url)
+        .tag(AuthenticatedApiConfiguration::class.java, configuration)
         .header("Accept", "application/json")
         .header("Authorization", "Bearer ${configuration.bearerToken}")
 
     private suspend inline fun <reified T> execute(request: Request, expectedStatus: Int): T {
-        val response = client.newCall(request).awaitGoogleAccountsResponse()
+        val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
+            ?: throw GoogleAccountsApiException.InvalidResponse()
+        val response = configuration.executeAuthenticated(client, request)
         response.use {
             if (response.code != expectedStatus) throw response.toGoogleAccountsApiException()
             val responseText = response.body.charStream().use { it.readBoundedGoogleText() }

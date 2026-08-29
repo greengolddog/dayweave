@@ -195,6 +195,7 @@ private fun DayWeaveRoot(
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
+    val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
     val healthPermissionLauncher = rememberLauncherForActivityResult(
@@ -473,8 +474,7 @@ private fun DayWeaveRoot(
 
     if (showApiConnection) {
         ApiConnectionDialog(
-            currentBaseUrl = suggestionSyncState.baseUrl.orEmpty(),
-            hasStoredToken = suggestionSyncState.hasStoredToken,
+            authState = deviceAuthState,
             credentialReplacementBlocked = state.pendingCanonicalMutation != null ||
                 state.pendingExecutionCommand != null ||
                 state.terminalExecutionOutcomes.values.any {
@@ -485,15 +485,14 @@ private fun DayWeaveRoot(
                             it.canonicalProjectionConflict == null ||
                                 it.canonicalProjectionRetryAuthorizedAt != null
                             )
-                },
-            onDismiss = { showApiConnection = false },
-            onSave = { baseUrl, bearerToken ->
-                viewModel.updateSuggestionConnection(baseUrl, bearerToken)
-                showApiConnection = false
             },
-            onForget = {
-                viewModel.clearSuggestionConnection()
-                showApiConnection = false
+            onDismiss = { showApiConnection = false },
+            onUpgradeWithBootstrap = viewModel::upgradeDeviceAuthentication,
+            onConsumeEnrollmentCode = viewModel::consumeDeviceEnrollmentCode,
+            onRetryPending = viewModel::retryDeviceAuthentication,
+            onRevokeAndSignOut = viewModel::signOutDeviceSession,
+            onDestroyLocalOnly = {
+                viewModel.destroyLocalDeviceAuthentication(confirmed = true)
             },
         )
     }

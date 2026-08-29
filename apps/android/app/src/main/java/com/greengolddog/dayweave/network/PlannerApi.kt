@@ -357,11 +357,14 @@ class OkHttpCanonicalPlannerTransport(
         url: String,
     ): Request.Builder = Request.Builder()
         .url(url)
+        .tag(AuthenticatedApiConfiguration::class.java, configuration)
         .header("Accept", "application/json")
         .header("Authorization", "Bearer ${configuration.bearerToken}")
 
     private suspend inline fun <reified T> execute(request: Request): T {
-        val response = client.newCall(request).awaitPlannerResponse()
+        val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
+            ?: throw PlannerApiException.InvalidResponse()
+        val response = configuration.executeAuthenticated(client, request)
         response.use {
             if (response.code != 200) throw response.toPlannerApiException()
             val responseText = response.body.charStream().use { reader ->

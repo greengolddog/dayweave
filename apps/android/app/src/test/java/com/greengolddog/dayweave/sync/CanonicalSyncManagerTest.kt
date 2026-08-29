@@ -42,6 +42,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
@@ -52,6 +53,87 @@ import org.junit.Test
 
 class CanonicalSyncManagerTest {
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
+
+    @Test
+    fun delayedOldBindingPlanCannotRepopulateAfterGenerationFence() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val credentials = GenerationBoundCredentialStore()
+        val responseStarted = CompletableDeferred<Unit>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                nextCursor = "old-binding-cursor",
+                hasMore = false,
+            )
+            previewResult = preview()
+            deltaStarted = responseStarted
+            deltaGate = releaseResponse
+        }
+        val manager = manager(plannerStore, transport, credentials)
+
+        val oldRequest = async { manager.refreshAndCompose() }
+        withTimeout(3_000) { responseStarted.await() }
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                val cleared = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        yield()
+        releaseResponse.complete(Unit)
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, withTimeout(3_000) { oldRequest.await() })
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertTrue(plannerStore.state.value.schedule.isEmpty())
+        assertEquals(null, plannerStore.state.value.canonicalSyncOrigin)
+        assertEquals(CanonicalSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
+
+    @Test
+    fun readerCreatedDuringWriterCannotSendOrRestoreOldCanonicalPlan() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val credentials = GenerationBoundCredentialStore()
+        val writerEntered = CompletableDeferred<Unit>()
+        val releaseWriter = CompletableDeferred<Unit>()
+        val configurationObserved = CompletableDeferred<Unit>()
+        credentials.configurationObserved = { configurationObserved.complete(Unit) }
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                nextCursor = "stale-cursor",
+                hasMore = false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport, credentials)
+
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                writerEntered.complete(Unit)
+                releaseWriter.await()
+                val cleared = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        withTimeout(3_000) { writerEntered.await() }
+        val refresh = async { manager.refreshAndCompose() }
+        withTimeout(3_000) { configurationObserved.await() }
+
+        assertTrue(credentials.enabled)
+        assertTrue(transport.deltaCursors.isEmpty())
+        releaseWriter.complete(Unit)
+
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertEquals(CanonicalRefreshOutcome.NOT_CONFIGURED, withTimeout(3_000) { refresh.await() })
+        assertTrue(transport.deltaCursors.isEmpty())
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertTrue(plannerStore.state.value.schedule.isEmpty())
+        assertEquals(CanonicalSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
 
     @Test
     fun refreshPersistsLosslessCanonicalItemsAndComposedTimeline() = runBlocking {
@@ -1677,9 +1759,10 @@ class CanonicalSyncManagerTest {
     private fun manager(
         plannerStore: PlannerStore,
         transport: FakeCanonicalTransport,
+        credentialStore: ApiCredentialStore = CanonicalCredentialStore(),
     ) = CanonicalSyncManager(
         plannerStore = plannerStore,
-        credentialStore = CanonicalCredentialStore(),
+        credentialStore = credentialStore,
         transport = transport,
         now = { clock },
         zoneId = { ZoneId.of("Europe/Madrid") },

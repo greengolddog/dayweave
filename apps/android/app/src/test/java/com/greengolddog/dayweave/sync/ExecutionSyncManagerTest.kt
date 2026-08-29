@@ -24,13 +24,16 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -43,6 +46,84 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ExecutionSyncManagerTest {
+    @Test
+    fun delayedOldBindingCommandCannotRestorePendingOrSessionAfterFence() = runBlocking {
+        val store = plannerStore(configurationId = "configuration-a")
+        val credentials = GenerationBoundCredentialStore()
+        val responseStarted = CompletableDeferred<Unit>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        val changed = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(0, null)
+            commandHandler = { _, _ ->
+                responseStarted.complete(Unit)
+                releaseResponse.await()
+                RemoteExecutionMutation(1, changed, changed, replayed = false)
+            }
+        }
+        val manager = manager(store, transport, credentials)
+
+        val oldCommand = async { manager.start(BLOCK_ID) }
+        withTimeout(3_000) { responseStarted.await() }
+        assertNotNull(store.state.value.pendingExecutionCommand)
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                val cleared = store.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        yield()
+        releaseResponse.complete(Unit)
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, withTimeout(3_000) { oldCommand.await() })
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertNull(store.state.value.canonicalExecutionSession)
+        assertNull(store.state.value.activeSession)
+        assertTrue(store.state.value.schedule.isEmpty())
+        assertEquals(CanonicalSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
+
+    @Test
+    fun readerCreatedDuringWriterCannotSendOrPersistOldExecutionCommand() = runBlocking {
+        val store = plannerStore(configurationId = "configuration-a")
+        val credentials = GenerationBoundCredentialStore()
+        val writerEntered = CompletableDeferred<Unit>()
+        val releaseWriter = CompletableDeferred<Unit>()
+        val configurationObserved = CompletableDeferred<Unit>()
+        credentials.configurationObserved = { configurationObserved.complete(Unit) }
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(0, null)
+        }
+        val manager = manager(store, transport, credentials)
+
+        val fence = async {
+            credentials.invalidateBeforeQuarantine {
+                writerEntered.complete(Unit)
+                releaseWriter.await()
+                val cleared = store.abandonCanonicalConnection()?.awaitDurable() == true
+                if (cleared) manager.quarantineBindingState()
+                cleared
+            }
+        }
+        withTimeout(3_000) { writerEntered.await() }
+        val command = async { manager.start(BLOCK_ID) }
+        withTimeout(3_000) { configurationObserved.await() }
+
+        assertTrue(credentials.enabled)
+        assertEquals(0, transport.snapshotCalls)
+        assertNull(store.state.value.pendingExecutionCommand)
+        releaseWriter.complete(Unit)
+
+        assertTrue(withTimeout(3_000) { fence.await() })
+        assertEquals(ExecutionSyncOutcome.NOT_CONFIGURED, withTimeout(3_000) { command.await() })
+        assertEquals(0, transport.snapshotCalls)
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertNull(store.state.value.canonicalExecutionSession)
+        assertEquals(CanonicalSyncPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
+
     @Test
     fun ambiguousStartIsRetriedWithExactBodyAndKeyAfterRelaunch() = runBlocking {
         val store = plannerStore()

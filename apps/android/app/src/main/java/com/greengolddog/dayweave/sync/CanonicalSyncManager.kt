@@ -8,6 +8,7 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
@@ -119,6 +120,11 @@ class CanonicalSyncManager(
         ignoreUnknownKeys = false
     }
     val state: StateFlow<CanonicalSyncState> = mutableState.asStateFlow()
+
+    /** Called only while the process-wide binding writer excludes every old response mutation. */
+    internal fun quarantineBindingState() {
+        mutableState.value = stateFrom(ApiConnectionSnapshot(null, false, null, null))
+    }
 
     init {
         require(dayStartMinute in 0 until MINUTES_PER_DAY)
@@ -241,66 +247,68 @@ class CanonicalSyncManager(
                 scheduledBlockCount = plannerStore.state.value.schedule.size,
             )
             try {
-                val instant = now()
-                val planningZone = zoneId()
-                ensureDurableWorkspaceBinding(configuration)
-                val pendingResolution = reconcilePendingMutation(configuration)
-                if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
-                    projectPendingTerminalExecution(configuration)
-                }
-                var loadedUpdate = loadConsistentPlan(
-                    configuration = configuration,
-                    instant = instant,
-                    planningZone = planningZone,
-                )
-                var update = if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
-                    loadedUpdate.copy(
-                        message = "${loadedUpdate.message} A pending action was superseded by newer canonical state.",
-                    )
-                } else {
-                    loadedUpdate
-                }
-                ensureConfigurationCurrent(configuration)
-                persistCanonicalPlan(update)
-                var projectionPasses = 0
-                var projectionResult = projectPendingTerminalExecution(configuration)
-                while (
-                    projectionPasses < MAX_TERMINAL_PROJECTION_RELOADS &&
-                    projectionResult in TERMINAL_PROJECTION_RELOAD_RESULTS
-                ) {
-                    projectionPasses += 1
-                    loadedUpdate = loadConsistentPlan(
+                configuration.withBindingOperation {
+                    val instant = now()
+                    val planningZone = zoneId()
+                    ensureDurableWorkspaceBinding(configuration)
+                    val pendingResolution = reconcilePendingMutation(configuration)
+                    if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
+                        projectPendingTerminalExecution(configuration)
+                    }
+                    var loadedUpdate = loadConsistentPlan(
                         configuration = configuration,
                         instant = instant,
                         planningZone = planningZone,
                     )
-                    update = loadedUpdate
+                    var update = if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
+                        loadedUpdate.copy(
+                            message = "${loadedUpdate.message} A pending action was superseded by newer canonical state.",
+                        )
+                    } else {
+                        loadedUpdate
+                    }
                     ensureConfigurationCurrent(configuration)
                     persistCanonicalPlan(update)
-                    projectionResult = projectPendingTerminalExecution(configuration)
-                }
-                val metadataSaved = runCatching {
-                    credentialStore.recordSuccessfulSync(instant.toEpochMilli())
-                }.isSuccess
-                mutableState.value = CanonicalSyncState(
-                    phase = if (metadataSaved) {
-                        CanonicalSyncPhase.CONNECTED
+                    var projectionPasses = 0
+                    var projectionResult = projectPendingTerminalExecution(configuration)
+                    while (
+                        projectionPasses < MAX_TERMINAL_PROJECTION_RELOADS &&
+                        projectionResult in TERMINAL_PROJECTION_RELOAD_RESULTS
+                    ) {
+                        projectionPasses += 1
+                        loadedUpdate = loadConsistentPlan(
+                            configuration = configuration,
+                            instant = instant,
+                            planningZone = planningZone,
+                        )
+                        update = loadedUpdate
+                        ensureConfigurationCurrent(configuration)
+                        persistCanonicalPlan(update)
+                        projectionResult = projectPendingTerminalExecution(configuration)
+                    }
+                    val metadataSaved = runCatching {
+                        credentialStore.recordSuccessfulSync(instant.toEpochMilli())
+                    }.isSuccess
+                    mutableState.value = CanonicalSyncState(
+                        phase = if (metadataSaved) {
+                            CanonicalSyncPhase.CONNECTED
+                        } else {
+                            CanonicalSyncPhase.ERROR
+                        },
+                        message = if (metadataSaved) {
+                            update.message
+                        } else {
+                            "${update.message} Last-sync metadata could not be saved."
+                        },
+                        lastInputDigest = update.inputDigest,
+                        sourceItemCount = update.items.size,
+                        scheduledBlockCount = update.schedule.size,
+                    )
+                    if (metadataSaved) {
+                        CanonicalRefreshOutcome.SUCCESS
                     } else {
-                        CanonicalSyncPhase.ERROR
-                    },
-                    message = if (metadataSaved) {
-                        update.message
-                    } else {
-                        "${update.message} Last-sync metadata could not be saved."
-                    },
-                    lastInputDigest = update.inputDigest,
-                    sourceItemCount = update.items.size,
-                    scheduledBlockCount = update.schedule.size,
-                )
-                if (metadataSaved) {
-                    CanonicalRefreshOutcome.SUCCESS
-                } else {
-                    CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                        CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                    }
                 }
             } catch (error: Throwable) {
                 handleFailure(error)
@@ -544,6 +552,7 @@ class CanonicalSyncManager(
                 scheduledBlockCount = initial.schedule.size,
             )
             try {
+                configuration.withBindingOperation {
                 val item = initial.canonicalItems.firstOrNull { it.id == itemId }
                     ?: throw InvalidCanonicalTransitionException()
                 if (
@@ -559,7 +568,7 @@ class CanonicalSyncManager(
                         phase = CanonicalSyncPhase.CONNECTED,
                         message = "Sensitive-item setting is already current",
                     )
-                    return@withLock CanonicalRefreshOutcome.SUCCESS
+                    return@withBindingOperation CanonicalRefreshOutcome.SUCCESS
                 }
                 val mutation = replaceCanonicalItemSensitivity(
                     configuration = configuration,
@@ -568,7 +577,7 @@ class CanonicalSyncManager(
                 )
                 if (mutation == PendingMutationResolution.SUPERSEDED) {
                     updateError("A newer item revision superseded the privacy change; review it again.")
-                    return@withLock CanonicalRefreshOutcome.STALE_REVISION
+                    return@withBindingOperation CanonicalRefreshOutcome.STALE_REVISION
                 }
                 val savedAt = now()
                 val metadataSaved = runCatching {
@@ -594,6 +603,7 @@ class CanonicalSyncManager(
                     CanonicalRefreshOutcome.SUCCESS
                 } else {
                     CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                }
                 }
             } catch (error: Throwable) {
                 handleFailure(error)
@@ -905,6 +915,7 @@ class CanonicalSyncManager(
                 scheduledBlockCount = initial.schedule.size,
             )
             try {
+                configuration.withBindingOperation {
                 val requestedBlock = initial.schedule.firstOrNull { it.id == blockId }
                     ?: throw InvalidCanonicalTransitionException()
                 if (requestedBlock.status !in allowedStatuses) {
@@ -947,6 +958,7 @@ class CanonicalSyncManager(
                     CanonicalRefreshOutcome.SUCCESS
                 } else {
                     CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+                }
                 }
             } catch (error: Throwable) {
                 handleFailure(error)
@@ -2419,6 +2431,15 @@ class CanonicalSyncManager(
         if (error is CancellationException) {
             mutableState.value = stateFrom(credentialStore.snapshot())
             throw error
+        }
+        if (error is ApiBindingChangedException) {
+            val snapshot = credentialStore.snapshot()
+            mutableState.value = stateFrom(snapshot)
+            return if (snapshot.hasBearerToken) {
+                CanonicalRefreshOutcome.CONFIGURATION_ERROR
+            } else {
+                CanonicalRefreshOutcome.NOT_CONFIGURED
+            }
         }
         val (phase, message, outcome) = when (error) {
             is PlannerApiException.Authentication -> Triple(

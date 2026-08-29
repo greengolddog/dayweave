@@ -3,6 +3,7 @@ package com.greengolddog.dayweave.sync
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
+import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
@@ -67,6 +68,11 @@ class SuggestionSyncManager(
     private val mutableState = MutableStateFlow(stateFrom(credentialStore.snapshot()))
     val state: StateFlow<SuggestionSyncState> = mutableState.asStateFlow()
 
+    /** Called only while the process-wide binding writer excludes every old response mutation. */
+    internal fun quarantineBindingState() {
+        mutableState.value = stateFrom(ApiConnectionSnapshot(null, false, null, null))
+    }
+
     suspend fun refresh(): SuggestionRefreshOutcome {
         val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
         if (loadState != PlannerLoadState.READY) {
@@ -79,17 +85,24 @@ class SuggestionSyncManager(
             val configuration = (resolution as ConfigurationResolution.Ready).configuration
             updateBusy("Refreshing Suggestions Inbox…")
             try {
-                val remoteSuggestions = transport.list(configuration)
-                if (remoteSuggestions.map(RemoteSuggestion::id).distinct().size != remoteSuggestions.size) {
-                    throw RemoteSuggestionMappingException()
+                configuration.withBindingOperation {
+                    val remoteSuggestions = transport.list(configuration)
+                    if (
+                        remoteSuggestions.map(RemoteSuggestion::id).distinct().size !=
+                        remoteSuggestions.size
+                    ) {
+                        throw RemoteSuggestionMappingException()
+                    }
+                    val suggestions = remoteSuggestions.map(::toPlanningSuggestion)
+                    val persistence = plannerStore.replaceRemoteSuggestions(suggestions)
+                    if (persistence == null || !persistence.awaitDurable()) {
+                        updateError(
+                            "Encrypted planner storage is unavailable; cached proposals were not replaced.",
+                        )
+                        return@withBindingOperation SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE
+                    }
+                    markSuccessful("Suggestions are up to date.")
                 }
-                val suggestions = remoteSuggestions.map(::toPlanningSuggestion)
-                val persistence = plannerStore.replaceRemoteSuggestions(suggestions)
-                if (persistence == null || !persistence.awaitDurable()) {
-                    updateError("Encrypted planner storage is unavailable; cached proposals were not replaced.")
-                    return@withLock SuggestionRefreshOutcome.LOCAL_STORAGE_FAILURE
-                }
-                markSuccessful("Suggestions are up to date.")
             } catch (error: Throwable) {
                 handleFailure(error, "Suggestions could not be refreshed.")
             }
@@ -213,21 +226,25 @@ class SuggestionSyncManager(
         val configuration = resolution.configuration
         updateBusy(progressMessage)
         try {
-            val response = operation(configuration)
-            if (
-                response.id != id ||
-                response.revision <= expectedRevision ||
-                response.status != expectedStatus
-            ) {
-                throw RemoteSuggestionMappingException()
+            configuration.withBindingOperation {
+                val response = operation(configuration)
+                if (
+                    response.id != id ||
+                    response.revision <= expectedRevision ||
+                    response.status != expectedStatus
+                ) {
+                    throw RemoteSuggestionMappingException()
+                }
+                val reconciled = toPlanningSuggestion(response)
+                val persistence = plannerStore.reconcileRemoteSuggestion(reconciled)
+                if (persistence == null || !persistence.awaitDurable()) {
+                    updateError(
+                        "Encrypted planner storage is unavailable; the server result was not cached.",
+                    )
+                    return@withBindingOperation
+                }
+                markSuccessful(successMessage)
             }
-            val reconciled = toPlanningSuggestion(response)
-            val persistence = plannerStore.reconcileRemoteSuggestion(reconciled)
-            if (persistence == null || !persistence.awaitDurable()) {
-                updateError("Encrypted planner storage is unavailable; the server result was not cached.")
-                return@withLock
-            }
-            markSuccessful(successMessage)
         } catch (error: Throwable) {
             handleFailure(error, "The proposal could not be updated.")
         }
@@ -307,6 +324,15 @@ class SuggestionSyncManager(
             mutableState.value = stateFrom(credentialStore.snapshot())
             throw error
         }
+        if (error is ApiBindingChangedException) {
+            val snapshot = credentialStore.snapshot()
+            mutableState.value = stateFrom(snapshot)
+            return if (snapshot.hasBearerToken) {
+                SuggestionRefreshOutcome.CONFIGURATION_ERROR
+            } else {
+                SuggestionRefreshOutcome.NOT_CONFIGURED
+            }
+        }
         val snapshot = credentialStore.snapshot()
         val (state, outcome) = when (error) {
             is SuggestionApiException.Authentication -> SuggestionSyncState(
@@ -329,6 +355,7 @@ class SuggestionSyncManager(
                 "The DayWeave API returned HTTP ${error.statusCode}. Try again later.",
             ) to if (
                 error.statusCode == 408 ||
+                error.statusCode == 425 ||
                 error.statusCode == 429 ||
                 error.statusCode in 500..599
             ) {
