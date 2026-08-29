@@ -60,6 +60,7 @@ import com.greengolddog.dayweave.ui.components.AppLockedScreen
 import com.greengolddog.dayweave.ui.components.BreakEndedDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
+import com.greengolddog.dayweave.ui.components.ProposalReviewDialog
 import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
@@ -191,6 +192,7 @@ private fun DayWeaveRoot(
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by viewModel.state.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
+    val proposalApplicationState by viewModel.proposalApplicationState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
@@ -219,7 +221,9 @@ private fun DayWeaveRoot(
     }
     val canonicalExecutionActionsEnabled =
         !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
-            state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null
+            !proposalApplicationState.isBusy &&
+            state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
+            state.pendingProposalApplicationMutation == null
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
     var showApiConnection by remember { mutableStateOf(false) }
@@ -355,6 +359,10 @@ private fun DayWeaveRoot(
                 onApprove = viewModel::approveSuggestion,
                 onReject = viewModel::rejectSuggestion,
                 onEdit = { editingSuggestion = it },
+                proposalApplicationState = proposalApplicationState,
+                onReviewProposal = viewModel::reviewProposal,
+                onUndoProposal = viewModel::undoProposalApplication,
+                onRecoverProposal = viewModel::recoverProposalApplication,
                 syncState = suggestionSyncState,
                 onRefresh = viewModel::refreshSuggestions,
                 onConfigureConnection = { showApiConnection = true },
@@ -472,10 +480,26 @@ private fun DayWeaveRoot(
         )
     }
 
+    proposalApplicationState.preview?.let { preview ->
+        val proposalId = proposalApplicationState.activeProposalId
+            ?: preview.proposals.singleOrNull()?.proposalId
+            ?: return@let
+        val proposalTitle = state.suggestions.firstOrNull { it.id == proposalId }?.title
+            ?: "Proposal"
+        ProposalReviewDialog(
+            proposalTitle = proposalTitle,
+            state = proposalApplicationState,
+            onDismiss = { viewModel.discardProposalReview(proposalId) },
+            onRegenerate = { viewModel.reviewProposal(proposalId) },
+            onApply = viewModel::applyReviewedProposal,
+        )
+    }
+
     if (showApiConnection) {
         ApiConnectionDialog(
             authState = deviceAuthState,
             credentialReplacementBlocked = state.pendingSchedulePublication != null ||
+                state.pendingProposalApplicationMutation != null ||
                 state.pendingCanonicalMutation != null ||
                 state.pendingExecutionCommand != null ||
                 state.terminalExecutionOutcomes.values.any {

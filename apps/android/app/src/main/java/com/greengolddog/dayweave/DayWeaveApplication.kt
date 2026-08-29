@@ -16,6 +16,7 @@ import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
+import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.security.AppAuthenticationProcessFence
 import com.greengolddog.dayweave.security.AppLockController
@@ -29,6 +30,7 @@ import com.greengolddog.dayweave.sync.CanonicalSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.GoogleAccountManager
+import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
@@ -104,6 +106,9 @@ class DayWeaveApplication : Application() {
                         if (suggestionSyncManagerDelegate.isInitialized()) {
                             suggestionSyncManager.quarantineBindingState()
                         }
+                        if (proposalApplicationManagerDelegate.isInitialized()) {
+                            proposalApplicationManager.quarantineBindingState()
+                        }
                         if (canonicalSyncManagerDelegate.isInitialized()) {
                             canonicalSyncManager.quarantineBindingState()
                         }
@@ -142,6 +147,16 @@ class DayWeaveApplication : Application() {
         )
     }
     val suggestionSyncManager: SuggestionSyncManager get() = suggestionSyncManagerDelegate.value
+
+    private val proposalApplicationManagerDelegate = lazy {
+        ProposalApplicationManager(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpProposalApplicationsTransport(),
+        )
+    }
+    val proposalApplicationManager: ProposalApplicationManager
+        get() = proposalApplicationManagerDelegate.value
 
     private val canonicalSyncManagerDelegate = lazy {
         CanonicalSyncManager(
@@ -207,8 +222,17 @@ class DayWeaveApplication : Application() {
         return true
     }
 
+    /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
+    fun onAppPrivacyBoundaryLocked() {
+        if (proposalApplicationManagerDelegate.isInitialized()) {
+            proposalApplicationManager.discardReviewForPrivacyBoundary()
+        }
+    }
+
     /** Reconciles an old/remote lease both before and after replacing today's composition. */
     suspend fun refreshCanonicalState() {
+        proposalApplicationManager.recoverPending()
+        if (plannerStore.state.value.pendingProposalApplicationMutation != null) return
         refreshCanonicalStateSequence(
             executionRefresh = executionSyncManager::refresh,
             canonicalRefresh = canonicalSyncManager::refreshAndCompose,

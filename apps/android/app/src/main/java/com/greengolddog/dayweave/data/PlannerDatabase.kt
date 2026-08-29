@@ -41,11 +41,12 @@ object PlannerSnapshotFormats {
     const val JSON_V3 = "json-v3-sensitive-items"
     const val JSON_V4 = "json-v4-sensitive-authoring"
     const val JSON_V5 = "json-v5-schedule-publication-journal"
+    const val JSON_V6 = "json-v6-proposal-application-journal"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -93,6 +94,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_5_6 = object : Migration(5, 6) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * The encrypted payload gains exact proposal apply/undo recovery evidence and content-free
+     * receipts. The version fence prevents an older binary from ignoring an unresolved write.
+     */
+    val MIGRATION_6_7 = object : Migration(6, 7) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -138,6 +147,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_3_4,
                 PlannerDatabaseMigrations.MIGRATION_4_5,
                 PlannerDatabaseMigrations.MIGRATION_5_6,
+                PlannerDatabaseMigrations.MIGRATION_6_7,
             )
             .build()
     }

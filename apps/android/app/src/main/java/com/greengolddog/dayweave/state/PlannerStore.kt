@@ -20,7 +20,11 @@ import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
+import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
+import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
+import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
@@ -30,7 +34,11 @@ import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.model.isApplicationReady
+import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
+import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
+import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
 import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
 import java.time.Instant
 import java.time.ZoneId
@@ -275,7 +283,10 @@ class PlannerStore(
         mutate { current ->
             val suggestion = current.suggestions.firstOrNull { it.id == id }
                 ?: return@mutate current
-            if (suggestion.disposition != SuggestionDisposition.PENDING) return@mutate current
+            if (
+                suggestion.disposition != SuggestionDisposition.PENDING ||
+                suggestion.usesReservedChangeSetNamespace
+            ) return@mutate current
 
             current.copy(
                 suggestions = current.suggestions.map {
@@ -364,6 +375,8 @@ class PlannerStore(
                     "Suggestion rejected · your plan was not changed"
                 SuggestionDisposition.EXPIRED ->
                     "Suggestion expired · your plan was not changed"
+                SuggestionDisposition.TRANSACTIONALLY_APPLIED ->
+                    "Proposal was applied transactionally · refreshing canonical state"
                 SuggestionDisposition.PENDING -> current.scheduleMessage
             }
             current.copy(
@@ -386,6 +399,9 @@ class PlannerStore(
         return mutateDurably { current ->
             require(current.pendingSchedulePublication == null) {
                 "A schedule publication must be reconciled before direct plan replacement"
+            }
+            require(current.pendingProposalApplicationMutation == null) {
+                "A proposal application must be reconciled before direct plan replacement"
             }
             canonicalPlanState(current, update).copy(publishedScheduleRevision = null)
         }
@@ -637,6 +653,9 @@ class PlannerStore(
             require(current.pendingExecutionCommand == null) {
                 "An execution command must be reconciled before schedule publication"
             }
+            require(current.pendingProposalApplicationMutation == null) {
+                "A proposal application must be reconciled before schedule publication"
+            }
             current.canonicalSyncOrigin?.let { origin ->
                 require(
                     origin == publication.syncOrigin &&
@@ -727,6 +746,292 @@ class PlannerStore(
         validateSchedulePublicationJournal(publication)
     }
 
+    /** Persists one exact reviewed apply/undo request before any network byte can leave. */
+    fun stageProposalApplicationMutation(
+        mutation: PendingProposalApplicationMutation,
+    ): PlannerPersistenceReceipt? {
+        validateProposalApplicationJournal(mutation)
+        return mutateDurably { current ->
+            require(current.pendingProposalApplicationMutation == null) {
+                "A proposal application already needs exact reconciliation"
+            }
+            require(current.pendingSchedulePublication == null) {
+                "A schedule publication must be reconciled before applying a proposal"
+            }
+            require(current.pendingCanonicalMutation == null) {
+                "A canonical mutation must be reconciled before applying a proposal"
+            }
+            require(current.pendingExecutionCommand == null) {
+                "An execution command must be reconciled before applying a proposal"
+            }
+            current.canonicalSyncOrigin?.let { origin ->
+                require(
+                    mutation.syncOrigin == origin &&
+                        mutation.configurationId == current.canonicalConfigurationId,
+                ) { "Proposal application binding does not match the canonical cache" }
+            }
+            current.canonicalExecutionSyncOrigin?.let { origin ->
+                require(
+                    mutation.syncOrigin == origin &&
+                        mutation.configurationId == current.canonicalExecutionConfigurationId,
+                ) { "Proposal application binding does not match canonical execution state" }
+            }
+            require(current.proposalApplications.values.all {
+                it.syncOrigin == mutation.syncOrigin &&
+                    it.configurationId == mutation.configurationId
+            }) { "Proposal application binding does not match retained receipts" }
+            when (mutation.kind) {
+                ProposalApplicationMutationKind.APPLY -> {
+                    require(current.proposalApplications[mutation.proposalId] == null) {
+                        "This proposal already has a durable application receipt"
+                    }
+                    val proposal = current.suggestions.firstOrNull {
+                        it.id == mutation.proposalId && it.remoteRevision != null
+                    } ?: throw IllegalArgumentException("The reviewed proposal is not cached")
+                    require(
+                        proposal.disposition == SuggestionDisposition.PENDING &&
+                            proposal.remoteRevision == mutation.expectedProposalRevision &&
+                            proposal.isApplicationReady,
+                    ) { "The reviewed proposal changed before application" }
+                    proposal.remoteExpiresAt?.let { expiresAt ->
+                        require(Instant.parse(expiresAt).toEpochMilli() > nowEpochMillis()) {
+                            "The reviewed proposal has expired"
+                        }
+                    }
+                }
+                ProposalApplicationMutationKind.UNDO -> {
+                    val receipt = current.proposalApplications[mutation.proposalId]
+                        ?: throw IllegalArgumentException("The applied proposal receipt is unavailable")
+                    require(
+                        receipt.status == ProposalApplicationStatusSnapshot.APPLIED &&
+                            receipt.applicationId == mutation.applicationId &&
+                            receipt.applicationRevision == mutation.expectedApplicationRevision &&
+                            receipt.appliedProposalRevision == mutation.expectedProposalRevision &&
+                            receipt.commandIds == mutation.expectedCommandIds &&
+                            receipt.syncOrigin == mutation.syncOrigin &&
+                            receipt.configurationId == mutation.configurationId,
+                    ) { "The proposal receipt changed before undo" }
+                    require(Instant.parse(receipt.undoExpiresAt).toEpochMilli() > nowEpochMillis()) {
+                        "The proposal undo window has expired"
+                    }
+                }
+            }
+            current.copy(
+                pendingProposalApplicationMutation = mutation,
+                scheduleMessage = when (mutation.kind) {
+                    ProposalApplicationMutationKind.APPLY ->
+                        "Applying the exact reviewed proposal · awaiting confirmation"
+                    ProposalApplicationMutationKind.UNDO ->
+                        "Undoing the proposal application · awaiting confirmation"
+                },
+            )
+        }
+    }
+
+    /** Clears the matching exact journal and installs its content-free receipt atomically. */
+    fun commitProposalApplicationMutation(
+        expected: PendingProposalApplicationMutation,
+        receipt: ProposalApplicationReceiptSnapshot,
+    ): PlannerPersistenceReceipt? {
+        validateProposalApplicationJournal(expected)
+        validateProposalApplicationReceipt(receipt)
+        require(receipt.syncOrigin == expected.syncOrigin)
+        require(receipt.configurationId == expected.configurationId)
+        require(receipt.proposalId == expected.proposalId)
+        require(receipt.commandIds == expected.expectedCommandIds)
+        when (expected.kind) {
+            ProposalApplicationMutationKind.APPLY -> require(
+                expected.expectedProposalRevision < Long.MAX_VALUE &&
+                    receipt.appliedProposalRevision == expected.expectedProposalRevision + 1L &&
+                    (receipt.status == ProposalApplicationStatusSnapshot.APPLIED ||
+                        receipt.status == ProposalApplicationStatusSnapshot.UNDONE),
+            ) { "Apply recovery returned an invalid application receipt" }
+            ProposalApplicationMutationKind.UNDO -> require(
+                receipt.appliedProposalRevision == expected.expectedProposalRevision &&
+                receipt.status == ProposalApplicationStatusSnapshot.UNDONE &&
+                    receipt.applicationId == expected.applicationId &&
+                    receipt.applicationRevision ==
+                    requireNotNull(expected.expectedApplicationRevision) + 1L,
+            ) { "Undo recovery returned a mismatched receipt" }
+        }
+        return mutateDurably { current ->
+            require(current.pendingProposalApplicationMutation == expected) {
+                "Proposal application fence changed during reconciliation"
+            }
+            expected.applicationId?.let { applicationId ->
+                val previous = current.proposalApplications[expected.proposalId]
+                    ?: throw IllegalArgumentException("The applied receipt was lost during undo")
+                require(
+                    previous.applicationId == applicationId &&
+                        previous.applicationRevision == expected.expectedApplicationRevision &&
+                        previous.status == ProposalApplicationStatusSnapshot.APPLIED &&
+                        previous.proposalId == receipt.proposalId &&
+                        previous.appliedProposalRevision == receipt.appliedProposalRevision &&
+                        previous.commandIds == receipt.commandIds &&
+                        previous.affectedItemIds == receipt.affectedItemIds &&
+                        previous.appliedAt == receipt.appliedAt &&
+                        previous.undoExpiresAt == receipt.undoExpiresAt,
+                ) { "Undo receipt does not preserve the applied application identity" }
+            }
+            current.withProposalApplicationReceipt(receipt).copy(
+                pendingProposalApplicationMutation = null,
+                scheduleMessage = if (receipt.status == ProposalApplicationStatusSnapshot.UNDONE) {
+                    "Proposal application undone · refreshing canonical items and schedule"
+                } else {
+                    "Proposal applied transactionally · refreshing canonical items and schedule"
+                },
+            )
+        }
+    }
+
+    /** Stores an authoritative lookup result without inventing an application or Inbox draft. */
+    fun recordProposalApplicationReceipt(
+        receipt: ProposalApplicationReceiptSnapshot,
+    ): PlannerPersistenceReceipt? {
+        validateProposalApplicationReceipt(receipt)
+        return mutateDurably { current ->
+            require(current.pendingProposalApplicationMutation == null) {
+                "An exact proposal request must be reconciled before recording another receipt"
+            }
+            current.canonicalSyncOrigin?.let { origin ->
+                require(origin == receipt.syncOrigin &&
+                    current.canonicalConfigurationId == receipt.configurationId)
+            }
+            require(current.proposalApplications.values.all {
+                it.syncOrigin == receipt.syncOrigin &&
+                    it.configurationId == receipt.configurationId
+            }) { "Proposal application receipts cannot cross API bindings" }
+            current.proposalApplications[receipt.proposalId]?.let { previous ->
+                require(previous.applicationId == receipt.applicationId)
+                require(receipt.applicationRevision >= previous.applicationRevision)
+            }
+            current.withProposalApplicationReceipt(receipt)
+        }
+    }
+
+    /** Clears only a definitively uncommitted request; ambiguous results retain the exact journal. */
+    fun clearPendingProposalApplicationMutation(
+        expected: PendingProposalApplicationMutation,
+        message: String,
+    ): PlannerPersistenceReceipt? {
+        validateProposalApplicationJournal(expected)
+        return mutateDurably { current ->
+            require(current.pendingProposalApplicationMutation == expected) {
+                "Proposal application fence changed during reconciliation"
+            }
+            current.copy(
+                pendingProposalApplicationMutation = null,
+                scheduleMessage = message,
+            )
+        }
+    }
+
+    fun validateProposalApplicationMutation(mutation: PendingProposalApplicationMutation) {
+        validateProposalApplicationJournal(mutation)
+    }
+
+    private fun DayWeaveUiState.withProposalApplicationReceipt(
+        receipt: ProposalApplicationReceiptSnapshot,
+    ): DayWeaveUiState = copy(
+        proposalApplications = proposalApplications + (receipt.proposalId to receipt),
+        suggestions = suggestions.map { suggestion ->
+            if (suggestion.id == receipt.proposalId && suggestion.remoteRevision != null) {
+                suggestion.copy(
+                    disposition = SuggestionDisposition.TRANSACTIONALLY_APPLIED,
+                    remoteRevision = maxOf(
+                        suggestion.remoteRevision,
+                        receipt.appliedProposalRevision,
+                    ),
+                )
+            } else {
+                suggestion
+            }
+        },
+        inbox = inbox.filterNot { it.id == "proposal-${receipt.proposalId}" },
+        publishedScheduleRevision = null,
+        scheduleInputDigest = null,
+    )
+
+    private fun validateProposalApplicationJournal(
+        mutation: PendingProposalApplicationMutation,
+    ) {
+        require(mutation.schemaVersion == PROPOSAL_APPLICATION_JOURNAL_VERSION)
+        listOf(mutation.idempotencyKey, mutation.proposalId).forEach(::requireCanonicalUuid)
+        require(mutation.syncOrigin.isNotBlank() && mutation.expectedProposalRevision > 0L)
+        mutation.configurationId?.let { require(it.isNotBlank()) }
+        requireNotNull(runCatching { Instant.parse(mutation.preparedAt) }.getOrNull())
+        require(mutation.expectedCommandIds.size in 1..MAX_PROPOSAL_APPLICATION_COMMANDS)
+        require(mutation.expectedCommandIds.distinct().size == mutation.expectedCommandIds.size)
+        mutation.expectedCommandIds.forEach(::requireCanonicalUuid)
+        when (mutation.kind) {
+            ProposalApplicationMutationKind.APPLY -> {
+                val previewId = requireNotNull(mutation.previewId)
+                val reviewHash = requireNotNull(mutation.expectedReviewHash)
+                requireCanonicalUuid(previewId)
+                require(reviewHash.isSha256ReviewHash())
+                require(mutation.applicationId == null && mutation.expectedApplicationRevision == null)
+                validateProposalApplyHttpRequest(
+                    expectedBaseUrl = mutation.syncOrigin,
+                    request = mutation.request,
+                    previewId = previewId,
+                    expectedReviewHash = reviewHash,
+                )
+            }
+            ProposalApplicationMutationKind.UNDO -> {
+                val applicationId = requireNotNull(mutation.applicationId)
+                val expectedApplicationRevision =
+                    requireNotNull(mutation.expectedApplicationRevision)
+                requireCanonicalUuid(applicationId)
+                require(expectedApplicationRevision > 0L)
+                require(mutation.previewId == null && mutation.expectedReviewHash == null)
+                validateProposalUndoHttpRequest(
+                    expectedBaseUrl = mutation.syncOrigin,
+                    request = mutation.request,
+                    applicationId = applicationId,
+                    expectedApplicationRevision = expectedApplicationRevision,
+                )
+            }
+        }
+    }
+
+    private fun validateProposalApplicationReceipt(
+        receipt: ProposalApplicationReceiptSnapshot,
+    ) {
+        require(receipt.schemaVersion == PROPOSAL_APPLICATION_RECEIPT_VERSION)
+        listOf(receipt.applicationId, receipt.proposalId).forEach(::requireCanonicalUuid)
+        require(receipt.syncOrigin.isNotBlank() && receipt.appliedProposalRevision > 0L)
+        receipt.configurationId?.let { require(it.isNotBlank()) }
+        require(receipt.commandIds.size in 1..MAX_PROPOSAL_APPLICATION_COMMANDS)
+        require(receipt.affectedItemIds.isNotEmpty())
+        require(receipt.commandIds.distinct().size == receipt.commandIds.size)
+        require(receipt.affectedItemIds.distinct().size == receipt.affectedItemIds.size)
+        receipt.commandIds.forEach(::requireCanonicalUuid)
+        receipt.affectedItemIds.forEach(::requireCanonicalUuid)
+        val appliedAt = Instant.parse(receipt.appliedAt)
+        val undoExpiresAt = Instant.parse(receipt.undoExpiresAt)
+        require(undoExpiresAt > appliedAt)
+        when (receipt.status) {
+            ProposalApplicationStatusSnapshot.APPLIED -> require(
+                receipt.applicationRevision == 1L && receipt.undoneAt == null,
+            )
+            ProposalApplicationStatusSnapshot.UNDONE -> require(
+                receipt.applicationRevision == 2L &&
+                    requireNotNull(receipt.undoneAt).let(Instant::parse).let { undoneAt ->
+                        undoneAt >= appliedAt && undoneAt <= undoExpiresAt
+                    },
+            )
+        }
+    }
+
+    private fun requireCanonicalUuid(raw: String) {
+        val parsed = UUID.fromString(raw)
+        require(parsed != NIL_UUID && parsed.toString() == raw)
+    }
+
+    private fun String.isSha256ReviewHash(): Boolean =
+        length == 71 && startsWith("sha256:") &&
+            drop(7).all { it in '0'..'9' || it in 'a'..'f' }
+
     private fun validateSchedulePublicationJournal(publication: PendingSchedulePublication) {
         require(publication.schemaVersion == SCHEDULE_PUBLICATION_JOURNAL_VERSION)
         val idempotencyKey = UUID.fromString(publication.idempotencyKey)
@@ -779,6 +1084,9 @@ class PlannerStore(
         }
         require(current.pendingExecutionCommand == null) {
             "An execution command already needs reconciliation"
+        }
+        require(current.pendingProposalApplicationMutation == null) {
+            "A proposal application already needs reconciliation"
         }
         require(UUID.fromString(mutation.idempotencyKey).toString() == mutation.idempotencyKey)
         require(UUID.fromString(mutation.itemId).toString() == mutation.itemId)
@@ -1068,6 +1376,9 @@ class PlannerStore(
         require(current.pendingCanonicalMutation == null) {
             "A legacy canonical mutation already needs reconciliation"
         }
+        require(current.pendingProposalApplicationMutation == null) {
+            "A proposal application already needs reconciliation"
+        }
         require(UUID.fromString(command.idempotencyKey).toString() == command.idempotencyKey)
         require(UUID.fromString(command.sessionId).toString() == command.sessionId)
         require(UUID.fromString(command.itemId).toString() == command.itemId)
@@ -1134,6 +1445,7 @@ class PlannerStore(
         return current.pendingCanonicalMutation != null ||
             current.pendingSchedulePublication != null ||
             current.pendingExecutionCommand != null ||
+            current.pendingProposalApplicationMutation != null ||
             projectionBlocked
     }
 
@@ -1563,6 +1875,8 @@ class PlannerStore(
             canonicalConfigurationId = null,
             canonicalDeltaCursor = null,
             pendingSchedulePublication = null,
+            pendingProposalApplicationMutation = null,
+            proposalApplications = emptyMap(),
             publishedScheduleRevision = null,
             schedule = current.schedule.filter { it.canonicalItemId == null },
             activeSession = current.activeSession?.takeUnless { it.itemId in canonicalBlockIds },
@@ -2655,6 +2969,9 @@ class PlannerStore(
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60
         const val MAX_TERMINAL_PROJECTION_CONFLICT_CHARS = 500
         const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
+        const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1
+        const val PROPOSAL_APPLICATION_RECEIPT_VERSION = 1
+        const val MAX_PROPOSAL_APPLICATION_COMMANDS = 100
         val NIL_UUID: UUID = UUID(0L, 0L)
         const val TERMINAL_PROJECTION_ITEM_DELETED = "item_deleted"
         const val TERMINAL_PROJECTION_USER_KEPT_LATEST = "user_kept_latest_item"

@@ -1,6 +1,7 @@
 package com.greengolddog.dayweave.model
 
 import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
+import com.greengolddog.dayweave.network.ProposalApplicationHttpRequest
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalTime
@@ -396,6 +397,62 @@ data class PendingSchedulePublication(
 )
 
 @Serializable
+enum class ProposalApplicationMutationKind {
+    APPLY,
+    UNDO,
+}
+
+/**
+ * Exact, binding-scoped proposal application request persisted before network I/O.
+ *
+ * Review diffs deliberately remain ephemeral because they can contain sensitive item content.
+ * This journal retains only the content-bound review hash or application revision plus the exact
+ * request bytes needed to resolve a lost response without minting a second operation.
+ */
+@Serializable
+data class PendingProposalApplicationMutation(
+    val schemaVersion: Int,
+    val kind: ProposalApplicationMutationKind,
+    val idempotencyKey: String,
+    val syncOrigin: String,
+    val configurationId: String? = null,
+    val proposalId: String,
+    val expectedProposalRevision: Long,
+    /** Ordered command identity from the reviewed preview/retained receipt. */
+    val expectedCommandIds: List<String>,
+    val previewId: String? = null,
+    val expectedReviewHash: String? = null,
+    val applicationId: String? = null,
+    val expectedApplicationRevision: Long? = null,
+    val preparedAt: String,
+    val request: ProposalApplicationHttpRequest,
+)
+
+@Serializable
+enum class ProposalApplicationStatusSnapshot {
+    APPLIED,
+    UNDONE,
+}
+
+/** Content-free durable receipt used for recovery, status display, and the bounded undo fence. */
+@Serializable
+data class ProposalApplicationReceiptSnapshot(
+    val schemaVersion: Int,
+    val syncOrigin: String,
+    val configurationId: String? = null,
+    val applicationId: String,
+    val proposalId: String,
+    val appliedProposalRevision: Long,
+    val applicationRevision: Long,
+    val status: ProposalApplicationStatusSnapshot,
+    val commandIds: List<String>,
+    val affectedItemIds: List<String>,
+    val appliedAt: String,
+    val undoExpiresAt: String,
+    val undoneAt: String? = null,
+)
+
+@Serializable
 data class ActiveSession(
     val itemId: String,
     val elapsedMinutes: Int,
@@ -414,6 +471,7 @@ data class ActiveSession(
 enum class SuggestionDisposition {
     PENDING,
     APPROVED_FOR_INBOX,
+    TRANSACTIONALLY_APPLIED,
     REJECTED,
     EXPIRED,
 }
@@ -439,7 +497,22 @@ data class PlanningSuggestion(
     val remoteRevision: Long? = null,
     /** Cached inside the encrypted planner snapshot so the offline draft remains reviewable. */
     val remotePayloadJson: String? = null,
+    /** Exact external conversation/reference label retained for review provenance. */
+    val remoteSourceReference: String? = null,
+    val remoteCreatedAt: String? = null,
+    val remoteExpiresAt: String? = null,
+    /** String-valued payload schema. Reserved unknown versions remain visible but non-actionable. */
+    val remotePayloadSchema: String? = null,
 )
+
+const val DAYWEAVE_PROPOSAL_CHANGE_SET_SCHEMA_V1 = "dayweave.proposal-change-set/1"
+
+val PlanningSuggestion.usesReservedChangeSetNamespace: Boolean
+    get() = remotePayloadSchema?.startsWith("dayweave.proposal-change-set/") == true
+
+val PlanningSuggestion.isApplicationReady: Boolean
+    get() = remoteRevision != null &&
+        remotePayloadSchema == DAYWEAVE_PROPOSAL_CHANGE_SET_SCHEMA_V1
 
 @Serializable
 enum class InboxSource(val label: String) {
@@ -496,6 +569,10 @@ data class DayWeaveUiState(
     val canonicalDeltaCursor: String? = null,
     /** Non-null only between durable staging and a strictly validated publish receipt. */
     val pendingSchedulePublication: PendingSchedulePublication? = null,
+    /** Exact apply/undo request awaiting an authoritative result. */
+    val pendingProposalApplicationMutation: PendingProposalApplicationMutation? = null,
+    /** Content-free receipts keyed by their single proposal identifier. */
+    val proposalApplications: Map<String, ProposalApplicationReceiptSnapshot> = emptyMap(),
     /** Receipt proving that [scheduleInputDigest] was published under this exact binding. */
     val publishedScheduleRevision: PublishedScheduleRevisionSnapshot? = null,
     val scheduleInputDigest: String? = null,

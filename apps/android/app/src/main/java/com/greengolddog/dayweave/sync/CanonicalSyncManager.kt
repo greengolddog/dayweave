@@ -144,7 +144,7 @@ class CanonicalSyncManager(
         operationMutex.withLock {
             if (plannerStore.hasCredentialReplacementBlocker()) {
                 updateError(
-                    "Reconnect the pending canonical action before changing the API connection.",
+                "Recover the pending proposal or canonical action before changing the API connection.",
                 )
                 throw CanonicalConfigurationChangeBlockedException()
             }
@@ -192,7 +192,7 @@ class CanonicalSyncManager(
         validateBearerToken(requireNotNull(bearerToken))
         if (plannerStore.hasCredentialReplacementBlocker()) {
             updateError(
-                "Recover the exact pending schedule publication, reconcile the pending " +
+                "Recover the exact pending schedule/proposal operation, reconcile the pending " +
                     "canonical/execution action, or explicitly forget the connection before " +
                     "replacing its bearer token.",
             )
@@ -207,6 +207,8 @@ class CanonicalSyncManager(
         val hasCredentialBoundPlannerState = planner.canonicalSyncOrigin != null ||
             planner.canonicalDeltaCursor != null || planner.canonicalItems.isNotEmpty() ||
             planner.pendingSchedulePublication != null ||
+            planner.pendingProposalApplicationMutation != null ||
+            planner.proposalApplications.isNotEmpty() ||
             planner.publishedScheduleRevision != null ||
             planner.schedule.any { it.canonicalItemId != null } ||
             planner.canonicalExecutionSyncOrigin != null ||
@@ -2572,6 +2574,11 @@ class CanonicalSyncManager(
         val pendingPublicationMismatch = current.pendingSchedulePublication?.let { pending ->
             pending.syncOrigin != origin || pending.configurationId != configurationId
         } ?: false
+        val proposalBindingMismatch = current.pendingProposalApplicationMutation?.let { pending ->
+            pending.syncOrigin != origin || pending.configurationId != configurationId
+        } ?: current.proposalApplications.values.any { receipt ->
+            receipt.syncOrigin != origin || receipt.configurationId != configurationId
+        }
         val hasExecutionState = current.canonicalExecutionSyncOrigin != null ||
             current.canonicalExecutionSession != null ||
             current.canonicalExecutionHistoryWindow.isNotEmpty() ||
@@ -2580,7 +2587,7 @@ class CanonicalSyncManager(
             current.canonicalExecutionHistoryVerified ||
             current.terminalExecutionOutcomes.isNotEmpty() ||
             current.pendingExecutionCommand != null
-        val canonicalMismatch = pendingPublicationMismatch || hasCanonicalCache &&
+        val canonicalMismatch = pendingPublicationMismatch || proposalBindingMismatch || hasCanonicalCache &&
             (current.canonicalSyncOrigin != origin ||
                 current.canonicalConfigurationId != configurationId)
         val executionMismatch = hasExecutionState &&

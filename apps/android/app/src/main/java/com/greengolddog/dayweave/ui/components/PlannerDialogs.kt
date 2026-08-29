@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -15,6 +16,7 @@ import androidx.compose.material.icons.outlined.AddTask
 import androidx.compose.material.icons.outlined.Coffee
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -26,6 +28,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,6 +42,13 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.network.DeviceAuthPhase
 import com.greengolddog.dayweave.network.DeviceAuthUiState
+import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
+import com.greengolddog.dayweave.network.RemoteProposalItemField
+import com.greengolddog.dayweave.sync.ProposalApplicationApproval
+import com.greengolddog.dayweave.sync.ProposalApplicationState
+import java.time.Instant
+import kotlinx.coroutines.delay
+import kotlinx.serialization.json.JsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -210,6 +220,318 @@ fun EditSuggestionDialog(
 }
 
 @Composable
+fun ProposalReviewDialog(
+    proposalTitle: String,
+    state: ProposalApplicationState,
+    onDismiss: () -> Unit,
+    onRegenerate: () -> Unit,
+    onApply: (ProposalApplicationApproval) -> Unit,
+) {
+    val preview = state.preview ?: return
+    val approval = state.exactApproval ?: return
+    var confirmed by remember(approval) { mutableStateOf(false) }
+    var revealSensitive by remember(approval) { mutableStateOf(false) }
+    var reviewExpired by remember(approval) {
+        mutableStateOf(!Instant.parse(preview.expiresAt).isAfter(Instant.now()))
+    }
+    val containsSensitiveValues = preview.diffs.any { diff ->
+        diff.before?.isSensitive == true || diff.after?.isSensitive == true
+    } || preview.implicitDiffs.any { diff ->
+        diff.before.isSensitive || diff.after.isSensitive
+    }
+    LaunchedEffect(approval, preview.expiresAt) {
+        val waitMillis = Instant.parse(preview.expiresAt).toEpochMilli() -
+            System.currentTimeMillis()
+        if (waitMillis > 0) delay(waitMillis)
+        reviewExpired = true
+        confirmed = false
+    }
+    AlertDialog(
+        onDismissRequest = { if (!state.isBusy) onDismiss() },
+        title = { Text("Review exact changes") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .testTag("proposal_review_content"),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(proposalTitle, style = MaterialTheme.typography.titleMedium)
+                Text(
+                    state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (preview.canApply) {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    } else {
+                        MaterialTheme.colorScheme.error
+                    },
+                )
+                Text(
+                    "Risk: ${preview.maximumRisk.displayLabel()} · " +
+                        "${preview.commandIds.size} atomic command(s) · expires ${preview.expiresAt}",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+
+                if (reviewExpired) {
+                    Text(
+                        "This exact review expired. Regenerate it before approval.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                if (containsSensitiveValues) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                    ) {
+                        Checkbox(
+                            checked = revealSensitive,
+                            onCheckedChange = { revealSensitive = it },
+                            enabled = !state.isBusy,
+                            modifier = Modifier.testTag("proposal_reveal_sensitive_values"),
+                        )
+                        Text(
+                            if (revealSensitive) {
+                                "Sensitive before/after values are visible until this review closes."
+                            } else {
+                                "Sensitive before/after values are concealed. Reveal for this review only."
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+
+                ReviewSection("Direct changes") {
+                    preview.diffs.forEachIndexed { index, diff ->
+                        val concealIdentity = !revealSensitive &&
+                            (diff.before?.isSensitive == true || diff.after?.isSensitive == true)
+                        Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Text(
+                                "${index + 1}. ${diff.operation.displayLabel()} · item " +
+                                    if (concealIdentity) "Concealed" else diff.itemId,
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            ExactItemIdentitySnapshot(
+                                before = diff.before,
+                                after = diff.after,
+                                revealSensitive = revealSensitive,
+                            )
+                            ExactChangedFieldValues(
+                                fields = diff.changedFields,
+                                before = diff.before,
+                                after = diff.after,
+                                revealSensitive = revealSensitive,
+                            )
+                        }
+                    }
+                }
+
+                if (preview.implicitDiffs.isNotEmpty()) {
+                    ReviewSection("Hierarchy side effects") {
+                        preview.implicitDiffs.forEach { diff ->
+                            val concealIdentity = !revealSensitive &&
+                                (diff.before.isSensitive || diff.after.isSensitive)
+                            Text(
+                                "${diff.reason.displayLabel()} · item " +
+                                    if (concealIdentity) "Concealed" else diff.itemId,
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            ExactItemIdentitySnapshot(
+                                before = diff.before,
+                                after = diff.after,
+                                revealSensitive = revealSensitive,
+                            )
+                            ExactChangedFieldValues(
+                                fields = diff.changedFields,
+                                before = diff.before,
+                                after = diff.after,
+                                revealSensitive = revealSensitive,
+                            )
+                        }
+                    }
+                }
+
+                if (preview.risks.isNotEmpty()) {
+                    ReviewSection("Risks") {
+                        preview.risks.forEach { risk ->
+                            Text(
+                                "${risk.level.displayLabel()}: ${risk.summary}" +
+                                    if (risk.requiresExplicitApproval) " · approval required" else "",
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
+                }
+
+                if (preview.conflicts.isNotEmpty()) {
+                    ReviewSection("Conflicts") {
+                        preview.conflicts.forEach { conflict ->
+                            Text(
+                                "${conflict.code.displayLabel()}: ${conflict.summary}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                ) {
+                    Checkbox(
+                        checked = confirmed,
+                        onCheckedChange = { confirmed = it },
+                        enabled = preview.canApply && !reviewExpired && !state.isBusy,
+                        modifier = Modifier.testTag("proposal_explicit_approval"),
+                    )
+                    Text(
+                        "I approve this exact review as one atomic change set.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onApply(approval) },
+                enabled = confirmed && preview.canApply && preview.conflicts.isEmpty() &&
+                    !reviewExpired && !state.isBusy,
+                modifier = Modifier.testTag("proposal_apply_exact_review"),
+            ) {
+                Text(if (state.isBusy) "Applying…" else "Apply exact changes")
+            }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onRegenerate, enabled = !state.isBusy) {
+                    Text("Regenerate review")
+                }
+                TextButton(onClick = onDismiss, enabled = !state.isBusy) { Text("Cancel") }
+            }
+        },
+    )
+}
+
+@Composable
+private fun ReviewSection(
+    title: String,
+    content: @Composable () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(title, style = MaterialTheme.typography.titleSmall)
+        content()
+    }
+}
+
+@Composable
+private fun ExactItemIdentitySnapshot(
+    before: RemoteProposalCanonicalItem?,
+    after: RemoteProposalCanonicalItem?,
+    revealSensitive: Boolean,
+) {
+    val concealTransition = !revealSensitive &&
+        (before?.isSensitive == true || after?.isSensitive == true)
+    SelectionContainer {
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+                "Identity before: ${proposalReviewIdentitySnapshot(before, concealTransition)}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Text(
+                "Identity after: ${proposalReviewIdentitySnapshot(after, concealTransition)}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ExactChangedFieldValues(
+    fields: List<RemoteProposalItemField>,
+    before: RemoteProposalCanonicalItem?,
+    after: RemoteProposalCanonicalItem?,
+    revealSensitive: Boolean,
+) {
+    val concealTransition = !revealSensitive &&
+        (before?.isSensitive == true || after?.isSensitive == true)
+    fields.forEach { field ->
+        Column(
+            modifier = Modifier.testTag("proposal_field_${field.name.lowercase()}"),
+            verticalArrangement = Arrangement.spacedBy(1.dp),
+        ) {
+            Text(field.displayLabel(), style = MaterialTheme.typography.labelMedium)
+            SelectionContainer {
+                Text(
+                    "Before: ${proposalReviewFieldValue(before, field, concealTransition)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            SelectionContainer {
+                Text(
+                    "After: ${proposalReviewFieldValue(after, field, concealTransition)}",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+internal fun proposalReviewIdentitySnapshot(
+    item: RemoteProposalCanonicalItem?,
+    concealSensitive: Boolean,
+): String {
+    if (item == null) return "Not present"
+    val id = if (concealSensitive) "Concealed" else item.id
+    val title = if (concealSensitive) "Concealed" else JsonPrimitive(item.title).toString()
+    val kind = if (concealSensitive) "Concealed" else JsonPrimitive(item.kind.name.lowercase()).toString()
+    val status = if (concealSensitive) {
+        "Concealed"
+    } else {
+        JsonPrimitive(item.status.name.lowercase()).toString()
+    }
+    return "id=$id · title=$title · kind=$kind · status=$status"
+}
+
+internal fun proposalReviewFieldValue(
+    item: RemoteProposalCanonicalItem?,
+    field: RemoteProposalItemField,
+    concealSensitive: Boolean,
+): String {
+    if (item == null) return "Not present"
+    if (concealSensitive && field != RemoteProposalItemField.IS_SENSITIVE) return "Concealed"
+    fun quoted(value: String): String = JsonPrimitive(value).toString()
+    fun quotedOrNull(value: String?): String = value?.let(::quoted) ?: "null"
+    return when (field) {
+        RemoteProposalItemField.IS_SENSITIVE -> item.isSensitive.toString()
+        RemoteProposalItemField.KIND -> quoted(item.kind.name.lowercase())
+        RemoteProposalItemField.STATUS -> quoted(item.status.name.lowercase())
+        RemoteProposalItemField.TITLE -> quoted(item.title)
+        RemoteProposalItemField.NOTES -> quotedOrNull(item.notes)
+        RemoteProposalItemField.TIMEZONE_NAME -> quoted(item.timezoneName)
+        RemoteProposalItemField.DURATION_SECONDS -> item.durationSeconds?.toString() ?: "null"
+        RemoteProposalItemField.DEADLINE_AT -> quotedOrNull(item.deadlineAt)
+        RemoteProposalItemField.EARLIEST_START_AT -> quotedOrNull(item.earliestStartAt)
+        RemoteProposalItemField.RECURRENCE -> item.recurrence?.toString() ?: "null"
+        RemoteProposalItemField.FLEXIBLE_CONSTRAINTS -> item.flexibleConstraints.toString()
+        RemoteProposalItemField.SPLIT_POLICY -> item.splitPolicy.toString()
+        RemoteProposalItemField.IMPORTANCE -> item.importance.toString()
+        RemoteProposalItemField.URGENCY -> item.urgency.toString()
+        RemoteProposalItemField.PARENT_ID -> quotedOrNull(item.parentId)
+        RemoteProposalItemField.SIBLING_ORDER -> item.siblingOrder.toString()
+        RemoteProposalItemField.IS_EXECUTABLE -> item.isExecutable.toString()
+        RemoteProposalItemField.REVISION -> item.revision.toString()
+        RemoteProposalItemField.COMPLETED_AT -> quotedOrNull(item.completedAt)
+        RemoteProposalItemField.DELETED_AT -> quotedOrNull(item.deletedAt)
+    }
+}
+
+private fun Enum<*>.displayLabel(): String =
+    name.lowercase().replace('_', ' ').replaceFirstChar(Char::uppercase)
+
+@Composable
 fun ApiConnectionDialog(
     authState: DeviceAuthUiState,
     credentialReplacementBlocked: Boolean,
@@ -309,8 +631,9 @@ fun ApiConnectionDialog(
                 )
                 if (credentialReplacementBlocked) {
                     Text(
-                        "Recover the exact schedule publication or canonical/execution action " +
-                            "before enrollment or sign-out. Confirmed local-only removal remains " +
+                        "Recover the exact schedule publication, proposal application, or " +
+                            "canonical/execution action before enrollment or sign-out. " +
+                            "Confirmed local-only removal remains " +
                             "available and will quarantine that recovery journal first.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,

@@ -40,6 +40,9 @@ class MainActivity : FragmentActivity() {
         AppLockWindowSecurity.apply(window, appLockController.state.value)
         lifecycleScope.launch {
             appLockController.state.collectLatest { state ->
+                if (state.isLocked) {
+                    (application as DayWeaveApplication).onAppPrivacyBoundaryLocked()
+                }
                 AppLockWindowSecurity.apply(window, state)
             }
         }

@@ -13,6 +13,10 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
+import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
+import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
+import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
@@ -25,6 +29,8 @@ import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.plannerSha256
+import com.greengolddog.dayweave.network.prepareProposalApplyHttpRequest
+import com.greengolddog.dayweave.network.prepareProposalUndoHttpRequest
 import java.nio.charset.StandardCharsets
 import java.time.Instant
 import java.util.UUID
@@ -48,6 +54,136 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlannerStoreTest {
+    @Test
+    fun proposalApplyAndUndoUseExactAtomicJournalWithoutManufacturingDraft() {
+        val proposalId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val commandId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val applicationId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val affectedItemId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        val configuration = AuthenticatedApiConfiguration.createBound(
+            CANONICAL_ORIGIN,
+            "synthetic-token",
+            "connection-1",
+        )
+        val suggestion = PlanningSuggestion(
+            id = proposalId,
+            title = "Create focused task",
+            summary = "One exact task creation",
+            source = "Codex",
+            kind = SuggestionKind.NEW_TASK,
+            expiresInDays = 30,
+            remoteRevision = 1,
+            remotePayloadSchema = "dayweave.proposal-change-set/1",
+            remoteExpiresAt = "2099-01-01T00:00:00Z",
+        )
+        val store = PlannerStore(
+            publishedCanonicalState().copy(
+                suggestions = listOf(suggestion),
+                inbox = listOf(
+                    InboxItem(
+                        id = "proposal-$proposalId",
+                        title = "Legacy draft must disappear",
+                        source = InboxSource.EXTERNAL_PROPOSAL,
+                    ),
+                ),
+            ),
+        )
+        val reviewHash = "sha256:${"a".repeat(64)}"
+        val apply = PendingProposalApplicationMutation(
+            schemaVersion = 1,
+            kind = ProposalApplicationMutationKind.APPLY,
+            idempotencyKey = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            proposalId = proposalId,
+            expectedProposalRevision = 1,
+            expectedCommandIds = listOf(commandId),
+            previewId = "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            expectedReviewHash = reviewHash,
+            preparedAt = "2026-08-30T10:00:00Z",
+            request = prepareProposalApplyHttpRequest(
+                configuration,
+                "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                reviewHash,
+            ),
+        )
+        val applied = ProposalApplicationReceiptSnapshot(
+            schemaVersion = 1,
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            applicationId = applicationId,
+            proposalId = proposalId,
+            appliedProposalRevision = 2,
+            applicationRevision = 1,
+            status = ProposalApplicationStatusSnapshot.APPLIED,
+            commandIds = listOf(commandId),
+            affectedItemIds = listOf(affectedItemId),
+            appliedAt = "2026-08-30T10:01:00Z",
+            undoExpiresAt = "2099-01-01T00:00:00Z",
+        )
+
+        assertNotNull(store.stageProposalApplicationMutation(apply))
+        assertTrue(store.hasCredentialReplacementBlocker())
+        assertNotNull(store.commitProposalApplicationMutation(apply, applied))
+        assertNull(store.state.value.pendingProposalApplicationMutation)
+        assertEquals(
+            SuggestionDisposition.TRANSACTIONALLY_APPLIED,
+            store.state.value.suggestions.single().disposition,
+        )
+        assertTrue(store.state.value.inbox.none { it.id == "proposal-$proposalId" })
+        assertPublishedPlanInvalidated(store)
+
+        val undo = PendingProposalApplicationMutation(
+            schemaVersion = 1,
+            kind = ProposalApplicationMutationKind.UNDO,
+            idempotencyKey = "12121212-1212-4212-8212-121212121212",
+            syncOrigin = CANONICAL_ORIGIN,
+            configurationId = "connection-1",
+            proposalId = proposalId,
+            expectedProposalRevision = 2,
+            expectedCommandIds = listOf(commandId),
+            applicationId = applicationId,
+            expectedApplicationRevision = 1,
+            preparedAt = "2026-08-30T10:02:00Z",
+            request = prepareProposalUndoHttpRequest(configuration, applicationId, 1),
+        )
+        assertNotNull(store.stageProposalApplicationMutation(undo))
+        assertNotNull(
+            store.commitProposalApplicationMutation(
+                undo,
+                applied.copy(
+                    status = ProposalApplicationStatusSnapshot.UNDONE,
+                    applicationRevision = 2,
+                    undoneAt = "2026-08-30T10:03:00Z",
+                ),
+            ),
+        )
+        assertEquals(
+            ProposalApplicationStatusSnapshot.UNDONE,
+            store.state.value.proposalApplications.getValue(proposalId).status,
+        )
+    }
+
+    @Test
+    fun reservedTypedProposalCannotUseLegacyApprovalPath() {
+        val proposal = PlanningSuggestion(
+            id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            title = "Typed change",
+            summary = "Must be reviewed",
+            source = "ChatGPT",
+            kind = SuggestionKind.SCHEDULE_CHANGE,
+            expiresInDays = 1,
+            remoteRevision = 1,
+            remotePayloadSchema = "dayweave.proposal-change-set/2",
+        )
+        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(proposal)))
+
+        store.approveSuggestion(proposal.id)
+
+        assertEquals(SuggestionDisposition.PENDING, store.state.value.suggestions.single().disposition)
+        assertTrue(store.state.value.inbox.isEmpty())
+    }
+
     @Test
     fun overLimitPublicationBodyIsRejectedBeforeStateMutationOrPersistence() = runBlocking {
         val initial = DayWeaveUiState()

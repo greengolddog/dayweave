@@ -38,6 +38,47 @@ class SuggestionSyncManagerTest {
     private val now = Instant.parse("2026-08-29T09:00:00Z").toEpochMilli()
 
     @Test
+    fun acceptedTransactionalProposalNeverManufacturesLegacyInboxDraft() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeSuggestionsTransport().apply {
+            listed = listOf(
+                remoteSuggestion(status = "accepted").copy(
+                    payload = buildJsonObject {
+                        put("schema", "dayweave.proposal-change-set/1")
+                    },
+                ),
+            )
+        }
+        val manager = manager(plannerStore, transport)
+
+        assertEquals(SuggestionRefreshOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            SuggestionDisposition.TRANSACTIONALLY_APPLIED,
+            plannerStore.state.value.suggestions.single().disposition,
+        )
+        assertTrue(plannerStore.state.value.inbox.isEmpty())
+    }
+
+    @Test
+    fun typedProposalCannotFallThroughLegacyAcceptEndpoint() = runBlocking {
+        val typed = cachedSuggestion(1).copy(
+            remotePayloadSchema = "dayweave.proposal-change-set/1",
+            remoteExpiresAt = "2026-09-05T09:00:00Z",
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState(suggestions = listOf(typed)))
+        val transport = FakeSuggestionsTransport()
+        val manager = manager(plannerStore, transport)
+
+        manager.accept(typed.id)
+
+        assertEquals(null, transport.acceptedRevision)
+        assertEquals(SuggestionDisposition.PENDING, plannerStore.state.value.suggestions.single().disposition)
+        assertTrue(plannerStore.state.value.inbox.isEmpty())
+        assertEquals(SuggestionSyncPhase.ERROR, manager.state.value.phase)
+    }
+
+    @Test
     fun delayedOldBindingResponseCannotRepopulateAfterGenerationFence() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val credentials = GenerationBoundCredentialStore()

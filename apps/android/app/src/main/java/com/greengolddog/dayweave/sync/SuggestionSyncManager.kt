@@ -3,6 +3,8 @@ package com.greengolddog.dayweave.sync
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
+import com.greengolddog.dayweave.model.isApplicationReady
+import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -24,6 +26,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.JsonPrimitive
 
 enum class SuggestionSyncPhase {
     NOT_CONFIGURED,
@@ -114,6 +117,16 @@ class SuggestionSyncManager(
         val revision = suggestion.remoteRevision
         if (revision == null) {
             plannerStore.approveSuggestion(id)
+            return
+        }
+        if (suggestion.usesReservedChangeSetNamespace) {
+            updateError(
+                if (suggestion.isApplicationReady) {
+                    "Review the exact typed changes and explicitly confirm them before applying."
+                } else {
+                    "This proposal uses a newer protected change-set format. Update DayWeave before applying it."
+                },
+            )
             return
         }
         mutateRemote(
@@ -408,9 +421,18 @@ class SuggestionSyncManager(
         val expiresInDays = ((remainingMillis + MILLIS_PER_DAY - 1) / MILLIS_PER_DAY)
             .coerceAtMost(Int.MAX_VALUE.toLong())
             .toInt()
+        val payloadSchema = (remote.payload["schema"] as? JsonPrimitive)
+            ?.takeIf(JsonPrimitive::isString)
+            ?.content
+        val reservesTransactionalNamespace =
+            payloadSchema?.startsWith("dayweave.proposal-change-set/") == true
         val disposition = when (remote.status) {
             "pending" -> SuggestionDisposition.PENDING
-            "accepted" -> SuggestionDisposition.APPROVED_FOR_INBOX
+            "accepted" -> if (reservesTransactionalNamespace) {
+                SuggestionDisposition.TRANSACTIONALLY_APPLIED
+            } else {
+                SuggestionDisposition.APPROVED_FOR_INBOX
+            }
             "rejected" -> SuggestionDisposition.REJECTED
             "expired" -> SuggestionDisposition.EXPIRED
             else -> throw RemoteSuggestionMappingException()
@@ -439,6 +461,10 @@ class SuggestionSyncManager(
             disposition = disposition,
             remoteRevision = remote.revision,
             remotePayloadJson = remote.payload.toString(),
+            remoteSourceReference = remote.sourceReference,
+            remoteCreatedAt = remote.createdAt,
+            remoteExpiresAt = remote.expiresAt,
+            remotePayloadSchema = payloadSchema,
         )
     }
 

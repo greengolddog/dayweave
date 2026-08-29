@@ -9,13 +9,21 @@ import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
+import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
+import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
+import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
+import com.greengolddog.dayweave.network.prepareProposalApplyHttpRequest
+import com.greengolddog.dayweave.network.prepareProposalUndoHttpRequest
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.SerializationException
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -24,7 +32,7 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV5() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV6() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -39,7 +47,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -77,7 +85,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -94,7 +102,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -105,6 +113,127 @@ class PlannerStateRepositoryTest {
 
         assertThrows(SerializationException::class.java) {
             runBlocking { repository.load() }
+        }
+        Unit
+    }
+
+    @Test
+    fun exactProposalApplyJournalRoundTripsAndEndpointTamperingFailsClosed() = runBlocking {
+        val configuration = AuthenticatedApiConfiguration.createBound(
+            "https://api.example.test/",
+            "synthetic-token",
+            "connection-1",
+        )
+        val proposalId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val previewId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val reviewHash = "sha256:${"c".repeat(64)}"
+        val pending = PendingProposalApplicationMutation(
+            schemaVersion = 1,
+            kind = ProposalApplicationMutationKind.APPLY,
+            idempotencyKey = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            syncOrigin = configuration.baseUrl.toString(),
+            configurationId = "connection-1",
+            proposalId = proposalId,
+            expectedProposalRevision = 4,
+            expectedCommandIds = listOf("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            previewId = previewId,
+            expectedReviewHash = reviewHash,
+            preparedAt = "2026-08-30T10:00:00Z",
+            request = prepareProposalApplyHttpRequest(configuration, previewId, reviewHash),
+        )
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao)
+
+        repository.save(DayWeaveUiState(pendingProposalApplicationMutation = pending))
+        assertEquals(
+            pending,
+            requireNotNull(repository.load()).pendingProposalApplicationMutation,
+        )
+
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payload = requireNotNull(dao.snapshot).payload.replaceFirst(
+                "/application-previews/$previewId/apply",
+                "/application-previews/$previewId/undo",
+            ),
+        )
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        Unit
+    }
+
+    @Test
+    fun v5MigrationCreatesNoProposalApplicationState() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 41 }
+        repository.save(DayWeaveUiState())
+        val root = Json.parseToJsonElement(requireNotNull(dao.snapshot).payload)
+            .let { it as JsonObject }
+        val legacy = JsonObject(
+            root.filterKeys {
+                it != "pendingProposalApplicationMutation" && it != "proposalApplications"
+            },
+        )
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payload = Json.encodeToString(JsonObject.serializer(), legacy),
+            payloadFormat = PlannerSnapshotFormats.JSON_V5,
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(null, restored.pendingProposalApplicationMutation)
+        assertTrue(restored.proposalApplications.isEmpty())
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
+    }
+
+    @Test
+    fun exactUndoJournalRoundTripsOnlyWithItsMatchingAppliedReceipt() = runBlocking {
+        val configuration = AuthenticatedApiConfiguration.createBound(
+            "https://api.example.test/",
+            "synthetic-token",
+            "connection-1",
+        )
+        val proposalId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val applicationId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        val commandId = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        val receipt = ProposalApplicationReceiptSnapshot(
+            schemaVersion = 1,
+            syncOrigin = configuration.baseUrl.toString(),
+            configurationId = "connection-1",
+            applicationId = applicationId,
+            proposalId = proposalId,
+            appliedProposalRevision = 2,
+            applicationRevision = 1,
+            status = ProposalApplicationStatusSnapshot.APPLIED,
+            commandIds = listOf(commandId),
+            affectedItemIds = listOf("dddddddd-dddd-4ddd-8ddd-dddddddddddd"),
+            appliedAt = "2026-08-30T10:00:00Z",
+            undoExpiresAt = "2026-08-30T10:15:00Z",
+        )
+        val pending = PendingProposalApplicationMutation(
+            schemaVersion = 1,
+            kind = ProposalApplicationMutationKind.UNDO,
+            idempotencyKey = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            syncOrigin = configuration.baseUrl.toString(),
+            configurationId = "connection-1",
+            proposalId = proposalId,
+            expectedProposalRevision = 2,
+            expectedCommandIds = listOf(commandId),
+            applicationId = applicationId,
+            expectedApplicationRevision = 1,
+            preparedAt = "2026-08-30T10:05:00Z",
+            request = prepareProposalUndoHttpRequest(configuration, applicationId, 1),
+        )
+        val repository = RoomPlannerStateRepository(FakePlannerSnapshotDao())
+        val state = DayWeaveUiState(
+            pendingProposalApplicationMutation = pending,
+            proposalApplications = mapOf(proposalId to receipt),
+        )
+
+        repository.save(state)
+        assertEquals(pending, requireNotNull(repository.load()).pendingProposalApplicationMutation)
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.save(state.copy(proposalApplications = emptyMap())) }
         }
         Unit
     }
@@ -162,7 +291,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -186,7 +315,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V5, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V6, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 

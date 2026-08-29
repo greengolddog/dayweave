@@ -16,6 +16,8 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.GoogleAccountState
+import com.greengolddog.dayweave.sync.ProposalApplicationApproval
+import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
@@ -27,6 +29,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val dayWeaveApplication = application as DayWeaveApplication
     private val plannerStore = dayWeaveApplication.plannerStore
     private val suggestionSyncManager = dayWeaveApplication.suggestionSyncManager
+    private val proposalApplicationManager = dayWeaveApplication.proposalApplicationManager
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
@@ -36,6 +39,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
+    val proposalApplicationState: StateFlow<ProposalApplicationState> =
+        proposalApplicationManager.state
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
@@ -148,6 +153,45 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
     fun approveSuggestion(id: String) {
         viewModelScope.launch { suggestionSyncManager.accept(id) }
+    }
+
+    fun reviewProposal(id: String) {
+        if (isCanonicalBusy()) return
+        dayWeaveApplication.launchCanonicalAction {
+            proposalApplicationManager.prepareReview(id)
+        }
+    }
+
+    fun applyReviewedProposal(approval: ProposalApplicationApproval) {
+        if (isCanonicalBusy()) return
+        dayWeaveApplication.launchCanonicalAction {
+            if (proposalApplicationManager.applyReviewed(approval)) {
+                dayWeaveApplication.refreshCanonicalState()
+            }
+        }
+    }
+
+    fun undoProposalApplication(id: String) {
+        if (isCanonicalBusy()) return
+        dayWeaveApplication.launchCanonicalAction {
+            if (proposalApplicationManager.undo(id)) {
+                dayWeaveApplication.refreshCanonicalState()
+            }
+        }
+    }
+
+    fun discardProposalReview(id: String? = null) {
+        proposalApplicationManager.discardReview(id)
+    }
+
+    fun recoverProposalApplication() {
+        if (proposalApplicationManager.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction {
+            proposalApplicationManager.recoverPending()
+            if (plannerStore.state.value.pendingProposalApplicationMutation == null) {
+                dayWeaveApplication.refreshCanonicalState()
+            }
+        }
     }
 
     fun rejectSuggestion(id: String) {
@@ -340,7 +384,9 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun isCanonicalBusy(): Boolean =
-        canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy
+        canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
+            proposalApplicationManager.state.value.isBusy ||
+            plannerStore.state.value.pendingProposalApplicationMutation != null
 }
 
 /** Terminal execution success immediately enters the application projection/recompose sequence. */

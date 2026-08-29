@@ -2,8 +2,12 @@ package com.greengolddog.dayweave.data
 
 import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
+import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
+import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
+import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
 import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
 import java.time.Instant
 import java.util.UUID
@@ -45,7 +49,15 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V5 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V6 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V5 -> {
+                val migrated = decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requireProposalApplicationFields = false,
+                )
+                save(migrated)
+                migrated
+            }
             PlannerSnapshotFormats.JSON_V4 -> {
                 val migrated = decodeVersionFourSnapshot(snapshot.payload)
                 save(migrated)
@@ -81,21 +93,32 @@ class RoomPlannerStateRepository(
 
     override suspend fun save(state: DayWeaveUiState) {
         validateSchedulePublicationState(state)
+        validateProposalApplicationState(state)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(state),
                 updatedAtEpochMillis = nowEpochMillis(),
-                payloadFormat = PlannerSnapshotFormats.JSON_V5,
+                payloadFormat = PlannerSnapshotFormats.JSON_V6,
             ),
         )
     }
 
-    private fun decodeCurrentSnapshot(payload: String): DayWeaveUiState {
+    private fun decodeCurrentSnapshot(
+        payload: String,
+        requireProposalApplicationFields: Boolean = true,
+    ): DayWeaveUiState {
         val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
             throw SerializationException("Current schedule publication fields are required")
+        }
+        if (
+            requireProposalApplicationFields &&
+            (!root.containsKey("pendingProposalApplicationMutation") ||
+                !root.containsKey("proposalApplications"))
+        ) {
+            throw SerializationException("Current proposal application fields are required")
         }
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
@@ -123,7 +146,10 @@ class RoomPlannerStateRepository(
         }
         return SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(root)
             .withPendingSensitivityHardened()
-            .also(::validateSchedulePublicationState)
+            .also {
+                validateSchedulePublicationState(it)
+                validateProposalApplicationState(it)
+            }
     }
 
     /** V4 already required explicit sensitivity and an exact pending replacement target. */
@@ -272,6 +298,179 @@ class RoomPlannerStateRepository(
         }
     }
 
+    private fun validateProposalApplicationState(state: DayWeaveUiState) {
+        state.pendingProposalApplicationMutation?.let { pending ->
+            if (pending.schemaVersion != PROPOSAL_APPLICATION_JOURNAL_VERSION) {
+                throw SerializationException("Unsupported proposal application journal")
+            }
+            validateUuid(pending.idempotencyKey, "proposal application idempotency key")
+            validateUuid(pending.proposalId, "proposal application proposal")
+            if (pending.expectedProposalRevision <= 0 || pending.syncOrigin.isBlank()) {
+                throw SerializationException("Invalid proposal application binding")
+            }
+            if (pending.expectedCommandIds.isEmpty() || pending.expectedCommandIds.size > 100 ||
+                pending.expectedCommandIds.distinct().size != pending.expectedCommandIds.size) {
+                throw SerializationException("Invalid proposal application command fence")
+            }
+            pending.expectedCommandIds.forEach {
+                validateUuid(it, "proposal application command")
+            }
+            pending.configurationId?.takeIf(String::isBlank)?.let {
+                throw SerializationException("Invalid proposal application configuration")
+            }
+            runCatching { Instant.parse(pending.preparedAt) }.getOrElse {
+                throw SerializationException("Invalid proposal application timestamp", it)
+            }
+            when (pending.kind) {
+                ProposalApplicationMutationKind.APPLY -> {
+                    val previewId = pending.previewId
+                        ?: throw SerializationException("Apply preview is required")
+                    validateUuid(
+                        previewId,
+                        "proposal application preview",
+                    )
+                    val hash = pending.expectedReviewHash
+                        ?: throw SerializationException("Apply review hash is required")
+                    if (!hash.isSha256Digest() || pending.applicationId != null ||
+                        pending.expectedApplicationRevision != null) {
+                        throw SerializationException("Invalid apply recovery journal")
+                    }
+                    runCatching {
+                        validateProposalApplyHttpRequest(
+                            expectedBaseUrl = pending.syncOrigin,
+                            request = pending.request,
+                            previewId = previewId,
+                            expectedReviewHash = hash,
+                        )
+                    }.getOrElse {
+                        throw SerializationException("Invalid exact apply request", it)
+                    }
+                }
+                ProposalApplicationMutationKind.UNDO -> {
+                    val applicationId = pending.applicationId
+                        ?: throw SerializationException("Undo application is required")
+                    validateUuid(
+                        applicationId,
+                        "proposal application",
+                    )
+                    val expectedApplicationRevision = pending.expectedApplicationRevision
+                    if (expectedApplicationRevision?.let { it > 0 } != true ||
+                        pending.previewId != null || pending.expectedReviewHash != null) {
+                        throw SerializationException("Invalid undo recovery journal")
+                    }
+                    runCatching {
+                        validateProposalUndoHttpRequest(
+                            expectedBaseUrl = pending.syncOrigin,
+                            request = pending.request,
+                            applicationId = applicationId,
+                            expectedApplicationRevision = expectedApplicationRevision,
+                        )
+                    }.getOrElse {
+                        throw SerializationException("Invalid exact undo request", it)
+                    }
+                }
+            }
+        }
+        state.proposalApplications.forEach { (proposalId, receipt) ->
+            validateUuid(proposalId, "proposal receipt key")
+            validateUuid(receipt.proposalId, "proposal receipt proposal")
+            validateUuid(receipt.applicationId, "proposal receipt application")
+            if (
+                proposalId != receipt.proposalId ||
+                receipt.schemaVersion != PROPOSAL_APPLICATION_RECEIPT_VERSION ||
+                receipt.syncOrigin.isBlank() || receipt.appliedProposalRevision <= 0 ||
+                receipt.configurationId?.isBlank() == true ||
+                receipt.commandIds.isEmpty() || receipt.commandIds.size > 100 ||
+                receipt.affectedItemIds.isEmpty() ||
+                receipt.commandIds.distinct().size != receipt.commandIds.size ||
+                receipt.affectedItemIds.distinct().size != receipt.affectedItemIds.size
+            ) {
+                throw SerializationException("Invalid proposal application receipt")
+            }
+            receipt.commandIds.forEach { validateUuid(it, "proposal receipt command") }
+            receipt.affectedItemIds.forEach { validateUuid(it, "proposal receipt item") }
+            val appliedAt = runCatching { Instant.parse(receipt.appliedAt) }.getOrElse {
+                throw SerializationException("Invalid proposal application time", it)
+            }
+            val undoExpiresAt = runCatching { Instant.parse(receipt.undoExpiresAt) }.getOrElse {
+                throw SerializationException("Invalid proposal undo deadline", it)
+            }
+            if (undoExpiresAt <= appliedAt) {
+                throw SerializationException("Invalid proposal undo window")
+            }
+            when (receipt.status) {
+                ProposalApplicationStatusSnapshot.APPLIED -> if (
+                    receipt.undoneAt != null || receipt.applicationRevision != 1L
+                ) throw SerializationException("Applied proposal receipt is invalid")
+                ProposalApplicationStatusSnapshot.UNDONE -> {
+                    val undoneAt = receipt.undoneAt?.let { raw ->
+                        runCatching { Instant.parse(raw) }.getOrElse {
+                            throw SerializationException("Invalid proposal undo time", it)
+                        }
+                    } ?: throw SerializationException("Undone proposal receipt needs a timestamp")
+                    if (
+                        receipt.applicationRevision != 2L || undoneAt < appliedAt ||
+                        undoneAt > undoExpiresAt
+                    ) {
+                        throw SerializationException("Invalid undone proposal receipt")
+                    }
+                }
+            }
+        }
+        state.pendingProposalApplicationMutation?.let { pending ->
+            val receipt = state.proposalApplications[pending.proposalId]
+            if (pending.kind == ProposalApplicationMutationKind.APPLY && receipt != null) {
+                throw SerializationException("Apply journal conflicts with an existing receipt")
+            }
+            if (pending.kind == ProposalApplicationMutationKind.UNDO &&
+                (receipt == null || receipt.applicationId != pending.applicationId ||
+                    receipt.applicationRevision != pending.expectedApplicationRevision ||
+                    receipt.appliedProposalRevision != pending.expectedProposalRevision ||
+                    receipt.commandIds != pending.expectedCommandIds ||
+                    receipt.status != ProposalApplicationStatusSnapshot.APPLIED)) {
+                throw SerializationException("Undo journal does not match its receipt")
+            }
+        }
+        val applicationBindings = state.proposalApplications.values
+            .map { it.syncOrigin to it.configurationId }
+            .toSet()
+        if (applicationBindings.size > 1) {
+            throw SerializationException("Proposal receipts cross API bindings")
+        }
+        state.pendingProposalApplicationMutation?.let { pending ->
+            if (applicationBindings.any {
+                it != (pending.syncOrigin to pending.configurationId)
+            }) {
+                throw SerializationException("Proposal journal crosses its receipt binding")
+            }
+        }
+        val proposalBinding = state.pendingProposalApplicationMutation
+            ?.let { it.syncOrigin to it.configurationId }
+            ?: applicationBindings.singleOrNull()
+        proposalBinding?.let { (origin, configurationId) ->
+            if (state.canonicalSyncOrigin != null &&
+                (state.canonicalSyncOrigin != origin ||
+                    state.canonicalConfigurationId != configurationId)) {
+                throw SerializationException("Proposal state crosses the canonical binding")
+            }
+            if (state.canonicalExecutionSyncOrigin != null &&
+                (state.canonicalExecutionSyncOrigin != origin ||
+                    state.canonicalExecutionConfigurationId != configurationId)) {
+                throw SerializationException("Proposal state crosses the execution binding")
+            }
+        }
+    }
+
+    private fun validateUuid(value: String, description: String) {
+        val parsed = runCatching { UUID.fromString(value) }.getOrNull()
+        if (parsed == null || parsed == UUID(0L, 0L) || parsed.toString() != value) {
+            throw SerializationException("Invalid $description")
+        }
+    }
+
+    private fun String.isSha256Digest(): Boolean =
+        length == 71 && startsWith("sha256:") && drop(7).all { it in '0'..'9' || it in 'a'..'f' }
+
     /** Validates the duplicated fence fields against the real snake_case wire journal. */
     private fun journaledPendingSensitivity(
         pending: JsonObject,
@@ -320,6 +519,8 @@ class RoomPlannerStateRepository(
     }
 
     private companion object {
+        const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1
+        const val PROPOSAL_APPLICATION_RECEIPT_VERSION = 1
         val SNAPSHOT_JSON = Json {
             encodeDefaults = true
             ignoreUnknownKeys = false
