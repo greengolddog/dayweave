@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod credential_auth;
 pub mod error;
 pub mod execution;
 pub mod google_oauth;

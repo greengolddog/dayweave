@@ -65,13 +65,28 @@ effects must flow through an auditable proposal or outbox boundary.
 
 ### Service and protocol
 
-- Non-health HTTP and MCP operations require a strict bearer credential. The
-  API retains only SHA-256 token digests and compares them in constant time;
-  configured credentials must be high-entropy values of at least the enforced
-  minimum length.
-- Each authenticated principal is resolved into an explicit user/workspace
-  scope. PostgreSQL access includes this scope rather than relying on the
-  personal single-user deployment assumption.
+- Non-health HTTP and MCP operations currently require a strict, statically
+  configured bearer credential. Runtime configuration retains only SHA-256
+  digests and compares them in constant time, but every accepted bootstrap
+  credential still receives the same five broad schedule/Suggestions scopes.
+- A not-yet-wired durable credential repository now provides version-fenced,
+  revocable device sessions, one-time device enrollment, rotating access and
+  refresh credentials, and separately scoped MCP credentials. It accepts only
+  exact `dw_da1_`, `dw_dr1_`, `dw_en1_`, and `dw_mc1_` formats carrying 32-byte
+  payloads, rejects reuse of the same secret material within a device issuance
+  or rotation even when the public prefixes differ, and stores domain-separated
+  SHA-256 digests only. Version-1 session rows retain the current credential
+  issuance time, so the 15-minute access, 30-day refresh-idle, and 180-day
+  session-absolute bounds are independently enforced during writes, by database
+  constraints, and again during hydration. The same boundaries enforce the
+  10-minute enrollment and
+  90-day-default/365-day-maximum MCP lifetimes. Database failures, invalid
+  durable metadata, expiry, revocation, reuse, and cross-tenant lookups fail
+  closed.
+- PostgreSQL adapters are explicitly scoped by the configured user/workspace,
+  and every version-1 credential row carries that user/workspace/client scope.
+  The current static bearer principal does not independently prove that scope;
+  runtime session issuance and audience-aware authorization remain a gate.
 - Mutation retries use hashed idempotency keys. Canonical changes, audit rows,
   and external-effect outbox rows are designed to commit transactionally.
 - MCP validates protocol version, media type, request size, origin, bearer
@@ -181,8 +196,15 @@ taken, and any remaining decision.
 The following controls are required before DayWeave is treated as production
 ready:
 
-- replace bootstrap static API credentials with revocable, expiring device
-  sessions and scoped MCP client credentials;
+- wire enrollment, refresh, revoke, and operator recovery APIs plus both app
+  clients to the durable credential repository, add audience-aware REST/MCP
+  authorization and rate limits, then remove the bootstrap static credential
+  without a fallback; every credential issuer must use an OS CSPRNG for each
+  independent 32-byte payload;
+- define and migrate endpoint-level REST scopes before that cutover. The current
+  five-value scope allowlist is intentionally limited to the existing
+  schedule/Suggestions foundation and is not a complete app authorization
+  vocabulary;
 - complete SEC-007 sensitive-item enforcement for lock-screen notifications,
   widgets while locked, external MCP access, proactive assistant context, and
   attachment analysis on both clients;

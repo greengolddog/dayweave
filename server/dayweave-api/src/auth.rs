@@ -39,6 +39,30 @@ impl Principal {
     }
 }
 
+impl Scope {
+    #[must_use]
+    pub const fn as_storage_name(self) -> &'static str {
+        match self {
+            Self::SuggestionsRead => "suggestions_read",
+            Self::SuggestionsWrite => "suggestions_write",
+            Self::ScheduleRead => "schedule_read",
+            Self::ScheduleSimulate => "schedule_simulate",
+            Self::SuggestionsSubmit => "suggestions_submit",
+        }
+    }
+
+    pub(crate) fn from_storage_name(value: &str) -> Option<Self> {
+        match value {
+            "suggestions_read" => Some(Self::SuggestionsRead),
+            "suggestions_write" => Some(Self::SuggestionsWrite),
+            "schedule_read" => Some(Self::ScheduleRead),
+            "schedule_simulate" => Some(Self::ScheduleSimulate),
+            "suggestions_submit" => Some(Self::SuggestionsSubmit),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AuthenticationError {
     #[error("invalid credentials")]

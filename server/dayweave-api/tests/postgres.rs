@@ -27,7 +27,7 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),
@@ -37,6 +37,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0005_execution_sessions.sql"),
         include_str!("../migrations/0006_google_oauth.sql"),
         include_str!("../migrations/0007_google_sync.sql"),
+        include_str!("../migrations/0008_credential_auth_foundation.sql"),
     ]
     .join("\n");
     for table in [
@@ -55,6 +56,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "outbox_messages",
         "proposals",
         "mcp_clients",
+        "device_enrollments",
         "idempotency_keys",
         "item_changes",
         "execution_sessions",

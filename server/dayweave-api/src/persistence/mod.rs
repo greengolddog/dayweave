@@ -1,3 +1,4 @@
+mod credential_auth_repository;
 mod database;
 mod execution_repository;
 mod google_oauth_repository;
@@ -7,6 +8,7 @@ mod item_repository;
 mod outbox;
 mod proposal_repository;
 
+pub use credential_auth_repository::PostgresCredentialRepository;
 pub use database::{Database, DatabaseScope, MIGRATOR, PersistenceError};
 pub use execution_repository::PostgresExecutionRepository;
 pub use google_oauth_repository::PostgresGoogleOAuthRepository;
