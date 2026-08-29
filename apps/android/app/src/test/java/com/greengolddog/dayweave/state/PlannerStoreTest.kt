@@ -363,8 +363,18 @@ class PlannerStoreTest {
 
         now = 121_000
         assertTrue(store.timedPauseReady())
-        store.resumeActive()
+        assertTrue(store.tickActiveSession())
+        assertTrue(store.state.value.activeSession?.timedBreakEnded == true)
+        assertTrue(store.state.value.activeSession?.isPaused == true)
+
+        store.pauseActive(1)
+        assertFalse(store.state.value.activeSession?.timedBreakEnded ?: true)
+        assertFalse(store.timedPauseReady())
         now = 181_000
+        assertTrue(store.tickActiveSession())
+        assertTrue(store.state.value.activeSession?.timedBreakEnded == true)
+        store.resumeActive()
+        now = 241_000
         store.tickActiveSession()
 
         assertEquals(2, store.state.value.activeSession?.elapsedMinutes)

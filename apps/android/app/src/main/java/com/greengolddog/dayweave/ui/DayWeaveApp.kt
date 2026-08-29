@@ -37,6 +37,7 @@ import com.greengolddog.dayweave.state.DayWeaveViewModel
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
 import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
+import com.greengolddog.dayweave.ui.components.BreakEndedDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
 import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
@@ -253,6 +254,14 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 viewModel.pauseActive(minutes)
                 showPauseChooser = false
             },
+        )
+    }
+
+    if (state.activeSession?.timedBreakEnded == true) {
+        BreakEndedDialog(
+            onResume = viewModel::resumeActive,
+            onExtend = { viewModel.pauseActive(10) },
+            onChooseLater = viewModel::doActiveLater,
         )
     }
 

@@ -25,35 +25,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
 
-    private var observedTimedResumeDeadline: Long? = null
-    private var timedResumeRetryAfterEpochMillis: Long = 0
-
     init {
         viewModelScope.launch {
             while (isActive) {
                 delay(1_000)
                 plannerStore.tickActiveSession()
-                val deadline = plannerStore.state.value.activeSession?.pauseUntilEpochMillis
-                if (deadline == null) {
-                    observedTimedResumeDeadline = null
-                    timedResumeRetryAfterEpochMillis = 0
-                } else {
-                    if (observedTimedResumeDeadline != deadline) {
-                        observedTimedResumeDeadline = deadline
-                        timedResumeRetryAfterEpochMillis = 0
-                    }
-                    val now = System.currentTimeMillis()
-                    if (
-                        plannerStore.timedPauseReady() &&
-                        now >= timedResumeRetryAfterEpochMillis &&
-                        !canonicalSyncManager.state.value.isBusy &&
-                        resumeActiveIfAvailable()
-                    ) {
-                        // A successful resume clears the deadline. If the async action fails, retry
-                        // at a bounded cadence instead of suppressing this break forever.
-                        timedResumeRetryAfterEpochMillis = now + TIMED_RESUME_RETRY_MILLIS
-                    }
-                }
             }
         }
     }
@@ -166,9 +142,5 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             localAction()
             return true
         }
-    }
-
-    private companion object {
-        const val TIMED_RESUME_RETRY_MILLIS = 60_000L
     }
 }

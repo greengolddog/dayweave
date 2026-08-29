@@ -115,6 +115,33 @@ fun PauseChooserDialog(
 }
 
 @Composable
+fun BreakEndedDialog(
+    onResume: () -> Unit,
+    onExtend: () -> Unit,
+    onChooseLater: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = {},
+        icon = { Icon(Icons.Outlined.Coffee, contentDescription = null) },
+        title = { Text("Your break is over") },
+        text = {
+            Text(
+                "Resume the paused item, extend the break by 10 minutes, or let DayWeave choose something else.",
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onResume) { Text("Resume") }
+        },
+        dismissButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = onExtend) { Text("Extend 10m") }
+                TextButton(onClick = onChooseLater) { Text("Something else") }
+            }
+        },
+    )
+}
+
+@Composable
 fun EditSuggestionDialog(
     suggestion: PlanningSuggestion,
     onDismiss: () -> Unit,

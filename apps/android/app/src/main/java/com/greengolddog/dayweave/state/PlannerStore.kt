@@ -198,7 +198,26 @@ class PlannerStore(
     /** Advances the visible timer without writing more than once per displayed minute. */
     fun tickActiveSession(): Boolean {
         val active = mutableState.value.activeSession ?: return false
-        if (active.isPaused) return false
+        if (active.isPaused) {
+            val deadline = active.pauseUntilEpochMillis ?: return false
+            if (nowEpochMillis() < deadline || active.timedBreakEnded) return false
+            return mutate { current ->
+                val latest = current.activeSession
+                if (
+                    latest == null || !latest.isPaused ||
+                    latest.pauseUntilEpochMillis != deadline || latest.timedBreakEnded
+                ) {
+                    current
+                } else {
+                    current.copy(
+                        activeSession = latest.copy(
+                            timedBreakEnded = true,
+                            pauseLabel = "Break ended · choose what to do next",
+                        ),
+                    )
+                }
+            }
+        }
         val elapsed = elapsedMinutes(active)
         if (elapsed == active.elapsedMinutes) return false
         return mutate { current ->
@@ -932,6 +951,7 @@ class PlannerStore(
             pauseUntilEpochMillis = minutes?.let { duration ->
                 now.saturatingAdd(duration.toLong() * 60_000L)
             },
+            timedBreakEnded = false,
         )
     }
 
@@ -940,6 +960,7 @@ class PlannerStore(
         pauseLabel = null,
         runningSinceEpochMillis = nowEpochMillis(),
         pauseUntilEpochMillis = null,
+        timedBreakEnded = false,
     )
 
     private fun Long.saturatingAdd(other: Long): Long =

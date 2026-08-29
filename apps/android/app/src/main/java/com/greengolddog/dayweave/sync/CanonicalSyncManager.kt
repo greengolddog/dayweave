@@ -330,7 +330,7 @@ class CanonicalSyncManager(
             return mutateLocalCanonicalBlock(
                 blockId = blockId,
                 displayStatus = ItemStatus.PAUSED,
-                allowedStatuses = setOf(ItemStatus.ACTIVE),
+                allowedStatuses = setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED),
                 pauseLabel = minutes?.let { "$it minute break" } ?: "Open-ended break",
                 pauseMinutes = minutes,
             )
@@ -339,7 +339,7 @@ class CanonicalSyncManager(
             blockId = blockId,
             targetStatus = "paused",
             displayStatus = ItemStatus.PAUSED,
-            allowedStatuses = setOf(ItemStatus.ACTIVE),
+            allowedStatuses = setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED),
             pauseLabel = minutes?.let { "$it minute break" } ?: "Open-ended break",
             pauseMinutes = minutes,
         )

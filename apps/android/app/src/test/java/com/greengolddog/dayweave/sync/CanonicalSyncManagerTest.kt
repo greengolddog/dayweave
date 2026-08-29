@@ -183,6 +183,50 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun anExpiredCanonicalBreakCanBeExtendedWithoutImplicitResume() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem(split = false))),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        transport.replacementResult = remoteItem(split = false).copy(
+            status = "in_progress",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.start(BLOCK_ID))
+        transport.replacementResult = remoteItem(split = false).copy(
+            status = "paused",
+            revision = 9,
+            updatedAt = "2026-09-01T07:02:00Z",
+        )
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.pause(BLOCK_ID, 5))
+        val firstDeadline = requireNotNull(
+            plannerStore.state.value.activeSession?.pauseUntilEpochMillis,
+        )
+        transport.replacementResult = remoteItem(split = false).copy(
+            status = "paused",
+            revision = 10,
+            updatedAt = "2026-09-01T07:03:00Z",
+        )
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.pause(BLOCK_ID, 10))
+
+        val extended = requireNotNull(plannerStore.state.value.activeSession)
+        assertTrue(extended.isPaused)
+        assertTrue(requireNotNull(extended.pauseUntilEpochMillis) > firstDeadline)
+        assertFalse(extended.timedBreakEnded)
+        assertEquals("paused", transport.replacementRequest?.item?.status)
+        assertEquals(9L, transport.replacementRequest?.expectedRevision)
+    }
+
+    @Test
     fun staleMutationKeepsDurablePlanAndRequestsARefresh() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {

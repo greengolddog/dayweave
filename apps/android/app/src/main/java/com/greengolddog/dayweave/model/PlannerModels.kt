@@ -215,6 +215,8 @@ data class ActiveSession(
     val accumulatedSeconds: Long = elapsedMinutes.toLong() * 60L,
     val runningSinceEpochMillis: Long? = null,
     val pauseUntilEpochMillis: Long? = null,
+    /** Set when a timed break expires; resuming remains an explicit user choice by default. */
+    val timedBreakEnded: Boolean = false,
 )
 
 @Serializable
