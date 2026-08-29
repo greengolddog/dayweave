@@ -5,6 +5,14 @@ import os
 @MainActor
 final class CodexAppServerClient: ObservableObject {
     private static let logger = Logger(subsystem: "com.greengolddog.dayweave", category: "Codex")
+    /// Production startup remains closed until the pinned runtime verifier is
+    /// wired to the app bundle and every server-initiated request is denied by
+    /// the host. Never fall back to PATH discovery or the user's ambient Codex
+    /// installation: that would cross the app's credential and filesystem
+    /// boundary without the reviewed containment contract.
+    private static let verifiedRuntimeEnabled = false
+    static let runtimeUnavailableMessage =
+        "The contained Codex runtime is not enabled in this development build."
     enum ConnectionState: Equatable {
         case stopped
         case starting
@@ -52,6 +60,10 @@ final class CodexAppServerClient: ObservableObject {
 
     func startIfNeeded() {
         guard process == nil else { return }
+        guard Self.verifiedRuntimeEnabled else {
+            state = .unavailable(Self.runtimeUnavailableMessage)
+            return
+        }
         state = .starting
 
         let process = Process()
