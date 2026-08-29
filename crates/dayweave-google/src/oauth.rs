@@ -42,7 +42,7 @@ impl OAuthConfig {
         client_secret: impl Into<String>,
         redirect_uri: &str,
     ) -> Result<Self, GoogleError> {
-        let redirect_uri = parse_url(redirect_uri, "redirect URI is invalid")?;
+        let redirect_uri = parse_redirect_url(redirect_uri, "redirect URI is invalid")?;
         Self::with_endpoints(
             client_id,
             client_secret,
@@ -53,7 +53,8 @@ impl OAuthConfig {
         )
     }
 
-    /// Supplies alternate endpoints for isolated contract tests.
+    /// Supplies alternate HTTPS endpoints for an isolated test service or a
+    /// trusted OAuth proxy.
     ///
     /// # Errors
     ///
@@ -78,20 +79,41 @@ impl OAuthConfig {
         Ok(Self {
             client_id,
             client_secret: SecretString::from(client_secret),
-            redirect_uri,
-            authorization_endpoint: parse_url(
+            redirect_uri: validate_redirect_url(redirect_uri, "redirect URI is invalid")?,
+            authorization_endpoint: parse_endpoint_url(
                 authorization_endpoint,
                 "authorization endpoint is invalid",
             )?,
-            token_endpoint: parse_url(token_endpoint, "token endpoint is invalid")?,
-            revocation_endpoint: parse_url(revocation_endpoint, "revocation endpoint is invalid")?,
+            token_endpoint: parse_endpoint_url(token_endpoint, "token endpoint is invalid")?,
+            revocation_endpoint: parse_endpoint_url(
+                revocation_endpoint,
+                "revocation endpoint is invalid",
+            )?,
         })
     }
 }
 
-fn parse_url(value: &str, message: &'static str) -> Result<Url, GoogleError> {
+fn parse_redirect_url(value: &str, message: &'static str) -> Result<Url, GoogleError> {
     let url = Url::parse(value).map_err(|_| GoogleError::InvalidOAuthRequest(message))?;
-    if url.cannot_be_a_base() {
+    validate_redirect_url(url, message)
+}
+
+fn validate_redirect_url(url: Url, message: &'static str) -> Result<Url, GoogleError> {
+    if url.cannot_be_a_base()
+        || url.scheme() != "https"
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(GoogleError::InvalidOAuthRequest(message));
+    }
+    Ok(url)
+}
+
+fn parse_endpoint_url(value: &str, message: &'static str) -> Result<Url, GoogleError> {
+    let url = parse_redirect_url(value, message)?;
+    if url.query().is_some() {
         return Err(GoogleError::InvalidOAuthRequest(message));
     }
     Ok(url)
@@ -184,12 +206,41 @@ impl OAuthClient {
     ///
     /// Returns a transport error if the HTTP client cannot be constructed.
     pub fn new(config: OAuthConfig) -> Result<Self, GoogleError> {
+        Self::build(config, None)
+    }
+
+    /// Creates an HTTPS-only OAuth transport that trusts one additional root
+    /// certificate.
+    ///
+    /// This is useful for a private-CA OAuth proxy and for ephemeral TLS
+    /// contract tests. Redirect following remains disabled, and every OAuth
+    /// endpoint is still required to use HTTPS.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error if the HTTP client cannot be constructed.
+    pub fn with_additional_root_certificate(
+        config: OAuthConfig,
+        root_certificate: reqwest::Certificate,
+    ) -> Result<Self, GoogleError> {
+        Self::build(config, Some(root_certificate))
+    }
+
+    fn build(
+        config: OAuthConfig,
+        root_certificate: Option<reqwest::Certificate>,
+    ) -> Result<Self, GoogleError> {
+        let mut http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .user_agent("DayWeave/0.1");
+        if let Some(root_certificate) = root_certificate {
+            http = http.add_root_certificate(root_certificate);
+        }
         Ok(Self {
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .user_agent("DayWeave/0.1")
-                .build()
-                .map_err(GoogleError::Transport)?,
+            http: http.build().map_err(GoogleError::Transport)?,
             config,
         })
     }
