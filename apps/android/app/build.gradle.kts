@@ -171,6 +171,7 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.okhttp)
     implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.androidx.health.connect.client)
     ksp(libs.androidx.room.compiler)
 
     testImplementation(libs.junit)

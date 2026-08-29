@@ -1,8 +1,10 @@
 package com.greengolddog.dayweave
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsSelected
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -34,5 +36,12 @@ class DayWeaveSmokeTest {
 
         composeRule.onNodeWithText("Protect a recovery window").assertIsDisplayed()
         composeRule.onAllNodesWithText("Accept draft")[0].assertIsDisplayed()
+    }
+
+    @Test
+    fun manualEnergyCheckInHasAccessibleSelectableControls() {
+        composeRule.onNodeWithText("Today").performClick()
+        composeRule.onNodeWithTag("energy_signal_card").assertIsDisplayed()
+        composeRule.onNodeWithTag("energy_check_in_low").performClick().assertIsSelected()
     }
 }

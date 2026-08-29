@@ -32,6 +32,35 @@ The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signe
 
 The supported floor is Android 9 / API 28, so the direct-download release APK intentionally uses APK Signature Scheme v3 only. Gradle disables v1, v2, and the uncopied v4 sidecar; the release script runs verbose `apksigner` verification before copying `dist/android/DayWeave-release.apk`. Release acceptance requires v3 `true`, v1/v2 `false`, and exactly one signer in that output.
 
+## Health Connect energy context
+
+**More → Health & context** provides an opt-in Health Connect connection using
+the stable AndroidX Health Connect 1.1.0 client. It checks official SDK
+availability, offers the provider update route when required, requests only
+read-sleep access through the Health Connect activity-result contract, and links
+back to Health Connect for access management. No write, background, health
+history, heart-rate, account, or Google OAuth permission is requested.
+
+While the app is foregrounded, the provider reads only the 24-hour aggregate
+sleep duration and immediately reduces it to Low/Medium/Deep energy plus a broad
+recovery band. The encrypted planner snapshot retains only those bands and the
+calculation time; raw records, session timestamps/stages, titles, notes, and IDs
+are neither returned across the provider boundary nor persisted or uploaded.
+Disabling sync, denying/revoking access, provider unavailability, or a read error
+clears the derived estimate and leaves core planning fully usable.
+
+Today always offers a manual Low/Medium/Deep check-in. Selecting another value
+corrects the check-in; clearing it returns to a non-stale Health Connect estimate
+when one exists. The current band powers only a “best current fit” hint against
+the existing schedule. The server compose API has no current-energy field yet,
+so this slice never silently changes the plan and is not a medical feature.
+
+The JVM suite uses `FakeEnergySignalProvider` with synthetic bands. A final
+physical-device pass on the target Pixel must cover install/update/unavailable,
+grant, deny, revoke, rationale, Manage access, and a synthetic sleep aggregate.
+Never use, export, screenshot, or commit real health data. Play distribution also
+requires the Health apps declaration to match the in-app rationale exactly.
+
 ## Suggestions API configuration
 
 The API base URL can be supplied at build time and must use HTTPS:
@@ -60,7 +89,7 @@ Execution completion is durably block-scoped first: the exact terminal lease ide
 
 ## Persistence safety
 
-The encrypted database, its WAL files, and the wrapped passphrase are excluded from cloud backup and device transfer because Android Keystore keys are device-bound. If the wrapping key is unavailable or the snapshot format cannot be decoded, persistence fails closed instead of silently replacing the existing database.
+Application backup and device transfer are disabled in the manifest; the encrypted database, its WAL files, and the wrapped passphrase are also named in exclusion rules as defense in depth because Android Keystore keys are device-bound. If the wrapping key is unavailable or the snapshot format cannot be decoded, persistence fails closed instead of silently replacing the existing database.
 
 Room schema history is exported under `app/schemas`, and explicit migrations are required—there is no destructive migration fallback.
 
@@ -68,4 +97,5 @@ Room schema history is exported under `app/schemas`, and explicit migrations are
 
 - Add an account-facing control if users should be able to opt out of periodic suggestion refresh while retaining API credentials.
 - Configure Google OAuth credentials and isolated Calendar/Tasks test resources.
+- Complete the Health Connect/Play declaration and target-Pixel physical-device gate using synthetic data only.
 - Configure release signing outside version control before producing the direct-download APK.

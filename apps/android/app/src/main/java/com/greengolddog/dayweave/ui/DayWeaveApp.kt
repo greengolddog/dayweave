@@ -1,6 +1,10 @@
 package com.greengolddog.dayweave.ui
 
+import android.content.ActivityNotFoundException
+import android.content.Context
+import android.content.Intent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,7 +36,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.health.connect.client.PermissionController
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -41,6 +47,8 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.health.EnergyProviderAvailability
+import com.greengolddog.dayweave.health.HealthConnectIntents
 import com.greengolddog.dayweave.state.DayWeaveViewModel
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
@@ -118,7 +126,13 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
+    val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     val uriHandler = LocalUriHandler.current
+    val healthPermissionLauncher = rememberLauncherForActivityResult(
+        contract = PermissionController.createRequestPermissionResultContract(),
+        onResult = viewModel::onHealthConnectPermissionResult,
+    )
     val effectiveCanonicalSyncState = if (
         executionSyncState.phase in setOf(
             CanonicalSyncPhase.AUTH_REQUIRED,
@@ -148,6 +162,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshExecution()
             viewModel.refreshGoogleAccounts()
+            viewModel.refreshEnergySignal()
             while (isActive) {
                 delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
                 viewModel.refreshExecution()
@@ -258,6 +273,8 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onLater = viewModel::doActiveLater,
                 onRetryTerminalProjection = viewModel::retryTerminalProjection,
                 onKeepLatestItem = viewModel::keepLatestItemAfterTerminalConflict,
+                onEnergyCheckIn = viewModel::recordManualEnergyCheckIn,
+                onClearManualEnergyCheckIn = viewModel::clearManualEnergyCheckIn,
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.CALENDAR -> CalendarScreen(
@@ -287,6 +304,7 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
                 googleAccountState = googleAccountState,
+                energySignalState = energySignalState,
                 onConfigureApiConnection = { showApiConnection = true },
                 onConnectGoogle = viewModel::connectGoogleAccount,
                 onRefreshGoogle = viewModel::refreshGoogleAccounts,
@@ -299,6 +317,29 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
                 onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
                 onSetGooglePaused = viewModel::setGoogleAccountPaused,
                 onRequestGoogleDisconnect = { disconnectingGoogleAccount = it },
+                onToggleHealthConnect = { enabled ->
+                    when {
+                        !enabled -> viewModel.disableHealthConnect()
+                        energySignalState.permissionGranted -> viewModel.enableHealthConnect()
+                        energySignalState.availability == EnergyProviderAvailability.AVAILABLE ->
+                            healthPermissionLauncher.launch(viewModel.healthConnectPermissions)
+                        energySignalState.availability == EnergyProviderAvailability.UPDATE_REQUIRED ->
+                            context.startActivitySafely(
+                                HealthConnectIntents.installOrUpdate(context),
+                                HealthConnectIntents.browserFallback(),
+                            )
+                    }
+                },
+                onRefreshHealthConnect = viewModel::refreshEnergySignal,
+                onManageHealthConnectAccess = {
+                    context.startActivitySafely(HealthConnectIntents.manageAccess())
+                },
+                onInstallHealthConnect = {
+                    context.startActivitySafely(
+                        HealthConnectIntents.installOrUpdate(context),
+                        HealthConnectIntents.browserFallback(),
+                    )
+                },
                 modifier = Modifier.padding(innerPadding),
             )
         }
@@ -406,3 +447,17 @@ private fun DayWeaveRoot(viewModel: DayWeaveViewModel) {
 }
 
 private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L
+
+private fun Context.startActivitySafely(primary: Intent, fallback: Intent? = null) {
+    try {
+        startActivity(primary)
+    } catch (_: ActivityNotFoundException) {
+        fallback?.let { secondary ->
+            try {
+                startActivity(secondary)
+            } catch (_: ActivityNotFoundException) {
+                // The integration remains off; core planning is intentionally unaffected.
+            }
+        }
+    }
+}

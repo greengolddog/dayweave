@@ -23,7 +23,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.ui.components.ActiveItemActions
+import com.greengolddog.dayweave.ui.components.EnergySignalCard
 import com.greengolddog.dayweave.ui.components.MetricCard
 import com.greengolddog.dayweave.ui.components.ScheduleItemCard
 import com.greengolddog.dayweave.sync.CanonicalSyncState
@@ -43,6 +45,8 @@ fun TodayScreen(
     onLater: () -> Unit,
     onRetryTerminalProjection: (String) -> Unit,
     onKeepLatestItem: (String) -> Unit,
+    onEnergyCheckIn: (EnergyLevel) -> Unit,
+    onClearManualEnergyCheckIn: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
@@ -194,6 +198,14 @@ fun TodayScreen(
                     modifier = Modifier.weight(1f),
                 )
             }
+        }
+
+        item {
+            EnergySignalCard(
+                state = state,
+                onCheckIn = onEnergyCheckIn,
+                onClearManualCheckIn = onClearManualEnergyCheckIn,
+            )
         }
 
         // An already-running cross-midnight session remains resolvable, but stale scheduled work

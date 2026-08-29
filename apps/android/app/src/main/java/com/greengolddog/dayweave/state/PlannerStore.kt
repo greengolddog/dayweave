@@ -9,10 +9,14 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.DerivedEnergySnapshot
+import com.greengolddog.dayweave.model.EnergyLevel
+import com.greengolddog.dayweave.model.EnergySignalSource
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
@@ -1747,6 +1751,43 @@ class PlannerStore(
 
     fun toggleDynamicColor() {
         mutate { it.copy(useDynamicColor = !it.useDynamicColor) }
+    }
+
+    fun enableHealthConnectSync(): Boolean = mutate { current ->
+        current.copy(healthConnectSyncEnabled = true)
+    }
+
+    /** Stops provider reads and removes the retained derived estimate; manual input is untouched. */
+    fun disableHealthConnectSync(): Boolean = mutate { current ->
+        current.copy(
+            healthConnectSyncEnabled = false,
+            derivedEnergySnapshot = null,
+        )
+    }
+
+    fun replaceDerivedEnergySnapshot(snapshot: DerivedEnergySnapshot?): Boolean {
+        snapshot?.let {
+            require(it.source != EnergySignalSource.MANUAL_CHECK_IN)
+            Instant.parse(it.calculatedAt)
+        }
+        return mutate { current ->
+            if (!current.healthConnectSyncEnabled) current else {
+                current.copy(derivedEnergySnapshot = snapshot)
+            }
+        }
+    }
+
+    fun recordManualEnergyCheckIn(energy: EnergyLevel): Boolean = mutate { current ->
+        current.copy(
+            manualEnergyCheckIn = ManualEnergyCheckIn(
+                energy = energy,
+                checkedInAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+            ),
+        )
+    }
+
+    fun clearManualEnergyCheckIn(): Boolean = mutate { current ->
+        current.copy(manualEnergyCheckIn = null)
     }
 
     fun recompose() {

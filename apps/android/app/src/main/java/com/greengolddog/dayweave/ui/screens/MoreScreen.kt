@@ -34,7 +34,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import com.greengolddog.dayweave.health.EnergySignalPhase
+import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
@@ -53,6 +58,7 @@ fun MoreScreen(
     suggestionSyncState: SuggestionSyncState,
     canonicalSyncState: CanonicalSyncState,
     googleAccountState: GoogleAccountState,
+    energySignalState: EnergySignalState,
     onConfigureApiConnection: () -> Unit,
     onConnectGoogle: () -> Unit,
     onRefreshGoogle: () -> Unit,
@@ -61,6 +67,10 @@ fun MoreScreen(
     onReauthorizeGoogle: (String) -> Unit,
     onSetGooglePaused: (String, Boolean) -> Unit,
     onRequestGoogleDisconnect: (GoogleAccountSummary) -> Unit,
+    onToggleHealthConnect: (Boolean) -> Unit,
+    onRefreshHealthConnect: () -> Unit,
+    onManageHealthConnectAccess: () -> Unit,
+    onInstallHealthConnect: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -175,6 +185,18 @@ fun MoreScreen(
             )
         }
 
+        item { SettingsSectionTitle("Health & context") }
+        item {
+            HealthConnectCard(
+                enabled = state.healthConnectSyncEnabled,
+                state = energySignalState,
+                onToggle = onToggleHealthConnect,
+                onRefresh = onRefreshHealthConnect,
+                onManageAccess = onManageHealthConnectAccess,
+                onInstallOrUpdate = onInstallHealthConnect,
+            )
+        }
+
         item { SettingsSectionTitle("Appearance & privacy") }
         item {
             Card {
@@ -198,6 +220,82 @@ fun MoreScreen(
                 modifier = Modifier.padding(vertical = 10.dp),
             )
         }
+    }
+}
+
+@Composable
+private fun HealthConnectCard(
+    enabled: Boolean,
+    state: EnergySignalState,
+    onToggle: (Boolean) -> Unit,
+    onRefresh: () -> Unit,
+    onManageAccess: () -> Unit,
+    onInstallOrUpdate: () -> Unit,
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("health_connect_settings_card")
+            .semantics { stateDescription = state.message },
+    ) {
+        ListItem(
+            headlineContent = { Text("Health Connect") },
+            supportingContent = { Text(state.message) },
+            leadingContent = {
+                Icon(Icons.Outlined.HealthAndSafety, contentDescription = null)
+            },
+            trailingContent = {
+                if (state.isBusy) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                } else {
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = onToggle,
+                        enabled = state.phase !in setOf(
+                            EnergySignalPhase.UNAVAILABLE,
+                            EnergySignalPhase.UPDATE_REQUIRED,
+                        ),
+                        modifier = Modifier.testTag("health_connect_sync_toggle"),
+                    )
+                }
+            },
+        )
+        Text(
+            "Opt-in foreground reads use only the recent sleep-duration aggregate. DayWeave " +
+                "retains encrypted energy/recovery bands and a calculation time—not raw health " +
+                "records—and never sends this signal to the server.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            when (state.phase) {
+                EnergySignalPhase.UPDATE_REQUIRED -> TextButton(onClick = onInstallOrUpdate) {
+                    Text("Install or update")
+                }
+                EnergySignalPhase.PERMISSION_REQUIRED,
+                EnergySignalPhase.DENIED,
+                -> TextButton(onClick = { onToggle(true) }) {
+                    Text("Allow sleep access")
+                }
+                else -> if (enabled && !state.isBusy) {
+                    TextButton(onClick = onRefresh) { Text("Refresh estimate") }
+                }
+            }
+            if (state.phase !in setOf(EnergySignalPhase.UNAVAILABLE, EnergySignalPhase.UPDATE_REQUIRED)) {
+                TextButton(onClick = onManageAccess) { Text("Manage access") }
+            }
+        }
+        Text(
+            "Planning remains available when Health Connect is off, unavailable, or denied. " +
+                "The estimate is a planning aid, not medical guidance.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+        )
     }
 }
 

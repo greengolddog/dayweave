@@ -4,8 +4,10 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.greengolddog.dayweave.DayWeaveApplication
+import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
@@ -15,6 +17,7 @@ import com.greengolddog.dayweave.sync.GoogleAccountState
 import java.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
@@ -26,6 +29,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
+    private val energySignalManager = dayWeaveApplication.energySignalManager
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
@@ -33,6 +37,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
+    val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
+    val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
 
     init {
         viewModelScope.launch {
@@ -40,6 +46,10 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 delay(1_000)
                 plannerStore.tickActiveSession()
             }
+        }
+        viewModelScope.launch {
+            val restored = loadState.first { it != PlannerLoadState.LOADING }
+            if (restored == PlannerLoadState.READY) energySignalManager.refresh()
         }
     }
 
@@ -199,6 +209,30 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun toggleCompleted() = plannerStore.toggleCompleted()
     fun toggleQuietSuggestions() = plannerStore.toggleQuietSuggestions()
     fun toggleDynamicColor() = plannerStore.toggleDynamicColor()
+    fun recordManualEnergyCheckIn(level: EnergyLevel) {
+        plannerStore.recordManualEnergyCheckIn(level)
+    }
+
+    fun clearManualEnergyCheckIn() {
+        plannerStore.clearManualEnergyCheckIn()
+    }
+
+    fun enableHealthConnect() {
+        viewModelScope.launch { energySignalManager.enable() }
+    }
+
+    fun disableHealthConnect() {
+        viewModelScope.launch { energySignalManager.disable() }
+    }
+
+    fun onHealthConnectPermissionResult(granted: Set<String>) {
+        viewModelScope.launch { energySignalManager.onPermissionResult(granted) }
+    }
+
+    fun refreshEnergySignal() {
+        viewModelScope.launch { energySignalManager.refresh() }
+    }
+
     fun recompose() {
         if (isCanonicalBusy()) return
         dayWeaveApplication.launchCanonicalAction { dayWeaveApplication.refreshCanonicalState() }

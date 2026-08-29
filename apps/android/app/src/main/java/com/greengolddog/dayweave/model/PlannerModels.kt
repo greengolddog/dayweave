@@ -1,7 +1,8 @@
 package com.greengolddog.dayweave.model
 
-import java.time.LocalTime
+import java.time.Duration
 import java.time.Instant
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.serialization.Serializable
@@ -43,6 +44,46 @@ enum class EnergyLevel(val label: String) {
     MEDIUM("Medium"),
     DEEP("Deep"),
 }
+
+@Serializable
+enum class RecoveryBand(val label: String) {
+    LOW("Low"),
+    BALANCED("Balanced"),
+    HIGH("High"),
+}
+
+@Serializable
+enum class EnergySignalSource(val label: String) {
+    HEALTH_CONNECT_SLEEP("Health Connect sleep estimate"),
+    MANUAL_CHECK_IN("Manual check-in"),
+}
+
+/**
+ * Privacy-minimal provider output retained in the encrypted planner snapshot.
+ *
+ * Provider record IDs, sleep bounds/stages, and other raw health measurements intentionally do
+ * not cross this boundary. A future WHOOP provider can produce the same small contract.
+ */
+@Serializable
+data class DerivedEnergySnapshot(
+    val energy: EnergyLevel,
+    val recovery: RecoveryBand,
+    val source: EnergySignalSource,
+    val calculatedAt: String,
+)
+
+@Serializable
+data class ManualEnergyCheckIn(
+    val energy: EnergyLevel,
+    val checkedInAt: String,
+)
+
+data class EffectiveEnergySignal(
+    val energy: EnergyLevel,
+    val recovery: RecoveryBand?,
+    val source: EnergySignalSource,
+    val recordedAt: Instant,
+)
 
 @Serializable
 data class ScheduleItem(
@@ -382,6 +423,12 @@ data class DayWeaveUiState(
     val showCompleted: Boolean = true,
     val quietSuggestions: Boolean = true,
     val useDynamicColor: Boolean = false,
+    /** User-controlled foreground Health Connect reads; never implies background access. */
+    val healthConnectSyncEnabled: Boolean = false,
+    /** Derived bands only. Raw Health Connect records are never persisted in planner state. */
+    val derivedEnergySnapshot: DerivedEnergySnapshot? = null,
+    /** A same-day manual check-in overrides the provider estimate and remains correctable. */
+    val manualEnergyCheckIn: ManualEnergyCheckIn? = null,
     val canonicalItems: List<CanonicalItemSnapshot> = emptyList(),
     val canonicalSyncOrigin: String? = null,
     /** Credential/workspace binding for every canonical cursor/cache field above and below. */
@@ -443,6 +490,52 @@ data class DayWeaveUiState(
     val pendingSuggestionCount: Int
         get() = suggestions.count { it.disposition == SuggestionDisposition.PENDING }
 
+    fun effectiveEnergySignal(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): EffectiveEnergySignal? {
+        manualEnergyCheckIn?.let { checkIn ->
+            val checkedInAt = runCatching { Instant.parse(checkIn.checkedInAt) }.getOrNull()
+            if (
+                checkedInAt != null &&
+                checkedInAt.atZone(currentZone).toLocalDate() ==
+                    reference.atZone(currentZone).toLocalDate()
+            ) {
+                return EffectiveEnergySignal(
+                    energy = checkIn.energy,
+                    recovery = null,
+                    source = EnergySignalSource.MANUAL_CHECK_IN,
+                    recordedAt = checkedInAt,
+                )
+            }
+        }
+
+        val snapshot = derivedEnergySnapshot ?: return null
+        val calculatedAt = runCatching { Instant.parse(snapshot.calculatedAt) }.getOrNull()
+            ?: return null
+        val age = Duration.between(calculatedAt, reference)
+        if (age.isNegative || age > AUTOMATIC_ENERGY_MAX_AGE) return null
+        return EffectiveEnergySignal(
+            energy = snapshot.energy,
+            recovery = snapshot.recovery,
+            source = snapshot.source,
+            recordedAt = calculatedAt,
+        )
+    }
+
+    /** Uses the current signal only for a non-mutating next-block fit hint. */
+    fun energyFitCandidate(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): ScheduleItem? {
+        val capacity = effectiveEnergySignal(reference, currentZone)?.energy ?: return null
+        val capacityRank = capacity.rank()
+        return visibleSchedule.firstOrNull { item ->
+            item.status in setOf(ItemStatus.NOT_STARTED, ItemStatus.SCHEDULED) &&
+                !item.isHardConstraint && item.energy.rank() <= capacityRank
+        }
+    }
+
     fun canonicalPlanningDate(): java.time.LocalDate? {
         val generated = scheduleGeneratedAt ?: return null
         val zone = schedulePlanningZoneId ?: return null
@@ -464,6 +557,8 @@ data class DayWeaveUiState(
     }
 
     companion object {
+        private val AUTOMATIC_ENERGY_MAX_AGE: Duration = Duration.ofHours(18)
+
         fun preview(): DayWeaveUiState = DayWeaveUiState(
             schedule = listOf(
                 ScheduleItem(
@@ -602,4 +697,10 @@ data class DayWeaveUiState(
             dayScore = 82,
         )
     }
+}
+
+private fun EnergyLevel.rank(): Int = when (this) {
+    EnergyLevel.LOW -> 0
+    EnergyLevel.MEDIUM -> 1
+    EnergyLevel.DEEP -> 2
 }

@@ -8,6 +8,8 @@ import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
+import com.greengolddog.dayweave.health.EnergySignalManager
+import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
@@ -78,6 +80,13 @@ class DayWeaveApplication : Application() {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
             transport = OkHttpGoogleAccountsTransport(),
+        )
+    }
+
+    val energySignalManager: EnergySignalManager by lazy {
+        EnergySignalManager(
+            provider = HealthConnectEnergyProvider(this),
+            plannerStore = plannerStore,
         )
     }
 
