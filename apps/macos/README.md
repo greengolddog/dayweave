@@ -61,15 +61,18 @@ The same authenticated configuration powers canonical planner sync. A sync:
 
 1. pulls the ordered `/v1/items/delta` stream using its opaque cursor;
 2. publishes local Quick Add captures with stable idempotency keys;
-3. sends revision-guarded status replacements only when every canonical field
-   can be round-tripped without loss; and
+3. sends revision-guarded privacy and status replacements only when every
+   canonical field can be round-tripped without loss; and
 4. requests the side-effect-free `/v1/schedule/preview` composition.
 
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
-live in the schema-v5 AES-GCM encrypted planner snapshot. Schema-v1 through v4
-snapshots are migrated once with explicit legacy sensitivity defaults; older
-binaries reject schema v5 instead of rewriting away new state. A sibling-file
+live in the schema-v7 AES-GCM encrypted planner snapshot. Schema-v1 through v4
+snapshots are migrated once with explicit legacy sensitivity defaults; schema
+v5 remains sensitivity-strict and migrates with no invented privacy edit.
+Schema-v6 retained privacy edits migrate as conservatively submitted because an
+older snapshot cannot prove that no request bytes were sent. Older binaries
+reject schema v7 instead of rewriting away new state. A sibling-file
 lock and ciphertext compare-and-swap revision stop a second app process from
 silently overwriting a newer snapshot. Unknown future
 item fields and nested split-policy fields are
@@ -83,9 +86,36 @@ and are shown in the Today diagnostics. Conflicted edits remain encrypted and
 can be explicitly rebased from the selected block after a fresh preview.
 Quick Add trims titles and enforces the API's 500-Unicode-scalar limit. Invalid
 legacy captures are skipped individually, kept locally with a persistent
-diagnostic, and can be edited or deleted in the inspector. Create/status pushes
-resume across syncs after bounded per-run request caps; stability hints are
+diagnostic, and can be edited or deleted in the inspector. Create/privacy/status
+pushes resume across syncs after bounded per-run request caps; stability hints are
 trimmed deterministically to the API's assignment and block-count limits.
+Status publication for an item waits behind that item's complete privacy-edit
+chain, so a bounded privacy run cannot strand the final choice on a stale
+revision.
+
+Quick Add and local-capture recovery expose an own-item **Sensitive** marker.
+For canonical items, the inspector distinguishes a marker set on that item from
+effective sensitivity inherited through an ancestor. Privacy edits are stored
+as encrypted, revision-bound intent with explicit conflict recovery and stable
+idempotency keys. The attempted state is flushed before transport; a submitted
+replacement cannot be canceled or inverted until its exact outcome is observed
+or replayed, and a changed user choice is retained as a follow-up replacement.
+Marking an item hardens its block and Codex redaction boundary immediately; if
+either stage of an ambiguous submitted/follow-up chain marks the item, that
+redaction fence remains active until the chain is reconciled.
+Removing a marker can change canonical-content eligibility only after server
+acceptance is validated: either an exact base-plus-one replacement response
+with complete mutable-field equality, or an authoritative later canonical
+revision that reconciles a submitted request whose response was lost. The
+rendered block remains shielded until a sensitivity-consistent preview is
+applied. Status replacements require the exact response validation, including
+hierarchy fields. An inherited marker cannot be overridden on a child. The
+locked main window, Settings, and menu-bar surfaces continue to expose no
+schedule content.
+Canonical privacy authoring currently starts from a selected rendered block;
+an unscheduled canonical item has no general item-browser editor yet. Any
+already-durable privacy conflict remains visible and recoverable from Today
+diagnostics even when the item has no rendered block.
 
 The seven-day preview validates the server's complete `source_item_revisions`
 map and performs a bounded delta-plus-preview retry if it raced a write. It uses

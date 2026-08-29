@@ -208,6 +208,17 @@ private enum EncryptedPlannerPersistenceScenarios {
             disposition: .conflicted,
             diagnostic: "revision changed"
         )
+        let sensitivityMutation = PendingCanonicalSensitivityMutation(
+            id: UUID(uuidString: "61000000-0000-4000-8000-000000000006")!,
+            itemID: item.id,
+            desiredIsSensitive: false,
+            baseRevision: item.revision,
+            createdAt: base.savedAt,
+            disposition: .conflicted,
+            diagnostic: "privacy revision changed",
+            hasBeenSubmitted: true,
+            followUpIsSensitive: true
+        )
         let outcome = RecurrenceSessionOutcome(
             itemID: item.id,
             occurrenceID: occurrenceID,
@@ -241,6 +252,7 @@ private enum EncryptedPlannerPersistenceScenarios {
             canonicalTombstoneRevisions: [UUID(uuidString: "70000000-0000-4000-8000-000000000007")!: 12],
             completedOccurrenceIDs: [occurrenceID],
             pendingCanonicalMutations: [mutation],
+            pendingCanonicalSensitivityMutations: [sensitivityMutation],
             recurrenceSessionOutcomes: [outcome],
             canonicalConfigurationIdentifier: configurationIdentifier,
             schedulePreviewProvenance: provenance,
@@ -255,6 +267,10 @@ private enum EncryptedPlannerPersistenceScenarios {
         try require(restored.completedOccurrenceIDs == snapshot.completedOccurrenceIDs, "Occurrence state was not restored")
         try require(restored.canonicalTombstoneRevisions == snapshot.canonicalTombstoneRevisions, "Tombstone revisions were not restored")
         try require(restored.pendingCanonicalMutations == [mutation], "Pending mutation was not restored")
+        try require(
+            restored.pendingCanonicalSensitivityMutations == [sensitivityMutation],
+            "Pending privacy mutation was not restored"
+        )
         try require(restored.recurrenceSessionOutcomes == [outcome], "Recurrence outcome was not restored")
         try require(
             restored.canonicalConfigurationIdentifier == configurationIdentifier,
@@ -507,12 +523,129 @@ private enum EncryptedPlannerPersistenceScenarios {
         legacyDecoder.userInfo[.dayWeaveAllowsMissingSensitivity] = true
         let decoded = try legacyDecoder.decode(PlannerSnapshot.self, from: payload)
         let migrated = try decoded.migratedToCurrentSchema()
-        try require(migrated.schemaVersion == 5, "Schema 4 did not migrate to schema 5")
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema 4 did not migrate to the current schema"
+        )
         try require(migrated.blocks.allSatisfy { !$0.isSensitive }, "Legacy block invented sensitivity")
         try require(
             migrated.canonicalItems?.allSatisfy { !$0.isSensitive } == true,
             "Legacy canonical item invented sensitivity"
         )
+    }
+
+    static func schemaFiveRemainsSensitivityStrictAndAddsNoPrivacyIntent() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 5,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [try canonicalItem()],
+            executionState: .empty
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var object = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema-5 snapshot was not an object"
+        )
+        object.removeValue(forKey: "pendingCanonicalSensitivityMutations")
+        let payload = try JSONSerialization.data(withJSONObject: object)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        let decoded = try decoder.decode(PlannerSnapshot.self, from: payload)
+        let migrated = try decoded.migratedToCurrentSchema()
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema 5 did not migrate to the current schema"
+        )
+        try require(
+            migrated.pendingCanonicalSensitivityMutations == [],
+            "Schema 5 migration invented a privacy edit"
+        )
+
+        var missingSensitivity = object
+        var items = try requireValue(
+            missingSensitivity["canonicalItems"] as? [[String: Any]],
+            "Schema-5 canonical items were missing"
+        )
+        items[0].removeValue(forKey: "is_sensitive")
+        missingSensitivity["canonicalItems"] = items
+        do {
+            _ = try decoder.decode(
+                PlannerSnapshot.self,
+                from: JSONSerialization.data(withJSONObject: missingSensitivity)
+            )
+            throw PersistenceScenarioFailure(
+                description: "Schema 5 accepted a missing canonical sensitivity field"
+            )
+        } catch is DecodingError {
+            // Schema 5 is never eligible for the pre-sensitivity migration default.
+        }
+    }
+
+    static func schemaSixPrivacyIntentMigratesAsAmbiguouslySubmitted() throws {
+        let base = makeSnapshot()
+        let item = try canonicalItem()
+        let mutation = PendingCanonicalSensitivityMutation(
+            id: UUID(uuidString: "62000000-0000-4000-8000-000000000006")!,
+            itemID: item.id,
+            desiredIsSensitive: false,
+            baseRevision: item.revision,
+            createdAt: base.savedAt,
+            disposition: .pending,
+            diagnostic: nil
+        )
+        let legacy = PlannerSnapshot(
+            schemaVersion: 6,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            canonicalItems: [item],
+            pendingCanonicalSensitivityMutations: [mutation],
+            executionState: .empty
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        var object = try requireValue(
+            JSONSerialization.jsonObject(with: encoder.encode(legacy)) as? [String: Any],
+            "Schema-6 snapshot was not an object"
+        )
+        var mutations = try requireValue(
+            object["pendingCanonicalSensitivityMutations"] as? [[String: Any]],
+            "Schema-6 privacy intent was missing"
+        )
+        mutations[0].removeValue(forKey: "hasBeenSubmitted")
+        mutations[0].removeValue(forKey: "followUpIsSensitive")
+        object["pendingCanonicalSensitivityMutations"] = mutations
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        let decoded = try decoder.decode(
+            PlannerSnapshot.self,
+            from: JSONSerialization.data(withJSONObject: object)
+        )
+        let migrated = try decoded.migratedToCurrentSchema()
+        let restored = try requireValue(
+            migrated.pendingCanonicalSensitivityMutations?.first,
+            "Schema-6 privacy intent was discarded"
+        )
+        try require(restored.hasBeenSubmitted, "Schema-6 ambiguity became cancelable")
+        try require(restored.followUpIsSensitive == nil, "Migration invented a follow-up edit")
     }
 
     private static func require(
@@ -679,6 +812,18 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
     func testEncryptedSchemaOneIsAtomicallyRewritten() throws {
         try EncryptedPlannerPersistenceScenarios.encryptedSchemaOneIsAtomicallyRewritten()
     }
+
+    func testSchemaFourAddsExplicitSensitivityDefaults() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaFourAddsExplicitSensitivityDefaults()
+    }
+
+    func testSchemaFivePrivacyMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaFiveRemainsSensitivityStrictAndAddsNoPrivacyIntent()
+    }
+
+    func testSchemaSixPrivacyAttemptMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSixPrivacyIntentMigratesAsAmbiguouslySubmitted()
+    }
 }
 #elseif canImport(Testing)
 @Suite("Encrypted planner persistence")
@@ -742,6 +887,16 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Schema 4 receives explicit non-sensitive migration defaults")
     func schemaFourSensitivityMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaFourAddsExplicitSensitivityDefaults()
+    }
+
+    @Test("Schema 5 stays sensitivity-strict and migrates with no invented privacy edit")
+    func schemaFivePrivacyMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaFiveRemainsSensitivityStrictAndAddsNoPrivacyIntent()
+    }
+
+    @Test("Schema 6 privacy intent migrates as ambiguously submitted")
+    func schemaSixPrivacyAttemptMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSixPrivacyIntentMigratesAsAmbiguouslySubmitted()
     }
 }
 #endif

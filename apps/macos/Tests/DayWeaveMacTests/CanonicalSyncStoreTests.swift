@@ -24,15 +24,20 @@ struct CanonicalSyncStoreTests {
             ),
             .init(
                 statusCode: 201,
-                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 1))}".utf8)
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 1, isSensitive: true))}".utf8)
             ),
             .init(
                 statusCode: 200,
-                body: Data(Self.previewObject(itemID: itemID, blockID: previewBlockID).utf8)
+                body: Data(Self.previewObject(
+                    itemID: itemID,
+                    blockID: previewBlockID,
+                    itemIsSensitive: true
+                ).utf8)
             )
         )
         let local = ScheduleBlock(
             id: itemID,
+            isSensitive: true,
             title: "Write launch plan",
             kind: .task,
             start: start,
@@ -63,6 +68,8 @@ struct CanonicalSyncStoreTests {
         #expect(planner.blocks[0].id == previewBlockID)
         #expect(planner.blocks[0].sourceItemID == itemID)
         #expect(planner.blocks[0].sourceItemRevision == 1)
+        #expect(planner.blocks[0].isSensitive)
+        #expect(planner.canonicalItems[0].isSensitive)
         #expect(planner.blocks[0].placementReason == "Placed in the earliest matching opening.")
         #expect(sync.lastPreview?.inputDigest == "sha256:test")
         if case .online = sync.status {} else { Issue.record("Expected online sync status") }
@@ -75,6 +82,7 @@ struct CanonicalSyncStoreTests {
             "/gateway/v1/schedule/preview",
         ])
         #expect(requests[1].headers["Idempotency-Key"] == "mac-create-\(itemID.uuidString.lowercased())")
+        #expect(requests[1].jsonBody?["is_sensitive"] as? Bool == true)
         let previewBody = try #require(requests[2].jsonBody)
         let previous = try #require(previewBody["previous_assignments"] as? [[String: Any]])
         // A locally guessed placement is not a server-authored stability hint.
@@ -88,7 +96,11 @@ struct CanonicalSyncStoreTests {
             ),
             .init(
                 statusCode: 200,
-                body: Data(Self.previewObject(itemID: itemID, blockID: previewBlockID).utf8)
+                body: Data(Self.previewObject(
+                    itemID: itemID,
+                    blockID: previewBlockID,
+                    itemIsSensitive: true
+                ).utf8)
             )
         )
         await sync.sync()
@@ -259,6 +271,412 @@ struct CanonicalSyncStoreTests {
         #expect(retried.disposition == .pending)
         #expect(retried.diagnostic == nil)
         #expect(planner.lastScheduleMessage.contains("sync to retry"))
+    }
+
+    @Test("privacy edits are revision-guarded, stable, and safely rebase a local status edit")
+    func testSensitivityEditRebasesStatusIntent() async throws {
+        let token = "canonical-sensitive-edit-token"
+        let itemID = UUID(uuidString: "22100000-2222-4333-8444-200000000000")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+        let block = Self.block(
+            itemID: itemID,
+            revision: 1,
+            start: now.addingTimeInterval(3_600),
+            status: .paused
+        )
+        let planner = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalDeltaCursor: "privacy-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        #expect(planner.setCanonicalItemSensitivity(itemID, isSensitive: true))
+        #expect(planner.blocks[0].isSensitive)
+        #expect(planner.pendingCanonicalSensitivityMutations.count == 1)
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"privacy-same","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 2, isSensitive: true))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 3, status: "paused", isSensitive: true))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 3]).utf8)
+            )
+        )
+
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+
+        #expect(planner.canonicalItem(id: itemID)?.revision == 3)
+        #expect(planner.canonicalItem(id: itemID)?.isSensitive == true)
+        #expect(planner.canonicalItem(id: itemID)?.status == .paused)
+        #expect(planner.pendingCanonicalSensitivityMutations.isEmpty)
+        #expect(planner.pendingCanonicalMutations.isEmpty)
+
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.map(\.method) == ["GET", "PUT", "PUT", "POST"])
+        let privacyBody = try #require(requests[1].jsonBody)
+        #expect((privacyBody["expected_revision"] as? NSNumber)?.uint64Value == 1)
+        #expect((privacyBody["item"] as? [String: Any])?["is_sensitive"] as? Bool == true)
+        #expect(
+            requests[1].headers["Idempotency-Key"]
+                == "mac-sensitive-\(itemID.uuidString.lowercased())-r1-private"
+        )
+        let statusBody = try #require(requests[2].jsonBody)
+        #expect((statusBody["expected_revision"] as? NSNumber)?.uint64Value == 2)
+        #expect((statusBody["item"] as? [String: Any])?["is_sensitive"] as? Bool == true)
+        #expect((statusBody["item"] as? [String: Any])?["status"] as? String == "paused")
+    }
+
+    @Test("a stale privacy edit stays encrypted as an explicit conflict")
+    func testSensitivityConflictRetainsIntent() async throws {
+        let token = "canonical-sensitive-conflict-token"
+        let itemID = UUID(uuidString: "22100000-2222-4333-8444-200000000001")!
+        let blockID = UUID(uuidString: "22100000-2222-4333-8444-200000000002")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+        let planner = PlannerStore(
+            canonicalItems: [item],
+            canonicalDeltaCursor: "privacy-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        #expect(planner.setCanonicalItemSensitivity(itemID, isSensitive: true))
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"privacy-same","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 409,
+                body: Data(#"{"error":{"code":"conflict","message":"revision changed"}}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.previewObject(
+                    itemID: itemID,
+                    blockID: blockID,
+                    itemIsSensitive: false
+                ).utf8)
+            )
+        )
+
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+
+        let mutation = try #require(planner.pendingCanonicalSensitivityMutations.first)
+        #expect(mutation.desiredIsSensitive)
+        #expect(mutation.baseRevision == 1)
+        #expect(mutation.disposition == .conflicted)
+        #expect(mutation.diagnostic?.contains("stale") == true)
+        #expect(planner.blocks.first?.isSensitive == true)
+        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == ["GET", "PUT", "POST"])
+
+        planner.retryConflictedCanonicalSensitivityMutation(mutation.id)
+        let retried = try #require(planner.pendingCanonicalSensitivityMutations.first)
+        #expect(retried.id == mutation.id)
+        #expect(retried.disposition == .pending)
+        #expect(retried.diagnostic == nil)
+    }
+
+    @Test("a lost declassification response cannot erase a later reclassification")
+    func testAmbiguousDeclassificationQueuesExactReclassification() async throws {
+        let token = "canonical-sensitive-ambiguous-token"
+        let itemID = UUID(uuidString: "22100000-2222-4333-8444-200000000003")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(
+            Self.itemObject(id: itemID, revision: 1, isSensitive: true)
+        )
+        let planner = PlannerStore(
+            canonicalItems: [item],
+            canonicalDeltaCursor: "privacy-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        #expect(planner.setCanonicalItemSensitivity(itemID, isSensitive: false))
+
+        URLProtocolStub.storage.reset(key: token)
+        // The replacement request is recorded, but the transport loses its
+        // response. The next delta models that the server did apply it.
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"privacy-ambiguous","has_more":false}"#.utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+        await sync.sync()
+
+        #expect(sync.status.isFailure)
+        var mutation = try #require(planner.pendingCanonicalSensitivityMutations.first)
+        #expect(mutation.desiredIsSensitive == false)
+        #expect(mutation.hasBeenSubmitted)
+        #expect(mutation.followUpIsSensitive == nil)
+
+        // Cached state is still sensitive=true. Reclassifying must preserve
+        // the ambiguous removal and durably queue a follow-up mark.
+        #expect(planner.setCanonicalItemSensitivity(itemID, isSensitive: true))
+        mutation = try #require(planner.pendingCanonicalSensitivityMutations.first)
+        #expect(mutation.desiredIsSensitive == false)
+        #expect(mutation.hasBeenSubmitted)
+        #expect(mutation.followUpIsSensitive == true)
+        #expect(mutation.requestedIsSensitive)
+
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data("""
+                {"changes":[{"type":"upsert","item":\(Self.itemObject(
+                    id: itemID,
+                    revision: 2,
+                    isSensitive: false
+                ))}],"next_cursor":"privacy-observed","has_more":false}
+                """.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 3, isSensitive: true))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 3]).utf8)
+            )
+        )
+        await sync.sync()
+
+        #expect(planner.canonicalItem(id: itemID)?.revision == 3)
+        #expect(planner.canonicalItem(id: itemID)?.isSensitive == true)
+        #expect(planner.pendingCanonicalSensitivityMutations.isEmpty)
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.map(\.method) == ["GET", "PUT", "GET", "PUT", "POST"])
+        let lostRemoval = try #require(requests[1].jsonBody)
+        #expect((lostRemoval["expected_revision"] as? NSNumber)?.uint64Value == 1)
+        #expect((lostRemoval["item"] as? [String: Any])?["is_sensitive"] as? Bool == false)
+        let restoration = try #require(requests[3].jsonBody)
+        #expect((restoration["expected_revision"] as? NSNumber)?.uint64Value == 2)
+        #expect((restoration["item"] as? [String: Any])?["is_sensitive"] as? Bool == true)
+    }
+
+    @Test("status waits behind a capped privacy follow-up on the same item")
+    func testStatusWaitsBehindCappedPrivacyFollowUp() async throws {
+        let token = "canonical-sensitive-follow-up-cap-token"
+        let itemID = UUID(uuidString: "22100000-2222-4333-8444-200000000005")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(
+            Self.itemObject(id: itemID, revision: 1, isSensitive: true)
+        )
+        let block = Self.block(
+            itemID: itemID,
+            revision: 1,
+            start: now.addingTimeInterval(3_600),
+            status: .paused
+        )
+        let statusMutation = PendingCanonicalMutation(
+            id: UUID(uuidString: "22100000-2222-4333-8444-200000000006")!,
+            itemID: itemID,
+            occurrenceID: nil,
+            sessionIndex: nil,
+            desiredStatus: .paused,
+            baseRevision: 1,
+            createdAt: now,
+            disposition: .pending,
+            diagnostic: nil
+        )
+        let privacyMutation = PendingCanonicalSensitivityMutation(
+            id: UUID(uuidString: "22100000-2222-4333-8444-200000000007")!,
+            itemID: itemID,
+            desiredIsSensitive: false,
+            baseRevision: 1,
+            createdAt: now,
+            disposition: .pending,
+            diagnostic: nil,
+            hasBeenSubmitted: true,
+            followUpIsSensitive: true
+        )
+        let planner = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalDeltaCursor: "privacy-cap-before",
+            pendingCanonicalMutations: [statusMutation],
+            pendingCanonicalSensitivityMutations: [privacyMutation],
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"privacy-cap-one","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 2, isSensitive: false))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 2]).utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"privacy-cap-two","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 3, isSensitive: true))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 4, status: "paused", isSensitive: true))}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 4]).utf8)
+            )
+        )
+        let sync = CanonicalSyncStore(
+            planner: planner,
+            configurationStore: FixedAPIConfigurationStore(baseURL: Self.configurationIdentifier),
+            tokenStore: TestBearerTokenStore(token: token),
+            session: URLProtocolStub.makeSession(),
+            statusPushLimit: 1,
+            now: { now }
+        )
+
+        await sync.sync()
+
+        let followUp = try #require(planner.pendingCanonicalSensitivityMutations.first)
+        #expect(followUp.desiredIsSensitive)
+        #expect(followUp.baseRevision == 2)
+        #expect(followUp.disposition == .pending)
+        #expect(planner.pendingCanonicalMutations.first?.baseRevision == 2)
+        #expect(planner.canonicalItem(id: itemID)?.revision == 2)
+        #expect(planner.blocks.first?.isSensitive == true)
+        #expect(sync.warnings.contains { $0.contains("status edit was deferred safely") })
+        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == ["GET", "PUT", "POST"])
+
+        await sync.sync()
+
+        #expect(planner.pendingCanonicalSensitivityMutations.isEmpty)
+        #expect(planner.pendingCanonicalMutations.isEmpty)
+        #expect(planner.canonicalItem(id: itemID)?.revision == 4)
+        #expect(planner.canonicalItem(id: itemID)?.isSensitive == true)
+        #expect(planner.canonicalItem(id: itemID)?.status == .paused)
+        #expect(
+            URLProtocolStub.storage.requests(for: token).map(\.method)
+                == ["GET", "PUT", "POST", "GET", "PUT", "PUT", "POST"]
+        )
+    }
+
+    @Test("status replacement cannot remove a sensitive parent")
+    func testStatusReplacementRejectsParentRemoval() async throws {
+        let token = "canonical-status-parent-removal-token"
+        let parentID = UUID(uuidString: "22200000-2222-4333-8444-200000000000")!
+        let childID = UUID(uuidString: "22200000-2222-4333-8444-200000000001")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let parent = try Self.decodeItem(Self.itemObject(
+            id: parentID,
+            revision: 1,
+            isSensitive: true
+        ))
+        let child = try Self.decodeItem(Self.itemObject(
+            id: childID,
+            revision: 1,
+            parentID: parentID
+        ))
+        var block = Self.block(
+            itemID: childID,
+            revision: 1,
+            start: now.addingTimeInterval(3_600),
+            status: .paused
+        )
+        block.isSensitive = true
+        let planner = PlannerStore(
+            blocks: [block],
+            canonicalItems: [parent, child],
+            canonicalDeltaCursor: "status-parent-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"status-parent-same","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: childID, revision: 2, status: "paused", parentID: nil))}".utf8)
+            )
+        )
+
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+
+        #expect(planner.canonicalItem(id: childID)?.parentID == parentID)
+        #expect(planner.pendingCanonicalMutations.first?.desiredStatus == .paused)
+        #expect(planner.blocks.first?.isSensitive == true)
+        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == ["GET", "PUT"])
+    }
+
+    @Test("status replacement requires exactly base revision plus one")
+    func testStatusReplacementRejectsRevisionJump() async throws {
+        let token = "canonical-status-revision-jump-token"
+        let itemID = UUID(uuidString: "22200000-2222-4333-8444-200000000002")!
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+        let block = Self.block(
+            itemID: itemID,
+            revision: 1,
+            start: now.addingTimeInterval(3_600),
+            status: .paused
+        )
+        let planner = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalDeltaCursor: "status-jump-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(#"{"changes":[],"next_cursor":"status-jump-same","has_more":false}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.itemObject(id: itemID, revision: 3, status: "paused"))}".utf8)
+            )
+        )
+
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+
+        #expect(planner.canonicalItem(id: itemID)?.revision == 1)
+        #expect(planner.pendingCanonicalMutations.first?.desiredStatus == .paused)
+        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == ["GET", "PUT"])
     }
 
     @Test("one split session never completes the whole canonical item")

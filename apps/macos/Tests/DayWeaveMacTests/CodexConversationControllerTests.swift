@@ -124,6 +124,129 @@ struct CodexConversationControllerTests {
         #expect(input.contains("\"privateBusySpans\""))
     }
 
+    @Test("a locally queued privacy mark redacts content before any network round trip")
+    func testPendingSensitivityMarkRedactsImmediately() throws {
+        let itemID = UUID(uuidString: "90500000-0000-4000-8000-000000000001")!
+        let canary = "SYNTHETIC-PENDING-PRIVACY-CANARY"
+        let item = try Self.canonicalItem(
+            id: itemID,
+            parentID: nil,
+            isSensitive: false,
+            title: canary,
+            kind: "task",
+            isExecutable: true
+        )
+        let block = ScheduleBlock(
+            id: UUID(uuidString: "90500000-0000-4000-8000-000000000002")!,
+            isSensitive: false,
+            title: canary,
+            kind: .task,
+            start: Date(timeIntervalSince1970: 1_787_980_000),
+            end: Date(timeIntervalSince1970: 1_787_983_600),
+            status: .scheduled,
+            project: "SYNTHETIC-PENDING-PRIVATE-PROJECT",
+            notes: "SYNTHETIC-PENDING-PRIVATE-NOTES",
+            energy: .deep,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: itemID,
+            sourceItemRevision: 1,
+            syncOrigin: .canonicalPreview,
+            previewKind: "planned"
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            restoreFromPersistence: false
+        )
+
+        #expect(store.setCanonicalItemSensitivity(itemID, isSensitive: true))
+        #expect(store.blocks[0].isSensitive)
+        let snapshot = store.codexPlannerContextSnapshot()
+        #expect(snapshot.scheduledBlocks.isEmpty)
+        #expect(snapshot.plannerItems.isEmpty)
+        #expect(snapshot.privateBusySpans.count == 1)
+
+        let input = try CodexPlannerContextSerializer.turnInput(
+            snapshot: snapshot,
+            userMessage: "What is available?"
+        )
+        for forbidden in [
+            canary,
+            "SYNTHETIC-PENDING-PRIVATE-PROJECT",
+            "SYNTHETIC-PENDING-PRIVATE-NOTES",
+            itemID.uuidString,
+        ] {
+            #expect(!input.localizedCaseInsensitiveContains(forbidden))
+        }
+    }
+
+    @Test("a submitted privacy mark stays redacted through a queued unmark")
+    func testAmbiguousMarkWithRemovalFollowUpStaysRedacted() throws {
+        let itemID = UUID(uuidString: "90500000-0000-4000-8000-000000000003")!
+        let canary = "SYNTHETIC-AMBIGUOUS-MARK-CANARY"
+        let item = try Self.canonicalItem(
+            id: itemID,
+            parentID: nil,
+            isSensitive: false,
+            title: canary,
+            kind: "task",
+            isExecutable: true
+        )
+        let block = ScheduleBlock(
+            id: UUID(uuidString: "90500000-0000-4000-8000-000000000004")!,
+            isSensitive: false,
+            title: canary,
+            kind: .task,
+            start: Date(timeIntervalSince1970: 1_787_980_000),
+            end: Date(timeIntervalSince1970: 1_787_983_600),
+            status: .scheduled,
+            project: "SYNTHETIC-AMBIGUOUS-MARK-PROJECT",
+            notes: "SYNTHETIC-AMBIGUOUS-MARK-NOTES",
+            energy: .deep,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: itemID,
+            sourceItemRevision: 1,
+            syncOrigin: .canonicalPreview,
+            previewKind: "planned"
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            restoreFromPersistence: false
+        )
+
+        #expect(store.setCanonicalItemSensitivity(itemID, isSensitive: true))
+        let submitted = try #require(store.pendingCanonicalSensitivityMutations.first)
+        #expect(store.markCanonicalSensitivityMutationSubmitted(submitted.id))
+        #expect(store.setCanonicalItemSensitivity(itemID, isSensitive: false))
+        let mutation = try #require(store.pendingCanonicalSensitivityMutations.first)
+        #expect(mutation.desiredIsSensitive)
+        #expect(mutation.followUpIsSensitive == false)
+        #expect(mutation.requestedIsSensitive == false)
+        #expect(mutation.requiresSensitivePresentation)
+
+        let snapshot = store.codexPlannerContextSnapshot()
+        #expect(snapshot.scheduledBlocks.isEmpty)
+        #expect(snapshot.plannerItems.isEmpty)
+        #expect(snapshot.privateBusySpans.count == 1)
+        let input = try CodexPlannerContextSerializer.turnInput(
+            snapshot: snapshot,
+            userMessage: "What is available?"
+        )
+        for forbidden in [
+            canary,
+            "SYNTHETIC-AMBIGUOUS-MARK-PROJECT",
+            "SYNTHETIC-AMBIGUOUS-MARK-NOTES",
+            itemID.uuidString,
+        ] {
+            #expect(!input.localizedCaseInsensitiveContains(forbidden))
+        }
+    }
+
     @Test("private block metadata cannot perturb public references or serialized context")
     func testSensitiveMetadataHasNoObservableOrderingSideChannel() throws {
         let instant = Date(timeIntervalSince1970: 1_788_033_600)

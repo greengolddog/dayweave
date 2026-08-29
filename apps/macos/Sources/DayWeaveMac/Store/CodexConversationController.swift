@@ -537,13 +537,19 @@ extension PlannerStore: CodexPlannerContextProviding {
     func codexPlannerContextSnapshot() -> CodexPlannerContextSnapshot {
         let generatedAt = Date()
         let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        let locallyMarkedSensitive = Set(pendingCanonicalSensitivityMutations.compactMap {
+            $0.requiresSensitivePresentation ? $0.itemID : nil
+        })
         func effectivelySensitive(_ itemID: UUID) -> Bool {
             var visited = Set<UUID>()
             var currentID: UUID? = itemID
             var sensitive = false
             while let id = currentID {
                 guard visited.insert(id).inserted, let item = canonicalByID[id] else { return true }
-                sensitive = sensitive || item.isSensitive
+                // A local mark becomes a redaction boundary immediately. A
+                // pending unmark never declassifies content before the server
+                // confirms the revision-guarded replacement.
+                sensitive = sensitive || item.isSensitive || locallyMarkedSensitive.contains(id)
                 currentID = item.parentID
             }
             return sensitive

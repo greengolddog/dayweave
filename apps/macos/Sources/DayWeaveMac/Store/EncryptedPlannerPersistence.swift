@@ -185,10 +185,12 @@ private struct PlannerSnapshotSchemaProbe: Decodable {
 struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Version 2 added canonical sync state, version 3 added persistent local
     /// capture quarantine diagnostics, version 4 added the encrypted execution
-    /// replay fence and immutable terminal ledger, and version 5 adds explicit
-    /// sensitivity to canonical items and derived schedule blocks. Older binaries
-    /// reject the newer schema instead of rewriting fields they do not understand.
-    static let currentSchemaVersion = 5
+    /// replay fence and immutable terminal ledger, version 5 adds explicit
+    /// sensitivity to canonical items and derived schedule blocks, version 6
+    /// adds durable, revision-bound sensitivity edits, and version 7 adds the
+    /// submitted-request and follow-up fence. Older binaries reject the newer
+    /// schema instead of rewriting fields they do not understand.
+    static let currentSchemaVersion = 7
 
     let schemaVersion: Int
     let savedAt: Date
@@ -206,6 +208,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let canonicalTombstoneRevisions: [UUID: UInt64]?
     let completedOccurrenceIDs: Set<UUID>?
     let pendingCanonicalMutations: [PendingCanonicalMutation]?
+    let pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation]?
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]?
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
@@ -229,6 +232,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         canonicalTombstoneRevisions: [UUID: UInt64]? = nil,
         completedOccurrenceIDs: Set<UUID>? = nil,
         pendingCanonicalMutations: [PendingCanonicalMutation]? = nil,
+        pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation]? = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
@@ -251,6 +255,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.canonicalTombstoneRevisions = canonicalTombstoneRevisions
         self.completedOccurrenceIDs = completedOccurrenceIDs
         self.pendingCanonicalMutations = pendingCanonicalMutations
+        self.pendingCanonicalSensitivityMutations = pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = recurrenceSessionOutcomes
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
@@ -261,8 +266,68 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         switch schemaVersion {
         case Self.currentSchemaVersion:
-            guard executionState != nil else { throw .snapshotDecodingFailed }
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil else {
+                throw .snapshotDecodingFailed
+            }
             return self
+        case 6:
+            guard executionState != nil,
+                  let pendingCanonicalSensitivityMutations else {
+                throw .snapshotDecodingFailed
+            }
+            let conservativelySubmitted = pendingCanonicalSensitivityMutations.map {
+                var mutation = $0
+                mutation.hasBeenSubmitted = true
+                mutation.followUpIsSensitive = nil
+                return mutation
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: conservativelySubmitted,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
+        case 5:
+            guard executionState != nil else { throw .snapshotDecodingFailed }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: [],
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 4:
             return PlannerSnapshot(
                 destination: destination,
@@ -473,7 +538,9 @@ struct EncryptedPlannerPersistence: Sendable {
             let probe = try JSONDecoder().decode(PlannerSnapshotSchemaProbe.self, from: plaintext)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .millisecondsSince1970
-            if (1..<PlannerSnapshot.currentSchemaVersion).contains(probe.schemaVersion) {
+            // Only schemas that predate the sensitivity field may default it.
+            // Schema 5 and every newer schema remain sensitivity-strict.
+            if (1..<5).contains(probe.schemaVersion) {
                 decoder.userInfo[.dayWeaveAllowsMissingSensitivity] = true
             }
             snapshot = try decoder.decode(PlannerSnapshot.self, from: plaintext)

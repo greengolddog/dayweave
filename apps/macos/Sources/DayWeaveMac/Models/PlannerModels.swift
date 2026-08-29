@@ -210,6 +210,79 @@ struct PendingCanonicalMutation: Identifiable, Hashable, Codable, Sendable {
     var executionSessionID: UUID? = nil
 }
 
+/// Durable, revision-bound intent to change only an item's own privacy marker.
+/// Inherited sensitivity is derived from the canonical hierarchy and is never
+/// overridden by a child edit.
+struct PendingCanonicalSensitivityMutation: Identifiable, Hashable, Codable, Sendable {
+    let id: UUID
+    let itemID: UUID
+    var desiredIsSensitive: Bool
+    var baseRevision: UInt64
+    let createdAt: Date
+    var disposition: CanonicalMutationDisposition
+    var diagnostic: String?
+    /// Set and durably flushed before the first request byte is sent. Once
+    /// submitted, the current replacement cannot be canceled or inverted
+    /// until its exact outcome is reconciled.
+    var hasBeenSubmitted: Bool = false
+    /// A user-requested final classification that must run only after the
+    /// submitted replacement above is observed or replayed exactly.
+    var followUpIsSensitive: Bool? = nil
+
+    var requestedIsSensitive: Bool {
+        followUpIsSensitive ?? desiredIsSensitive
+    }
+
+    /// Privacy is a one-way presentation fence across an ambiguous chain. If
+    /// either the submitted replacement or its queued final replacement marks
+    /// the item sensitive, content must remain redacted until both are
+    /// authoritatively reconciled.
+    var requiresSensitivePresentation: Bool {
+        desiredIsSensitive || followUpIsSensitive == true
+    }
+}
+
+extension PendingCanonicalSensitivityMutation {
+    private enum CodingKeys: String, CodingKey {
+        case id, itemID, desiredIsSensitive, baseRevision, createdAt
+        case disposition, diagnostic, hasBeenSubmitted, followUpIsSensitive
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        desiredIsSensitive = try container.decode(Bool.self, forKey: .desiredIsSensitive)
+        baseRevision = try container.decode(UInt64.self, forKey: .baseRevision)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        disposition = try container.decode(CanonicalMutationDisposition.self, forKey: .disposition)
+        diagnostic = try container.decodeIfPresent(String.self, forKey: .diagnostic)
+        // A pre-fence schema cannot prove that a retained request was never
+        // sent. Missing attempt state is therefore ambiguous, never cancelable.
+        hasBeenSubmitted = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .hasBeenSubmitted
+        ) ?? true
+        followUpIsSensitive = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .followUpIsSensitive
+        )
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(desiredIsSensitive, forKey: .desiredIsSensitive)
+        try container.encode(baseRevision, forKey: .baseRevision)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(disposition, forKey: .disposition)
+        try container.encodeIfPresent(diagnostic, forKey: .diagnostic)
+        try container.encode(hasBeenSubmitted, forKey: .hasBeenSubmitted)
+        try container.encodeIfPresent(followUpIsSensitive, forKey: .followUpIsSensitive)
+    }
+}
+
 enum RecurrenceSessionDisposition: String, Codable, Hashable, Sendable {
     case completed
     case skipped

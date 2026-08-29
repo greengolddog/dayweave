@@ -172,6 +172,12 @@ final class CanonicalSyncStore: ObservableObject {
                 operationID: operationID,
                 generation: generation
             )
+            status = .syncing("Publishing privacy changes…")
+            let privacyUpdated = try await publishSensitivityChanges(
+                client: client,
+                operationID: operationID,
+                generation: generation
+            )
             status = .syncing("Reconciling status changes…")
             let updated = try await publishSafeStatusChanges(
                 client: client,
@@ -192,7 +198,12 @@ final class CanonicalSyncStore: ObservableObject {
             let rendered = render(preview)
             planner.applySchedulePreview(
                 blocks: rendered,
-                message: previewMessage(preview, created: created, updated: updated),
+                message: previewMessage(
+                    preview,
+                    created: created,
+                    privacyUpdated: privacyUpdated,
+                    updated: updated
+                ),
                 provenance: .init(
                     configurationIdentifier: client.configurationIdentifier,
                     generatedAt: now(),
@@ -581,8 +592,9 @@ final class CanonicalSyncStore: ObservableObject {
                 continue
             }
             if let existing = planner.canonicalItem(id: block.id) {
-                guard existing.title == block.title else {
-                    let diagnostic = "Not published: this identifier already belongs to a differently titled server item. Edit or delete the local capture."
+                guard let intended = makeNewItem(from: block),
+                      DayWeaveCanonicalItemFields(item: existing) == intended.fields else {
+                    let diagnostic = "Not published: this identifier already belongs to a server item with different canonical fields or privacy. Edit or delete the local capture."
                     planner.quarantineLocalCapture(block.id, diagnostic: diagnostic)
                     warnings.append("“\(block.title)” was not published because its identifier already exists remotely.")
                     continue
@@ -623,6 +635,7 @@ final class CanonicalSyncStore: ObservableObject {
             try ensureOperationCurrent(operationID: operationID, generation: generation)
             guard created.id == block.id,
                   created.revision > (planner.canonicalTombstoneRevisions[block.id] ?? 0),
+                  created.isSensitive == newItem.fields.isSensitive,
                   created.status == newItem.fields.status,
                   created.deletedAt == nil else {
                 throw CanonicalSyncError.invalidMutationResponse
@@ -631,6 +644,114 @@ final class CanonicalSyncStore: ObservableObject {
             createdCount += 1
         }
         return createdCount
+    }
+
+    private func publishSensitivityChanges(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> Int {
+        var mutations = planner.pendingCanonicalSensitivityMutations.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        var updatedCount = 0
+        var networkPushes = 0
+
+        while !mutations.isEmpty {
+            let mutation = mutations.removeFirst()
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            guard mutation.disposition == .pending else {
+                warnings.append("A conflicted privacy edit remains encrypted for review.")
+                continue
+            }
+            guard let item = planner.canonicalItem(id: mutation.itemID) else {
+                planner.markCanonicalSensitivityMutationConflicted(
+                    itemID: mutation.itemID,
+                    diagnostic: "The source item is no longer present in the canonical cache."
+                )
+                warnings.append("A local privacy edit targets an item that was removed remotely.")
+                continue
+            }
+            if item.isSensitive == mutation.desiredIsSensitive {
+                if let next = planner.reconcileCanonicalSensitivityObservation(item) {
+                    mutations.append(next)
+                }
+                continue
+            }
+            guard mutation.baseRevision == item.revision else {
+                planner.markCanonicalSensitivityMutationConflicted(
+                    itemID: item.id,
+                    diagnostic: "Remote revision \(item.revision) differs from local privacy-edit base revision \(mutation.baseRevision)."
+                )
+                warnings.append("“\(item.title)” changed remotely; its privacy edit was retained as a conflict.")
+                continue
+            }
+            guard item.supportsLosslessReplacement else {
+                planner.markCanonicalSensitivityMutationConflicted(
+                    itemID: item.id,
+                    diagnostic: "A full replacement cannot losslessly preserve this item's fields."
+                )
+                warnings.append("“\(item.title)” has fields this app will not overwrite; its privacy edit remains recoverable.")
+                continue
+            }
+            guard planner.executionState.activeSession?.itemID != item.id,
+                  planner.executionState.pendingCommand == nil else {
+                warnings.append("“\(item.title)” has active execution state; its privacy edit was deferred safely.")
+                continue
+            }
+            guard networkPushes < statusPushLimit else {
+                warnings.append(
+                    "Deferred remaining privacy pushes to a later sync after reaching the \(statusPushLimit)-request safety cap."
+                )
+                break
+            }
+            let (expectedRevision, revisionOverflow) = item.revision.addingReportingOverflow(1)
+            guard !revisionOverflow else {
+                throw CanonicalSyncError.invalidMutationResponse
+            }
+            var replacement = DayWeaveCanonicalItemFields(item: item)
+            replacement.isSensitive = mutation.desiredIsSensitive
+
+            do {
+                guard planner.markCanonicalSensitivityMutationSubmitted(mutation.id) else {
+                    throw CanonicalSyncError.localPersistenceUnavailable
+                }
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                networkPushes += 1
+                let updated = try await client.replaceCanonicalItem(
+                    item.id,
+                    expectedRevision: item.revision,
+                    item: replacement,
+                    idempotencyKey: "mac-sensitive-\(item.id.uuidString.lowercased())-r\(item.revision)-\(mutation.desiredIsSensitive ? "private" : "standard")"
+                )
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                guard updated.id == item.id,
+                      updated.revision == expectedRevision,
+                      updated.deletedAt == nil,
+                      DayWeaveCanonicalItemFields(item: updated) == replacement else {
+                    throw CanonicalSyncError.invalidMutationResponse
+                }
+                if let next = planner.applyCanonicalSensitivityMutationResponse(
+                    updated,
+                    replacingBaseRevision: item.revision
+                ) {
+                    mutations.append(next)
+                }
+                updatedCount += 1
+            } catch let error as DayWeaveAPIError {
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                guard case let .server(statusCode, _, _, _) = error, statusCode == 409 else {
+                    throw error
+                }
+                planner.markCanonicalSensitivityMutationConflicted(
+                    itemID: item.id,
+                    diagnostic: "The server rejected privacy-edit base revision \(item.revision) as stale."
+                )
+                warnings.append("“\(item.title)” conflicted remotely; its privacy edit was retained.")
+            }
+        }
+        return updatedCount
     }
 
     private func publishSafeStatusChanges(
@@ -651,6 +772,16 @@ final class CanonicalSyncStore: ObservableObject {
                     diagnostic: "The source item is no longer present in the canonical cache."
                 )
                 warnings.append("A local status edit targets an item that was removed remotely.")
+                continue
+            }
+            guard planner.canonicalSensitivityMutation(itemID: itemID) == nil else {
+                // Privacy replacements own this item's revision until their
+                // complete submitted/follow-up chain is reconciled. Advancing
+                // the item here would strand the final privacy choice on a
+                // stale base revision when the privacy push cap is reached.
+                warnings.append(
+                    "“\(item.title)” has a privacy edit in progress; its status edit was deferred safely."
+                )
                 continue
             }
             guard mutations.count == 1,
@@ -693,6 +824,14 @@ final class CanonicalSyncStore: ObservableObject {
                 warnings.append("“\(item.title)” has fields or a status this app will not overwrite; the edit remains recoverable.")
                 continue
             }
+            let (expectedRevision, revisionOverflow) = item.revision.addingReportingOverflow(1)
+            guard !revisionOverflow else {
+                throw CanonicalSyncError.invalidMutationResponse
+            }
+            let replacement = DayWeaveCanonicalItemFields(
+                item: item,
+                status: desiredStatus
+            )
 
             do {
                 guard networkPushes < statusPushLimit else {
@@ -705,14 +844,13 @@ final class CanonicalSyncStore: ObservableObject {
                 let updated = try await client.replaceCanonicalItem(
                     item.id,
                     expectedRevision: item.revision,
-                    item: DayWeaveCanonicalItemFields(item: item, status: desiredStatus),
+                    item: replacement,
                     idempotencyKey: "mac-status-\(item.id.uuidString.lowercased())-r\(item.revision)-\(desiredStatus.wireValue)"
                 )
                 try ensureOperationCurrent(operationID: operationID, generation: generation)
                 guard updated.id == item.id,
-                      updated.revision > item.revision,
-                      updated.isSensitive == item.isSensitive,
-                      updated.status == desiredStatus,
+                      updated.revision == expectedRevision,
+                      DayWeaveCanonicalItemFields(item: updated) == replacement,
                       updated.deletedAt == nil else {
                     throw CanonicalSyncError.invalidMutationResponse
                 }
@@ -755,6 +893,7 @@ final class CanonicalSyncStore: ObservableObject {
         return DayWeaveNewCanonicalItem(
             id: block.id,
             fields: DayWeaveCanonicalItemFields(
+                isSensitive: block.isSensitive,
                 kind: kind,
                 status: status,
                 title: block.title,
@@ -1030,6 +1169,7 @@ final class CanonicalSyncStore: ObservableObject {
     private func previewMessage(
         _ preview: DayWeaveSchedulePreview,
         created: Int,
+        privacyUpdated: Int,
         updated: Int
     ) -> String {
         var parts = [
@@ -1037,6 +1177,7 @@ final class CanonicalSyncStore: ObservableObject {
             "\(preview.plan.score.unscheduledMinutes)m unscheduled",
         ]
         if created > 0 { parts.append("published \(created) new") }
+        if privacyUpdated > 0 { parts.append("updated \(privacyUpdated) privacy") }
         if updated > 0 { parts.append("updated \(updated)") }
         if !preview.rejectedItems.isEmpty { parts.append("\(preview.rejectedItems.count) need review") }
         if !warnings.isEmpty { parts.append("\(warnings.count) sync warning\(warnings.count == 1 ? "" : "s")") }

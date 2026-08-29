@@ -40,6 +40,12 @@ enum PlannerExecutionStateError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum CanonicalSensitivityPresentation: Equatable, Sendable {
+    case standard
+    case own
+    case inherited
+}
+
 private struct CanonicalSessionKey: Hashable {
     let itemID: UUID
     let occurrenceID: UUID?
@@ -85,6 +91,9 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var pendingCanonicalMutations: [PendingCanonicalMutation] {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation] {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var recurrenceSessionOutcomes: [RecurrenceSessionOutcome] {
@@ -135,6 +144,7 @@ final class PlannerStore: ObservableObject {
         canonicalTombstoneRevisions: [UUID: UInt64] = [:],
         completedOccurrenceIDs: Set<UUID> = [],
         pendingCanonicalMutations: [PendingCanonicalMutation] = [],
+        pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation] = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
@@ -173,6 +183,8 @@ final class PlannerStore: ObservableObject {
             ?? canonicalTombstoneRevisions
         self.completedOccurrenceIDs = restoredSnapshot?.completedOccurrenceIDs ?? completedOccurrenceIDs
         self.pendingCanonicalMutations = restoredSnapshot?.pendingCanonicalMutations ?? pendingCanonicalMutations
+        self.pendingCanonicalSensitivityMutations = restoredSnapshot?.pendingCanonicalSensitivityMutations
+            ?? pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = restoredSnapshot?.recurrenceSessionOutcomes ?? recurrenceSessionOutcomes
         self.canonicalConfigurationIdentifier = restoredSnapshot?.canonicalConfigurationIdentifier
             ?? canonicalConfigurationIdentifier
@@ -307,6 +319,7 @@ final class PlannerStore: ObservableObject {
         canonicalTombstoneRevisions = [:]
         completedOccurrenceIDs = []
         pendingCanonicalMutations = []
+        pendingCanonicalSensitivityMutations = []
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
@@ -384,6 +397,7 @@ final class PlannerStore: ObservableObject {
             || !canonicalTombstoneRevisions.isEmpty
             || !completedOccurrenceIDs.isEmpty
             || !pendingCanonicalMutations.isEmpty
+            || !pendingCanonicalSensitivityMutations.isEmpty
             || !recurrenceSessionOutcomes.isEmpty
             || schedulePreviewProvenance != nil
             || blocks.contains {
@@ -525,6 +539,18 @@ final class PlannerStore: ObservableObject {
                             diagnostic: "Remote revision \(item.revision) differs from local base revision \(mutation.baseRevision)."
                         )
                     }
+                    if let mutation = pendingCanonicalSensitivityMutations.first(where: {
+                        $0.itemID == item.id && $0.baseRevision != item.revision
+                    }) {
+                        if item.isSensitive == mutation.desiredIsSensitive {
+                            reconcileCanonicalSensitivityObservation(item)
+                        } else {
+                            markCanonicalSensitivityMutationConflicted(
+                                itemID: item.id,
+                                diagnostic: "Remote revision \(item.revision) differs from local privacy-edit base revision \(mutation.baseRevision)."
+                            )
+                        }
+                    }
                 }
             case let .tombstone(tombstone):
                 if tombstone.revision >= (indexed[tombstone.id]?.revision ?? 0),
@@ -535,11 +561,16 @@ final class PlannerStore: ObservableObject {
                         itemID: tombstone.id,
                         diagnostic: "The item was deleted remotely at revision \(tombstone.revision)."
                     )
+                    markCanonicalSensitivityMutationConflicted(
+                        itemID: tombstone.id,
+                        diagnostic: "The item was deleted remotely at revision \(tombstone.revision)."
+                    )
                 }
             }
         }
         canonicalItems = Self.hierarchicallySorted(Array(indexed.values))
         canonicalDeltaCursor = nextCursor
+        hardenPendingSensitivityPresentation()
         pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys))
     }
 
@@ -632,6 +663,10 @@ final class PlannerStore: ObservableObject {
         let uniqueOutcomeBlocks = retainedOutcomeBlocks.filter { !retainedIDs.contains($0.id) }
         blocks = (merged + retainedEditedBlocks + uniqueOutcomeBlocks + pendingLocalBlocks)
             .sorted { $0.start < $1.start }
+        // A pending or conflicted local privacy mark is a one-way hardening
+        // boundary. A server preview cannot visually or contextually lower it
+        // before that intent is explicitly resolved.
+        hardenPendingSensitivityPresentation()
         selectedBlockID = blocks.first(where: { $0.id == previousSelection })?.id
             ?? blocks.first(where: { $0.sourceItemID == selectedSourceID })?.id
             ?? blocks.first?.id
@@ -648,21 +683,239 @@ final class PlannerStore: ObservableObject {
     }
 
     /// Resolves inherited sensitivity and fails closed for a missing or cyclic ancestor.
-    private func effectiveSensitivity(itemID: UUID) -> Bool {
+    private func effectiveSensitivity(
+        itemID: UUID,
+        includingPendingMarks: Bool = true
+    ) -> Bool {
         let items = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        let pendingMarks: Set<UUID> = includingPendingMarks
+            ? Set(pendingCanonicalSensitivityMutations.compactMap {
+                $0.requiresSensitivePresentation ? $0.itemID : nil
+            })
+            : Set()
         var visited = Set<UUID>()
         var currentID: UUID? = itemID
         var sensitive = false
         while let id = currentID {
             guard visited.insert(id).inserted, let item = items[id] else { return true }
-            sensitive = sensitive || item.isSensitive
+            sensitive = sensitive || item.isSensitive || pendingMarks.contains(id)
             currentID = item.parentID
         }
         return sensitive
     }
 
+    func canonicalSensitivityPresentation(itemID: UUID) -> CanonicalSensitivityPresentation {
+        guard let item = canonicalItem(id: itemID) else { return .inherited }
+        if item.isSensitive { return .own }
+        return effectiveSensitivity(itemID: itemID, includingPendingMarks: false)
+            ? .inherited
+            : .standard
+    }
+
+    func canonicalSensitivityMutation(
+        itemID: UUID
+    ) -> PendingCanonicalSensitivityMutation? {
+        pendingCanonicalSensitivityMutations.first { $0.itemID == itemID }
+    }
+
+    func canEditCanonicalSensitivity(itemID: UUID) -> Bool {
+        guard canMutatePlan,
+              let item = canonicalItem(id: itemID),
+              item.deletedAt == nil,
+              item.supportsLosslessReplacement else { return false }
+        return executionState.activeSession?.itemID != itemID
+            && executionState.pendingCommand == nil
+    }
+
     @discardableResult
-    func quickAdd(title: String, kind: PlannerItemKind, minutes: Int) -> Bool {
+    func setCanonicalItemSensitivity(_ itemID: UUID, isSensitive: Bool) -> Bool {
+        guard canEditCanonicalSensitivity(itemID: itemID),
+              let item = canonicalItem(id: itemID) else { return false }
+        if let index = pendingCanonicalSensitivityMutations.firstIndex(where: {
+            $0.itemID == itemID
+        }), pendingCanonicalSensitivityMutations[index].hasBeenSubmitted {
+            // The server may already have applied the submitted replacement.
+            // Preserve its exact bytes/idempotency identity and queue the
+            // user's new classification only as a follow-up.
+            pendingCanonicalSensitivityMutations[index].followUpIsSensitive =
+                isSensitive == pendingCanonicalSensitivityMutations[index].desiredIsSensitive
+                    ? nil
+                    : isSensitive
+            lastScheduleMessage = "Saved the final privacy choice; sync will reconcile the submitted change before applying it"
+        } else if isSensitive == item.isSensitive {
+            pendingCanonicalSensitivityMutations.removeAll { $0.itemID == itemID }
+            lastScheduleMessage = "Discarded the unsubmitted privacy change; canonical state was not changed"
+        } else {
+            pendingCanonicalSensitivityMutations.removeAll { $0.itemID == itemID }
+            pendingCanonicalSensitivityMutations.append(.init(
+                id: UUID(),
+                itemID: itemID,
+                desiredIsSensitive: isSensitive,
+                baseRevision: item.revision,
+                createdAt: now(),
+                disposition: .pending,
+                diagnostic: nil
+            ))
+            lastScheduleMessage = isSensitive
+                ? "Privacy mark saved locally; sync to publish it"
+                : "Privacy removal saved locally; content stays redacted until sync confirms it"
+        }
+        hardenPendingSensitivityPresentation()
+        flushPersistence()
+        return true
+    }
+
+    func retryConflictedCanonicalSensitivityMutation(_ mutationID: UUID) {
+        guard let index = pendingCanonicalSensitivityMutations.firstIndex(where: {
+            $0.id == mutationID
+        }),
+              pendingCanonicalSensitivityMutations[index].disposition == .conflicted,
+              canEditCanonicalSensitivity(
+                itemID: pendingCanonicalSensitivityMutations[index].itemID
+              ),
+              let item = canonicalItem(
+                id: pendingCanonicalSensitivityMutations[index].itemID
+              ) else { return }
+        if item.isSensitive == pendingCanonicalSensitivityMutations[index].desiredIsSensitive {
+            let next = advanceCanonicalSensitivityMutation(
+                itemID: item.id,
+                observedIsSensitive: item.isSensitive,
+                observedRevision: item.revision
+            )
+            lastScheduleMessage = next == nil
+                ? "The latest canonical item already has the requested privacy setting"
+                : "The submitted privacy change was reconciled; sync to apply the saved final choice"
+        } else {
+            pendingCanonicalSensitivityMutations[index].baseRevision = item.revision
+            pendingCanonicalSensitivityMutations[index].disposition = .pending
+            pendingCanonicalSensitivityMutations[index].diagnostic = nil
+            pendingCanonicalSensitivityMutations[index].hasBeenSubmitted = false
+            lastScheduleMessage = "Privacy conflict rebased locally; sync to retry against revision \(item.revision)"
+        }
+        hardenPendingSensitivityPresentation()
+        flushPersistence()
+    }
+
+    func keepLatestCanonicalSensitivity(_ mutationID: UUID) {
+        guard canMutatePlan,
+              pendingCanonicalSensitivityMutations.contains(where: {
+                  $0.id == mutationID && $0.disposition == .conflicted
+              }) else { return }
+        pendingCanonicalSensitivityMutations.removeAll { $0.id == mutationID }
+        lastScheduleMessage = "Kept the latest canonical privacy setting"
+        flushPersistence()
+    }
+
+    func markCanonicalSensitivityMutationConflicted(
+        itemID: UUID,
+        diagnostic: String
+    ) {
+        guard canPersistPlan,
+              let index = pendingCanonicalSensitivityMutations.firstIndex(where: {
+                  $0.itemID == itemID
+              }) else { return }
+        pendingCanonicalSensitivityMutations[index].disposition = .conflicted
+        pendingCanonicalSensitivityMutations[index].diagnostic = diagnostic
+    }
+
+    func clearCanonicalSensitivityMutation(itemID: UUID) {
+        guard canPersistPlan else { return }
+        pendingCanonicalSensitivityMutations.removeAll { $0.itemID == itemID }
+    }
+
+    @discardableResult
+    func markCanonicalSensitivityMutationSubmitted(_ mutationID: UUID) -> Bool {
+        guard canPersistPlan,
+              let index = pendingCanonicalSensitivityMutations.firstIndex(where: {
+                  $0.id == mutationID && $0.disposition == .pending
+              }) else { return false }
+        if !pendingCanonicalSensitivityMutations[index].hasBeenSubmitted {
+            pendingCanonicalSensitivityMutations[index].hasBeenSubmitted = true
+            flushPersistence()
+        }
+        return persistenceError == nil
+    }
+
+    @discardableResult
+    func reconcileCanonicalSensitivityObservation(
+        _ item: DayWeaveCanonicalItem
+    ) -> PendingCanonicalSensitivityMutation? {
+        guard canPersistPlan,
+              let mutation = canonicalSensitivityMutation(itemID: item.id),
+              mutation.desiredIsSensitive == item.isSensitive else { return nil }
+        return advanceCanonicalSensitivityMutation(
+            itemID: item.id,
+            observedIsSensitive: item.isSensitive,
+            observedRevision: item.revision
+        )
+    }
+
+    @discardableResult
+    func applyCanonicalSensitivityMutationResponse(
+        _ item: DayWeaveCanonicalItem,
+        replacingBaseRevision baseRevision: UInt64
+    ) -> PendingCanonicalSensitivityMutation? {
+        guard canPersistPlan else { return nil }
+        upsertCanonicalItem(item)
+        let next = advanceCanonicalSensitivityMutation(
+            itemID: item.id,
+            observedIsSensitive: item.isSensitive,
+            observedRevision: item.revision
+        )
+        for index in pendingCanonicalMutations.indices
+            where pendingCanonicalMutations[index].itemID == item.id
+                && pendingCanonicalMutations[index].baseRevision == baseRevision
+                && pendingCanonicalMutations[index].disposition == .pending {
+            pendingCanonicalMutations[index].baseRevision = item.revision
+        }
+        for index in blocks.indices
+            where blocks[index].sourceItemID == item.id
+                && blocks[index].sourceItemRevision == baseRevision {
+            blocks[index].sourceItemRevision = item.revision
+            if item.isSensitive { blocks[index].isSensitive = true }
+        }
+        hardenPendingSensitivityPresentation()
+        return next
+    }
+
+    private func advanceCanonicalSensitivityMutation(
+        itemID: UUID,
+        observedIsSensitive: Bool,
+        observedRevision: UInt64
+    ) -> PendingCanonicalSensitivityMutation? {
+        guard let index = pendingCanonicalSensitivityMutations.firstIndex(where: {
+            $0.itemID == itemID && $0.desiredIsSensitive == observedIsSensitive
+        }) else { return nil }
+        let followUp = pendingCanonicalSensitivityMutations[index].followUpIsSensitive
+        pendingCanonicalSensitivityMutations.remove(at: index)
+        guard let followUp, followUp != observedIsSensitive else { return nil }
+        let next = PendingCanonicalSensitivityMutation(
+            id: UUID(),
+            itemID: itemID,
+            desiredIsSensitive: followUp,
+            baseRevision: observedRevision,
+            createdAt: now(),
+            disposition: .pending,
+            diagnostic: nil
+        )
+        pendingCanonicalSensitivityMutations.append(next)
+        return next
+    }
+
+    private func hardenPendingSensitivityPresentation() {
+        for index in blocks.indices {
+            guard let itemID = blocks[index].sourceItemID else { continue }
+            if effectiveSensitivity(itemID: itemID) { blocks[index].isSensitive = true }
+        }
+    }
+
+    @discardableResult
+    func quickAdd(
+        title: String,
+        kind: PlannerItemKind,
+        minutes: Int,
+        isSensitive: Bool = false
+    ) -> Bool {
         guard canMutatePlan,
               let title = Self.normalizedCanonicalTitle(title),
               minutes > 0 else { return false }
@@ -671,6 +924,7 @@ final class PlannerStore: ObservableObject {
         let start = max(lastEnd.addingTimeInterval(10 * 60), currentTime)
         let block = ScheduleBlock(
             id: UUID(),
+            isSensitive: isSensitive,
             title: title,
             kind: kind,
             start: start,
@@ -699,12 +953,22 @@ final class PlannerStore: ObservableObject {
 
     @discardableResult
     func updateLocalCapture(_ id: UUID, title: String) -> Bool {
+        updateLocalCapture(id, title: title, isSensitive: nil)
+    }
+
+    @discardableResult
+    func updateLocalCapture(
+        _ id: UUID,
+        title: String,
+        isSensitive: Bool?
+    ) -> Bool {
         guard canMutatePlan,
               let title = Self.normalizedCanonicalTitle(title),
               let index = blocks.firstIndex(where: {
                   $0.id == id && $0.isLocallyAuthored && $0.sourceItemID == nil
               }) else { return false }
         blocks[index].title = title
+        if let isSensitive { blocks[index].isSensitive = isSensitive }
         localCaptureDiagnostics.removeValue(forKey: id)
         selectedBlockID = id
         lastScheduleMessage = "Updated local capture; sync will validate its placement"
@@ -919,6 +1183,7 @@ final class PlannerStore: ObservableObject {
     var hasExecutionCredentialReplacementBlocker: Bool {
         executionState.hasCredentialReplacementBlocker
             || !pendingCanonicalMutations.isEmpty
+            || !pendingCanonicalSensitivityMutations.isEmpty
     }
 
     /// Binds the encrypted execution cache to an opaque URL+credential digest.
@@ -1045,6 +1310,7 @@ final class PlannerStore: ObservableObject {
         canonicalTombstoneRevisions = [:]
         completedOccurrenceIDs = []
         pendingCanonicalMutations = []
+        pendingCanonicalSensitivityMutations = []
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
@@ -1625,6 +1891,7 @@ final class PlannerStore: ObservableObject {
             canonicalTombstoneRevisions: canonicalTombstoneRevisions,
             completedOccurrenceIDs: completedOccurrenceIDs,
             pendingCanonicalMutations: pendingCanonicalMutations,
+            pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
             recurrenceSessionOutcomes: recurrenceSessionOutcomes,
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,

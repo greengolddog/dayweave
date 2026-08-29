@@ -360,6 +360,11 @@ private struct PreviewDiagnosticsStrip: View {
                             itemTitle: title(for: mutation.itemID)
                         )
                     }
+                    ForEach(conflictedSensitivityMutations) { mutation in
+                        CanonicalSensitivityConflictRecoveryControls(
+                            mutation: mutation
+                        )
+                    }
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -385,6 +390,12 @@ private struct PreviewDiagnosticsStrip: View {
             let title = store.canonicalItem(id: mutation.itemID)?.title ?? mutation.itemID.uuidString
             let state = mutation.disposition == .conflicted ? "conflict" : "pending edit"
             return "\(title): \(state) → \(mutation.desiredStatus.title). \(mutation.diagnostic ?? "Retained in encrypted local storage.")"
+        })
+        result.append(contentsOf: store.pendingCanonicalSensitivityMutations.map { mutation in
+            let title = store.canonicalItem(id: mutation.itemID)?.title ?? mutation.itemID.uuidString
+            let state = mutation.disposition == .conflicted ? "privacy conflict" : "pending privacy edit"
+            let change = mutation.requestedIsSensitive ? "mark sensitive" : "remove own sensitive marker"
+            return "\(title): \(state) → \(change). \(mutation.diagnostic ?? "Retained in encrypted local storage.")"
         })
         result.append(contentsOf: store.recurrenceSessionOutcomes.map { outcome in
             let title = store.canonicalItem(id: outcome.itemID)?.title ?? outcome.itemID.uuidString
@@ -421,6 +432,10 @@ private struct PreviewDiagnosticsStrip: View {
 
     private var conflictedMutations: [PendingCanonicalMutation] {
         store.pendingCanonicalMutations.filter { $0.disposition == .conflicted }
+    }
+
+    private var conflictedSensitivityMutations: [PendingCanonicalSensitivityMutation] {
+        store.pendingCanonicalSensitivityMutations.filter { $0.disposition == .conflicted }
     }
 }
 
@@ -612,6 +627,13 @@ private struct ScheduleBlockView: View {
                             .foregroundStyle(.secondary)
                             .help("Fixed by the scheduler preview")
                     }
+                    if block.isSensitive {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.caption)
+                            .foregroundStyle(.purple)
+                            .help(sensitivityHelp)
+                            .accessibilityLabel(sensitivityHelp)
+                    }
                     Spacer()
                     Text(block.status.title)
                         .font(.caption.weight(.medium))
@@ -668,6 +690,23 @@ private struct ScheduleBlockView: View {
                     .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
                 Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
             }
+        }
+    }
+
+    private var sensitivityHelp: String {
+        guard let itemID = block.sourceItemID else {
+            return "Sensitive local capture"
+        }
+        if let mutation = store.canonicalSensitivityMutation(itemID: itemID),
+           mutation.requiresSensitivePresentation {
+            return mutation.requestedIsSensitive
+                ? "Sensitive privacy mark pending sync"
+                : "Sensitive until submitted privacy changes are reconciled"
+        }
+        return switch store.canonicalSensitivityPresentation(itemID: itemID) {
+        case .standard: "Sensitive schedule details"
+        case .own: "Sensitive on this item"
+        case .inherited: "Sensitive through its hierarchy"
         }
     }
 }
@@ -1012,6 +1051,26 @@ private struct CanonicalConflictRecoveryControls: View {
     }
 }
 
+private struct CanonicalSensitivityConflictRecoveryControls: View {
+    @EnvironmentObject private var store: PlannerStore
+    let mutation: PendingCanonicalSensitivityMutation
+
+    var body: some View {
+        HStack {
+            Button("Retry privacy edit on current revision") {
+                store.retryConflictedCanonicalSensitivityMutation(mutation.id)
+            }
+            .buttonStyle(.link)
+            .disabled(!store.canEditCanonicalSensitivity(itemID: mutation.itemID))
+            Button("Keep latest privacy setting") {
+                store.keepLatestCanonicalSensitivity(mutation.id)
+            }
+            .buttonStyle(.link)
+            .disabled(!store.canMutatePlan)
+        }
+    }
+}
+
 private struct InspectorView: View {
     @EnvironmentObject private var store: PlannerStore
     @State private var tab = 0
@@ -1046,10 +1105,12 @@ private struct BlockInspector: View {
     @EnvironmentObject private var store: PlannerStore
     let block: ScheduleBlock
     @State private var recoveryTitle: String
+    @State private var recoveryIsSensitive: Bool
 
     init(block: ScheduleBlock) {
         self.block = block
         _recoveryTitle = State(initialValue: block.title)
+        _recoveryIsSensitive = State(initialValue: block.isSensitive)
     }
 
     var body: some View {
@@ -1082,6 +1143,10 @@ private struct BlockInspector: View {
                             )
                         }
                         LabeledContent("Split", value: splitDescription(item.splitPolicy))
+                        LabeledContent(
+                            "Privacy",
+                            value: sensitivityDescription(itemID: itemID)
+                        )
                         if item.parentID != nil {
                             LabeledContent("Hierarchy", value: block.project ?? "Nested item")
                         }
@@ -1119,6 +1184,13 @@ private struct BlockInspector: View {
                     }
                 }
 
+                if let itemID = block.sourceItemID,
+                   let item = store.canonicalItem(id: itemID) {
+                    InspectorSection(title: "Privacy") {
+                        CanonicalSensitivityEditor(item: item)
+                    }
+                }
+
                 if block.isLocallyAuthored, block.sourceItemID == nil {
                     InspectorSection(title: "Local capture recovery") {
                         TextField("Title", text: $recoveryTitle)
@@ -1126,6 +1198,12 @@ private struct BlockInspector: View {
                         Text("\(recoveryTitle.unicodeScalars.count)/\(PlannerStore.maximumCanonicalTitleScalars) Unicode characters")
                             .font(.caption)
                             .foregroundStyle(localCaptureTitleIsValid ? Color.secondary : Color.red)
+                        Toggle(isOn: $recoveryIsSensitive) {
+                            Label("Sensitive", systemImage: "checkmark.shield")
+                        }
+                        Text("Sensitive captures are published with their privacy marker and omitted from Codex context except for an anonymous busy span.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         if let diagnostic = store.localCaptureDiagnostics[block.id] {
                             Text(diagnostic)
                                 .font(.caption)
@@ -1133,7 +1211,11 @@ private struct BlockInspector: View {
                         }
                         HStack {
                             Button("Save title") {
-                                _ = store.updateLocalCapture(block.id, title: recoveryTitle)
+                                _ = store.updateLocalCapture(
+                                    block.id,
+                                    title: recoveryTitle,
+                                    isSensitive: recoveryIsSensitive
+                                )
                             }
                             .disabled(!localCaptureTitleIsValid || !store.canMutatePlan)
                             Button("Delete local capture", role: .destructive) {
@@ -1171,12 +1253,148 @@ private struct BlockInspector: View {
         PlannerStore.normalizedCanonicalTitle(recoveryTitle) != nil
     }
 
+    private func sensitivityDescription(itemID: UUID) -> String {
+        let current = switch store.canonicalSensitivityPresentation(itemID: itemID) {
+        case .standard: "Standard"
+        case .own: "Sensitive on this item"
+        case .inherited: "Sensitive from an ancestor"
+        }
+        guard let mutation = store.canonicalSensitivityMutation(itemID: itemID) else {
+            return current
+        }
+        let requested = mutation.requestedIsSensitive ? "mark pending" : "removal pending"
+        return "\(current) · \(requested)"
+    }
+
     private func splitDescription(_ policy: DayWeaveSplitPolicy) -> String {
         switch policy {
         case .indivisible: "Indivisible"
         case let .splittable(minimum, maximum): "\(minimum / 60)–\(maximum / 60) minute sessions"
         case .unknown: "Unsupported — read only"
         }
+    }
+}
+
+private struct CanonicalSensitivityEditor: View {
+    @EnvironmentObject private var store: PlannerStore
+    let item: DayWeaveCanonicalItem
+    @State private var desiredIsSensitive: Bool
+
+    init(item: DayWeaveCanonicalItem) {
+        self.item = item
+        _desiredIsSensitive = State(initialValue: item.isSensitive)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(currentLabel, systemImage: currentSymbol)
+                .foregroundStyle(currentColor)
+
+            Toggle("Mark this item sensitive", isOn: $desiredIsSensitive)
+                .disabled(!store.canEditCanonicalSensitivity(itemID: item.id))
+
+            Text(helpText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if let mutation {
+                Label(
+                    mutationDescription(mutation),
+                    systemImage: mutation.disposition == .conflicted
+                        ? "exclamationmark.triangle.fill"
+                        : "arrow.triangle.2.circlepath"
+                )
+                .font(.caption)
+                .foregroundStyle(mutation.disposition == .conflicted ? Color.orange : Color.secondary)
+
+                if mutation.disposition == .conflicted {
+                    if let diagnostic = mutation.diagnostic {
+                        Text(diagnostic)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Button("Retry on latest revision") {
+                            store.retryConflictedCanonicalSensitivityMutation(mutation.id)
+                        }
+                        .disabled(!store.canEditCanonicalSensitivity(itemID: item.id))
+                        Button("Keep latest") {
+                            store.keepLatestCanonicalSensitivity(mutation.id)
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            Button(mutation == nil ? "Save privacy change" : "Update privacy change") {
+                _ = store.setCanonicalItemSensitivity(
+                    item.id,
+                    isSensitive: desiredIsSensitive
+                )
+            }
+            .disabled(!canSave)
+        }
+        .onAppear { refreshDraft() }
+        .onChange(of: item.revision) { _, _ in refreshDraft() }
+        .onChange(of: mutation) { _, _ in refreshDraft() }
+    }
+
+    private var mutation: PendingCanonicalSensitivityMutation? {
+        store.canonicalSensitivityMutation(itemID: item.id)
+    }
+
+    private var currentLabel: String {
+        switch store.canonicalSensitivityPresentation(itemID: item.id) {
+        case .standard: "Standard privacy"
+        case .own: "Sensitive on this item"
+        case .inherited: "Sensitive through an ancestor"
+        }
+    }
+
+    private var currentSymbol: String {
+        switch store.canonicalSensitivityPresentation(itemID: item.id) {
+        case .standard: "shield"
+        case .own: "checkmark.shield.fill"
+        case .inherited: "arrow.triangle.branch"
+        }
+    }
+
+    private var currentColor: Color {
+        store.canonicalSensitivityPresentation(itemID: item.id) == .standard
+            ? .secondary
+            : .purple
+    }
+
+    private var helpText: String {
+        if store.canonicalSensitivityPresentation(itemID: item.id) == .inherited {
+            return "This item stays effectively sensitive while any ancestor is sensitive. Turning off its own marker cannot override that hierarchy."
+        }
+        if !item.supportsLosslessReplacement {
+            return "This item contains fields that this build cannot round-trip losslessly, so its privacy marker is read-only."
+        }
+        return "The change is encrypted locally, then sent as a revision-guarded full replacement. Sensitive content is excluded from Codex context."
+    }
+
+    private var canSave: Bool {
+        store.canEditCanonicalSensitivity(itemID: item.id)
+            && desiredIsSensitive != (mutation?.requestedIsSensitive ?? item.isSensitive)
+    }
+
+    private func refreshDraft() {
+        desiredIsSensitive = mutation?.requestedIsSensitive ?? item.isSensitive
+    }
+
+    private func mutationDescription(
+        _ mutation: PendingCanonicalSensitivityMutation
+    ) -> String {
+        if let followUp = mutation.followUpIsSensitive {
+            return followUp
+                ? "A submitted privacy change will be reconciled, then the item will be marked sensitive."
+                : "A submitted privacy change will be reconciled before the final privacy removal."
+        }
+        return mutation.desiredIsSensitive
+            ? "A privacy mark is waiting for sync."
+            : "A privacy removal is waiting for sync; content remains redacted until confirmed."
     }
 }
 
@@ -1707,6 +1925,7 @@ private struct QuickAddView: View {
     @State private var title = ""
     @State private var kind: PlannerItemKind = .task
     @State private var minutes = 30
+    @State private var isSensitive = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1736,10 +1955,22 @@ private struct QuickAddView: View {
 
             Stepper("Estimated duration: \(minutes) minutes", value: $minutes, in: 5...480, step: 5)
 
+            Toggle(isOn: $isSensitive) {
+                Label("Sensitive", systemImage: "checkmark.shield")
+            }
+            Text("Sensitive captures stay encrypted locally and are excluded from Codex context except for anonymous schedule occupancy.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
             HStack {
                 Spacer()
                 Button("Add locally") {
-                    if store.quickAdd(title: title, kind: kind, minutes: minutes) {
+                    if store.quickAdd(
+                        title: title,
+                        kind: kind,
+                        minutes: minutes,
+                        isSensitive: isSensitive
+                    ) {
                         dismiss()
                     }
                 }
