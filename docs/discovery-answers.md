@@ -183,7 +183,7 @@ The conversation briefly reused question numbers 164 and 165 before returning to
 
 ## 141–149 — Nebius deployment and data protection
 
-141. **May the existing Nebius CLI profile `lol` be used?** Yes.
+141. **May the existing local Nebius CLI profile be used?** Yes.
 142. **Should routine deploys and migrations be automated?** Yes.
 143. **Should the personal login bootstrap least-privilege service accounts?** Yes.
 144. **Must runtime and deployment credentials be project-scoped and revocable?** Yes.
@@ -195,7 +195,7 @@ The conversation briefly reused question numbers 164 and 165 before returning to
 
 ## 150–168 — ownership, distribution, identifiers, CI, and release
 
-150. **How may Nebius be accessed for setup?** Through the existing `lol` profile as the owner's user; bootstrap scoped service accounts afterward.
+150. **How may Nebius be accessed for setup?** Through the existing local profile as the owner's user; bootstrap scoped service accounts afterward.
 151. **Where should the private GitHub repository live?** Under the owner's personal `greengolddog` account.
 152. **Is an Apple Developer Program membership available?** No.
 153. **Is a Google Play Console account available?** No.

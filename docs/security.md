@@ -150,9 +150,9 @@ effects must flow through an auditable proposal or outbox boundary.
   filesystem, all Linux capabilities dropped, and `no-new-privileges`.
 - Backups are encrypted with an `age` public recipient before upload. The
   corresponding private identity must remain off the production VM.
-- Deployment, runtime, tunnel, and backup identities are separate; the human
-  `lol` profile is only a bootstrap identity and is never copied to the VM or
-  repository.
+- Deployment, runtime, tunnel, and backup identities are separate; a locally
+  authenticated human profile is only a bootstrap identity and is never copied
+  to the VM or repository.
 
 ### Software supply chain
 

@@ -324,7 +324,7 @@ The initial Nebius deployment uses one regular `cpu-e2` VM (2 vCPU, 8 GiB RAM) i
 
 Encrypted incremental database backups run at least every fifteen minutes and daily snapshots/archives are copied to versioned object storage for seven days. Attachment objects use object versioning/retention consistent with the same policy. A restore verification job uses a temporary isolated database and validates schema, counts, checksums, and a scheduler smoke test.
 
-The `lol` user profile may bootstrap the project, deployment identity, runtime identity, storage policy, and CI federation/credentials. Routine automation uses least-privilege service identities. No CLI profile or long-lived credential is copied into the repository.
+A locally authenticated human profile may bootstrap the project, deployment identity, runtime identity, storage policy, and CI federation/credentials. Routine automation uses least-privilege service identities. No CLI profile or long-lived credential is copied into the repository.
 
 The deployment must produce a monthly cost estimate before creation and alert before the USD 50 including-tax ceiling. Vertical or horizontal scaling is an explicit later decision backed by measured resource pressure.
 
