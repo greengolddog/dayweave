@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install the runtime verified by the app bundle gate
-        run: brew install --cask codex
+        run: scripts/install-codex-runtime-ci.sh
       - run: scripts/build-macos-app.sh
       - run: ditto -c -k --sequesterRsrc --keepParent dist/macos/DayWeave.app dist/DayWeave-macOS.zip
       - uses: actions/upload-artifact@v7

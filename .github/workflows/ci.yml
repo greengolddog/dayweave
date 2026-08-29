@@ -42,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Install the runtime verified by the app bundle gate
-        run: brew install --cask codex
+        run: scripts/install-codex-runtime-ci.sh
       - run: swift build --package-path apps/macos -Xswiftc -warnings-as-errors
       - run: scripts/test-macos.sh -Xswiftc -warnings-as-errors
       - run: scripts/build-macos-app.sh
