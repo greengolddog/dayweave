@@ -1759,6 +1759,97 @@ private struct QuickAddView: View {
     }
 }
 
+struct AppLockedView: View {
+    @EnvironmentObject private var appLock: AppLockController
+
+    var body: some View {
+        ZStack {
+            LinearGradient(
+                colors: [
+                    Color(nsColor: .windowBackgroundColor),
+                    Color.accentColor.opacity(0.08),
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+            .ignoresSafeArea()
+
+            VStack(spacing: 18) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 52, weight: .semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(.tint)
+                    .accessibilityHidden(true)
+                VStack(spacing: 7) {
+                    Text("DayWeave is locked")
+                        .font(.title2.weight(.semibold))
+                    Text("Your schedule, accounts, and assistant stay hidden until you authenticate.")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 390)
+                }
+
+                Button {
+                    Task { await appLock.unlock() }
+                } label: {
+                    if appLock.isAuthenticating {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("Authenticating…")
+                        }
+                    } else {
+                        Label("Unlock DayWeave", systemImage: "touchid")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(appLock.isAuthenticating)
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("app-lock.unlock")
+
+                Text("Use Touch ID or your Mac login password.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if let message = appLock.statusMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 420)
+                        .accessibilityIdentifier("app-lock.status")
+                }
+            }
+            .padding(40)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("app-lock.screen")
+    }
+}
+
+struct AppLockMenuBarView: View {
+    @EnvironmentObject private var appLock: AppLockController
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("DayWeave is locked", systemImage: "lock.fill")
+                .font(.headline)
+            Text("Schedule details are hidden.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button(appLock.isAuthenticating ? "Authenticating…" : "Unlock DayWeave") {
+                Task { await appLock.unlock() }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(appLock.isAuthenticating)
+            Divider()
+            Button("Quit DayWeave") { NSApp.terminate(nil) }
+        }
+        .padding(14)
+        .frame(width: 260)
+    }
+}
+
 struct MenuBarView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
@@ -1828,6 +1919,7 @@ struct SettingsView: View {
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var appLock: AppLockController
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
     @State private var isCanonicalResetConfirmationPresented = false
@@ -1844,6 +1936,38 @@ struct SettingsView: View {
             Section("Accounts") {
                 LabeledContent("Google", value: "Not connected")
                 codexAccountControls
+            }
+            Section("Privacy & app lock") {
+                Toggle("Require authentication to open DayWeave", isOn: appLockEnabledBinding)
+                    .disabled(appLock.isAuthenticating)
+
+                Picker("Lock when away", selection: appLockTimeoutBinding) {
+                    ForEach(AppLockTimeout.allCases) { timeout in
+                        Text(timeout.title).tag(timeout)
+                    }
+                }
+                .disabled(!appLock.preferences.isEnabled || appLock.isAuthenticating)
+
+                if appLock.preferences.isEnabled {
+                    Button("Lock now") { appLock.lockNow() }
+                        .disabled(appLock.isAuthenticating)
+                }
+
+                Text("Cold launches always start locked. When you leave the app, DayWeave hides every window and its menu-bar details after the selected delay. Enabling or disabling the lock requires Touch ID or your Mac login password.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if appLock.isAuthenticating {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Waiting for device-owner authentication…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else if let message = appLock.statusMessage {
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
             Section("DayWeave API") {
                 TextField("https://dayweave.example.com", text: $dayWeaveAPIBaseURL)
@@ -1961,6 +2085,24 @@ struct SettingsView: View {
         return tokenIsBeingReplaced
             || requested.canonicalConfigurationIdentifier
                 != current.canonicalConfigurationIdentifier
+    }
+
+    private var appLockEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { appLock.preferences.isEnabled },
+            set: { enabled in
+                Task { await appLock.setEnabled(enabled) }
+            }
+        )
+    }
+
+    private var appLockTimeoutBinding: Binding<AppLockTimeout> {
+        Binding(
+            get: { appLock.preferences.timeout },
+            set: { timeout in
+                _ = appLock.setTimeout(timeout)
+            }
+        )
     }
 
     private var executionStatusIsFailure: Bool {

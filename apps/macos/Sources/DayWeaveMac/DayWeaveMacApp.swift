@@ -11,6 +11,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var suggestionSync: SuggestionSyncStore
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
+    @StateObject private var appLock: AppLockController
     @State private var activationTask: Task<Void, Never>?
     @State private var servicesAreActive = false
 
@@ -27,26 +28,43 @@ struct DayWeaveMacApp: App {
         _suggestionSync = StateObject(wrappedValue: SuggestionSyncStore())
         _canonicalSync = StateObject(wrappedValue: CanonicalSyncStore(planner: store))
         _executionSync = StateObject(wrappedValue: ExecutionSyncStore(planner: store))
-        codex.startIfNeeded()
+        _appLock = StateObject(wrappedValue: AppLockController.live())
     }
 
     var body: some Scene {
         WindowGroup {
-            RootView()
+            Group {
+                if appLock.isContentAvailable {
+                    RootView()
+                } else {
+                    AppLockedView()
+                }
+            }
                 .environmentObject(store)
                 .environmentObject(codex)
                 .environmentObject(codexConversation)
                 .environmentObject(suggestionSync)
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
+                .environmentObject(appLock)
                 .frame(minWidth: 1_080, minHeight: 720)
                 .onAppear {
+                    updateAppLock(for: scenePhase)
                     if scenePhase == .active {
                         activateServices()
                     }
                 }
                 .onChange(of: scenePhase) { _, phase in
+                    updateAppLock(for: phase)
                     if phase == .active {
+                        activateServices()
+                    } else {
+                        deactivateServices()
+                        store.flushPersistence()
+                    }
+                }
+                .onChange(of: appLock.isContentAvailable) { _, isAvailable in
+                    if isAvailable, scenePhase == .active {
                         activateServices()
                     } else {
                         deactivateServices()
@@ -59,6 +77,30 @@ struct DayWeaveMacApp: App {
                     codexConversation.shutDown()
                     codex.shutDown()
                 }
+                .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                    for: NSWorkspace.sessionDidResignActiveNotification
+                )) { _ in
+                    appLock.applicationBecameInactive()
+                    deactivateServices()
+                    store.flushPersistence()
+                }
+                .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                    for: NSWorkspace.willSleepNotification
+                )) { _ in
+                    appLock.applicationBecameInactive()
+                    deactivateServices()
+                    store.flushPersistence()
+                }
+                .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                    for: NSWorkspace.sessionDidBecomeActiveNotification
+                )) { _ in
+                    resumeAfterSystemBoundaryIfFrontmost()
+                }
+                .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                    for: NSWorkspace.didWakeNotification
+                )) { _ in
+                    resumeAfterSystemBoundaryIfFrontmost()
+                }
         }
         .defaultSize(width: 1_420, height: 900)
         .commands {
@@ -67,41 +109,58 @@ struct DayWeaveMacApp: App {
                     store.isQuickAddPresented = true
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
-                .disabled(!store.canMutatePlan)
+                .disabled(!appLock.isContentAvailable || !store.canMutatePlan)
 
                 Button("Recompose Schedule") {
                     store.recomposeSchedule()
                 }
                 .keyboardShortcut("r", modifiers: [.command, .option])
-                .disabled(!store.canRecomposeSchedule)
+                .disabled(!appLock.isContentAvailable || !store.canRecomposeSchedule)
             }
         }
 
         MenuBarExtra(
             "DayWeave",
-            systemImage: executionSync.activeSession == nil && store.activeItem == nil
-                ? "sparkles" : "timer"
+            systemImage: appLock.isContentAvailable
+                ? (executionSync.activeSession == nil && store.activeItem == nil
+                    ? "sparkles" : "timer")
+                : "lock.fill"
         ) {
-            MenuBarView()
-                .environmentObject(store)
-                .environmentObject(executionSync)
+            Group {
+                if appLock.isContentAvailable {
+                    MenuBarView()
+                        .environmentObject(store)
+                        .environmentObject(executionSync)
+                } else {
+                    AppLockMenuBarView()
+                }
+            }
+            .environmentObject(appLock)
         }
         .menuBarExtraStyle(.window)
 
         Settings {
-            SettingsView()
-                .environmentObject(store)
-                .environmentObject(codex)
-                .environmentObject(suggestionSync)
-                .environmentObject(canonicalSync)
-                .environmentObject(executionSync)
-                .frame(width: 660, height: 620)
+            Group {
+                if appLock.isContentAvailable {
+                    SettingsView()
+                        .environmentObject(store)
+                        .environmentObject(codex)
+                        .environmentObject(suggestionSync)
+                        .environmentObject(canonicalSync)
+                        .environmentObject(executionSync)
+                } else {
+                    AppLockedView()
+                }
+            }
+            .environmentObject(appLock)
+            .frame(width: 660, height: 620)
         }
     }
 
     private func activateServices() {
-        guard !servicesAreActive else { return }
+        guard appLock.isContentAvailable, !servicesAreActive else { return }
         servicesAreActive = true
+        codex.startIfNeeded()
         activationTask = Task { @MainActor in
             let executionOutcome = await executionSync.refresh()
             guard !Task.isCancelled, servicesAreActive else { return }
@@ -119,5 +178,19 @@ struct DayWeaveMacApp: App {
         activationTask?.cancel()
         activationTask = nil
         executionSync.stopForegroundPolling()
+    }
+
+    private func updateAppLock(for phase: ScenePhase) {
+        if phase == .active {
+            appLock.applicationBecameActive()
+        } else {
+            appLock.applicationBecameInactive()
+        }
+    }
+
+    private func resumeAfterSystemBoundaryIfFrontmost() {
+        guard NSApp.isActive else { return }
+        appLock.applicationBecameActive()
+        activateServices()
     }
 }

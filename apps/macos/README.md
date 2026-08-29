@@ -5,6 +5,22 @@ new production profile starts with an empty plan and restores the encrypted
 snapshot synchronously before exposing actions; preview fixtures are used only
 by `PlannerStore.preview` and tests.
 
+## App lock
+
+**Settings → Privacy & app lock** can require Touch ID or the Mac login
+password before any DayWeave content is shown. Enabling and disabling the lock
+both require device-owner authentication. An enabled profile starts locked on
+every cold launch, and the automatic lock delay can be immediate, 1, 5, 15, or
+60 minutes after the app becomes inactive. macOS session-lock and sleep events
+also enter the same inactivity boundary.
+
+While locked, the main window, Settings window, menu-bar details, keyboard
+commands, foreground sync, and contained Codex runtime are unavailable or
+redacted. Authentication cancellations and stale successes after a lifecycle
+change fail closed. Preferences contain no schedule or credential material and
+are stored as one versioned `UserDefaults` record; a malformed existing record
+is treated as enabled so it can be recovered only after authentication.
+
 ## DayWeave API
 
 Open **Settings → DayWeave API** and provide:
