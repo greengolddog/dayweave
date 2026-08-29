@@ -235,11 +235,15 @@ class AppUnlockCoordinatorTest {
     }
 
     @Test
-    fun androidResultMappingUsesCompatibleDeviceCredentialCombination() {
+    fun androidResultMappingUsesCryptoCompatibleAuthenticatorCombinations() {
         assertEquals(
-            BiometricManager.Authenticators.BIOMETRIC_WEAK or
+            BiometricManager.Authenticators.BIOMETRIC_STRONG,
+            AndroidBiometricAppUnlockAuthenticator.allowedAuthenticatorsForSdk(29),
+        )
+        assertEquals(
+            BiometricManager.Authenticators.BIOMETRIC_STRONG or
                 BiometricManager.Authenticators.DEVICE_CREDENTIAL,
-            AndroidBiometricAppUnlockAuthenticator.ALLOWED_AUTHENTICATORS,
+            AndroidBiometricAppUnlockAuthenticator.allowedAuthenticatorsForSdk(30),
         )
         assertEquals(
             AppUnlockAvailability.AVAILABLE,

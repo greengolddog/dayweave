@@ -37,12 +37,17 @@ The supported floor is Android 9 / API 28, so the direct-download release APK in
 **More → Appearance & privacy → App lock** enables an opt-in presentation lock.
 Both enabling and disabling it require a fresh, successful system-owned
 AndroidX BiometricPrompt; reaching an already-unlocked settings screen is not
-enough to remove protection. The prompt accepts a compatible biometric or the
-enrolled device PIN, pattern, or password. The implementation follows the
+enough to remove protection. On Android 11 and newer, the prompt accepts a
+strong biometric or the enrolled device PIN, pattern, or password. Android 9
+and 10 use a strong biometric because those releases cannot combine a
+cryptographic prompt with device-credential fallback. DayWeave follows the
 [official BiometricPrompt guide](https://developer.android.com/identity/sign-in/biometric-auth)
 and uses the [current stable AndroidX Biometric 1.1.0 release](https://developer.android.com/jetpack/androidx/releases/biometric)
-with its API-28-compatible `BIOMETRIC_WEAK | DEVICE_CREDENTIAL` combination.
-DayWeave never receives or stores biometric or device-credential material.
+with an auth-per-use, non-exportable Android Keystore signing key. A prompt
+callback unlocks the app only after its `CryptoObject` signs a fresh random,
+attempt-bound challenge that verifies against that exact key; a bare or forged
+success callback fails closed. DayWeave never receives or stores biometric or
+device-credential material.
 
 When enabled, every cold start is locked. Leaving the app locks immediately or
 after the selected 1, 5, 15, or 30 minute timeout measured by the monotonic

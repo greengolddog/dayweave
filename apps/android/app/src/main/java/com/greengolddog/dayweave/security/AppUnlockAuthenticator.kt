@@ -14,6 +14,19 @@ data class AppLockAuthenticationAttempt(
     val purpose: AppLockAuthenticationPurpose,
 )
 
+internal fun cryptographicAuthenticationOutcome(
+    proof: AppLockCryptographicProof,
+    attempt: AppLockAuthenticationAttempt,
+    authenticatedSignature: java.security.Signature?,
+): AppLockAuthenticationOutcome = if (
+    authenticatedSignature != null &&
+    runCatching { proof.verify(attempt, authenticatedSignature) }.getOrDefault(false)
+) {
+    AppLockAuthenticationOutcome.SUCCESS
+} else {
+    AppLockAuthenticationOutcome.ERROR
+}
+
 @JvmInline
 value class AppAuthenticationOwnerToken internal constructor(internal val value: Long)
 
@@ -42,23 +55,29 @@ interface AppUnlockAuthenticator {
  * Each callback closes over one immutable attempt. Reusing an Activity for a later prompt therefore
  * cannot retag a delayed callback from an earlier platform operation.
  */
-class AndroidBiometricAppUnlockAuthenticator(
+internal class AndroidBiometricAppUnlockAuthenticator(
     private val activity: FragmentActivity,
+    private val cryptographicProof: AppLockCryptographicProof =
+        AndroidKeystoreAppLockCryptographicProof(),
 ) : AppUnlockAuthenticator {
     private val biometricManager = BiometricManager.from(activity)
     private var activeBinding: PromptBinding? = null
 
     override fun availability(): AppUnlockAvailability = availabilityForResult(
-        biometricManager.canAuthenticate(ALLOWED_AUTHENTICATORS),
+        biometricManager.canAuthenticate(allowedAuthenticatorsForSdk()),
     )
 
     override fun authenticate(
         attempt: AppLockAuthenticationAttempt,
         onResult: (AppLockAuthenticationAttempt, AppLockAuthenticationOutcome) -> Unit,
     ) {
+        val signingOperation = cryptographicProof.createSigningOperation()
         val prompt = createPrompt(attempt, onResult)
         activeBinding = PromptBinding(attempt, prompt)
-        prompt.authenticate(promptInfo(attempt.purpose))
+        prompt.authenticate(
+            promptInfo(attempt.purpose),
+            BiometricPrompt.CryptoObject(signingOperation),
+        )
     }
 
     override fun reconnect(
@@ -86,7 +105,13 @@ class AndroidBiometricAppUnlockAuthenticator(
         ContextCompat.getMainExecutor(activity),
         object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-                dispatch(attempt, AppLockAuthenticationOutcome.SUCCESS, onResult)
+                val authenticatedSignature = result.cryptoObject?.signature
+                val outcome = cryptographicAuthenticationOutcome(
+                    proof = cryptographicProof,
+                    attempt = attempt,
+                    authenticatedSignature = authenticatedSignature,
+                )
+                dispatch(attempt, outcome, onResult)
             }
 
             override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
@@ -114,9 +139,14 @@ class AndroidBiometricAppUnlockAuthenticator(
     )
 
     internal companion object {
-        val ALLOWED_AUTHENTICATORS: Int =
-            BiometricManager.Authenticators.BIOMETRIC_WEAK or
-                BiometricManager.Authenticators.DEVICE_CREDENTIAL
+        /** CryptoObject + device credential is supported from Android 11 (API 30). */
+        fun allowedAuthenticatorsForSdk(sdk: Int = Build.VERSION.SDK_INT): Int =
+            if (sdk >= Build.VERSION_CODES.R) {
+                BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                    BiometricManager.Authenticators.DEVICE_CREDENTIAL
+            } else {
+                BiometricManager.Authenticators.BIOMETRIC_STRONG
+            }
 
         private fun promptInfo(purpose: AppLockAuthenticationPurpose) =
             BiometricPrompt.PromptInfo.Builder()
@@ -127,8 +157,14 @@ class AndroidBiometricAppUnlockAuthenticator(
                         AppLockAuthenticationPurpose.DISABLE -> "Turn off app lock"
                     },
                 )
-                .setSubtitle("Use your device screen lock or biometrics")
-                .setAllowedAuthenticators(ALLOWED_AUTHENTICATORS)
+                .setSubtitle(
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        "Use your device screen lock or strong biometrics"
+                    } else {
+                        "Use strong biometrics"
+                    },
+                )
+                .setAllowedAuthenticators(allowedAuthenticatorsForSdk())
                 .build()
 
         fun availabilityForResult(result: Int): AppUnlockAvailability = when (result) {
@@ -360,7 +396,7 @@ object AppLockIntents {
     fun enrollmentOrSecuritySettings(): Intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
         Intent(Settings.ACTION_BIOMETRIC_ENROLL).putExtra(
             Settings.EXTRA_BIOMETRIC_AUTHENTICATORS_ALLOWED,
-            AndroidBiometricAppUnlockAuthenticator.ALLOWED_AUTHENTICATORS,
+            AndroidBiometricAppUnlockAuthenticator.allowedAuthenticatorsForSdk(),
         )
     } else {
         Intent(Settings.ACTION_SECURITY_SETTINGS)
