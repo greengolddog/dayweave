@@ -134,6 +134,10 @@ impl ExecutionService {
     }
 
     /// Returns one newest-first history page with an exact continuation offset.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation errors for an unsupported page shape and propagates storage failures.
     pub async fn history_page(
         &self,
         limit: usize,
@@ -142,7 +146,7 @@ impl ExecutionService {
         if !(1..=MAX_HISTORY_LIMIT).contains(&limit) {
             return Err(ExecutionServiceError::InvalidHistoryLimit);
         }
-        if offset > i64::MAX as usize {
+        if i64::try_from(offset).is_err() {
             return Err(ExecutionServiceError::InvalidHistoryOffset);
         }
         let probe_limit = limit
