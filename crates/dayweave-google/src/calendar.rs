@@ -6,6 +6,10 @@ use serde_json::Value;
 
 use crate::{GoogleClient, GoogleError};
 
+/// A provider event page is untrusted input. This bounds peak encoded response
+/// memory before `serde` expands strings, arrays, and flattened wire fields.
+const MAX_EVENT_LIST_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventListOptions {
     pub page_token: Option<String>,
@@ -458,7 +462,8 @@ impl GoogleClient {
             .request(Method::GET, url)
             .await?
             .query(&options.query()?);
-        self.json(request).await
+        self.json_limited(request, MAX_EVENT_LIST_RESPONSE_BYTES)
+            .await
     }
 
     /// Lists concrete instances from one recurring event series. This supports
@@ -486,7 +491,8 @@ impl GoogleClient {
             .request(Method::GET, url)
             .await?
             .query(&options.query());
-        self.json(request).await
+        self.json_limited(request, MAX_EVENT_LIST_RESPONSE_BYTES)
+            .await
     }
 
     /// Reads a single event or recurrence exception by remote ID.

@@ -4,23 +4,21 @@ This document separates work Codex can perform automatically from browser
 consent that only the owner can complete. Never paste credentials into chat or
 commit them to this repository.
 
-## Current local access
+## Local prerequisites
 
-- GitHub CLI is authenticated as `greengolddog` and the repository is public.
-  Treat every tracked file and build artifact as public: use synthetic fixtures
-  only, and keep tokens, account exports, signing files, and health records out
-  of the repository.
-- Nebius CLI profile `lol` is active and can read the owner's non-suspended
-  tenant and its `eu-north1` project. The target project currently has a default
-  subnet and no VM or Object Storage bucket, so deployment can start cleanly.
+- Treat every tracked file and build artifact as public: use synthetic fixtures
+  only, and keep tokens, account exports, signing files, health records, CLI
+  profile names, tenant inventory, and project identifiers out of the
+  repository.
+- Authenticate GitHub and Nebius CLIs locally with human profiles that are never
+  copied into application configuration, CI, deployment manifests, or docs.
 - Codex CLI 0.150.1 is the pinned App Server runtime. The macOS packaging step
   verifies its exact binary and generated schemas, preserves its Developer ID
   signature, and seals a private copy into the DayWeave app bundle. The app
   accepts managed ChatGPT device-code authentication only.
-- No Android device is currently visible through ADB.
-- The Command Line Tools build the Swift package, but full Xcode is not selected;
-  widgets, extensions, UI automation, and release entitlements therefore remain
-  an explicit local-toolchain gate.
+- Android packaging requires a local JDK/SDK; device validation additionally
+  requires an ADB-visible device. Widgets, extensions, UI automation, and
+  release entitlements require a selected full Xcode toolchain.
 
 ## Google Cloud project
 
@@ -117,26 +115,64 @@ responses.
    retry; after reauthorization, call it to resume retained outbound work.
    Invalid authorization and terminal durable failures make `/ready` false.
 
-Calendar pages include tombstones and whole recurrence series. Exceptions retain
-their series ID and original start. All-day bounds keep Google's exclusive end
-and are converted using the event/calendar IANA timezone, including DST days.
-Birthdays, working-location events, and transparent events never block.
-Self-declined invitations are ignored; if an already imported invitation becomes
-self-declined, reconciliation moves that mapped item to recoverable trash, while
-another attendee's decline does not hide it. Out-of-office and ordinary opaque
-events block only for `blocking` or `writable` sources. An invisible source
-redacts the user-facing title, notes, and location while retaining time bounds
-and bounded structural sync metadata such as recurrence, response/count flags,
-event type, and conference/attachment presence. Tasks import completed, hidden,
-deleted, due, parent, and ordering metadata. Provider cursors are AES-GCM sealed
-with account/collection AAD and advance only after every page and canonical
-mutation commits. Calendar 410 recovery, and every cursorless Calendar or Tasks
-run after configuration invalidates a cursor, performs a complete paginated
-provider scan. The run fails before advancing its cursor if the documented
-100,000-item safety cap is exceeded. After a complete scan, mappings absent from
-the snapshot are reconciled: unchanged external items move to recoverable trash,
-local edits conflict, and DayWeave-owned records conflict rather than being
-silently detached from their provider identity.
+Calendar reconciliation deliberately uses two provider views. The unbounded
+`singleEvents=false` lane owns Google's incremental sync token and retains only
+series/version metadata; a live recurrence master is never mistaken for either
+one fixed event or a deletion. After that lane is complete, a second
+`singleEvents=true` scan expands the bounded planning window from 30 days before
+the run through 120 days after it. DayWeave fetches every page before one
+transaction replaces the occurrence generation. The bounded lane permits at
+most 100 pages and 10,000 occurrences; duplicate IDs, token cycles, malformed
+bounds/timezones, a recurrence master, any rejected occurrence, or an incomplete
+page sequence leaves planning coverage failed instead of installing a partial
+calendar.
+
+Expanded exceptions retain their series ID in the restricted mapping store;
+their original provider start remains covered by the restricted payload hash
+and is never copied into canonical scheduling data. Canonical blocking occurrences contain exactly an
+ID-free `calendar_event` time constraint; retained nonblocking occurrences
+contain exactly an ID-free `calendar_context` constraint and do not consume
+planner capacity. Both are non-recurring canonical event instances. All-day
+bounds keep Google's exclusive end and are converted using the event/calendar
+IANA timezone, including DST days. Birthdays and working-location events are
+always context-only. Self-declined invitations are removed; another attendee's
+decline does not hide the event. Out-of-office, focus-time, ordinary opaque,
+tentative, transparent, and all-day behavior follows the configured collection
+policy.
+
+An invisible source or a provider-private/confidential occurrence is stored as
+a sensitive `Busy` interval without title, notes, location, attendee counts,
+conference/attachment flags, event type, or provider identifiers. That
+provider-imposed sensitivity is monotonic while the mapping remains active.
+Tasks continue to import completed, hidden, deleted, due, parent, and ordering
+metadata. Provider cursors are AES-GCM sealed with account/collection AAD and
+advance only after the source scan and complete occurrence generation commit.
+Calendar 410 recovery, and every cursorless Calendar or Tasks run after
+configuration invalidates a cursor, performs a complete paginated provider
+scan. The unbounded source run fails before advancing its cursor if the
+documented 100,000-item safety cap is exceeded. After a complete scan, mappings
+absent from the snapshot are reconciled: unchanged external items move to
+recoverable trash, local edits conflict, and DayWeave-owned records conflict
+rather than being silently detached from their provider identity.
+
+Each Calendar refresh invalidates its prior planning coverage before discovery
+or provider I/O, so network/protocol failure cannot leave the old generation
+trusted indefinitely. Deselecting or provider-deleting a calendar, downgrading
+its blocking role/policy, pausing the Google account, or starting disconnect
+retires its active projected occurrences to recoverable trash in the same
+canonical transaction while retaining restricted mapping identity. Resume or a
+later policy upgrade must complete a fresh expanded generation before the
+scheduler uses that source again. A database fallback also refuses scheduling
+if an active blocking occurrence survives any missed teardown transition.
+
+Teardown never trashes an occurrence whose canonical revision changed after its
+last import. That item remains an unchanged local fork, while the historical
+provider mapping is retired as a local-only conflict so it cannot keep the
+Calendar safety fence active. A future provider occurrence receives a fresh
+active mapping and cannot overwrite the fork. Ordinary absent occurrences are
+retired once; later complete generations leave their dormant mappings untouched
+until the occurrence reappears, keeping refresh work bounded by the current
+window instead of all retained Calendar history.
 
 Provider changes never silently overwrite a locally edited canonical item. The
 mapping records the last imported local revision: a provider update or deletion
@@ -234,15 +270,14 @@ deployment therefore still depends on restricted database access and the
 documented database/storage encryption gate; these payloads are sensitive.
 
 Two canonical-model gaps remain explicit. Imported attendee identity,
-conference, and attachment entities have no first-class canonical tables; the
-safe import retains the self response and bounded counts but does not claim
-round-trip fidelity. Also, published schedule blocks and imported fixed events
-are not yet automatically fed into the side-effect-free schedule-preview input;
-the current preview contract still requires callers to supply fixed blocks.
-Likewise, Google Tasks parent/order values are retained as provider metadata but
-are not silently projected into the canonical hierarchy until a conflict-aware
-hierarchy reconciliation primitive exists. These gaps must be closed before
-claiming automatic schedule publication or full-fidelity bidirectional sync.
+conference, and attachment entities have no first-class canonical tables, so
+the occurrence projection does not claim round-trip fidelity for those values.
+Google Tasks parent/order values are retained as provider metadata but are not
+silently projected into the canonical hierarchy until a conflict-aware
+hierarchy reconciliation primitive exists. Google Calendar fixed events are no
+longer such a gap: a complete generation is consumed automatically by schedule
+preview and publication, and clients must not submit duplicate
+`google_calendar` fixed blocks when that authoritative projection is active.
 
 Official references:
 
@@ -397,7 +432,7 @@ Official references:
 
 ## Nebius access and deployment identity
 
-The human `lol` profile is sufficient to bootstrap resources; it must not be
+A locally authenticated human profile can bootstrap resources; it must not be
 copied to the VM or CI. Deployment creates separate least-privilege identities:
 
 - a runtime service account attached to the VM;
@@ -405,9 +440,10 @@ copied to the VM or CI. Deployment creates separate least-privilege identities:
 - a backup account restricted to the private Object Storage bucket;
 - an optional CI deployment account restricted to updating DayWeave resources.
 
-The selected instance is `cpu-e2/2vcpu-8gb` in `eu-north1` with a 32 GiB Network
-SSD. One VM runs API/worker/PostgreSQL. The account profile check is complete;
-there is no need to share a tenant token or credential file.
+The cost-conscious starting recommendation is `cpu-e2/2vcpu-8gb` with a 32 GiB
+Network SSD in the owner's chosen project region. One VM runs
+API/worker/PostgreSQL. Resolve tenant, project, subnet, and region from the local
+CLI profile at deployment time; never record them or a credential file here.
 
 Nebius Tunnel provides the generated DNS name and TLS while accepting only an
 outbound agent connection. It does not replace application authentication.

@@ -28,6 +28,10 @@ use crate::items::{
     Item, ItemKind, ItemQuery, ItemService, ItemServiceError, ItemStatus, SplitPolicy,
 };
 
+use super::{
+    CalendarProjectionFenceError, CalendarProjectionStamp, postgres::PostgresSchedulingRepository,
+};
+
 const MAX_CANONICAL_ITEMS: usize = 10_000;
 const MAX_AVAILABILITY_WINDOWS: usize = 10_000;
 const MAX_FIXED_BLOCKS: usize = 10_000;
@@ -156,6 +160,15 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) source_item_sensitivity: BTreeMap<Uuid, bool>,
+    /// Content-free Google Calendar generation evidence bound into the input
+    /// digest and rechecked by durable publication. It remains internal so the
+    /// strict macOS/Android response contract does not change.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    /// Canonical items understood by this scheduler schema. This includes
+    /// retained nonblocking calendar context even though it emits no work item
+    /// or schedule block.
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
@@ -358,6 +371,10 @@ pub enum ComposeScheduleError {
     Scheduler(#[from] ScheduleError),
     #[error("schedule preview input could not be encoded")]
     Encoding,
+    #[error("selected Google Calendar projection does not cover the requested horizon")]
+    CalendarProjectionIncomplete,
+    #[error("Google Calendar projection evidence is temporarily unavailable")]
+    CalendarProjectionUnavailable,
 }
 
 impl ComposeScheduleError {
@@ -383,9 +400,38 @@ impl ComposeScheduleError {
 /// rejects the composed graph.
 pub async fn compose_canonical_schedule(
     service: &ItemService,
+    projection: &PostgresSchedulingRepository,
+    request: ComposeScheduleRequest,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    compose_canonical_schedule_inner(service, Some(projection), request).await
+}
+
+/// Explicit in-memory composition path for deployments without `PostgreSQL` or
+/// Google Calendar projection state. Production `PostgreSQL` callers must use
+/// [`compose_canonical_schedule`] so Calendar capacity cannot be bypassed.
+pub(crate) async fn compose_canonical_schedule_unfenced(
+    service: &ItemService,
+    request: ComposeScheduleRequest,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    compose_canonical_schedule_inner(service, None, request).await
+}
+
+/// Composes against a stable canonical-item and Calendar-generation snapshot.
+/// Generation evidence is read on both sides of the item list so a committed
+/// projection/configuration change cannot produce a mixed preview.
+async fn compose_canonical_schedule_inner(
+    service: &ItemService,
+    projection: Option<&PostgresSchedulingRepository>,
     request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     validate_request_shape(&request)?;
+    let projection_before = match projection {
+        Some(projection) => projection
+            .calendar_projection_stamps(request.horizon_start, request.horizon_end)
+            .await
+            .map_err(map_projection_fence_error)?,
+        None => Vec::new(),
+    };
     let items = service
         .list(ItemQuery {
             parent_id: None,
@@ -396,9 +442,36 @@ pub async fn compose_canonical_schedule(
     if items.len() > MAX_CANONICAL_ITEMS {
         return Err(ComposeScheduleError::TooManyItems);
     }
-    compose_items(items, request)
+    let projection_after = match projection {
+        Some(projection) => projection
+            .calendar_projection_stamps(request.horizon_start, request.horizon_end)
+            .await
+            .map_err(map_projection_fence_error)?,
+        None => Vec::new(),
+    };
+    if projection_before != projection_after {
+        return Err(ComposeScheduleError::CalendarProjectionIncomplete);
+    }
+    compose_items_with_projection_for_schema(
+        items,
+        request,
+        super::SCHEDULER_PUBLICATION_SCHEMA,
+        projection_before,
+    )
 }
 
+const fn map_projection_fence_error(error: CalendarProjectionFenceError) -> ComposeScheduleError {
+    match error {
+        CalendarProjectionFenceError::Incomplete => {
+            ComposeScheduleError::CalendarProjectionIncomplete
+        }
+        CalendarProjectionFenceError::Unavailable => {
+            ComposeScheduleError::CalendarProjectionUnavailable
+        }
+    }
+}
+
+#[cfg(test)]
 fn compose_items(
     source_items: Vec<Item>,
     request: ComposeScheduleRequest,
@@ -406,11 +479,38 @@ fn compose_items(
     compose_items_for_schema(source_items, request, super::SCHEDULER_PUBLICATION_SCHEMA)
 }
 
+#[cfg(test)]
 fn compose_items_for_schema(
     source_items: Vec<Item>,
     request: ComposeScheduleRequest,
     scheduler_publication_schema: &str,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    compose_items_with_projection_for_schema(
+        source_items,
+        request,
+        scheduler_publication_schema,
+        Vec::new(),
+    )
+}
+
+#[allow(clippy::too_many_lines)] // One pipeline keeps snapshot counts, digest, and plan atomic.
+fn compose_items_with_projection_for_schema(
+    source_items: Vec<Item>,
+    request: ComposeScheduleRequest,
+    scheduler_publication_schema: &str,
+    calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    if !calendar_projection_stamps.is_empty()
+        && request
+            .fixed_blocks
+            .iter()
+            .any(|block| matches!(block.source, FixedBlockSourceInput::GoogleCalendar))
+    {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "caller-supplied Google Calendar fixed blocks cannot be combined with the authoritative Calendar projection"
+                .to_owned(),
+        ));
+    }
     let publication_timezone = request.timezone_name.clone();
     let source_item_count = source_items.len();
     let source_item_revisions = source_items
@@ -420,10 +520,16 @@ fn compose_items_for_schema(
     let effective_sensitivity = effective_sensitivity_by_item(&source_items);
     let mut rejected_items = Vec::new();
     let mut accepted = Vec::with_capacity(source_items.len());
+    let mut context_only_count = 0_usize;
     for item in source_items {
         let is_sensitive = effective_sensitivity.get(&item.id).copied().unwrap_or(true);
-        match map_item(&item, is_sensitive) {
-            Ok(mapped) => accepted.push(mapped),
+        match classify_item(&item, is_sensitive) {
+            Ok(MappedScheduleItem::Plannable(mapped)) => accepted.push(*mapped),
+            Ok(MappedScheduleItem::ContextOnly) => {
+                context_only_count = context_only_count
+                    .checked_add(1)
+                    .ok_or(ComposeScheduleError::Encoding)?;
+            }
             Err(reason) => rejected_items.push(RejectedScheduleItem {
                 item_id: item.id,
                 is_sensitive,
@@ -484,15 +590,25 @@ fn compose_items_for_schema(
         scheduler_publication_schema,
         &request.timezone_name,
         &source_item_revisions,
+        &calendar_projection_stamps,
         &plan_request,
     )?;
     let plan = Scheduler.plan(&plan_request)?;
+    let accepted_item_count = plan_request
+        .items
+        .len()
+        .checked_add(context_only_count)
+        .ok_or(ComposeScheduleError::Encoding)?;
+    if accepted_item_count.checked_add(rejected_items.len()) != Some(source_item_count) {
+        return Err(ComposeScheduleError::Encoding);
+    }
     let result = ComposeScheduleResult {
         input_digest,
         source_item_count,
         source_item_revisions,
         source_item_sensitivity: effective_sensitivity,
-        accepted_item_count: plan_request.items.len(),
+        calendar_projection_stamps,
+        accepted_item_count,
         rejected_items,
         ignored_previous_assignments,
         plan: Rfc3339SchedulePlan(plan),
@@ -705,7 +821,12 @@ fn validate_recurrence_context_references(
     Ok(())
 }
 
-fn map_item(item: &Item, is_sensitive: bool) -> Result<WorkItem, String> {
+enum MappedScheduleItem {
+    Plannable(Box<WorkItem>),
+    ContextOnly,
+}
+
+fn classify_item(item: &Item, is_sensitive: bool) -> Result<MappedScheduleItem, String> {
     let item_timezone: Tz = item
         .timezone_name
         .parse()
@@ -713,6 +834,26 @@ fn map_item(item: &Item, is_sensitive: bool) -> Result<WorkItem, String> {
     let metadata: SchedulingMetadata = serde_json::from_value(item.flexible_constraints.clone())
         .map_err(|error| format!("unsupported flexible_constraints: {error}"))?;
     let recurrence = parse_recurrence(item.recurrence.as_ref())?;
+    if let Some(context) = metadata.calendar_context.as_ref() {
+        validate_calendar_context(item, recurrence.as_ref(), &metadata, context)?;
+        return Ok(MappedScheduleItem::ContextOnly);
+    }
+    if item.kind != ItemKind::Event && metadata.calendar_event.is_some() {
+        return Err("calendar_event metadata is only valid for event items".into());
+    }
+    if metadata.dayweave_firm_block.is_some()
+        && (item.kind != ItemKind::Event
+            || item
+                .flexible_constraints
+                .as_object()
+                .is_none_or(|constraints| {
+                    constraints.len() != 1 || !constraints.contains_key("dayweave_firm_block")
+                }))
+    {
+        return Err(
+            "dayweave_firm_block is only valid as the sole metadata for an event item".into(),
+        );
+    }
     let duration = item.duration_seconds.map(duration_estimate);
     let mut constraints = metadata.constraints.clone();
     if let Some(earliest) = item.earliest_start_at {
@@ -744,7 +885,7 @@ fn map_item(item: &Item, is_sensitive: bool) -> Result<WorkItem, String> {
 
     let kind = map_kind(item.kind, recurrence, &metadata)?;
     let split_policy = map_split_policy(&item.split_policy, &metadata);
-    Ok(WorkItem {
+    Ok(MappedScheduleItem::Plannable(Box::new(WorkItem {
         id: ItemId(item.id),
         is_sensitive,
         revision: item.revision,
@@ -772,7 +913,56 @@ fn map_item(item: &Item, is_sensitive: bool) -> Result<WorkItem, String> {
             .map_err(|error| error.to_string())?,
         updated_at: to_time_in_timezone(item.updated_at, item_timezone)
             .map_err(|error| error.to_string())?,
-    })
+    })))
+}
+
+fn validate_calendar_context(
+    item: &Item,
+    recurrence: Option<&Recurrence>,
+    metadata: &SchedulingMetadata,
+    context: &CalendarContextSpec,
+) -> Result<(), String> {
+    if item.kind != ItemKind::Event {
+        return Err("calendar_context metadata is only valid for event items".into());
+    }
+    if item.parent_id.is_some() {
+        return Err("calendar_context event must be a root item".into());
+    }
+    if recurrence.is_some() {
+        return Err("calendar_context event must be one expanded occurrence".into());
+    }
+    if metadata.calendar_event.is_some()
+        || item
+            .flexible_constraints
+            .as_object()
+            .is_none_or(|constraints| {
+                constraints.len() != 1 || !constraints.contains_key("calendar_context")
+            })
+    {
+        return Err("calendar_context cannot be combined with other scheduling metadata".into());
+    }
+    let owner = if context.all_day {
+        "all-day calendar_context"
+    } else {
+        "calendar_context"
+    };
+    validate_calendar_bounds(context.start, context.end, owner)
+}
+
+fn validate_calendar_bounds(
+    start: OffsetDateTime,
+    end: OffsetDateTime,
+    owner: &str,
+) -> Result<(), String> {
+    if start >= end {
+        return Err(format!("{owner} end must follow start"));
+    }
+    if !start.nanosecond().is_multiple_of(1_000) || !end.nanosecond().is_multiple_of(1_000) {
+        return Err(format!(
+            "{owner} instants must use PostgreSQL microsecond precision"
+        ));
+    }
+    Ok(())
 }
 
 fn map_kind(
@@ -787,11 +977,26 @@ fn map_kind(
                     "calendar event recurrence must be expanded by its calendar source".into(),
                 );
             }
-            metadata
-                .calendar_event
-                .clone()
-                .map(PlanningItemKind::CalendarEvent)
-                .ok_or_else(|| "event metadata requires calendar_event".into())
+            let event = match (
+                metadata.calendar_event.clone(),
+                metadata.dayweave_firm_block.as_ref(),
+            ) {
+                (Some(event), None) => event,
+                (None, Some(firm)) => firm.as_calendar_event()?,
+                (Some(_), Some(_)) => {
+                    return Err(
+                        "event metadata cannot combine calendar_event and dayweave_firm_block"
+                            .into(),
+                    );
+                }
+                (None, None) => {
+                    return Err(
+                        "event metadata requires calendar_event or dayweave_firm_block".into(),
+                    );
+                }
+            };
+            validate_calendar_bounds(event.start, event.end, "calendar_event")?;
+            Ok(PlanningItemKind::CalendarEvent(event))
         }
         ItemKind::Task => Ok(recurrence.map_or(PlanningItemKind::Task, |recurrence| {
             PlanningItemKind::RecurringTask(RecurringTaskSpec { recurrence })
@@ -1165,6 +1370,7 @@ fn request_digest(
     scheduler_publication_schema: &str,
     timezone_name: &str,
     source_item_revisions: &BTreeMap<Uuid, u64>,
+    calendar_projection_stamps: &[CalendarProjectionStamp],
     request: &PlanRequest,
 ) -> Result<String, ComposeScheduleError> {
     #[derive(Serialize)]
@@ -1172,6 +1378,7 @@ fn request_digest(
         scheduler_publication_schema: &'a str,
         timezone_name: &'a str,
         source_item_revisions: &'a BTreeMap<Uuid, u64>,
+        calendar_projection_stamps: &'a [CalendarProjectionStamp],
         request: &'a PlanRequest,
     }
 
@@ -1179,6 +1386,7 @@ fn request_digest(
         scheduler_publication_schema,
         timezone_name,
         source_item_revisions,
+        calendar_projection_stamps,
         request,
     })
     .map_err(|_| ComposeScheduleError::Encoding)?;
@@ -1205,6 +1413,10 @@ struct SchedulingMetadata {
     energy: Option<EnergyMetadata>,
     tags: BTreeSet<String>,
     calendar_event: Option<CalendarEventSpec>,
+    calendar_context: Option<CalendarContextSpec>,
+    /// Backward-compatible ownership/publication shape used by already-created
+    /// `DayWeave` Calendar blocks. New provider projections never emit it.
+    dayweave_firm_block: Option<DayWeaveFirmBlockSpec>,
     habit_target: Option<QuantityTarget>,
     preserves_streak_when_paused: bool,
     routine_ordered: bool,
@@ -1228,6 +1440,8 @@ impl Default for SchedulingMetadata {
             energy: None,
             tags: BTreeSet::new(),
             calendar_event: None,
+            calendar_context: None,
+            dayweave_firm_block: None,
             habit_target: None,
             preserves_streak_when_paused: true,
             routine_ordered: false,
@@ -1242,6 +1456,63 @@ impl Default for SchedulingMetadata {
             preferred_start_minute: None,
         }
     }
+}
+
+/// A retained provider occurrence that is useful calendar context but must not
+/// reserve planner capacity. Provider identifiers deliberately do not belong
+/// in this scheduling representation.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CalendarContextSpec {
+    #[serde(with = "time::serde::rfc3339")]
+    start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    end: OffsetDateTime,
+    all_day: bool,
+}
+
+/// Legacy canonical shape for a DayWeave-owned event. It remains strict so
+/// accepting an existing owned block cannot smuggle provider identifiers into
+/// scheduling evidence. Google echoes are independently authenticated and
+/// deduplicated by the provider mapping layer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)] // Independent provider publication semantics.
+struct DayWeaveFirmBlockSpec {
+    owned: bool,
+    #[serde(with = "time::serde::rfc3339")]
+    starts_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    ends_at: OffsetDateTime,
+    #[serde(default)]
+    all_day: bool,
+    #[serde(default)]
+    tentative: bool,
+    #[serde(default = "default_true")]
+    busy: bool,
+}
+
+impl DayWeaveFirmBlockSpec {
+    fn as_calendar_event(&self) -> Result<CalendarEventSpec, String> {
+        if !self.owned {
+            return Err("dayweave_firm_block must be explicitly owned".into());
+        }
+        // These publication flags affect only the provider representation.
+        // The locally owned work still reserves capacity in either state.
+        let _ = (self.tentative, self.busy);
+        validate_calendar_bounds(self.starts_at, self.ends_at, "dayweave_firm_block")?;
+        Ok(CalendarEventSpec {
+            start: self.starts_at,
+            end: self.ends_at,
+            immutable: true,
+            all_day: self.all_day,
+            source_calendar_id: None,
+        })
+    }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1313,6 +1584,13 @@ mod tests {
         }
     }
 
+    fn map_plannable(item: &Item) -> WorkItem {
+        match classify_item(item, item.is_sensitive).expect("valid plannable item") {
+            MappedScheduleItem::Plannable(item) => *item,
+            MappedScheduleItem::ContextOnly => panic!("expected plannable item"),
+        }
+    }
+
     #[test]
     fn composes_canonical_item_and_is_digest_stable() {
         let item = canonical_item(Uuid::from_u128(1));
@@ -1339,6 +1617,53 @@ mod tests {
         )
         .unwrap();
         assert_ne!(current.input_digest, upgraded.input_digest);
+    }
+
+    #[test]
+    fn preview_digest_binds_hidden_calendar_generation_and_rejects_duplicate_fixed_input() {
+        let item = canonical_item(Uuid::from_u128(12));
+        let stamp = CalendarProjectionStamp {
+            collection_id: Uuid::from_u128(13),
+            collection_revision: 4,
+            generation: 9,
+            window_start: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+            window_end: Utc.with_ymd_and_hms(2026, 12, 1, 0, 0, 0).unwrap(),
+            refreshed_at: Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap(),
+        };
+        let without_projection = compose_items(vec![item.clone()], preview_request()).unwrap();
+        let with_projection = compose_items_with_projection_for_schema(
+            vec![item.clone()],
+            preview_request(),
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            vec![stamp.clone()],
+        )
+        .unwrap();
+
+        assert_ne!(
+            without_projection.input_digest,
+            with_projection.input_digest
+        );
+        let encoded = serde_json::to_value(&with_projection).unwrap();
+        assert!(encoded.get("calendar_projection_stamps").is_none());
+
+        let mut duplicate = preview_request();
+        duplicate.fixed_blocks.push(FixedBlockInput {
+            id: Uuid::from_u128(14),
+            is_sensitive: false,
+            title: "Synthetic provider duplicate".to_owned(),
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+            source: FixedBlockSourceInput::GoogleCalendar,
+        });
+        assert!(matches!(
+            compose_items_with_projection_for_schema(
+                vec![item],
+                duplicate,
+                super::super::SCHEDULER_PUBLICATION_SCHEMA,
+                vec![stamp],
+            ),
+            Err(ComposeScheduleError::InvalidRequest(_))
+        ));
     }
 
     #[test]
@@ -1406,11 +1731,195 @@ mod tests {
                 "source_calendar_id": "primary"
             }
         });
-        let mapped = map_item(&item, item.is_sensitive).unwrap();
+        let mapped = map_plannable(&item);
         let PlanningItemKind::CalendarEvent(event) = mapped.kind else {
             panic!("expected calendar event");
         };
         assert_eq!((event.end - event.start).whole_minutes(), 60);
+    }
+
+    #[test]
+    fn exact_calendar_event_reserves_capacity_without_provider_identifiers() {
+        let event_id = Uuid::from_u128(40);
+        let mut item = canonical_item(event_id);
+        item.kind = ItemKind::Event;
+        item.duration_seconds = None;
+        item.deadline_at = None;
+        item.flexible_constraints = json!({
+            "calendar_event": {
+                "start": "2026-09-01T10:00:00+02:00",
+                "end": "2026-09-01T11:00:00+02:00",
+                "immutable": true,
+                "all_day": false,
+                "source_calendar_id": null
+            }
+        });
+        let mut unexpanded = item.clone();
+        unexpanded.id = Uuid::from_u128(400);
+        unexpanded.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+
+        let result = compose_items(vec![item], preview_request()).unwrap();
+
+        assert_eq!(result.source_item_count, 1);
+        assert_eq!(result.accepted_item_count, 1);
+        assert!(result.rejected_items.is_empty());
+        let block = result.plan.blocks.first().expect("calendar event block");
+        assert_eq!(block.item_id, Some(ItemId(event_id)));
+        assert_eq!(block.kind, dayweave_core::ScheduleBlockKind::CalendarEvent);
+        assert_eq!((block.end - block.start).whole_minutes(), 60);
+
+        let rejected = compose_items(vec![unexpanded], preview_request()).unwrap();
+        assert_eq!(rejected.accepted_item_count, 0);
+        assert_eq!(rejected.rejected_items.len(), 1);
+    }
+
+    #[test]
+    fn legacy_owned_google_block_reserves_capacity_exactly_once() {
+        let event_id = Uuid::from_u128(401);
+        let mut owned = canonical_item(event_id);
+        owned.kind = ItemKind::Event;
+        owned.duration_seconds = None;
+        owned.deadline_at = None;
+        owned.flexible_constraints = json!({
+            "dayweave_firm_block": {
+                "owned": true,
+                "starts_at": "2026-09-01T08:00:00Z",
+                "ends_at": "2026-09-01T09:00:00Z",
+                "all_day": false,
+                "tentative": false,
+                "busy": true
+            }
+        });
+
+        let result = compose_items(vec![owned.clone()], preview_request()).unwrap();
+
+        assert_eq!(result.accepted_item_count, 1);
+        assert!(result.rejected_items.is_empty());
+        let blocks: Vec<_> = result
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| block.item_id == Some(ItemId(event_id)))
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            blocks[0].kind,
+            dayweave_core::ScheduleBlockKind::CalendarEvent
+        );
+
+        owned.flexible_constraints["dayweave_firm_block"]["owned"] = json!(false);
+        let rejected = compose_items(vec![owned], preview_request()).unwrap();
+        assert_eq!(rejected.accepted_item_count, 0);
+        assert_eq!(rejected.rejected_items.len(), 1);
+    }
+
+    #[test]
+    fn calendar_context_counts_as_accepted_without_reserving_capacity() {
+        let context_id = Uuid::from_u128(41);
+        let mut context = canonical_item(context_id);
+        context.kind = ItemKind::Event;
+        context.duration_seconds = None;
+        context.deadline_at = None;
+        context.flexible_constraints = json!({
+            "calendar_context": {
+                "start": "2026-09-01T10:00:00+02:00",
+                "end": "2026-09-01T11:00:00+02:00",
+                "all_day": false
+            }
+        });
+        let task_id = Uuid::from_u128(42);
+        let task = canonical_item(task_id);
+
+        let result = compose_items(vec![context, task], preview_request()).unwrap();
+
+        assert_eq!(result.source_item_count, 2);
+        assert_eq!(result.accepted_item_count, 2);
+        assert!(result.rejected_items.is_empty());
+        assert!(
+            result
+                .plan
+                .blocks
+                .iter()
+                .all(|block| block.item_id != Some(ItemId(context_id)))
+        );
+        assert!(
+            result
+                .plan
+                .blocks
+                .iter()
+                .any(|block| block.item_id == Some(ItemId(task_id)))
+        );
+    }
+
+    #[test]
+    fn malformed_provider_constraints_are_rejected_without_leaking_values() {
+        const RAW_PROVIDER_ID: &str = "SYNTHETIC-REMOTE-ID-MUST-NOT-LEAK";
+        let mut malformed = canonical_item(Uuid::from_u128(43));
+        malformed.kind = ItemKind::Event;
+        malformed.duration_seconds = None;
+        malformed.deadline_at = None;
+        malformed.flexible_constraints = json!({
+            "calendar_context": {
+                "start": "2026-09-01T10:00:00+02:00",
+                "end": "2026-09-01T11:00:00+02:00",
+                "all_day": false,
+                "remote_id": RAW_PROVIDER_ID
+            }
+        });
+        let task = canonical_item(Uuid::from_u128(44));
+
+        let result = compose_items(vec![malformed, task], preview_request()).unwrap();
+
+        assert_eq!(result.source_item_count, 2);
+        assert_eq!(result.accepted_item_count, 1);
+        assert_eq!(result.rejected_items.len(), 1);
+        assert_eq!(
+            result.accepted_item_count + result.rejected_items.len(),
+            result.source_item_count
+        );
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains(RAW_PROVIDER_ID));
+    }
+
+    #[test]
+    fn calendar_context_requires_one_valid_root_occurrence() {
+        fn context_item(id: u128) -> Item {
+            let mut item = canonical_item(Uuid::from_u128(id));
+            item.kind = ItemKind::Event;
+            item.duration_seconds = None;
+            item.deadline_at = None;
+            item.flexible_constraints = json!({
+                "calendar_context": {
+                    "start": "2026-09-01T10:00:00+02:00",
+                    "end": "2026-09-01T11:00:00+02:00",
+                    "all_day": false
+                }
+            });
+            item
+        }
+
+        let mut recurring = context_item(45);
+        recurring.recurrence = Some(json!({"type": "daily", "times_per_day": 1}));
+        let mut child = context_item(46);
+        child.parent_id = Some(Uuid::from_u128(1));
+        let mut reversed = context_item(47);
+        reversed.flexible_constraints["calendar_context"]["end"] =
+            json!("2026-09-01T09:00:00+02:00");
+        let mut ambiguous = context_item(48);
+        ambiguous.flexible_constraints["calendar_event"] = json!({
+            "start": "2026-09-01T10:00:00+02:00",
+            "end": "2026-09-01T11:00:00+02:00",
+            "immutable": true,
+            "all_day": false,
+            "source_calendar_id": null
+        });
+
+        for item in [recurring, child, reversed, ambiguous] {
+            let result = compose_items(vec![item], preview_request()).unwrap();
+            assert_eq!(result.source_item_count, 1);
+            assert_eq!(result.accepted_item_count, 0);
+            assert_eq!(result.rejected_items.len(), 1);
+        }
     }
 
     #[test]
@@ -1432,7 +1941,7 @@ mod tests {
                 }]
             }
         });
-        let mapped = map_item(&item, item.is_sensitive).unwrap();
+        let mapped = map_plannable(&item);
         assert_eq!(mapped.constraints.earliest_start.unwrap().value.hour(), 8);
 
         let item_id = item.id.to_string();
@@ -1457,6 +1966,6 @@ mod tests {
             }
         });
         let sensitivity = invalid.is_sensitive;
-        assert!(map_item(&invalid, sensitivity).is_err());
+        assert!(classify_item(&invalid, sensitivity).is_err());
     }
 }

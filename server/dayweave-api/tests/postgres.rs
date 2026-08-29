@@ -27,7 +27,10 @@ use uuid::Uuid;
 #[test]
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+    assert_eq!(
+        versions,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+    );
 
     let schema = [
         include_str!("../migrations/0001_identity_and_items.sql"),
@@ -43,6 +46,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0011_google_outbound_safety.sql"),
         include_str!("../migrations/0012_schedule_publication.sql"),
         include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
+        include_str!("../migrations/0014_google_calendar_projection.sql"),
     ]
     .join("\n");
     for table in [
@@ -78,6 +82,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_sync_collections",
         "google_sync_runs",
         "google_sync_outbox",
+        "google_calendar_projection_rejections",
         "google_outbound_previews",
         "google_provider_identity_roots",
     ] {
@@ -87,6 +92,935 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(!schema.contains("timestamp without time zone"));
     assert!(schema.contains("trashed_at"));
     assert!(schema.contains("tombstoned_at"));
+    assert!(schema.contains("DELETE FROM provider_sync_cursors cursor"));
+    assert!(schema.contains("cursor.collection_key = 'calendar:' || collection.id::text"));
+    assert!(schema.contains("provider_sync_mappings_sensitivity_floor_item_fk"));
+    assert!(schema.contains("'dayweave.items.v1:' || NEW.workspace_id::text"));
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn calendar_projection_upgrade_retires_legacy_items_and_resets_only_calendar_cursor() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar upgrade test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in [
+        include_str!("../migrations/0001_identity_and_items.sql"),
+        include_str!("../migrations/0002_schedule_sync_and_audit.sql"),
+        include_str!("../migrations/0003_proposals_mcp_idempotency_outbox.sql"),
+        include_str!("../migrations/0004_item_delta_sync.sql"),
+        include_str!("../migrations/0005_execution_sessions.sql"),
+        include_str!("../migrations/0006_google_oauth.sql"),
+        include_str!("../migrations/0007_google_sync.sql"),
+        include_str!("../migrations/0008_credential_auth_foundation.sql"),
+        include_str!("../migrations/0009_sensitive_items.sql"),
+        include_str!("../migrations/0010_auth_runtime.sql"),
+        include_str!("../migrations/0011_google_outbound_safety.sql"),
+        include_str!("../migrations/0012_schedule_publication.sql"),
+        include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
+    ] {
+        pool.execute(migration)
+            .await
+            .expect("pre-projection migration");
+    }
+
+    let scope = seed_scope(pool).await;
+    let account_id = Uuid::new_v4();
+    let paused_account_id = Uuid::new_v4();
+    let inactive_account_id = Uuid::new_v4();
+    let calendar_id = Uuid::new_v4();
+    let unselected_calendar_id = Uuid::new_v4();
+    let paused_calendar_id = Uuid::new_v4();
+    let inactive_calendar_id = Uuid::new_v4();
+    let task_list_id = Uuid::new_v4();
+    let now = Utc::now();
+    for (id, status, sync_enabled) in [
+        (account_id, "active", true),
+        (paused_account_id, "paused", false),
+        (inactive_account_id, "reauthorization_required", false),
+    ] {
+        sqlx::query(
+            "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+             external_account_id, display_label, encrypted_credentials, credential_key_version, \
+             granted_scopes, status, sync_enabled, is_default) \
+             VALUES ($1, $2, $3, 'google', $4, 'Synthetic upgrade account', $5, 1, \
+             ARRAY['https://www.googleapis.com/auth/calendar.readonly'], $6, $7, false)",
+        )
+        .bind(id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(format!("upgrade-{id}"))
+        .bind(vec![7_u8; 64])
+        .bind(status)
+        .bind(sync_enabled)
+        .execute(pool)
+        .await
+        .expect("upgrade account");
+    }
+    for (id, owner_account_id, kind, remote_id, role, selected) in [
+        (
+            calendar_id,
+            account_id,
+            "calendar",
+            "calendar-remote",
+            "blocking",
+            true,
+        ),
+        (
+            unselected_calendar_id,
+            account_id,
+            "calendar",
+            "calendar-unselected",
+            "blocking",
+            false,
+        ),
+        (
+            paused_calendar_id,
+            paused_account_id,
+            "calendar",
+            "calendar-paused",
+            "blocking",
+            true,
+        ),
+        (
+            inactive_calendar_id,
+            inactive_account_id,
+            "calendar",
+            "calendar-inactive",
+            "blocking",
+            true,
+        ),
+        (
+            task_list_id,
+            account_id,
+            "task_list",
+            "tasks-remote",
+            "read_only",
+            true,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO google_sync_collections (id, workspace_id, user_id, \
+             provider_account_id, collection_kind, remote_collection_id, display_name, \
+             provider_access_role, selected, visible, sync_role, discovered_at, configured_at, \
+             created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'Synthetic collection', \
+             'owner', $7, true, $8, $9, $9, $9, $9)",
+        )
+        .bind(id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(owner_account_id)
+        .bind(kind)
+        .bind(remote_id)
+        .bind(selected)
+        .bind(role)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("upgrade collection");
+    }
+    let calendar_key = format!("calendar:{calendar_id}");
+    let tasks_key = format!("tasks:{task_list_id}");
+    for key in [&calendar_key, &tasks_key] {
+        sqlx::query(
+            "INSERT INTO provider_sync_cursors (workspace_id, provider_account_id, \
+             collection_key, encrypted_cursor, cursor_key_version, updated_at) \
+             VALUES ($1, $2, $3, $4, 1, $5)",
+        )
+        .bind(scope.workspace_id)
+        .bind(account_id)
+        .bind(key)
+        .bind(vec![8_u8; 64])
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("legacy cursor");
+    }
+
+    let selected_external_id = Uuid::new_v4();
+    let unselected_external_id = Uuid::new_v4();
+    let paused_external_id = Uuid::new_v4();
+    let inactive_external_id = Uuid::new_v4();
+    let dayweave_owned_id = Uuid::new_v4();
+    let task_item_id = Uuid::new_v4();
+    let divergent_external_id = Uuid::new_v4();
+    let mixed_revision_external_id = Uuid::new_v4();
+    let missing_revision_external_id = Uuid::new_v4();
+    let shared_non_calendar_id = Uuid::new_v4();
+    let already_trashed_id = Uuid::new_v4();
+    let already_trashed_at = now - ChronoDuration::days(1);
+    for (item_id, title, revision, trashed_at) in [
+        (selected_external_id, "Selected legacy event", 1_i64, None),
+        (unselected_external_id, "Unselected legacy event", 1, None),
+        (paused_external_id, "Paused legacy event", 1, None),
+        (inactive_external_id, "Inactive legacy event", 1, None),
+        (dayweave_owned_id, "DayWeave-owned event", 1, None),
+        (task_item_id, "Task-list item", 1, None),
+        (
+            divergent_external_id,
+            "Locally edited legacy event",
+            2,
+            None,
+        ),
+        (
+            mixed_revision_external_id,
+            "Mixed-revision legacy event",
+            3,
+            None,
+        ),
+        (
+            missing_revision_external_id,
+            "Missing-revision legacy event",
+            2,
+            None,
+        ),
+        (
+            shared_non_calendar_id,
+            "Legacy event shared with Tasks",
+            1,
+            None,
+        ),
+        (
+            already_trashed_id,
+            "Already retired legacy event",
+            1,
+            Some(already_trashed_at),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, \
+             status, title, timezone_name, scheduling_constraints, split_allowed, revision, \
+             created_at, updated_at, trashed_at) VALUES ($1, $2, $3, false, 'event', \
+             'scheduled', $4, 'UTC', '{}'::jsonb, false, $5, $6, $6, $7)",
+        )
+        .bind(item_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(title)
+        .bind(revision)
+        .bind(now - ChronoDuration::days(10))
+        .bind(trashed_at)
+        .execute(pool)
+        .await
+        .expect("legacy canonical item");
+    }
+    let dayweave_mapping_id = Uuid::new_v4();
+    let shadow_external_mapping_id = Uuid::new_v4();
+    let divergent_mapping_id = Uuid::new_v4();
+    let mixed_matching_mapping_id = Uuid::new_v4();
+    let mixed_stale_mapping_id = Uuid::new_v4();
+    let missing_revision_mapping_id = Uuid::new_v4();
+    let shared_calendar_mapping_id = Uuid::new_v4();
+    let shared_task_mapping_id = Uuid::new_v4();
+    let legacy_mappings = [
+        (
+            Uuid::new_v4(),
+            account_id,
+            calendar_id,
+            selected_external_id,
+            "upgrade-provider-selected",
+            Some(1_i64),
+            "external",
+        ),
+        (
+            Uuid::new_v4(),
+            account_id,
+            unselected_calendar_id,
+            unselected_external_id,
+            "upgrade-provider-unselected",
+            Some(1),
+            "external",
+        ),
+        (
+            Uuid::new_v4(),
+            paused_account_id,
+            paused_calendar_id,
+            paused_external_id,
+            "upgrade-provider-paused",
+            Some(1),
+            "external",
+        ),
+        (
+            Uuid::new_v4(),
+            inactive_account_id,
+            inactive_calendar_id,
+            inactive_external_id,
+            "upgrade-provider-inactive",
+            Some(1),
+            "external",
+        ),
+        (
+            dayweave_mapping_id,
+            account_id,
+            calendar_id,
+            dayweave_owned_id,
+            "upgrade-provider-dayweave-owned",
+            Some(1),
+            "dayweave",
+        ),
+        (
+            shadow_external_mapping_id,
+            account_id,
+            unselected_calendar_id,
+            dayweave_owned_id,
+            "upgrade-provider-shadow-external",
+            Some(1),
+            "external",
+        ),
+        (
+            Uuid::new_v4(),
+            account_id,
+            task_list_id,
+            task_item_id,
+            "upgrade-provider-task-control",
+            Some(1),
+            "external",
+        ),
+        (
+            Uuid::new_v4(),
+            account_id,
+            calendar_id,
+            already_trashed_id,
+            "upgrade-provider-already-trashed",
+            Some(1),
+            "external",
+        ),
+        (
+            divergent_mapping_id,
+            account_id,
+            calendar_id,
+            divergent_external_id,
+            "upgrade-provider-divergent",
+            Some(1),
+            "external",
+        ),
+        (
+            mixed_matching_mapping_id,
+            account_id,
+            calendar_id,
+            mixed_revision_external_id,
+            "upgrade-provider-mixed-matching",
+            Some(3),
+            "external",
+        ),
+        (
+            mixed_stale_mapping_id,
+            paused_account_id,
+            paused_calendar_id,
+            mixed_revision_external_id,
+            "upgrade-provider-mixed-stale",
+            Some(2),
+            "external",
+        ),
+        (
+            missing_revision_mapping_id,
+            account_id,
+            unselected_calendar_id,
+            missing_revision_external_id,
+            "upgrade-provider-missing-revision",
+            None,
+            "external",
+        ),
+        (
+            shared_calendar_mapping_id,
+            account_id,
+            calendar_id,
+            shared_non_calendar_id,
+            "upgrade-provider-shared-calendar",
+            Some(1),
+            "external",
+        ),
+        (
+            shared_task_mapping_id,
+            account_id,
+            task_list_id,
+            shared_non_calendar_id,
+            "upgrade-provider-shared-task",
+            Some(1),
+            "external",
+        ),
+    ];
+    for (
+        mapping_id,
+        owner_account_id,
+        collection_id,
+        item_id,
+        remote_id,
+        local_revision,
+        ownership,
+    ) in legacy_mappings
+    {
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+             collection_id, entity_kind, local_entity_id, remote_resource_id, local_revision, \
+             sync_state, ownership, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, 'synced', $8, $9, $9)",
+        )
+        .bind(mapping_id)
+        .bind(scope.workspace_id)
+        .bind(owner_account_id)
+        .bind(collection_id)
+        .bind(item_id)
+        .bind(remote_id)
+        .bind(local_revision)
+        .bind(ownership)
+        .bind(now - ChronoDuration::days(5))
+        .execute(pool)
+        .await
+        .expect("legacy provider mapping");
+    }
+
+    pool.execute(include_str!(
+        "../migrations/0014_google_calendar_projection.sql"
+    ))
+    .await
+    .expect("Calendar projection migration");
+    let remaining: Vec<String> = sqlx::query_scalar(
+        "SELECT collection_key FROM provider_sync_cursors WHERE workspace_id = $1 \
+         AND provider_account_id = $2 ORDER BY collection_key",
+    )
+    .bind(scope.workspace_id)
+    .bind(account_id)
+    .fetch_all(pool)
+    .await
+    .expect("remaining cursor keys");
+    assert_eq!(remaining, vec![tasks_key]);
+
+    let retired_item_ids = [
+        selected_external_id,
+        unselected_external_id,
+        paused_external_id,
+        inactive_external_id,
+    ];
+    for item_id in retired_item_ids {
+        let item: (i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("retired legacy item");
+        assert_eq!(item.0, 2);
+        assert!(item.1.is_some());
+
+        let mapping: (i64, String) = sqlx::query_as(
+            "SELECT local_revision, sync_state FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND local_entity_id = $2 AND entity_kind = 'item'",
+        )
+        .bind(scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("recoverable legacy mapping");
+        assert_eq!(mapping, (2, "pending_pull".to_owned()));
+
+        let tombstone: serde_json::Value = sqlx::query_scalar(
+            "SELECT payload FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+             AND item_revision = 2 AND change_kind = 'tombstone'",
+        )
+        .bind(scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("upgrade tombstone delta");
+        assert_eq!(
+            tombstone.get("id").and_then(|value| value.as_str()),
+            Some(item_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            tombstone
+                .get("revision")
+                .and_then(serde_json::Value::as_i64),
+            Some(2)
+        );
+        assert!(
+            tombstone
+                .get("deleted_at")
+                .is_some_and(|value| !value.is_null())
+        );
+        assert!(
+            tombstone
+                .get("parent_id")
+                .is_some_and(serde_json::Value::is_null)
+        );
+    }
+
+    for (item_id, revision) in [
+        (dayweave_owned_id, 1_i64),
+        (task_item_id, 1),
+        (divergent_external_id, 2),
+        (mixed_revision_external_id, 3),
+        (missing_revision_external_id, 2),
+        (shared_non_calendar_id, 1),
+    ] {
+        let item: (i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(pool)
+        .await
+        .expect("preserved control item");
+        assert_eq!(item, (revision, None));
+    }
+    let owned_mapping: (Option<Uuid>, Option<i64>, String, Option<serde_json::Value>) =
+        sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state, conflict_metadata \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(dayweave_mapping_id)
+        .fetch_one(pool)
+        .await
+        .expect("DayWeave owner mapping remains attached");
+    assert_eq!(
+        owned_mapping,
+        (Some(dayweave_owned_id), Some(1), "synced".to_owned(), None)
+    );
+
+    let preservation_evidence = [
+        (
+            shadow_external_mapping_id,
+            dayweave_owned_id,
+            Some(1_i64),
+            1_i64,
+            true,
+            "calendar_projection_upgrade_shared_canonical_item",
+        ),
+        (
+            divergent_mapping_id,
+            divergent_external_id,
+            Some(1),
+            2,
+            false,
+            "calendar_projection_upgrade_local_revision_diverged",
+        ),
+        (
+            mixed_matching_mapping_id,
+            mixed_revision_external_id,
+            Some(3),
+            3,
+            true,
+            "calendar_projection_upgrade_local_revision_diverged",
+        ),
+        (
+            mixed_stale_mapping_id,
+            mixed_revision_external_id,
+            Some(2),
+            3,
+            false,
+            "calendar_projection_upgrade_local_revision_diverged",
+        ),
+        (
+            missing_revision_mapping_id,
+            missing_revision_external_id,
+            None,
+            2,
+            false,
+            "calendar_projection_upgrade_local_revision_diverged",
+        ),
+        (
+            shared_calendar_mapping_id,
+            shared_non_calendar_id,
+            Some(1),
+            1,
+            true,
+            "calendar_projection_upgrade_shared_canonical_item",
+        ),
+    ];
+    for (mapping_id, item_id, mapping_revision, item_revision, mapping_revision_matches, reason) in
+        preservation_evidence
+    {
+        let mapping: (Option<Uuid>, Option<i64>, String, serde_json::Value) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state, conflict_metadata \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(mapping_id)
+        .fetch_one(pool)
+        .await
+        .expect("preserved legacy Calendar mapping evidence");
+        assert_eq!(mapping.0, None);
+        assert_eq!(mapping.1, None);
+        assert_eq!(mapping.2, "conflict");
+        assert_eq!(
+            mapping.3,
+            json!({
+                "reason": reason,
+                "local_item_id": item_id,
+                "item_revision": item_revision,
+                "mapping_local_revision": mapping_revision,
+                "mapping_revision_matches": mapping_revision_matches,
+            })
+        );
+
+        let audit: (
+            Option<Uuid>,
+            Option<i64>,
+            Option<i64>,
+            String,
+            serde_json::Value,
+        ) = sqlx::query_as(
+            "SELECT entity_id, base_revision, result_revision, outcome, metadata \
+             FROM audit_operations WHERE workspace_id = $1 \
+               AND operation_type = \
+                   'item.google_calendar_legacy_projection_preserved_on_upgrade' \
+               AND metadata->>'mapping_id' = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(mapping_id.to_string())
+        .fetch_one(pool)
+        .await
+        .expect("durable preserved legacy Calendar audit evidence");
+        assert_eq!(audit.0, Some(item_id));
+        assert_eq!(audit.1, mapping_revision);
+        assert_eq!(audit.2, Some(item_revision));
+        assert_eq!(audit.3, "conflicted");
+        assert_eq!(
+            audit.4,
+            json!({
+                "source": "google_sync",
+                "reason": reason,
+                "mapping_id": mapping_id,
+                "item_id": item_id,
+                "item_revision": item_revision,
+                "mapping_local_revision": mapping_revision,
+                "mapping_revision_matches": mapping_revision_matches,
+            })
+        );
+    }
+    let shared_task_mapping: (Option<Uuid>, Option<i64>, String) = sqlx::query_as(
+        "SELECT local_entity_id, local_revision, sync_state FROM provider_sync_mappings \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(shared_task_mapping_id)
+    .fetch_one(pool)
+    .await
+    .expect("non-Calendar sibling mapping remains attached");
+    assert_eq!(
+        shared_task_mapping,
+        (Some(shared_non_calendar_id), Some(1), "synced".to_owned())
+    );
+    let preserved_item_mutations: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM item_changes WHERE workspace_id = $1 \
+         AND item_id = ANY($2)",
+    )
+    .bind(scope.workspace_id)
+    .bind(vec![
+        dayweave_owned_id,
+        divergent_external_id,
+        mixed_revision_external_id,
+        missing_revision_external_id,
+        shared_non_calendar_id,
+    ])
+    .fetch_one(pool)
+    .await
+    .expect("preserved items have no migration delta");
+    assert_eq!(preserved_item_mutations, 0);
+    let already_trashed: (i64, Option<chrono::DateTime<Utc>>) = sqlx::query_as(
+        "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(already_trashed_id)
+    .fetch_one(pool)
+    .await
+    .expect("already-trashed control item");
+    assert_eq!(already_trashed, (1, Some(already_trashed_at)));
+
+    let retirement_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \
+         AND operation_type = 'item.google_calendar_legacy_projection_retired_on_upgrade'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .expect("upgrade audit count");
+    assert_eq!(retirement_audits, 4);
+    let preservation_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \
+         AND operation_type = \
+             'item.google_calendar_legacy_projection_preserved_on_upgrade'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .expect("upgrade preservation audit count");
+    assert_eq!(preservation_audits, 6);
+    let retirement_outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+         AND event_type = 'item.google_calendar_legacy_projection_retired_on_upgrade'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .expect("upgrade outbox count");
+    assert_eq!(retirement_outbox, 4);
+    for raw_remote_id in [
+        "upgrade-provider-selected",
+        "upgrade-provider-unselected",
+        "upgrade-provider-paused",
+        "upgrade-provider-inactive",
+        "upgrade-provider-shadow-external",
+        "upgrade-provider-divergent",
+        "upgrade-provider-mixed-matching",
+        "upgrade-provider-mixed-stale",
+        "upgrade-provider-missing-revision",
+        "upgrade-provider-shared-calendar",
+        "upgrade-provider-shared-task",
+    ] {
+        let leaked: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM item_changes WHERE workspace_id = $1 \
+               AND payload::text LIKE '%' || $2 || '%' \
+             UNION ALL SELECT 1 FROM outbox_messages WHERE workspace_id = $1 \
+               AND (payload::text LIKE '%' || $2 || '%' OR headers::text LIKE '%' || $2 || '%') \
+             UNION ALL SELECT 1 FROM audit_operations WHERE workspace_id = $1 \
+               AND metadata::text LIKE '%' || $2 || '%')",
+        )
+        .bind(scope.workspace_id)
+        .bind(raw_remote_id)
+        .fetch_one(pool)
+        .await
+        .expect("raw provider identity scan");
+        assert!(!leaked, "raw provider identity escaped: {raw_remote_id}");
+    }
+
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'complete', \
+         planning_generation = 1, planning_collection_revision = revision, \
+         planning_window_start = $3, planning_window_end = $4, \
+         planning_window_refreshed_at = $5 WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(calendar_id)
+    .bind(now - ChronoDuration::days(30))
+    .bind(now + ChronoDuration::days(120))
+    .bind(now)
+    .execute(pool)
+    .await
+    .expect("first generation is accepted");
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_generation = planning_generation \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(calendar_id)
+    .execute(pool)
+    .await
+    .expect("no-op generation update is accepted");
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_generation = 2 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(calendar_id)
+    .execute(pool)
+    .await
+    .expect("next generation is accepted");
+    let regression = sqlx::query(
+        "UPDATE google_sync_collections SET planning_generation = 1 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(calendar_id)
+    .execute(pool)
+    .await
+    .expect_err("generation regression must be rejected by SQL");
+    let regression_code = regression
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(regression_code.as_deref(), Some("23514"));
+    let generation: i64 = sqlx::query_scalar(
+        "SELECT planning_generation FROM google_sync_collections \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(calendar_id)
+    .fetch_one(pool)
+    .await
+    .expect("generation after rejected regression");
+    assert_eq!(generation, 2);
+
+    // The provider path takes the canonical workspace lock and a key lock on
+    // the exact sensitive item tuple. A concurrent direct declassification
+    // must wait for that path, then reject rather than committing write skew.
+    let provider_wins_item_id = Uuid::new_v4();
+    let item_wins_item_id = Uuid::new_v4();
+    for (item_id, title) in [
+        (provider_wins_item_id, "Provider sensitivity race"),
+        (item_wins_item_id, "Local sensitivity race"),
+    ] {
+        sqlx::query(
+            "INSERT INTO items (id, workspace_id, created_by_user_id, is_sensitive, kind, \
+             status, title, timezone_name, scheduling_constraints, split_allowed, revision, \
+             created_at, updated_at) VALUES ($1, $2, $3, true, 'event', 'scheduled', $4, \
+             'UTC', '{}'::jsonb, false, 1, $5, $5)",
+        )
+        .bind(item_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(title)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("sensitivity race item");
+    }
+    let provider_wins_mapping_id = Uuid::new_v4();
+    let item_wins_mapping_id = Uuid::new_v4();
+    for (mapping_id, item_id, remote_id) in [
+        (
+            provider_wins_mapping_id,
+            provider_wins_item_id,
+            "synthetic-provider-wins-occurrence",
+        ),
+        (
+            item_wins_mapping_id,
+            item_wins_item_id,
+            "synthetic-item-wins-occurrence",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+             collection_id, entity_kind, local_entity_id, remote_resource_id, local_revision, \
+             sync_state, ownership, projection_generation, provider_forced_sensitive, \
+             created_at, updated_at) VALUES ($1, $2, $3, $4, 'calendar_occurrence', $5, $6, \
+             1, 'synced', 'external', 1, false, $7, $7)",
+        )
+        .bind(mapping_id)
+        .bind(scope.workspace_id)
+        .bind(account_id)
+        .bind(calendar_id)
+        .bind(item_id)
+        .bind(remote_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("sensitivity race mapping");
+    }
+
+    let mut provider_wins = pool.begin().await.expect("provider-wins transaction");
+    let provider_wins_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *provider_wins)
+        .await
+        .expect("provider-wins backend pid");
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET provider_forced_sensitive = true \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(provider_wins_mapping_id)
+    .execute(&mut *provider_wins)
+    .await
+    .expect("provider path establishes sensitivity floor");
+    let concurrent_pool = (*pool).clone();
+    let declassify = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE items SET is_sensitive = false \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(provider_wins_item_id)
+        .execute(&concurrent_pool)
+        .await
+    });
+    wait_for_postgres_blocker(pool, provider_wins_pid).await;
+    provider_wins
+        .commit()
+        .await
+        .expect("commit provider sensitivity floor");
+    let declassify_error = declassify
+        .await
+        .expect("declassification task")
+        .expect_err("declassification must fail after provider transaction commits");
+    let declassify_code = declassify_error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(declassify_code.as_deref(), Some("23514"));
+    let provider_wins_state: (bool, bool) = sqlx::query_as(
+        "SELECT item.is_sensitive, mapping.provider_forced_sensitive \
+         FROM items item JOIN provider_sync_mappings mapping \
+           ON mapping.workspace_id = item.workspace_id AND mapping.local_entity_id = item.id \
+         WHERE item.workspace_id = $1 AND item.id = $2 AND mapping.id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(provider_wins_item_id)
+    .bind(provider_wins_mapping_id)
+    .fetch_one(pool)
+    .await
+    .expect("provider-wins invariant state");
+    assert_eq!(provider_wins_state, (true, true));
+    let hard_delete = sqlx::query("DELETE FROM items WHERE workspace_id = $1 AND id = $2")
+        .bind(scope.workspace_id)
+        .bind(provider_wins_item_id)
+        .execute(pool)
+        .await
+        .expect_err("active provider sensitivity floor must reject a hard delete");
+    let hard_delete_code = hard_delete
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(hard_delete_code.as_deref(), Some("23503"));
+
+    // The opposite order is safe too: the local item mutation owns the item
+    // row, so the provider trigger waits without taking locks in reverse order,
+    // then observes the committed non-sensitive value and rejects its floor.
+    let mut item_wins = pool.begin().await.expect("item-wins transaction");
+    let item_wins_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *item_wins)
+        .await
+        .expect("item-wins backend pid");
+    sqlx::query("UPDATE items SET is_sensitive = false WHERE workspace_id = $1 AND id = $2")
+        .bind(scope.workspace_id)
+        .bind(item_wins_item_id)
+        .execute(&mut *item_wins)
+        .await
+        .expect("local path declassifies before provider floor");
+    let concurrent_pool = (*pool).clone();
+    let force_sensitive = tokio::spawn(async move {
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET provider_forced_sensitive = true \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(item_wins_mapping_id)
+        .execute(&concurrent_pool)
+        .await
+    });
+    wait_for_postgres_blocker(pool, item_wins_pid).await;
+    item_wins
+        .commit()
+        .await
+        .expect("commit local declassification");
+    let force_error = force_sensitive
+        .await
+        .expect("provider floor task")
+        .expect_err("provider floor must fail after local transaction commits");
+    let force_code = force_error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned);
+    assert_eq!(force_code.as_deref(), Some("23514"));
+    let item_wins_state: (bool, bool) = sqlx::query_as(
+        "SELECT item.is_sensitive, mapping.provider_forced_sensitive \
+         FROM items item JOIN provider_sync_mappings mapping \
+           ON mapping.workspace_id = item.workspace_id AND mapping.local_entity_id = item.id \
+         WHERE item.workspace_id = $1 AND item.id = $2 AND mapping.id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_wins_item_id)
+    .bind(item_wins_mapping_id)
+    .fetch_one(pool)
+    .await
+    .expect("item-wins invariant state");
+    assert_eq!(item_wins_state, (false, false));
+
+    test_database.destroy().await;
 }
 
 #[tokio::test]
@@ -1820,6 +2754,27 @@ impl TestDatabase {
             .expect("drop isolated test schema");
         self.admin.close().await;
     }
+}
+
+async fn wait_for_postgres_blocker(pool: &PgPool, blocker_pid: i32) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity activity \
+                 WHERE $1 = ANY(pg_blocking_pids(activity.pid)))",
+            )
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .expect("inspect PostgreSQL blocking graph");
+            if blocked {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("competing PostgreSQL sensitivity mutation reached the intended lock");
 }
 
 async fn seed_scope(pool: &PgPool) -> DatabaseScope {

@@ -172,7 +172,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         .await
         .expect("remove rejected-item control canary from the active graph");
 
-    let preview = compose_canonical_schedule(&items, request.clone())
+    let preview = compose_canonical_schedule(&items, &schedules, request.clone())
         .await
         .expect("compose preview");
     let expected_digest = preview.input_digest.clone();
@@ -1047,7 +1047,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         .unwrap();
 
     let next_request = compose_request();
-    let next_preview = compose_canonical_schedule(&items, next_request)
+    let next_preview = compose_canonical_schedule(&items, &schedules, next_request)
         .await
         .unwrap();
     let legacy_draft_id = Uuid::new_v4();
@@ -1200,15 +1200,16 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         same_content_right.revision.id
     );
 
-    let different_left_result = compose_canonical_schedule(&items, compose_request())
+    let different_left_result = compose_canonical_schedule(&items, &schedules, compose_request())
         .await
         .unwrap();
     let mut different_right_request = compose_request();
     different_right_request.fixed_blocks[0].title =
         "Explicitly different concurrent publication".to_owned();
-    let different_right_result = compose_canonical_schedule(&items, different_right_request)
-        .await
-        .unwrap();
+    let different_right_result =
+        compose_canonical_schedule(&items, &schedules, different_right_request)
+            .await
+            .unwrap();
     let different_left = PublishScheduleSpec {
         idempotency_key: Uuid::new_v4(),
         request_hash: [96; 32],
@@ -1243,9 +1244,10 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     // deterministic future-then-past caller sequence remains monotonic.
     let mut future_caller_request = compose_request();
     future_caller_request.fixed_blocks[0].title = "Future caller clock".to_owned();
-    let future_caller_result = compose_canonical_schedule(&items, future_caller_request)
-        .await
-        .unwrap();
+    let future_caller_result =
+        compose_canonical_schedule(&items, &schedules, future_caller_request)
+            .await
+            .unwrap();
     let future_caller = concurrency_repository
         .publish(
             &access,
@@ -1262,7 +1264,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         .unwrap();
     let mut past_caller_request = compose_request();
     past_caller_request.fixed_blocks[0].title = "Past caller clock".to_owned();
-    let past_caller_result = compose_canonical_schedule(&items, past_caller_request)
+    let past_caller_result = compose_canonical_schedule(&items, &schedules, past_caller_request)
         .await
         .unwrap();
     let past_caller = concurrency_repository
@@ -1828,7 +1830,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
 
     // Item mutation holding the shared advisory lock wins; publication wakes,
     // rechecks the exact active revision map, and refuses stale composition.
-    let race_preview = compose_canonical_schedule(&items, compose_request())
+    let race_preview = compose_canonical_schedule(&items, &schedules, compose_request())
         .await
         .unwrap();
     let mut mutation = test_database.pool.begin().await.unwrap();
@@ -2002,6 +2004,13 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         ))
         .await
         .expect("schedule seal migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0014_google_calendar_projection.sql"
+        ))
+        .await
+        .expect("Calendar projection fence migration applies");
 
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
@@ -2079,7 +2088,7 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         .expect("legacy draft remains discardable");
 
     let fresh_request = compose_request();
-    let fresh_preview = compose_canonical_schedule(&items, fresh_request)
+    let fresh_preview = compose_canonical_schedule(&items, &schedules, fresh_request)
         .await
         .unwrap();
     let fresh = schedules
@@ -2131,6 +2140,485 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
     assert_eq!(legacy_state, "superseded");
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn calendar_projection_fences_preview_publication_and_exact_replay() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let item_repository = Arc::new(PostgresItemRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
+    items
+        .create(
+            task(
+                Uuid::new_v4(),
+                "Synthetic projection fence task",
+                false,
+                None,
+                json!({}),
+            ),
+            idempotency(201),
+        )
+        .await
+        .expect("create projection fence task");
+    let schedules = Arc::new(PostgresSchedulingRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let (app, access_token) =
+        credential_publish_app(&test_database.pool, scope, items.clone(), schedules.clone()).await;
+    let request = compose_request();
+    let account_id = seed_google_calendar_account(&test_database.pool, scope).await;
+    let remote_calendar_canary = "synthetic-remote-calendar-content-must-not-leak";
+    let first_collection = insert_blocking_calendar(
+        &test_database.pool,
+        scope,
+        account_id,
+        remote_calendar_canary,
+        true,
+    )
+    .await;
+
+    assert_projection_preview_unavailable(&app, &access_token, &request).await;
+
+    set_failed_calendar_projection(&test_database.pool, first_collection).await;
+    assert_projection_preview_unavailable(&app, &access_token, &request).await;
+
+    let full_window_start = "2026-08-31T00:00:00Z".parse().unwrap();
+    let full_window_end = "2026-09-03T00:00:00Z".parse().unwrap();
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        1,
+        "2026-09-01T01:00:00Z".parse().unwrap(),
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    assert_projection_preview_unavailable(&app, &access_token, &request).await;
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        2,
+        full_window_start,
+        full_window_end,
+        Utc::now() - chrono::Duration::minutes(31),
+    )
+    .await;
+    assert_projection_preview_unavailable(&app, &access_token, &request).await;
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        3,
+        full_window_start,
+        full_window_end,
+        Utc::now() + chrono::Duration::minutes(1),
+    )
+    .await;
+    assert_projection_preview_unavailable(&app, &access_token, &request).await;
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        4,
+        full_window_start,
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    let transaction_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("compose with a fresh Calendar projection");
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        4,
+        full_window_start,
+        full_window_end,
+        Utc::now() + chrono::Duration::minutes(1),
+    )
+    .await;
+    let transaction_result = schedules
+        .publish(
+            &ScheduleAccess {
+                subject: "calendar-projection-fence-test".to_owned(),
+                include_sensitive: false,
+                workspace_id: Some(scope.workspace_id),
+                user_id: Some(scope.user_id),
+            },
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [202; 32],
+                input_digest: digest_bytes(&transaction_preview.input_digest),
+                timezone_name: request.timezone_name.clone(),
+                result: transaction_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await;
+    assert!(matches!(
+        transaction_result,
+        Err(SchedulePublicationError::StaleComposition)
+    ));
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        5,
+        full_window_start,
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    let generation_preview = public_schedule_preview(&app, &access_token, &request).await;
+    assert!(
+        generation_preview
+            .get("calendar_projection_stamps")
+            .is_none()
+    );
+    assert!(
+        !generation_preview
+            .to_string()
+            .contains(remote_calendar_canary)
+    );
+    let generation_publish = schedule_publish_body(
+        Uuid::new_v4(),
+        generation_preview["input_digest"].as_str().unwrap(),
+        &request,
+    );
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_generation = planning_generation + 1, \
+         planning_window_refreshed_at = clock_timestamp() WHERE id = $1",
+    )
+    .bind(first_collection)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    assert_stale_schedule_publication(&app, &access_token, &generation_publish).await;
+
+    let configuration_preview = public_schedule_preview(&app, &access_token, &request).await;
+    let configuration_publish = schedule_publish_body(
+        Uuid::new_v4(),
+        configuration_preview["input_digest"].as_str().unwrap(),
+        &request,
+    );
+    sqlx::query(
+        "UPDATE google_sync_collections SET visible = NOT visible, revision = revision + 1 \
+         WHERE id = $1",
+    )
+    .bind(first_collection)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    assert_stale_schedule_publication(&app, &access_token, &configuration_publish).await;
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        7,
+        full_window_start,
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    let selection_preview = public_schedule_preview(&app, &access_token, &request).await;
+    let selection_publish = schedule_publish_body(
+        Uuid::new_v4(),
+        selection_preview["input_digest"].as_str().unwrap(),
+        &request,
+    );
+    let newly_selected_remote_canary = "synthetic-newly-selected-calendar-content";
+    let second_collection = insert_blocking_calendar(
+        &test_database.pool,
+        scope,
+        account_id,
+        newly_selected_remote_canary,
+        false,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE google_sync_collections SET selected = true, revision = revision + 1 WHERE id = $1",
+    )
+    .bind(second_collection)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    assert_stale_schedule_publication(&app, &access_token, &selection_publish).await;
+    assert_eq!(
+        publication_counts(&test_database.pool, scope).await,
+        (0, 0, 0, 0, 0),
+        "projection invalidation must not create partial publication evidence"
+    );
+
+    set_complete_calendar_projection(
+        &test_database.pool,
+        first_collection,
+        8,
+        full_window_start,
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    set_complete_calendar_projection(
+        &test_database.pool,
+        second_collection,
+        1,
+        full_window_start,
+        full_window_end,
+        Utc::now(),
+    )
+    .await;
+    let publish_preview = public_schedule_preview(&app, &access_token, &request).await;
+    assert!(publish_preview.get("calendar_projection_stamps").is_none());
+    let publish_key = Uuid::new_v4();
+    let publish_body = schedule_publish_body(
+        publish_key,
+        publish_preview["input_digest"].as_str().unwrap(),
+        &request,
+    );
+    let published = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &publish_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    let published = body_json(published).await;
+    assert_eq!(published["replayed"], false);
+    let published_id = Uuid::parse_str(published["revision"]["id"].as_str().unwrap()).unwrap();
+
+    let snapshot: Value = sqlx::query_scalar(
+        "SELECT result_snapshot FROM schedule_revision_details \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(published_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert!(
+        snapshot["compose"]
+            .get("calendar_projection_stamps")
+            .is_none()
+    );
+    let stamps = snapshot["evidence"]["calendar_projection_stamps"]
+        .as_array()
+        .expect("durable projection stamps");
+    assert_eq!(stamps.len(), 2);
+    let stamped_collection_ids: std::collections::BTreeSet<_> = stamps
+        .iter()
+        .map(|stamp| Uuid::parse_str(stamp["collection_id"].as_str().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        stamped_collection_ids,
+        std::collections::BTreeSet::from([first_collection, second_collection])
+    );
+    for stamp in stamps {
+        let keys: std::collections::BTreeSet<_> = stamp
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "collection_id",
+                "collection_revision",
+                "generation",
+                "refreshed_at",
+                "window_end",
+                "window_start",
+            ])
+        );
+    }
+    let encoded_snapshot = snapshot.to_string();
+    assert!(!encoded_snapshot.contains(remote_calendar_canary));
+    assert!(!encoded_snapshot.contains(newly_selected_remote_canary));
+    assert!(!encoded_snapshot.contains(&account_id.to_string()));
+
+    sqlx::query("UPDATE google_sync_collections SET revision = revision + 1 WHERE id = $1")
+        .bind(first_collection)
+        .execute(&test_database.pool)
+        .await
+        .unwrap();
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &publish_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay = body_json(replay).await;
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["revision"], published["revision"]);
+
+    test_database.destroy().await;
+}
+
+async fn seed_google_calendar_account(pool: &PgPool, scope: DatabaseScope) -> Uuid {
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, external_account_id, \
+         display_label, encrypted_credentials, credential_key_version, granted_scopes, status, \
+         sync_enabled) VALUES ($1, $2, $3, 'google', $4, \
+         'Synthetic projection account', $5, 1, \
+         ARRAY['https://www.googleapis.com/auth/calendar.readonly']::text[], 'active', true)",
+    )
+    .bind(account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(format!("synthetic-calendar-account-{account_id}"))
+    .bind(vec![0x53_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    account_id
+}
+
+async fn insert_blocking_calendar(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    remote_collection_id: &str,
+    selected: bool,
+) -> Uuid {
+    let collection_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO google_sync_collections (id, workspace_id, user_id, provider_account_id, \
+         collection_kind, remote_collection_id, display_name, provider_access_role, \
+         provider_selected, selected, visible, sync_role, discovered_at, configured_at, \
+         created_at, updated_at) VALUES ($1, $2, $3, $4, 'calendar', $5, \
+         'Synthetic blocking calendar', 'owner', $6, $6, true, 'blocking', \
+         clock_timestamp(), clock_timestamp(), clock_timestamp(), clock_timestamp())",
+    )
+    .bind(collection_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(remote_collection_id)
+    .bind(selected)
+    .execute(pool)
+    .await
+    .unwrap();
+    collection_id
+}
+
+async fn set_failed_calendar_projection(pool: &PgPool, collection_id: Uuid) {
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'failed', \
+         planning_collection_revision = NULL, planning_window_start = NULL, \
+         planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+         planning_last_error_code = 'synthetic_projection_failure' WHERE id = $1",
+    )
+    .bind(collection_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn set_complete_calendar_projection(
+    pool: &PgPool,
+    collection_id: Uuid,
+    generation: i64,
+    window_start: chrono::DateTime<Utc>,
+    window_end: chrono::DateTime<Utc>,
+    refreshed_at: chrono::DateTime<Utc>,
+) {
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'complete', \
+         planning_generation = $2, planning_collection_revision = revision, \
+         planning_window_start = $3, planning_window_end = $4, \
+         planning_window_refreshed_at = $5, planning_last_error_code = NULL WHERE id = $1",
+    )
+    .bind(collection_id)
+    .bind(generation)
+    .bind(window_start)
+    .bind(window_end)
+    .bind(refreshed_at)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn assert_projection_preview_unavailable(
+    app: &Router,
+    access_token: &str,
+    request: &ComposeScheduleRequest,
+) {
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/preview",
+            &serde_json::to_value(request).unwrap(),
+            access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "service_unavailable");
+}
+
+async fn public_schedule_preview(
+    app: &Router,
+    access_token: &str,
+    request: &ComposeScheduleRequest,
+) -> Value {
+    let response = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/preview",
+            &serde_json::to_value(request).unwrap(),
+            access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    body_json(response).await
+}
+
+fn schedule_publish_body(
+    idempotency_key: Uuid,
+    expected_input_digest: &str,
+    request: &ComposeScheduleRequest,
+) -> Value {
+    json!({
+        "idempotency_key": idempotency_key,
+        "expected_input_digest": expected_input_digest,
+        "schedule": request,
+    })
+}
+
+async fn assert_stale_schedule_publication(app: &Router, access_token: &str, body: &Value) {
+    let response = app
+        .clone()
+        .oneshot(json_request("/v1/schedule/publish", body, access_token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["code"], "schedule_publication_stale");
 }
 
 fn compose_request() -> ComposeScheduleRequest {
@@ -2531,7 +3019,9 @@ async fn assert_publication_failure_rollbacks(
         request.fixed_blocks[0].title = format!("Failure injection target {index}");
         request.fixed_blocks[0].start += chrono::Duration::minutes(i64::try_from(index).unwrap());
         request.fixed_blocks[0].end += chrono::Duration::minutes(i64::try_from(index).unwrap());
-        let preview = compose_canonical_schedule(items, request).await.unwrap();
+        let preview = compose_canonical_schedule(items, schedules, request)
+            .await
+            .unwrap();
         let result = schedules
             .publish(
                 access,

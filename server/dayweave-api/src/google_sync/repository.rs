@@ -4,10 +4,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use super::{
-    DiscoveredCollection, GoogleCalendarPolicy, GoogleOutboundAccepted, GoogleOutboundPreview,
-    GoogleSyncCollection, GoogleSyncRole, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
-    OutboundDispatchPermit, OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
-    RemoteItemChange, StoredCursor, SyncClaim, SyncCounts, SyncFailureKind,
+    CalendarProjectionBatch, CalendarProjectionResult, DiscoveredCollection, GoogleCalendarPolicy,
+    GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRole,
+    GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec, OutboundDispatchPermit,
+    OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
+    RemoteCalendarSeriesChange, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
+    SyncFailureKind,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -68,6 +70,15 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
     async fn request_refresh(
         &self,
         account_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError>;
+
+    /// Invalidates every selected Calendar projection before discovery or any
+    /// provider read. A failed/partial refresh can therefore never leave stale
+    /// complete coverage available to the scheduler.
+    async fn begin_calendar_projection_refresh(
+        &self,
+        claim: &SyncClaim,
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError>;
 
@@ -139,6 +150,24 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
         &self,
         claim: &SyncClaim,
         change: RemoteItemChange,
+        now: DateTime<Utc>,
+    ) -> Result<ImportOutcome, GoogleSyncRepositoryError>;
+
+    /// Atomically replaces one complete bounded Calendar occurrence window.
+    /// Rejections invalidate coverage without partially applying the batch.
+    async fn replace_calendar_projection(
+        &self,
+        claim: &SyncClaim,
+        batch: CalendarProjectionBatch,
+        now: DateTime<Utc>,
+    ) -> Result<CalendarProjectionResult, GoogleSyncRepositoryError>;
+
+    /// Retains recurrence-series provider/version metadata without treating a
+    /// live series master as either a canonical event or a deletion.
+    async fn apply_calendar_series_metadata(
+        &self,
+        claim: &SyncClaim,
+        change: RemoteCalendarSeriesChange,
         now: DateTime<Utc>,
     ) -> Result<ImportOutcome, GoogleSyncRepositoryError>;
 
@@ -264,6 +293,8 @@ pub(crate) enum GoogleSyncRepositoryError {
     ClaimLost,
     #[error("sync cursor changed concurrently")]
     CursorConflict,
+    #[error("expanded Calendar projection batch is invalid")]
+    InvalidProjectionBatch,
     #[error("Google sync persistence failed")]
     Internal,
 }

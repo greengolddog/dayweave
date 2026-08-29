@@ -15,7 +15,10 @@ use crate::google_oauth::{
     OAuthSessionStart, OperatorRecoveryResult, RevocationFenceClaim, SealedSecret, SecretHash,
 };
 
-use super::DatabaseScope;
+use super::{
+    DatabaseScope, google_sync_repository::retire_active_calendar_occurrences_for_account,
+    lock_canonical_item_space,
+};
 
 const ACCOUNT_COLUMNS: &str = "id, external_account_id, display_label, status, sync_enabled, \
     is_default, granted_scopes, token_expires_at, revision, created_at, updated_at, \
@@ -1336,6 +1339,9 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         now: DateTime<Utc>,
     ) -> Result<OperatorRecoveryResult, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
         let state = sqlx::query(
             "SELECT revocation_kind, revocation_owner_id FROM google_oauth_scope_state \
@@ -1364,6 +1370,35 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .map_err(internal)?;
         if !recovery && legacy_count == 0 {
             return Err(GoogleOAuthRepositoryError::OperatorRecoveryNotRequired);
+        }
+
+        let teardown_account_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT account.id FROM provider_accounts account \
+             WHERE account.workspace_id = $1 AND account.user_id = $2 \
+               AND account.provider = 'google' AND ( \
+                 ($3 AND account.status <> 'revoked' AND account.tombstoned_at IS NULL) \
+                 OR EXISTS(SELECT 1 FROM google_oauth_legacy_credential_quarantine quarantine \
+                   WHERE quarantine.workspace_id = account.workspace_id \
+                     AND quarantine.user_id = account.user_id \
+                     AND quarantine.source_account_id = account.id \
+                     AND quarantine.recovery_confirmed_at IS NULL)) \
+             ORDER BY account.id",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(recovery)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for account_id in teardown_account_ids {
+            retire_active_calendar_occurrences_for_account(
+                &mut transaction,
+                self.scope,
+                account_id,
+                now,
+            )
+            .await
+            .map_err(internal)?;
         }
 
         let accounts_affected = if recovery {
@@ -1567,6 +1602,9 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         idempotency: OAuthIdempotency,
     ) -> Result<GoogleAccountMutation, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
         if let Some(account) = account_idempotency_replay(
             lookup_idempotency(&mut transaction, self.scope, &idempotency, now).await?,
@@ -1586,6 +1624,16 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         let expected_status = if paused { "active" } else { "paused" };
         if current.account.status.as_db() != expected_status {
             return Err(GoogleOAuthRepositoryError::AccountStateConflict);
+        }
+        if paused {
+            retire_active_calendar_occurrences_for_account(
+                &mut transaction,
+                self.scope,
+                account_id,
+                now,
+            )
+            .await
+            .map_err(internal)?;
         }
         let next_status = if paused { "paused" } else { "active" };
         let next_revision = expected_revision
@@ -1703,6 +1751,9 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         idempotency: OAuthIdempotency,
     ) -> Result<DisconnectMutation, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
         let idempotency_state =
             lookup_idempotency(&mut transaction, self.scope, &idempotency, now).await?;
@@ -1795,6 +1846,14 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
                 return Err(GoogleOAuthRepositoryError::DisconnectInProgress);
             }
         }
+        retire_active_calendar_occurrences_for_account(
+            &mut transaction,
+            self.scope,
+            account_id,
+            now,
+        )
+        .await
+        .map_err(internal)?;
         let next_revision = current
             .account
             .revision

@@ -118,6 +118,12 @@ pub struct GoogleSyncCollection {
     pub discovered_at: DateTime<Utc>,
     pub configured_at: Option<DateTime<Utc>>,
     pub last_import_at: Option<DateTime<Utc>>,
+    pub planning_projection_state: CalendarProjectionState,
+    pub planning_generation: u64,
+    pub planning_collection_revision: Option<u64>,
+    pub planning_window_start: Option<DateTime<Utc>>,
+    pub planning_window_end: Option<DateTime<Utc>>,
+    pub planning_window_refreshed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -223,6 +229,62 @@ pub(crate) struct StoredCursor {
 pub(crate) enum CursorValue {
     Calendar { sync_token: String },
     Tasks { updated_min: DateTime<Utc> },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarProjectionState {
+    Uninitialized,
+    Complete,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CalendarProjectionWindow {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RejectedRemoteItem {
+    pub remote_id: String,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CalendarProjectionBatch {
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub changes: Vec<RemoteItemChange>,
+    pub rejected: Vec<RejectedRemoteItem>,
+    pub window: CalendarProjectionWindow,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CalendarProjectionResult {
+    pub generation: u64,
+    pub complete: bool,
+    pub counts: SyncCounts,
+}
+
+/// Provider/version state for a recurring Calendar series. This is distinct
+/// from a deletion and deliberately contains no canonical item projection.
+#[derive(Clone, Debug)]
+pub(crate) struct RemoteCalendarSeriesChange {
+    pub account_id: Uuid,
+    pub collection_id: Uuid,
+    pub collection_revision: u64,
+    pub dayweave_item_id: Option<Uuid>,
+    pub remote_id: String,
+    pub remote_etag: Option<String>,
+    pub remote_updated_at: Option<DateTime<Utc>>,
+    pub remote_payload_hash: [u8; 32],
+    pub remote_projection_hash: [u8; 32],
+    /// Complete normalized provider representation used only to recover an
+    /// authenticated DayWeave-owned create after a lost provider response.
+    pub reviewed_provider_projection: Option<Value>,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug)]

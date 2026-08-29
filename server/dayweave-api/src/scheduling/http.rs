@@ -13,7 +13,7 @@ use crate::{AppState, auth::Principal, error::ApiError};
 use super::{
     ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult, PublishScheduleSpec,
     ScheduleAccess, SchedulePublication, SchedulePublicationError, compose_canonical_schedule,
-    postgres::decode_prefixed_sha256,
+    compose_canonical_schedule_unfenced, postgres::decode_prefixed_sha256,
 };
 
 pub const SCHEDULE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -45,6 +45,7 @@ pub struct PublishScheduleRequest {
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Schedule request exceeds 16 MiB", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid horizon, timezone, bounds, metadata, or scheduling input", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Required Google Calendar projection is incomplete or temporarily unavailable", body = crate::error::ErrorEnvelope),
         (status = 500, description = "Canonical item storage or encoding failure", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -55,9 +56,11 @@ pub(crate) async fn preview_schedule(
     let request = request
         .map_err(|error| ApiError::from_json_rejection(&error))?
         .0;
-    let result = compose_canonical_schedule(&state.items, request)
-        .await
-        .map_err(|error| map_compose_error(&error))?;
+    let result = match state.scheduling.as_deref() {
+        Some(projection) => compose_canonical_schedule(&state.items, projection, request).await,
+        None => compose_canonical_schedule_unfenced(&state.items, request).await,
+    }
+    .map_err(|error| map_compose_error(&error))?;
     Ok(Json(result))
 }
 
@@ -75,7 +78,7 @@ pub(crate) async fn preview_schedule(
         (status = 409, description = "schedule_publication_stale or schedule_publication_idempotency_conflict", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Schedule request exceeds 16 MiB", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid digest, horizon, timezone, bounds, metadata, or scheduling input", body = crate::error::ErrorEnvelope),
-        (status = 503, description = "Durable schedule publication is not configured", body = crate::error::ErrorEnvelope)
+        (status = 503, description = "Durable publication is not configured or Google Calendar projection evidence is temporarily unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
 pub(crate) async fn publish_schedule(
@@ -111,9 +114,9 @@ pub(crate) async fn publish_schedule(
     }
 
     let timezone_name = request.schedule.timezone_name.clone();
-    let result = compose_canonical_schedule(&state.items, request.schedule)
+    let result = compose_canonical_schedule(&state.items, repository, request.schedule)
         .await
-        .map_err(|error| map_compose_error(&error))?;
+        .map_err(|error| map_publish_compose_error(&error))?;
     if result.input_digest != request.expected_input_digest {
         return Err(ApiError::schedule_publication_stale(
             "Schedule preview is stale; preview again before publishing",
@@ -174,9 +177,23 @@ fn map_publication_error(error: SchedulePublicationError) -> ApiError {
 }
 
 fn map_compose_error(error: &ComposeScheduleError) -> ApiError {
-    if error.is_client_error() {
-        ApiError::validation(error.to_string())
-    } else {
-        ApiError::internal()
+    match error {
+        ComposeScheduleError::CalendarProjectionIncomplete => ApiError::unavailable(
+            "Selected Google Calendar data is not ready for this scheduling horizon; refresh sync and retry",
+        ),
+        ComposeScheduleError::CalendarProjectionUnavailable => {
+            ApiError::unavailable("Google Calendar projection evidence is temporarily unavailable")
+        }
+        _ if error.is_client_error() => ApiError::validation(error.to_string()),
+        _ => ApiError::internal(),
     }
+}
+
+fn map_publish_compose_error(error: &ComposeScheduleError) -> ApiError {
+    if matches!(error, ComposeScheduleError::CalendarProjectionIncomplete) {
+        return ApiError::schedule_publication_stale(
+            "Google Calendar data changed after preview; preview again before publishing",
+        );
+    }
+    map_compose_error(error)
 }

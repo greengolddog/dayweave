@@ -2,8 +2,9 @@
 
 `POST /v1/schedule/preview` composes the active canonical item graph without
 writing items, schedule blocks, or provider state. It requires the ordinary
-DayWeave bearer token. The same canonical revisions and request produce the
-same `input_digest` and plan.
+DayWeave bearer token. The same canonical revisions, request, scheduler schema,
+and required Calendar projection stamps produce the same `input_digest` and
+plan.
 
 The preview and publication routes each have a 16 MiB request-body ceiling.
 Other API routes retain the service-wide 1 MiB ceiling. A body over its route
@@ -32,6 +33,22 @@ version, so a preview cached across a solver/schema upgrade cannot acknowledge
 and install different blocks. Effective sensitivity evidence is retained
 internally for publication/redaction; it is deliberately not exposed as a
 whole-item map in the preview JSON or OpenAPI schema.
+
+Every selected `blocking` or `writable` Google Calendar whose policy can reserve
+time must also have one complete expanded-occurrence generation under its
+current collection revision, covering the entire requested horizon. Otherwise
+preview returns `503` and no plan is produced. A completed generation is usable
+for at most 30 minutes (twice the normal sync cadence); a stopped worker or an
+account that can no longer refresh therefore cannot leave cached Google truth
+trusted for months merely because its window still covers the horizon. The
+digest binds sorted, content-free generation/window stamps on both sides of the
+canonical item read; those internal stamps contain only DayWeave collection
+UUIDs and are omitted
+from the response and OpenAPI schema. Once an authoritative Calendar generation
+is present, caller-supplied `google_calendar` fixed blocks are rejected to avoid
+double booking. Context-only calendars do not form a capacity fence because
+their canonical `calendar_context` items are accepted but intentionally emit no
+work item or block.
 
 ## Explicit immutable publication
 
@@ -71,8 +88,12 @@ receipt and its original `published_at`; changed content under the same key is
 For a new key, the server recomposes from canonical items and compares the
 result with `expected_input_digest`. Inside the publication transaction it
 serializes against item mutations and rechecks the complete active-item
-revision set. It then inserts a draft header, blocks and exactly one detail;
-supersedes the old current revision; seals the draft as published; and writes
+revision set. It also share-locks every Calendar collection row, reconstructs
+the required projection stamps, and rejects a changed generation, configuration,
+coverage window, or newly enabled blocking source as
+`409 schedule_publication_stale`. It then inserts a draft header, blocks, and
+exactly one detail; supersedes the old current revision; seals the draft as
+published; and writes
 the receipt and audit row, all in one transaction. Content insertion is allowed
 only while the parent is draft, and blocks/details become immutable after the
 seal. A fresh key whose solver-versioned publication content is identical to the
@@ -157,7 +178,7 @@ must be positive and no longer than 90 days.
 
 Production publication, immutable reads, and transactional MCP proposal
 submission require migrations through
-`0013_schedule_seal_and_mcp_submission.sql`.
+`0014_google_calendar_projection.sql`.
 
 An upgrade from migrations 1–11 safely seals any legacy published revision but
 cannot invent the missing durable detail/evidence snapshot. Schedule and item
@@ -208,7 +229,7 @@ such a client could otherwise treat sensitive content as ordinary planner data.
       "title": "Private appointment",
       "start": "2026-09-01T08:00:00Z",
       "end": "2026-09-01T08:30:00Z",
-      "source": "google_calendar"
+      "source": "protected_time"
     }
   ],
   "previous_assignments": [],
@@ -243,7 +264,9 @@ Supported metadata keys are:
 
 - `constraints`: the portable core constraint object;
 - `has_own_effort`, `goal_ids`, `tags`, and `energy`;
-- `calendar_event` for an `event` item;
+- `calendar_event` for an event that reserves capacity;
+- `calendar_context` for a retained, nonblocking provider occurrence;
+- `dayweave_firm_block` for a legacy DayWeave-owned immutable event;
 - `habit_target` and `preserves_streak_when_paused`;
 - `routine_ordered`;
 - `goal_measures` and `goal_weekly_allocation`;
@@ -292,8 +315,8 @@ Other core constraint keys include `earliest_start`, `latest_finish`,
 `earliest_start_at` and `deadline_at` become hard bounds; defining the same
 bound again in metadata rejects the item as ambiguous.
 
-An event requires this metadata (recurring Google series are expanded by the
-calendar integration before composition):
+A blocking event uses this metadata (recurring Google series are expanded by
+the calendar integration before composition):
 
 ```json
 {
@@ -302,10 +325,34 @@ calendar integration before composition):
     "end": "2026-09-01T11:00:00+02:00",
     "immutable": true,
     "all_day": false,
-    "source_calendar_id": "primary"
+    "source_calendar_id": null
   }
 }
 ```
+
+Authoritative Google projections always set `source_calendar_id` to `null`;
+provider identifiers remain in the sync mapping layer and never enter scheduling
+digest or publication evidence. The nullable field remains part of the generic
+and legacy manual-event schema for compatibility.
+
+A retained nonblocking provider occurrence is a recurrence-free root `event`
+whose sole metadata key is the strict, identifier-free context shape below. It
+counts as an accepted canonical item but emits no work item or capacity block:
+
+```json
+{
+  "calendar_context": {
+    "start": "2026-09-01T10:00:00+02:00",
+    "end": "2026-09-01T11:00:00+02:00",
+    "all_day": false
+  }
+}
+```
+
+Existing DayWeave-owned Calendar blocks use `dayweave_firm_block` as their sole
+metadata key. It requires `owned: true`, `starts_at`, and `ends_at`; `all_day`
+and `tentative` default to `false`, while `busy` defaults to `true`. New provider
+projections do not emit this legacy shape.
 
 ## Recurrence
 

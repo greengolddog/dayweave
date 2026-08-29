@@ -6,6 +6,10 @@ pub enum GoogleError {
     InvalidBaseUrl,
     #[error("Google transport failed")]
     Transport(#[source] reqwest::Error),
+    #[error("Google API response exceeded the safe processing limit")]
+    ResponseTooLarge,
+    #[error("Google API returned an invalid JSON response")]
+    InvalidResponse,
     #[error("Google credentials are missing or no longer authorized")]
     Unauthorized,
     #[error("Google incremental sync token expired; a bounded full sync is required")]

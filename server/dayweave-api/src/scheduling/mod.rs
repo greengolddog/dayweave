@@ -3,8 +3,9 @@ pub(crate) mod http;
 mod memory;
 mod ports;
 mod postgres;
+mod projection;
 
-pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/1";
+pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/2";
 
 /// `PostgreSQL` `timestamptz` stores microseconds. Query boundaries must already
 /// use that precision so a read cannot silently change meaning when bound.
@@ -19,6 +20,7 @@ pub(crate) fn truncate_to_postgres_timestamp_precision(
         .expect("a valid DateTime must remain representable at microsecond precision")
 }
 
+pub(crate) use compose::compose_canonical_schedule_unfenced;
 pub use compose::{
     AvailabilityInput, ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult,
     EnergyInput, FixedBlockInput, FixedBlockSourceInput, IgnoredPreviousAssignment,
@@ -31,3 +33,4 @@ pub use postgres::{
     PostgresSchedulingRepository, PublishScheduleSpec, PublishedScheduleRevision,
     SchedulePublication, SchedulePublicationError,
 };
+pub(crate) use projection::{CalendarProjectionFenceError, CalendarProjectionStamp};

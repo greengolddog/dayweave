@@ -21,16 +21,18 @@ use crate::{
 };
 
 use super::{
-    ComposeScheduleResult, ConflictQuery, ConflictReport, ItemSearchQuery, ItemSearchResult,
-    ItemSummary, PlacementAlternative, PlacementExplanation, PlacementReason, PlanOperationKind,
-    PlanningSimulationPort, ProposalSubmissionError, ProposalSubmissionPort,
-    ProposalSubmissionResult, ProposalSubmissionSpec, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess,
-    ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
-    ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationIssue, SimulationRequest,
-    SimulationResult, has_postgres_timestamp_precision, simulation_request_digest,
+    CalendarProjectionFenceError, CalendarProjectionStamp, ComposeScheduleResult, ConflictQuery,
+    ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary, PlacementAlternative,
+    PlacementExplanation, PlacementReason, PlanOperationKind, PlanningSimulationPort,
+    ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
+    ProposalSubmissionSpec, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess, ScheduleBlockView,
+    ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort, ScheduleView,
+    SchedulingPortError, SimulatedBlockMove, SimulationIssue, SimulationRequest, SimulationResult,
+    has_postgres_timestamp_precision, simulation_request_digest,
 };
 
 const MAX_CANONICAL_ITEMS: usize = 10_000;
+const CALENDAR_PROJECTION_MAX_AGE_MINUTES: i64 = 30;
 const MAX_SIMULATION_BYTES: usize = 1024 * 1024;
 const MAX_ACTIVE_SIMULATIONS: i64 = 256;
 const SIMULATION_TTL: Duration = Duration::minutes(15);
@@ -97,6 +99,149 @@ impl PostgresSchedulingRepository {
     #[must_use]
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self { pool, scope }
+    }
+
+    /// Captures content-free generation evidence for every selected Calendar
+    /// that can reserve schedule capacity.
+    ///
+    /// A selected collection is unusable until one complete expanded-event
+    /// generation covers the whole requested horizon under its current
+    /// configuration revision. Read-only/context-only calendars do not form a
+    /// capacity-safety fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CalendarProjectionFenceError::Incomplete`] if any required
+    /// collection is uninitialized, failed, stale or only partially covers the
+    /// horizon. Storage failures are redacted as `Unavailable`.
+    #[allow(clippy::too_many_lines)] // The query and typed fail-closed validation form one fence.
+    pub(crate) async fn calendar_projection_stamps(
+        &self,
+        horizon_start: DateTime<Utc>,
+        horizon_end: DateTime<Utc>,
+    ) -> Result<Vec<CalendarProjectionStamp>, CalendarProjectionFenceError> {
+        if horizon_start >= horizon_end {
+            return Err(CalendarProjectionFenceError::Incomplete);
+        }
+        let rows = sqlx::query(
+            "SELECT collection.id, collection.revision, collection.planning_projection_state, \
+             collection.planning_generation, collection.planning_collection_revision, \
+             collection.planning_window_start, collection.planning_window_end, \
+             collection.planning_window_refreshed_at, statement_timestamp() AS observed_at, \
+             (account.status = 'active' AND account.sync_enabled \
+              AND account.tombstoned_at IS NULL AND collection.selected \
+              AND NOT collection.provider_deleted \
+              AND collection.sync_role IN ('blocking', 'writable') \
+              AND (collection.confirmed_busy_policy = 'blocking' \
+                   OR collection.tentative_policy = 'blocking' \
+                   OR collection.free_policy = 'blocking' \
+                   OR collection.all_day_policy = 'blocking')) AS configuration_requires_projection, \
+             EXISTS(SELECT 1 FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+               WHERE mapping.workspace_id = collection.workspace_id \
+                 AND mapping.provider_account_id = collection.provider_account_id \
+                 AND mapping.collection_id = collection.id \
+                 AND mapping.entity_kind = 'calendar_occurrence' \
+                 AND mapping.tombstoned_at IS NULL AND item.trashed_at IS NULL \
+                 AND item.scheduling_constraints ? 'calendar_event') AS has_active_blocking_occurrence \
+             FROM google_sync_collections collection JOIN provider_accounts account \
+               ON account.workspace_id = collection.workspace_id \
+              AND account.user_id = collection.user_id \
+              AND account.id = collection.provider_account_id \
+             WHERE collection.workspace_id = $1 AND collection.user_id = $2 \
+               AND collection.collection_kind = 'calendar' \
+               AND ((account.status = 'active' AND account.sync_enabled \
+                     AND account.tombstoned_at IS NULL AND collection.selected \
+                     AND NOT collection.provider_deleted \
+                     AND collection.sync_role IN ('blocking', 'writable') \
+                     AND (collection.confirmed_busy_policy = 'blocking' \
+                          OR collection.tentative_policy = 'blocking' \
+                          OR collection.free_policy = 'blocking' \
+                          OR collection.all_day_policy = 'blocking')) \
+                    OR EXISTS(SELECT 1 FROM provider_sync_mappings mapping JOIN items item \
+                      ON item.workspace_id = mapping.workspace_id \
+                     AND item.id = mapping.local_entity_id \
+                      WHERE mapping.workspace_id = collection.workspace_id \
+                        AND mapping.provider_account_id = collection.provider_account_id \
+                        AND mapping.collection_id = collection.id \
+                        AND mapping.entity_kind = 'calendar_occurrence' \
+                        AND mapping.tombstoned_at IS NULL AND item.trashed_at IS NULL \
+                        AND item.scheduling_constraints ? 'calendar_event')) \
+             ORDER BY collection.id",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+
+        let mut stamps = Vec::with_capacity(rows.len());
+        for row in rows {
+            let configuration_requires_projection: bool = row
+                .try_get("configuration_requires_projection")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let has_active_blocking_occurrence: bool = row
+                .try_get("has_active_blocking_occurrence")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            if !configuration_requires_projection && has_active_blocking_occurrence {
+                return Err(CalendarProjectionFenceError::Incomplete);
+            }
+            let collection_id = row
+                .try_get("id")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let revision: i64 = row
+                .try_get("revision")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let generation: i64 = row
+                .try_get("planning_generation")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let projection_revision: Option<i64> = row
+                .try_get("planning_collection_revision")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let window_start: Option<DateTime<Utc>> = row
+                .try_get("planning_window_start")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let window_end: Option<DateTime<Utc>> = row
+                .try_get("planning_window_end")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let refreshed_at: Option<DateTime<Utc>> =
+                row.try_get("planning_window_refreshed_at")
+                    .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let observed_at: DateTime<Utc> = row
+                .try_get("observed_at")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?;
+            let complete = row
+                .try_get::<String, _>("planning_projection_state")
+                .map_err(|_| CalendarProjectionFenceError::Unavailable)?
+                == "complete";
+            let (Some(window_start), Some(window_end), Some(refreshed_at)) =
+                (window_start, window_end, refreshed_at)
+            else {
+                return Err(CalendarProjectionFenceError::Incomplete);
+            };
+            if !complete
+                || generation <= 0
+                || projection_revision != Some(revision)
+                || window_start > horizon_start
+                || window_end < horizon_end
+                || refreshed_at > observed_at
+                || refreshed_at
+                    < observed_at - Duration::minutes(CALENDAR_PROJECTION_MAX_AGE_MINUTES)
+            {
+                return Err(CalendarProjectionFenceError::Incomplete);
+            }
+            stamps.push(CalendarProjectionStamp {
+                collection_id,
+                collection_revision: u64::try_from(revision)
+                    .map_err(|_| CalendarProjectionFenceError::Unavailable)?,
+                generation: u64::try_from(generation)
+                    .map_err(|_| CalendarProjectionFenceError::Unavailable)?,
+                window_start,
+                window_end,
+                refreshed_at,
+            });
+        }
+        Ok(stamps)
     }
 
     /// Looks up a durable publication receipt before expensive recomposition.
@@ -173,6 +318,8 @@ impl PostgresSchedulingRepository {
         }
         let (publication_hash, snapshot) =
             validate_publishable_compose_result(&spec.timezone_name, &spec.result)?;
+        let horizon_start = offset_to_chrono(spec.result.plan.horizon_start)?;
+        let horizon_end = offset_to_chrono(spec.result.plan.horizon_end)?;
         let mut transaction = self
             .pool
             .begin()
@@ -204,6 +351,14 @@ impl PostgresSchedulingRepository {
             &mut transaction,
             self.scope,
             &spec.result.source_item_revisions,
+        )
+        .await?;
+        assert_current_calendar_projection(
+            &mut transaction,
+            self.scope,
+            horizon_start,
+            horizon_end,
+            &spec.result.calendar_projection_stamps,
         )
         .await?;
 
@@ -283,8 +438,6 @@ impl PostgresSchedulingRepository {
         }
 
         let revision_id = Uuid::new_v4();
-        let horizon_start = offset_to_chrono(spec.result.plan.horizon_start)?;
-        let horizon_end = offset_to_chrono(spec.result.plan.horizon_end)?;
         sqlx::query(
             "INSERT INTO schedule_revisions (id, workspace_id, revision_number, \
              parent_revision_id, state, horizon_start, horizon_end, timezone_name, solver_version, \
@@ -1315,6 +1468,7 @@ fn durable_snapshot(
         "compose": result,
         "evidence": {
             "source_item_sensitivity": result.source_item_sensitivity,
+            "calendar_projection_stamps": result.calendar_projection_stamps,
         },
         "conflicts": conflicts,
     });
@@ -1355,6 +1509,33 @@ fn validate_publication_result(
             != Some(result.source_item_count)
     {
         return Err(SchedulePublicationError::InvalidPayload);
+    }
+    let horizon_start = offset_to_chrono(result.plan.horizon_start)?;
+    let horizon_end = offset_to_chrono(result.plan.horizon_end)?;
+    let mut previous_collection_id = None;
+    for stamp in &result.calendar_projection_stamps {
+        if stamp.collection_revision == 0
+            || stamp.generation == 0
+            || stamp.window_start >= stamp.window_end
+            || stamp.window_start > horizon_start
+            || stamp.window_end < horizon_end
+            || !stamp
+                .window_start
+                .timestamp_subsec_nanos()
+                .is_multiple_of(1_000)
+            || !stamp
+                .window_end
+                .timestamp_subsec_nanos()
+                .is_multiple_of(1_000)
+            || !stamp
+                .refreshed_at
+                .timestamp_subsec_nanos()
+                .is_multiple_of(1_000)
+            || previous_collection_id.is_some_and(|previous| previous >= stamp.collection_id)
+        {
+            return Err(SchedulePublicationError::InvalidPayload);
+        }
+        previous_collection_id = Some(stamp.collection_id);
     }
     let mut block_ids = BTreeSet::new();
     for block in &result.plan.blocks {
@@ -1399,6 +1580,7 @@ pub(crate) fn publication_content_hash(
         timezone_name: &'a str,
         result: &'a ComposeScheduleResult,
         source_item_sensitivity: &'a BTreeMap<Uuid, bool>,
+        calendar_projection_stamps: &'a [CalendarProjectionStamp],
     }
     let bytes = serde_json::to_vec(&Content {
         domain: "dayweave.schedule-publication-content.v1",
@@ -1406,6 +1588,7 @@ pub(crate) fn publication_content_hash(
         timezone_name,
         result,
         source_item_sensitivity: &result.source_item_sensitivity,
+        calendar_projection_stamps: &result.calendar_projection_stamps,
     })
     .map_err(|_| SchedulePublicationError::InvalidPayload)?;
     Ok(Sha256::digest(bytes).into())
@@ -1534,6 +1717,157 @@ async fn assert_current_item_snapshot(
         if revision <= 0 || expected.get(&id).copied() != u64::try_from(revision).ok() {
             return Err(SchedulePublicationError::StaleComposition);
         }
+    }
+    Ok(())
+}
+
+/// Rechecks and share-locks every Calendar collection row after the canonical
+/// item-space lock. Locking even currently unselected rows prevents a
+/// concurrent configuration update from introducing a new blocking source as
+/// a publication is sealed.
+#[allow(clippy::too_many_lines)] // Lock, eligibility, freshness, and exact stamp checks are one fence.
+async fn assert_current_calendar_projection(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    horizon_start: DateTime<Utc>,
+    horizon_end: DateTime<Utc>,
+    expected: &[CalendarProjectionStamp],
+) -> Result<(), SchedulePublicationError> {
+    let rows = sqlx::query(
+        "SELECT collection.id, collection.selected, collection.provider_deleted, \
+         collection.sync_role, collection.confirmed_busy_policy, collection.tentative_policy, \
+         collection.free_policy, collection.all_day_policy, collection.revision, \
+         collection.planning_projection_state, collection.planning_generation, \
+         collection.planning_collection_revision, collection.planning_window_start, \
+         collection.planning_window_end, collection.planning_window_refreshed_at, \
+         account.status AS account_status, account.sync_enabled, account.tombstoned_at, \
+         statement_timestamp() AS observed_at, \
+         EXISTS(SELECT 1 FROM provider_sync_mappings mapping JOIN items item \
+           ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+           WHERE mapping.workspace_id = collection.workspace_id \
+             AND mapping.provider_account_id = collection.provider_account_id \
+             AND mapping.collection_id = collection.id \
+             AND mapping.entity_kind = 'calendar_occurrence' \
+             AND mapping.tombstoned_at IS NULL AND item.trashed_at IS NULL \
+             AND item.scheduling_constraints ? 'calendar_event') AS has_active_blocking_occurrence \
+         FROM google_sync_collections collection JOIN provider_accounts account \
+           ON account.workspace_id = collection.workspace_id \
+          AND account.user_id = collection.user_id \
+          AND account.id = collection.provider_account_id \
+         WHERE collection.workspace_id = $1 AND collection.user_id = $2 \
+           AND collection.collection_kind = 'calendar' \
+         ORDER BY collection.id FOR SHARE OF collection, account",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| SchedulePublicationError::Unavailable)?;
+
+    let mut actual = Vec::new();
+    for row in rows {
+        let selected: bool = row
+            .try_get("selected")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let provider_deleted: bool = row
+            .try_get("provider_deleted")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let role: String = row
+            .try_get("sync_role")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let policy_blocks = [
+            "confirmed_busy_policy",
+            "tentative_policy",
+            "free_policy",
+            "all_day_policy",
+        ]
+        .into_iter()
+        .map(|column| row.try_get::<String, _>(column))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| SchedulePublicationError::Unavailable)?
+        .into_iter()
+        .any(|policy| policy == "blocking");
+        let account_active = row
+            .try_get::<String, _>("account_status")
+            .map_err(|_| SchedulePublicationError::Unavailable)?
+            == "active"
+            && row
+                .try_get::<bool, _>("sync_enabled")
+                .map_err(|_| SchedulePublicationError::Unavailable)?
+            && row
+                .try_get::<Option<DateTime<Utc>>, _>("tombstoned_at")
+                .map_err(|_| SchedulePublicationError::Unavailable)?
+                .is_none();
+        let required = account_active
+            && selected
+            && !provider_deleted
+            && matches!(role.as_str(), "blocking" | "writable")
+            && policy_blocks;
+        let has_active_blocking_occurrence: bool = row
+            .try_get("has_active_blocking_occurrence")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        if !required && has_active_blocking_occurrence {
+            return Err(SchedulePublicationError::StaleComposition);
+        }
+        if !required {
+            continue;
+        }
+
+        let state: String = row
+            .try_get("planning_projection_state")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let revision: i64 = row
+            .try_get("revision")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let generation: i64 = row
+            .try_get("planning_generation")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let projection_revision: Option<i64> = row
+            .try_get("planning_collection_revision")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let window_start: Option<DateTime<Utc>> = row
+            .try_get("planning_window_start")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let window_end: Option<DateTime<Utc>> = row
+            .try_get("planning_window_end")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let refreshed_at: Option<DateTime<Utc>> = row
+            .try_get("planning_window_refreshed_at")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let observed_at: DateTime<Utc> = row
+            .try_get("observed_at")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let (Some(window_start), Some(window_end), Some(refreshed_at)) =
+            (window_start, window_end, refreshed_at)
+        else {
+            return Err(SchedulePublicationError::StaleComposition);
+        };
+        if state != "complete"
+            || revision <= 0
+            || generation <= 0
+            || projection_revision != Some(revision)
+            || window_start > horizon_start
+            || window_end < horizon_end
+            || refreshed_at > observed_at
+            || refreshed_at < observed_at - Duration::minutes(CALENDAR_PROJECTION_MAX_AGE_MINUTES)
+        {
+            return Err(SchedulePublicationError::StaleComposition);
+        }
+        actual.push(CalendarProjectionStamp {
+            collection_id: row
+                .try_get("id")
+                .map_err(|_| SchedulePublicationError::Unavailable)?,
+            collection_revision: u64::try_from(revision)
+                .map_err(|_| SchedulePublicationError::Unavailable)?,
+            generation: u64::try_from(generation)
+                .map_err(|_| SchedulePublicationError::Unavailable)?,
+            window_start,
+            window_end,
+            refreshed_at,
+        });
+    }
+    if actual != expected {
+        return Err(SchedulePublicationError::StaleComposition);
     }
     Ok(())
 }

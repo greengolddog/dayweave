@@ -7,7 +7,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, Duration, NaiveDate, NaiveTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, SecondsFormat, TimeZone, Utc};
 use chrono_tz::Tz;
 use dayweave_google::{
     AccessTokenProvider, GoogleClient, GoogleError, PreparedGoogleRequest,
@@ -39,17 +39,23 @@ use crate::{
 };
 
 use super::{
-    CursorValue, DiscoveredCollection, GoogleCalendarPolicy, GoogleCollectionKind,
-    GoogleEventDisposition, GoogleOutboundAccepted, GoogleOutboundApproval, GoogleOutboundPreview,
-    GoogleSyncCollection, GoogleSyncRefreshAccepted, GoogleSyncRepository,
-    GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncStatus, OutboundApprovalSpec,
-    OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec, OutboundRequest, OutboundResult,
-    OutboundWork, PreparedOutbound, RemoteItemChange, SyncClaim, SyncCounts, SyncFailureKind,
+    CalendarProjectionBatch, CalendarProjectionWindow, CursorValue, DiscoveredCollection,
+    GoogleCalendarPolicy, GoogleCollectionKind, GoogleEventDisposition, GoogleOutboundAccepted,
+    GoogleOutboundApproval, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRefreshAccepted,
+    GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncStatus,
+    OutboundApprovalSpec, OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec,
+    OutboundRequest, OutboundResult, OutboundWork, PreparedOutbound, RejectedRemoteItem,
+    RemoteCalendarSeriesChange, RemoteItemChange, SyncClaim, SyncCounts, SyncFailureKind,
 };
 
 const MAX_PAGES: usize = 100;
 const MAX_COLLECTIONS: usize = 10_000;
 const MAX_ITEMS_PER_RUN: usize = 100_000;
+const MAX_CALENDAR_PROJECTION_ITEMS: usize = 10_000;
+const MAX_CALENDAR_PROJECTION_NORMALIZED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CALENDAR_PROJECTION_WINDOW_DAYS: i64 = 150;
+const CALENDAR_PROJECTION_LOOKBACK_DAYS: i64 = 30;
+const CALENDAR_PROJECTION_LOOKAHEAD_DAYS: i64 = 120;
 const MAX_OUTBOUND_PER_RUN: usize = 100;
 const TASK_CURSOR_OVERLAP_MINUTES: i64 = 2;
 const RUN_LEASE_MINUTES: i64 = 10;
@@ -945,6 +951,13 @@ impl GoogleSyncService {
         claim: &SyncClaim,
         started_at: DateTime<Utc>,
     ) -> Result<SyncCounts, GoogleSyncServiceError> {
+        // Invalidate every currently selected Calendar before discovery or
+        // provider I/O. Any discovery, source-page, projection-page, protocol,
+        // or persistence failure must leave scheduling fail-closed rather than
+        // trusting an indefinitely stale previously-complete generation.
+        self.repository
+            .begin_calendar_projection_refresh(claim, started_at)
+            .await?;
         let collections = self.discover_inner(claim.account_id, Some(claim)).await?;
         let account = self.oauth.account_for_sync(claim.account_id).await?;
         let mut counts = SyncCounts::default();
@@ -980,6 +993,7 @@ impl GoogleSyncService {
         started_at: DateTime<Utc>,
         claim: &SyncClaim,
     ) -> Result<SyncCounts, GoogleSyncServiceError> {
+        let projection_window = calendar_projection_window(started_at)?;
         let collection_key = format!("calendar:{}", collection.id);
         let stored = self
             .open_cursor(collection.account_id, &collection_key)
@@ -1011,6 +1025,24 @@ impl GoogleSyncService {
                             .await?;
                         counts.merge(&swept);
                     }
+                    // Scheduling consumes only this complete, bounded
+                    // singleEvents projection. Fetch and normalize every page
+                    // before crossing the atomic repository boundary.
+                    let projection = self
+                        .fetch_calendar_projection(collection, projection_window, claim)
+                        .await?;
+                    let projected = self
+                        .repository
+                        .replace_calendar_projection(claim, projection, self.clock.now())
+                        .await?;
+                    counts.merge(&projected.counts);
+                    if !projected.complete {
+                        return Err(GoogleSyncServiceError::ProviderProtocol);
+                    }
+                    // Do not advance the durable source cursor/last-import
+                    // watermark when the scheduling projection failed. If this
+                    // store races, retrying the source lane is idempotent and
+                    // safer than reporting partial success.
                     self.store_cursor(
                         claim,
                         collection.id,
@@ -1062,6 +1094,7 @@ impl GoogleSyncService {
             let options = EventListOptions {
                 page_token: page_token.clone(),
                 sync_token: sync_token.map(str::to_owned),
+                single_events: false,
                 // Cursorless reconciliation is intentionally unbounded. Google
                 // requires a complete replacement after a 410, and a bounded
                 // window cannot prove that an absent event was deleted or
@@ -1078,7 +1111,6 @@ impl GoogleSyncService {
                     &options,
                 )
                 .await?;
-            let page_timezone = page.time_zone.as_deref().unwrap_or("UTC");
             for event in page.items {
                 item_count += 1;
                 if item_count.is_multiple_of(100) {
@@ -1088,10 +1120,12 @@ impl GoogleSyncService {
                     return Err(GoogleSyncServiceError::ProviderLimitExceeded);
                 }
                 let remote_id = event.id.clone();
-                seen_remote_ids.insert(remote_id.clone());
-                match normalize_event_authenticated(
+                validate_remote_id(&remote_id)?;
+                if !seen_remote_ids.insert(remote_id.clone()) {
+                    return Err(GoogleSyncServiceError::ProviderProtocol);
+                }
+                match normalize_calendar_series_authenticated(
                     collection,
-                    page_timezone,
                     event,
                     &self.cipher,
                     self.scope,
@@ -1099,7 +1133,7 @@ impl GoogleSyncService {
                     Ok(change) => {
                         let outcome = self
                             .repository
-                            .apply_remote_item(claim, change, self.clock.now())
+                            .apply_calendar_series_metadata(claim, change, self.clock.now())
                             .await?;
                         counts.add(outcome);
                     }
@@ -1128,6 +1162,66 @@ impl GoogleSyncService {
                 .filter(|value| valid_opaque(value, 16_384))
                 .map(|token| (counts, token, seen_remote_ids.into_iter().collect()))
                 .ok_or(GoogleSyncServiceError::ProviderProtocol);
+        }
+        Err(GoogleSyncServiceError::ProviderLimitExceeded)
+    }
+
+    async fn fetch_calendar_projection(
+        &self,
+        collection: &GoogleSyncCollection,
+        window: CalendarProjectionWindow,
+        claim: &SyncClaim,
+    ) -> Result<CalendarProjectionBatch, GoogleSyncServiceError> {
+        validate_calendar_projection_window(window)?;
+        let mut page_token = None;
+        let mut seen_tokens = HashSet::new();
+        let mut seen_remote_ids = HashSet::new();
+        let mut item_count = 0_usize;
+        let mut normalized_bytes = 0_usize;
+        let mut projection_timezone = None;
+        let mut changes = Vec::new();
+        let mut rejected = Vec::new();
+
+        for _ in 0..MAX_PAGES {
+            self.heartbeat(claim).await?;
+            let options = expanded_event_list_options(window, page_token.clone());
+            let page = self
+                .provider
+                .list_events(
+                    collection.account_id,
+                    &collection.remote_collection_id,
+                    &options,
+                )
+                .await?;
+            validate_projection_page(&page, &mut seen_remote_ids, &mut item_count)?;
+            let page_timezone = consistent_projection_timezone(&page, &mut projection_timezone)?;
+            let next_page_token = page.next_page_token.clone();
+            normalize_calendar_projection_events(
+                collection,
+                window,
+                &page_timezone,
+                page.items,
+                &self.cipher,
+                self.scope,
+                &mut changes,
+                &mut rejected,
+                &mut normalized_bytes,
+            )?;
+
+            if let Some(next) = next_page_token {
+                validate_page_token(&next, &mut seen_tokens)?;
+                page_token = Some(next);
+                continue;
+            }
+
+            return Ok(CalendarProjectionBatch {
+                account_id: collection.account_id,
+                collection_id: collection.id,
+                collection_revision: collection.revision,
+                changes,
+                rejected,
+                window,
+            });
         }
         Err(GoogleSyncServiceError::ProviderLimitExceeded)
     }
@@ -1704,6 +1798,274 @@ impl GoogleSyncService {
     }
 }
 
+fn calendar_projection_window(
+    started_at: DateTime<Utc>,
+) -> Result<CalendarProjectionWindow, GoogleSyncServiceError> {
+    let anchor = truncate_to_microseconds(started_at)?;
+    let start = anchor
+        .checked_sub_signed(Duration::days(CALENDAR_PROJECTION_LOOKBACK_DAYS))
+        .ok_or(GoogleSyncServiceError::Internal)?;
+    let end = anchor
+        .checked_add_signed(Duration::days(CALENDAR_PROJECTION_LOOKAHEAD_DAYS))
+        .ok_or(GoogleSyncServiceError::Internal)?;
+    let window = CalendarProjectionWindow { start, end };
+    validate_calendar_projection_window(window)?;
+    Ok(window)
+}
+
+fn validate_calendar_projection_window(
+    window: CalendarProjectionWindow,
+) -> Result<(), GoogleSyncServiceError> {
+    if window.start >= window.end
+        || window.end - window.start > Duration::days(MAX_CALENDAR_PROJECTION_WINDOW_DAYS)
+        || !window.start.timestamp_subsec_nanos().is_multiple_of(1_000)
+        || !window.end.timestamp_subsec_nanos().is_multiple_of(1_000)
+    {
+        return Err(GoogleSyncServiceError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn expanded_event_list_options(
+    window: CalendarProjectionWindow,
+    page_token: Option<String>,
+) -> EventListOptions {
+    EventListOptions {
+        page_token,
+        sync_token: None,
+        single_events: true,
+        time_min: Some(window.start.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        time_max: Some(window.end.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        max_results: Some(2500),
+    }
+}
+
+fn validate_projection_page(
+    page: &EventListPage,
+    seen_remote_ids: &mut HashSet<String>,
+    item_count: &mut usize,
+) -> Result<(), GoogleSyncServiceError> {
+    let Some(timezone) = page.time_zone.as_deref() else {
+        return Err(GoogleSyncServiceError::ProviderProtocol);
+    };
+    if !valid_opaque(timezone, 255) || timezone.parse::<Tz>().is_err() {
+        return Err(GoogleSyncServiceError::ProviderProtocol);
+    }
+    *item_count = item_count
+        .checked_add(page.items.len())
+        .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    if *item_count > MAX_CALENDAR_PROJECTION_ITEMS {
+        return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+    }
+    for event in &page.items {
+        validate_remote_id(&event.id)?;
+        if !seen_remote_ids.insert(event.id.clone()) {
+            return Err(GoogleSyncServiceError::ProviderProtocol);
+        }
+    }
+    Ok(())
+}
+
+fn consistent_projection_timezone(
+    page: &EventListPage,
+    expected: &mut Option<String>,
+) -> Result<String, GoogleSyncServiceError> {
+    let timezone = page
+        .time_zone
+        .as_deref()
+        .ok_or(GoogleSyncServiceError::ProviderProtocol)?;
+    if expected
+        .as_deref()
+        .is_some_and(|expected| expected != timezone)
+    {
+        return Err(GoogleSyncServiceError::ProviderProtocol);
+    }
+    if expected.is_none() {
+        *expected = Some(timezone.to_owned());
+    }
+    Ok(timezone.to_owned())
+}
+
+#[allow(clippy::too_many_arguments)] // One page is normalized and released before fetching the next.
+fn normalize_calendar_projection_events(
+    collection: &GoogleSyncCollection,
+    window: CalendarProjectionWindow,
+    page_timezone: &str,
+    events: Vec<GoogleEvent>,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+    changes: &mut Vec<RemoteItemChange>,
+    rejected: &mut Vec<RejectedRemoteItem>,
+    normalized_bytes: &mut usize,
+) -> Result<(), GoogleSyncServiceError> {
+    for event in events {
+        let remote_id = event.id.clone();
+        match normalize_event_authenticated(collection, page_timezone, event, cipher, scope) {
+            Ok(change) => {
+                if let Some(item) = change.item.as_ref() {
+                    let starts_at = item
+                        .earliest_start_at
+                        .ok_or(GoogleSyncServiceError::ProviderProtocol)?;
+                    let ends_at = item
+                        .deadline_at
+                        .ok_or(GoogleSyncServiceError::ProviderProtocol)?;
+                    if starts_at >= window.end || ends_at <= window.start {
+                        return Err(GoogleSyncServiceError::ProviderProtocol);
+                    }
+                }
+                *normalized_bytes = normalized_bytes
+                    .checked_add(calendar_projection_change_bytes(&change)?)
+                    .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+                if *normalized_bytes > MAX_CALENDAR_PROJECTION_NORMALIZED_BYTES {
+                    return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+                }
+                changes.push(change);
+            }
+            Err(NormalizationError::Rejected(reason)) => {
+                *normalized_bytes = normalized_bytes
+                    .checked_add(
+                        remote_id
+                            .len()
+                            .saturating_add(reason.len())
+                            .saturating_add(64),
+                    )
+                    .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+                if *normalized_bytes > MAX_CALENDAR_PROJECTION_NORMALIZED_BYTES {
+                    return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+                }
+                rejected.push(RejectedRemoteItem { remote_id, reason });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn calendar_projection_change_bytes(
+    change: &RemoteItemChange,
+) -> Result<usize, GoogleSyncServiceError> {
+    let mut bytes = 256_usize
+        .checked_add(change.remote_id.len())
+        .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    if let Some(parent_id) = change.remote_parent_id.as_ref() {
+        bytes = bytes
+            .checked_add(parent_id.len())
+            .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    }
+    if let Some(etag) = change.remote_etag.as_ref() {
+        bytes = bytes
+            .checked_add(etag.len())
+            .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    }
+    if let Some(item) = change.item.as_ref() {
+        bytes = bytes
+            .checked_add(
+                serde_json::to_vec(item)
+                    .map_err(|_| GoogleSyncServiceError::Internal)?
+                    .len(),
+            )
+            .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    }
+    if let Some(reviewed) = change.reviewed_provider_projection.as_ref() {
+        bytes = bytes
+            .checked_add(
+                serde_json::to_vec(reviewed)
+                    .map_err(|_| GoogleSyncServiceError::Internal)?
+                    .len(),
+            )
+            .ok_or(GoogleSyncServiceError::ProviderLimitExceeded)?;
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+fn normalize_calendar_projection_pages(
+    collection: &GoogleSyncCollection,
+    window: CalendarProjectionWindow,
+    pages: Vec<EventListPage>,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<CalendarProjectionBatch, GoogleSyncServiceError> {
+    validate_calendar_projection_window(window)?;
+    if pages.is_empty() || pages.len() > MAX_PAGES {
+        return Err(GoogleSyncServiceError::ProviderLimitExceeded);
+    }
+    let page_count = pages.len();
+    let mut validated_ids = HashSet::new();
+    let mut validated_tokens = HashSet::new();
+    let mut validated_count = 0_usize;
+    let mut projection_timezone = None;
+    let mut changes = Vec::new();
+    let mut rejected = Vec::new();
+    let mut normalized_bytes = 0_usize;
+    for (index, page) in pages.into_iter().enumerate() {
+        validate_projection_page(&page, &mut validated_ids, &mut validated_count)?;
+        let page_timezone = consistent_projection_timezone(&page, &mut projection_timezone)?;
+        match page.next_page_token.as_deref() {
+            Some(token) if index + 1 < page_count => {
+                validate_page_token(token, &mut validated_tokens)?;
+            }
+            None if index + 1 == page_count => {}
+            _ => return Err(GoogleSyncServiceError::ProviderProtocol),
+        }
+        normalize_calendar_projection_events(
+            collection,
+            window,
+            &page_timezone,
+            page.items,
+            cipher,
+            scope,
+            &mut changes,
+            &mut rejected,
+            &mut normalized_bytes,
+        )?;
+    }
+
+    Ok(CalendarProjectionBatch {
+        account_id: collection.account_id,
+        collection_id: collection.id,
+        collection_revision: collection.revision,
+        changes,
+        rejected,
+        window,
+    })
+}
+
+fn normalize_calendar_series_authenticated(
+    collection: &GoogleSyncCollection,
+    event: GoogleEvent,
+    cipher: &SecretCipher,
+    scope: OAuthScope,
+) -> Result<RemoteCalendarSeriesChange, NormalizationError> {
+    validate_remote_id(&event.id).map_err(|_| NormalizationError::Rejected("invalid_remote_id"))?;
+    let remote_payload_hash = payload_hash(&event)?;
+    let remote_projection_hash = projection_hash(remote_payload_hash, collection)?;
+    let dayweave_item_id = calendar_dayweave_item_id(&event, collection, cipher, scope)?;
+    let remote_updated_at = parse_optional_timestamp(event.updated.as_deref())?;
+    let self_declined = event
+        .attendees
+        .iter()
+        .any(|attendee| attendee.self_ && attendee.response_status.as_deref() == Some("declined"));
+    let deleted = event.status.as_deref() == Some("cancelled") || self_declined;
+    let reviewed_provider_projection = (dayweave_item_id.is_some() && !deleted)
+        .then(|| calendar_reviewed_projection(&event))
+        .transpose()
+        .map_err(|_| NormalizationError::Rejected("provider_payload_invalid"))?;
+
+    Ok(RemoteCalendarSeriesChange {
+        account_id: collection.account_id,
+        collection_id: collection.id,
+        collection_revision: collection.revision,
+        dayweave_item_id,
+        remote_id: event.id,
+        remote_etag: bounded_optional(event.etag.as_deref(), 1000)?,
+        remote_updated_at,
+        remote_payload_hash,
+        remote_projection_hash,
+        reviewed_provider_projection,
+        deleted,
+    })
+}
+
 #[allow(clippy::too_many_lines)] // The projection intentionally centralizes all event semantics.
 fn normalize_event_authenticated(
     collection: &GoogleSyncCollection,
@@ -1714,10 +2076,15 @@ fn normalize_event_authenticated(
 ) -> Result<RemoteItemChange, NormalizationError> {
     validate_remote_id(&event.id).map_err(|_| NormalizationError::Rejected("invalid_remote_id"))?;
     let remote_hash = payload_hash(&event)?;
-    let remote_projection_hash = projection_hash(remote_hash, collection)?;
-    let reviewed_provider_projection = calendar_reviewed_projection(&event)
-        .map_err(|_| NormalizationError::Rejected("provider_payload_invalid"))?;
     let dayweave_item_id = calendar_dayweave_item_id(&event, collection, cipher, scope)?;
+    // Provider recovery material is useful only for an authenticated
+    // DayWeave-owned echo. External event content, especially private content,
+    // must not gain a second durable copy in the provider mapping.
+    let reviewed_provider_projection = dayweave_item_id
+        .is_some()
+        .then(|| calendar_reviewed_projection(&event))
+        .transpose()
+        .map_err(|_| NormalizationError::Rejected("provider_payload_invalid"))?;
     let remote_updated_at = parse_optional_timestamp(event.updated.as_deref())?;
     let self_response = event
         .attendees
@@ -1735,10 +2102,15 @@ fn normalize_event_authenticated(
             remote_etag: bounded_optional(event.etag.as_deref(), 1000)?,
             remote_updated_at,
             remote_payload_hash: remote_hash,
-            remote_projection_hash,
-            reviewed_provider_projection: Some(reviewed_provider_projection),
+            remote_projection_hash: calendar_occurrence_projection_hash(None)?,
+            reviewed_provider_projection,
             item: None,
         });
+    }
+    // `singleEvents=true` must return concrete occurrences. A live master in
+    // this bounded lane would otherwise become a malformed canonical event.
+    if !event.recurrence.is_empty() {
+        return Err(NormalizationError::Rejected("provider_payload_invalid"));
     }
     let start = event
         .start
@@ -1749,8 +2121,11 @@ fn normalize_event_authenticated(
         .as_ref()
         .ok_or(NormalizationError::Rejected("event_bounds_missing"))?;
     let (starts_at, timezone_name, all_day) = parse_event_bound(start, page_timezone)?;
-    let (ends_at, _, end_all_day) = parse_event_bound(end, &timezone_name)?;
-    if ends_at <= starts_at || all_day != end_all_day {
+    let (ends_at, end_timezone_name, end_all_day) = parse_event_bound(end, &timezone_name)?;
+    if ends_at <= starts_at
+        || all_day != end_all_day
+        || (all_day && timezone_name != end_timezone_name)
+    {
         return Err(NormalizationError::Rejected("event_bounds_invalid"));
     }
     let duration = (ends_at - starts_at)
@@ -1770,8 +2145,8 @@ fn normalize_event_authenticated(
             remote_etag: bounded_optional(event.etag.as_deref(), 1000)?,
             remote_updated_at,
             remote_payload_hash: remote_hash,
-            remote_projection_hash,
-            reviewed_provider_projection: Some(reviewed_provider_projection),
+            remote_projection_hash: calendar_occurrence_projection_hash(None)?,
+            reviewed_provider_projection,
             item: None,
         });
     }
@@ -1780,70 +2155,54 @@ fn normalize_event_authenticated(
             collection.sync_role,
             GoogleSyncRole::Blocking | GoogleSyncRole::Writable
         );
-    let provider_private = event
-        .visibility
-        .as_deref()
-        .is_some_and(|visibility| visibility.eq_ignore_ascii_case("private"));
-    let fallback_title = if blocking {
+    let provider_private = event.visibility.as_deref().is_some_and(|visibility| {
+        visibility.eq_ignore_ascii_case("private")
+            || visibility.eq_ignore_ascii_case("confidential")
+    });
+    let protected = !collection.visible || provider_private;
+    let fallback_title = if protected || blocking {
         "Busy"
     } else {
         "Google calendar event"
     };
-    let (title, title_truncated) = if collection.visible {
+    let title = if protected {
+        "Busy".to_owned()
+    } else {
         bounded_title(
             event.summary.as_deref().unwrap_or(fallback_title),
             fallback_title,
         )
-    } else {
-        (fallback_title.to_owned(), false)
+        .0
     };
-    let (notes, notes_truncated) = if collection.visible {
-        bounded_notes(event.description.as_deref())
+    let notes = if protected {
+        None
     } else {
-        (None, false)
+        bounded_notes(event.description.as_deref()).0
     };
-    let recurrence = (!event.recurrence.is_empty()
-        || event.recurring_event_id.is_some()
-        || event.original_start_time.is_some())
-    .then(|| {
+    let constraints = if blocking {
         json!({
-            "source": "google_calendar",
-            "rules": event.recurrence,
-            "series_remote_id": event.recurring_event_id,
-            "original_start": event.original_start_time,
+            "calendar_event": {
+                "start": starts_at,
+                "end": ends_at,
+                "immutable": true,
+                "all_day": all_day,
+                "source_calendar_id": Value::Null,
+            }
         })
-    });
-    let constraints = json!({
-        "google_sync": {
-            "account_id": collection.account_id,
-            "collection_id": collection.id,
-            "remote_id": event.id,
-            "starts_at": starts_at,
-            "ends_at": ends_at,
-            "all_day": all_day,
-            "blocking": blocking,
-            "planning_disposition": disposition,
-            "visible": collection.visible,
-            "event_type": event_type,
-            "transparency": event.transparency,
-            "self_response": self_response,
-            "attendee_count": event.attendees.len(),
-            "has_conference": event.conference_data.is_some(),
-            "attachment_count": event.attachments.len(),
-            "location": collection.visible.then_some(event.location).flatten(),
-            "content_truncated": title_truncated || notes_truncated,
-            "provider_sequence": event.sequence,
-            "visibility": event.visibility,
-        }
-    });
+    } else {
+        json!({
+            "calendar_context": {
+                "start": starts_at,
+                "end": ends_at,
+                "all_day": all_day,
+            }
+        })
+    };
     let item_id = Uuid::new_v4();
-    let remote_id = constraints["google_sync"]["remote_id"]
-        .as_str()
-        .ok_or(NormalizationError::Rejected("invalid_remote_id"))?
-        .to_owned();
+    let remote_id = event.id;
     let item = NewItem {
         id: item_id,
-        is_sensitive: !collection.visible || provider_private,
+        is_sensitive: protected,
         kind: ItemKind::Event,
         status: ItemStatus::Scheduled,
         title,
@@ -1852,7 +2211,7 @@ fn normalize_event_authenticated(
         duration_seconds: Some(duration),
         deadline_at: Some(ends_at),
         earliest_start_at: Some(starts_at),
-        recurrence,
+        recurrence: None,
         flexible_constraints: constraints,
         split_policy: SplitPolicy::Indivisible,
         importance: 0,
@@ -1861,6 +2220,7 @@ fn normalize_event_authenticated(
         sibling_order: 0,
     };
     validate_normalized_item(&item)?;
+    let remote_projection_hash = calendar_occurrence_projection_hash(Some(&item))?;
     Ok(RemoteItemChange {
         account_id: collection.account_id,
         collection_id: collection.id,
@@ -1872,7 +2232,7 @@ fn normalize_event_authenticated(
         remote_updated_at,
         remote_payload_hash: remote_hash,
         remote_projection_hash,
-        reviewed_provider_projection: Some(reviewed_provider_projection),
+        reviewed_provider_projection,
         item: Some(item),
     })
 }
@@ -1918,11 +2278,11 @@ fn event_disposition(
     event_type: &str,
     all_day: bool,
 ) -> GoogleEventDisposition {
-    // Provider semantic event types override the generic all-day policy:
-    // birthdays/working location are context only, while out-of-office and
-    // vacation reserve time by default even when represented as date-only.
+    // Provider semantic event types override every configurable busy/free or
+    // all-day policy: birthdays and working location are always retained as
+    // context, while out-of-office/focus time uses confirmed-busy policy.
     if matches!(event_type, "birthday" | "workingLocation") {
-        return collection.calendar_policy.free;
+        return GoogleEventDisposition::VisibleNonblocking;
     }
     if matches!(event_type, "outOfOffice" | "focusTime") {
         return collection.calendar_policy.confirmed_busy;
@@ -2453,19 +2813,60 @@ fn sanitize_task_notes(notes: Option<&str>) -> (Option<String>, bool) {
     let Some(notes) = notes else {
         return (None, false);
     };
+    let mut normalized = String::with_capacity(notes.len());
+    let mut in_inline_control_run = false;
+    for character in notes.chars() {
+        if character == '\n' {
+            normalized.push(character);
+            in_inline_control_run = false;
+        } else if character.is_control() {
+            if !in_inline_control_run {
+                normalized.push(' ');
+            }
+            in_inline_control_run = true;
+        } else {
+            normalized.push(character);
+            in_inline_control_run = false;
+        }
+    }
     let mut stripped = false;
-    let retained = notes
+    while let Some(start) = legacy_task_marker_start(&normalized) {
+        let end = normalized[start..]
+            .find(']')
+            .map_or(normalized.len(), |offset| start + offset + 1);
+        normalized.replace_range(start..end, "");
+        stripped = true;
+    }
+    let retained = normalized
         .lines()
-        .filter(|line| {
-            let keep = !line.to_ascii_lowercase().contains("[dayweave item:");
-            stripped |= !keep;
-            keep
-        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
         .to_owned();
     ((!retained.is_empty()).then_some(retained), stripped)
+}
+
+fn legacy_task_marker_start(value: &str) -> Option<usize> {
+    let lower = value.to_ascii_lowercase();
+    let mut searched = 0_usize;
+    while let Some(relative) = lower[searched..].find("[dayweave") {
+        let start = searched + relative;
+        let mut suffix = start + "[dayweave".len();
+        while lower
+            .as_bytes()
+            .get(suffix)
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            suffix += 1;
+        }
+        if lower[suffix..].starts_with("item:") {
+            return Some(start);
+        }
+        searched = start + 1;
+    }
+    None
 }
 
 fn calendar_marker_aad(scope: OAuthScope, account_id: Uuid, collection_id: Uuid) -> Vec<u8> {
@@ -2483,19 +2884,16 @@ fn parse_event_bound(
     value: &EventDateTime,
     fallback_timezone: &str,
 ) -> Result<(DateTime<Utc>, String, bool), NormalizationError> {
+    if value.date.is_some() == value.date_time.is_some() {
+        return Err(NormalizationError::Rejected("event_bounds_invalid"));
+    }
     if let Some(date_time) = value.date_time.as_deref() {
         let parsed = parse_timestamp(date_time)?;
-        let timezone = value
-            .time_zone
-            .as_deref()
-            .filter(|name| name.parse::<Tz>().is_ok())
-            .unwrap_or(fallback_timezone);
-        let timezone = if timezone.parse::<Tz>().is_ok() {
-            timezone.to_owned()
-        } else {
-            "UTC".to_owned()
-        };
-        return Ok((parsed, timezone, false));
+        let timezone = value.time_zone.as_deref().unwrap_or(fallback_timezone);
+        if !valid_opaque(timezone, 255) || timezone.parse::<Tz>().is_err() {
+            return Err(NormalizationError::Rejected("event_timezone_invalid"));
+        }
+        return Ok((parsed, timezone.to_owned(), false));
     }
     let date = value
         .date
@@ -2519,9 +2917,16 @@ fn parse_event_bound(
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, NormalizationError> {
-    DateTime::parse_from_rfc3339(value)
+    let parsed = DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
-        .map_err(|_| NormalizationError::Rejected("timestamp_invalid"))
+        .map_err(|_| NormalizationError::Rejected("timestamp_invalid"))?;
+    DateTime::from_timestamp_micros(parsed.timestamp_micros())
+        .ok_or(NormalizationError::Rejected("timestamp_invalid"))
+}
+
+fn truncate_to_microseconds(value: DateTime<Utc>) -> Result<DateTime<Utc>, GoogleSyncServiceError> {
+    DateTime::from_timestamp_micros(value.timestamp_micros())
+        .ok_or(GoogleSyncServiceError::Internal)
 }
 
 fn parse_optional_timestamp(
@@ -2531,7 +2936,8 @@ fn parse_optional_timestamp(
 }
 
 fn bounded_title(value: &str, fallback: &str) -> (String, bool) {
-    let trimmed = value.trim();
+    let sanitized = sanitize_provider_display_text(value);
+    let trimmed = sanitized.trim();
     let source = if trimmed.is_empty() {
         fallback
     } else {
@@ -2544,8 +2950,26 @@ fn bounded_notes(value: Option<&str>) -> (Option<String>, bool) {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return (None, false);
     };
-    let (value, truncated) = bounded_chars(value, 100_000);
+    let sanitized = sanitize_provider_display_text(value);
+    let (value, truncated) = bounded_chars(&sanitized, 100_000);
     (Some(value), truncated)
+}
+
+fn sanitize_provider_display_text(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut in_control_run = false;
+    for character in value.chars() {
+        if character.is_control() {
+            if !in_control_run {
+                sanitized.push(' ');
+            }
+            in_control_run = true;
+        } else {
+            sanitized.push(character);
+            in_control_run = false;
+        }
+    }
+    sanitized
 }
 
 fn bounded_chars(value: &str, limit: usize) -> (String, bool) {
@@ -2718,10 +3142,50 @@ fn projection_hash(
     collection: &GoogleSyncCollection,
 ) -> Result<[u8; 32], NormalizationError> {
     payload_hash(&(
+        "dayweave.google.canonical-projection.v2",
         remote_hash,
         collection.visible,
         collection.sync_role,
         collection.calendar_policy,
+    ))
+}
+
+fn calendar_occurrence_projection_hash(
+    item: Option<&NewItem>,
+) -> Result<[u8; 32], NormalizationError> {
+    let Some(item) = item else {
+        return payload_hash(&(
+            "dayweave.google.calendar-occurrence-projection.v1",
+            "absent",
+        ));
+    };
+    // Provider payload identity/version has its own raw hash. Bind this hash
+    // only to durable canonical semantics (and deliberately exclude the fresh
+    // local UUID), so redacted private text changes cannot cause canonical
+    // churn or reveal a content-change oracle.
+    payload_hash(&(
+        "dayweave.google.calendar-occurrence-projection.v1",
+        "present",
+        (
+            item.is_sensitive,
+            &item.kind,
+            &item.status,
+            &item.title,
+            &item.notes,
+            &item.timezone_name,
+            item.duration_seconds,
+            item.deadline_at,
+            item.earliest_start_at,
+        ),
+        (
+            &item.recurrence,
+            &item.flexible_constraints,
+            &item.split_policy,
+            item.importance,
+            item.urgency,
+            item.parent_id,
+            item.sibling_order,
+        ),
     ))
 }
 
@@ -2824,13 +3288,15 @@ impl GoogleSyncServiceError {
                         .unwrap_or(3600),
                 ),
             },
-            Self::Google(GoogleError::Temporary { .. } | GoogleError::Transport(_)) => {
-                FailureDisposition {
-                    kind: SyncFailureKind::Backoff,
-                    code: "provider_temporary",
-                    delay: Duration::minutes(5),
-                }
-            }
+            Self::Google(
+                GoogleError::Temporary { .. }
+                | GoogleError::Transport(_)
+                | GoogleError::InvalidResponse,
+            ) => FailureDisposition {
+                kind: SyncFailureKind::Backoff,
+                code: "provider_temporary",
+                delay: Duration::minutes(5),
+            },
             Self::OAuth(GoogleOAuthServiceError::IntegrationTimeout) => FailureDisposition {
                 kind: SyncFailureKind::Backoff,
                 code: "oauth_timeout",
@@ -2851,11 +3317,13 @@ impl GoogleSyncServiceError {
                 code: "claim_lost",
                 delay: Duration::seconds(30),
             },
-            Self::ProviderLimitExceeded => FailureDisposition {
-                kind: SyncFailureKind::Failed,
-                code: "provider_limit_exceeded",
-                delay: Duration::hours(24),
-            },
+            Self::ProviderLimitExceeded | Self::Google(GoogleError::ResponseTooLarge) => {
+                FailureDisposition {
+                    kind: SyncFailureKind::Failed,
+                    code: "provider_limit_exceeded",
+                    delay: Duration::hours(24),
+                }
+            }
             Self::CursorCorrupt | Self::Crypto(_) => FailureDisposition {
                 kind: SyncFailureKind::Failed,
                 code: "cursor_unreadable",
@@ -2958,6 +3426,12 @@ mod tests {
             discovered_at: now,
             configured_at: Some(now),
             last_import_at: None,
+            planning_projection_state: crate::google_sync::CalendarProjectionState::Uninitialized,
+            planning_generation: 0,
+            planning_collection_revision: None,
+            planning_window_start: None,
+            planning_window_end: None,
+            planning_window_refreshed_at: None,
             created_at: now,
             updated_at: now,
         }
@@ -2983,7 +3457,7 @@ mod tests {
             }),
             recurring_event_id: None,
             original_start_time: None,
-            recurrence: vec!["RRULE:FREQ=WEEKLY".to_owned()],
+            recurrence: Vec::new(),
             transparency: Some("opaque".to_owned()),
             visibility: Some("default".to_owned()),
             event_type: Some("default".to_owned()),
@@ -3054,8 +3528,236 @@ mod tests {
         .expect("valid synthetic firm event")
     }
 
+    fn projection_window_fixture() -> CalendarProjectionWindow {
+        CalendarProjectionWindow {
+            start: "2026-08-01T00:00:00Z".parse().expect("window start"),
+            end: "2026-12-01T00:00:00Z".parse().expect("window end"),
+        }
+    }
+
+    fn event_page(items: Vec<GoogleEvent>, next_page_token: Option<&str>) -> EventListPage {
+        EventListPage {
+            items,
+            next_page_token: next_page_token.map(str::to_owned),
+            next_sync_token: None,
+            time_zone: Some("Europe/Madrid".to_owned()),
+        }
+    }
+
     #[test]
-    fn event_semantics_cover_visibility_busy_declined_and_series() {
+    fn projection_window_and_request_are_bounded_expanded_and_microsecond_exact() {
+        let started_at = "2026-08-29T12:34:56.123456789Z"
+            .parse()
+            .expect("start time");
+        let window = calendar_projection_window(started_at).expect("projection window");
+        assert_eq!(
+            window.start,
+            "2026-07-30T12:34:56.123456Z"
+                .parse::<DateTime<Utc>>()
+                .expect("lookback")
+        );
+        assert_eq!(
+            window.end,
+            "2026-12-27T12:34:56.123456Z"
+                .parse::<DateTime<Utc>>()
+                .expect("lookahead")
+        );
+
+        let options = expanded_event_list_options(window, Some("page-2".to_owned()));
+        assert!(options.single_events);
+        assert!(options.sync_token.is_none());
+        assert_eq!(options.page_token.as_deref(), Some("page-2"));
+        assert_eq!(
+            options.time_min.as_deref(),
+            Some("2026-07-30T12:34:56.123456Z")
+        );
+        assert_eq!(
+            options.time_max.as_deref(),
+            Some("2026-12-27T12:34:56.123456Z")
+        );
+        assert_eq!(options.max_results, Some(2500));
+    }
+
+    #[test]
+    fn projection_page_validation_rejects_duplicates_cycles_invalid_timezone_and_item_10001() {
+        let mut seen_ids = HashSet::new();
+        let mut count = 0;
+        validate_projection_page(
+            &event_page(vec![event()], Some("page-a")),
+            &mut seen_ids,
+            &mut count,
+        )
+        .expect("first unique page");
+        assert!(matches!(
+            validate_projection_page(&event_page(vec![event()], None), &mut seen_ids, &mut count,),
+            Err(GoogleSyncServiceError::ProviderProtocol)
+        ));
+
+        let mut seen_tokens = HashSet::new();
+        validate_page_token("page-a", &mut seen_tokens).expect("first page token");
+        validate_page_token("page-b", &mut seen_tokens).expect("second page token");
+        assert!(matches!(
+            validate_page_token("page-a", &mut seen_tokens),
+            Err(GoogleSyncServiceError::ProviderProtocol)
+        ));
+
+        let mut invalid_timezone = event_page(Vec::new(), None);
+        invalid_timezone.time_zone = Some("not/a-real-timezone".to_owned());
+        let mut invalid_timezone_count = 0_usize;
+        assert!(matches!(
+            validate_projection_page(
+                &invalid_timezone,
+                &mut HashSet::new(),
+                &mut invalid_timezone_count,
+            ),
+            Err(GoogleSyncServiceError::ProviderProtocol)
+        ));
+        let mut missing_timezone = event_page(Vec::new(), None);
+        missing_timezone.time_zone = None;
+        let mut missing_timezone_count = 0_usize;
+        assert!(matches!(
+            validate_projection_page(
+                &missing_timezone,
+                &mut HashSet::new(),
+                &mut missing_timezone_count,
+            ),
+            Err(GoogleSyncServiceError::ProviderProtocol)
+        ));
+
+        let mut at_cap = MAX_CALENDAR_PROJECTION_ITEMS;
+        assert!(matches!(
+            validate_projection_page(
+                &event_page(vec![event()], None),
+                &mut HashSet::new(),
+                &mut at_cap,
+            ),
+            Err(GoogleSyncServiceError::ProviderLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn complete_projection_pages_normalize_together_without_provider_identity_leaks() {
+        let mut second = event();
+        second.id = "event-2".to_owned();
+        second.summary = Some("Second event".to_owned());
+        let batch = normalize_calendar_projection_pages(
+            &collection(GoogleSyncRole::Blocking, true),
+            projection_window_fixture(),
+            vec![
+                event_page(vec![event()], Some("page-2")),
+                event_page(vec![second], None),
+            ],
+            &test_marker_cipher(),
+            test_oauth_scope(),
+        )
+        .expect("complete page set");
+
+        assert_eq!(batch.changes.len(), 2);
+        assert!(batch.rejected.is_empty());
+        assert_eq!(batch.window, projection_window_fixture());
+        for change in batch.changes {
+            let item = change.item.expect("live occurrence");
+            assert!(item.recurrence.is_none());
+            assert!(item.flexible_constraints.get("calendar_event").is_some());
+            let canonical = serde_json::to_string(&item).expect("canonical item");
+            assert!(!canonical.contains(&change.remote_id));
+            assert!(!canonical.contains("google_sync"));
+        }
+    }
+
+    #[test]
+    fn visible_calendar_display_text_is_safe_before_the_projection_boundary() {
+        let mut multiline = event();
+        multiline.summary = Some("\r\n  Planning\r\nreview\0\u{7}\u{7f}  ".to_owned());
+        multiline.description = Some("Agenda\r\nfirst\tsecond\0\u{7}third".to_owned());
+
+        let batch = normalize_calendar_projection_pages(
+            &collection(GoogleSyncRole::Blocking, true),
+            projection_window_fixture(),
+            vec![event_page(vec![multiline], None)],
+            &test_marker_cipher(),
+            test_oauth_scope(),
+        )
+        .expect("ordinary multiline provider text remains a valid projection batch");
+
+        assert!(batch.rejected.is_empty());
+        let item = batch.changes[0].item.as_ref().expect("live occurrence");
+        assert_eq!(item.title, "Planning review");
+        assert_eq!(item.notes.as_deref(), Some("Agenda first second third"));
+        assert!(!item.title.chars().any(char::is_control));
+        assert!(
+            item.notes
+                .as_deref()
+                .is_some_and(|notes| !notes.chars().any(char::is_control))
+        );
+    }
+
+    #[test]
+    fn projection_rejects_a_timezone_change_between_pages() {
+        let mut second = event();
+        second.id = "event-in-second-zone".to_owned();
+        let mut second_page = event_page(vec![second], None);
+        second_page.time_zone = Some("UTC".to_owned());
+
+        assert!(matches!(
+            normalize_calendar_projection_pages(
+                &collection(GoogleSyncRole::Blocking, true),
+                projection_window_fixture(),
+                vec![event_page(vec![event()], Some("page-2")), second_page],
+                &test_marker_cipher(),
+                test_oauth_scope(),
+            ),
+            Err(GoogleSyncServiceError::ProviderProtocol)
+        ));
+    }
+
+    #[test]
+    fn projection_collects_rejection_with_valid_changes_for_atomic_fail_closed_batch() {
+        let mut malformed = event();
+        malformed.id = "malformed-event".to_owned();
+        malformed.end = None;
+        let batch = normalize_calendar_projection_pages(
+            &collection(GoogleSyncRole::Blocking, true),
+            projection_window_fixture(),
+            vec![event_page(vec![event(), malformed], None)],
+            &test_marker_cipher(),
+            test_oauth_scope(),
+        )
+        .expect("normalization returns one complete atomic batch");
+
+        assert_eq!(batch.changes.len(), 1);
+        assert_eq!(batch.rejected.len(), 1);
+        assert_eq!(batch.rejected[0].remote_id, "malformed-event");
+        assert_eq!(batch.rejected[0].reason, "event_bounds_missing");
+    }
+
+    #[test]
+    fn expanded_lane_rejects_live_series_master_but_series_lane_keeps_metadata() {
+        let mut master = event();
+        master.recurrence = vec!["RRULE:FREQ=WEEKLY".to_owned()];
+        assert!(matches!(
+            normalize_event(
+                &collection(GoogleSyncRole::Blocking, true),
+                "UTC",
+                master.clone(),
+            ),
+            Err(NormalizationError::Rejected("provider_payload_invalid"))
+        ));
+
+        let metadata = normalize_calendar_series_authenticated(
+            &collection(GoogleSyncRole::Blocking, true),
+            master,
+            &test_marker_cipher(),
+            test_oauth_scope(),
+        )
+        .expect("series metadata");
+        assert_eq!(metadata.remote_id, "event-1");
+        assert!(!metadata.deleted);
+        assert!(metadata.reviewed_provider_projection.is_none());
+    }
+
+    #[test]
+    fn event_semantics_cover_exact_block_declines_and_concrete_series_instance() {
         let imported = normalize_event(&collection(GoogleSyncRole::Blocking, true), "UTC", event())
             .expect("valid event")
             .item
@@ -3064,10 +3766,29 @@ mod tests {
         assert_eq!(imported.duration_seconds, Some(3600));
         assert_eq!(imported.timezone_name, "Europe/Madrid");
         assert_eq!(
-            imported.flexible_constraints["google_sync"]["blocking"],
-            true
+            imported.flexible_constraints,
+            json!({"calendar_event": {
+                "start": "2026-08-29T08:00:00Z",
+                "end": "2026-08-29T09:00:00Z",
+                "immutable": true,
+                "all_day": false,
+                "source_calendar_id": Value::Null,
+            }})
         );
-        assert!(imported.recurrence.is_some());
+        assert!(imported.recurrence.is_none());
+
+        let mut instance = event();
+        instance.id = "event-instance-1".to_owned();
+        instance.recurring_event_id = Some("series-1".to_owned());
+        instance.original_start_time = instance.start.clone();
+        assert!(
+            normalize_event(&collection(GoogleSyncRole::Blocking, true), "UTC", instance,)
+                .expect("expanded recurrence instance")
+                .item
+                .expect("upsert")
+                .recurrence
+                .is_none()
+        );
 
         let mut declined = event();
         declined.attendees[0].response_status = Some("declined".to_owned());
@@ -3101,16 +3822,33 @@ mod tests {
 
     #[test]
     fn birthday_free_and_out_of_office_semantics_are_explicit() {
+        let mut semantic_collection = collection(GoogleSyncRole::Blocking, true);
+        semantic_collection.calendar_policy.free = GoogleEventDisposition::Ignore;
         let mut birthday = event();
         birthday.event_type = Some("birthday".to_owned());
-        let birthday =
-            normalize_event(&collection(GoogleSyncRole::Blocking, true), "UTC", birthday)
-                .expect("birthday")
-                .item
-                .expect("upsert");
-        assert_eq!(
-            birthday.flexible_constraints["google_sync"]["blocking"],
-            false
+        let birthday = normalize_event(&semantic_collection, "UTC", birthday)
+            .expect("birthday")
+            .item
+            .expect("upsert");
+        assert!(
+            birthday
+                .flexible_constraints
+                .get("calendar_context")
+                .is_some()
+        );
+
+        let mut working_location = event();
+        working_location.id = "working-location-1".to_owned();
+        working_location.event_type = Some("workingLocation".to_owned());
+        let working_location = normalize_event(&semantic_collection, "UTC", working_location)
+            .expect("working location")
+            .item
+            .expect("always retained as context");
+        assert!(
+            working_location
+                .flexible_constraints
+                .get("calendar_context")
+                .is_some()
         );
 
         let mut free = event();
@@ -3119,7 +3857,7 @@ mod tests {
             .expect("free")
             .item
             .expect("upsert");
-        assert_eq!(free.flexible_constraints["google_sync"]["blocking"], false);
+        assert!(free.flexible_constraints.get("calendar_context").is_some());
 
         let mut away = event();
         away.event_type = Some("outOfOffice".to_owned());
@@ -3127,7 +3865,7 @@ mod tests {
             .expect("out of office")
             .item
             .expect("upsert");
-        assert_eq!(away.flexible_constraints["google_sync"]["blocking"], true);
+        assert!(away.flexible_constraints.get("calendar_event").is_some());
     }
 
     #[test]
@@ -3139,26 +3877,25 @@ mod tests {
             .expect("tentative event")
             .item
             .expect("default retains tentative context");
-        assert_eq!(
-            tentative.flexible_constraints["google_sync"]["blocking"],
-            false
-        );
-        assert_eq!(
-            tentative.flexible_constraints["google_sync"]["planning_disposition"],
-            "visible_nonblocking"
+        assert!(
+            tentative
+                .flexible_constraints
+                .get("calendar_context")
+                .is_some()
         );
 
         let mut blocking = defaults.clone();
         blocking.calendar_policy.tentative = GoogleEventDisposition::Blocking;
         let mut provider_tentative = event();
         provider_tentative.status = Some("tentative".to_owned());
-        assert_eq!(
+        assert!(
             normalize_event(&blocking, "UTC", provider_tentative)
                 .expect("configured tentative event")
                 .item
                 .expect("retained")
-                .flexible_constraints["google_sync"]["blocking"],
-            true
+                .flexible_constraints
+                .get("calendar_event")
+                .is_some()
         );
 
         let mut ignored = defaults;
@@ -3177,15 +3914,34 @@ mod tests {
     fn projection_hash_tracks_visibility_and_role_separately_from_google_payload() {
         let visible = normalize_event(&collection(GoogleSyncRole::ReadOnly, true), "UTC", event())
             .expect("visible projection");
-        let hidden = normalize_event(&collection(GoogleSyncRole::Blocking, false), "UTC", event())
+        let hidden_collection = collection(GoogleSyncRole::Blocking, false);
+        let hidden = normalize_event(&hidden_collection, "UTC", event())
             .expect("hidden blocking projection");
 
         assert!(!visible.item.as_ref().expect("visible item").is_sensitive);
-        assert!(hidden.item.as_ref().expect("hidden item").is_sensitive);
+        let hidden_item = hidden.item.as_ref().expect("hidden item");
+        assert!(hidden_item.is_sensitive);
+        assert_eq!(hidden_item.title, "Busy");
+        assert!(hidden_item.notes.is_none());
         assert_eq!(visible.remote_payload_hash, hidden.remote_payload_hash);
         assert_ne!(
             visible.remote_projection_hash,
             hidden.remote_projection_hash
+        );
+
+        let mut changed_hidden_text = event();
+        changed_hidden_text.summary = Some("CHANGED-HIDDEN-TITLE".to_owned());
+        changed_hidden_text.description = Some("CHANGED-HIDDEN-NOTES".to_owned());
+        changed_hidden_text.location = Some("CHANGED-HIDDEN-LOCATION".to_owned());
+        let changed_hidden = normalize_event(&hidden_collection, "UTC", changed_hidden_text)
+            .expect("changed hidden projection");
+        assert_ne!(
+            hidden.remote_payload_hash,
+            changed_hidden.remote_payload_hash
+        );
+        assert_eq!(
+            hidden.remote_projection_hash,
+            changed_hidden.remote_projection_hash
         );
     }
 
@@ -3193,18 +3949,56 @@ mod tests {
     fn private_event_in_visible_collection_is_sensitive() {
         let mut private_event = event();
         private_event.summary = Some("SYNTHETIC-PRIVATE-GOOGLE-EVENT-CANARY".to_owned());
+        private_event.description = Some("SYNTHETIC-PRIVATE-NOTES-CANARY".to_owned());
+        private_event.location = Some("SYNTHETIC-PRIVATE-LOCATION-CANARY".to_owned());
         private_event.visibility = Some("private".to_owned());
 
-        let item = normalize_event(
+        let first = normalize_event(
+            &collection(GoogleSyncRole::ReadOnly, true),
+            "UTC",
+            private_event.clone(),
+        )
+        .expect("private event projection");
+        let item = first.item.as_ref().expect("private event upsert");
+
+        assert!(item.is_sensitive);
+        assert_eq!(item.title, "Busy");
+        assert!(item.notes.is_none());
+        assert_eq!(
+            item.flexible_constraints,
+            json!({"calendar_context": {
+                "start": "2026-08-29T08:00:00Z",
+                "end": "2026-08-29T09:00:00Z",
+                "all_day": false,
+            }})
+        );
+        let serialized = serde_json::to_string(item).expect("canonical private item serializes");
+        for canary in [
+            "SYNTHETIC-PRIVATE-GOOGLE-EVENT-CANARY",
+            "SYNTHETIC-PRIVATE-NOTES-CANARY",
+            "SYNTHETIC-PRIVATE-LOCATION-CANARY",
+            "event-1",
+            "owner@example.test",
+        ] {
+            assert!(!serialized.contains(canary), "canonical leak: {canary}");
+        }
+        assert!(first.reviewed_provider_projection.is_none());
+
+        private_event.summary = Some("CHANGED-PRIVATE-TITLE".to_owned());
+        private_event.description = Some("CHANGED-PRIVATE-NOTES".to_owned());
+        private_event.location = Some("CHANGED-PRIVATE-LOCATION".to_owned());
+        private_event.attendees.clear();
+        private_event.attachments.clear();
+        private_event.conference_data = None;
+        let second = normalize_event(
             &collection(GoogleSyncRole::ReadOnly, true),
             "UTC",
             private_event,
         )
-        .expect("private event projection")
-        .item
-        .expect("private event upsert");
+        .expect("changed private event projection");
 
-        assert!(item.is_sensitive);
+        assert_ne!(first.remote_payload_hash, second.remote_payload_hash);
+        assert_eq!(first.remote_projection_hash, second.remote_projection_hash);
     }
 
     #[test]
@@ -3236,8 +4030,10 @@ mod tests {
             .item
             .expect("upsert");
         assert_eq!(item.duration_seconds, Some(23 * 60 * 60));
-        assert_eq!(item.flexible_constraints["google_sync"]["all_day"], true);
-        assert_eq!(item.flexible_constraints["google_sync"]["blocking"], false);
+        assert_eq!(
+            item.flexible_constraints["calendar_context"]["all_day"],
+            true
+        );
 
         let mut fall_back = event();
         fall_back.start = Some(EventDateTime {
@@ -3261,6 +4057,52 @@ mod tests {
             .expect("upsert")
             .duration_seconds,
             Some(25 * 60 * 60)
+        );
+    }
+
+    #[test]
+    fn occurrence_timestamps_are_canonicalized_to_postgres_microseconds() {
+        let mut precise = event();
+        precise.start.as_mut().expect("start").date_time =
+            Some("2026-08-29T10:00:00.123456789+02:00".to_owned());
+        precise.end.as_mut().expect("end").date_time =
+            Some("2026-08-29T11:00:00.987654321+02:00".to_owned());
+        precise.updated = Some("2026-08-29T08:00:00.999999999Z".to_owned());
+
+        let change = normalize_event(&collection(GoogleSyncRole::Blocking, true), "UTC", precise)
+            .expect("precise occurrence");
+        let item = change.item.expect("upsert");
+        assert_eq!(
+            item.earliest_start_at,
+            Some(
+                "2026-08-29T08:00:00.123456Z"
+                    .parse()
+                    .expect("microsecond start")
+            )
+        );
+        assert_eq!(
+            item.deadline_at,
+            Some(
+                "2026-08-29T09:00:00.987654Z"
+                    .parse()
+                    .expect("microsecond end")
+            )
+        );
+        assert_eq!(
+            change.remote_updated_at,
+            Some(
+                "2026-08-29T08:00:00.999999Z"
+                    .parse()
+                    .expect("microsecond update")
+            )
+        );
+        assert_eq!(
+            item.flexible_constraints["calendar_event"]["start"],
+            "2026-08-29T08:00:00.123456Z"
+        );
+        assert_eq!(
+            item.flexible_constraints["calendar_event"]["end"],
+            "2026-08-29T09:00:00.987654Z"
         );
     }
 
@@ -3368,6 +4210,16 @@ mod tests {
                 .values()
                 .any(|value| value.contains(&Uuid::from_u128(44).to_string()))
         );
+        let source_metadata =
+            normalize_calendar_series_authenticated(&collection, event.clone(), &cipher, scope)
+                .expect("authenticated source metadata");
+        assert_eq!(source_metadata.dayweave_item_id, Some(Uuid::from_u128(44)));
+        assert!(source_metadata.reviewed_provider_projection.is_some());
+        let echoed = normalize_event_authenticated(&collection, "UTC", event, &cipher, scope)
+            .expect("authenticated expanded echo");
+        assert_eq!(echoed.dayweave_item_id, Some(Uuid::from_u128(44)));
+        assert!(echoed.reviewed_provider_projection.is_some());
+        assert!(echoed.item.is_some());
     }
 
     #[test]
@@ -4083,6 +4935,67 @@ mod tests {
             .expect("prepare sanitized task");
         assert!(!prepared.payload.to_string().contains(&canary));
         assert_eq!(prepared.payload["notes"], "local details");
+    }
+
+    #[test]
+    fn task_control_obfuscated_markers_are_stripped_before_display_normalization() {
+        let canary = Uuid::from_u128(78).to_string();
+        let notes = format!(
+            "ordinary first line\n[DayWeave\t\0\u{7}item:{canary}]\r\nordinary second\u{7}line\n[DayWeave\r\nitem:{canary}]\nordinary third line"
+        );
+        let (retained, stripped) = sanitize_task_notes(Some(&notes));
+        assert!(stripped);
+        assert_eq!(
+            retained.as_deref(),
+            Some("ordinary first line\nordinary second line\nordinary third line")
+        );
+
+        let mut tasks_collection = collection(GoogleSyncRole::ReadOnly, true);
+        tasks_collection.kind = GoogleCollectionKind::TaskList;
+        let change = normalize_task(
+            &tasks_collection,
+            GoogleTask {
+                id: "remote-control-marker".to_owned(),
+                etag: Some("etag-control-marker".to_owned()),
+                title: "Task".to_owned(),
+                notes: Some(notes),
+                status: Some("needsAction".to_owned()),
+                due: None,
+                completed: None,
+                updated: None,
+                parent: None,
+                position: None,
+                links: None,
+                deleted: false,
+                hidden: false,
+            },
+        )
+        .expect("control-obfuscated legacy marker is safely normalized");
+        let item = change.item.expect("normalized task");
+
+        assert_eq!(
+            item.notes.as_deref(),
+            Some("ordinary first line ordinary second line ordinary third line")
+        );
+        assert_eq!(
+            item.flexible_constraints["google_sync"]["legacy_marker_stripped"],
+            true
+        );
+        assert!(
+            !item
+                .notes
+                .as_deref()
+                .expect("retained notes")
+                .contains(&canary)
+        );
+        assert!(
+            !item
+                .notes
+                .as_deref()
+                .expect("retained notes")
+                .chars()
+                .any(char::is_control)
+        );
     }
 
     #[test]

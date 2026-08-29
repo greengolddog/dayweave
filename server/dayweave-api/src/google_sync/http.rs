@@ -506,6 +506,7 @@ fn map_repository_error(error: &GoogleSyncRepositoryError) -> ApiError {
         }
         GoogleSyncRepositoryError::ClaimLost
         | GoogleSyncRepositoryError::CursorConflict
+        | GoogleSyncRepositoryError::InvalidProjectionBatch
         | GoogleSyncRepositoryError::IdentityRootMismatch
         | GoogleSyncRepositoryError::Internal => ApiError::internal(),
     }

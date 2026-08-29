@@ -15,7 +15,7 @@ use std::{sync::Arc, time::SystemTime};
 
 use reqwest::{Method, RequestBuilder, Response};
 use secrecy::ExposeSecret;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use url::Url;
 
 pub use auth::{AccessTokenProvider, StaticAccessToken};
@@ -168,6 +168,38 @@ impl GoogleClient {
         response.json().await.map_err(GoogleError::Transport)
     }
 
+    /// Reads a successful JSON response incrementally and never accumulates
+    /// more than `max_bytes` of its encoded body before deserialization. A
+    /// `Content-Length` check provides an early exit, while the chunk loop is
+    /// authoritative for HTTP/2 and chunked responses without a declared size.
+    pub(crate) async fn json_limited<T: DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+        max_bytes: usize,
+    ) -> Result<T, GoogleError> {
+        let response = request.send().await.map_err(GoogleError::Transport)?;
+        let mut response = ensure_success(response)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(GoogleError::ResponseTooLarge);
+        }
+        let initial_capacity = response
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(0)
+            .min(max_bytes);
+        let mut body = Vec::with_capacity(initial_capacity);
+        while let Some(chunk) = response.chunk().await.map_err(GoogleError::Transport)? {
+            if chunk.len() > max_bytes.saturating_sub(body.len()) {
+                return Err(GoogleError::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body).map_err(|_| GoogleError::InvalidResponse)
+    }
+
     pub(crate) fn prepare(
         &self,
         request: RequestBuilder,
@@ -203,5 +235,69 @@ fn ensure_success(response: Response) -> Result<Response, GoogleError> {
         }),
         code if status.is_server_error() => Err(GoogleError::Temporary { status: code }),
         code => Err(GoogleError::Api { status: code }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use reqwest::Method;
+    use serde_json::Value;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::{GoogleClient, GoogleError, StaticAccessToken};
+
+    async fn serve_once(response: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let address = listener.local_addr().expect("listener address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request");
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.expect("request headers");
+            socket.write_all(response).await.expect("response");
+        });
+        format!("http://{address}/")
+    }
+
+    async fn limited_request(base_url: &str, limit: usize) -> Result<Value, GoogleError> {
+        let client = GoogleClient::with_base_url(
+            Arc::new(StaticAccessToken::new("test-access-token")),
+            base_url,
+        )
+        .expect("test base URL");
+        let url = client.endpoint(&["limited"]).expect("test endpoint");
+        let request = client
+            .request(Method::GET, url)
+            .await
+            .expect("authorized request");
+        client.json_limited(request, limit).await
+    }
+
+    #[tokio::test]
+    async fn limited_json_rejects_declared_oversize_before_deserialization() {
+        let base_url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 33\r\nConnection: close\r\n\r\n{\"padding\":\"01234567890123456789\"}",
+        )
+        .await;
+        let error = limited_request(&base_url, 16)
+            .await
+            .expect_err("declared oversize response");
+        assert!(matches!(error, GoogleError::ResponseTooLarge));
+    }
+
+    #[tokio::test]
+    async fn limited_json_rejects_chunked_oversize_during_streaming() {
+        let base_url = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nA\r\n{\"padding\"\r\n17\r\n:\"01234567890123456789\"}\r\n0\r\n\r\n",
+        )
+        .await;
+        let error = limited_request(&base_url, 16)
+            .await
+            .expect_err("streamed oversize response");
+        assert!(matches!(error, GoogleError::ResponseTooLarge));
     }
 }

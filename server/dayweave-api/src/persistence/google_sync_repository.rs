@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
@@ -15,15 +17,16 @@ use crate::{
         GOOGLE_TASKS_SCOPE,
     },
     google_sync::{
+        CalendarProjectionBatch, CalendarProjectionResult, CalendarProjectionState,
         DiscoveredCollection, GoogleCalendarPolicy, GoogleCollectionKind, GoogleEventDisposition,
         GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRepository,
         GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncRunState, GoogleSyncRunStatus,
         ImportOutcome, OutboundApprovalSpec, OutboundDispatchPermit, OutboundEnqueueSpec,
         OutboundOperation, OutboundPreviewSpec, OutboundResult, OutboundWork, OutboxCounts,
-        RemoteItemChange, StoredCursor, SyncClaim, SyncCounts, SyncFailureKind,
-        outbound_intent_hash, outbound_preview_hash,
+        RemoteCalendarSeriesChange, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
+        SyncFailureKind, outbound_intent_hash, outbound_preview_hash,
     },
-    items::{Item, ItemStatus, ItemTombstone, ReplaceItem, SplitPolicy},
+    items::{Item, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy},
 };
 
 use super::DatabaseScope;
@@ -32,7 +35,12 @@ const COLLECTION_COLUMNS: &str = "id, provider_account_id, collection_kind, remo
     provider_access_role, provider_primary, provider_selected, provider_hidden, provider_deleted, \
     selected, visible, sync_role, confirmed_busy_policy, tentative_policy, free_policy, \
     all_day_policy, publish_all_day, publish_tentative, publish_free, revision, discovered_at, \
-    configured_at, last_import_at, created_at, updated_at";
+    configured_at, last_import_at, planning_projection_state, planning_generation, \
+    planning_collection_revision, planning_window_start, planning_window_end, \
+    planning_window_refreshed_at, created_at, updated_at";
+
+const MAX_CALENDAR_PROJECTION_ENTRIES: usize = 10_000;
+const MAX_CALENDAR_PROJECTION_WINDOW_DAYS: i64 = 150;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresGoogleSyncRepository {
@@ -204,6 +212,11 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<Vec<GoogleSyncCollection>, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        if kind == GoogleCollectionKind::Calendar {
+            super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+                .await
+                .map_err(internal)?;
+        }
         let granted_scopes = self
             .ensure_account(&mut transaction, account_id, true)
             .await?;
@@ -216,6 +229,27 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             }
             ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
         }
+        let previous_calendar_state: BTreeMap<String, (Uuid, bool)> =
+            if kind == GoogleCollectionKind::Calendar {
+                sqlx::query_as::<_, (String, Uuid, bool)>(
+                    "SELECT remote_collection_id, id, provider_deleted \
+                     FROM google_sync_collections WHERE workspace_id = $1 AND user_id = $2 \
+                       AND provider_account_id = $3 AND collection_kind = 'calendar' \
+                     ORDER BY id FOR UPDATE",
+                )
+                .bind(self.scope.workspace_id)
+                .bind(self.scope.user_id)
+                .bind(account_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(internal)?
+                .into_iter()
+                .map(|(remote_id, id, deleted)| (remote_id, (id, deleted)))
+                .collect()
+            } else {
+                BTreeMap::new()
+            };
+        let mut teardown_collections = BTreeSet::new();
         let mut seen = Vec::with_capacity(collections.len());
         for collection in collections {
             if collection.kind != kind {
@@ -243,6 +277,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 .await
                 .map_err(internal)?;
                 if let Some(collection_id) = downgraded {
+                    teardown_collections.insert(collection_id);
                     sqlx::query(
                         "DELETE FROM provider_sync_cursors WHERE workspace_id = $1 \
                          AND provider_account_id = $2 AND collection_key = $3",
@@ -270,6 +305,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                     .await
                     .map_err(internal)?;
                 }
+            }
+            if collection.provider_deleted
+                && let Some((collection_id, false)) =
+                    previous_calendar_state.get(&collection.remote_id)
+            {
+                teardown_collections.insert(*collection_id);
             }
             seen.push(collection.remote_id.clone());
             sqlx::query(
@@ -326,12 +367,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             .await
             .map_err(internal)?;
         }
-        sqlx::query(
+        let newly_deleted: Vec<Uuid> = sqlx::query_scalar(
             "UPDATE google_sync_collections SET provider_deleted = true, selected = false, \
              revision = revision + 1, updated_at = $6 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
              AND collection_kind = $4 AND NOT provider_deleted \
-             AND NOT (remote_collection_id = ANY($5))",
+             AND NOT (remote_collection_id = ANY($5)) RETURNING id",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
@@ -339,9 +380,22 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(kind.as_db())
         .bind(&seen)
         .bind(now)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(internal)?;
+        if kind == GoogleCollectionKind::Calendar {
+            teardown_collections.extend(newly_deleted);
+            for collection_id in teardown_collections {
+                retire_active_calendar_occurrences(
+                    &mut transaction,
+                    self.scope,
+                    account_id,
+                    collection_id,
+                    now,
+                )
+                .await?;
+            }
+        }
         sqlx::query(
             "UPDATE google_sync_outbox outbox SET state = 'conflict', claim_id = NULL, \
              claimed_at = NULL, run_claim_id = NULL, run_claim_generation = NULL, \
@@ -428,6 +482,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<GoogleSyncCollection, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         let granted_scopes = self
             .ensure_account(&mut transaction, account_id, true)
             .await?;
@@ -463,8 +520,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         if selected && !has_collection_read_scope_db(&granted_scopes, &collection_kind) {
             return Err(GoogleSyncRepositoryError::ReadScopeMissing);
         }
-        let projection_changed = current.try_get::<bool, _>("visible").map_err(internal)?
-            != visible
+        let projection_changed = current.try_get::<bool, _>("selected").map_err(internal)?
+            != selected
+            || current.try_get::<bool, _>("visible").map_err(internal)? != visible
             || current
                 .try_get::<String, _>("sync_role")
                 .map_err(internal)?
@@ -547,6 +605,16 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .fetch_one(&mut *transaction)
         .await
         .map_err(internal)?;
+        if collection_kind == "calendar" && projection_changed {
+            retire_active_calendar_occurrences(
+                &mut transaction,
+                self.scope,
+                account_id,
+                collection_id,
+                now,
+            )
+            .await?;
+        }
         if projection_changed {
             let collection_key = if collection_kind == "calendar" {
                 format!("calendar:{collection_id}")
@@ -698,6 +766,35 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
         .bind(account_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(())
+    }
+
+    async fn begin_calendar_projection_refresh(
+        &self,
+        claim: &SyncClaim,
+        now: DateTime<Utc>,
+    ) -> Result<(), GoogleSyncRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
+        ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
+        sqlx::query(
+            "UPDATE google_sync_collections SET planning_projection_state = 'uninitialized', \
+             planning_collection_revision = NULL, planning_window_start = NULL, \
+             planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+             planning_last_error_code = NULL, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND collection_kind = 'calendar' AND selected AND NOT provider_deleted",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(claim.account_id)
         .bind(now)
         .execute(&mut *transaction)
         .await
@@ -1146,6 +1243,131 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         Ok(outcome)
     }
 
+    async fn replace_calendar_projection(
+        &self,
+        claim: &SyncClaim,
+        batch: CalendarProjectionBatch,
+        now: DateTime<Utc>,
+    ) -> Result<CalendarProjectionResult, GoogleSyncRepositoryError> {
+        validate_calendar_projection_batch(claim, &batch)?;
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
+        ensure_inbound_claim(
+            &mut transaction,
+            self.scope,
+            claim,
+            batch.collection_id,
+            batch.collection_revision,
+            now,
+        )
+        .await?;
+        let generation =
+            lock_calendar_projection_collection(&mut transaction, self.scope, &batch).await?;
+        if !batch.rejected.is_empty() {
+            record_projection_rejections(&mut transaction, self.scope, &batch, generation, now)
+                .await?;
+            transaction.commit().await.map_err(internal)?;
+            return Ok(CalendarProjectionResult {
+                generation,
+                complete: false,
+                counts: SyncCounts {
+                    rejected: batch.rejected.len() as u64,
+                    ..SyncCounts::default()
+                },
+            });
+        }
+        let next_generation = generation
+            .checked_add(1)
+            .ok_or(GoogleSyncRepositoryError::Internal)?;
+        sqlx::query("SAVEPOINT replace_calendar_projection")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        let replacement = replace_calendar_projection_tx(
+            &mut transaction,
+            self.scope,
+            &batch,
+            next_generation,
+            now,
+        )
+        .await;
+        let counts = match replacement {
+            Ok(counts) => match seal_calendar_projection(
+                &mut transaction,
+                self.scope,
+                &batch,
+                generation,
+                next_generation,
+                now,
+            )
+            .await
+            {
+                Ok(()) => counts,
+                Err(error) => {
+                    return finish_projection_semantic_failure(
+                        transaction,
+                        self.scope,
+                        &batch,
+                        generation,
+                        error,
+                        now,
+                    )
+                    .await;
+                }
+            },
+            Err(error) => {
+                return finish_projection_semantic_failure(
+                    transaction,
+                    self.scope,
+                    &batch,
+                    generation,
+                    error,
+                    now,
+                )
+                .await;
+            }
+        };
+        sqlx::query("RELEASE SAVEPOINT replace_calendar_projection")
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(CalendarProjectionResult {
+            generation: next_generation,
+            complete: true,
+            counts,
+        })
+    }
+
+    async fn apply_calendar_series_metadata(
+        &self,
+        claim: &SyncClaim,
+        change: RemoteCalendarSeriesChange,
+        now: DateTime<Utc>,
+    ) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+        validate_calendar_series_change(claim, &change)?;
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
+        ensure_inbound_claim(
+            &mut transaction,
+            self.scope,
+            claim,
+            change.collection_id,
+            change.collection_revision,
+            now,
+        )
+        .await?;
+        let outcome =
+            apply_calendar_series_metadata_tx(&mut transaction, self.scope, claim, &change, now)
+                .await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(outcome)
+    }
+
     async fn mark_rejected(
         &self,
         claim: &SyncClaim,
@@ -1197,6 +1419,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
+        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,
@@ -3117,6 +3342,1606 @@ async fn reconcile_outbound_for_parent_end(
     Ok(())
 }
 
+fn validate_calendar_projection_batch(
+    claim: &SyncClaim,
+    batch: &CalendarProjectionBatch,
+) -> Result<(), GoogleSyncRepositoryError> {
+    if claim.account_id != batch.account_id
+        || batch.window.start >= batch.window.end
+        || !batch
+            .window
+            .start
+            .timestamp_subsec_nanos()
+            .is_multiple_of(1_000)
+        || !batch
+            .window
+            .end
+            .timestamp_subsec_nanos()
+            .is_multiple_of(1_000)
+        || batch.window.end - batch.window.start
+            > chrono::Duration::days(MAX_CALENDAR_PROJECTION_WINDOW_DAYS)
+        || batch
+            .changes
+            .len()
+            .checked_add(batch.rejected.len())
+            .is_none_or(|count| count > MAX_CALENDAR_PROJECTION_ENTRIES)
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    let mut remote_ids = BTreeSet::new();
+    let mut new_item_ids = BTreeSet::new();
+    for change in &batch.changes {
+        if change.account_id != batch.account_id
+            || change.collection_id != batch.collection_id
+            || change.collection_revision != batch.collection_revision
+            || (change.dayweave_item_id.is_none() && change.reviewed_provider_projection.is_some())
+            || (change.dayweave_item_id.is_some() && change.reviewed_provider_projection.is_none())
+            || !valid_provider_text(&change.remote_id, 1000)
+            || change
+                .remote_parent_id
+                .as_deref()
+                .is_some_and(|value| !valid_provider_text(value, 1000))
+            || change
+                .remote_etag
+                .as_deref()
+                .is_some_and(|value| !valid_provider_text(value, 1000))
+            || !remote_ids.insert(change.remote_id.as_str())
+        {
+            return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+        }
+        if change.dayweave_item_id.is_none()
+            && let Some(item) = &change.item
+        {
+            validate_calendar_occurrence_item(item)?;
+            if !new_item_ids.insert(item.id) {
+                return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+            }
+        }
+    }
+    for rejected in &batch.rejected {
+        if !valid_provider_text(&rejected.remote_id, 1000)
+            || !valid_projection_rejection_reason(rejected.reason)
+            || !remote_ids.insert(rejected.remote_id.as_str())
+        {
+            return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_calendar_occurrence_item(item: &NewItem) -> Result<(), GoogleSyncRepositoryError> {
+    let constraints = item
+        .flexible_constraints
+        .as_object()
+        .ok_or(GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    let typed_constraints = constraints.len() == 1
+        && (constraints.contains_key("calendar_event")
+            || constraints.contains_key("calendar_context"));
+    if item.kind != crate::items::ItemKind::Event
+        || item.status != ItemStatus::Scheduled
+        || item.recurrence.is_some()
+        || item.parent_id.is_some()
+        || !matches!(item.split_policy, SplitPolicy::Indivisible)
+        || !typed_constraints
+        || !valid_database_text(&item.title, 500)
+        || (item.is_sensitive && (item.title != "Busy" || item.notes.is_some()))
+        || item
+            .notes
+            .as_deref()
+            .is_some_and(|value| !valid_database_text(value, 100_000))
+        || !json_is_provider_evidence_safe(&item.flexible_constraints, 0)
+        || Item::new(item.clone(), Utc::now()).is_err()
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    let (start, end) = if let Some(value) = constraints.get("calendar_event") {
+        validate_calendar_event_constraints(value)?
+    } else {
+        validate_calendar_context_constraints(
+            constraints
+                .get("calendar_context")
+                .ok_or(GoogleSyncRepositoryError::InvalidProjectionBatch)?,
+        )?
+    };
+    let duration = (end - start)
+        .num_seconds()
+        .try_into()
+        .map_err(|_| GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    if item.earliest_start_at != Some(start)
+        || item.deadline_at != Some(end)
+        || item.duration_seconds != Some(duration)
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    Ok(())
+}
+
+fn validate_calendar_event_constraints(
+    value: &Value,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), GoogleSyncRepositoryError> {
+    let object = value
+        .as_object()
+        .ok_or(GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    if object.len() != 5
+        || !["start", "end", "immutable", "all_day"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+        || !object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "start" | "end" | "immutable" | "all_day" | "source_calendar_id"
+            )
+        })
+        || object.get("immutable").and_then(Value::as_bool) != Some(true)
+        || object.get("all_day").and_then(Value::as_bool).is_none()
+        || object
+            .get("source_calendar_id")
+            .is_none_or(|value| !value.is_null())
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    projection_bounds(object)
+}
+
+fn validate_calendar_context_constraints(
+    value: &Value,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), GoogleSyncRepositoryError> {
+    let object = value
+        .as_object()
+        .ok_or(GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    if object.len() != 3
+        || !["start", "end", "all_day"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+        || object.get("all_day").and_then(Value::as_bool).is_none()
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    projection_bounds(object)
+}
+
+fn projection_bounds(
+    object: &serde_json::Map<String, Value>,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), GoogleSyncRepositoryError> {
+    let parse = |key| {
+        let value = object
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or(GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+        let instant = DateTime::parse_from_rfc3339(value)
+            .map_err(|_| GoogleSyncRepositoryError::InvalidProjectionBatch)?
+            .with_timezone(&Utc);
+        if !instant.timestamp_subsec_nanos().is_multiple_of(1_000) {
+            return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+        }
+        Ok(instant)
+    };
+    let start = parse("start")?;
+    let end = parse("end")?;
+    if start >= end {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    Ok((start, end))
+}
+
+fn json_is_provider_evidence_safe(value: &Value, depth: usize) -> bool {
+    if depth > 16 {
+        return false;
+    }
+    match value {
+        Value::String(value) => valid_database_text(value, 16_384),
+        Value::Array(values) => values
+            .iter()
+            .all(|value| json_is_provider_evidence_safe(value, depth + 1)),
+        Value::Object(values) => values.iter().all(|(key, value)| {
+            valid_database_text(key, 200)
+                && !matches!(
+                    key.as_str(),
+                    "account_id"
+                        | "collection_id"
+                        | "remote_id"
+                        | "remote_parent_id"
+                        | "series_remote_id"
+                )
+                && json_is_provider_evidence_safe(value, depth + 1)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn valid_database_text(value: &str, max_chars: usize) -> bool {
+    !value.is_empty() && value.chars().count() <= max_chars && !value.chars().any(char::is_control)
+}
+
+fn valid_provider_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && !value.chars().any(char::is_control)
+}
+
+fn valid_projection_rejection_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "canonical_item_invalid"
+            | "dayweave_marker_invalid"
+            | "event_bounds_invalid"
+            | "event_bounds_missing"
+            | "event_date_invalid"
+            | "event_duration_invalid"
+            | "event_timezone_invalid"
+            | "invalid_remote_id"
+            | "provider_metadata_invalid"
+            | "provider_payload_invalid"
+            | "timestamp_invalid"
+            | "unauthenticated_dayweave_marker"
+    )
+}
+
+fn validate_calendar_series_change(
+    claim: &SyncClaim,
+    change: &RemoteCalendarSeriesChange,
+) -> Result<(), GoogleSyncRepositoryError> {
+    if claim.account_id != change.account_id
+        || !valid_provider_text(&change.remote_id, 1000)
+        || change
+            .remote_etag
+            .as_deref()
+            .is_some_and(|value| !valid_provider_text(value, 1000))
+        || (change.dayweave_item_id.is_none() && change.reviewed_provider_projection.is_some())
+        || (change.dayweave_item_id.is_some()
+            && !change.deleted
+            && change.reviewed_provider_projection.is_none())
+        || (change.deleted && change.reviewed_provider_projection.is_some())
+    {
+        return Err(GoogleSyncRepositoryError::InvalidProjectionBatch);
+    }
+    Ok(())
+}
+
+async fn lock_calendar_projection_collection(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+) -> Result<u64, GoogleSyncRepositoryError> {
+    let row = sqlx::query(
+        "SELECT planning_generation, collection_kind, revision, selected, provider_deleted \
+         FROM google_sync_collections WHERE workspace_id = $1 AND user_id = $2 \
+           AND provider_account_id = $3 AND id = $4 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(GoogleSyncRepositoryError::CollectionNotFound)?;
+    if row
+        .try_get::<String, _>("collection_kind")
+        .map_err(internal)?
+        != "calendar"
+        || !row.try_get::<bool, _>("selected").map_err(internal)?
+        || row
+            .try_get::<bool, _>("provider_deleted")
+            .map_err(internal)?
+        || i64_to_u64(row.try_get("revision").map_err(internal)?)? != batch.collection_revision
+    {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    i64_to_u64(row.try_get("planning_generation").map_err(internal)?)
+}
+
+async fn record_projection_rejections(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    sqlx::query(
+        "DELETE FROM google_calendar_projection_rejections WHERE workspace_id = $1 \
+         AND user_id = $2 AND provider_account_id = $3 AND collection_id = $4",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    for rejected in &batch.rejected {
+        sqlx::query(
+            "INSERT INTO google_calendar_projection_rejections (workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, remote_resource_id, \
+             reason_code, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(batch.account_id)
+        .bind(batch.collection_id)
+        .bind(u64_to_i64(batch.collection_revision)?)
+        .bind(&rejected.remote_id)
+        .bind(rejected.reason)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    let affected = sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'failed', \
+         planning_collection_revision = NULL, planning_window_start = NULL, \
+         planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+         planning_last_error_code = 'projection_rejected', updated_at = $7 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4 \
+           AND revision = $5 AND planning_generation = $6",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .bind(u64_to_i64(batch.collection_revision)?)
+    .bind(u64_to_i64(generation)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected != 1 {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    let reason_codes: BTreeSet<_> = batch
+        .rejected
+        .iter()
+        .map(|rejected| rejected.reason)
+        .collect();
+    sqlx::query(
+        "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+         entity_type, entity_id, outcome, metadata, occurred_at) \
+         VALUES ($1, $2, $3, 'google.calendar_projection_rejected', \
+         'google_calendar_projection', $4, 'rejected', $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.collection_id)
+    .bind(json!({"count": batch.rejected.len(), "reason_codes": reason_codes}))
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn seal_calendar_projection(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+    previous_generation: u64,
+    next_generation: u64,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    sqlx::query(
+        "DELETE FROM google_calendar_projection_rejections WHERE workspace_id = $1 \
+         AND user_id = $2 AND provider_account_id = $3 AND collection_id = $4",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let affected = sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'complete', \
+         planning_generation = $7, planning_collection_revision = $5, \
+         planning_window_start = $8, planning_window_end = $9, \
+         planning_window_refreshed_at = $10, planning_last_error_code = NULL, \
+         last_import_at = $10, updated_at = $10 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4 \
+           AND revision = $5 AND planning_generation = $6",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .bind(u64_to_i64(batch.collection_revision)?)
+    .bind(u64_to_i64(previous_generation)?)
+    .bind(u64_to_i64(next_generation)?)
+    .bind(batch.window.start)
+    .bind(batch.window.end)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected != 1 {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    sqlx::query(
+        "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+         entity_type, entity_id, result_revision, outcome, metadata, occurred_at) \
+         VALUES ($1, $2, $3, 'google.calendar_projection_replaced', \
+         'google_calendar_projection', $4, $5, 'succeeded', \
+         jsonb_build_object('generation', $5, 'occurrence_count', $6), $7)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.collection_id)
+    .bind(u64_to_i64(next_generation)?)
+    .bind(i64::try_from(batch.changes.len()).map_err(internal)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn finish_projection_semantic_failure(
+    mut transaction: Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+    generation: u64,
+    error: GoogleSyncRepositoryError,
+    now: DateTime<Utc>,
+) -> Result<CalendarProjectionResult, GoogleSyncRepositoryError> {
+    if !matches!(
+        &error,
+        GoogleSyncRepositoryError::CursorConflict
+            | GoogleSyncRepositoryError::InvalidProjectionBatch
+            | GoogleSyncRepositoryError::ItemNotFound
+    ) {
+        return Err(error);
+    }
+    sqlx::query("ROLLBACK TO SAVEPOINT replace_calendar_projection")
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    let affected = sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'failed', \
+         planning_collection_revision = NULL, planning_window_start = NULL, \
+         planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+         planning_last_error_code = 'projection_conflict', updated_at = $7 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 AND id = $4 \
+           AND revision = $5 AND planning_generation = $6",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .bind(u64_to_i64(batch.collection_revision)?)
+    .bind(u64_to_i64(generation)?)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected != 1 {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    sqlx::query(
+        "INSERT INTO audit_operations (id, workspace_id, actor_user_id, operation_type, \
+         entity_type, entity_id, outcome, metadata, occurred_at) \
+         VALUES ($1, $2, $3, 'google.calendar_projection_conflicted', \
+         'google_calendar_projection', $4, 'conflicted', \
+         '{\"reason\":\"canonical_projection_conflict\"}'::jsonb, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(batch.collection_id)
+    .bind(now)
+    .execute(&mut *transaction)
+    .await
+    .map_err(internal)?;
+    sqlx::query("RELEASE SAVEPOINT replace_calendar_projection")
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+    transaction.commit().await.map_err(internal)?;
+    Ok(CalendarProjectionResult {
+        generation,
+        complete: false,
+        counts: SyncCounts {
+            conflicts: 1,
+            ..SyncCounts::default()
+        },
+    })
+}
+
+async fn replace_calendar_projection_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let mut counts = SyncCounts::default();
+    let owned_remote_ids = owned_calendar_remote_ids(transaction, scope, batch).await?;
+    for change in &batch.changes {
+        if (change.dayweave_item_id.is_some() || owned_remote_ids.contains(&change.remote_id))
+            && validate_owned_calendar_occurrence(transaction, scope, change).await?
+        {
+            continue;
+        }
+        counts.add(
+            apply_calendar_occurrence_change(transaction, scope, change, generation, now).await?,
+        );
+    }
+    // The first arm is bounded by the current unresolved occurrence set and a
+    // matching partial index. The second arm starts from live canonical items,
+    // then uses the active local-identity uniqueness index to catch a user
+    // restore behind an otherwise dormant deleted mapping. Historical
+    // deleted+trashed mappings are deliberately not rewritten every refresh;
+    // an occurrence that reappears is still found by its remote identity and
+    // restores the same mapping/item.
+    let missing = sqlx::query(
+        "WITH candidate_ids AS MATERIALIZED ( \
+           SELECT mapping.id FROM provider_sync_mappings mapping \
+           WHERE mapping.workspace_id = $1 AND mapping.provider_account_id = $2 \
+             AND mapping.collection_id = $3 AND mapping.entity_kind = 'calendar_occurrence' \
+             AND mapping.tombstoned_at IS NULL AND mapping.sync_state <> 'deleted_remote' \
+             AND mapping.projection_generation <> $4 \
+           UNION ALL \
+           SELECT restored.id FROM items item \
+           CROSS JOIN LATERAL ( \
+             SELECT mapping.id FROM provider_sync_mappings mapping \
+             WHERE mapping.workspace_id = item.workspace_id \
+               AND mapping.provider_account_id = $2 AND mapping.collection_id = $3 \
+               AND mapping.entity_kind = 'calendar_occurrence' \
+               AND mapping.local_entity_id = item.id AND mapping.tombstoned_at IS NULL \
+               AND mapping.sync_state = 'deleted_remote' \
+               AND mapping.projection_generation <> $4 LIMIT 1 \
+           ) restored \
+           WHERE item.workspace_id = $1 AND item.trashed_at IS NULL \
+         ) \
+         SELECT mapping.id, mapping.local_entity_id, mapping.local_revision \
+         FROM provider_sync_mappings mapping JOIN candidate_ids candidate ON candidate.id = mapping.id \
+         ORDER BY mapping.remote_resource_id FOR UPDATE OF mapping",
+    )
+    .bind(scope.workspace_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .bind(u64_to_i64(generation)?)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    for mapping in &missing {
+        counts.add(
+            retire_calendar_occurrence_mapping(transaction, scope, mapping, generation, now)
+                .await?,
+        );
+    }
+    Ok(counts)
+}
+
+async fn owned_calendar_remote_ids(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    batch: &CalendarProjectionBatch,
+) -> Result<HashSet<String>, GoogleSyncRepositoryError> {
+    // Restrict the identity lookup to this already-bounded provider batch.
+    // This catches stripped markers without adding one query per external
+    // occurrence or loading an account's entire historical mapping set.
+    let remote_ids: Vec<String> = batch
+        .changes
+        .iter()
+        .map(|change| change.remote_id.clone())
+        .collect();
+    sqlx::query_scalar(
+        "SELECT remote_resource_id FROM provider_sync_mappings \
+         WHERE workspace_id = $1 AND provider_account_id = $2 AND collection_id = $3 \
+           AND entity_kind = 'item' AND ownership = 'dayweave' AND tombstoned_at IS NULL \
+           AND remote_resource_id = ANY($4::text[]) ORDER BY remote_resource_id FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(batch.account_id)
+    .bind(batch.collection_id)
+    .bind(remote_ids)
+    .fetch_all(&mut **transaction)
+    .await
+    .map(|values| values.into_iter().collect())
+    .map_err(internal)
+}
+
+async fn validate_owned_calendar_occurrence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    change: &RemoteItemChange,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    // Consult the durable series identity even when Google omits private
+    // extended properties from a cancellation tombstone. A markerless live
+    // echo must never fall through and become a duplicate external occurrence.
+    let mapping = sqlx::query(
+        "SELECT local_entity_id, local_revision, ownership, sync_state, \
+                remote_payload_hash, remote_etag \
+         FROM provider_sync_mappings WHERE workspace_id = $1 AND provider_account_id = $2 \
+           AND collection_id = $3 AND entity_kind = 'item' \
+           AND remote_resource_id = $4 AND tombstoned_at IS NULL FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(change.account_id)
+    .bind(change.collection_id)
+    .bind(&change.remote_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(mapping) = mapping else {
+        if change.dayweave_item_id.is_some() {
+            return Err(GoogleSyncRepositoryError::CursorConflict);
+        }
+        return Ok(false);
+    };
+    let ownership: String = mapping.try_get("ownership").map_err(internal)?;
+    if ownership != "dayweave" {
+        if change.dayweave_item_id.is_some() {
+            return Err(GoogleSyncRepositoryError::CursorConflict);
+        }
+        return Ok(false);
+    }
+    let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
+    let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
+    let mapping_state: String = mapping.try_get("sync_state").map_err(internal)?;
+    let remote_payload_hash: Option<Vec<u8>> =
+        mapping.try_get("remote_payload_hash").map_err(internal)?;
+    let remote_etag: Option<String> = mapping.try_get("remote_etag").map_err(internal)?;
+    let marker_matches_or_is_absent = change
+        .dayweave_item_id
+        .is_none_or(|item_id| Some(item_id) == local_id);
+    let deleted_item_matches =
+        deleted_owned_item_matches(transaction, scope.workspace_id, local_id, local_revision)
+            .await?;
+
+    // Metadata ingestion has already authenticated this exact provider
+    // tombstone and advanced the mapping hash/ETag while retaining the durable
+    // deleted_remote publication acknowledgement. Exact matching is what
+    // distinguishes a cancellation from a policy-ignored live resurrection,
+    // since both normalize to `item = None` in the expanded lane.
+    if mapping_state == "deleted_remote"
+        && change.item.is_none()
+        && marker_matches_or_is_absent
+        && deleted_item_matches
+        && remote_payload_hash.as_deref() == Some(change.remote_payload_hash.as_slice())
+        && remote_etag == change.remote_etag
+    {
+        return Ok(true);
+    }
+
+    let Some(item_id) = change.dayweave_item_id else {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    };
+    if change.reviewed_provider_projection.is_none()
+        || Some(item_id) != local_id
+        || mapping_state != "synced"
+        || remote_payload_hash.as_deref() != Some(change.remote_payload_hash.as_slice())
+        || remote_etag != change.remote_etag
+        || deleted_item_matches
+    {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    let active_revision_matches: Option<bool> = sqlx::query_scalar(
+        "SELECT revision = $3 AND trashed_at IS NULL FROM items \
+         WHERE workspace_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(local_revision)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if active_revision_matches != Some(true) {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    Ok(true)
+}
+
+async fn deleted_owned_item_matches(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    local_id: Option<Uuid>,
+    local_revision: Option<i64>,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    let (Some(item_id), Some(expected_revision)) = (local_id, local_revision) else {
+        return Ok(false);
+    };
+    sqlx::query_scalar(
+        "SELECT revision = $3 AND trashed_at IS NOT NULL FROM items \
+         WHERE workspace_id = $1 AND id = $2 FOR SHARE",
+    )
+    .bind(workspace_id)
+    .bind(item_id)
+    .bind(expected_revision)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map(|value| value == Some(true))
+    .map_err(internal)
+}
+
+#[allow(clippy::too_many_lines)] // One occurrence's item, mapping, delta, and privacy floor are atomic.
+async fn apply_calendar_occurrence_change(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    change: &RemoteItemChange,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+    let mapping = sqlx::query(
+        "SELECT id, local_entity_id, local_revision, remote_projection_hash, \
+         provider_forced_sensitive FROM provider_sync_mappings \
+         WHERE workspace_id = $1 AND provider_account_id = $2 AND collection_id = $3 \
+           AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $4 \
+           AND tombstoned_at IS NULL FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(change.account_id)
+    .bind(change.collection_id)
+    .bind(&change.remote_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(mapping) = mapping else {
+        return insert_calendar_occurrence(transaction, scope, change, generation, now).await;
+    };
+    let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
+    let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
+    let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
+    let old_projection_hash: Option<Vec<u8>> = mapping
+        .try_get("remote_projection_hash")
+        .map_err(internal)?;
+    let forced_sensitive: bool = mapping
+        .try_get("provider_forced_sensitive")
+        .map_err(internal)?;
+    let current = if let Some(local_id) = local_id {
+        fetch_import_item_optional(transaction, scope.workspace_id, local_id).await?
+    } else {
+        None
+    };
+    let mapped_item_exists = current.is_some();
+    let Some(input) = change.item.as_ref() else {
+        if local_id.is_some() && !mapped_item_exists {
+            update_dangling_calendar_occurrence_tombstone(
+                transaction,
+                mapping_id,
+                change,
+                generation,
+                now,
+            )
+            .await?;
+            return Ok(ImportOutcome::Unchanged);
+        }
+        let outcome = if let Some(local_id) = local_id {
+            trash_projected_item(
+                transaction,
+                scope,
+                local_id,
+                local_revision,
+                "item.google_calendar_occurrence_deleted",
+                now,
+            )
+            .await?
+        } else {
+            ImportOutcome::Unchanged
+        };
+        let revision = current_item_revision(transaction, scope.workspace_id, local_id).await?;
+        update_calendar_occurrence_mapping(
+            transaction,
+            mapping_id,
+            change,
+            local_id,
+            revision,
+            forced_sensitive,
+            generation,
+            "deleted_remote",
+            now,
+        )
+        .await?;
+        return Ok(outcome);
+    };
+    let mut input = input.clone();
+    if forced_sensitive {
+        input.is_sensitive = true;
+        "Busy".clone_into(&mut input.title);
+        input.notes = None;
+    }
+    if mapped_item_exists {
+        let local_id = local_id.ok_or(GoogleSyncRepositoryError::Internal)?;
+        input.id = local_id;
+    } else if local_id == Some(input.id) {
+        // A hard-deleted item's immutable delta history can still occupy its
+        // old UUID. The current complete projection supplies no reason to
+        // reuse that stale canonical identity.
+        input.id = Uuid::new_v4();
+    }
+    let candidate =
+        Item::new(input, now).map_err(|_| GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    if !mapped_item_exists {
+        insert_imported_item(transaction, scope, &candidate).await?;
+        record_import_mutation(
+            transaction,
+            scope,
+            candidate.id,
+            u64_to_i64(candidate.revision)?,
+            "upsert",
+            serde_json::to_value(&candidate).map_err(internal)?,
+            "item.google_calendar_occurrence_created",
+            None,
+            now,
+        )
+        .await?;
+        update_calendar_occurrence_mapping(
+            transaction,
+            mapping_id,
+            change,
+            Some(candidate.id),
+            Some(u64_to_i64(candidate.revision)?),
+            candidate.is_sensitive || forced_sensitive,
+            generation,
+            "synced",
+            now,
+        )
+        .await?;
+        return Ok(ImportOutcome::Created);
+    }
+    let local_id = local_id.ok_or(GoogleSyncRepositoryError::Internal)?;
+    let current = current.ok_or(GoogleSyncRepositoryError::Internal)?;
+    let expected = local_revision.ok_or(GoogleSyncRepositoryError::Internal)?;
+    let local_changed = u64_to_i64(current.revision)? != expected;
+    if local_changed && !candidate.is_sensitive && !forced_sensitive {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    if !local_changed
+        && current.deleted_at.is_none()
+        && old_projection_hash.as_deref() == Some(change.remote_projection_hash.as_slice())
+    {
+        update_calendar_occurrence_mapping(
+            transaction,
+            mapping_id,
+            change,
+            Some(local_id),
+            Some(expected),
+            current.is_sensitive || forced_sensitive,
+            generation,
+            "synced",
+            now,
+        )
+        .await?;
+        return Ok(ImportOutcome::Unchanged);
+    }
+    let restored = current.deleted_at.is_some();
+    let base_revision = u64_to_i64(current.revision)?;
+    let replacement = ReplaceItem {
+        is_sensitive: current.is_sensitive || candidate.is_sensitive || forced_sensitive,
+        kind: candidate.kind,
+        status: candidate.status,
+        title: candidate.title,
+        notes: candidate.notes,
+        timezone_name: candidate.timezone_name,
+        duration_seconds: candidate.duration_seconds,
+        deadline_at: candidate.deadline_at,
+        earliest_start_at: candidate.earliest_start_at,
+        recurrence: candidate.recurrence,
+        flexible_constraints: candidate.flexible_constraints,
+        split_policy: candidate.split_policy,
+        importance: candidate.importance,
+        urgency: candidate.urgency,
+        parent_id: current.parent_id,
+        sibling_order: current.sibling_order,
+    };
+    let mut updated = current
+        .replaced(replacement, now)
+        .map_err(|_| GoogleSyncRepositoryError::Internal)?;
+    if restored {
+        updated.deleted_at = None;
+    }
+    update_imported_item(transaction, scope.workspace_id, &updated).await?;
+    record_import_mutation(
+        transaction,
+        scope,
+        updated.id,
+        u64_to_i64(updated.revision)?,
+        "upsert",
+        serde_json::to_value(&updated).map_err(internal)?,
+        if restored {
+            "item.google_calendar_occurrence_restored"
+        } else {
+            "item.google_calendar_occurrence_updated"
+        },
+        Some(base_revision),
+        now,
+    )
+    .await?;
+    update_calendar_occurrence_mapping(
+        transaction,
+        mapping_id,
+        change,
+        Some(updated.id),
+        Some(u64_to_i64(updated.revision)?),
+        updated.is_sensitive || forced_sensitive,
+        generation,
+        "synced",
+        now,
+    )
+    .await?;
+    Ok(ImportOutcome::Updated)
+}
+
+async fn insert_calendar_occurrence(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    change: &RemoteItemChange,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+    let candidate = change
+        .item
+        .as_ref()
+        .map(|input| Item::new(input.clone(), now))
+        .transpose()
+        .map_err(|_| GoogleSyncRepositoryError::InvalidProjectionBatch)?;
+    if let Some(item) = &candidate {
+        insert_imported_item(transaction, scope, item).await?;
+        record_import_mutation(
+            transaction,
+            scope,
+            item.id,
+            u64_to_i64(item.revision)?,
+            "upsert",
+            serde_json::to_value(item).map_err(internal)?,
+            "item.google_calendar_occurrence_created",
+            None,
+            now,
+        )
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, collection_id, \
+         entity_kind, local_entity_id, remote_resource_id, remote_etag, remote_updated_at, \
+         remote_parent_id, remote_payload_hash, remote_projection_hash, local_revision, sync_state, \
+         ownership, projection_generation, provider_forced_sensitive, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'calendar_occurrence', $5, $6, $7, $8, $9, $10, $11, \
+         $12, $13, 'external', $14, $15, $16, $16)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(change.account_id)
+    .bind(change.collection_id)
+    .bind(candidate.as_ref().map(|item| item.id))
+    .bind(&change.remote_id)
+    .bind(&change.remote_etag)
+    .bind(change.remote_updated_at)
+    .bind(&change.remote_parent_id)
+    .bind(change.remote_payload_hash.as_slice())
+    .bind(change.remote_projection_hash.as_slice())
+    .bind(
+        candidate
+            .as_ref()
+            .map(|item| u64_to_i64(item.revision))
+            .transpose()?,
+    )
+    .bind(if candidate.is_some() {
+        "synced"
+    } else {
+        "deleted_remote"
+    })
+    .bind(u64_to_i64(generation)?)
+    .bind(candidate.as_ref().is_some_and(|item| item.is_sensitive))
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(if candidate.is_some() {
+        ImportOutcome::Created
+    } else {
+        ImportOutcome::Unchanged
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // Exact occurrence mapping replacement is one durable fence.
+async fn update_calendar_occurrence_mapping(
+    transaction: &mut Transaction<'_, Postgres>,
+    mapping_id: Uuid,
+    change: &RemoteItemChange,
+    local_id: Option<Uuid>,
+    local_revision: Option<i64>,
+    provider_forced_sensitive: bool,
+    generation: u64,
+    state: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET local_entity_id = $2, local_revision = $3, \
+         remote_etag = $4, remote_updated_at = $5, remote_parent_id = $6, \
+         remote_payload_hash = $7, remote_projection_hash = $8, sync_state = $9, \
+         projection_generation = $10, provider_forced_sensitive = $11, \
+         conflict_metadata = NULL, updated_at = $12 WHERE id = $1",
+    )
+    .bind(mapping_id)
+    .bind(local_id)
+    .bind(local_revision)
+    .bind(&change.remote_etag)
+    .bind(change.remote_updated_at)
+    .bind(&change.remote_parent_id)
+    .bind(change.remote_payload_hash.as_slice())
+    .bind(change.remote_projection_hash.as_slice())
+    .bind(state)
+    .bind(u64_to_i64(generation)?)
+    .bind(provider_forced_sensitive)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn update_dangling_calendar_occurrence_tombstone(
+    transaction: &mut Transaction<'_, Postgres>,
+    mapping_id: Uuid,
+    change: &RemoteItemChange,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    // Do not rewrite local_entity_id or provider_forced_sensitive here. A
+    // deleted private occurrence has no provider payload from which to safely
+    // reconstruct a sensitive canonical item, and the database deliberately
+    // makes that privacy floor monotonic. The next live complete projection
+    // can recreate the item and rebind this same mapping.
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET local_revision = NULL, remote_etag = $2, \
+         remote_updated_at = $3, remote_parent_id = $4, remote_payload_hash = $5, \
+         remote_projection_hash = $6, sync_state = 'deleted_remote', \
+         projection_generation = $7, conflict_metadata = NULL, updated_at = $8 WHERE id = $1",
+    )
+    .bind(mapping_id)
+    .bind(&change.remote_etag)
+    .bind(change.remote_updated_at)
+    .bind(&change.remote_parent_id)
+    .bind(change.remote_payload_hash.as_slice())
+    .bind(change.remote_projection_hash.as_slice())
+    .bind(u64_to_i64(generation)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn current_item_revision(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Option<Uuid>,
+) -> Result<Option<i64>, GoogleSyncRepositoryError> {
+    let Some(item_id) = item_id else {
+        return Ok(None);
+    };
+    sqlx::query_scalar("SELECT revision FROM items WHERE workspace_id = $1 AND id = $2")
+        .bind(workspace_id)
+        .bind(item_id)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(internal)
+}
+
+async fn retire_calendar_occurrence_mapping(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    mapping: &PgRow,
+    generation: u64,
+    now: DateTime<Utc>,
+) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+    let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
+    let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
+    let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
+    let current_revision = current_item_revision(transaction, scope.workspace_id, local_id).await?;
+    let outcome = if let (Some(local_id), Some(_)) = (local_id, current_revision) {
+        trash_projected_item(
+            transaction,
+            scope,
+            local_id,
+            local_revision,
+            "item.google_calendar_occurrence_absent",
+            now,
+        )
+        .await?
+    } else {
+        ImportOutcome::Unchanged
+    };
+    let revision = current_item_revision(transaction, scope.workspace_id, local_id).await?;
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET local_revision = $2, sync_state = 'deleted_remote', \
+         projection_generation = $3, conflict_metadata = NULL, updated_at = $4 WHERE id = $1",
+    )
+    .bind(mapping_id)
+    .bind(revision)
+    .bind(u64_to_i64(generation)?)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(outcome)
+}
+
+/// Removes active canonical occurrence projections while retaining their
+/// provider mapping identities for a later full refresh. The caller must hold
+/// the workspace canonical-item advisory lock before any account/collection
+/// row lock so teardown cannot race schedule publication or deadlock it.
+pub(crate) async fn retire_active_calendar_occurrences(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    collection_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let rows = sqlx::query(
+        "SELECT mapping.id, mapping.local_entity_id, mapping.local_revision, item.revision \
+         FROM provider_sync_mappings mapping JOIN items item \
+           ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+         WHERE mapping.workspace_id = $1 AND mapping.provider_account_id = $2 \
+           AND mapping.collection_id = $3 AND mapping.entity_kind = 'calendar_occurrence' \
+           AND mapping.tombstoned_at IS NULL AND item.trashed_at IS NULL \
+         ORDER BY item.id FOR UPDATE OF mapping, item",
+    )
+    .bind(scope.workspace_id)
+    .bind(account_id)
+    .bind(collection_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let mut counts = SyncCounts::default();
+    for row in rows {
+        let mapping_id: Uuid = row.try_get("id").map_err(internal)?;
+        let item_id: Uuid = row.try_get("local_entity_id").map_err(internal)?;
+        let imported_revision: Option<i64> = row.try_get("local_revision").map_err(internal)?;
+        let current_revision: i64 = row.try_get("revision").map_err(internal)?;
+        if imported_revision != Some(current_revision) {
+            // Configuration teardown must never turn a locally edited provider
+            // projection into a tombstone. Retire the provider association so
+            // it no longer participates in the Calendar safety fence, while
+            // retaining both the canonical fork and the historical mapping.
+            // Tombstoning also safely releases a provider sensitivity floor
+            // without weakening the preserved item's current sensitivity.
+            sqlx::query(
+                "UPDATE provider_sync_mappings SET sync_state = 'conflict', \
+                 conflict_metadata = jsonb_build_object( \
+                   'reason', 'calendar_occurrence_configuration_retired_local_changed', \
+                   'local_item_id', $2, 'mapping_local_revision', $3, \
+                   'item_revision', $4), tombstoned_at = $5, updated_at = $5 \
+                 WHERE id = $1",
+            )
+            .bind(mapping_id)
+            .bind(item_id)
+            .bind(imported_revision)
+            .bind(current_revision)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(internal)?;
+            counts.add(ImportOutcome::Conflict);
+            continue;
+        }
+        counts.add(
+            trash_projected_item(
+                transaction,
+                scope,
+                item_id,
+                imported_revision,
+                "item.google_calendar_occurrence_retired_for_configuration",
+                now,
+            )
+            .await?,
+        );
+        let new_revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM items WHERE workspace_id = $1 AND id = $2")
+                .bind(scope.workspace_id)
+                .bind(item_id)
+                .fetch_one(&mut **transaction)
+                .await
+                .map_err(internal)?;
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET local_revision = $2, sync_state = 'pending_pull', \
+             conflict_metadata = NULL, updated_at = $3 WHERE id = $1",
+        )
+        .bind(mapping_id)
+        .bind(new_revision)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    }
+    Ok(counts)
+}
+
+/// Account-wide companion for OAuth pause/revocation transactions. Callers
+/// must acquire the canonical-item advisory lock before locking the provider
+/// account row, then invoke this helper before disabling the account.
+pub(crate) async fn retire_active_calendar_occurrences_for_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'uninitialized', \
+         planning_collection_revision = NULL, planning_window_start = NULL, \
+         planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+         planning_last_error_code = NULL, updated_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND collection_kind = 'calendar'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let collection_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM google_sync_collections WHERE workspace_id = $1 AND user_id = $2 \
+         AND provider_account_id = $3 AND collection_kind = 'calendar' ORDER BY id FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let mut counts = SyncCounts::default();
+    for collection_id in collection_ids {
+        counts.merge(
+            &retire_active_calendar_occurrences(transaction, scope, account_id, collection_id, now)
+                .await?,
+        );
+    }
+    Ok(counts)
+}
+
+async fn trash_projected_item(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    expected_revision: Option<i64>,
+    event: &'static str,
+    now: DateTime<Utc>,
+) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+    let current = fetch_import_item(transaction, scope.workspace_id, item_id).await?;
+    let expected = expected_revision.ok_or(GoogleSyncRepositoryError::Internal)?;
+    if u64_to_i64(current.revision)? != expected {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    if current.deleted_at.is_some() {
+        return Ok(ImportOutcome::Unchanged);
+    }
+    let deleted = current
+        .trashed(now)
+        .map_err(|_| GoogleSyncRepositoryError::Internal)?;
+    update_imported_item(transaction, scope.workspace_id, &deleted).await?;
+    let tombstone = ItemTombstone {
+        id: deleted.id,
+        revision: deleted.revision,
+        deleted_at: now,
+        parent_id: deleted.parent_id,
+    };
+    record_import_mutation(
+        transaction,
+        scope,
+        deleted.id,
+        u64_to_i64(deleted.revision)?,
+        "tombstone",
+        serde_json::to_value(tombstone).map_err(internal)?,
+        event,
+        Some(expected),
+        now,
+    )
+    .await?;
+    Ok(ImportOutcome::Deleted)
+}
+
+#[allow(clippy::too_many_lines)] // Metadata retirement and owned recovery share one mapping fence.
+async fn apply_calendar_series_metadata_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    claim: &SyncClaim,
+    change: &RemoteCalendarSeriesChange,
+    now: DateTime<Utc>,
+) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
+    let mapping = sqlx::query(
+        "SELECT id, local_entity_id, local_revision, ownership, sync_state, remote_payload_hash \
+         FROM provider_sync_mappings WHERE workspace_id = $1 AND provider_account_id = $2 \
+           AND collection_id = $3 AND entity_kind = 'item' AND remote_resource_id = $4 \
+           AND tombstoned_at IS NULL FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(change.account_id)
+    .bind(change.collection_id)
+    .bind(&change.remote_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(mapping) = mapping else {
+        if change.dayweave_item_id.is_some() {
+            if !change.deleted {
+                let recovery = RemoteItemChange {
+                    account_id: change.account_id,
+                    collection_id: change.collection_id,
+                    collection_revision: change.collection_revision,
+                    dayweave_item_id: change.dayweave_item_id,
+                    remote_id: change.remote_id.clone(),
+                    remote_parent_id: None,
+                    remote_etag: change.remote_etag.clone(),
+                    remote_updated_at: change.remote_updated_at,
+                    remote_payload_hash: change.remote_payload_hash,
+                    remote_projection_hash: change.remote_projection_hash,
+                    reviewed_provider_projection: change.reviewed_provider_projection.clone(),
+                    item: None,
+                };
+                if recover_dayweave_mapping(transaction, scope, claim, &recovery, true, now)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(ImportOutcome::Unchanged);
+                }
+            }
+            sqlx::query(
+                "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+                 collection_id, entity_kind, remote_resource_id, remote_etag, remote_updated_at, \
+                 remote_payload_hash, remote_projection_hash, sync_state, ownership, \
+                 conflict_metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', $5, \
+                 $6, $7, $8, $9, 'conflict', 'external', \
+                 '{\"reason\":\"unrecognized_or_changed_dayweave_marker\"}'::jsonb, $10, $10)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(scope.workspace_id)
+            .bind(change.account_id)
+            .bind(change.collection_id)
+            .bind(&change.remote_id)
+            .bind(&change.remote_etag)
+            .bind(change.remote_updated_at)
+            .bind(change.remote_payload_hash.as_slice())
+            .bind(change.remote_projection_hash.as_slice())
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(internal)?;
+            mark_calendar_projection_failed(
+                transaction,
+                scope,
+                change.account_id,
+                change.collection_id,
+                change.collection_revision,
+                "owned_provider_conflict",
+                now,
+            )
+            .await?;
+            return Ok(ImportOutcome::Conflict);
+        }
+        sqlx::query(
+            "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+             collection_id, entity_kind, remote_resource_id, remote_etag, remote_updated_at, \
+             remote_payload_hash, remote_projection_hash, sync_state, ownership, created_at, \
+             updated_at) VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, $8, $9, $10, \
+             'external', $11, $11)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(scope.workspace_id)
+        .bind(change.account_id)
+        .bind(change.collection_id)
+        .bind(&change.remote_id)
+        .bind(&change.remote_etag)
+        .bind(change.remote_updated_at)
+        .bind(change.remote_payload_hash.as_slice())
+        .bind(change.remote_projection_hash.as_slice())
+        .bind(if change.deleted {
+            "deleted_remote"
+        } else {
+            "synced"
+        })
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        return Ok(ImportOutcome::Unchanged);
+    };
+    let mapping_id: Uuid = mapping.try_get("id").map_err(internal)?;
+    let local_id: Option<Uuid> = mapping.try_get("local_entity_id").map_err(internal)?;
+    let local_revision: Option<i64> = mapping.try_get("local_revision").map_err(internal)?;
+    let ownership: String = mapping.try_get("ownership").map_err(internal)?;
+    let mapping_state: String = mapping.try_get("sync_state").map_err(internal)?;
+    let old_hash: Option<Vec<u8>> = mapping.try_get("remote_payload_hash").map_err(internal)?;
+    if ownership == "dayweave" {
+        let marker_matches_or_is_absent = change
+            .dayweave_item_id
+            .is_none_or(|item_id| Some(item_id) == local_id);
+        if change.deleted
+            && marker_matches_or_is_absent
+            && mapping_state == "deleted_remote"
+            && deleted_owned_item_matches(transaction, scope.workspace_id, local_id, local_revision)
+                .await?
+        {
+            sqlx::query(
+                "UPDATE provider_sync_mappings SET remote_etag = $2, remote_updated_at = $3, \
+                 remote_payload_hash = $4, remote_projection_hash = $5, \
+                 sync_state = 'deleted_remote', conflict_metadata = NULL, updated_at = $6 \
+                 WHERE id = $1",
+            )
+            .bind(mapping_id)
+            .bind(&change.remote_etag)
+            .bind(change.remote_updated_at)
+            .bind(change.remote_payload_hash.as_slice())
+            .bind(change.remote_projection_hash.as_slice())
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(internal)?;
+            return Ok(ImportOutcome::Unchanged);
+        }
+        if !marker_matches_or_is_absent || (!change.deleted && change.dayweave_item_id != local_id)
+        {
+            return Err(GoogleSyncRepositoryError::CursorConflict);
+        }
+        let state = if change.deleted
+            || old_hash.as_deref() != Some(change.remote_payload_hash.as_slice())
+        {
+            "conflict"
+        } else {
+            "synced"
+        };
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET remote_etag = $2, remote_updated_at = $3, \
+             remote_payload_hash = $4, remote_projection_hash = $5, sync_state = $6, \
+             conflict_metadata = CASE WHEN $6 = 'conflict' \
+               THEN '{\"reason\":\"provider_changed_dayweave_owned_item\"}'::jsonb \
+               ELSE NULL END, updated_at = $7 WHERE id = $1",
+        )
+        .bind(mapping_id)
+        .bind(&change.remote_etag)
+        .bind(change.remote_updated_at)
+        .bind(change.remote_payload_hash.as_slice())
+        .bind(change.remote_projection_hash.as_slice())
+        .bind(state)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        if state == "conflict" {
+            mark_calendar_projection_failed(
+                transaction,
+                scope,
+                change.account_id,
+                change.collection_id,
+                change.collection_revision,
+                "owned_provider_conflict",
+                now,
+            )
+            .await?;
+        }
+        return Ok(if state == "synced" {
+            ImportOutcome::Unchanged
+        } else {
+            ImportOutcome::Conflict
+        });
+    }
+    if change.dayweave_item_id.is_some() {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    if let Some(local_id) = local_id
+        && has_active_dayweave_mapping(transaction, scope.workspace_id, local_id).await?
+    {
+        // Migration 0014 deliberately preserves a canonical item when a
+        // corrupt/legacy external Calendar mapping shadows an active
+        // DayWeave-owned mapping. The metadata lane must finish that repair by
+        // detaching only the external shadow; retiring the shared item would
+        // delete the user's owned block on the first post-upgrade sync.
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET local_entity_id = NULL, local_revision = NULL, \
+             remote_etag = $2, remote_updated_at = $3, remote_payload_hash = $4, \
+             remote_projection_hash = $5, sync_state = $6, conflict_metadata = NULL, \
+             updated_at = $7 WHERE id = $1",
+        )
+        .bind(mapping_id)
+        .bind(&change.remote_etag)
+        .bind(change.remote_updated_at)
+        .bind(change.remote_payload_hash.as_slice())
+        .bind(change.remote_projection_hash.as_slice())
+        .bind(if change.deleted {
+            "deleted_remote"
+        } else {
+            "synced"
+        })
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+        return Ok(ImportOutcome::Unchanged);
+    }
+    let outcome = if let Some(local_id) = local_id {
+        trash_projected_item(
+            transaction,
+            scope,
+            local_id,
+            local_revision,
+            "item.google_calendar_legacy_projection_retired",
+            now,
+        )
+        .await?
+    } else {
+        ImportOutcome::Unchanged
+    };
+    let revision = current_item_revision(transaction, scope.workspace_id, local_id).await?;
+    sqlx::query(
+        "UPDATE provider_sync_mappings SET local_revision = $2, remote_etag = $3, \
+         remote_updated_at = $4, remote_payload_hash = $5, remote_projection_hash = $6, \
+         sync_state = $7, conflict_metadata = NULL, updated_at = $8 WHERE id = $1",
+    )
+    .bind(mapping_id)
+    .bind(revision)
+    .bind(&change.remote_etag)
+    .bind(change.remote_updated_at)
+    .bind(change.remote_payload_hash.as_slice())
+    .bind(change.remote_projection_hash.as_slice())
+    .bind(if change.deleted {
+        "deleted_remote"
+    } else {
+        "synced"
+    })
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(outcome)
+}
+
+async fn has_active_dayweave_mapping(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Uuid,
+) -> Result<bool, GoogleSyncRepositoryError> {
+    // The canonical-item advisory lock is already held by the caller, and the
+    // row lock makes the dependency explicit for direct SQL maintenance paths.
+    let mapping = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
+         AND local_entity_id = $2 AND ownership = 'dayweave' \
+         AND tombstoned_at IS NULL ORDER BY id LIMIT 1 FOR SHARE",
+    )
+    .bind(workspace_id)
+    .bind(item_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(mapping.is_some())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mark_calendar_projection_failed(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    collection_id: Uuid,
+    collection_revision: u64,
+    code: &'static str,
+    now: DateTime<Utc>,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let affected = sqlx::query(
+        "UPDATE google_sync_collections SET planning_projection_state = 'failed', \
+         planning_collection_revision = NULL, planning_window_start = NULL, \
+         planning_window_end = NULL, planning_window_refreshed_at = NULL, \
+         planning_last_error_code = $6, updated_at = $7 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND id = $4 AND revision = $5",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(collection_id)
+    .bind(u64_to_i64(collection_revision)?)
+    .bind(code)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if affected != 1 {
+        return Err(GoogleSyncRepositoryError::CursorConflict);
+    }
+    Ok(())
+}
+
 async fn ensure_inbound_claim(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -3297,6 +5122,32 @@ async fn apply_remote_delete(
             )
             .await?;
         }
+        return Ok(ImportOutcome::Unchanged);
+    }
+    if let Some(local_id) = local_id
+        && has_active_dayweave_mapping(transaction, scope.workspace_id, local_id).await?
+    {
+        // A cursorless post-upgrade sweep can observe an external legacy
+        // shadow as absent before the metadata lane has detached it. Retire
+        // only that provider shadow; the shared DayWeave-owned canonical item
+        // is authoritative and must never be treated as an external deletion.
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET local_entity_id = NULL, local_revision = NULL, \
+             remote_etag = $2, remote_updated_at = $3, remote_parent_id = $4, \
+             remote_payload_hash = $5, remote_projection_hash = $6, \
+             sync_state = 'deleted_remote', conflict_metadata = NULL, updated_at = $7 \
+             WHERE id = $1",
+        )
+        .bind(mapping_id)
+        .bind(&change.remote_etag)
+        .bind(change.remote_updated_at)
+        .bind(&change.remote_parent_id)
+        .bind(change.remote_payload_hash.as_slice())
+        .bind(change.remote_projection_hash.as_slice())
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
         return Ok(ImportOutcome::Unchanged);
     }
     let Some(local_id) = local_id else {
@@ -3876,7 +5727,7 @@ async fn recover_dayweave_mapping(
     .bind(scope.user_id)
     .bind(item_id)
     .bind(local_revision)
-    .bind(json!({"collection_id": change.collection_id, "remote_id": &change.remote_id}))
+    .bind(json!({"collection_id": change.collection_id}))
     .bind(now)
     .execute(&mut **transaction)
     .await
@@ -4197,6 +6048,16 @@ async fn fetch_import_item(
     workspace_id: Uuid,
     item_id: Uuid,
 ) -> Result<Item, GoogleSyncRepositoryError> {
+    fetch_import_item_optional(transaction, workspace_id, item_id)
+        .await?
+        .ok_or(GoogleSyncRepositoryError::ItemNotFound)
+}
+
+async fn fetch_import_item_optional(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Uuid,
+) -> Result<Option<Item>, GoogleSyncRepositoryError> {
     let row = sqlx::query(
         "SELECT item.id, item.is_sensitive, item.kind, item.status, item.title, item.notes, item.timezone_name, \
          item.duration_seconds, item.deadline_at, item.earliest_start_at, item.recurrence, \
@@ -4212,9 +6073,8 @@ async fn fetch_import_item(
     .bind(item_id)
     .fetch_optional(&mut **transaction)
     .await
-    .map_err(internal)?
-    .ok_or(GoogleSyncRepositoryError::ItemNotFound)?;
-    item_from_row(&row)
+    .map_err(internal)?;
+    row.as_ref().map(item_from_row).transpose()
 }
 
 fn item_from_row(row: &PgRow) -> Result<Item, GoogleSyncRepositoryError> {
@@ -4309,9 +6169,35 @@ fn collection_from_row(row: &PgRow) -> Result<GoogleSyncCollection, GoogleSyncRe
         discovered_at: row.try_get("discovered_at").map_err(internal)?,
         configured_at: row.try_get("configured_at").map_err(internal)?,
         last_import_at: row.try_get("last_import_at").map_err(internal)?,
+        planning_projection_state: parse_projection_state(
+            &row.try_get::<String, _>("planning_projection_state")
+                .map_err(internal)?,
+        )?,
+        planning_generation: i64_to_u64(row.try_get("planning_generation").map_err(internal)?)?,
+        planning_collection_revision: row
+            .try_get::<Option<i64>, _>("planning_collection_revision")
+            .map_err(internal)?
+            .map(i64_to_u64)
+            .transpose()?,
+        planning_window_start: row.try_get("planning_window_start").map_err(internal)?,
+        planning_window_end: row.try_get("planning_window_end").map_err(internal)?,
+        planning_window_refreshed_at: row
+            .try_get("planning_window_refreshed_at")
+            .map_err(internal)?,
         created_at: row.try_get("created_at").map_err(internal)?,
         updated_at: row.try_get("updated_at").map_err(internal)?,
     })
+}
+
+fn parse_projection_state(
+    value: &str,
+) -> Result<CalendarProjectionState, GoogleSyncRepositoryError> {
+    match value {
+        "uninitialized" => Ok(CalendarProjectionState::Uninitialized),
+        "complete" => Ok(CalendarProjectionState::Complete),
+        "failed" => Ok(CalendarProjectionState::Failed),
+        _ => Err(GoogleSyncRepositoryError::Internal),
+    }
 }
 
 fn parse_event_disposition(
@@ -4559,7 +6445,7 @@ mod tests {
 
     use crate::{
         google_oauth::{GoogleOAuthRepository, OAuthIdempotency},
-        google_sync::OutboundOperation,
+        google_sync::{CalendarProjectionWindow, OutboundOperation, RejectedRemoteItem},
         items::{ItemKind, NewItem},
         persistence::{MIGRATOR, PostgresGoogleOAuthRepository},
     };
@@ -4723,6 +6609,2394 @@ mod tests {
             now,
         )
         .expect("local task")
+    }
+
+    fn projected_occurrence(
+        fixture: &SyncFixture,
+        remote_id: &str,
+        title: &str,
+        sensitive: bool,
+        hash_marker: u8,
+    ) -> RemoteItemChange {
+        let start = fixture.now + Duration::hours(1);
+        let end = start + Duration::hours(1);
+        RemoteItemChange {
+            account_id: fixture.account_id,
+            collection_id: fixture.collection.id,
+            collection_revision: fixture.collection.revision,
+            dayweave_item_id: None,
+            remote_id: remote_id.to_owned(),
+            remote_parent_id: Some("restricted-series-identity".to_owned()),
+            remote_etag: Some(format!("etag-{hash_marker}")),
+            remote_updated_at: Some(fixture.now),
+            remote_payload_hash: [hash_marker; 32],
+            remote_projection_hash: [hash_marker.wrapping_add(1); 32],
+            reviewed_provider_projection: None,
+            item: Some(NewItem {
+                id: Uuid::new_v4(),
+                is_sensitive: sensitive,
+                kind: ItemKind::Event,
+                status: ItemStatus::Scheduled,
+                title: title.to_owned(),
+                notes: (!sensitive).then(|| "Public context".to_owned()),
+                timezone_name: "UTC".to_owned(),
+                duration_seconds: Some(3600),
+                deadline_at: Some(end),
+                earliest_start_at: Some(start),
+                recurrence: None,
+                flexible_constraints: json!({
+                    "calendar_event": {
+                        "start": start.to_rfc3339(),
+                        "end": end.to_rfc3339(),
+                        "immutable": true,
+                        "all_day": false,
+                        "source_calendar_id": null
+                    }
+                }),
+                split_policy: SplitPolicy::Indivisible,
+                importance: 0,
+                urgency: 0,
+                parent_id: None,
+                sibling_order: 0,
+            }),
+        }
+    }
+
+    fn projection_batch(
+        fixture: &SyncFixture,
+        changes: Vec<RemoteItemChange>,
+    ) -> CalendarProjectionBatch {
+        CalendarProjectionBatch {
+            account_id: fixture.account_id,
+            collection_id: fixture.collection.id,
+            collection_revision: fixture.collection.revision,
+            changes,
+            rejected: Vec::new(),
+            window: CalendarProjectionWindow {
+                start: fixture.now - Duration::days(30),
+                end: fixture.now + Duration::days(120),
+            },
+        }
+    }
+
+    #[test]
+    fn calendar_projection_validation_enforces_window_precision_and_exact_shapes() {
+        let claim = SyncClaim {
+            account_id: Uuid::new_v4(),
+            claim_id: Uuid::new_v4(),
+            claim_generation: 1,
+        };
+        let fixture_like = SyncFixtureValidation {
+            account_id: claim.account_id,
+            collection_id: Uuid::new_v4(),
+            revision: 1,
+            now: "2026-08-29T10:00:00Z".parse().expect("time"),
+        };
+        let valid = validation_projection_batch(&fixture_like);
+        assert_eq!(valid.window.end - valid.window.start, Duration::days(150));
+        assert!(validate_calendar_projection_batch(&claim, &valid).is_ok());
+
+        let mut too_wide = valid.clone();
+        too_wide.window.end += Duration::microseconds(1);
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &too_wide),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+        let mut nanosecond = valid.clone();
+        nanosecond.window.start += Duration::nanoseconds(1);
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &nanosecond),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+
+        let mut missing_source = valid.clone();
+        missing_source.changes[0]
+            .item
+            .as_mut()
+            .expect("item")
+            .flexible_constraints["calendar_event"]
+            .as_object_mut()
+            .expect("event object")
+            .remove("source_calendar_id");
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &missing_source),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+        let mut provider_source = valid;
+        provider_source.changes[0]
+            .item
+            .as_mut()
+            .expect("item")
+            .flexible_constraints["calendar_event"]["source_calendar_id"] =
+            Value::String("must-not-persist".to_owned());
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &provider_source),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+    }
+
+    #[test]
+    fn calendar_projection_validation_accepts_sanitized_display_text_but_rejects_controls() {
+        let claim = SyncClaim {
+            account_id: Uuid::new_v4(),
+            claim_id: Uuid::new_v4(),
+            claim_generation: 1,
+        };
+        let fixture = SyncFixtureValidation {
+            account_id: claim.account_id,
+            collection_id: Uuid::new_v4(),
+            revision: 1,
+            now: "2026-08-29T10:00:00Z".parse().expect("time"),
+        };
+        let mut sanitized = validation_projection_batch(&fixture);
+        let item = sanitized.changes[0].item.as_mut().expect("item");
+        item.title = "Planning review".to_owned();
+        item.notes = Some("Agenda first second third".to_owned());
+        assert!(validate_calendar_projection_batch(&claim, &sanitized).is_ok());
+
+        let mut multiline_title = sanitized.clone();
+        multiline_title.changes[0]
+            .item
+            .as_mut()
+            .expect("item")
+            .title = "Planning\nreview".to_owned();
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &multiline_title),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+
+        let mut multiline_notes = sanitized.clone();
+        multiline_notes.changes[0]
+            .item
+            .as_mut()
+            .expect("item")
+            .notes = Some("Agenda\r\nfirst\tsecond".to_owned());
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &multiline_notes),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+
+        sanitized.changes[0].item.as_mut().expect("item").notes =
+            Some("Agenda\0details".to_owned());
+        assert_eq!(
+            validate_calendar_projection_batch(&claim, &sanitized),
+            Err(GoogleSyncRepositoryError::InvalidProjectionBatch)
+        );
+    }
+
+    struct SyncFixtureValidation {
+        account_id: Uuid,
+        collection_id: Uuid,
+        revision: u64,
+        now: DateTime<Utc>,
+    }
+
+    fn validation_projection_batch(fixture: &SyncFixtureValidation) -> CalendarProjectionBatch {
+        let start = fixture.now + Duration::hours(1);
+        let end = start + Duration::hours(1);
+        CalendarProjectionBatch {
+            account_id: fixture.account_id,
+            collection_id: fixture.collection_id,
+            collection_revision: fixture.revision,
+            changes: vec![RemoteItemChange {
+                account_id: fixture.account_id,
+                collection_id: fixture.collection_id,
+                collection_revision: fixture.revision,
+                dayweave_item_id: None,
+                remote_id: "restricted-id".to_owned(),
+                remote_parent_id: None,
+                remote_etag: Some("etag".to_owned()),
+                remote_updated_at: Some(fixture.now),
+                remote_payload_hash: [1; 32],
+                remote_projection_hash: [2; 32],
+                reviewed_provider_projection: None,
+                item: Some(NewItem {
+                    id: Uuid::new_v4(),
+                    is_sensitive: false,
+                    kind: ItemKind::Event,
+                    status: ItemStatus::Scheduled,
+                    title: "Valid occurrence".to_owned(),
+                    notes: None,
+                    timezone_name: "UTC".to_owned(),
+                    duration_seconds: Some(3600),
+                    deadline_at: Some(end),
+                    earliest_start_at: Some(start),
+                    recurrence: None,
+                    flexible_constraints: json!({"calendar_event": {
+                        "start": start.to_rfc3339(),
+                        "end": end.to_rfc3339(),
+                        "immutable": true,
+                        "all_day": false,
+                        "source_calendar_id": null
+                    }}),
+                    split_policy: SplitPolicy::Indivisible,
+                    importance: 0,
+                    urgency: 0,
+                    parent_id: None,
+                    sibling_order: 0,
+                }),
+            }],
+            rejected: Vec::new(),
+            window: CalendarProjectionWindow {
+                start: fixture.now - Duration::days(30),
+                end: fixture.now + Duration::days(120),
+            },
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_projection_is_atomic_stable_private_and_invalidated_by_local_edits()
+    {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar projection test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "restricted-occurrence-identity";
+        let initial = projected_occurrence(&fixture, remote_id, "Visible meeting", false, 11);
+        let initial_candidate_id = initial.item.as_ref().expect("candidate").id;
+        let first = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![initial]),
+                fixture.now,
+            )
+            .await
+            .expect("first complete projection");
+        assert!(first.complete);
+        assert_eq!(first.generation, 1);
+        assert_eq!(first.counts.imported, 1);
+        let coverage: (String, i64, i64, DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_generation, planning_collection_revision, \
+             planning_window_start, planning_window_end FROM google_sync_collections \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("projection coverage");
+        assert_eq!(coverage.0, "complete");
+        assert_eq!(coverage.1, 1);
+        assert_eq!(
+            coverage.2,
+            i64::try_from(fixture.collection.revision).expect("fixture revision")
+        );
+        assert_eq!(coverage.3, fixture.now - Duration::days(30));
+        assert_eq!(coverage.4, fixture.now + Duration::days(120));
+        let mapping: (Uuid, i64, bool, i64) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, provider_forced_sensitive, \
+             projection_generation FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("occurrence mapping");
+        assert_eq!(mapping.0, initial_candidate_id);
+        assert_eq!((mapping.1, mapping.2, mapping.3), (1, false, 1));
+        let raw_identity_leaked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM items WHERE workspace_id = $1 \
+                  AND (scheduling_constraints::text LIKE '%' || $2 || '%' \
+                    OR title LIKE '%' || $2 || '%' OR coalesce(notes, '') LIKE '%' || $2 || '%')
+                UNION ALL SELECT 1 FROM item_changes WHERE workspace_id = $1 \
+                  AND payload::text LIKE '%' || $2 || '%'
+                UNION ALL SELECT 1 FROM outbox_messages WHERE workspace_id = $1 \
+                  AND payload::text LIKE '%' || $2 || '%'
+                UNION ALL SELECT 1 FROM audit_operations WHERE workspace_id = $1 \
+                  AND metadata::text LIKE '%' || $2 || '%'
+             )",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("privacy scan");
+        assert!(!raw_identity_leaked);
+
+        fixture
+            .repository
+            .begin_calendar_projection_refresh(
+                &fixture.claim,
+                fixture.now + Duration::milliseconds(500),
+            )
+            .await
+            .expect("refresh-start fence");
+        let refresh_fence: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_generation, planning_window_start \
+             FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("refresh-start coverage fence");
+        assert_eq!(refresh_fence, ("uninitialized".to_owned(), 1, None));
+
+        let same_semantics =
+            projected_occurrence(&fixture, remote_id, "Visible meeting", false, 11);
+        assert_ne!(
+            same_semantics.item.as_ref().expect("candidate").id,
+            initial_candidate_id
+        );
+        let second = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![same_semantics]),
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("overlapping refresh");
+        assert!(second.complete);
+        assert_eq!(second.generation, 2);
+        let stable: (Uuid, i64, i64) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, projection_generation \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+               AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("stable occurrence identity");
+        assert_eq!(stable, (initial_candidate_id, 1, 2));
+        let swept = fixture
+            .repository
+            .sweep_full_snapshot(
+                &fixture.claim,
+                fixture.collection.id,
+                fixture.collection.revision,
+                &[],
+                fixture.now + Duration::milliseconds(1500),
+            )
+            .await
+            .expect("metadata-lane full sweep");
+        assert_eq!(swept, SyncCounts::default());
+        let occurrence_survived_series_sweep: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'calendar_occurrence' AND mapping.remote_resource_id = $3 \
+               AND item.trashed_at IS NULL)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("occurrence survives metadata sweep");
+        assert!(occurrence_survived_series_sweep);
+
+        sqlx::query(
+            "UPDATE items SET title = 'Locally edited', revision = revision + 1, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(initial_candidate_id)
+        .bind(fixture.now + Duration::seconds(2))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("local item edit");
+        let invalidated: (String, Option<DateTime<Utc>>, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_window_start, planning_window_end \
+                 FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("invalidated coverage");
+        assert_eq!(invalidated, ("uninitialized".to_owned(), None, None));
+
+        let private_refresh = projected_occurrence(&fixture, remote_id, "Busy", true, 12);
+        let private_result = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![private_refresh]),
+                fixture.now + Duration::seconds(3),
+            )
+            .await
+            .expect("provider sensitivity floor overrides stale local projection");
+        assert!(private_result.complete);
+        let protected: (bool, String, Option<String>, bool) = sqlx::query_as(
+            "SELECT item.is_sensitive, item.title, item.notes, mapping.provider_forced_sensitive \
+             FROM items item JOIN provider_sync_mappings mapping \
+               ON mapping.workspace_id = item.workspace_id AND mapping.local_entity_id = item.id \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(initial_candidate_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("private canonical projection");
+        assert_eq!(protected, (true, "Busy".to_owned(), None, true));
+        assert!(
+            sqlx::query(
+                "UPDATE items SET is_sensitive = false WHERE workspace_id = $1 AND id = $2"
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(initial_candidate_id)
+            .execute(&fixture.database.pool)
+            .await
+            .is_err(),
+            "the provider privacy floor cannot be locally cleared"
+        );
+
+        let before_rejected: (i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM items WHERE workspace_id = $1), \
+                    (SELECT count(*) FROM item_changes WHERE workspace_id = $1), \
+                    (SELECT planning_generation FROM google_sync_collections \
+                     WHERE workspace_id = $1 AND id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("pre-rejection counts");
+        let mut rejected_batch = projection_batch(
+            &fixture,
+            vec![projected_occurrence(&fixture, remote_id, "Busy", true, 13)],
+        );
+        rejected_batch.rejected.push(RejectedRemoteItem {
+            remote_id: "restricted-invalid-occurrence".to_owned(),
+            reason: "unauthenticated_dayweave_marker",
+        });
+        let rejected = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                rejected_batch,
+                fixture.now + Duration::seconds(4),
+            )
+            .await
+            .expect("rejected batch is durably fail closed");
+        assert!(!rejected.complete);
+        assert_eq!(rejected.generation, private_result.generation);
+        assert_eq!(rejected.counts.rejected, 1);
+        let after_rejected: (i64, i64, i64, String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM items WHERE workspace_id = $1), \
+                    (SELECT count(*) FROM item_changes WHERE workspace_id = $1), \
+                    planning_generation, planning_projection_state, planning_window_start \
+             FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("post-rejection state");
+        assert_eq!(
+            (after_rejected.0, after_rejected.1, after_rejected.2),
+            before_rejected
+        );
+        assert_eq!(
+            (after_rejected.3.as_str(), after_rejected.4),
+            ("failed", None)
+        );
+
+        let resealed = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(&fixture, remote_id, "Busy", true, 12)],
+                ),
+                fixture.now + Duration::seconds(5),
+            )
+            .await
+            .expect("clean generation replaces rejection");
+        assert!(resealed.complete);
+        let removed_rejections: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM google_calendar_projection_rejections \
+             WHERE workspace_id = $1 AND collection_id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("rejection cleanup");
+        assert_eq!(removed_rejections, 0);
+        let absent = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(6),
+            )
+            .await
+            .expect("complete absence generation");
+        assert!(absent.complete);
+        assert_eq!(absent.counts.deleted, 1);
+        let absent_mapping: (Uuid, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT mapping.local_entity_id, item.trashed_at \
+             FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'calendar_occurrence' \
+               AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("retained absent mapping");
+        assert_eq!(absent_mapping.0, initial_candidate_id);
+        assert!(absent_mapping.1.is_some());
+        let restored = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(&fixture, remote_id, "Busy", true, 12)],
+                ),
+                fixture.now + Duration::seconds(7),
+            )
+            .await
+            .expect("overlapping-window occurrence reentry");
+        assert!(restored.complete);
+        let restored_identity: (Uuid, Uuid, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT mapping.id, mapping.local_entity_id, item.trashed_at \
+             FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'calendar_occurrence' \
+               AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("restored stable mapping");
+        assert_eq!(
+            (restored_identity.1, restored_identity.2),
+            (initial_candidate_id, None)
+        );
+        let delete_error = sqlx::query("DELETE FROM items WHERE workspace_id = $1 AND id = $2")
+            .bind(fixture.scope.workspace_id)
+            .bind(initial_candidate_id)
+            .execute(&fixture.database.pool)
+            .await
+            .expect_err("forced-sensitive occurrence hard deletion must fail closed");
+        assert_eq!(
+            delete_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23503")
+        );
+        let protected_after_delete: (bool, Option<DateTime<Utc>>, String) = sqlx::query_as(
+            "SELECT item.is_sensitive, item.trashed_at, collection.planning_projection_state \
+             FROM items item JOIN provider_sync_mappings mapping \
+               ON mapping.workspace_id = item.workspace_id AND mapping.local_entity_id = item.id \
+             JOIN google_sync_collections collection \
+               ON collection.workspace_id = mapping.workspace_id \
+              AND collection.id = mapping.collection_id \
+             WHERE item.workspace_id = $1 AND item.id = $2 \
+               AND mapping.entity_kind = 'calendar_occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(initial_candidate_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("forced-sensitive item remains intact");
+        assert_eq!(protected_after_delete, (true, None, "complete".to_owned()));
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_projection_self_heals_non_sensitive_hard_delete() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar self-heal test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "hard-delete-self-heal-canary";
+        let initial_change =
+            projected_occurrence(&fixture, remote_id, "Visible provider event", false, 71);
+        let initial_item_id = initial_change.item.as_ref().expect("initial item").id;
+        let initial = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![initial_change]),
+                fixture.now,
+            )
+            .await
+            .expect("initial non-sensitive projection");
+        assert!(initial.complete);
+        let mapping_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("initial occurrence mapping");
+
+        sqlx::query("DELETE FROM items WHERE workspace_id = $1 AND id = $2")
+            .bind(fixture.scope.workspace_id)
+            .bind(initial_item_id)
+            .execute(&fixture.database.pool)
+            .await
+            .expect("non-sensitive hard delete");
+        let invalidated: String = sqlx::query_scalar(
+            "SELECT planning_projection_state FROM google_sync_collections \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("hard delete invalidates coverage");
+        assert_eq!(invalidated, "uninitialized");
+
+        let recreated_change =
+            projected_occurrence(&fixture, remote_id, "Visible provider event", false, 71);
+        let recreated_item_id = recreated_change.item.as_ref().expect("recreated item").id;
+        assert_ne!(recreated_item_id, initial_item_id);
+        let recreated = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![recreated_change]),
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("complete projection recreates missing occurrence");
+        assert!(recreated.complete);
+        assert_eq!(recreated.generation, initial.generation + 1);
+        assert_eq!(recreated.counts.imported, 1);
+        let rebound: (Uuid, Uuid, Option<i64>, String, bool, bool, String) = sqlx::query_as(
+            "SELECT mapping.id, mapping.local_entity_id, mapping.local_revision, \
+                    mapping.sync_state, mapping.provider_forced_sensitive, item.is_sensitive, \
+                    item.title FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'calendar_occurrence' \
+               AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping rebound to recreated item");
+        assert_eq!(
+            rebound,
+            (
+                mapping_id,
+                recreated_item_id,
+                Some(1),
+                "synced".to_owned(),
+                false,
+                false,
+                "Visible provider event".to_owned(),
+            )
+        );
+        let raw_identity_leaked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM items WHERE workspace_id = $1 \
+                  AND (scheduling_constraints::text LIKE '%' || $2 || '%' \
+                    OR title LIKE '%' || $2 || '%' OR coalesce(notes, '') LIKE '%' || $2 || '%')
+                UNION ALL SELECT 1 FROM item_changes WHERE workspace_id = $1 \
+                  AND payload::text LIKE '%' || $2 || '%'
+                UNION ALL SELECT 1 FROM outbox_messages WHERE workspace_id = $1 \
+                  AND payload::text LIKE '%' || $2 || '%'
+                UNION ALL SELECT 1 FROM audit_operations WHERE workspace_id = $1 \
+                  AND metadata::text LIKE '%' || $2 || '%'
+             )",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("self-heal privacy scan");
+        assert!(!raw_identity_leaked);
+
+        sqlx::query("DELETE FROM items WHERE workspace_id = $1 AND id = $2")
+            .bind(fixture.scope.workspace_id)
+            .bind(recreated_item_id)
+            .execute(&fixture.database.pool)
+            .await
+            .expect("second non-sensitive hard delete");
+        let retired = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("complete absence retires dangling mapping");
+        assert!(retired.complete);
+        assert_eq!(retired.generation, recreated.generation + 1);
+        assert_eq!(retired.counts, SyncCounts::default());
+        let retired_mapping: (Uuid, Option<Uuid>, Option<i64>, String, bool) = sqlx::query_as(
+            "SELECT id, local_entity_id, local_revision, sync_state, provider_forced_sensitive \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+               AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("dangling mapping retired");
+        assert_eq!(
+            retired_mapping,
+            (
+                mapping_id,
+                Some(recreated_item_id),
+                None,
+                "deleted_remote".to_owned(),
+                false,
+            )
+        );
+        let repeated_absence = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(3),
+            )
+            .await
+            .expect("retired dangling mapping remains replaceable");
+        assert!(repeated_absence.complete);
+        assert_eq!(repeated_absence.generation, retired.generation + 1);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_series_metadata_recovers_lost_response_and_fails_closed_on_conflict()
+    {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar series test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now,
+            )
+            .await
+            .expect("initial complete coverage");
+        let item = local_firm_block(Uuid::new_v4(), "Owned series", fixture.now);
+        let mut transaction = fixture.database.pool.begin().await.expect("item tx");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("owned item fixture");
+        transaction.commit().await.expect("item commit");
+        let remote_id = "SYNTHETIC-RECOVERY-REMOTE-ID-CANARY";
+        let reviewed = json!({
+            "id": remote_id,
+            "summary": "Owned series",
+            "description": "Reviewed representation"
+        });
+        fixture
+            .repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: reviewed.clone(),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("reviewed create queued");
+        let recovered = fixture
+            .repository
+            .apply_calendar_series_metadata(
+                &fixture.claim,
+                RemoteCalendarSeriesChange {
+                    account_id: fixture.account_id,
+                    collection_id: fixture.collection.id,
+                    collection_revision: fixture.collection.revision,
+                    dayweave_item_id: Some(item.id),
+                    remote_id: remote_id.to_owned(),
+                    remote_etag: Some("etag-owned-1".to_owned()),
+                    remote_updated_at: Some(fixture.now),
+                    remote_payload_hash: [31; 32],
+                    remote_projection_hash: [32; 32],
+                    reviewed_provider_projection: Some(reviewed.clone()),
+                    deleted: false,
+                },
+                fixture.now,
+            )
+            .await
+            .expect("lost response identity recovery");
+        assert_eq!(recovered, ImportOutcome::Unchanged);
+        let recovered_mapping: (Option<Uuid>, String, String) = sqlx::query_as(
+            "SELECT local_entity_id, ownership, sync_state FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 AND entity_kind = 'item' \
+               AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("recovered mapping");
+        assert_eq!(
+            recovered_mapping,
+            (Some(item.id), "dayweave".to_owned(), "synced".to_owned())
+        );
+        let recovery_audit: Value = sqlx::query_scalar(
+            "SELECT metadata FROM audit_operations WHERE workspace_id = $1 \
+             AND operation_type = 'google.sync.outbound_identity_recovered' \
+             AND entity_type = 'item' AND entity_id = $2 ORDER BY occurred_at DESC, id DESC LIMIT 1",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("content-free recovery audit");
+        let serialized_audit = serde_json::to_string(&recovery_audit).expect("serialize audit");
+        assert!(
+            !serialized_audit.contains(remote_id),
+            "provider remote IDs must not be copied into general audit metadata"
+        );
+        assert_eq!(
+            recovery_audit,
+            json!({"collection_id": fixture.collection.id})
+        );
+
+        let owned_echo = RemoteItemChange {
+            account_id: fixture.account_id,
+            collection_id: fixture.collection.id,
+            collection_revision: fixture.collection.revision,
+            dayweave_item_id: Some(item.id),
+            remote_id: remote_id.to_owned(),
+            remote_parent_id: None,
+            remote_etag: Some("etag-owned-1".to_owned()),
+            remote_updated_at: Some(fixture.now),
+            remote_payload_hash: [31; 32],
+            remote_projection_hash: [91; 32],
+            reviewed_provider_projection: Some(reviewed.clone()),
+            item: None,
+        };
+        let ignored_echo = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![owned_echo.clone()]),
+                fixture.now,
+            )
+            .await
+            .expect("owned context-only echo validates without a duplicate item");
+        assert!(ignored_echo.complete);
+        let mut stale_echo = owned_echo.clone();
+        stale_echo.remote_payload_hash = [99; 32];
+        let stale = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![stale_echo]),
+                fixture.now + Duration::milliseconds(500),
+            )
+            .await
+            .expect("cross-lane mismatch fails closed");
+        assert!(!stale.complete);
+        let resealed = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![owned_echo]),
+                fixture.now + Duration::milliseconds(750),
+            )
+            .await
+            .expect("matching owned echo reseals coverage");
+        assert!(resealed.complete);
+
+        let conflict = fixture
+            .repository
+            .apply_calendar_series_metadata(
+                &fixture.claim,
+                RemoteCalendarSeriesChange {
+                    account_id: fixture.account_id,
+                    collection_id: fixture.collection.id,
+                    collection_revision: fixture.collection.revision,
+                    dayweave_item_id: Some(item.id),
+                    remote_id: remote_id.to_owned(),
+                    remote_etag: Some("etag-owned-2".to_owned()),
+                    remote_updated_at: Some(fixture.now + Duration::seconds(1)),
+                    remote_payload_hash: [33; 32],
+                    remote_projection_hash: [34; 32],
+                    reviewed_provider_projection: Some(json!({
+                        "id": remote_id,
+                        "summary": "Provider edited"
+                    })),
+                    deleted: false,
+                },
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("owned provider conflict is committed");
+        assert_eq!(conflict, ImportOutcome::Conflict);
+        let failed: (String, Option<DateTime<Utc>>, Option<String>, String) = sqlx::query_as(
+            "SELECT collection.planning_projection_state, collection.planning_window_start, \
+                    collection.planning_last_error_code, mapping.sync_state \
+             FROM google_sync_collections collection JOIN provider_sync_mappings mapping \
+               ON mapping.workspace_id = collection.workspace_id \
+              AND mapping.collection_id = collection.id \
+             WHERE collection.workspace_id = $1 AND collection.id = $2 \
+               AND mapping.entity_kind = 'item' AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("failed coverage");
+        assert_eq!(
+            failed,
+            (
+                "failed".to_owned(),
+                None,
+                Some("owned_provider_conflict".to_owned()),
+                "conflict".to_owned()
+            )
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_series_detaches_external_shadow_without_trashing_owned_item() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar shadow test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let item = local_firm_block(
+            Uuid::new_v4(),
+            "Owned block with legacy shadow",
+            fixture.now,
+        );
+        let discovered = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                Some(&fixture.claim),
+                GoogleCollectionKind::Calendar,
+                vec![
+                    DiscoveredCollection {
+                        kind: GoogleCollectionKind::Calendar,
+                        remote_id: "primary@example.test".to_owned(),
+                        display_name: "Primary".to_owned(),
+                        provider_access_role: Some("owner".to_owned()),
+                        provider_primary: true,
+                        provider_selected: true,
+                        provider_hidden: false,
+                        provider_deleted: false,
+                    },
+                    DiscoveredCollection {
+                        kind: GoogleCollectionKind::Calendar,
+                        remote_id: "legacy-shadow@example.test".to_owned(),
+                        display_name: "Legacy shadow".to_owned(),
+                        provider_access_role: Some("owner".to_owned()),
+                        provider_primary: false,
+                        provider_selected: true,
+                        provider_hidden: false,
+                        provider_deleted: false,
+                    },
+                ],
+                fixture.now,
+            )
+            .await
+            .expect("shadow collection discovery");
+        let shadow = discovered
+            .into_iter()
+            .find(|collection| collection.remote_collection_id == "legacy-shadow@example.test")
+            .expect("shadow collection");
+        let shadow = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                shadow.id,
+                shadow.revision,
+                true,
+                true,
+                GoogleSyncRole::Blocking,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .expect("selected shadow collection");
+
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("shadow fixture tx");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("owned item fixture");
+        for (collection_id, remote_id, ownership, hash_marker) in [
+            (
+                fixture.collection.id,
+                "owned-calendar-identity",
+                "dayweave",
+                61_u8,
+            ),
+            (shadow.id, "external-legacy-shadow", "external", 63_u8),
+        ] {
+            sqlx::query(
+                "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, \
+                 collection_id, entity_kind, local_entity_id, remote_resource_id, \
+                 remote_payload_hash, remote_projection_hash, local_revision, sync_state, \
+                 ownership, created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', $5, $6, \
+                 $7, $8, $9, 'synced', $10, $11, $11)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.account_id)
+            .bind(collection_id)
+            .bind(item.id)
+            .bind(remote_id)
+            .bind(vec![hash_marker; 32])
+            .bind(vec![hash_marker.wrapping_add(1); 32])
+            .bind(u64_to_i64(item.revision).expect("item revision"))
+            .bind(ownership)
+            .bind(fixture.now)
+            .execute(&mut *transaction)
+            .await
+            .expect("dual mapping fixture");
+        }
+        transaction.commit().await.expect("shadow fixture commit");
+
+        let outcome = fixture
+            .repository
+            .apply_calendar_series_metadata(
+                &fixture.claim,
+                RemoteCalendarSeriesChange {
+                    account_id: fixture.account_id,
+                    collection_id: shadow.id,
+                    collection_revision: shadow.revision,
+                    dayweave_item_id: None,
+                    remote_id: "external-legacy-shadow".to_owned(),
+                    remote_etag: Some("etag-shadow-refreshed".to_owned()),
+                    remote_updated_at: Some(fixture.now + Duration::seconds(1)),
+                    remote_payload_hash: [65; 32],
+                    remote_projection_hash: [66; 32],
+                    reviewed_provider_projection: None,
+                    deleted: false,
+                },
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("external shadow metadata refresh");
+        assert_eq!(outcome, ImportOutcome::Unchanged);
+
+        let preserved: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("preserved owned item");
+        assert_eq!(preserved, (u64_to_i64(item.revision).unwrap(), None));
+        let owned_mapping: (Option<Uuid>, Option<i64>, String) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind("owned-calendar-identity")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("owned mapping retained");
+        assert_eq!(
+            owned_mapping,
+            (
+                Some(item.id),
+                Some(u64_to_i64(item.revision).unwrap()),
+                "synced".to_owned()
+            )
+        );
+        let shadow_mapping: (Option<Uuid>, Option<i64>, String, String) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state, ownership \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+               AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(shadow.id)
+        .bind("external-legacy-shadow")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("external shadow detached");
+        assert_eq!(
+            shadow_mapping,
+            (None, None, "synced".to_owned(), "external".to_owned())
+        );
+
+        // Migration 0014 forces one cursorless metadata scan. Recreate the
+        // legacy attachment to prove an absent provider shadow takes the same
+        // preservation path instead of deleting the shared owned item.
+        sqlx::query(
+            "UPDATE provider_sync_mappings SET local_entity_id = $3, local_revision = $4, \
+             sync_state = 'synced' WHERE workspace_id = $1 AND id = ( \
+               SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
+                 AND collection_id = $2 AND remote_resource_id = 'external-legacy-shadow')",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(shadow.id)
+        .bind(item.id)
+        .bind(u64_to_i64(item.revision).unwrap())
+        .execute(&fixture.database.pool)
+        .await
+        .expect("recreate absent legacy shadow");
+        let swept = fixture
+            .repository
+            .sweep_full_snapshot(
+                &fixture.claim,
+                shadow.id,
+                shadow.revision,
+                &[],
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("cursorless absence detaches external shadow");
+        assert_eq!(swept, SyncCounts::default());
+        let preserved_after_sweep: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("owned item survives absent shadow");
+        assert_eq!(preserved_after_sweep, preserved);
+        let absent_shadow: (Option<Uuid>, Option<i64>, String) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(shadow.id)
+        .bind("external-legacy-shadow")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("absent external shadow detached");
+        assert_eq!(absent_shadow, (None, None, "deleted_remote".to_owned()));
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_owned_calendar_delete_echo_requires_exact_durable_acknowledgement() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; owned delete echo test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let repository = &fixture.repository;
+        let item = local_firm_block(Uuid::new_v4(), "Published then deleted", fixture.now);
+        let mut transaction = fixture.database.pool.begin().await.expect("item tx");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("owned item fixture");
+        transaction.commit().await.expect("item commit");
+
+        let remote_id = "owned-published-delete";
+        repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: item.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": remote_id, "summary": item.title}),
+                },
+                fixture.collection.id,
+                fixture.now,
+            )
+            .await
+            .expect("owned create queued");
+        let create_work = repository
+            .claim_outbound(&fixture.claim, fixture.now)
+            .await
+            .expect("create claim")
+            .expect("create work");
+        let create_permit = repository
+            .authorize_outbound_dispatch(&create_work, true, fixture.now)
+            .await
+            .expect("create permit");
+        repository
+            .complete_outbound(
+                &create_work,
+                OutboundResult {
+                    remote_resource_id: remote_id.to_owned(),
+                    remote_etag: Some("etag-before-delete".to_owned()),
+                    remote_updated_at: Some(fixture.now),
+                    payload_hash: [71; 32],
+                    dispatch_nonce: create_permit.nonce,
+                },
+                fixture.now,
+            )
+            .await
+            .expect("create acknowledgement");
+
+        let deleted = item
+            .trashed(fixture.now + Duration::seconds(1))
+            .expect("local trash");
+        let mut transaction = fixture.database.pool.begin().await.expect("trash tx");
+        update_imported_item(&mut transaction, fixture.scope.workspace_id, &deleted)
+            .await
+            .expect("persist local trash");
+        transaction.commit().await.expect("trash commit");
+        repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: deleted.clone(),
+                    operation: OutboundOperation::Delete,
+                    payload: json!({}),
+                },
+                fixture.collection.id,
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("owned delete queued");
+        let delete_work = repository
+            .claim_outbound(&fixture.claim, fixture.now + Duration::seconds(1))
+            .await
+            .expect("delete claim")
+            .expect("delete work");
+        let delete_permit = repository
+            .authorize_outbound_dispatch(&delete_work, true, fixture.now + Duration::seconds(1))
+            .await
+            .expect("delete permit");
+        repository
+            .complete_outbound(
+                &delete_work,
+                OutboundResult {
+                    remote_resource_id: remote_id.to_owned(),
+                    remote_etag: None,
+                    remote_updated_at: None,
+                    payload_hash: [72; 32],
+                    dispatch_nonce: delete_permit.nonce,
+                },
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("delete acknowledgement");
+        let durable_delete: (String, Option<String>, i64, bool) = sqlx::query_as(
+            "SELECT mapping.sync_state, mapping.remote_etag, mapping.local_revision, \
+                    item.trashed_at IS NOT NULL \
+             FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'item' AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("durable delete fence");
+        assert_eq!(
+            durable_delete,
+            (
+                "deleted_remote".to_owned(),
+                None,
+                u64_to_i64(deleted.revision).expect("deleted revision"),
+                true,
+            )
+        );
+
+        let markerless_hash = [73; 32];
+        assert_eq!(
+            repository
+                .apply_calendar_series_metadata(
+                    &fixture.claim,
+                    RemoteCalendarSeriesChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: None,
+                        remote_id: remote_id.to_owned(),
+                        remote_etag: Some("etag-tombstone-1".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(2)),
+                        remote_payload_hash: markerless_hash,
+                        remote_projection_hash: [74; 32],
+                        reviewed_provider_projection: None,
+                        deleted: true,
+                    },
+                    fixture.now + Duration::seconds(2),
+                )
+                .await
+                .expect("markerless expected tombstone"),
+            ImportOutcome::Unchanged
+        );
+        let markerless_expanded = RemoteItemChange {
+            account_id: fixture.account_id,
+            collection_id: fixture.collection.id,
+            collection_revision: fixture.collection.revision,
+            dayweave_item_id: None,
+            remote_id: remote_id.to_owned(),
+            remote_parent_id: None,
+            remote_etag: Some("etag-tombstone-1".to_owned()),
+            remote_updated_at: Some(fixture.now + Duration::seconds(2)),
+            remote_payload_hash: markerless_hash,
+            remote_projection_hash: [75; 32],
+            reviewed_provider_projection: None,
+            item: None,
+        };
+        let markerless_projection = repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![markerless_expanded]),
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("markerless expanded tombstone");
+        assert!(markerless_projection.complete);
+        let occurrence_mapping_created: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = $3 AND tombstoned_at IS NULL)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("no duplicate occurrence identity");
+        assert!(!occurrence_mapping_created);
+
+        let marked_hash = [76; 32];
+        assert_eq!(
+            repository
+                .apply_calendar_series_metadata(
+                    &fixture.claim,
+                    RemoteCalendarSeriesChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: Some(item.id),
+                        remote_id: remote_id.to_owned(),
+                        remote_etag: Some("etag-tombstone-2".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(3)),
+                        remote_payload_hash: marked_hash,
+                        remote_projection_hash: [77; 32],
+                        reviewed_provider_projection: None,
+                        deleted: true,
+                    },
+                    fixture.now + Duration::seconds(3),
+                )
+                .await
+                .expect("marked expected tombstone"),
+            ImportOutcome::Unchanged
+        );
+        let marked_projection = repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![RemoteItemChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: Some(item.id),
+                        remote_id: remote_id.to_owned(),
+                        remote_parent_id: None,
+                        remote_etag: Some("etag-tombstone-2".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(3)),
+                        remote_payload_hash: marked_hash,
+                        remote_projection_hash: [78; 32],
+                        reviewed_provider_projection: Some(json!({"id": remote_id})),
+                        item: None,
+                    }],
+                ),
+                fixture.now + Duration::seconds(3),
+            )
+            .await
+            .expect("marked expanded tombstone");
+        assert!(marked_projection.complete);
+
+        // A local revision advance invalidates the deletion acknowledgement;
+        // the same provider identity can no longer be silently accepted.
+        sqlx::query(
+            "UPDATE items SET revision = revision + 1, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item.id)
+        .bind(fixture.now + Duration::seconds(4))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("advance deleted local revision");
+        assert_eq!(
+            repository
+                .apply_calendar_series_metadata(
+                    &fixture.claim,
+                    RemoteCalendarSeriesChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: None,
+                        remote_id: remote_id.to_owned(),
+                        remote_etag: Some("etag-tombstone-stale".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(4)),
+                        remote_payload_hash: [79; 32],
+                        remote_projection_hash: [80; 32],
+                        reviewed_provider_projection: None,
+                        deleted: true,
+                    },
+                    fixture.now + Duration::seconds(4),
+                )
+                .await
+                .expect("stale durable deletion becomes a conflict"),
+            ImportOutcome::Conflict
+        );
+
+        // A provider-side deletion of a still-active, synced owned event is a
+        // conflict, including when Google's tombstone omits the private marker.
+        let active = local_firm_block(Uuid::new_v4(), "Provider deleted active", fixture.now);
+        let mut transaction = fixture.database.pool.begin().await.expect("active item tx");
+        insert_imported_item(&mut transaction, fixture.scope, &active)
+            .await
+            .expect("active owned item");
+        transaction.commit().await.expect("active item commit");
+        repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item: active.clone(),
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "owned-active-delete", "summary": active.title}),
+                },
+                fixture.collection.id,
+                fixture.now + Duration::seconds(5),
+            )
+            .await
+            .expect("active create queued");
+        let active_work = repository
+            .claim_outbound(&fixture.claim, fixture.now + Duration::seconds(5))
+            .await
+            .expect("active claim")
+            .expect("active work");
+        let active_permit = repository
+            .authorize_outbound_dispatch(&active_work, true, fixture.now + Duration::seconds(5))
+            .await
+            .expect("active permit");
+        repository
+            .complete_outbound(
+                &active_work,
+                OutboundResult {
+                    remote_resource_id: "owned-active-delete".to_owned(),
+                    remote_etag: Some("etag-active".to_owned()),
+                    remote_updated_at: Some(fixture.now + Duration::seconds(5)),
+                    payload_hash: [81; 32],
+                    dispatch_nonce: active_permit.nonce,
+                },
+                fixture.now + Duration::seconds(5),
+            )
+            .await
+            .expect("active acknowledgement");
+        let active_tombstone_hash = [82; 32];
+        assert_eq!(
+            repository
+                .apply_calendar_series_metadata(
+                    &fixture.claim,
+                    RemoteCalendarSeriesChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: None,
+                        remote_id: "owned-active-delete".to_owned(),
+                        remote_etag: Some("etag-active-tombstone".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(6)),
+                        remote_payload_hash: active_tombstone_hash,
+                        remote_projection_hash: [83; 32],
+                        reviewed_provider_projection: None,
+                        deleted: true,
+                    },
+                    fixture.now + Duration::seconds(6),
+                )
+                .await
+                .expect("active provider deletion is retained as conflict"),
+            ImportOutcome::Conflict
+        );
+        let active_projection = repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![RemoteItemChange {
+                        account_id: fixture.account_id,
+                        collection_id: fixture.collection.id,
+                        collection_revision: fixture.collection.revision,
+                        dayweave_item_id: None,
+                        remote_id: "owned-active-delete".to_owned(),
+                        remote_parent_id: None,
+                        remote_etag: Some("etag-active-tombstone".to_owned()),
+                        remote_updated_at: Some(fixture.now + Duration::seconds(6)),
+                        remote_payload_hash: active_tombstone_hash,
+                        remote_projection_hash: [84; 32],
+                        reviewed_provider_projection: None,
+                        item: None,
+                    }],
+                ),
+                fixture.now + Duration::seconds(6),
+            )
+            .await
+            .expect("expanded active tombstone fails semantically");
+        assert!(!active_projection.complete);
+        let active_mapping: (String, bool) = sqlx::query_as(
+            "SELECT mapping.sync_state, item.trashed_at IS NULL \
+             FROM provider_sync_mappings mapping JOIN items item \
+               ON item.workspace_id = mapping.workspace_id AND item.id = mapping.local_entity_id \
+             WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+               AND mapping.entity_kind = 'item' AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind("owned-active-delete")
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active owned conflict retained");
+        assert_eq!(active_mapping, ("conflict".to_owned(), true));
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
+    async fn postgres_calendar_deselect_preserves_a_locally_edited_private_fork() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar fork test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "configuration-retired-local-private-fork";
+        let projected = projected_occurrence(&fixture, remote_id, "Busy", true, 101);
+        let projected_item_id = projected.item.as_ref().expect("projected item").id;
+        fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![projected]),
+                fixture.now,
+            )
+            .await
+            .expect("initial private projection");
+        let original_mapping: (Uuid, Option<i64>) = sqlx::query_as(
+            "SELECT id, local_revision FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 \
+               AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $3 \
+               AND tombstoned_at IS NULL",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("original private mapping");
+        assert_eq!(original_mapping.1, Some(1));
+
+        sqlx::query(
+            "UPDATE items SET title = 'Private local fork', revision = revision + 1, \
+             updated_at = $3 WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .bind(fixture.now + Duration::seconds(1))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("local edit of private projection");
+        let edited: (String, i64, Option<DateTime<Utc>>, bool) = sqlx::query_as(
+            "SELECT title, revision, trashed_at, is_sensitive FROM items \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("locally edited private fork");
+        assert_eq!(edited, ("Private local fork".to_owned(), 2, None, true));
+        let mutation_counts_before: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutation counts before deselection");
+
+        let deselected = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                fixture.collection.id,
+                fixture.collection.revision,
+                false,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("deselect locally diverged calendar");
+        assert!(!deselected.selected);
+        let preserved: (String, i64, Option<DateTime<Utc>>, bool) = sqlx::query_as(
+            "SELECT title, revision, trashed_at, is_sensitive FROM items \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("private fork after deselection");
+        assert_eq!(preserved, edited);
+        let mutation_counts_after: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutation counts after deselection");
+        assert_eq!(mutation_counts_after, mutation_counts_before);
+        assert_eq!(mutation_counts_after.1, 0);
+
+        let retired_mapping: (
+            Option<Uuid>,
+            Option<i64>,
+            String,
+            Option<DateTime<Utc>>,
+            Option<Value>,
+        ) = sqlx::query_as(
+            "SELECT local_entity_id, local_revision, sync_state, tombstoned_at, conflict_metadata \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(original_mapping.0)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("historical mapping for local fork");
+        assert_eq!(retired_mapping.0, Some(projected_item_id));
+        assert_eq!(retired_mapping.1, Some(1));
+        assert_eq!(retired_mapping.2, "conflict");
+        assert_eq!(retired_mapping.3, Some(fixture.now + Duration::seconds(2)));
+        let conflict_metadata = retired_mapping.4.expect("local-only conflict metadata");
+        assert_eq!(
+            conflict_metadata,
+            json!({
+                "reason": "calendar_occurrence_configuration_retired_local_changed",
+                "local_item_id": projected_item_id,
+                "mapping_local_revision": 1,
+                "item_revision": 2
+            })
+        );
+        assert!(
+            !conflict_metadata.to_string().contains(remote_id),
+            "provider identity must not leak into local conflict metadata"
+        );
+        let invalidated: (
+            String,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_window_start, planning_window_end, \
+                    planning_window_refreshed_at FROM google_sync_collections \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("invalidated projection after deselection");
+        assert_eq!(invalidated, ("uninitialized".to_owned(), None, None, None));
+
+        let reselected = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                deselected.id,
+                deselected.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now + Duration::seconds(3),
+            )
+            .await
+            .expect("reselect calendar containing a preserved fork");
+        let mut reappeared = projected_occurrence(&fixture, remote_id, "Busy", true, 102);
+        reappeared.collection_revision = reselected.revision;
+        let replacement_item_id = reappeared.item.as_ref().expect("replacement item").id;
+        let mut reappearance_batch = projection_batch(&fixture, vec![reappeared]);
+        reappearance_batch.collection_revision = reselected.revision;
+        let reappearance = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                reappearance_batch,
+                fixture.now + Duration::seconds(4),
+            )
+            .await
+            .expect("same provider occurrence creates a fresh projection");
+        assert!(reappearance.complete);
+        assert_eq!(reappearance.counts.imported, 1);
+        let active: (Uuid, Uuid, String, i64, Option<DateTime<Utc>>, bool, bool) = sqlx::query_as(
+            "SELECT mapping.id, mapping.local_entity_id, item.title, item.revision, \
+                        item.trashed_at, item.is_sensitive, mapping.provider_forced_sensitive \
+                 FROM provider_sync_mappings mapping JOIN items item \
+                   ON item.workspace_id = mapping.workspace_id \
+                  AND item.id = mapping.local_entity_id \
+                 WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+                   AND mapping.entity_kind = 'calendar_occurrence' \
+                   AND mapping.remote_resource_id = $3 AND mapping.tombstoned_at IS NULL",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("fresh active mapping after provider reappearance");
+        assert_ne!(active.0, original_mapping.0);
+        assert_eq!(active.1, replacement_item_id);
+        assert_ne!(active.1, projected_item_id);
+        assert_eq!(
+            (&active.2, active.3, active.4, active.5, active.6),
+            (&"Busy".to_owned(), 1, None, true, true)
+        );
+        let fork_after_reappearance: (String, i64, Option<DateTime<Utc>>, bool) = sqlx::query_as(
+            "SELECT title, revision, trashed_at, is_sensitive FROM items \
+                 WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("preserved fork after provider reappearance");
+        assert_eq!(fork_after_reappearance, edited);
+        let mapping_counts: (i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE tombstoned_at IS NULL) \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+               AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("historical and active provider mappings");
+        assert_eq!(mapping_counts, (2, 1));
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_absence_history_quiesces_and_guards_a_local_restore() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar history test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "quiescent-calendar-occurrence";
+        let projected = projected_occurrence(&fixture, remote_id, "Stable occurrence", false, 111);
+        let item_id = projected.item.as_ref().expect("projected item").id;
+        let initial = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![projected]),
+                fixture.now,
+            )
+            .await
+            .expect("initial occurrence projection");
+        assert!(initial.complete);
+        let mapping_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = $3 AND tombstoned_at IS NULL",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("initial occurrence mapping");
+        let projection_index_predicate: String = sqlx::query_scalar(
+            "SELECT pg_get_expr(index.indpred, index.indrelid) \
+             FROM pg_index index JOIN pg_class class ON class.oid = index.indexrelid \
+             JOIN pg_namespace namespace ON namespace.oid = class.relnamespace \
+             WHERE class.relname = 'provider_sync_mappings_calendar_projection_idx' \
+               AND namespace.nspname = current_schema()",
+        )
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("projection work index predicate");
+        assert!(projection_index_predicate.contains("sync_state"));
+        assert!(projection_index_predicate.contains("deleted_remote"));
+
+        let first_absence = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(1),
+            )
+            .await
+            .expect("first complete absence");
+        assert!(first_absence.complete);
+        assert_eq!(first_absence.counts.deleted, 1);
+        let first_mapping_snapshot: (i64, DateTime<Utc>, Option<i64>, String) = sqlx::query_as(
+            "SELECT projection_generation, updated_at, local_revision, sync_state \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(mapping_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping after first absence");
+        assert_eq!(
+            first_mapping_snapshot,
+            (
+                i64::try_from(first_absence.generation).expect("generation"),
+                fixture.now + Duration::seconds(1),
+                Some(2),
+                "deleted_remote".to_owned()
+            )
+        );
+        let first_item_snapshot: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("item after first absence");
+        assert_eq!(
+            first_item_snapshot,
+            (2, Some(fixture.now + Duration::seconds(1)))
+        );
+        let first_mutation_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutations after first absence");
+        assert_eq!(first_mutation_counts.1, 1);
+
+        for offset in 2..=4 {
+            let quiescent = fixture
+                .repository
+                .replace_calendar_projection(
+                    &fixture.claim,
+                    projection_batch(&fixture, Vec::new()),
+                    fixture.now + Duration::seconds(offset),
+                )
+                .await
+                .expect("repeated empty projection");
+            assert!(quiescent.complete);
+            assert_eq!(quiescent.counts, SyncCounts::default());
+        }
+        let mapping_after_repeated_absence: (i64, DateTime<Utc>, Option<i64>, String) =
+            sqlx::query_as(
+                "SELECT projection_generation, updated_at, local_revision, sync_state \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(mapping_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("quiescent mapping after repeated absences");
+        assert_eq!(mapping_after_repeated_absence, first_mapping_snapshot);
+        let item_after_repeated_absence: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("quiescent item after repeated absences");
+        assert_eq!(item_after_repeated_absence, first_item_snapshot);
+        let mutations_after_repeated_absence: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("quiescent mutations after repeated absences");
+        assert_eq!(mutations_after_repeated_absence, first_mutation_counts);
+
+        let reappeared = projected_occurrence(
+            &fixture,
+            remote_id,
+            "Stable occurrence reappeared",
+            false,
+            112,
+        );
+        let unused_candidate_id = reappeared.item.as_ref().expect("reappearance item").id;
+        assert_ne!(unused_candidate_id, item_id);
+        let reappearance = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, vec![reappeared]),
+                fixture.now + Duration::seconds(5),
+            )
+            .await
+            .expect("occurrence reappearance");
+        assert!(reappearance.complete);
+        assert_eq!(reappearance.counts.updated, 1);
+        let restored_identity: (Uuid, Uuid, i64, Option<DateTime<Utc>>, String) = sqlx::query_as(
+            "SELECT mapping.id, mapping.local_entity_id, item.revision, item.trashed_at, \
+                        mapping.sync_state FROM provider_sync_mappings mapping JOIN items item \
+                   ON item.workspace_id = mapping.workspace_id \
+                  AND item.id = mapping.local_entity_id \
+                 WHERE mapping.workspace_id = $1 AND mapping.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(mapping_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("restored occurrence identity");
+        assert_eq!(
+            restored_identity,
+            (mapping_id, item_id, 3, None, "synced".to_owned())
+        );
+
+        let second_absence = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(6),
+            )
+            .await
+            .expect("second complete absence");
+        assert!(second_absence.complete);
+        assert_eq!(second_absence.counts.deleted, 1);
+        let second_mapping_snapshot: (i64, DateTime<Utc>, Option<i64>, String) = sqlx::query_as(
+            "SELECT projection_generation, updated_at, local_revision, sync_state \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(mapping_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping after second absence");
+        assert_eq!(
+            second_mapping_snapshot,
+            (
+                i64::try_from(second_absence.generation).expect("generation"),
+                fixture.now + Duration::seconds(6),
+                Some(4),
+                "deleted_remote".to_owned()
+            )
+        );
+        let second_item_snapshot: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("item after second absence");
+        assert_eq!(
+            second_item_snapshot,
+            (4, Some(fixture.now + Duration::seconds(6)))
+        );
+        let second_mutation_counts: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutations after second absence");
+        assert_eq!(second_mutation_counts.1, 2);
+        assert_eq!(second_mutation_counts.0, first_mutation_counts.0 + 2);
+        assert_eq!(second_mutation_counts.2, first_mutation_counts.2 + 2);
+
+        for offset in 7..=8 {
+            let quiescent = fixture
+                .repository
+                .replace_calendar_projection(
+                    &fixture.claim,
+                    projection_batch(&fixture, Vec::new()),
+                    fixture.now + Duration::seconds(offset),
+                )
+                .await
+                .expect("empty projection after second retirement");
+            assert!(quiescent.complete);
+            assert_eq!(quiescent.counts, SyncCounts::default());
+        }
+        let mapping_after_second_quiescence: (i64, DateTime<Utc>, Option<i64>, String) =
+            sqlx::query_as(
+                "SELECT projection_generation, updated_at, local_revision, sync_state \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(mapping_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("mapping after second quiescence");
+        assert_eq!(mapping_after_second_quiescence, second_mapping_snapshot);
+        let item_after_second_quiescence: (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("item after second quiescence");
+        assert_eq!(item_after_second_quiescence, second_item_snapshot);
+        let mutations_after_second_quiescence: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutations after second quiescence");
+        assert_eq!(mutations_after_second_quiescence, second_mutation_counts);
+
+        sqlx::query(
+            "UPDATE items SET title = 'Locally restored occurrence fork', trashed_at = NULL, \
+             revision = revision + 1, updated_at = $3 WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .bind(fixture.now + Duration::seconds(9))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("local restore behind deleted provider mapping");
+        let restored_fork_before_failure: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("locally restored fork before empty projection");
+        assert_eq!(
+            restored_fork_before_failure,
+            ("Locally restored occurrence fork".to_owned(), 5, None)
+        );
+        let failed_absence = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(&fixture, Vec::new()),
+                fixture.now + Duration::seconds(10),
+            )
+            .await
+            .expect("local restore is reported as a durable projection conflict");
+        assert!(!failed_absence.complete);
+        assert_eq!(failed_absence.counts.conflicts, 1);
+        let restored_fork_after_failure: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("locally restored fork after failed empty projection");
+        assert_eq!(restored_fork_after_failure, restored_fork_before_failure);
+        let mapping_after_failure: (i64, DateTime<Utc>, Option<i64>, String) = sqlx::query_as(
+            "SELECT projection_generation, updated_at, local_revision, sync_state \
+             FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(mapping_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping after failed empty projection");
+        assert_eq!(mapping_after_failure, second_mapping_snapshot);
+        let mutations_after_failure: (i64, i64, i64) = sqlx::query_as(
+            "SELECT \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2), \
+               (SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                  AND change_kind = 'tombstone'), \
+               (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+                  AND aggregate_type = 'item' AND aggregate_id = $2)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mutations after failed empty projection");
+        assert_eq!(mutations_after_failure, second_mutation_counts);
+        let failed_projection_state: (String, Option<String>) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_last_error_code \
+             FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("failed projection state after local restore");
+        assert_eq!(
+            failed_projection_state,
+            ("failed".to_owned(), Some("projection_conflict".to_owned()))
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CalendarTeardownCase {
+        Deselect,
+        ProviderDelete,
+        RoleDowngrade,
+        PolicyDowngrade,
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        clippy::single_match_else
+    )] // One table-driven PostgreSQL lifecycle proof keeps each transition identical.
+    async fn postgres_calendar_lifecycle_transitions_retire_occurrences_without_identity_churn() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar teardown test skipped");
+            return;
+        };
+        for case in [
+            CalendarTeardownCase::Deselect,
+            CalendarTeardownCase::ProviderDelete,
+            CalendarTeardownCase::RoleDowngrade,
+            CalendarTeardownCase::PolicyDowngrade,
+        ] {
+            let fixture = sync_fixture(&database_url).await;
+            let remote_id = format!("lifecycle-{case:?}");
+            fixture
+                .repository
+                .replace_calendar_projection(
+                    &fixture.claim,
+                    projection_batch(
+                        &fixture,
+                        vec![projected_occurrence(
+                            &fixture,
+                            &remote_id,
+                            "Lifecycle block",
+                            false,
+                            51,
+                        )],
+                    ),
+                    fixture.now,
+                )
+                .await
+                .expect("initial projection");
+            let original_mapping: (Uuid, i64) = sqlx::query_as(
+                "SELECT local_entity_id, local_revision FROM provider_sync_mappings \
+                 WHERE workspace_id = $1 AND collection_id = $2 \
+                   AND entity_kind = 'calendar_occurrence' AND remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.collection.id)
+            .bind(&remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("mapping before lifecycle transition");
+
+            let mut selected = true;
+            let mut role = GoogleSyncRole::Writable;
+            let mut policy = GoogleCalendarPolicy::default();
+            match case {
+                CalendarTeardownCase::Deselect => selected = false,
+                CalendarTeardownCase::RoleDowngrade => role = GoogleSyncRole::ReadOnly,
+                CalendarTeardownCase::PolicyDowngrade => {
+                    policy.confirmed_busy = GoogleEventDisposition::VisibleNonblocking;
+                }
+                CalendarTeardownCase::ProviderDelete => {}
+            }
+            match case {
+                CalendarTeardownCase::ProviderDelete => {
+                    fixture
+                        .repository
+                        .replace_discovered(
+                            fixture.account_id,
+                            Some(&fixture.claim),
+                            GoogleCollectionKind::Calendar,
+                            Vec::new(),
+                            fixture.now + Duration::seconds(1),
+                        )
+                        .await
+                        .expect("provider deletion discovery");
+                }
+                _ => {
+                    fixture
+                        .repository
+                        .configure_collection(
+                            fixture.account_id,
+                            fixture.collection.id,
+                            fixture.collection.revision,
+                            selected,
+                            true,
+                            role,
+                            policy,
+                            fixture.now + Duration::seconds(1),
+                        )
+                        .await
+                        .expect("projection-affecting configuration");
+                }
+            }
+            let retired: (
+                Uuid,
+                i64,
+                String,
+                Option<DateTime<Utc>>,
+                String,
+                Option<DateTime<Utc>>,
+            ) = sqlx::query_as(
+                "SELECT mapping.local_entity_id, mapping.local_revision, mapping.sync_state, \
+                            item.trashed_at, collection.planning_projection_state, \
+                            collection.planning_window_start \
+                     FROM provider_sync_mappings mapping JOIN items item \
+                       ON item.workspace_id = mapping.workspace_id \
+                      AND item.id = mapping.local_entity_id \
+                     JOIN google_sync_collections collection \
+                       ON collection.workspace_id = mapping.workspace_id \
+                      AND collection.id = mapping.collection_id \
+                     WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+                       AND mapping.entity_kind = 'calendar_occurrence' \
+                       AND mapping.remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.collection.id)
+            .bind(&remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("retired occurrence");
+            assert_eq!(retired.0, original_mapping.0, "{case:?}");
+            assert_eq!(retired.1, original_mapping.1 + 1, "{case:?}");
+            assert_eq!(retired.2, "pending_pull", "{case:?}");
+            assert!(retired.3.is_some(), "{case:?}");
+            assert_eq!((retired.4.as_str(), retired.5), ("uninitialized", None));
+            let tombstones: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM item_changes WHERE workspace_id = $1 AND item_id = $2 \
+                 AND change_kind = 'tombstone'",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(original_mapping.0)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("teardown delta");
+            assert_eq!(tombstones, 1, "{case:?}");
+
+            // Repeating the same steady-state transition must not churn the
+            // retained item identity, revision, audit, or delta stream.
+            match case {
+                CalendarTeardownCase::ProviderDelete => {
+                    fixture
+                        .repository
+                        .replace_discovered(
+                            fixture.account_id,
+                            Some(&fixture.claim),
+                            GoogleCollectionKind::Calendar,
+                            Vec::new(),
+                            fixture.now + Duration::seconds(2),
+                        )
+                        .await
+                        .expect("steady deleted discovery");
+                }
+                _ => {
+                    let current = fixture
+                        .repository
+                        .collection(fixture.account_id, fixture.collection.id)
+                        .await
+                        .expect("current collection");
+                    fixture
+                        .repository
+                        .configure_collection(
+                            fixture.account_id,
+                            current.id,
+                            current.revision,
+                            selected,
+                            true,
+                            role,
+                            policy,
+                            fixture.now + Duration::seconds(2),
+                        )
+                        .await
+                        .expect("steady configuration");
+                }
+            }
+            let unchanged: (i64, i64) = sqlx::query_as(
+                "SELECT mapping.local_revision, \
+                        (SELECT count(*) FROM item_changes change \
+                         WHERE change.workspace_id = mapping.workspace_id \
+                           AND change.item_id = mapping.local_entity_id \
+                           AND change.change_kind = 'tombstone') \
+                 FROM provider_sync_mappings mapping WHERE mapping.workspace_id = $1 \
+                   AND mapping.collection_id = $2 AND mapping.entity_kind = 'calendar_occurrence' \
+                   AND mapping.remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.collection.id)
+            .bind(&remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("steady identity");
+            assert_eq!(unchanged, (original_mapping.1 + 1, 1), "{case:?}");
+            fixture.database.destroy().await;
+        }
     }
 
     #[tokio::test]
@@ -5442,6 +9716,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_full_snapshot_sweep_waits_for_canonical_item_lock() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; snapshot lock test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let mut blocker = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("canonical lock blocker");
+        super::super::database::lock_canonical_item_space(&mut blocker, fixture.scope.workspace_id)
+            .await
+            .expect("hold canonical item lock");
+
+        let repository = fixture.repository.clone();
+        let claim = fixture.claim.clone();
+        let collection_id = fixture.collection.id;
+        let collection_revision = fixture.collection.revision;
+        let now = fixture.now;
+        let mut sweep = tokio::spawn(async move {
+            repository
+                .sweep_full_snapshot(&claim, collection_id, collection_revision, &[], now)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut sweep)
+                .await
+                .is_err(),
+            "snapshot sweep must acquire the canonical lock before account/collection rows"
+        );
+        blocker.commit().await.expect("release canonical item lock");
+        let counts = tokio::time::timeout(std::time::Duration::from_secs(2), sweep)
+            .await
+            .expect("snapshot sweep unblocks")
+            .expect("snapshot task")
+            .expect("snapshot succeeds");
+        assert_eq!(counts, SyncCounts::default());
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn postgres_full_snapshot_sweep_removes_absent_external_and_conflicts_guarded_items() {
         let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
@@ -5728,6 +10045,47 @@ mod tests {
             .authorize_outbound_dispatch(&pause_work, true, fixture.now)
             .await
             .expect("pause dispatch authorized before the race");
+        repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(
+                        &fixture,
+                        "pause-projected-occurrence",
+                        "Projected meeting retired on pause",
+                        false,
+                        96,
+                    )],
+                ),
+                fixture.now,
+            )
+            .await
+            .expect("complete projection before account pause");
+        let pause_projection_identity: (Uuid, Uuid, Option<i64>) = sqlx::query_as(
+            "SELECT id, local_entity_id, local_revision FROM provider_sync_mappings \
+             WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = 'pause-projected-occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("projected occurrence identity before pause");
+        let pause_projected_item_id = pause_projection_identity.1;
+        assert_eq!(pause_projection_identity.2, Some(1));
+        sqlx::query(
+            "UPDATE items SET title = 'Locally edited before account pause', \
+             revision = revision + 1, updated_at = $3 \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(pause_projected_item_id)
+        .bind(fixture.now + Duration::seconds(30))
+        .execute(&fixture.database.pool)
+        .await
+        .expect("local edit before account pause");
         let oauth =
             PostgresGoogleOAuthRepository::new(fixture.database.pool.clone(), fixture.scope);
         let paused = oauth
@@ -5741,6 +10099,61 @@ mod tests {
             )
             .await
             .expect("account paused");
+        let pause_projection_state: (String, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT planning_projection_state, planning_window_start \
+             FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("pause tears down projected Calendar truth");
+        assert_eq!(pause_projection_state, ("uninitialized".to_owned(), None));
+        let pause_preserved_item: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(pause_projected_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("account pause preserves the locally edited occurrence");
+        assert_eq!(
+            pause_preserved_item,
+            ("Locally edited before account pause".to_owned(), 2, None)
+        );
+        let pause_retired_mapping: (String, Option<DateTime<Utc>>, Option<i64>, Option<Value>) =
+            sqlx::query_as(
+                "SELECT sync_state, tombstoned_at, local_revision, conflict_metadata \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(pause_projection_identity.0)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("account pause preserves historical provider mapping");
+        assert_eq!(pause_retired_mapping.0, "conflict");
+        assert_eq!(
+            pause_retired_mapping.1,
+            Some(fixture.now + Duration::minutes(1))
+        );
+        assert_eq!(pause_retired_mapping.2, Some(1));
+        let pause_conflict = pause_retired_mapping
+            .3
+            .expect("account pause local-only conflict metadata");
+        assert_eq!(
+            pause_conflict,
+            json!({
+                "reason": "calendar_occurrence_configuration_retired_local_changed",
+                "local_item_id": pause_projected_item_id,
+                "mapping_local_revision": 1,
+                "item_revision": 2
+            })
+        );
+        assert!(
+            !pause_conflict
+                .to_string()
+                .contains("pause-projected-occurrence")
+        );
         let stale_remote = remote_event(
             fixture.account_id,
             fixture.collection.id,
