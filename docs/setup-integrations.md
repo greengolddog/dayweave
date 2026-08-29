@@ -6,7 +6,10 @@ commit them to this repository.
 
 ## Current local access
 
-- GitHub CLI is authenticated as `greengolddog` and the repository is private.
+- GitHub CLI is authenticated as `greengolddog` and the repository is public.
+  Treat every tracked file and build artifact as public: use synthetic fixtures
+  only, and keep tokens, account exports, signing files, and health records out
+  of the repository.
 - Nebius CLI profile `lol` is active and can read the owner's non-suspended
   tenant and its `eu-north1` project. The target project currently has a default
   subnet and no VM or Object Storage bucket, so deployment can start cleanly.
@@ -211,6 +214,60 @@ Official references:
 - <https://developers.google.com/workspace/calendar/api/guides/create-events>
 - <https://developers.google.com/workspace/tasks/auth>
 - <https://developers.google.com/identity/protocols/oauth2/web-server>
+
+## Android Health Connect
+
+The Android client uses the current stable
+`androidx.health.connect:connect-client:1.1.0`. Health Connect requires a mobile
+device on Android 9/API 28 or newer with Google Play services. It is a system
+component on Android 14 and newer; Android 13 and older use the Health Connect
+Play Store app. Work-profile contexts are unsupported by Health Connect.
+
+The first CTX-006 slice is deliberately read-only and foreground-only:
+
+1. Open **More → Health & context → Health Connect** and turn sync on.
+2. DayWeave checks `HealthConnectClient.getSdkStatus`. An unsupported device
+   remains manual-only; an absent or old provider offers the official Play Store
+   install/update route.
+3. The Health Connect activity-result contract requests only
+   `android.permission.health.READ_SLEEP`. DayWeave requests no write,
+   background-read, history-read, heart-rate, account, or Google identity scope.
+4. With access granted, DayWeave reads the aggregate sleep duration for the last
+   24 hours while the UI is foregrounded. It converts that aggregate into only a
+   Low/Medium/Deep energy band, a broad recovery band, and a calculation time.
+   Raw records, record IDs, session bounds, stages, titles, and notes do not cross
+   the provider boundary and are never persisted, logged, uploaded, or placed in
+   test fixtures.
+5. **Manage access** opens Health Connect settings. Turning sync off, revoking or
+   denying access, provider unavailability, and read failure all remove the
+   automatic estimate. Manual energy check-in and correction continue to work,
+   and none of these conditions blocks capture, viewing, execution, or planning.
+
+The derived bands and manual check-in live only in the existing encrypted local
+planner snapshot. The application manifest disables Android backup entirely;
+the backup exclusion rules remain defense in depth. The Today screen uses the
+current non-stale band only to show a non-mutating best-fit hint against existing
+task energy demands. The server composition contract does not yet accept a
+current-energy signal, so Health Connect never silently changes or recomposes a
+schedule in this slice.
+
+The exported Health Connect rationale activity contains the on-device privacy
+explanation. Before Play distribution, copy that exact data-use statement into
+the Health apps declaration/privacy policy and obtain approval; no Play Console
+credential or declaration artifact belongs in Git.
+
+JVM tests use the deterministic synthetic provider. Final acceptance still has
+a physical-device gate: on the target Pixel, verify unavailable/update/available
+states, grant/deny/revoke, the rationale and Manage access entry points, and one
+synthetic sleep aggregate without using or recording the owner's real health
+data. Then rerun `./gradlew connectedDebugAndroidTest`.
+
+Official references:
+
+- <https://developer.android.com/health-and-fitness/health-connect/availability>
+- <https://developer.android.com/health-and-fitness/health-connect/get-started>
+- <https://developer.android.com/health-and-fitness/health-connect/ui/permissions>
+- <https://developer.android.com/jetpack/androidx/releases/health-connect>
 
 ## Codex inside the macOS app
 
