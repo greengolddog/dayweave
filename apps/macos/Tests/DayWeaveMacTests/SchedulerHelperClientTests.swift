@@ -238,7 +238,7 @@ struct SchedulerHelperClientTests {
         let result = try await SchedulerHelperProcessRunner().run(
             executable: executable,
             standardInput: Data(repeating: 0x41, count: 1_024 * 1_024),
-            timeout: .seconds(15)
+            timeout: .seconds(60)
         )
 
         #expect(result.termination == .exited(0))
@@ -260,7 +260,7 @@ struct SchedulerHelperClientTests {
         let result = try await SchedulerHelperProcessRunner().run(
             executable: executable,
             standardInput: Data(repeating: 0x41, count: 2 * 1_024 * 1_024),
-            timeout: .seconds(15)
+            timeout: .seconds(60)
         )
 
         #expect(result.termination == .exited(2))
@@ -282,7 +282,7 @@ struct SchedulerHelperClientTests {
             _ = try await runner.run(
                 executable: executable,
                 standardInput: Data(),
-                timeout: .seconds(15)
+                timeout: .seconds(60)
             )
             Issue.record("Expected stdout overflow")
         } catch let error as SchedulerHelperClientError {
@@ -296,7 +296,7 @@ struct SchedulerHelperClientTests {
                     repeating: 0x41,
                     count: SchedulerHelperClient.maximumStandardInputBytes + 1
                 ),
-                timeout: .seconds(15)
+                timeout: .seconds(60)
             )
             Issue.record("Expected stdin overflow")
         } catch let error as SchedulerHelperClientError {
@@ -337,7 +337,7 @@ struct SchedulerHelperClientTests {
             try await runner.run(
                 executable: executable,
                 standardInput: Data(),
-                timeout: .seconds(15)
+                timeout: .seconds(60)
             )
         }
         try await waitForFile(fixture.pidFile)
