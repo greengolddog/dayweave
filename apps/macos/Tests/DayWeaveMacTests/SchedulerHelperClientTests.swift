@@ -554,19 +554,10 @@ private final class HelperBundleFixture: @unchecked Sendable {
 
     func installUncooperativeScript() throws {
         try install("""
-        #!/usr/bin/python3
-        import os
-        import signal
-
-        def handle_term(_signal, _frame):
-            with open(\(pythonString(termFile.path)), "w", encoding="ascii") as marker:
-                marker.write("term")
-
-        signal.signal(signal.SIGTERM, handle_term)
-        with open(\(pythonString(pidFile.path)), "w", encoding="ascii") as marker:
-            marker.write(str(os.getpid()))
-        while True:
-            signal.pause()
+        #!/bin/sh
+        trap 'printf term > \(shellString(termFile.path)); exit 0' TERM
+        printf '%s' "$$" > \(shellString(pidFile.path))
+        while :; do :; done
         """)
     }
 
@@ -584,10 +575,8 @@ private final class HelperBundleFixture: @unchecked Sendable {
         }
     }
 
-    private func pythonString(_ value: String) -> String {
-        let data = try? JSONSerialization.data(withJSONObject: value, options: .fragmentsAllowed)
-        return data.flatMap { String(data: $0, encoding: .utf8) }?
-            .replacingOccurrences(of: "\\/", with: "/") ?? "\"\""
+    private func shellString(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\"'\"'"))'"
     }
 }
 
