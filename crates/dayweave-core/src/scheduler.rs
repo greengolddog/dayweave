@@ -159,6 +159,38 @@ pub struct ManualPlacementAssessment {
     pub violations: Vec<ManualPlacementViolation>,
 }
 
+/// Exact, server-authoritative hypothetical replacement for one in-flight
+/// execution session.
+///
+/// `placement_id` is also the stable assessment correlation identifier. The
+/// caller supplies total credited effort after the source session is stopped;
+/// the scheduler derives the source session's remaining whole-minute demand
+/// from the authoritative execution snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferCandidateAssessmentInput {
+    pub placement_id: Uuid,
+    pub item_id: ItemId,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
+    pub source_session_index: u16,
+    pub replacement_session_index: u16,
+    pub credited_seconds_after_source: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub move_start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub move_end: OffsetDateTime,
+}
+
+/// Deterministic hypothetical plan and the one assessment selected by the
+/// defer candidate's correlation identifier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeferCandidateAssessmentResult {
+    pub plan: SchedulePlan,
+    pub assessment: ManualPlacementAssessment,
+}
+
 /// Stable, content-free evidence the UI can show and bind to an approval.
 ///
 /// Titles and notes are intentionally excluded. Clients may resolve visible
@@ -267,6 +299,42 @@ pub enum ScheduleError {
     InvalidRecurrence(String),
     #[error("schedule conflict evidence exceeds the supported limit")]
     ConflictEvidenceLimit,
+    #[error("invalid defer candidate {placement_id}: {message}")]
+    InvalidDeferCandidate { placement_id: Uuid, message: String },
+    #[error(
+        "defer candidate {placement_id} has no source work unit for item {item_id} and occurrence {occurrence_id:?}"
+    )]
+    MissingDeferSourceWorkUnit {
+        placement_id: Uuid,
+        item_id: ItemId,
+        occurrence_id: Option<OccurrenceId>,
+    },
+    #[error(
+        "defer candidate {placement_id} has ambiguous source work units for item {item_id} and occurrence {occurrence_id:?}"
+    )]
+    AmbiguousDeferSourceWorkUnit {
+        placement_id: Uuid,
+        item_id: ItemId,
+        occurrence_id: Option<OccurrenceId>,
+    },
+    #[error(
+        "defer candidate {placement_id} has no in-flight source reservation at session {source_session_index}"
+    )]
+    MissingDeferSourceReservation {
+        placement_id: Uuid,
+        source_session_index: u16,
+    },
+    #[error(
+        "defer candidate {placement_id} has ambiguous in-flight source reservations at session {source_session_index}"
+    )]
+    AmbiguousDeferSourceReservation {
+        placement_id: Uuid,
+        source_session_index: u16,
+    },
+    #[error("defer candidate {0} did not produce an assessment")]
+    MissingDeferAssessment(Uuid),
+    #[error("defer candidate {0} produced ambiguous assessments")]
+    AmbiguousDeferAssessment(Uuid),
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -314,6 +382,106 @@ impl Scheduler {
         remap_occurrence_outputs(&mut plan, &materialized.identities);
         plan.occurrences = materialized.occurrences;
         Ok(plan)
+    }
+
+    /// Assesses one exact future replacement for an in-flight execution
+    /// session without mutating either caller-owned input.
+    ///
+    /// The replacement is installed only in a cloned execution snapshot, so
+    /// normal planning accounts for it as authoritative reserved time. Its
+    /// hard-rule and immutable-overlap evidence is then produced by the same
+    /// bounded assessor used for manual placements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduleError`] when the candidate is malformed, does not
+    /// bind exactly one in-flight source session, uses a non-fresh replacement
+    /// index, does not cover the scheduler-normalized unfinished source
+    /// duration, or when either planning input is structurally invalid.
+    #[allow(clippy::too_many_lines)]
+    pub fn assess_defer_candidate(
+        &self,
+        request: &PlanRequest,
+        execution: &ExecutionPlanningContext,
+        candidate: &DeferCandidateAssessmentInput,
+    ) -> Result<DeferCandidateAssessmentResult, ScheduleError> {
+        validate_request(request)?;
+        let (candidate_execution, remaining_source_minutes) =
+            prepare_defer_candidate(request, execution, candidate)?;
+        validate_execution_context(request, &candidate_execution)?;
+
+        let materialized = materialize_recurrences(request)
+            .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
+        let (materialized_request, materialized_execution) = apply_execution_context(
+            &materialized.request,
+            &materialized.identities,
+            &candidate_execution,
+        )?;
+        let materialized_item_id =
+            defer_materialized_item_id(&materialized_request, &materialized.identities, candidate)?;
+        let target = PreviousAssignment {
+            item_id: materialized_item_id,
+            occurrence_id: candidate.occurrence_id,
+            blocks: vec![PreviousBlock {
+                start: candidate.move_start,
+                end: candidate.move_end,
+                session_index: candidate.replacement_session_index,
+            }],
+            pinned: true,
+            manual_placement_id: Some(candidate.placement_id),
+        };
+        validate_defer_materialized_target(
+            &materialized_request,
+            &target,
+            remaining_source_minutes,
+            candidate,
+        )?;
+
+        let mut plan = Self::plan_materialized(&materialized_request, &materialized_execution)?;
+        let matching_blocks = plan
+            .blocks
+            .iter()
+            .filter(|block| manual_block_matches(block, materialized_item_id, &target.blocks[0]))
+            .count();
+        if matching_blocks != 1 {
+            return Err(invalid_defer_candidate(
+                candidate,
+                if matching_blocks == 0 {
+                    "the replacement did not produce its exact reserved schedule block"
+                } else {
+                    "the replacement produced ambiguous reserved schedule blocks"
+                },
+            ));
+        }
+
+        plan.manual_placement_assessments =
+            assess_manual_placement_targets(&materialized_request, &plan, &[target])?;
+        for violation in plan
+            .manual_placement_assessments
+            .iter()
+            .flat_map(|assessment| &assessment.violations)
+        {
+            plan.violations.push(violation.as_plan_violation());
+        }
+        remap_occurrence_outputs(&mut plan, &materialized.identities);
+        plan.occurrences = materialized.occurrences;
+
+        let mut matching = plan
+            .manual_placement_assessments
+            .iter()
+            .filter(|assessment| assessment.placement_id == candidate.placement_id);
+        let assessment = matching
+            .next()
+            .cloned()
+            .ok_or(ScheduleError::MissingDeferAssessment(
+                candidate.placement_id,
+            ))?;
+        if matching.next().is_some() {
+            return Err(ScheduleError::AmbiguousDeferAssessment(
+                candidate.placement_id,
+            ));
+        }
+        Ok(DeferCandidateAssessmentResult { plan, assessment })
     }
 
     fn plan_materialized(
@@ -736,6 +904,328 @@ fn ceil_seconds_to_minutes(seconds: u64) -> u32 {
     u32::try_from(minutes).unwrap_or(u32::MAX)
 }
 
+#[allow(clippy::too_many_lines)]
+fn prepare_defer_candidate(
+    request: &PlanRequest,
+    execution: &ExecutionPlanningContext,
+    candidate: &DeferCandidateAssessmentInput,
+) -> Result<(ExecutionPlanningContext, u32), ScheduleError> {
+    if candidate.placement_id.is_nil() {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the placement identifier must not be nil",
+        ));
+    }
+    if request
+        .previous_assignments
+        .iter()
+        .any(|assignment| assignment.manual_placement_id == Some(candidate.placement_id))
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the placement identifier is already present in the planning request",
+        ));
+    }
+
+    let matching_units = execution
+        .work_units
+        .iter()
+        .enumerate()
+        .filter(|(_, unit)| {
+            unit.item_id == candidate.item_id && unit.occurrence_id == candidate.occurrence_id
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let unit_index = match matching_units.as_slice() {
+        [] => {
+            return Err(ScheduleError::MissingDeferSourceWorkUnit {
+                placement_id: candidate.placement_id,
+                item_id: candidate.item_id,
+                occurrence_id: candidate.occurrence_id,
+            });
+        }
+        [index] => *index,
+        _ => {
+            return Err(ScheduleError::AmbiguousDeferSourceWorkUnit {
+                placement_id: candidate.placement_id,
+                item_id: candidate.item_id,
+                occurrence_id: candidate.occurrence_id,
+            });
+        }
+    };
+    let source_unit = &execution.work_units[unit_index];
+    let matching_reservations = source_unit
+        .reservations
+        .iter()
+        .enumerate()
+        .filter(|(_, reservation)| {
+            reservation.session_index == candidate.source_session_index
+                && reservation.kind == ExecutionReservationKind::InFlight
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let source_reservation_index = match matching_reservations.as_slice() {
+        [] => {
+            return Err(ScheduleError::MissingDeferSourceReservation {
+                placement_id: candidate.placement_id,
+                source_session_index: candidate.source_session_index,
+            });
+        }
+        [index] => *index,
+        _ => {
+            return Err(ScheduleError::AmbiguousDeferSourceReservation {
+                placement_id: candidate.placement_id,
+                source_session_index: candidate.source_session_index,
+            });
+        }
+    };
+    if source_unit
+        .reservations
+        .iter()
+        .enumerate()
+        .any(|(index, reservation)| {
+            index != source_reservation_index
+                && reservation.kind == ExecutionReservationKind::InFlight
+        })
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the source work unit retains another in-flight reservation",
+        ));
+    }
+    if candidate.credited_seconds_after_source < source_unit.credited_seconds {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "credited seconds after the source cannot move backwards",
+        ));
+    }
+
+    let source = &source_unit.reservations[source_reservation_index];
+    let source_seconds = (source.end - source.start).whole_seconds();
+    if source_seconds <= 0 || source_seconds % 60 != 0 {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the authoritative source reservation must have a whole-minute duration",
+        ));
+    }
+    let source_minutes = u32::try_from(source_seconds / 60).map_err(|_| {
+        invalid_defer_candidate(
+            candidate,
+            "the authoritative source duration exceeds supported bounds",
+        )
+    })?;
+    let credited_before_minutes = ceil_seconds_to_minutes(source_unit.credited_seconds);
+    let credited_after_minutes = ceil_seconds_to_minutes(candidate.credited_seconds_after_source);
+    let newly_credited_minutes = credited_after_minutes
+        .checked_sub(credited_before_minutes)
+        .ok_or_else(|| {
+            invalid_defer_candidate(
+                candidate,
+                "normalized credited minutes cannot move backwards",
+            )
+        })?;
+    let remaining_source_minutes = source_minutes
+        .checked_sub(newly_credited_minutes)
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            invalid_defer_candidate(
+                candidate,
+                "the source session has no unfinished whole-minute demand to defer",
+            )
+        })?;
+
+    let high_water = source_unit
+        .used_session_indices
+        .iter()
+        .copied()
+        .chain(
+            source_unit
+                .reservations
+                .iter()
+                .map(|reservation| reservation.session_index),
+        )
+        .chain(
+            request
+                .previous_assignments
+                .iter()
+                .filter(|assignment| {
+                    assignment.item_id == candidate.item_id
+                        && assignment.occurrence_id == candidate.occurrence_id
+                })
+                .flat_map(|assignment| assignment.blocks.iter())
+                .map(|block| block.session_index),
+        )
+        .max();
+    let expected_replacement_index = high_water
+        .map_or(Some(0), |index| index.checked_add(1))
+        .ok_or_else(|| {
+            invalid_defer_candidate(
+                candidate,
+                "the replacement session index space is exhausted",
+            )
+        })?;
+    if candidate.replacement_session_index != expected_replacement_index {
+        return Err(invalid_defer_candidate(
+            candidate,
+            format!(
+                "replacement session index {} is not the next fresh index {expected_replacement_index}",
+                candidate.replacement_session_index
+            ),
+        ));
+    }
+
+    let target_seconds = (candidate.move_end - candidate.move_start).whole_seconds();
+    let expected_target_seconds = i64::from(remaining_source_minutes) * 60;
+    let granularity_seconds = i64::from(request.config.slot_granularity.get()) * 60;
+    if candidate.move_start >= candidate.move_end
+        || candidate.move_start.nanosecond() != 0
+        || candidate.move_end.nanosecond() != 0
+        || target_seconds != expected_target_seconds
+        || candidate
+            .move_start
+            .unix_timestamp()
+            .rem_euclid(granularity_seconds)
+            != 0
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            format!(
+                "the replacement must start on the scheduler grid and cover exactly {remaining_source_minutes} whole minutes"
+            ),
+        ));
+    }
+    if candidate.move_start < request.as_of
+        || candidate.move_start < request.horizon_start
+        || candidate.move_end > request.horizon_end
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the replacement is outside the active planning horizon",
+        ));
+    }
+
+    let mut candidate_execution = execution.clone();
+    let unit = &mut candidate_execution.work_units[unit_index];
+    unit.credited_seconds = candidate.credited_seconds_after_source;
+    unit.reservations[source_reservation_index] = ExecutionReservation {
+        session_index: candidate.replacement_session_index,
+        start: candidate.move_start,
+        end: candidate.move_end,
+        kind: ExecutionReservationKind::DeferredReplacement {
+            source_session_index: candidate.source_session_index,
+        },
+    };
+    Ok((candidate_execution, remaining_source_minutes))
+}
+
+fn defer_materialized_item_id(
+    materialized_request: &PlanRequest,
+    identities: &BTreeMap<ItemId, MaterializedIdentity>,
+    candidate: &DeferCandidateAssessmentInput,
+) -> Result<ItemId, ScheduleError> {
+    if let Some(occurrence_id) = candidate.occurrence_id {
+        return identities
+            .iter()
+            .find_map(|(materialized_id, identity)| {
+                (identity.series_item_id == candidate.item_id
+                    && identity.occurrence_id == occurrence_id)
+                    .then_some(*materialized_id)
+            })
+            .ok_or_else(|| {
+                invalid_defer_candidate(
+                    candidate,
+                    "the source occurrence is not materialized in the active planning horizon",
+                )
+            });
+    }
+    if identities
+        .values()
+        .any(|identity| identity.series_item_id == candidate.item_id)
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "a recurring source must bind its exact occurrence identifier",
+        ));
+    }
+    materialized_request
+        .items
+        .iter()
+        .any(|item| item.id == candidate.item_id)
+        .then_some(candidate.item_id)
+        .ok_or_else(|| {
+            invalid_defer_candidate(
+                candidate,
+                "the source item is not executable in the active planning horizon",
+            )
+        })
+}
+
+fn validate_defer_materialized_target(
+    request: &PlanRequest,
+    target: &PreviousAssignment,
+    remaining_source_minutes: u32,
+    candidate: &DeferCandidateAssessmentInput,
+) -> Result<(), ScheduleError> {
+    let item = request
+        .items
+        .iter()
+        .find(|item| item.id == target.item_id)
+        .ok_or_else(|| {
+            invalid_defer_candidate(candidate, "the materialized source item is missing")
+        })?;
+    let children = child_map(&request.items);
+    let has_children = children
+        .get(&item.id)
+        .is_some_and(|children| !children.is_empty());
+    if matches!(item.kind, ItemKind::CalendarEvent(_))
+        || item.status.is_terminal()
+        || !item.occupies_time(has_children)
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the source does not identify executable work",
+        ));
+    }
+    let remaining_item_minutes = item
+        .duration
+        .ok_or_else(|| {
+            invalid_defer_candidate(candidate, "the source item has no authoritative duration")
+        })?
+        .planning_minutes()
+        .get();
+    if remaining_source_minutes > remaining_item_minutes {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the source replacement exceeds the item's remaining demand",
+        ));
+    }
+    let block = target
+        .blocks
+        .first()
+        .expect("defer targets always contain exactly one block");
+    if item
+        .constraints
+        .occurrence_window
+        .is_some_and(|window| block.start < window.start || block.end > window.end)
+    {
+        return Err(invalid_defer_candidate(
+            candidate,
+            "the replacement is outside its exact occurrence window",
+        ));
+    }
+    validate_manual_split_policy(item, &target.blocks, remaining_source_minutes)
+}
+
+fn invalid_defer_candidate(
+    candidate: &DeferCandidateAssessmentInput,
+    message: impl Into<String>,
+) -> ScheduleError {
+    ScheduleError::InvalidDeferCandidate {
+        placement_id: candidate.placement_id,
+        message: message.into(),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Interval {
     start: OffsetDateTime,
@@ -819,6 +1309,15 @@ fn assess_manual_placements(
     request: &PlanRequest,
     plan: &SchedulePlan,
 ) -> Result<Vec<ManualPlacementAssessment>, ScheduleError> {
+    assess_manual_placement_targets(request, plan, &[])
+}
+
+#[allow(clippy::too_many_lines)]
+fn assess_manual_placement_targets(
+    request: &PlanRequest,
+    plan: &SchedulePlan,
+    additional_targets: &[PreviousAssignment],
+) -> Result<Vec<ManualPlacementAssessment>, ScheduleError> {
     let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
     let children = child_map(&request.items);
     let dependencies = dependencies_with_routine_order(&request.items, &children);
@@ -831,6 +1330,11 @@ fn assess_manual_placements(
         .previous_assignments
         .iter()
         .filter(|assignment| assignment.pinned && assignment.manual_placement_id.is_some())
+        .chain(
+            additional_targets
+                .iter()
+                .filter(|assignment| assignment.pinned && assignment.manual_placement_id.is_some()),
+        )
     {
         let placement_id = assignment
             .manual_placement_id

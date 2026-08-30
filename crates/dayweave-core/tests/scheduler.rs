@@ -89,6 +89,30 @@ fn execution_work(
     }
 }
 
+fn in_flight_defer_work(item_id: ItemId, source_minutes: i64) -> ExecutionWorkUnit {
+    let mut work = execution_work(item_id, 0, vec![0]);
+    work.reservations.push(ExecutionReservation {
+        session_index: 0,
+        start: DAY + Duration::hours(8),
+        end: DAY + Duration::hours(8) + Duration::minutes(source_minutes),
+        kind: ExecutionReservationKind::InFlight,
+    });
+    work
+}
+
+fn defer_candidate(item_id: ItemId) -> DeferCandidateAssessmentInput {
+    DeferCandidateAssessmentInput {
+        placement_id: Uuid::from_u128(30_002),
+        item_id,
+        occurrence_id: None,
+        source_session_index: 0,
+        replacement_session_index: 1,
+        credited_seconds_after_source: 601,
+        move_start: DAY + Duration::hours(10),
+        move_end: DAY + Duration::hours(10) + Duration::minutes(49),
+    }
+}
+
 #[test]
 fn sensitivity_is_output_metadata_and_never_changes_placement() {
     let ordinary = item(9_001, "SYNTHETIC-SENSITIVE-SCHEDULER-CANARY", 60);
@@ -940,6 +964,196 @@ fn deferred_replacement_is_exact_and_new_work_starts_after_it() {
     assert_eq!(planned.len(), 1);
     assert_eq!(planned[0].session_index, 2);
     assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 30);
+}
+
+#[test]
+fn defer_candidate_rounds_credit_once_and_replaces_only_the_source_session() {
+    let mut task = item(30_001, "Split defer source", 120);
+    task.split_policy = SplitPolicy::Splittable {
+        minimum_session: Minutes(15),
+        maximum_session: Minutes(60),
+        maximum_sessions: 4,
+        minimum_gap: Minutes::ZERO,
+        maximum_days: Some(2),
+    };
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments.push(PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(12),
+            end: DAY + Duration::hours(13),
+            session_index: 2,
+        }],
+        pinned: true,
+        manual_placement_id: None,
+    });
+    let execution = execution_context(vec![in_flight_defer_work(task.id, 60)]);
+    let mut candidate = defer_candidate(task.id);
+    candidate.replacement_session_index = 3;
+
+    let stale_replacement_index = defer_candidate(task.id);
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &stale_replacement_index),
+        Err(ScheduleError::InvalidDeferCandidate { placement_id, message })
+            if placement_id == candidate.placement_id && message.contains("next fresh index 3")
+    ));
+
+    let first = Scheduler
+        .assess_defer_candidate(&input, &execution, &candidate)
+        .unwrap();
+    let second = Scheduler
+        .assess_defer_candidate(&input, &execution, &candidate)
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.assessment.placement_id, candidate.placement_id);
+    assert!(first.assessment.violations.is_empty());
+
+    let replacement = first
+        .plan
+        .blocks_for(task.id)
+        .find(|block| block.session_index == candidate.replacement_session_index)
+        .expect("exact deferred replacement");
+    assert_eq!(replacement.start, candidate.move_start);
+    assert_eq!(replacement.end, candidate.move_end);
+    assert_eq!((replacement.end - replacement.start).whole_minutes(), 49);
+    let remaining_session = first
+        .plan
+        .blocks_for(task.id)
+        .find(|block| block.session_index == 4)
+        .expect("the other split-session demand remains scheduled");
+    assert_eq!(
+        (remaining_session.end - remaining_session.start).whole_minutes(),
+        60
+    );
+    assert!(first.plan.unscheduled.is_empty());
+
+    // 601 seconds normalizes once to 11 credited minutes. The exact source
+    // remainder is therefore 49 minutes, never the legacy 2,999 seconds.
+    let mut exact_second_remainder = candidate.clone();
+    exact_second_remainder.move_end = exact_second_remainder.move_start + Duration::seconds(2_999);
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &exact_second_remainder),
+        Err(ScheduleError::InvalidDeferCandidate { placement_id, message })
+            if placement_id == candidate.placement_id
+                && message.contains("exactly 49 whole minutes")
+    ));
+
+    let mut encoded = serde_json::to_value(&candidate).unwrap();
+    encoded
+        .as_object_mut()
+        .unwrap()
+        .insert("untrusted_extra".to_owned(), serde_json::json!(true));
+    assert!(serde_json::from_value::<DeferCandidateAssessmentInput>(encoded).is_err());
+}
+
+#[test]
+fn defer_candidate_surfaces_content_free_immutable_overlap_evidence() {
+    const PRIVATE_CONFLICT_TITLE: &str = "SYNTHETIC-DEFER-CONFLICT-TITLE-CANARY";
+    let task = item(30_003, "Active source title", 60);
+    let mut input = request(vec![task.clone()]);
+    input.fixed_blocks.push(FixedBlock {
+        id: Uuid::from_u128(30_004),
+        is_sensitive: true,
+        title: PRIVATE_CONFLICT_TITLE.to_owned(),
+        start: DAY + Duration::hours(10),
+        end: DAY + Duration::hours(11),
+        source: FixedBlockSource::ProtectedTime,
+    });
+    let execution = execution_context(vec![in_flight_defer_work(task.id, 60)]);
+    let mut candidate = defer_candidate(task.id);
+    candidate.credited_seconds_after_source = 30 * 60;
+    candidate.move_end = candidate.move_start + Duration::minutes(30);
+
+    let result = Scheduler
+        .assess_defer_candidate(&input, &execution, &candidate)
+        .unwrap();
+    let overlap = result
+        .assessment
+        .violations
+        .iter()
+        .find(|violation| violation.code == ManualPlacementViolationCode::ImmutableOverlap)
+        .expect("immutable overlap evidence");
+    assert_eq!(
+        overlap.conflicting_block_ids,
+        vec![input.fixed_blocks[0].id]
+    );
+    assert_eq!(overlap.conflicting_blocks.len(), 1);
+    assert_eq!(
+        overlap.conflicting_blocks[0].kind,
+        ScheduleBlockKind::ExternalFixed
+    );
+    let encoded = serde_json::to_string(&result.assessment).unwrap();
+    assert!(!encoded.contains(PRIVATE_CONFLICT_TITLE));
+    assert!(!encoded.contains(&task.title));
+    assert!(result.plan.violations.iter().any(|violation| {
+        violation.kind == ViolationKind::PinnedConflict
+            && violation.start == Some(candidate.move_start)
+            && violation.end == Some(candidate.move_end)
+    }));
+    assert!(!result.plan.blocks_for(task.id).any(|block| {
+        block.session_index == candidate.source_session_index
+            && block.start == DAY + Duration::hours(8)
+    }));
+}
+
+#[test]
+fn defer_candidate_rejects_wrong_source_fresh_index_and_occurrence() {
+    let task = item(30_005, "Strict defer identity", 60);
+    let input = request(vec![task.clone()]);
+    let work = in_flight_defer_work(task.id, 60);
+    let execution = execution_context(vec![work.clone()]);
+    let candidate = defer_candidate(task.id);
+
+    let mut wrong_source = candidate.clone();
+    wrong_source.source_session_index = 9;
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &wrong_source),
+        Err(ScheduleError::MissingDeferSourceReservation {
+            placement_id,
+            source_session_index: 9,
+        }) if placement_id == candidate.placement_id
+    ));
+
+    let mut wrong_fresh_index = candidate.clone();
+    wrong_fresh_index.replacement_session_index = 2;
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &wrong_fresh_index),
+        Err(ScheduleError::InvalidDeferCandidate { placement_id, message })
+            if placement_id == candidate.placement_id && message.contains("next fresh index 1")
+    ));
+
+    let mut wrong_occurrence = candidate.clone();
+    wrong_occurrence.occurrence_id = Some(OccurrenceId(Uuid::from_u128(30_006)));
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &execution, &wrong_occurrence),
+        Err(ScheduleError::MissingDeferSourceWorkUnit {
+            placement_id,
+            item_id,
+            occurrence_id: Some(_),
+        }) if placement_id == candidate.placement_id && item_id == task.id
+    ));
+
+    let ambiguous_units = execution_context(vec![work.clone(), work.clone()]);
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(&input, &ambiguous_units, &candidate),
+        Err(ScheduleError::AmbiguousDeferSourceWorkUnit { placement_id, .. })
+            if placement_id == candidate.placement_id
+    ));
+
+    let mut duplicate_reservations = work;
+    duplicate_reservations
+        .reservations
+        .push(duplicate_reservations.reservations[0].clone());
+    assert!(matches!(
+        Scheduler.assess_defer_candidate(
+            &input,
+            &execution_context(vec![duplicate_reservations]),
+            &candidate,
+        ),
+        Err(ScheduleError::AmbiguousDeferSourceReservation { placement_id, .. })
+            if placement_id == candidate.placement_id
+    ));
 }
 
 #[test]
