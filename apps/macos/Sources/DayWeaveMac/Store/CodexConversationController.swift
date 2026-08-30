@@ -604,7 +604,9 @@ extension PlannerStore: CodexPlannerContextProviding {
             if block.isSensitive { return true }
             guard let itemID = block.sourceItemID else { return false }
             if canonicalByID[itemID] != nil { return effectivelySensitive(itemID) }
-            return block.syncOrigin == .canonicalPreview || block.syncOrigin == .remoteExecutionLease
+            return block.syncOrigin == .canonicalPreview
+                || block.syncOrigin == .localComposition
+                || block.syncOrigin == .remoteExecutionLease
         }
 
         let classifiedBlocks = Array(blocks.prefix(256)).map { block in

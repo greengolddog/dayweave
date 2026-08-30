@@ -230,6 +230,9 @@ final class ExecutionSyncStore: ObservableObject {
                     "Only a current scheduled canonical block can be started."
                 )
             }
+            if let issue = self.planner.canonicalScheduleBlockActionabilityIssue(block) {
+                throw ExecutionSyncControllerError.invalidLocalState(issue)
+            }
             guard self.planner.canonicalAuthoringMutation(itemID: itemID) == nil else {
                 throw ExecutionSyncControllerError.invalidLocalState(
                     "Sync or resolve this item's queued edit before starting it."

@@ -82,6 +82,7 @@ enum ScheduleBlockOrigin: String, Codable, Sendable {
     case local
     case canonicalPreview
     case externalPreview
+    case localComposition
     case remoteExecutionLease
 }
 
@@ -304,6 +305,44 @@ struct SchedulePreviewProvenance: Equatable, Codable, Sendable {
     let horizonStart: Date
     let horizonEnd: Date
     let timezoneName: String
+}
+
+/// Evidence for a schedule composed by the signed helper on this Mac. This is
+/// intentionally disjoint from `SchedulePreviewProvenance`: a local
+/// fingerprint is not a server `input_digest` and cannot authorize schedule
+/// publication.
+struct LocalScheduleCompositionProvenance: Equatable, Codable, Sendable {
+    let configurationIdentifier: String
+    let localInputFingerprint: String
+    let generatedAt: Date
+    let asOf: Date
+    let horizonStart: Date
+    let horizonEnd: Date
+    let timezoneName: String
+    let sourceItemRevisions: [UUID: UInt64]
+
+    var hasValidShape: Bool {
+        let prefix = "local-sha256:"
+        let digest = localInputFingerprint.dropFirst(prefix.count)
+        return localInputFingerprint.hasPrefix(prefix)
+            && digest.count == 64
+            && digest.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+            && !configurationIdentifier.isEmpty
+            && configurationIdentifier.utf8.count <= 4_096
+            && !configurationIdentifier.unicodeScalars.contains(
+                where: CharacterSet.controlCharacters.contains
+            )
+            && generatedAt.timeIntervalSinceReferenceDate.isFinite
+            && asOf.timeIntervalSinceReferenceDate.isFinite
+            && horizonStart.timeIntervalSinceReferenceDate.isFinite
+            && horizonEnd.timeIntervalSinceReferenceDate.isFinite
+            && horizonStart < horizonEnd
+            && TimeZone(identifier: timezoneName) != nil
+            && sourceItemRevisions.count <= 10_000
+            && sourceItemRevisions.values.allSatisfy { $0 > 0 }
+    }
 }
 
 enum SidebarDestination: String, Codable, CaseIterable, Identifiable, Sendable {

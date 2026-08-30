@@ -22,6 +22,24 @@ enum CanonicalSyncStatus: Equatable, Sendable {
     }
 }
 
+enum LocalScheduleCompositionStatus: Equatable, Sendable {
+    case ready
+    case composing(String)
+    case composed(generatedAt: Date, message: String)
+    case failed(String)
+
+    var message: String {
+        switch self {
+        case .ready:
+            "On-device composition is ready."
+        case let .composing(message), let .failed(message):
+            message
+        case let .composed(generatedAt, message):
+            "\(message) · \(generatedAt.formatted(date: .omitted, time: .shortened))"
+        }
+    }
+}
+
 @MainActor
 final class CanonicalSyncStore: ObservableObject {
     static let maximumDeltaChanges = 20_000
@@ -36,12 +54,18 @@ final class CanonicalSyncStore: ObservableObject {
     @Published private(set) var isSyncing = false
     @Published private(set) var lastPreview: DayWeaveSchedulePreview?
     @Published private(set) var warnings: [String] = []
+    @Published private(set) var localCompositionStatus: LocalScheduleCompositionStatus = .ready
+    @Published private(set) var isLocallyComposing = false
+    @Published private(set) var lastLocalComposition: LocalScheduleComposition?
+    @Published private(set) var lastLocalCompositionScore: DayWeaveSchedulePreview.Plan.Score?
+    @Published private(set) var localCompositionWarnings: [String] = []
 
     private let planner: PlannerStore
     private let configurationStore: any SuggestionAPIConfigurationStoring
     private let tokenStore: any BearerTokenStoring
     private let authCoordinator: DurableAuthCoordinator?
     private let session: URLSession
+    private let localComposer: any LocalScheduleComposing
     private let now: @Sendable () -> Date
     private let createPushLimit: Int
     private let authoringPushLimit: Int
@@ -53,6 +77,8 @@ final class CanonicalSyncStore: ObservableObject {
     private var activeSyncTask: Task<Void, Never>?
     private var lastSuccessfulSyncID: UUID?
     private var lastFreshCompositionSyncID: UUID?
+    private var activeLocalCompositionID: UUID?
+    private var activeLocalCompositionTask: Task<LocalScheduleComposition, Error>?
 
     init(
         planner: PlannerStore,
@@ -60,6 +86,7 @@ final class CanonicalSyncStore: ObservableObject {
         tokenStore: any BearerTokenStoring = KeychainBearerTokenStore(),
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
+        localComposer: any LocalScheduleComposing = SchedulerHelperClient(),
         createPushLimit: Int = CanonicalSyncStore.maximumCreatePushesPerSync,
         authoringPushLimit: Int = CanonicalSyncStore.maximumAuthoringPushesPerSync,
         statusPushLimit: Int = CanonicalSyncStore.maximumStatusPushesPerSync,
@@ -72,6 +99,7 @@ final class CanonicalSyncStore: ObservableObject {
         self.tokenStore = tokenStore
         self.authCoordinator = authCoordinator
         self.session = session
+        self.localComposer = localComposer
         self.createPushLimit = max(0, createPushLimit)
         self.authoringPushLimit = max(0, authoringPushLimit)
         self.statusPushLimit = max(0, statusPushLimit)
@@ -86,12 +114,26 @@ final class CanonicalSyncStore: ObservableObject {
         makeClient(reportFailure: false) != nil
     }
 
+    /// Side-effect-free eligibility for UI commands. The operation repeats
+    /// this fail-closed preflight immediately before acquiring the mutation
+    /// fence, so this value is only an enablement hint rather than authority.
+    var canRecomposeLocally: Bool {
+        do {
+            try requireLocalCompositionPreflight()
+            return true
+        } catch {
+            return false
+        }
+    }
+
     func configurationDidChange() {
         configurationGeneration &+= 1
         activeSyncTask?.cancel()
+        activeLocalCompositionTask?.cancel()
         planner.invalidateCanonicalPreview()
         lastPreview = nil
         warnings = []
+        clearTransientLocalComposition()
         reloadConfigurationStatus()
         if planner.pendingSchedulePublication != nil {
             status = .failed(
@@ -101,7 +143,7 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     func resetCanonicalSyncState() {
-        guard activeSyncID == nil else { return }
+        guard activeSyncID == nil, activeLocalCompositionID == nil else { return }
         guard planner.pendingSchedulePublication == nil else {
             status = .failed(
                 "An exact schedule publication may already be committed remotely. Restore its original API configuration and authentication, then sync to recover it before resetting local state."
@@ -111,7 +153,173 @@ final class CanonicalSyncStore: ObservableObject {
         planner.resetCanonicalSyncState()
         lastPreview = nil
         warnings = []
+        clearTransientLocalComposition()
         reloadConfigurationStatus()
+    }
+
+    /// Composes from the complete encrypted canonical cache without making a
+    /// network request or creating a server publication journal.
+    @discardableResult
+    func recomposeLocally() async -> Bool {
+        do {
+            try requireLocalCompositionPreflight()
+        } catch {
+            reportLocalCompositionFailure(error)
+            return false
+        }
+        guard planner.beginCanonicalSync() else {
+            reportLocalCompositionFailure(LocalCompositionCoordinatorError.busy)
+            return false
+        }
+
+        let operationID = UUID()
+        let generation = configurationGeneration
+        activeLocalCompositionID = operationID
+        isLocallyComposing = true
+        localCompositionWarnings = []
+        localCompositionStatus = .composing("Composing seven days on this Mac…")
+
+        let succeeded: Bool
+        do {
+            planner.flushPersistence()
+            if let persistenceError = planner.persistenceError { throw persistenceError }
+            try ensureLocalCompositionCurrent(
+                operationID: operationID,
+                generation: generation
+            )
+
+            let priorWarningCount = warnings.count
+            let request = makePreviewRequest()
+            let requestWarnings = Array(warnings.dropFirst(priorWarningCount))
+            if warnings.count > priorWarningCount {
+                warnings.removeLast(warnings.count - priorWarningCount)
+            }
+            let canonicalItems = planner.canonicalItems
+            let capturedRevisions = Dictionary(
+                uniqueKeysWithValues: canonicalItems.map { ($0.id, $0.revision) }
+            )
+            let fence = LocalCompositionMutationFence(
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: planner.canonicalDeltaCursor,
+                canonicalConfigurationIdentifier: planner.canonicalConfigurationIdentifier,
+                completedOccurrenceIDs: planner.completedOccurrenceIDs,
+                recurrenceSessionOutcomes: planner.recurrenceSessionOutcomes,
+                blocks: planner.blocks,
+                protectedFreeMinutes: planner.protectedFreeMinutes,
+                freezeHours: planner.freezeHours,
+                timezoneName: planningTimezone
+            )
+            let composer = localComposer
+            let task = Task.detached(priority: .userInitiated) {
+                try await composer.compose(
+                    canonicalItems: canonicalItems,
+                    schedule: request
+                )
+            }
+            activeLocalCompositionTask = task
+            let composition = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+
+            try ensureLocalCompositionCurrent(
+                operationID: operationID,
+                generation: generation
+            )
+            guard fence.matches(planner: planner, timezoneName: planningTimezone) else {
+                throw LocalCompositionCoordinatorError.canonicalStateChanged
+            }
+            guard composition.sourceItemCount == canonicalItems.count,
+                  composition.sourceItemRevisions == capturedRevisions,
+                  composition.sourceItemRevisions == Dictionary(
+                      uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
+                  ),
+                  composition.acceptedItemCount >= 0,
+                  composition.acceptedItemCount <= composition.sourceItemCount,
+                  composition.rejectedItems.count
+                    == composition.sourceItemCount - composition.acceptedItemCount,
+                  composition.ignoredPreviousAssignments.count <= 10_000 else {
+                throw LocalCompositionCoordinatorError.invalidHelperResponse
+            }
+            try validate(
+                plan: composition.plan,
+                sourceItemRevisions: composition.sourceItemRevisions,
+                rejectedItems: composition.rejectedItems,
+                against: request
+            )
+
+            let generatedAt = now()
+            var calendar = Calendar(identifier: .gregorian)
+            guard let timezone = TimeZone(identifier: request.timezoneName) else {
+                throw LocalCompositionCoordinatorError.invalidHelperResponse
+            }
+            calendar.timeZone = timezone
+            guard planningTimezone == request.timezoneName,
+                  calendar.isDate(request.asOf, inSameDayAs: generatedAt),
+                  generatedAt >= request.horizonStart,
+                  generatedAt < request.horizonEnd else {
+                throw LocalCompositionCoordinatorError.canonicalStateChanged
+            }
+            let provenance = LocalScheduleCompositionProvenance(
+                configurationIdentifier: fence.canonicalConfigurationIdentifier ?? "",
+                localInputFingerprint: composition.localInputFingerprint,
+                generatedAt: generatedAt,
+                asOf: composition.plan.asOf,
+                horizonStart: composition.plan.horizonStart,
+                horizonEnd: composition.plan.horizonEnd,
+                timezoneName: request.timezoneName,
+                sourceItemRevisions: composition.sourceItemRevisions
+            )
+            guard provenance.hasValidShape else {
+                throw LocalCompositionCoordinatorError.invalidHelperResponse
+            }
+            let renderWarningCount = warnings.count
+            let rendered = render(plan: composition.plan, origin: .localComposition)
+            let renderWarnings = Array(warnings.dropFirst(renderWarningCount))
+            if warnings.count > renderWarningCount {
+                warnings.removeLast(warnings.count - renderWarningCount)
+            }
+            var localWarnings = requestWarnings + renderWarnings
+            localWarnings.append(contentsOf: composition.rejectedItems.map {
+                "“\($0.title)” was excluded on this device: \($0.reason)"
+            })
+            localWarnings.append(contentsOf: composition.ignoredPreviousAssignments.map {
+                "A previous assignment for \($0.itemID.uuidString.lowercased()) was ignored on this device: \($0.reason)"
+            })
+            let message = "On-device schedule · composed \(rendered.count) blocks · \(composition.plan.score.unscheduledMinutes)m unscheduled · not published"
+            try planner.commitLocalScheduleComposition(
+                blocks: rendered,
+                message: message,
+                provenance: provenance
+            )
+            // The durable local install is now authoritative. Do not expose
+            // evidence from an older server candidate beside it.
+            lastPreview = nil
+            warnings = []
+            lastLocalComposition = composition
+            lastLocalCompositionScore = composition.plan.score
+            localCompositionWarnings = localWarnings
+            localCompositionStatus = .composed(
+                generatedAt: generatedAt,
+                message: message
+            )
+            succeeded = true
+        } catch {
+            if activeLocalCompositionID == operationID,
+               generation == configurationGeneration {
+                reportLocalCompositionFailure(error)
+            }
+            succeeded = false
+        }
+
+        if activeLocalCompositionID == operationID {
+            activeLocalCompositionTask = nil
+            activeLocalCompositionID = nil
+            isLocallyComposing = false
+            planner.endCanonicalSync()
+        }
+        return succeeded
     }
 
     func sync() async {
@@ -120,6 +328,11 @@ final class CanonicalSyncStore: ObservableObject {
 
     private func syncReportingSuccess() async -> Bool {
         guard await waitForCanonicalMutationFence() else { return false }
+        // The normal sync path now owns the exclusive mutation fence and is
+        // about to invalidate the durable local composition. Clear its
+        // transient score/status at the same boundary, including when client
+        // construction or the later network attempt fails.
+        clearTransientLocalComposition()
         // Invalidate before reading configuration or Keychain state. An
         // out-of-process change must not leave an old preview actionable just
         // because client construction fails.
@@ -472,6 +685,7 @@ final class CanonicalSyncStore: ObservableObject {
             return .requiresFreshComposition
         }
         try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+        clearTransientLocalComposition()
         return .installed(
             revisionNumber: published.revision.revisionNumber,
             blockCount: rendered.count
@@ -577,6 +791,7 @@ final class CanonicalSyncStore: ObservableObject {
             }
 
             try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+            clearTransientLocalComposition()
             return .init(preview: preview, blockCount: rendered.count)
         }
     }
@@ -665,6 +880,25 @@ final class CanonicalSyncStore: ObservableObject {
         preview: DayWeaveSchedulePreview,
         against request: DayWeaveSchedulePreviewRequest
     ) throws {
+        guard !preview.inputDigest.isEmpty else {
+            throw CanonicalSyncError.invalidPreview(
+                "The response has no server input digest."
+            )
+        }
+        try validate(
+            plan: preview.plan,
+            sourceItemRevisions: preview.sourceItemRevisions,
+            rejectedItems: preview.rejectedItems,
+            against: request
+        )
+    }
+
+    private func validate(
+        plan: DayWeaveSchedulePreview.Plan,
+        sourceItemRevisions: [UUID: UInt64],
+        rejectedItems: [DayWeaveSchedulePreview.RejectedItem],
+        against request: DayWeaveSchedulePreviewRequest
+    ) throws {
         let itemByID = Dictionary(
             uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0) }
         )
@@ -683,16 +917,15 @@ final class CanonicalSyncStore: ObservableObject {
             return false
         }
         let fixedByID = try Self.validatedFixedBlocksByID(request.fixedBlocks)
-        guard !preview.inputDigest.isEmpty,
-              sameInstant(preview.plan.asOf, request.asOf),
-              sameInstant(preview.plan.horizonStart, request.horizonStart),
-              sameInstant(preview.plan.horizonEnd, request.horizonEnd),
-              preview.plan.horizonStart < preview.plan.horizonEnd else {
+        guard sameInstant(plan.asOf, request.asOf),
+              sameInstant(plan.horizonStart, request.horizonStart),
+              sameInstant(plan.horizonEnd, request.horizonEnd),
+              plan.horizonStart < plan.horizonEnd else {
             throw CanonicalSyncError.invalidPreview(
                 "The response clock or horizon does not match the preview request."
             )
         }
-        for rejected in preview.rejectedItems {
+        for rejected in rejectedItems {
             guard let item = itemByID[rejected.itemID],
                   item.title == rejected.title,
                   rejected.isSensitive == effectiveSensitivity(for: rejected.itemID) else {
@@ -706,7 +939,7 @@ final class CanonicalSyncStore: ObservableObject {
         var sessionIdentities = Set<PreviewSessionIdentity>()
         var externalBlockIDs = Set<UUID>()
         var scheduledMinutes: UInt32 = 0
-        let orderedBlocks = preview.plan.blocks.sorted {
+        let orderedBlocks = plan.blocks.sorted {
             if $0.start != $1.start { return $0.start < $1.start }
             if $0.end != $1.end { return $0.end < $1.end }
             return $0.id.uuidString < $1.id.uuidString
@@ -718,8 +951,8 @@ final class CanonicalSyncStore: ObservableObject {
                 throw CanonicalSyncError.invalidPreview("The response contains a duplicate block identifier.")
             }
             guard block.start < block.end,
-                  block.end > preview.plan.horizonStart,
-                  block.start < preview.plan.horizonEnd else {
+                  block.end > plan.horizonStart,
+                  block.start < plan.horizonEnd else {
                 throw CanonicalSyncError.invalidPreview(
                     "A response block has an empty interval or does not intersect the response horizon."
                 )
@@ -739,14 +972,14 @@ final class CanonicalSyncStore: ObservableObject {
                         "A planned response block overlaps another block."
                     )
                 }
-                guard block.start >= preview.plan.horizonStart,
-                      block.end <= preview.plan.horizonEnd else {
+                guard block.start >= plan.horizonStart,
+                      block.end <= plan.horizonEnd else {
                     throw CanonicalSyncError.invalidPreview(
                         "A planned response block lies outside the response horizon."
                     )
                 }
                 guard let itemID = block.itemID,
-                      preview.sourceItemRevisions[itemID] != nil,
+                      sourceItemRevisions[itemID] != nil,
                       block.externalBlockID == nil,
                       itemByID[itemID]?.isExecutable == true else {
                     throw CanonicalSyncError.invalidPreview(
@@ -785,7 +1018,7 @@ final class CanonicalSyncStore: ObservableObject {
                     )
                 }
                 guard let itemID = block.itemID,
-                      preview.sourceItemRevisions[itemID] != nil,
+                      sourceItemRevisions[itemID] != nil,
                       block.externalBlockID == nil,
                       itemByID[itemID]?.kind == .event else {
                     throw CanonicalSyncError.invalidPreview(
@@ -840,8 +1073,8 @@ final class CanonicalSyncStore: ObservableObject {
         )
         var unscheduledMinutes: UInt32 = 0
         var unscheduledIdentities = Set<PreviewOccurrenceIdentity>()
-        for unscheduled in preview.plan.unscheduled {
-            guard preview.sourceItemRevisions[unscheduled.itemID] != nil,
+        for unscheduled in plan.unscheduled {
+            guard sourceItemRevisions[unscheduled.itemID] != nil,
                   unscheduledIdentities.insert(.init(
                       itemID: unscheduled.itemID,
                       occurrenceID: unscheduled.occurrenceID
@@ -854,8 +1087,8 @@ final class CanonicalSyncStore: ObservableObject {
                 ? UInt32.max
                 : unscheduledMinutes &+ unscheduled.remaining
         }
-        guard preview.plan.score.scheduledMinutes == scheduledMinutes,
-              preview.plan.score.unscheduledMinutes == unscheduledMinutes else {
+        guard plan.score.scheduledMinutes == scheduledMinutes,
+              plan.score.unscheduledMinutes == unscheduledMinutes else {
             throw CanonicalSyncError.invalidPreview(
                 "The response score does not match its scheduled and unscheduled work."
             )
@@ -1743,7 +1976,8 @@ final class CanonicalSyncStore: ObservableObject {
             uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
         )
         let candidates = planner.blocks.compactMap { block -> (AssignmentKey, ScheduleBlock)? in
-            guard block.syncOrigin == .canonicalPreview,
+            guard block.syncOrigin == .canonicalPreview
+                    || block.syncOrigin == .localComposition,
                   (block.previewKind == "planned" || block.previewKind == "pinned"),
                   block.status != .completed,
                   block.status != .skipped,
@@ -1823,6 +2057,13 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     private func render(_ preview: DayWeaveSchedulePreview) -> [ScheduleBlock] {
+        render(plan: preview.plan, origin: nil)
+    }
+
+    private func render(
+        plan: DayWeaveSchedulePreview.Plan,
+        origin: ScheduleBlockOrigin?
+    ) -> [ScheduleBlock] {
         let itemByID = Dictionary(
             uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0) }
         )
@@ -1847,10 +2088,10 @@ final class CanonicalSyncStore: ObservableObject {
                 "\(duplicatePreviousSessions.count) duplicate local session identities were not used to restore status."
             )
         }
-        let unscheduledOccurrences = Set(preview.plan.unscheduled.map {
+        let unscheduledOccurrences = Set(plan.unscheduled.map {
             PreviewOccurrenceIdentity(itemID: $0.itemID, occurrenceID: $0.occurrenceID)
         })
-        return preview.plan.blocks.map { block in
+        return plan.blocks.map { block in
             let item = block.itemID.flatMap { itemByID[$0] }
             let previous = block.itemID.flatMap { itemID -> ScheduleBlock? in
                 let candidate = previousBySession[.init(
@@ -1886,7 +2127,7 @@ final class CanonicalSyncStore: ObservableObject {
                 sourceItemRevision: item?.revision,
                 occurrenceID: block.occurrenceID,
                 sessionIndex: block.sessionIndex,
-                syncOrigin: item == nil ? .externalPreview : .canonicalPreview,
+                syncOrigin: origin ?? (item == nil ? .externalPreview : .canonicalPreview),
                 placementReason: explanation.isEmpty ? nil : explanation,
                 previewKind: block.kind,
                 occurrenceFullyScheduled: occurrenceFullyScheduled
@@ -1951,6 +2192,102 @@ final class CanonicalSyncStore: ObservableObject {
         }
     }
 
+    private func requireLocalCompositionPreflight() throws {
+        guard !Task.isCancelled,
+              activeSyncID == nil,
+              activeSyncTask == nil,
+              activeLocalCompositionID == nil,
+              activeLocalCompositionTask == nil,
+              !isSyncing,
+              !planner.isCanonicalSyncLocked else {
+            throw LocalCompositionCoordinatorError.busy
+        }
+        guard planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.persistenceError == nil else {
+            throw LocalCompositionCoordinatorError.persistenceUnavailable
+        }
+        guard let cursor = planner.canonicalDeltaCursor,
+              !cursor.isEmpty,
+              cursor.utf8.count <= Self.maximumDeltaCursorBytes,
+              let configurationIdentifier = planner.canonicalConfigurationIdentifier,
+              !configurationIdentifier.isEmpty else {
+            throw LocalCompositionCoordinatorError.incompleteCanonicalCache
+        }
+        guard planner.pendingSchedulePublication == nil else {
+            throw LocalCompositionCoordinatorError.pendingSchedulePublication
+        }
+        guard planner.pendingProposalApplicationMutation == nil else {
+            throw LocalCompositionCoordinatorError.pendingProposalApplication
+        }
+        guard planner.googleOutboundRecoveryJournal == nil else {
+            throw LocalCompositionCoordinatorError.pendingGoogleRecovery
+        }
+        guard planner.pendingCanonicalMutations.isEmpty else {
+            throw LocalCompositionCoordinatorError.pendingStatusMutation
+        }
+        guard planner.pendingCanonicalSensitivityMutations.isEmpty else {
+            throw LocalCompositionCoordinatorError.pendingSensitivityMutation
+        }
+        guard planner.pendingCanonicalAuthoringMutations.isEmpty else {
+            throw LocalCompositionCoordinatorError.pendingAuthoringMutation
+        }
+        guard planner.executionState.activeSession == nil,
+              planner.executionState.pendingCommand == nil,
+              !planner.executionState.hasCredentialReplacementBlocker,
+              !planner.blocks.contains(where: { $0.syncOrigin == .remoteExecutionLease }) else {
+            throw LocalCompositionCoordinatorError.executionLeaseActive
+        }
+        guard planner.canonicalItems.count <= 10_000 else {
+            throw LocalCompositionCoordinatorError.canonicalResourceLimit
+        }
+    }
+
+    private func ensureLocalCompositionCurrent(
+        operationID: UUID,
+        generation: UInt64
+    ) throws {
+        guard !Task.isCancelled,
+              activeLocalCompositionID == operationID,
+              configurationGeneration == generation,
+              activeSyncID == nil,
+              planner.isCanonicalSyncLocked else {
+            throw LocalCompositionCoordinatorError.operationSuperseded
+        }
+        guard planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.persistenceError == nil else {
+            throw LocalCompositionCoordinatorError.persistenceUnavailable
+        }
+        guard planner.pendingSchedulePublication == nil,
+              planner.pendingProposalApplicationMutation == nil,
+              planner.googleOutboundRecoveryJournal == nil,
+              planner.pendingCanonicalMutations.isEmpty,
+              planner.pendingCanonicalSensitivityMutations.isEmpty,
+              planner.pendingCanonicalAuthoringMutations.isEmpty,
+              planner.executionState.activeSession == nil,
+              planner.executionState.pendingCommand == nil,
+              !planner.executionState.hasCredentialReplacementBlocker,
+              !planner.blocks.contains(where: { $0.syncOrigin == .remoteExecutionLease }) else {
+            throw LocalCompositionCoordinatorError.canonicalStateChanged
+        }
+    }
+
+    private func reportLocalCompositionFailure(_ error: any Error) {
+        let diagnostic = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        localCompositionStatus = .failed(
+            "\(diagnostic) No network request or publication was made. Use normal Sync as the explicit fallback."
+        )
+    }
+
+    private func clearTransientLocalComposition() {
+        lastLocalComposition = nil
+        lastLocalCompositionScore = nil
+        localCompositionWarnings = []
+        localCompositionStatus = .ready
+    }
+
     private func makeClient(reportFailure: Bool) -> DayWeaveAPIClient? {
         do {
             guard let configuredURL = configurationStore.loadBaseURL() else {
@@ -2006,6 +2343,81 @@ private enum PendingSchedulePublicationRecovery {
 private struct InstalledSchedulePublication {
     let preview: DayWeaveSchedulePreview
     let blockCount: Int
+}
+
+private struct LocalCompositionMutationFence: Sendable {
+    let canonicalItems: [DayWeaveCanonicalItem]
+    let canonicalDeltaCursor: String?
+    let canonicalConfigurationIdentifier: String?
+    let completedOccurrenceIDs: Set<UUID>
+    let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]
+    let blocks: [ScheduleBlock]
+    let protectedFreeMinutes: Int
+    let freezeHours: Int
+    let timezoneName: String
+
+    @MainActor
+    func matches(planner: PlannerStore, timezoneName currentTimezoneName: String) -> Bool {
+        canonicalItems == planner.canonicalItems
+            && canonicalDeltaCursor == planner.canonicalDeltaCursor
+            && canonicalConfigurationIdentifier == planner.canonicalConfigurationIdentifier
+            && completedOccurrenceIDs == planner.completedOccurrenceIDs
+            && recurrenceSessionOutcomes == planner.recurrenceSessionOutcomes
+            && blocks == planner.blocks
+            && protectedFreeMinutes == planner.protectedFreeMinutes
+            && freezeHours == planner.freezeHours
+            && timezoneName == currentTimezoneName
+    }
+}
+
+private enum LocalCompositionCoordinatorError: LocalizedError {
+    case busy
+    case persistenceUnavailable
+    case incompleteCanonicalCache
+    case pendingSchedulePublication
+    case pendingProposalApplication
+    case pendingGoogleRecovery
+    case pendingStatusMutation
+    case pendingSensitivityMutation
+    case pendingAuthoringMutation
+    case executionLeaseActive
+    case canonicalResourceLimit
+    case canonicalStateChanged
+    case operationSuperseded
+    case invalidHelperResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .busy:
+            "Wait for the active canonical, execution, or on-device composition operation to finish."
+        case .persistenceUnavailable:
+            "Healthy encrypted planner persistence is required for on-device composition."
+        case .incompleteCanonicalCache:
+            "The encrypted canonical cache is not complete and bound to an API configuration."
+        case .pendingSchedulePublication:
+            "Recover the exact pending schedule publication before composing on this device."
+        case .pendingProposalApplication:
+            "Recover the exact pending proposal application or undo before composing on this device."
+        case .pendingGoogleRecovery:
+            "Recover the pending Google Calendar publication before composing on this device."
+        case .pendingStatusMutation:
+            "Resolve the pending canonical status journal before composing on this device."
+        case .pendingSensitivityMutation:
+            "Resolve the pending canonical privacy journal before composing on this device."
+        case .pendingAuthoringMutation:
+            "Resolve the pending canonical authoring journal before composing on this device."
+        case .executionLeaseActive:
+            "Reconcile the remote execution lease and actionability state before composing on this device."
+        case .canonicalResourceLimit:
+            "The canonical cache exceeds the on-device scheduler's 10,000-item safety limit."
+        case .canonicalStateChanged:
+            "Canonical schedule inputs changed while the helper was running; its result was discarded."
+        case .operationSuperseded:
+            "On-device composition was cancelled because its operation or configuration changed."
+        case .invalidHelperResponse:
+            "The signed helper response did not match the captured canonical schedule request."
+        }
+    }
 }
 
 private struct PreviewSessionIdentity: Hashable {

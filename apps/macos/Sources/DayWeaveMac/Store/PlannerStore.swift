@@ -57,6 +57,23 @@ enum PlannerSchedulePublicationError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerLocalCompositionError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case mutationFenceUnavailable
+    case invalidProvenance
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Healthy encrypted planner persistence is required before installing an on-device schedule."
+        case .mutationFenceUnavailable:
+            "Another canonical or execution operation is active; the on-device schedule was not installed."
+        case .invalidProvenance:
+            "The on-device schedule evidence is invalid; the prior plan was preserved."
+        }
+    }
+}
+
 enum PlannerProposalApplicationJournalError: LocalizedError, Equatable, Sendable {
     case encryptedPersistenceRequired
     case invalidMutation
@@ -225,6 +242,10 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var schedulePreviewProvenance: SchedulePreviewProvenance? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var localScheduleCompositionProvenance:
+        LocalScheduleCompositionProvenance? {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var pendingSchedulePublication: PendingSchedulePublication? {
         didSet { scheduleAutosave() }
     }
@@ -291,6 +312,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
+        localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
         proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt] = [],
@@ -341,8 +363,29 @@ final class PlannerStore: ObservableObject {
             ?? pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = restoredSnapshot?.recurrenceSessionOutcomes ?? recurrenceSessionOutcomes
         self.canonicalConfigurationIdentifier = initialCanonicalConfigurationIdentifier
-        self.schedulePreviewProvenance = restoredSnapshot?.schedulePreviewProvenance
+        let initialSchedulePreviewProvenance = restoredSnapshot?.schedulePreviewProvenance
             ?? schedulePreviewProvenance
+        let initialLocalScheduleCompositionProvenance = restoredSnapshot == nil
+            ? localScheduleCompositionProvenance
+            : restoredSnapshot?.localScheduleCompositionProvenance
+        self.schedulePreviewProvenance = initialSchedulePreviewProvenance
+        self.localScheduleCompositionProvenance = initialLocalScheduleCompositionProvenance
+        if initialLocalScheduleCompositionProvenance?.hasValidShape == false
+            || (initialSchedulePreviewProvenance != nil
+                && initialLocalScheduleCompositionProvenance != nil)
+            || initialLocalScheduleCompositionProvenance.map({
+                $0.configurationIdentifier != initialCanonicalConfigurationIdentifier
+                    || initialBlocks.contains {
+                        $0.syncOrigin == .canonicalPreview
+                            || $0.syncOrigin == .externalPreview
+                    }
+            }) == true
+            || (initialSchedulePreviewProvenance != nil
+                && initialBlocks.contains { $0.syncOrigin == .localComposition })
+            || (initialLocalScheduleCompositionProvenance == nil
+                && initialBlocks.contains { $0.syncOrigin == .localComposition }) {
+            restorationError = .snapshotDecodingFailed
+        }
         self.pendingSchedulePublication = restoredSnapshot?.pendingSchedulePublication
             ?? pendingSchedulePublication
         let initialPendingProposalApplicationMutation = restoredSnapshot == nil
@@ -586,6 +629,7 @@ final class PlannerStore: ObservableObject {
             $0.sourceItemID != nil
                 || $0.syncOrigin == .canonicalPreview
                 || $0.syncOrigin == .externalPreview
+                || $0.syncOrigin == .localComposition
                 || $0.syncOrigin == .remoteExecutionLease
         }
         canonicalItems = []
@@ -598,6 +642,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
+        localScheduleCompositionProvenance = nil
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
@@ -617,30 +662,60 @@ final class PlannerStore: ObservableObject {
 
     var canonicalPreviewFreshnessIssue: String? {
         guard isCanonicalPreviewValidatedForCurrentLaunch else {
-            return "Sync successfully in this app session before changing canonical preview blocks."
+            return "Sync or compose on this device in this app session before changing canonical schedule blocks."
         }
-        guard let provenance = schedulePreviewProvenance,
-              provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
-            return "The visible preview is not bound to the active API configuration."
+        let generatedAt: Date
+        let asOf: Date
+        let horizonStart: Date
+        let horizonEnd: Date
+        let timezoneName: String
+        if let provenance = localScheduleCompositionProvenance {
+            guard schedulePreviewProvenance == nil,
+                  provenance.hasValidShape,
+                  provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
+                return "The visible on-device schedule has invalid composition evidence."
+            }
+            let currentRevisions = Dictionary(
+                uniqueKeysWithValues: canonicalItems.map { ($0.id, $0.revision) }
+            )
+            guard provenance.sourceItemRevisions == currentRevisions else {
+                return "Canonical item revisions changed after on-device composition. Compose again."
+            }
+            generatedAt = provenance.generatedAt
+            asOf = provenance.asOf
+            horizonStart = provenance.horizonStart
+            horizonEnd = provenance.horizonEnd
+            timezoneName = provenance.timezoneName
+        } else if let provenance = schedulePreviewProvenance {
+            guard provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
+                return "The visible preview is not bound to the active API configuration."
+            }
+            generatedAt = provenance.generatedAt
+            asOf = provenance.asOf
+            horizonStart = provenance.horizonStart
+            horizonEnd = provenance.horizonEnd
+            timezoneName = provenance.timezoneName
+        } else {
+            return "The visible canonical schedule has no trusted composition evidence."
         }
         let currentTime = now()
-        guard provenance.generatedAt <= currentTime.addingTimeInterval(5 * 60),
-              currentTime.timeIntervalSince(provenance.generatedAt) <= 6 * 3_600 else {
-            return "The visible preview is older than the six-hour execution safety window. Sync again."
+        guard generatedAt <= currentTime.addingTimeInterval(5 * 60),
+              currentTime.timeIntervalSince(generatedAt) <= 6 * 3_600 else {
+            return "The visible schedule is older than the six-hour execution safety window. Sync or compose again."
         }
         let currentTimezoneIdentifier = TimeZone.autoupdatingCurrent.identifier == "GMT"
             ? "UTC"
             : TimeZone.autoupdatingCurrent.identifier
-        guard let timezone = TimeZone(identifier: provenance.timezoneName),
-              provenance.timezoneName == currentTimezoneIdentifier else {
-            return "The planning timezone changed. Sync again before changing canonical blocks."
+        guard let timezone = TimeZone(identifier: timezoneName),
+              timezoneName == currentTimezoneIdentifier else {
+            return "The planning timezone changed. Sync or compose again before changing canonical blocks."
         }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timezone
-        guard calendar.isDate(provenance.asOf, inSameDayAs: currentTime),
-              currentTime >= provenance.horizonStart,
-              currentTime < provenance.horizonEnd else {
-            return "The visible preview is outside its generated day or planning horizon. Sync again."
+        guard calendar.isDate(asOf, inSameDayAs: currentTime),
+              currentTime >= horizonStart,
+              currentTime < horizonEnd else {
+            return "The visible schedule is outside its generated day or planning horizon. Sync or compose again."
         }
         return nil
     }
@@ -650,7 +725,9 @@ final class PlannerStore: ObservableObject {
         guard block.syncOrigin != .remoteExecutionLease else { return false }
         if let itemID = block.sourceItemID,
            canonicalAuthoringMutation(itemID: itemID) != nil { return false }
-        guard block.syncOrigin == .canonicalPreview || block.syncOrigin == .externalPreview else {
+        guard block.syncOrigin == .canonicalPreview
+                || block.syncOrigin == .externalPreview
+                || block.syncOrigin == .localComposition else {
             return true
         }
         guard canonicalPreviewFreshnessIssue == nil,
@@ -666,11 +743,30 @@ final class PlannerStore: ObservableObject {
     var canRecomposeSchedule: Bool {
         canMutatePlan && blocks.allSatisfy { block in
             if block.syncOrigin == .remoteExecutionLease { return false }
-            guard block.syncOrigin == .canonicalPreview || block.syncOrigin == .externalPreview else {
+            guard block.syncOrigin == .canonicalPreview
+                    || block.syncOrigin == .externalPreview
+                    || block.syncOrigin == .localComposition else {
                 return true
             }
             return canMutate(block)
         }
+    }
+
+    /// Checked while the shared mutation lock is held, so it deliberately does
+    /// not consult `canMutatePlan`. Existing server-preview authority continues
+    /// through its publication path; this adds the stricter evidence gate that
+    /// locally composed blocks require before execution.
+    func canonicalScheduleBlockActionabilityIssue(_ block: ScheduleBlock) -> String? {
+        guard block.syncOrigin == .localComposition else { return nil }
+        if let issue = canonicalPreviewFreshnessIssue { return issue }
+        guard let itemID = block.sourceItemID,
+              let revision = block.sourceItemRevision,
+              let item = canonicalItem(id: itemID),
+              revision == item.revision,
+              item.isExecutable else {
+            return "The scheduled block no longer matches its canonical item revision."
+        }
+        return nil
     }
 
     private var hasCanonicalRemoteState: Bool {
@@ -683,6 +779,7 @@ final class PlannerStore: ObservableObject {
             || !pendingCanonicalSensitivityMutations.isEmpty
             || !recurrenceSessionOutcomes.isEmpty
             || schedulePreviewProvenance != nil
+            || localScheduleCompositionProvenance != nil
             || pendingSchedulePublication != nil
             || pendingProposalApplicationMutation != nil
             || !proposalApplicationReceipts.isEmpty
@@ -694,6 +791,7 @@ final class PlannerStore: ObservableObject {
             || blocks.contains {
                 $0.syncOrigin == .canonicalPreview
                     || $0.syncOrigin == .externalPreview
+                    || $0.syncOrigin == .localComposition
                     || $0.syncOrigin == .remoteExecutionLease
             }
     }
@@ -1905,6 +2003,7 @@ final class PlannerStore: ObservableObject {
         let priorBlocks = blocks
         let priorSelection = selectedBlockID
         let priorProvenance = schedulePreviewProvenance
+        let priorLocalProvenance = localScheduleCompositionProvenance
         let priorExecutionState = executionState
         let priorMessage = lastScheduleMessage
 
@@ -1919,11 +2018,65 @@ final class PlannerStore: ObservableObject {
             blocks = priorBlocks
             selectedBlockID = priorSelection
             schedulePreviewProvenance = priorProvenance
+            localScheduleCompositionProvenance = priorLocalProvenance
             executionState = priorExecutionState
             lastScheduleMessage = priorMessage
             pendingSchedulePublication = publication
             // A failed atomic local commit must never leave either the prior
             // or newly published projection actionable in this process.
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            throw persistenceError
+        }
+    }
+
+    /// Installs a helper-produced plan and its local evidence as one encrypted
+    /// transition. It never creates, clears, or recovers the server publication
+    /// journal.
+    func commitLocalScheduleComposition(
+        blocks newBlocks: [ScheduleBlock],
+        message: String,
+        provenance: LocalScheduleCompositionProvenance
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerLocalCompositionError.encryptedPersistenceRequired
+        }
+        guard isCanonicalSyncLocked, pendingSchedulePublication == nil else {
+            throw PlannerLocalCompositionError.mutationFenceUnavailable
+        }
+        let currentRevisions = Dictionary(
+            uniqueKeysWithValues: canonicalItems.map { ($0.id, $0.revision) }
+        )
+        guard provenance.hasValidShape,
+              provenance.configurationIdentifier == canonicalConfigurationIdentifier,
+              provenance.sourceItemRevisions == currentRevisions,
+              newBlocks.allSatisfy({ block in
+                  guard block.syncOrigin == .localComposition else { return false }
+                  guard let itemID = block.sourceItemID else { return true }
+                  return block.sourceItemRevision == currentRevisions[itemID]
+              }) else {
+            throw PlannerLocalCompositionError.invalidProvenance
+        }
+
+        let priorBlocks = blocks
+        let priorSelection = selectedBlockID
+        let priorServerProvenance = schedulePreviewProvenance
+        let priorLocalProvenance = localScheduleCompositionProvenance
+        let priorExecutionState = executionState
+        let priorMessage = lastScheduleMessage
+
+        applyLocalScheduleCompositionInMemory(
+            blocks: newBlocks,
+            message: message,
+            provenance: provenance
+        )
+        flushPersistence()
+        if let persistenceError {
+            blocks = priorBlocks
+            selectedBlockID = priorSelection
+            schedulePreviewProvenance = priorServerProvenance
+            localScheduleCompositionProvenance = priorLocalProvenance
+            executionState = priorExecutionState
+            lastScheduleMessage = priorMessage
             isCanonicalPreviewValidatedForCurrentLaunch = false
             throw persistenceError
         }
@@ -2208,6 +2361,37 @@ final class PlannerStore: ObservableObject {
         message: String,
         provenance: SchedulePreviewProvenance
     ) {
+        applyComposedScheduleBlocksInMemory(blocks: newBlocks, message: message)
+        for index in blocks.indices
+            where blocks[index].sourceItemID != nil
+                && blocks[index].syncOrigin != .remoteExecutionLease {
+            blocks[index].syncOrigin = .canonicalPreview
+        }
+        schedulePreviewProvenance = provenance
+        localScheduleCompositionProvenance = nil
+        isCanonicalPreviewValidatedForCurrentLaunch = true
+    }
+
+    private func applyLocalScheduleCompositionInMemory(
+        blocks newBlocks: [ScheduleBlock],
+        message: String,
+        provenance: LocalScheduleCompositionProvenance
+    ) {
+        applyComposedScheduleBlocksInMemory(blocks: newBlocks, message: message)
+        for index in blocks.indices
+            where blocks[index].sourceItemID != nil
+                && blocks[index].syncOrigin != .remoteExecutionLease {
+            blocks[index].syncOrigin = .localComposition
+        }
+        schedulePreviewProvenance = nil
+        localScheduleCompositionProvenance = provenance
+        isCanonicalPreviewValidatedForCurrentLaunch = true
+    }
+
+    private func applyComposedScheduleBlocksInMemory(
+        blocks newBlocks: [ScheduleBlock],
+        message: String
+    ) {
         guard canPersistPlan else { return }
         let previousSelection = selectedBlockID
         let selectedSourceID = selectedBlock?.sourceItemID
@@ -2265,8 +2449,6 @@ final class PlannerStore: ObservableObject {
         selectedBlockID = blocks.first(where: { $0.id == previousSelection })?.id
             ?? blocks.first(where: { $0.sourceItemID == selectedSourceID })?.id
             ?? blocks.first?.id
-        schedulePreviewProvenance = provenance
-        isCanonicalPreviewValidatedForCurrentLaunch = true
         var presentedExecutionState = executionState
         applyExecutionPresentation(to: &presentedExecutionState)
         executionState = presentedExecutionState
@@ -2922,7 +3104,8 @@ final class PlannerStore: ObservableObject {
     }
 
     func canonicalProjectionEligibleAtExecutionStart(_ block: ScheduleBlock) -> Bool {
-        guard block.sourceItemID != nil,
+        guard canonicalScheduleBlockActionabilityIssue(block) == nil,
+              block.sourceItemID != nil,
               block.occurrenceID == nil,
               block.occurrenceFullyScheduled,
               let itemID = block.sourceItemID,
@@ -2964,6 +3147,7 @@ final class PlannerStore: ObservableObject {
             $0.sourceItemID != nil
                 || $0.syncOrigin == .canonicalPreview
                 || $0.syncOrigin == .externalPreview
+                || $0.syncOrigin == .localComposition
                 || $0.syncOrigin == .remoteExecutionLease
         }
         canonicalItems = []
@@ -2976,6 +3160,7 @@ final class PlannerStore: ObservableObject {
         recurrenceSessionOutcomes = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
+        localScheduleCompositionProvenance = nil
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
@@ -3658,6 +3843,7 @@ final class PlannerStore: ObservableObject {
             recurrenceSessionOutcomes: recurrenceSessionOutcomes,
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
+            localScheduleCompositionProvenance: localScheduleCompositionProvenance,
             pendingSchedulePublication: pendingSchedulePublication,
             pendingProposalApplicationMutation: pendingProposalApplicationMutation,
             proposalApplicationReceipts: proposalApplicationReceipts,
