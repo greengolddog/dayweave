@@ -83,6 +83,122 @@ struct ScheduleProfileTests {
         }
     }
 
+    @Test("publication proof round-trips, accepts horizon overlap, and schema 13 gains no proof")
+    func publicationProofPersistenceAndMigration() throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let savedAt = Self.date("2026-08-30T08:00:00Z")
+        let horizonStart = Self.date("2026-08-30T00:00:00Z")
+        let horizonEnd = Self.date("2026-08-31T00:00:00Z")
+        let item = try Self.canonicalItem()
+        let blockID = UUID(uuidString: "f3000000-0000-4000-8000-000000000003")!
+        let revisionID = UUID(uuidString: "f4000000-0000-4000-8000-000000000004")!
+        let block = ScheduleBlock(
+            id: blockID,
+            title: item.title,
+            kind: .task,
+            start: Self.date("2026-08-29T23:30:00Z"),
+            end: Self.date("2026-08-30T00:30:00Z"),
+            status: .scheduled,
+            project: nil,
+            notes: "",
+            energy: .medium,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: item.id,
+            sourceItemRevision: item.revision,
+            occurrenceID: nil,
+            sessionIndex: 7,
+            syncOrigin: .canonicalPreview,
+            placementReason: nil,
+            previewKind: "pinned"
+        )
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: "fixture",
+            generatedAt: savedAt,
+            asOf: savedAt,
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            timezoneName: "UTC"
+        )
+        let proof = DayWeavePublishedScheduleProof(
+            configurationIdentifier: "fixture",
+            revisionID: revisionID,
+            revision: "9:\(revisionID.uuidString.lowercased())",
+            revisionNumber: 9,
+            inputDigest: "sha256:\(String(repeating: "a", count: 64))",
+            asOf: savedAt,
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            timezoneName: "UTC",
+            publishedAt: savedAt,
+            publishedBlocks: [.init(
+                id: blockID,
+                itemID: item.id,
+                itemRevision: item.revision,
+                occurrenceID: nil,
+                sessionIndex: 7,
+                start: block.start,
+                end: block.end,
+                kind: "pinned"
+            )]
+        )
+        #expect(proof.hasValidShape)
+        #expect(proof.matchesPublishedPlan([block]))
+        let current = PlannerSnapshot(
+            savedAt: savedAt,
+            destination: .today,
+            selectedBlockID: block.id,
+            blocks: [block],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "published",
+            protectedFreeMinutes: 90,
+            scheduleProfile: try .legacyDefault(
+                timezoneName: "UTC",
+                protectedFreeMinutes: 90
+            ),
+            freezeHours: 2,
+            showCompleted: true,
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: "fixture",
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: proof
+        )
+
+        try context.persistence.save(current)
+        let restored = try #require(try context.persistence.load())
+        #expect(restored.publishedScheduleProof == proof)
+        #expect(restored.blocks == [block])
+
+        let legacy = PlannerSnapshot(
+            schemaVersion: 13,
+            savedAt: savedAt,
+            destination: .today,
+            selectedBlockID: block.id,
+            blocks: [block],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "legacy",
+            protectedFreeMinutes: 90,
+            scheduleProfile: try .legacyDefault(
+                timezoneName: "UTC",
+                protectedFreeMinutes: 90
+            ),
+            freezeHours: 2,
+            showCompleted: true,
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: "fixture",
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: proof
+        )
+        let migrated = try legacy.migratedToCurrentSchema()
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion)
+        #expect(migrated.publishedScheduleProof == nil)
+        #expect(migrated.blocks == [block])
+    }
+
     @Test("Madrid spring and fall horizons and overnight sleep use local calendar days")
     func madridDSTAndOvernightSleep() throws {
         let profile = try Self.profile(

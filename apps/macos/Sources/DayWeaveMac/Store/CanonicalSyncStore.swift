@@ -693,7 +693,11 @@ final class CanonicalSyncStore: ObservableObject {
             )
             return .requiresFreshComposition
         }
-        try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+        try planner.commitPendingSchedulePublication(
+            publication,
+            blocks: rendered,
+            response: published
+        )
         clearTransientLocalComposition()
         return .installed(
             revisionNumber: published.revision.revisionNumber,
@@ -799,7 +803,11 @@ final class CanonicalSyncStore: ObservableObject {
                 continue
             }
 
-            try planner.commitPendingSchedulePublication(publication, blocks: rendered)
+            try planner.commitPendingSchedulePublication(
+                publication,
+                blocks: rendered,
+                response: published
+            )
             clearTransientLocalComposition()
             return .init(
                 preview: preview,

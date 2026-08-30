@@ -230,6 +230,11 @@ final class ExecutionSyncStore: ObservableObject {
                     "Only a current scheduled canonical block can be started."
                 )
             }
+            guard let sessionIndex = block.sessionIndex else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "This block has no server-issued session index. Sync and publish the schedule again."
+                )
+            }
             if let issue = self.planner.canonicalScheduleBlockActionabilityIssue(block) {
                 throw ExecutionSyncControllerError.invalidLocalState(issue)
             }
@@ -249,7 +254,7 @@ final class ExecutionSyncStore: ObservableObject {
                 itemID: itemID,
                 itemRevision: itemRevision,
                 occurrenceID: block.occurrenceID,
-                sessionIndex: block.sessionIndex ?? 0,
+                sessionIndex: sessionIndex,
                 plannedBlockID: block.id,
                 sourceDeviceID: deviceID
             )
@@ -259,7 +264,7 @@ final class ExecutionSyncStore: ObservableObject {
                     itemID: itemID,
                     itemRevision: itemRevision,
                     occurrenceID: block.occurrenceID,
-                    sessionIndex: block.sessionIndex ?? 0,
+                    sessionIndex: sessionIndex,
                     plannedBlockID: block.id,
                     deviceID: deviceID
                 ),

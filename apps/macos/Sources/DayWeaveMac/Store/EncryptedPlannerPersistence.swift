@@ -422,10 +422,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// and a destination-aware canonical selection. Version 11 adds the
     /// encrypted Google outbound preview/approval/enqueue recovery fence, and
     /// version 12 adds provenance for signed on-device schedule composition,
-    /// and version 13 adds the encrypted, timezone-bound schedule profile.
+    /// version 13 adds the encrypted, timezone-bound schedule profile, and
+    /// version 14 adds the exact successful schedule-publication proof.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 13
+    static let currentSchemaVersion = 14
 
     let schemaVersion: Int
     let savedAt: Date
@@ -438,8 +439,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let lastScheduleMessage: String
     let protectedFreeMinutes: Int
     /// Optional only so schemas through 12 can be decoded before migration.
-    /// Every schema-13 snapshot must contain a valid profile whose protected
-    /// duration agrees exactly with the retained compatibility field.
+    /// Every schema-13-or-later snapshot must contain a valid profile whose
+    /// protected duration agrees exactly with the retained compatibility field.
     let scheduleProfile: ScheduleProfile?
     let freezeHours: Int
     let showCompleted: Bool
@@ -452,6 +453,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]?
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
+    let publishedScheduleProof: DayWeavePublishedScheduleProof?
     let localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
     let pendingSchedulePublication: PendingSchedulePublication?
     let pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation?
@@ -485,6 +487,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
+        publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
         localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
@@ -527,6 +530,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.recurrenceSessionOutcomes = recurrenceSessionOutcomes
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
+        self.publishedScheduleProof = publishedScheduleProof
         self.localScheduleCompositionProvenance = localScheduleCompositionProvenance
         self.pendingSchedulePublication = pendingSchedulePublication
         self.pendingProposalApplicationMutation = pendingProposalApplicationMutation
@@ -579,10 +583,95 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   schedulePreviewProvenance == nil
                     || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
                   localScheduleCompositionProvenance != nil
-                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }) else {
+                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
+                  (publishedScheduleProof.map { proof in
+                      proof.hasValidShape
+                          && proof.configurationIdentifier
+                              == canonicalConfigurationIdentifier
+                          && schedulePreviewProvenance.map(proof.matches) == true
+                          && localScheduleCompositionProvenance == nil
+                          && proof.matchesPublishedPlan(blocks)
+                  } ?? true) else {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 13:
+            // Schema 13 predates durable publication receipts. Ignore any
+            // injected newer field so a legacy cache can never gain execution
+            // authority merely by being migrated.
+            guard let scheduleProfile,
+                  scheduleProfile.hasValidShape,
+                  scheduleProfile.protectedFreeMinutes == protectedFreeMinutes,
+                  schedulePreviewProvenance?.timezoneName == nil
+                    || schedulePreviewProvenance?.timezoneName == scheduleProfile.timezoneName,
+                  localScheduleCompositionProvenance?.timezoneName == nil
+                    || localScheduleCompositionProvenance?.timezoneName
+                        == scheduleProfile.timezoneName,
+                  executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil,
+                  let proposalApplicationReceipts,
+                  let pendingCanonicalAuthoringMutations,
+                  let canonicalTrash,
+                  PlannerProposalApplicationJournalValidator.isValidState(
+                      pending: pendingProposalApplicationMutation,
+                      receipts: proposalApplicationReceipts
+                  ),
+                  PlannerCanonicalAuthoringJournalValidator.isValidState(
+                      mutations: pendingCanonicalAuthoringMutations,
+                      trash: canonicalTrash,
+                      canonicalItems: canonicalItems ?? [],
+                      tombstoneRevisions: canonicalTombstoneRevisions ?? [:],
+                      configurationIdentifier: canonicalConfigurationIdentifier
+                  ),
+                  googleOutboundRecoveryJournal?.hasValidShape != false,
+                  localScheduleCompositionProvenance?.hasValidShape != false,
+                  schedulePreviewProvenance == nil
+                    || localScheduleCompositionProvenance == nil,
+                  (localScheduleCompositionProvenance.map {
+                      $0.configurationIdentifier == canonicalConfigurationIdentifier
+                          && !blocks.contains {
+                              $0.syncOrigin == .canonicalPreview
+                                  || $0.syncOrigin == .externalPreview
+                          }
+                  } ?? true),
+                  schedulePreviewProvenance == nil
+                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
+                  localScheduleCompositionProvenance != nil
+                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }) else {
+                throw .snapshotDecodingFailed
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: nil,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 12:
             // Schema 12 has no trusted schedule profile. Ignore any injected
             // newer field and derive the exact legacy 06:00–23:00 shape from

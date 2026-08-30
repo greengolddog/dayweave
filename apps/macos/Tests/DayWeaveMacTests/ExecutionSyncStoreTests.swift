@@ -181,6 +181,108 @@ struct ExecutionSyncStoreTests {
         #expect(relaunched.executionState.historyVerified)
     }
 
+    @Test("Start requires the durable proof for the exact unchanged published block")
+    func startRequiresExactPublishedBlockProof() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()]
+        )
+        let priorStart = planner.blocks[0].start
+        planner.doLater(Self.blockID)
+        let transport = Self.emptyReadTransport()
+
+        #expect(planner.blocks.first?.start == priorStart.addingTimeInterval(3_600))
+        #expect(planner.publishedScheduleProof == nil)
+        #expect(await Self.controller(planner: planner, transport: transport).start(Self.blockID)
+            == .invalidLocalState)
+        #expect(await transport.receivedCommands().isEmpty)
+
+        let mismatchContext = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: mismatchContext.directory) }
+        let exactMismatch = Self.planner(
+            persistence: mismatchContext.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()]
+        )
+        exactMismatch.blocks[0].start.addTimeInterval(300)
+        exactMismatch.blocks[0].end.addTimeInterval(300)
+        #expect(exactMismatch.publishedScheduleProof != nil)
+        #expect(exactMismatch.canonicalScheduleBlockActionabilityIssue(
+            exactMismatch.blocks[0]
+        ) != nil)
+
+        let unprovenContext = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: unprovenContext.directory) }
+        let unproven = Self.planner(
+            persistence: unprovenContext.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()],
+            includePublicationProof: false
+        )
+        let unprovenTransport = Self.emptyReadTransport()
+        #expect(await Self.controller(
+            planner: unproven,
+            transport: unprovenTransport
+        ).start(Self.blockID) == .invalidLocalState)
+        #expect(await unprovenTransport.receivedCommands().isEmpty)
+    }
+
+    @Test("Start rejects a missing server session index instead of synthesizing zero")
+    func startRejectsMissingSessionIndex() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [Self.block(sessionIndex: nil)],
+            canonicalItems: [try Self.canonicalItem()],
+            includePublicationProof: false
+        )
+        let transport = Self.emptyReadTransport()
+
+        #expect(await Self.controller(planner: planner, transport: transport).start(Self.blockID)
+            == .invalidLocalState)
+        #expect(await transport.receivedCommands().isEmpty)
+    }
+
+    @Test("A locally composed helper block stays visible but cannot Start")
+    func localHelperBlockIsNotActionable() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let item = try Self.canonicalItem()
+        var helperBlock = Self.block()
+        helperBlock.syncOrigin = .localComposition
+        let provenance = LocalScheduleCompositionProvenance(
+            configurationIdentifier: Self.canonicalConfiguration,
+            localInputFingerprint: "local-sha256:\(String(repeating: "a", count: 64))",
+            generatedAt: Self.baseDate,
+            asOf: Self.baseDate,
+            horizonStart: Self.baseDate.addingTimeInterval(-3_600),
+            horizonEnd: Self.baseDate.addingTimeInterval(86_400),
+            timezoneName: "UTC",
+            sourceItemRevisions: [item.id: item.revision]
+        )
+        let planner = PlannerStore(
+            blocks: [helperBlock],
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: Self.canonicalConfiguration,
+            localScheduleCompositionProvenance: provenance,
+            executionState: Self.emptyBoundState,
+            previewValidatedForCurrentLaunch: true,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Self.baseDate }
+        )
+        let transport = Self.emptyReadTransport()
+
+        #expect(planner.blocks == [helperBlock])
+        #expect(await Self.controller(planner: planner, transport: transport).start(Self.blockID)
+            == .invalidLocalState)
+        #expect(await transport.receivedCommands().isEmpty)
+    }
+
     @Test("credential rotation cannot rebind a durable pending command")
     func credentialRotationLeavesPendingFenceIntact() async throws {
         let context = try Self.persistenceContext()
@@ -982,19 +1084,60 @@ struct ExecutionSyncStoreTests {
         completedOccurrenceIDs: Set<UUID> = [],
         pendingCanonicalMutations: [PendingCanonicalMutation] = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
-        executionState: DayWeaveExecutionDurableState = emptyBoundState
+        executionState: DayWeaveExecutionDurableState = emptyBoundState,
+        includePublicationProof: Bool = true
     ) -> PlannerStore {
-        PlannerStore(
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: canonicalConfiguration,
+            generatedAt: baseDate,
+            asOf: baseDate,
+            horizonStart: baseDate.addingTimeInterval(-3_600),
+            horizonEnd: baseDate.addingTimeInterval(86_400),
+            timezoneName: "UTC"
+        )
+        let revisionID = UUID(uuidString: "10000000-0000-4000-8000-000000000001")!
+        let publishedBlocks = blocks.compactMap { block -> DayWeavePublishedScheduleBlockProof? in
+            guard block.syncOrigin == .canonicalPreview,
+                  let itemID = block.sourceItemID,
+                  let itemRevision = block.sourceItemRevision else { return nil }
+            return .init(
+                id: block.id,
+                itemID: itemID,
+                itemRevision: itemRevision,
+                occurrenceID: block.occurrenceID,
+                sessionIndex: block.sessionIndex ?? 0,
+                start: block.start,
+                end: block.end,
+                kind: block.previewKind ?? "planned"
+            )
+        }
+        let proof = includePublicationProof ? DayWeavePublishedScheduleProof(
+            configurationIdentifier: canonicalConfiguration,
+            revisionID: revisionID,
+            revision: "1:\(revisionID.uuidString.lowercased())",
+            revisionNumber: 1,
+            inputDigest: "sha256:\(String(repeating: "b", count: 64))",
+            asOf: provenance.asOf,
+            horizonStart: provenance.horizonStart,
+            horizonEnd: provenance.horizonEnd,
+            timezoneName: provenance.timezoneName,
+            publishedAt: baseDate,
+            publishedBlocks: publishedBlocks
+        ) : nil
+        return PlannerStore(
             blocks: blocks,
             canonicalItems: canonicalItems,
             completedOccurrenceIDs: completedOccurrenceIDs,
             pendingCanonicalMutations: pendingCanonicalMutations,
             recurrenceSessionOutcomes: recurrenceSessionOutcomes,
             canonicalConfigurationIdentifier: canonicalConfiguration,
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: proof,
             executionState: executionState,
             previewValidatedForCurrentLaunch: true,
             persistence: persistence,
             restoreFromPersistence: false,
+            autosaveDelay: .seconds(60),
             now: { baseDate }
         )
     }
@@ -1018,9 +1161,17 @@ struct ExecutionSyncStoreTests {
         )
     }
 
+    private static func emptyReadTransport() -> ExecutionTransportDouble {
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        return ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+    }
+
     private static func block(
         id: UUID = blockID,
-        sessionIndex: UInt16 = 0,
+        sessionIndex: UInt16? = 0,
         occurrenceID: UUID? = nil
     ) -> ScheduleBlock {
         ScheduleBlock(

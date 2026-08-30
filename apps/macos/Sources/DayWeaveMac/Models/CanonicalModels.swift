@@ -839,6 +839,264 @@ struct DayWeaveSchedulePublishResponse: Decodable, Equatable, Sendable {
     let replayed: Bool
 }
 
+struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
+    let id: UUID
+    let itemID: UUID
+    let itemRevision: UInt64
+    let occurrenceID: UUID?
+    let sessionIndex: UInt16
+    let start: Date
+    let end: Date
+    let kind: String
+
+    init?(
+        block: DayWeaveSchedulePreview.Plan.Block,
+        sourceItemRevisions: [UUID: UInt64]
+    ) {
+        guard let itemID = block.itemID,
+              let itemRevision = sourceItemRevisions[itemID] else { return nil }
+        self.init(
+            id: block.id,
+            itemID: itemID,
+            itemRevision: itemRevision,
+            occurrenceID: block.occurrenceID,
+            sessionIndex: block.sessionIndex,
+            start: block.start,
+            end: block.end,
+            kind: block.kind
+        )
+    }
+
+    init(
+        id: UUID,
+        itemID: UUID,
+        itemRevision: UInt64,
+        occurrenceID: UUID?,
+        sessionIndex: UInt16,
+        start: Date,
+        end: Date,
+        kind: String
+    ) {
+        self.id = id
+        self.itemID = itemID
+        self.itemRevision = itemRevision
+        self.occurrenceID = occurrenceID
+        self.sessionIndex = sessionIndex
+        self.start = start
+        self.end = end
+        self.kind = kind
+    }
+
+    var hasValidShape: Bool {
+        !id.isDayWeavePublicationNil
+            && !itemID.isDayWeavePublicationNil
+            && itemRevision > 0
+            && start.timeIntervalSinceReferenceDate.isFinite
+            && end.timeIntervalSinceReferenceDate.isFinite
+            && start < end
+            && !kind.isEmpty
+            && kind.utf8.count <= 128
+            && !kind.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
+    func matches(_ block: ScheduleBlock) -> Bool {
+        hasValidShape
+            && block.id == id
+            && block.sourceItemID == itemID
+            && block.sourceItemRevision == itemRevision
+            && block.occurrenceID == occurrenceID
+            && block.sessionIndex == sessionIndex
+            && block.syncOrigin == .canonicalPreview
+            && block.previewKind == kind
+            && sameInstant(block.start, start)
+            && sameInstant(block.end, end)
+    }
+
+    private func sameInstant(_ left: Date, _ right: Date) -> Bool {
+        abs(left.timeIntervalSince(right)) <= 0.002
+    }
+}
+
+/// Durable positive evidence for the exact schedule installed after a
+/// validated, non-replayed publication response. The server receipt does not
+/// carry the compose `as_of` value or local API binding, so both are retained
+/// beside it instead of being inferred again after a restart.
+struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+
+    let version: Int
+    let configurationIdentifier: String
+    let revisionID: UUID
+    let revision: String
+    let revisionNumber: UInt64
+    let inputDigest: String
+    let asOf: Date
+    let horizonStart: Date
+    let horizonEnd: Date
+    let timezoneName: String
+    let publishedAt: Date
+    let publishedBlocks: [DayWeavePublishedScheduleBlockProof]
+
+    init?(
+        publication: PendingSchedulePublication,
+        revision: DayWeavePublishedScheduleRevision
+    ) {
+        let request = publication.preparedRequest.request
+        let publishedBlocks = publication.preview.plan.blocks.compactMap {
+            DayWeavePublishedScheduleBlockProof(
+                block: $0,
+                sourceItemRevisions: publication.preview.sourceItemRevisions
+            )
+        }.sorted { $0.id.uuidString < $1.id.uuidString }
+        self.init(
+            configurationIdentifier: publication.configurationIdentifier,
+            revisionID: revision.id,
+            revision: revision.revision,
+            revisionNumber: revision.revisionNumber,
+            inputDigest: revision.inputDigest,
+            asOf: request.schedule.asOf,
+            horizonStart: revision.horizonStart,
+            horizonEnd: revision.horizonEnd,
+            timezoneName: revision.timezoneName,
+            publishedAt: revision.publishedAt,
+            publishedBlocks: publishedBlocks
+        )
+        let canonicalPreviewBlockCount = publication.preview.plan.blocks.count {
+            $0.itemID != nil
+        }
+        guard publishedBlocks.count == canonicalPreviewBlockCount,
+              inputDigest == request.expectedInputDigest,
+              inputDigest == publication.preview.inputDigest,
+              sameInstant(horizonStart, request.schedule.horizonStart),
+              sameInstant(horizonEnd, request.schedule.horizonEnd),
+              timezoneName == request.schedule.timezoneName,
+              matches(publication.provenance) else { return nil }
+    }
+
+    init(
+        version: Int = Self.currentVersion,
+        configurationIdentifier: String,
+        revisionID: UUID,
+        revision: String,
+        revisionNumber: UInt64,
+        inputDigest: String,
+        asOf: Date,
+        horizonStart: Date,
+        horizonEnd: Date,
+        timezoneName: String,
+        publishedAt: Date,
+        publishedBlocks: [DayWeavePublishedScheduleBlockProof]
+    ) {
+        self.version = version
+        self.configurationIdentifier = configurationIdentifier
+        self.revisionID = revisionID
+        self.revision = revision
+        self.revisionNumber = revisionNumber
+        self.inputDigest = inputDigest
+        self.asOf = asOf
+        self.horizonStart = horizonStart
+        self.horizonEnd = horizonEnd
+        self.timezoneName = timezoneName
+        self.publishedAt = publishedAt
+        self.publishedBlocks = publishedBlocks
+    }
+
+    var hasValidShape: Bool {
+        let digestPrefix = "sha256:"
+        let digest = inputDigest.dropFirst(digestPrefix.count)
+        let expectedRevision = "\(revisionNumber):\(revisionID.uuidString.lowercased())"
+        return version == Self.currentVersion
+            && !configurationIdentifier.isEmpty
+            && configurationIdentifier.utf8.count <= 4_096
+            && !configurationIdentifier.unicodeScalars.contains(
+                where: CharacterSet.controlCharacters.contains
+            )
+            && !revisionID.isDayWeavePublicationNil
+            && revisionNumber > 0
+            && revision == expectedRevision
+            && inputDigest.hasPrefix(digestPrefix)
+            && digest.count == 64
+            && digest.utf8.allSatisfy {
+                (48...57).contains($0) || (97...102).contains($0)
+            }
+            && asOf.timeIntervalSinceReferenceDate.isFinite
+            && horizonStart.timeIntervalSinceReferenceDate.isFinite
+            && horizonEnd.timeIntervalSinceReferenceDate.isFinite
+            && publishedAt.timeIntervalSinceReferenceDate.isFinite
+            && horizonStart <= asOf
+            && asOf < horizonEnd
+            && TimeZone(identifier: timezoneName) != nil
+            && publishedBlocks.count <= 10_000
+            && publishedBlocks.allSatisfy {
+                $0.hasValidShape
+                    && $0.start < horizonEnd
+                    && horizonStart < $0.end
+            }
+            && Set(publishedBlocks.map(\.id)).count == publishedBlocks.count
+    }
+
+    func matches(_ provenance: SchedulePreviewProvenance) -> Bool {
+        hasValidShape
+            && configurationIdentifier == provenance.configurationIdentifier
+            && sameInstant(asOf, provenance.asOf)
+            && sameInstant(horizonStart, provenance.horizonStart)
+            && sameInstant(horizonEnd, provenance.horizonEnd)
+            && timezoneName == provenance.timezoneName
+    }
+
+    func matchesPublishedPlan(_ blocks: [ScheduleBlock]) -> Bool {
+        guard hasValidShape else { return false }
+        let canonicalBlocks = blocks.filter { $0.syncOrigin == .canonicalPreview }
+        guard canonicalBlocks.count == publishedBlocks.count else { return false }
+        var blockByID: [UUID: ScheduleBlock] = [:]
+        for block in canonicalBlocks {
+            guard blockByID.updateValue(block, forKey: block.id) == nil else {
+                return false
+            }
+        }
+        return publishedBlocks.allSatisfy { proof in
+            blockByID[proof.id].map(proof.matches) == true
+        }
+    }
+
+    func matches(_ block: ScheduleBlock) -> Bool {
+        guard hasValidShape,
+              let proof = publishedBlocks.first(where: { $0.id == block.id }) else {
+            return false
+        }
+        return proof.matches(block)
+    }
+
+    func rebindingConfigurationIdentifier(
+        _ configurationIdentifier: String
+    ) -> DayWeavePublishedScheduleProof {
+        .init(
+            version: version,
+            configurationIdentifier: configurationIdentifier,
+            revisionID: revisionID,
+            revision: revision,
+            revisionNumber: revisionNumber,
+            inputDigest: inputDigest,
+            asOf: asOf,
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            timezoneName: timezoneName,
+            publishedAt: publishedAt,
+            publishedBlocks: publishedBlocks
+        )
+    }
+
+    private func sameInstant(_ left: Date, _ right: Date) -> Bool {
+        abs(left.timeIntervalSince(right)) <= 0.002
+    }
+}
+
+private extension UUID {
+    var isDayWeavePublicationNil: Bool {
+        self == UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+    }
+}
+
 /// Encrypted with the planner snapshot before the first publication request is
 /// sent. Retaining both the exact compose input and its accepted preview lets a
 /// restart replay one idempotency tuple and finish the local commit without

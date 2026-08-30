@@ -335,16 +335,43 @@ struct LocalCompositionStoreTests {
         try context.planner.persistPendingSchedulePublication(publication)
         var serverBlock = try #require(context.planner.blocks.first { $0.sourceItemID == item.id })
         serverBlock.syncOrigin = .canonicalPreview
-        try context.planner.commitPendingSchedulePublication(publication, blocks: [serverBlock])
+        let revisionID = UUID(uuidString: "b3000000-0000-4000-8000-000000000003")!
+        let request = publication.preparedRequest.request.schedule
+        let revision = DayWeavePublishedScheduleRevision(
+            id: revisionID,
+            revision: "1:\(revisionID.uuidString.lowercased())",
+            revisionNumber: 1,
+            inputDigest: publication.preview.inputDigest,
+            horizonStart: request.horizonStart,
+            horizonEnd: request.horizonEnd,
+            timezoneName: request.timezoneName,
+            publishedAt: now
+        )
+        #expect(throws: PlannerSchedulePublicationError.replayedReceiptCannotAuthorize) {
+            try context.planner.commitPendingSchedulePublication(
+                publication,
+                blocks: [serverBlock],
+                response: .init(revision: revision, replayed: true)
+            )
+        }
+        #expect(context.planner.pendingSchedulePublication == publication)
+        #expect(context.planner.publishedScheduleProof == nil)
+        try context.planner.commitPendingSchedulePublication(
+            publication,
+            blocks: [serverBlock],
+            response: .init(revision: revision, replayed: false)
+        )
 
         #expect(context.planner.pendingSchedulePublication == nil)
         #expect(context.planner.localScheduleCompositionProvenance == nil)
         #expect(context.planner.schedulePreviewProvenance == publication.provenance)
+        #expect(context.planner.publishedScheduleProof != nil)
         #expect(context.planner.blocks.first { $0.sourceItemID == item.id }?.syncOrigin == .canonicalPreview)
         let loaded = try context.persistence.load()
         let restored = try #require(loaded)
         #expect(restored.localScheduleCompositionProvenance == nil)
         #expect(restored.schedulePreviewProvenance == publication.provenance)
+        #expect(restored.publishedScheduleProof == context.planner.publishedScheduleProof)
     }
 
     @Test("restored, old, and revision-mismatched local schedules are not actionable")
@@ -361,7 +388,7 @@ struct LocalCompositionStoreTests {
         #expect(await store.recomposeLocally())
         let freshBlock = try #require(context.planner.blocks.first { $0.sourceItemID == item.id })
         #expect(context.planner.canMutate(freshBlock))
-        #expect(context.planner.canonicalScheduleBlockActionabilityIssue(freshBlock) == nil)
+        #expect(context.planner.canonicalScheduleBlockActionabilityIssue(freshBlock) != nil)
 
         let restoredPlanner = PlannerStore(
             persistence: context.persistence,
