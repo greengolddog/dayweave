@@ -8,9 +8,10 @@ use uuid::Uuid;
 
 use crate::{
     AvailabilityWindow, ConstraintStrength, DayOfWeek, Dependency, DependencyRelation,
-    FixedBlockSource, ItemId, ItemKind, MaterializedIdentity, Minutes, Occurrence, OccurrenceId,
-    PlanRequest, PreviousBlock, SchedulingConstraints, SplitPolicy, WorkItem,
-    materialize_recurrences, roll_up_expected_durations,
+    ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
+    ExecutionWorkUnit, FixedBlockSource, ItemId, ItemKind, MaterializedIdentity, Minutes,
+    Occurrence, OccurrenceId, PlanRequest, PreviousBlock, SchedulingConstraints, SplitPolicy,
+    WorkItem, materialize_recurrences, roll_up_expected_durations,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,24 +200,46 @@ impl Scheduler {
     /// Capacity and constraint conflicts are represented in the returned plan,
     /// not as errors.
     pub fn plan(&self, request: &PlanRequest) -> Result<SchedulePlan, ScheduleError> {
+        self.plan_with_execution(request, &ExecutionPlanningContext::default())
+    }
+
+    /// Computes a plan using a normalized, server-authoritative execution
+    /// snapshot without adding execution fields to [`PlanRequest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScheduleError`] when either input is structurally invalid or
+    /// an execution reservation is only partly covered by the horizon.
+    pub fn plan_with_execution(
+        &self,
+        request: &PlanRequest,
+        execution: &ExecutionPlanningContext,
+    ) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
+        validate_execution_context(request, execution)?;
         let materialized = materialize_recurrences(request)
             .map_err(|error| ScheduleError::InvalidRecurrence(error.to_string()))?;
-        let mut plan = Self::plan_materialized(&materialized.request)?;
+        let (materialized_request, materialized_execution) =
+            apply_execution_context(&materialized.request, &materialized.identities, execution)?;
+        let mut plan = Self::plan_materialized(&materialized_request, &materialized_execution)?;
         remap_occurrence_outputs(&mut plan, &materialized.identities);
         plan.occurrences = materialized.occurrences;
         Ok(plan)
     }
 
-    fn plan_materialized(request: &PlanRequest) -> Result<SchedulePlan, ScheduleError> {
+    fn plan_materialized(
+        request: &PlanRequest,
+        execution: &MaterializedExecutionContext,
+    ) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
 
         let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
         let children = child_map(&request.items);
-        let mut state = PlanningState::new(request);
+        let mut state = PlanningState::new(request, execution);
 
         state.add_external_fixed_blocks(request);
         state.add_calendar_events(request);
+        state.add_execution_reservations(request, &items, execution)?;
         state.add_pinned_assignments(request, &items);
         state.detect_immutable_overlaps();
 
@@ -348,6 +371,258 @@ fn remap_occurrence_outputs(
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct MaterializedExecutionContext {
+    work_units: BTreeMap<ItemId, MaterializedExecutionWorkUnit>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedExecutionWorkUnit {
+    skipped: bool,
+    used_session_indices: BTreeSet<u16>,
+    reservations: Vec<ExecutionReservation>,
+}
+
+impl MaterializedExecutionWorkUnit {
+    fn high_water(&self) -> Option<u16> {
+        self.used_session_indices
+            .iter()
+            .copied()
+            .chain(
+                self.reservations
+                    .iter()
+                    .map(|reservation| reservation.session_index),
+            )
+            .max()
+    }
+}
+
+fn validate_execution_context(
+    request: &PlanRequest,
+    execution: &ExecutionPlanningContext,
+) -> Result<(), ScheduleError> {
+    if !execution.work_units.is_empty() && execution.snapshot_revision == 0 {
+        return Err(invalid_execution(
+            execution.work_units[0].item_id,
+            "snapshot revision must be positive when work-unit evidence is present",
+        ));
+    }
+    let item_ids: BTreeSet<_> = request.items.iter().map(|item| item.id).collect();
+    let mut identities = BTreeSet::new();
+    for unit in &execution.work_units {
+        if !item_ids.contains(&unit.item_id) {
+            return Err(invalid_execution(
+                unit.item_id,
+                format!("work unit references missing item {}", unit.item_id),
+            ));
+        }
+        if !identities.insert((unit.item_id, unit.occurrence_id)) {
+            return Err(invalid_execution(
+                unit.item_id,
+                format!(
+                    "duplicate work unit for item {} and occurrence {:?}",
+                    unit.item_id, unit.occurrence_id
+                ),
+            ));
+        }
+        validate_execution_work_unit(unit)?;
+    }
+    Ok(())
+}
+
+fn validate_execution_work_unit(unit: &ExecutionWorkUnit) -> Result<(), ScheduleError> {
+    if unit.progress_epoch == 0 {
+        return Err(invalid_execution(
+            unit.item_id,
+            format!(
+                "work unit for item {} has a zero progress epoch",
+                unit.item_id
+            ),
+        ));
+    }
+    if unit.disposition == Some(ExecutionDisposition::Skipped) && !unit.reservations.is_empty() {
+        return Err(invalid_execution(
+            unit.item_id,
+            format!(
+                "skipped work unit for item {} cannot retain reservations",
+                unit.item_id
+            ),
+        ));
+    }
+
+    let mut used = BTreeSet::new();
+    for index in &unit.used_session_indices {
+        if !used.insert(*index) {
+            return Err(invalid_execution(
+                unit.item_id,
+                format!(
+                    "work unit for item {} repeats historical session index {index}",
+                    unit.item_id
+                ),
+            ));
+        }
+    }
+    let historical_high_water = used.iter().next_back().copied();
+    let mut reservation_indices = BTreeSet::new();
+    for reservation in &unit.reservations {
+        validate_execution_reservation(unit.item_id, reservation, &used, historical_high_water)?;
+        if !reservation_indices.insert(reservation.session_index) {
+            return Err(invalid_execution(
+                unit.item_id,
+                format!(
+                    "work unit for item {} repeats reservation index {}",
+                    unit.item_id, reservation.session_index
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_execution_reservation(
+    item_id: ItemId,
+    reservation: &ExecutionReservation,
+    used: &BTreeSet<u16>,
+    historical_high_water: Option<u16>,
+) -> Result<(), ScheduleError> {
+    if reservation.start >= reservation.end {
+        return Err(invalid_execution(
+            item_id,
+            format!(
+                "reservation {} for item {item_id} has an empty window",
+                reservation.session_index
+            ),
+        ));
+    }
+    match reservation.kind {
+        ExecutionReservationKind::InFlight if !used.contains(&reservation.session_index) => {
+            Err(invalid_execution(
+                item_id,
+                format!(
+                    "in-flight reservation {} for item {item_id} is not historical",
+                    reservation.session_index
+                ),
+            ))
+        }
+        ExecutionReservationKind::DeferredReplacement {
+            source_session_index,
+        } if !used.contains(&source_session_index) => Err(invalid_execution(
+            item_id,
+            format!(
+                "deferred source index {source_session_index} for item {item_id} is not historical"
+            ),
+        )),
+        ExecutionReservationKind::DeferredReplacement { .. }
+            if used.contains(&reservation.session_index)
+                || historical_high_water.is_some_and(|high| reservation.session_index <= high) =>
+        {
+            Err(invalid_execution(
+                item_id,
+                format!(
+                    "deferred replacement index {} for item {item_id} is not fresh and monotonic",
+                    reservation.session_index
+                ),
+            ))
+        }
+        ExecutionReservationKind::InFlight
+        | ExecutionReservationKind::DeferredReplacement { .. } => Ok(()),
+    }
+}
+
+fn invalid_execution(item_id: ItemId, message: impl Into<String>) -> ScheduleError {
+    invalid_item(
+        item_id,
+        format!("invalid execution planning context: {}", message.into()),
+    )
+}
+
+fn apply_execution_context(
+    materialized_request: &PlanRequest,
+    identities: &BTreeMap<ItemId, MaterializedIdentity>,
+    execution: &ExecutionPlanningContext,
+) -> Result<(PlanRequest, MaterializedExecutionContext), ScheduleError> {
+    let source: BTreeMap<_, _> = execution
+        .work_units
+        .iter()
+        .map(|unit| ((unit.item_id, unit.occurrence_id), unit))
+        .collect();
+    let mut request = materialized_request.clone();
+    let mut materialized = MaterializedExecutionContext::default();
+    let mut matched = BTreeSet::new();
+
+    for item in &mut request.items {
+        let identity = identities
+            .get(&item.id)
+            .map_or((item.id, None), |identity| {
+                (identity.series_item_id, Some(identity.occurrence_id))
+            });
+        let Some(unit) = source.get(&identity) else {
+            continue;
+        };
+        matched.insert(identity);
+        if unit.disposition == Some(ExecutionDisposition::Skipped) {
+            item.status = crate::WorkStatus::Skipped;
+        } else if let Some(duration) = &mut item.duration {
+            let credited_minutes = ceil_seconds_to_minutes(unit.credited_seconds);
+            duration.remaining = Some(Minutes(
+                duration.expected.get().saturating_sub(credited_minutes),
+            ));
+        }
+        materialized.work_units.insert(
+            item.id,
+            MaterializedExecutionWorkUnit {
+                skipped: unit.disposition == Some(ExecutionDisposition::Skipped),
+                used_session_indices: unit.used_session_indices.iter().copied().collect(),
+                reservations: unit.reservations.clone(),
+            },
+        );
+    }
+
+    let horizon = Interval {
+        start: request.horizon_start,
+        end: request.horizon_end,
+    };
+    for (identity, unit) in source {
+        if matched.contains(&identity) {
+            continue;
+        }
+        if let Some(reservation) = unit.reservations.iter().find(|reservation| {
+            horizon.overlaps(Interval {
+                start: reservation.start,
+                end: reservation.end,
+            })
+        }) {
+            return Err(invalid_execution(
+                identity.0,
+                format!(
+                    "reservation for occurrence {:?}, session {} does not map to materialized work",
+                    identity.1, reservation.session_index
+                ),
+            ));
+        }
+    }
+
+    request.previous_assignments.retain_mut(|assignment| {
+        if let Some(unit) = materialized.work_units.get(&assignment.item_id) {
+            if unit.skipped {
+                assignment.blocks.clear();
+            } else if let Some(high_water) = unit.high_water() {
+                assignment
+                    .blocks
+                    .retain(|block| block.session_index > high_water);
+            }
+        }
+        !assignment.blocks.is_empty()
+    });
+
+    Ok((request, materialized))
+}
+
+fn ceil_seconds_to_minutes(seconds: u64) -> u32 {
+    let minutes = seconds.saturating_add(59) / 60;
+    u32::try_from(minutes).unwrap_or(u32::MAX)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Interval {
     start: OffsetDateTime,
@@ -402,10 +677,13 @@ struct PlanningState {
     score: PlanScore,
     previous: BTreeMap<(ItemId, u16), PreviousBlock>,
     pinned_minutes: BTreeMap<ItemId, u32>,
+    execution_reserved_minutes: BTreeMap<ItemId, u32>,
+    session_high_water: BTreeMap<ItemId, u16>,
+    live_session_indices: BTreeMap<ItemId, BTreeSet<u16>>,
 }
 
 impl PlanningState {
-    fn new(request: &PlanRequest) -> Self {
+    fn new(request: &PlanRequest, execution: &MaterializedExecutionContext) -> Self {
         let previous = request
             .previous_assignments
             .iter()
@@ -416,6 +694,11 @@ impl PlanningState {
                     .map(move |block| ((assignment.item_id, block.session_index), *block))
             })
             .collect();
+        let session_high_water = execution
+            .work_units
+            .iter()
+            .filter_map(|(item_id, unit)| unit.high_water().map(|index| (*item_id, index)))
+            .collect();
         Self {
             blocks: Vec::new(),
             busy: Vec::new(),
@@ -425,6 +708,9 @@ impl PlanningState {
             score: PlanScore::default(),
             previous,
             pinned_minutes: BTreeMap::new(),
+            execution_reserved_minutes: BTreeMap::new(),
+            session_high_water,
+            live_session_indices: BTreeMap::new(),
         }
     }
 
@@ -515,6 +801,83 @@ impl PlanningState {
         }
     }
 
+    fn add_execution_reservations(
+        &mut self,
+        request: &PlanRequest,
+        items: &BTreeMap<ItemId, &WorkItem>,
+        execution: &MaterializedExecutionContext,
+    ) -> Result<(), ScheduleError> {
+        let horizon = Interval {
+            start: request.horizon_start,
+            end: request.horizon_end,
+        };
+        for (item_id, unit) in &execution.work_units {
+            let item = items[item_id];
+            for reservation in &unit.reservations {
+                let interval = Interval {
+                    start: reservation.start,
+                    end: reservation.end,
+                };
+                *self.execution_reserved_minutes.entry(*item_id).or_default() = self
+                    .execution_reserved_minutes
+                    .get(item_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(ceil_duration_minutes(reservation.end - reservation.start));
+                self.live_session_indices
+                    .entry(*item_id)
+                    .or_default()
+                    .insert(reservation.session_index);
+
+                let contained = horizon.contains(interval);
+                let disjoint = !horizon.overlaps(interval);
+                if disjoint {
+                    continue;
+                }
+                if !contained {
+                    return Err(invalid_execution(
+                        *item_id,
+                        format!(
+                            "reservation session {} is only partly covered by the planning horizon",
+                            reservation.session_index
+                        ),
+                    ));
+                }
+                self.busy.push(BusyBlock {
+                    interval,
+                    item_id: Some(*item_id),
+                    pinned: true,
+                });
+                self.blocks.push(ScheduleBlock {
+                    id: block_id(*item_id, reservation.session_index, reservation.start),
+                    is_sensitive: item.is_sensitive,
+                    item_id: Some(*item_id),
+                    occurrence_id: None,
+                    external_block_id: None,
+                    title: item.title.clone(),
+                    start: reservation.start,
+                    end: reservation.end,
+                    session_index: reservation.session_index,
+                    kind: ScheduleBlockKind::Pinned,
+                    explanations: vec![PlacementExplanation {
+                        code: ExplanationCode::Pinned,
+                        message: "Reserved by authoritative execution state.".to_owned(),
+                    }],
+                });
+            }
+            if !unit.reservations.is_empty() {
+                self.decisions.push(PlanDecision {
+                    item_id: *item_id,
+                    occurrence_id: None,
+                    kind: DecisionKind::KeptPinned,
+                    message: "Authoritative execution reservations were preserved exactly."
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn add_pinned_assignments(
         &mut self,
         request: &PlanRequest,
@@ -533,6 +896,10 @@ impl PlanningState {
                 continue;
             }
             for block in &assignment.blocks {
+                self.session_high_water
+                    .entry(item.id)
+                    .and_modify(|current| *current = (*current).max(block.session_index))
+                    .or_insert(block.session_index);
                 let interval = Interval {
                     start: block.start,
                     end: block.end,
@@ -641,7 +1008,12 @@ impl PlanningState {
 
         let required = duration.planning_minutes().get();
         let pinned = self.pinned_minutes.get(&item.id).copied().unwrap_or(0);
-        let mut remaining = required.saturating_sub(pinned);
+        let execution_reserved = self
+            .execution_reserved_minutes
+            .get(&item.id)
+            .copied()
+            .unwrap_or(0);
+        let mut remaining = required.saturating_sub(pinned.saturating_add(execution_reserved));
         if remaining == 0 {
             self.score.scheduled_minutes = self.score.scheduled_minutes.saturating_add(required);
             return true;
@@ -652,13 +1024,27 @@ impl PlanningState {
             .iter()
             .filter(|block| block.item_id == Some(item.id))
             .collect();
-        let mut session_index = existing_blocks
+        let highest_existing = existing_blocks
             .iter()
             .map(|block| block.session_index)
-            .max()
-            .map_or(0, |index| index.saturating_add(1));
-        let existing_session_count = u16::try_from(existing_blocks.len()).unwrap_or(u16::MAX);
-        let mut sessions_added = 0_u16;
+            .max();
+        let highest_allocated = self
+            .session_high_water
+            .get(&item.id)
+            .copied()
+            .into_iter()
+            .chain(highest_existing)
+            .max();
+        let mut session_index = highest_allocated.map_or(Some(0), |index| index.checked_add(1));
+        let mut live_session_indices = self
+            .live_session_indices
+            .get(&item.id)
+            .cloned()
+            .unwrap_or_default();
+        live_session_indices.extend(existing_blocks.iter().map(|block| block.session_index));
+        let existing_session_count = live_session_indices.len();
+        let mut sessions_added = 0_usize;
+        let mut session_limit_hit = false;
         let mut previous_session_end = existing_blocks.iter().map(|block| block.end).max();
         let mut used_days: BTreeSet<_> = existing_blocks
             .iter()
@@ -667,19 +1053,23 @@ impl PlanningState {
 
         match &item.split_policy {
             SplitPolicy::Indivisible => {
-                if let Some(candidate) = self.best_candidate(
-                    request,
-                    item,
-                    dependencies,
-                    all_items,
-                    Minutes(remaining),
-                    session_index,
-                    None,
-                    &used_days,
-                    None,
-                ) {
-                    self.accept_candidate(item, candidate, session_index, false);
-                    remaining = 0;
+                if let Some(index) = session_index {
+                    if let Some(candidate) = self.best_candidate(
+                        request,
+                        item,
+                        dependencies,
+                        all_items,
+                        Minutes(remaining),
+                        index,
+                        None,
+                        &used_days,
+                        None,
+                    ) {
+                        self.accept_candidate(item, candidate, index, false);
+                        remaining = 0;
+                    }
+                } else {
+                    session_limit_hit = true;
                 }
             }
             SplitPolicy::Splittable {
@@ -689,9 +1079,17 @@ impl PlanningState {
                 minimum_gap,
                 maximum_days,
             } => {
-                while remaining > 0
-                    && existing_session_count.saturating_add(sessions_added) < *maximum_sessions
-                {
+                while remaining > 0 {
+                    if existing_session_count.saturating_add(sessions_added)
+                        >= usize::from(*maximum_sessions)
+                    {
+                        session_limit_hit = true;
+                        break;
+                    }
+                    let Some(index) = session_index else {
+                        session_limit_hit = true;
+                        break;
+                    };
                     let mut size = remaining.min(maximum_session.get());
                     let granularity = request.config.slot_granularity.get();
                     let minimum = minimum_session.get().min(remaining);
@@ -708,7 +1106,7 @@ impl PlanningState {
                                 dependencies,
                                 all_items,
                                 Minutes(size),
-                                session_index,
+                                index,
                                 previous_session_end.map(|end| {
                                     end + Duration::minutes(i64::from(minimum_gap.get()))
                                 }),
@@ -730,9 +1128,9 @@ impl PlanningState {
                     };
                     previous_session_end = Some(candidate.interval.end);
                     used_days.insert(candidate.interval.start.date());
-                    self.accept_candidate(item, candidate, session_index, true);
+                    self.accept_candidate(item, candidate, index, true);
                     remaining = remaining.saturating_sub(size);
-                    session_index = session_index.saturating_add(1);
+                    session_index = index.checked_add(1);
                     sessions_added = sessions_added.saturating_add(1);
                 }
             }
@@ -749,9 +1147,7 @@ impl PlanningState {
             });
             true
         } else {
-            let reason = if matches!(item.split_policy, SplitPolicy::Splittable { .. })
-                && sessions_added > 0
-            {
+            let reason = if session_limit_hit {
                 UnscheduledReason::SessionLimit
             } else {
                 UnscheduledReason::NoCapacity
@@ -763,9 +1159,15 @@ impl PlanningState {
                 occurrence_id: None,
                 remaining: Minutes(remaining),
                 reason,
-                message: format!(
-                    "No valid capacity for the remaining {remaining} minutes inside the horizon."
-                ),
+                message: if session_limit_hit {
+                    format!(
+                        "The session limit or semantic index space leaves {remaining} minutes unscheduled."
+                    )
+                } else {
+                    format!(
+                        "No valid capacity for the remaining {remaining} minutes inside the horizon."
+                    )
+                },
             });
             self.violations.push(PlanViolation {
                 kind: ViolationKind::Capacity,
@@ -1381,7 +1783,7 @@ impl PlanningState {
         if split {
             candidate.explanations.push(explanation(
                 ExplanationCode::SplitSession,
-                format!("Session {} of split work.", session_index + 1),
+                format!("Session {} of split work.", u32::from(session_index) + 1),
             ));
         }
         self.score.soft_penalty = self.score.soft_penalty.saturating_add(candidate.penalty);
@@ -1914,6 +2316,13 @@ fn align_up(value: OffsetDateTime, granularity: Minutes) -> OffsetDateTime {
 
 fn positive_minutes(duration: Duration) -> u32 {
     u32::try_from(duration.whole_minutes().max(0)).unwrap_or(u32::MAX)
+}
+
+fn ceil_duration_minutes(duration: Duration) -> u32 {
+    const NANOS_PER_MINUTE: i128 = 60_000_000_000;
+    let nanoseconds = duration.whole_nanoseconds().max(0);
+    let minutes = nanoseconds.saturating_add(NANOS_PER_MINUTE - 1) / NANOS_PER_MINUTE;
+    u32::try_from(minutes).unwrap_or(u32::MAX)
 }
 
 fn overlap_minutes(left: Interval, right: Interval) -> u32 {

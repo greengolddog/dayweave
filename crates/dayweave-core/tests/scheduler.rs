@@ -66,6 +66,29 @@ fn planned<'a>(plan: &'a SchedulePlan, item: &WorkItem) -> Vec<&'a ScheduleBlock
         .collect()
 }
 
+fn execution_context(work_units: Vec<ExecutionWorkUnit>) -> ExecutionPlanningContext {
+    ExecutionPlanningContext {
+        snapshot_revision: 1,
+        work_units,
+    }
+}
+
+fn execution_work(
+    item_id: ItemId,
+    credited_seconds: u64,
+    used_session_indices: Vec<u16>,
+) -> ExecutionWorkUnit {
+    ExecutionWorkUnit {
+        item_id,
+        occurrence_id: None,
+        progress_epoch: 1,
+        credited_seconds,
+        disposition: None,
+        used_session_indices,
+        reservations: Vec::new(),
+    }
+}
+
 #[test]
 fn sensitivity_is_output_metadata_and_never_changes_placement() {
     let ordinary = item(9_001, "SYNTHETIC-SENSITIVE-SCHEDULER-CANARY", 60);
@@ -496,4 +519,206 @@ fn property_style_permutations_keep_invariants_and_same_plan() {
             }
         }
     }
+}
+
+#[test]
+fn execution_credit_reduces_remaining_once_and_uses_a_fresh_index() {
+    let task = item(200, "Partly complete", 60);
+    let input = request(vec![task.clone()]);
+    let execution = execution_context(vec![execution_work(task.id, 20 * 60 + 1, vec![0])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    let blocks = planned(&plan, &task);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].session_index, 1);
+    assert_eq!((blocks[0].end - blocks[0].start).whole_minutes(), 39);
+    assert!(plan.unscheduled.is_empty());
+}
+
+#[test]
+fn zero_execution_credit_preserves_demand_but_advances_the_index() {
+    let task = item(201, "Zero-credit completion", 60);
+    let input = request(vec![task.clone()]);
+    let execution = execution_context(vec![execution_work(task.id, 0, vec![0])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    let blocks = planned(&plan, &task);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].session_index, 1);
+    assert_eq!((blocks[0].end - blocks[0].start).whole_minutes(), 60);
+}
+
+#[test]
+fn skipped_execution_unit_does_not_suppress_other_work() {
+    let skipped = item(202, "Skip only this", 60);
+    let retained = item(203, "Still required", 60);
+    let mut input = request(vec![skipped.clone(), retained.clone()]);
+    input.previous_assignments.push(PreviousAssignment {
+        item_id: skipped.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(12),
+            end: DAY + Duration::hours(13),
+            session_index: 5,
+        }],
+        pinned: true,
+    });
+    let mut skipped_work = execution_work(skipped.id, 0, vec![0]);
+    skipped_work.disposition = Some(ExecutionDisposition::Skipped);
+
+    let plan = Scheduler
+        .plan_with_execution(&input, &execution_context(vec![skipped_work]))
+        .unwrap();
+    assert!(plan.blocks_for(skipped.id).next().is_none());
+    assert_eq!(planned(&plan, &retained).len(), 1);
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.item_id == skipped.id && decision.kind == DecisionKind::TerminalItemIgnored
+    }));
+}
+
+#[test]
+fn deferred_replacement_is_exact_and_new_work_starts_after_it() {
+    let task = item(204, "Deferred split work", 90);
+    let input = request(vec![task.clone()]);
+    let mut work = execution_work(task.id, 30 * 60, vec![0]);
+    work.reservations.push(ExecutionReservation {
+        session_index: 1,
+        start: DAY + Duration::hours(10),
+        end: DAY + Duration::hours(10) + Duration::minutes(30),
+        kind: ExecutionReservationKind::DeferredReplacement {
+            source_session_index: 0,
+        },
+    });
+
+    let plan = Scheduler
+        .plan_with_execution(&input, &execution_context(vec![work]))
+        .unwrap();
+    let pinned = plan
+        .blocks_for(task.id)
+        .find(|block| block.kind == ScheduleBlockKind::Pinned)
+        .unwrap();
+    assert_eq!(pinned.session_index, 1);
+    assert_eq!(pinned.start, DAY + Duration::hours(10));
+    assert_eq!(
+        pinned.end,
+        DAY + Duration::hours(10) + Duration::minutes(30)
+    );
+    let planned = planned(&plan, &task);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].session_index, 2);
+    assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 30);
+}
+
+#[test]
+fn disjoint_execution_reservation_reduces_demand_without_emitting_a_block() {
+    let task = item(205, "Reserved outside this horizon", 60);
+    let input = request(vec![task.clone()]);
+    let mut work = execution_work(task.id, 0, vec![0]);
+    work.reservations.push(ExecutionReservation {
+        session_index: 1,
+        start: DAY + Duration::days(3),
+        end: DAY + Duration::days(3) + Duration::minutes(30),
+        kind: ExecutionReservationKind::DeferredReplacement {
+            source_session_index: 0,
+        },
+    });
+
+    let plan = Scheduler
+        .plan_with_execution(&input, &execution_context(vec![work]))
+        .unwrap();
+    assert!(
+        plan.blocks_for(task.id)
+            .all(|block| block.kind != ScheduleBlockKind::Pinned)
+    );
+    let planned = planned(&plan, &task);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].session_index, 2);
+    assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 30);
+}
+
+#[test]
+fn partially_covered_execution_reservation_is_rejected() {
+    let task = item(206, "Partly outside", 60);
+    let input = request(vec![task.clone()]);
+    let mut work = execution_work(task.id, 0, vec![0]);
+    work.reservations.push(ExecutionReservation {
+        session_index: 1,
+        start: DAY - Duration::minutes(30),
+        end: DAY + Duration::minutes(30),
+        kind: ExecutionReservationKind::DeferredReplacement {
+            source_session_index: 0,
+        },
+    });
+
+    assert!(matches!(
+        Scheduler.plan_with_execution(&input, &execution_context(vec![work])),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == task.id && message.contains("only partly covered")
+    ));
+}
+
+#[test]
+fn caller_blocks_at_or_below_execution_high_water_are_removed() {
+    let task = item(207, "Do not resurrect old blocks", 60);
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments.push(PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(9),
+            end: DAY + Duration::hours(9) + Duration::minutes(30),
+            session_index: 1,
+        }],
+        pinned: true,
+    });
+    let execution = execution_context(vec![execution_work(task.id, 0, vec![0, 2])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    assert!(
+        plan.blocks_for(task.id)
+            .all(|block| block.kind != ScheduleBlockKind::Pinned)
+    );
+    let planned = planned(&plan, &task);
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].session_index, 3);
+    assert_eq!((planned[0].end - planned[0].start).whole_minutes(), 60);
+}
+
+#[test]
+fn terminal_history_does_not_consume_the_live_maximum_session_count() {
+    let mut task = item(208, "History is not live capacity", 60);
+    task.split_policy = SplitPolicy::Splittable {
+        minimum_session: Minutes(30),
+        maximum_session: Minutes(30),
+        maximum_sessions: 2,
+        minimum_gap: Minutes::ZERO,
+        maximum_days: None,
+    };
+    let input = request(vec![task.clone()]);
+    let execution = execution_context(vec![execution_work(task.id, 0, vec![0, 1, 2, 3])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    let blocks = planned(&plan, &task);
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(
+        blocks
+            .iter()
+            .map(|block| block.session_index)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    assert!(plan.unscheduled.is_empty());
+}
+
+#[test]
+fn exhausted_u16_session_space_never_reuses_the_last_index() {
+    let task = item(209, "No index reuse", 60);
+    let input = request(vec![task.clone()]);
+    let execution = execution_context(vec![execution_work(task.id, 0, vec![u16::MAX])]);
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    assert!(plan.blocks_for(task.id).next().is_none());
+    assert_eq!(plan.unscheduled.len(), 1);
+    assert_eq!(plan.unscheduled[0].reason, UnscheduledReason::SessionLimit);
+    assert_eq!(plan.unscheduled[0].remaining, Minutes(60));
 }

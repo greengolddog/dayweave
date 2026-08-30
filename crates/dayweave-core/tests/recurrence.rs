@@ -285,6 +285,70 @@ fn completed_paused_skipped_and_moved_occurrences_integrate_with_planning() {
 }
 
 #[test]
+fn execution_evidence_maps_only_to_its_exact_recurring_occurrence() {
+    let item = recurring_item(801, Recurrence::Daily { times_per_day: 1 });
+    let mut input = request(item.clone(), START, START + Duration::days(2));
+    input.availability = all_day_availability(START, 2);
+    let occurrences = expand_occurrences(&input).unwrap();
+    assert_eq!(occurrences.len(), 2);
+    let execution = ExecutionPlanningContext {
+        snapshot_revision: 1,
+        work_units: vec![ExecutionWorkUnit {
+            item_id: item.id,
+            occurrence_id: Some(occurrences[0].id),
+            progress_epoch: 1,
+            credited_seconds: 0,
+            disposition: Some(ExecutionDisposition::Skipped),
+            used_session_indices: vec![0],
+            reservations: Vec::new(),
+        }],
+    };
+
+    let plan = Scheduler.plan_with_execution(&input, &execution).unwrap();
+    let blocks: Vec<_> = plan.blocks_for(item.id).collect();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].occurrence_id, Some(occurrences[1].id));
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.occurrence_id == Some(occurrences[0].id)
+            && decision.kind == DecisionKind::TerminalItemIgnored
+    }));
+}
+
+#[test]
+fn overlapping_reservation_for_unmaterialized_occurrence_fails_closed() {
+    let item = recurring_item(802, Recurrence::Daily { times_per_day: 1 });
+    let input = request(item.clone(), START, START + Duration::days(1));
+    let missing_occurrence = OccurrenceId(Uuid::from_u128(999_802));
+    let execution = ExecutionPlanningContext {
+        snapshot_revision: 1,
+        work_units: vec![ExecutionWorkUnit {
+            item_id: item.id,
+            occurrence_id: Some(missing_occurrence),
+            progress_epoch: 1,
+            credited_seconds: 0,
+            disposition: None,
+            used_session_indices: vec![0],
+            reservations: vec![ExecutionReservation {
+                session_index: 1,
+                start: START + Duration::hours(8),
+                end: START + Duration::hours(9),
+                kind: ExecutionReservationKind::DeferredReplacement {
+                    source_session_index: 0,
+                },
+            }],
+        }],
+    };
+
+    assert!(matches!(
+        Scheduler.plan_with_execution(&input, &execution),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == item.id
+                && message.contains(&missing_occurrence.to_string())
+                && message.contains("does not map to materialized work")
+    ));
+}
+
+#[test]
 fn explicit_timezone_days_preserve_spring_and_fall_dst_lengths() {
     let item = recurring_item(9, Recurrence::Daily { times_per_day: 2 });
     let spring_start = datetime!(2026-03-28 0:00 +01:00);

@@ -732,6 +732,76 @@ pub struct PreviousBlock {
     pub session_index: u16,
 }
 
+/// Server-authoritative execution evidence used to recompose unfinished work.
+///
+/// This is deliberately separate from [`PlanRequest`]. Local callers that do
+/// not have a durable execution ledger keep the original planning wire shape,
+/// while authoritative callers can prevent completed semantic sessions from
+/// being recreated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecutionPlanningContext {
+    /// Monotonic snapshot fence owned by the execution repository.
+    pub snapshot_revision: u64,
+    /// One normalized entry per canonical item and occurrence in the current
+    /// progress epoch.
+    pub work_units: Vec<ExecutionWorkUnit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionWorkUnit {
+    pub item_id: ItemId,
+    #[serde(default)]
+    pub occurrence_id: Option<OccurrenceId>,
+    /// Stable across ordinary canonical item revisions. An explicit progress
+    /// reset advances the epoch without permitting old session indices to be
+    /// reused.
+    pub progress_epoch: u64,
+    /// Authoritative completed effort for this epoch, summed in seconds before
+    /// the minute-precision scheduler rounds it once.
+    pub credited_seconds: u64,
+    /// `Some(Skipped)` waives the remaining demand for only this exact work
+    /// unit. Absence means that residual work remains schedulable.
+    #[serde(default)]
+    pub disposition: Option<ExecutionDisposition>,
+    /// Every historical semantic index, across item revisions and progress
+    /// epochs. These indices are never eligible for allocation again.
+    #[serde(default)]
+    pub used_session_indices: Vec<u16>,
+    /// Exact live reservations. Deferred replacements use a new index while
+    /// retaining their terminal source index in `used_session_indices`.
+    #[serde(default)]
+    pub reservations: Vec<ExecutionReservation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDisposition {
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionReservation {
+    pub session_index: u16,
+    #[serde(with = "time::serde::rfc3339")]
+    pub start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end: OffsetDateTime,
+    pub kind: ExecutionReservationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExecutionReservationKind {
+    /// An already-started active or paused semantic session.
+    InFlight,
+    /// A terminal defer's exact future replacement. The replacement index is
+    /// fresh; the source index remains immutable history.
+    DeferredReplacement { source_session_index: u16 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulerConfig {
     pub slot_granularity: Minutes,
