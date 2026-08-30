@@ -9,7 +9,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use dayweave_core::{
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
-    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, ScheduleBlockKind,
+    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, ScheduleBlockKind, Scheduler,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,15 +30,16 @@ use crate::{
 
 use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp, ComposeScheduleResult, ConflictQuery,
-    ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary, ManualPlacementInput,
-    ManualPlacementViolationOutput, PlacementAlternative, PlacementExplanation, PlacementReason,
-    PlanOperationKind, PlanningSimulationPort, PreviousAssignmentInput, PreviousBlockInput,
-    ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
-    ProposalSubmissionSpec, RetainedManualPlacementCatalog, SCHEDULER_PUBLICATION_SCHEMA,
-    ScheduleAccess, ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery,
-    ScheduleQueryPort, ScheduleView, SchedulingPortError, SimulatedBlockMove,
-    SimulationConsumption, SimulationIssue, SimulationProposalEvidence, SimulationRequest,
-    SimulationResult, has_postgres_timestamp_precision, materialize_proposal,
+    ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary,
+    MANUAL_PLACEMENT_PUBLICATION_SCHEMA, ManualPlacementInput, ManualPlacementViolationOutput,
+    PlacementAlternative, PlacementExplanation, PlacementReason, PlanOperationKind,
+    PlanningSimulationPort, PreviousAssignmentInput, PreviousBlockInput, ProposalSubmissionError,
+    ProposalSubmissionPort, ProposalSubmissionResult, ProposalSubmissionSpec,
+    RetainedManualPlacementCatalog, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess,
+    ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
+    ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationConsumption, SimulationIssue,
+    SimulationProposalEvidence, SimulationRequest, SimulationResult,
+    has_postgres_timestamp_precision, materialize_proposal,
     proposal_bridge::{
         OperationCompilation, RequestCompilation, classify_request, compile_operation,
         finish_evidence, parent_item_id, target_item_id,
@@ -2107,9 +2108,10 @@ fn durable_snapshot(
         })
         .collect::<Result<Vec<_>, SchedulePublicationError>>()?;
     let snapshot = json!({
-        "schema_version": 4,
+        "schema_version": 5,
         "scheduler_publication_schema": SCHEDULER_PUBLICATION_SCHEMA,
         "compose": result,
+        "planning_request": &result.planning_request,
         "execution_planning": &result.planning_evidence,
         "evidence": {
             "source_item_sensitivity": result.source_item_sensitivity,
@@ -2499,7 +2501,7 @@ async fn current_published_assignments_tx(
     let Some((revision_id, solver_version)) = published else {
         return Ok((None, Vec::new(), Vec::new()));
     };
-    let retained_manual_placements = if solver_version == SCHEDULER_PUBLICATION_SCHEMA {
+    let retained_manual_placements = if supports_retained_manual_placement_schema(&solver_version) {
         let value: Option<Value> = sqlx::query_scalar(
             "SELECT result_snapshot -> 'manual_placement_state' \
              FROM schedule_revision_details \
@@ -2614,6 +2616,13 @@ async fn current_published_assignments_tx(
     ))
 }
 
+fn supports_retained_manual_placement_schema(schema: &str) -> bool {
+    matches!(
+        schema,
+        SCHEDULER_PUBLICATION_SCHEMA | MANUAL_PLACEMENT_PUBLICATION_SCHEMA
+    )
+}
+
 fn validate_retained_manual_placement_state(
     previous_assignments: &[PreviousAssignmentInput],
     retained: &[PersistedManualPlacementState],
@@ -2717,11 +2726,41 @@ pub(super) fn validate_publishable_compose_result(
     timezone_name: &str,
     result: &ComposeScheduleResult,
 ) -> Result<([u8; 32], Value), SchedulePublicationError> {
-    validate_publication_result(result)?;
+    validate_composed_result_for_schema(SCHEDULER_PUBLICATION_SCHEMA, timezone_name, result)?;
     let publication_hash = publication_content_hash(timezone_name, result)?;
     let manual_placement_state = persisted_manual_placement_state(result)?;
     let snapshot = durable_snapshot(result, &publication_hash, &[], &manual_placement_state)?;
     Ok((publication_hash, snapshot))
+}
+
+pub(super) fn validate_composed_result_for_schema(
+    scheduler_publication_schema: &str,
+    timezone_name: &str,
+    result: &ComposeScheduleResult,
+) -> Result<(), SchedulePublicationError> {
+    validate_publication_result(result)?;
+    let expected_input_digest = super::compose::request_digest(
+        scheduler_publication_schema,
+        timezone_name,
+        &result.source_item_revisions,
+        &result.calendar_projection_stamps,
+        &result.planning_evidence.execution,
+        &result.planning_request,
+    )
+    .map_err(|_| SchedulePublicationError::InvalidPayload)?;
+    if expected_input_digest != result.input_digest {
+        return Err(SchedulePublicationError::InvalidPayload);
+    }
+    let expected_plan = Scheduler
+        .plan_with_execution(
+            &result.planning_request,
+            &result.planning_evidence.execution,
+        )
+        .map_err(|_| SchedulePublicationError::InvalidPayload)?;
+    if expected_plan != *result.plan {
+        return Err(SchedulePublicationError::InvalidPayload);
+    }
+    Ok(())
 }
 
 fn validate_publication_result(
@@ -2941,6 +2980,7 @@ pub(crate) fn publication_content_hash(
         scheduler_publication_schema: &'static str,
         timezone_name: &'a str,
         result: &'a ComposeScheduleResult,
+        planning_request: &'a dayweave_core::PlanRequest,
         manual_placements: &'a [ManualPlacementInput],
         manual_placement_releases: &'a [super::ManualPlacementReleaseInput],
         execution_planning: &'a ExecutionPlanningContext,
@@ -2948,10 +2988,11 @@ pub(crate) fn publication_content_hash(
         calendar_projection_stamps: &'a [CalendarProjectionStamp],
     }
     let bytes = serde_json::to_vec(&Content {
-        domain: "dayweave.schedule-publication-content.v2",
+        domain: "dayweave.schedule-publication-content.v3",
         scheduler_publication_schema: SCHEDULER_PUBLICATION_SCHEMA,
         timezone_name,
         result,
+        planning_request: &result.planning_request,
         manual_placements: &result.manual_placements,
         manual_placement_releases: &result.manual_placement_releases,
         execution_planning: &result.planning_evidence.execution,
@@ -4441,6 +4482,19 @@ mod tests {
             block_kind_name(ScheduleBlockKind::ExternalFixed),
             "external_fixed"
         );
+    }
+
+    #[test]
+    fn retained_manual_placements_accept_current_and_previous_private_schemas() {
+        assert!(supports_retained_manual_placement_schema(
+            SCHEDULER_PUBLICATION_SCHEMA
+        ));
+        assert!(supports_retained_manual_placement_schema(
+            MANUAL_PLACEMENT_PUBLICATION_SCHEMA
+        ));
+        assert!(!supports_retained_manual_placement_schema(
+            "dayweave-scheduler-publication/3"
+        ));
     }
 
     #[test]

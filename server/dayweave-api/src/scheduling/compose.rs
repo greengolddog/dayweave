@@ -78,6 +78,12 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) manual_placement_releases: Vec<ManualPlacementReleaseInput>,
+    /// Exact normalized scheduler input retained only in the private durable
+    /// publication snapshot. Execution defer assessment reuses this policy so
+    /// callers cannot weaken availability or constraints at approval time.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) planning_request: PlanRequest,
     /// Canonical items accepted by this scheduler schema. This includes Inbox
     /// subtrees and retained nonblocking calendar context even though neither
     /// emits a work item or schedule block.
@@ -1183,19 +1189,27 @@ fn compose_prepared_for_schema(
         planning_evidence,
         manual_placements,
         manual_placement_releases,
+        planning_request: plan_request.clone(),
         accepted_item_count,
         rejected_items,
         ignored_previous_assignments,
         manual_placement_assessments,
         plan: Rfc3339SchedulePlan(plan),
     };
-    super::postgres::validate_publishable_compose_result(&timezone_name, &result).map_err(
-        |_| {
-            ComposeScheduleError::InvalidRequest(
-                "composed schedule exceeds the durable publication contract".to_owned(),
-            )
-        },
-    )?;
+    let validation = if scheduler_publication_schema == super::SCHEDULER_PUBLICATION_SCHEMA {
+        super::postgres::validate_publishable_compose_result(&timezone_name, &result).map(|_| ())
+    } else {
+        super::postgres::validate_composed_result_for_schema(
+            scheduler_publication_schema,
+            &timezone_name,
+            &result,
+        )
+    };
+    validation.map_err(|_| {
+        ComposeScheduleError::InvalidRequest(
+            "composed schedule exceeds the durable publication contract".to_owned(),
+        )
+    })?;
     Ok(result)
 }
 
@@ -1492,7 +1506,7 @@ fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.format(&Rfc3339)
 }
 
-fn request_digest(
+pub(super) fn request_digest(
     scheduler_publication_schema: &str,
     timezone_name: &str,
     source_item_revisions: &BTreeMap<Uuid, u64>,
@@ -1636,17 +1650,17 @@ mod tests {
 
     #[test]
     fn composes_canonical_item_and_is_digest_stable() {
-        const V4_DIGEST: &str =
-            "sha256:cda24bc7077b64f0a9227ae1ffd76321d693dc3dd9c0ffd05980d8fc77d8a046";
-        const V4_RESPONSE: &str = r#"{"input_digest":"sha256:cda24bc7077b64f0a9227ae1ffd76321d693dc3dd9c0ffd05980d8fc77d8a046","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
+        const V5_DIGEST: &str =
+            "sha256:bdf9e77bbfd56d28bfc8743fbefe8782b77c7ebbcba1e330b14cb49f36e8077a";
+        const V5_RESPONSE: &str = r#"{"input_digest":"sha256:bdf9e77bbfd56d28bfc8743fbefe8782b77c7ebbcba1e330b14cb49f36e8077a","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
         let item = canonical_item(Uuid::from_u128(1));
         let first = compose_items(vec![item.clone()], preview_request()).unwrap();
         let second = compose_items(vec![item], preview_request()).unwrap();
         assert_eq!(first.input_digest, second.input_digest);
-        assert_eq!(first.input_digest, V4_DIGEST);
+        assert_eq!(first.input_digest, V5_DIGEST);
         assert_eq!(
             serde_json::to_string(&first).expect("migrated response encoding"),
-            V4_RESPONSE
+            V5_RESPONSE
         );
         assert_eq!(first.accepted_item_count, 1);
         assert_eq!(
@@ -1655,6 +1669,26 @@ mod tests {
         );
         assert_eq!(first.plan.blocks.len(), 1);
         assert!(first.input_digest.starts_with("sha256:"));
+        let public = serde_json::to_value(&first).expect("public response must serialize");
+        assert!(public.get("planning_request").is_none());
+        let (_, snapshot) =
+            super::super::postgres::validate_publishable_compose_result("Europe/Madrid", &first)
+                .expect("composed response must remain publishable");
+        assert_eq!(snapshot.get("schema_version"), Some(&json!(5)));
+        assert_eq!(
+            snapshot.get("planning_request"),
+            Some(
+                &serde_json::to_value(&first.planning_request)
+                    .expect("private planning request must serialize")
+            )
+        );
+
+        let mut tampered = first;
+        tampered.planning_request.config.stability_weight += 1;
+        assert_eq!(
+            super::super::postgres::validate_publishable_compose_result("Europe/Madrid", &tampered,),
+            Err(super::super::postgres::SchedulePublicationError::InvalidPayload)
+        );
     }
 
     #[test]

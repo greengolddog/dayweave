@@ -563,7 +563,7 @@ async fn durable_snapshot_limit_rejects_before_publication_journaling() {
         .oneshot(request(
             "POST",
             "/v1/schedule/preview",
-            Some(request_with_blocks(3_200)),
+            Some(request_with_blocks(1_500)),
             true,
             None,
         ))
@@ -575,7 +575,7 @@ async fn durable_snapshot_limit_rejects_before_publication_journaling() {
         .oneshot(request(
             "POST",
             "/v1/schedule/preview",
-            Some(request_with_blocks(4_000)),
+            Some(request_with_blocks(2_500)),
             true,
             None,
         ))

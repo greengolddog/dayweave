@@ -46,6 +46,14 @@ and exact active, paused, or deferred reservations. It is bound into the digest
 and durable publication snapshot but is not exposed in the public preview
 schema.
 
+Private durable publication evidence uses schema v5 and retains the exact
+normalized `PlanRequest` passed to the solver, including availability, fixed
+blocks, scheduler config, and recurrence context. That private policy capsule is
+bound to the immutable published revision and its digests and is not exposed in
+the public preview or revision response. A future server-side Defer assessment
+must reload this v5 capsule; it must not accept a caller-supplied substitute that
+omits constraints or otherwise weakens the policy that produced the schedule.
+
 Caller-requested exact positioning uses `manual_placements`, never
 `previous_assignments`. Each proposal has a fresh UUID, the exact current
 published schedule revision (or `null` only before the first publication), and
@@ -186,7 +194,7 @@ exactly one detail; supersedes the old current revision; seals the draft as
 published; and writes the receipt and audit row, all in one transaction.
 Content insertion is allowed only while the parent is draft, and blocks/details
 become immutable after the seal. A fresh key whose solver-versioned publication
-content and private v4 evidence are identical to the current revision binds to
+content and private v5 evidence are identical to the current revision binds to
 that existing revision without revision churn.
 An expected-digest mismatch or canonical item change during the transaction is
 `409 schedule_publication_stale`. That stable code proves no publication was
@@ -236,7 +244,7 @@ closed when that proof is required.
 approvals return `409 schedule_publication_stale` (or `422` for malformed
 shape) and commit nothing. Conflict-free and safely carried-forward placements
 must not be echoed as approvals. Accepted facts, authorization origin, and
-digests are stored in private v4 revision evidence, on every affected block,
+digests are stored in private v5 revision evidence, on every affected block,
 and in content-free publication audit metadata.
 
 Both first publication and exact idempotent replay return `200`; `replayed` is
@@ -334,6 +342,12 @@ simulation return the stable `republish_required` result until the native app
 previews and publishes one fresh revision. Operators must complete that fresh
 publication before enabling remote MCP access. Legacy drafts remain drafts and
 may be discarded normally; they are never promoted by the migration.
+
+Published revisions with earlier private evidence versions remain readable and
+immutable, and existing idempotency receipts retain their documented replay
+behavior. Those revisions do not contain the authoritative normalized
+`PlanRequest`, however, so they cannot be used for future server-side Defer
+assessment; the native app must publish a fresh v5 revision first.
 
 The publication `idempotency_key` is a random client-generated UUID and a
 non-secret correlation identifier, not a bearer capability. It is intentionally
