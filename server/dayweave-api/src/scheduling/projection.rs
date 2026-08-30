@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -9,7 +9,8 @@ use uuid::Uuid;
 /// Provider account, calendar, series, event and occurrence identifiers never
 /// cross this boundary. The local collection UUID is sufficient to bind a
 /// preview to one durable projection generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CalendarProjectionStamp {
     pub collection_id: Uuid,
     pub collection_revision: u64,

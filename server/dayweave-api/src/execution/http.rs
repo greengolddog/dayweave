@@ -20,8 +20,9 @@ use crate::{
 };
 
 use super::{
-    ExecutionCommand, ExecutionDomainError, ExecutionIdempotencyKey, ExecutionMutation,
-    ExecutionRepositoryError, ExecutionServiceError, ExecutionSession, ExecutionSnapshot,
+    DeferAssessment, DeferAssessmentRequest, ExecutionCommand, ExecutionDomainError,
+    ExecutionIdempotencyKey, ExecutionMutation, ExecutionRepositoryError, ExecutionServiceError,
+    ExecutionSession, ExecutionSnapshot,
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
@@ -32,6 +33,7 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/execution", get(get_execution))
         .route("/execution/commands", post(apply_execution_command))
+        .route("/execution/defer-assessments", post(assess_defer))
         .route("/execution/history", get(execution_history))
 }
 
@@ -57,6 +59,11 @@ pub(crate) struct ExecutionSnapshotEnvelope {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ExecutionMutationEnvelope {
     pub mutation: ExecutionMutation,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DeferAssessmentEnvelope {
+    pub assessment: DeferAssessment,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -123,6 +130,37 @@ pub(crate) async fn apply_execution_command(
         HeaderValue::from_static(if replayed { "true" } else { "false" }),
     );
     Ok(response)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/execution/defer-assessments",
+    tag = "execution",
+    security(("bearer_token" = [])),
+    request_body = DeferAssessmentRequest,
+    responses(
+        (status = 200, description = "Exact content-free assessment for a paused session defer", body = DeferAssessmentEnvelope),
+        (status = 400, description = "Malformed assessment JSON", body = crate::error::ErrorEnvelope),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 404, description = "Execution session not found", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale execution, schedule, item, Calendar, or target evidence", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid defer target", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable assessment support is unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn assess_defer(
+    State(state): State<AppState>,
+    request: Result<Json<DeferAssessmentRequest>, JsonRejection>,
+) -> Result<Json<DeferAssessmentEnvelope>, ApiError> {
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
+    let assessment = state
+        .execution
+        .assess_defer(request)
+        .await
+        .map_err(map_execution_error)?;
+    Ok(Json(DeferAssessmentEnvelope { assessment }))
 }
 
 #[utoipa::path(
@@ -230,6 +268,31 @@ fn map_execution_error(error: ExecutionServiceError) -> ApiError {
                 "the deferred move window must exactly match the unfinished planned duration",
             )
         }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferRequiresPause) => {
+            ApiError::execution_defer_requires_pause(
+                "pause the current execution before choosing a later time",
+            )
+        }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferAssessmentUnavailable) => {
+            ApiError::unavailable(
+                "durable defer assessment requires PostgreSQL and a fresh published schedule",
+            )
+        }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferAssessmentStale) => {
+            ApiError::execution_defer_assessment_stale(
+                "the defer assessment is missing, expired, or no longer matches current state",
+            )
+        }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferApprovalRequired) => {
+            ApiError::execution_defer_approval_required(
+                "the current defer assessment requires exact user approval",
+            )
+        }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferApprovalInvalid) => {
+            ApiError::execution_defer_approval_invalid(
+                "the supplied defer approval does not exactly match the current assessment",
+            )
+        }
         ExecutionServiceError::InvalidIdempotencyKey => {
             ApiError::validation("Idempotency-Key must be 8-128 URL-safe ASCII characters")
         }
@@ -290,6 +353,21 @@ mod tests {
             .expect("read error envelope");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("decode error envelope");
         assert_eq!(body["error"]["code"], "execution_defer_duration_conflict");
+        assert!(body["error"].get("details").is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_assessment_evidence_has_its_own_stable_recovery_code() {
+        let response = map_execution_error(ExecutionServiceError::Repository(
+            ExecutionRepositoryError::DeferAssessmentStale,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error envelope");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("decode error envelope");
+        assert_eq!(body["error"]["code"], "execution_defer_assessment_stale");
         assert!(body["error"].get("details").is_none());
     }
 }

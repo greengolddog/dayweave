@@ -31,7 +31,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21
         ]
     );
 
@@ -56,6 +56,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0018_execution_defer.sql"),
         include_str!("../migrations/0019_schedule_deferred_placements.sql"),
         include_str!("../migrations/0020_execution_progress_ledger.sql"),
+        include_str!("../migrations/0021_execution_defer_approval.sql"),
     ]
     .join("\n");
     for table in [
@@ -85,6 +86,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "execution_state",
         "schedule_deferred_placements",
         "execution_session_schedule_origins",
+        "execution_defer_assessments",
         "execution_defer_replacement_claims",
         "execution_defer_replacement_consumptions",
         "execution_physical_indices",
@@ -125,6 +127,10 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("guard_execution_session_semantic_start"));
     assert!(schema.contains("ADD COLUMN execution_epoch bigint NOT NULL DEFAULT 1"));
     assert!(schema.contains("execution_defer_replacement_claims_physical_index_uq"));
+    assert!(schema.contains("new execution defer replacement claims require v1 authorization"));
+    assert!(schema.contains("credited_before_seconds"));
+    assert!(schema.contains("credited_source_seconds"));
+    assert!(schema.contains("approval_required = (jsonb_array_length(violations) > 0)"));
     assert!(schema.contains("NULLS NOT DISTINCT"));
     assert!(schema.contains("protect_execution_defer_claim_source"));
     assert!(schema.contains("FOR UPDATE"));
@@ -447,6 +453,56 @@ async fn execution_progress_ledger_migration_backfills_partitioned_fresh_claims(
             .contains("execution defer replacement index is not fresh")
     );
     bypass.rollback().await.expect("roll back raw claim bypass");
+
+    let approval_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 21)
+        .expect("execution defer approval migration is embedded");
+    pool.execute(AssertSqlSafe(approval_migration.sql.as_str().to_owned()))
+        .await
+        .expect("execution defer approval migration applies over populated v20 evidence");
+    let legacy_authorizations: Vec<(i16, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT authorization_schema_version, authorization_kind, assessment_id \
+         FROM execution_defer_replacement_claims WHERE workspace_id = $1 \
+         ORDER BY source_deferred_session_id",
+    )
+    .bind(scope.workspace_id)
+    .fetch_all(pool)
+    .await
+    .expect("load upgraded legacy claim authorization");
+    assert_eq!(legacy_authorizations.len(), 4);
+    assert!(
+        legacy_authorizations
+            .iter()
+            .all(|(version, kind, assessment)| {
+                *version == 0 && kind == "legacy_unassessed" && assessment.is_none()
+            })
+    );
+
+    let forbidden_v0 = sqlx::query(
+        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
+         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
+         occurrence_id, source_session_index, replacement_session_index, \
+         planned_duration_seconds, planned_duration_source, consumed_before_seconds, \
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at, \
+         authorization_schema_version, authorization_kind) VALUES ($1, $2, $3, 1, 1, NULL, \
+         200, 201, 1800, 'legacy_move_window', 0, 0, 1800, $4, $5, $6, \
+         0, 'legacy_unassessed')",
+    )
+    .bind(scope.workspace_id)
+    .bind(Uuid::new_v4())
+    .bind(first_item)
+    .bind(base + ChronoDuration::hours(5))
+    .bind(base + ChronoDuration::hours(5) + ChronoDuration::minutes(30))
+    .bind(base + ChronoDuration::seconds(5))
+    .execute(pool)
+    .await
+    .expect_err("new v0 replacement claims are forbidden after upgrade");
+    assert!(
+        forbidden_v0
+            .to_string()
+            .contains("new execution defer replacement claims require v1 authorization")
+    );
 
     test_database.destroy().await;
 }

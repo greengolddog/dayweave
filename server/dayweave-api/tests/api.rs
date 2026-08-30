@@ -169,6 +169,9 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
         );
     }
     for schema in [
+        "DeferAssessment",
+        "DeferAssessmentEnvelope",
+        "DeferAssessmentRequest",
         "DeferExecution",
         "ExecutionCommand",
         "ExecutionSession",
@@ -182,7 +185,13 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     let defer_required = document["components"]["schemas"]["DeferExecution"]["required"]
         .as_array()
         .expect("defer required fields");
-    for field in ["session_id", "move_start", "move_end"] {
+    for field in [
+        "session_id",
+        "move_start",
+        "move_end",
+        "actual_seconds",
+        "assessment_digest",
+    ] {
         assert!(
             defer_required.iter().any(|required| required == field),
             "OpenAPI must require defer {field}"
@@ -191,7 +200,53 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     assert!(
         !defer_required
             .iter()
+            .any(|required| required == "approved_assessment_digest"),
+        "approval is present only for a conflicting assessment"
+    );
+    let assessment_path = &document["paths"]["/v1/execution/defer-assessments"]["post"];
+    assert_eq!(
+        assessment_path["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/DeferAssessmentRequest"
+    );
+    assert_eq!(
+        assessment_path["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/DeferAssessmentEnvelope"
+    );
+    let assessment_request = &document["components"]["schemas"]["DeferAssessmentRequest"];
+    assert_eq!(assessment_request["additionalProperties"], false);
+    let assessment_required = assessment_request["required"]
+        .as_array()
+        .expect("defer assessment request required fields");
+    for field in ["expected_revision", "session_id", "move_start"] {
+        assert!(
+            assessment_required.iter().any(|required| required == field),
+            "OpenAPI must require defer assessment {field}"
+        );
+    }
+    assert!(
+        !assessment_required
+            .iter()
             .any(|required| required == "actual_seconds")
+    );
+    for field in [
+        "execution_revision",
+        "session_revision",
+        "replacement_session_index",
+        "remaining_duration_seconds",
+        "environment_digest",
+        "assessment_digest",
+        "approval_required",
+        "violations",
+        "expires_at",
+    ] {
+        assert!(
+            document["components"]["schemas"]["DeferAssessment"]["properties"][field].is_object(),
+            "OpenAPI must expose defer assessment {field}"
+        );
+    }
+    assert!(
+        document["components"]["schemas"]["DeferAssessmentEnvelope"]["properties"]["assessment"]
+            .is_object()
     );
     assert!(
         document["components"]["schemas"]["ExecutionStatus"]["enum"]
@@ -380,6 +435,56 @@ async fn rest_scopes_and_credential_audiences_are_enforced_before_handlers() {
         .unwrap();
     assert_eq!(write.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(write).await["error"]["code"], "forbidden");
+
+    let assessment_body = json!({
+        "expected_revision": 0,
+        "session_id": "00000000-0000-4000-8000-000000000201",
+        "move_start": "2026-10-02T09:30:00Z",
+        "actual_seconds": null
+    });
+    let execution_reader = Principal {
+        subject: "device-session:execution-reader".to_owned(),
+        scopes: vec![Scope::ExecutionRead],
+        audience: PrincipalAudience::Device,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+    let forbidden_assessment = app_with_principal(execution_reader)
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(assessment_body.clone()),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden_assessment.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        body_json(forbidden_assessment).await["error"]["code"],
+        "forbidden"
+    );
+
+    let execution_writer = Principal {
+        subject: "device-session:execution-writer".to_owned(),
+        scopes: vec![Scope::ExecutionWrite],
+        audience: PrincipalAudience::Device,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+    let allowed_assessment = app_with_principal(execution_writer)
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(assessment_body),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(allowed_assessment.status(), StatusCode::SERVICE_UNAVAILABLE);
 
     let mcp = Principal {
         subject: "mcp-client:synthetic".to_owned(),

@@ -8,7 +8,44 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::scheduling::ManualPlacementViolationOutput;
+
 use super::{ExecutionCommand, ExecutionDomainError, ExecutionSession};
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeferAssessmentRequest {
+    pub expected_revision: u64,
+    pub session_id: Uuid,
+    pub move_start: DateTime<Utc>,
+    pub actual_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeferAssessment {
+    pub session_id: Uuid,
+    pub execution_revision: u64,
+    pub session_revision: u64,
+    pub item_id: Uuid,
+    pub item_revision: u64,
+    pub occurrence_id: Option<Uuid>,
+    pub source_session_index: u16,
+    pub replacement_session_index: u16,
+    pub source_schedule_revision_id: Uuid,
+    pub source_block_id: Uuid,
+    pub actual_seconds: u64,
+    pub credited_source_seconds: u64,
+    pub planned_duration_seconds: u64,
+    pub remaining_duration_seconds: u64,
+    pub move_start: DateTime<Utc>,
+    pub move_end: DateTime<Utc>,
+    pub environment_digest: String,
+    pub assessment_digest: String,
+    pub approval_required: bool,
+    pub violations: Vec<ManualPlacementViolationOutput>,
+    pub expires_at: DateTime<Utc>,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
 pub struct ExecutionSnapshot {
@@ -61,6 +98,16 @@ pub enum ExecutionRepositoryError {
     IndexExhausted,
     #[error("deferred move window does not match the unfinished planned duration")]
     DeferDurationConflict,
+    #[error("execution must be paused before it can be deferred")]
+    DeferRequiresPause,
+    #[error("durable defer assessment is unavailable")]
+    DeferAssessmentUnavailable,
+    #[error("the defer assessment is missing, expired, or stale")]
+    DeferAssessmentStale,
+    #[error("the current defer assessment requires exact user approval")]
+    DeferApprovalRequired,
+    #[error("the defer approval does not exactly match the current assessment")]
+    DeferApprovalInvalid,
     #[error("idempotency key was used for different execution content")]
     IdempotencyConflict,
     #[error(transparent)]
@@ -78,6 +125,12 @@ pub trait ExecutionRepository: Send + Sync {
         now: DateTime<Utc>,
         idempotency: &ExecutionIdempotency,
     ) -> Result<Option<ExecutionMutation>, ExecutionRepositoryError>;
+
+    async fn assess_defer(
+        &self,
+        request: DeferAssessmentRequest,
+        now: DateTime<Utc>,
+    ) -> Result<DeferAssessment, ExecutionRepositoryError>;
 
     async fn apply(
         &self,
@@ -141,6 +194,14 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             replayed: true,
             ..remembered.mutation.clone()
         }))
+    }
+
+    async fn assess_defer(
+        &self,
+        _request: DeferAssessmentRequest,
+        _now: DateTime<Utc>,
+    ) -> Result<DeferAssessment, ExecutionRepositoryError> {
+        Err(ExecutionRepositoryError::DeferAssessmentUnavailable)
     }
 
     async fn apply(

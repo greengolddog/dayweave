@@ -131,6 +131,10 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **EXE-008** Actual-duration history shall be retained and used for transparent estimates until the user deletes or resets it.
 - **EXE-009** macOS lock/sleep/inactivity and Android equivalent signals shall help distinguish active work from abandoned timers, with a correction flow.
 - **EXE-010** Pomodoro patterns and mandatory-break rules shall be configurable.
+- **EXE-011** “Will do later” shall pause first, derive its replacement duration
+  and conflicts from the current authoritative schedule, require explicit
+  approval for the exact reported conflict set, and never transfer approval to
+  changed or expired evidence.
 
 ### 4.8 Google Calendar
 

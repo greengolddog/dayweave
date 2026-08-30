@@ -327,6 +327,9 @@ impl ExecutionSession {
         transition_at: DateTime<Utc>,
         elapsed_at: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
+        if self.status != ExecutionStatus::Paused {
+            return Err(ExecutionDomainError::InvalidTransition);
+        }
         validate_defer(input, transition_at)?;
         let mut deferred = self.finish(
             input.session_id,
@@ -469,7 +472,16 @@ pub struct DeferExecution {
     pub session_id: Uuid,
     pub move_start: DateTime<Utc>,
     pub move_end: DateTime<Utc>,
+    /// Exact actual duration returned by the durable defer assessment.
+    #[schema(required, nullable = false)]
     pub actual_seconds: Option<u64>,
+    /// Exact canonical digest returned by the durable defer assessment.
+    #[schema(required, nullable = false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_digest: Option<String>,
+    /// The same digest when the assessment reports conflicts; otherwise omit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_assessment_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -488,6 +500,8 @@ pub enum ExecutionDomainError {
         "deferred move window must use microsecond precision, start in the future, and span no more than 24 hours"
     )]
     InvalidDefer,
+    #[error("defer assessment digest or approval is malformed or mismatched")]
+    InvalidDeferAssessment,
     #[error("execution command does not match the active session state")]
     InvalidTransition,
     #[error("execution revision or duration exceeded the supported range")]
@@ -512,6 +526,25 @@ fn validate_defer(input: &DeferExecution, now: DateTime<Utc>) -> Result<(), Exec
     {
         return Err(ExecutionDomainError::InvalidActualDuration);
     }
+    if input
+        .assessment_digest
+        .as_deref()
+        .is_some_and(|digest| !is_canonical_sha256_digest(digest))
+        || input
+            .approved_assessment_digest
+            .as_deref()
+            .is_some_and(|digest| !is_canonical_sha256_digest(digest))
+        || match (
+            input.assessment_digest.as_deref(),
+            input.approved_assessment_digest.as_deref(),
+        ) {
+            (None, Some(_)) => true,
+            (Some(assessment), Some(approved)) => assessment != approved,
+            _ => false,
+        }
+    {
+        return Err(ExecutionDomainError::InvalidDeferAssessment);
+    }
     let duration = input.move_end.signed_duration_since(input.move_start);
     if !has_postgres_timestamp_precision(input.move_start)
         || !has_postgres_timestamp_precision(input.move_end)
@@ -522,6 +555,15 @@ fn validate_defer(input: &DeferExecution, now: DateTime<Utc>) -> Result<(), Exec
         return Err(ExecutionDomainError::InvalidDefer);
     }
     Ok(())
+}
+
+fn is_canonical_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn reject_nil(id: Uuid) -> Result<(), ExecutionDomainError> {
@@ -787,33 +829,131 @@ mod tests {
     }
 
     #[test]
-    fn defer_is_terminal_from_active_and_paused_with_elapsed_semantics() {
+    fn legacy_defer_wire_bytes_remain_unchanged_when_assessment_fields_are_absent() {
+        #[derive(Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+        enum LegacyExecutionCommand {
+            Defer(LegacyDeferExecution),
+        }
+
+        #[derive(Serialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyDeferExecution {
+            session_id: Uuid,
+            move_start: DateTime<Utc>,
+            move_end: DateTime<Utc>,
+            actual_seconds: Option<u64>,
+        }
+
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let current = ExecutionCommand::Defer(DeferExecution {
+            session_id: Uuid::from_u128(1),
+            move_start: now + chrono::Duration::minutes(1),
+            move_end: now + chrono::Duration::minutes(2),
+            actual_seconds: Some(7),
+            assessment_digest: None,
+            approved_assessment_digest: None,
+        });
+        let legacy = LegacyExecutionCommand::Defer(LegacyDeferExecution {
+            session_id: Uuid::from_u128(1),
+            move_start: now + chrono::Duration::minutes(1),
+            move_end: now + chrono::Duration::minutes(2),
+            actual_seconds: Some(7),
+        });
+
+        let current_bytes = serde_json::to_vec(&current).unwrap();
+        assert_eq!(current_bytes, serde_json::to_vec(&legacy).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<ExecutionCommand>(&current_bytes).unwrap(),
+            current
+        );
+        let shape: serde_json::Value = serde_json::from_slice(&current_bytes).unwrap();
+        assert!(shape.get("assessment_digest").is_none());
+        assert!(shape.get("approved_assessment_digest").is_none());
+    }
+
+    #[test]
+    fn defer_wire_rejects_unknown_fields() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut shape = serde_json::to_value(ExecutionCommand::Defer(DeferExecution {
+            session_id: Uuid::from_u128(1),
+            move_start: now + chrono::Duration::minutes(1),
+            move_end: now + chrono::Duration::minutes(2),
+            actual_seconds: None,
+            assessment_digest: None,
+            approved_assessment_digest: None,
+        }))
+        .unwrap();
+        shape["assessment"] = serde_json::json!("unexpected");
+
+        assert!(serde_json::from_value::<ExecutionCommand>(shape).is_err());
+    }
+
+    #[test]
+    fn defer_assessment_digests_are_canonical_and_approval_must_match() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let other_digest = format!("sha256:{}", "b".repeat(64));
+        let command = |assessment_digest: Option<String>, approved_assessment_digest| {
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: Uuid::from_u128(1),
+                move_start: now + chrono::Duration::minutes(1),
+                move_end: now + chrono::Duration::minutes(2),
+                actual_seconds: None,
+                assessment_digest,
+                approved_assessment_digest,
+            })
+        };
+
+        assert_eq!(command(Some(digest.clone()), None).validate(now), Ok(()));
+        let approved = command(Some(digest.clone()), Some(digest.clone()));
+        assert_eq!(approved.validate(now), Ok(()));
+        let approved_shape = serde_json::to_value(&approved).unwrap();
+        assert_eq!(approved_shape["assessment_digest"], digest);
+        assert_eq!(approved_shape["approved_assessment_digest"], digest);
+        assert_eq!(
+            serde_json::from_value::<ExecutionCommand>(approved_shape).unwrap(),
+            approved
+        );
+
+        for invalid in [
+            command(Some("sha256:abc".to_owned()), None),
+            command(Some(format!("sha256:{}", "A".repeat(64))), None),
+            command(Some(format!("sha256:{}", "g".repeat(64))), None),
+            command(Some(format!("SHA256:{}", "a".repeat(64))), None),
+            command(None, Some(digest.clone())),
+            command(Some(digest.clone()), Some(other_digest)),
+            command(
+                Some(digest.clone()),
+                Some(format!("sha256:{}", "A".repeat(64))),
+            ),
+        ] {
+            assert_eq!(
+                invalid.validate(now),
+                Err(ExecutionDomainError::InvalidDeferAssessment)
+            );
+        }
+    }
+
+    #[test]
+    fn defer_requires_paused_session_and_preserves_paused_actual_semantics() {
         let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
         let move_start = t0 + chrono::Duration::hours(2);
         let move_end = move_start + chrono::Duration::minutes(45);
         let session = ExecutionSession::start(&start(), t0);
-        let deferred = session
-            .apply(
-                &ExecutionCommand::Defer(DeferExecution {
-                    session_id: session.id,
-                    move_start,
-                    move_end,
-                    actual_seconds: None,
-                }),
-                t0 + chrono::Duration::seconds(90),
-            )
-            .unwrap();
+        let active_result = session.apply(
+            &ExecutionCommand::Defer(DeferExecution {
+                session_id: session.id,
+                move_start,
+                move_end,
+                actual_seconds: None,
+                assessment_digest: None,
+                approved_assessment_digest: None,
+            }),
+            t0 + chrono::Duration::seconds(90),
+        );
+        assert_eq!(active_result, Err(ExecutionDomainError::InvalidTransition));
 
-        assert_eq!(deferred.status, ExecutionStatus::Deferred);
-        assert!(!deferred.status.is_open());
-        assert_eq!(deferred.accumulated_seconds, 90);
-        assert_eq!(deferred.actual_seconds, Some(90));
-        assert_eq!(deferred.move_start, Some(move_start));
-        assert_eq!(deferred.move_end, Some(move_end));
-        assert_eq!(deferred.ended_at, Some(t0 + chrono::Duration::seconds(90)));
-        assert!(deferred.running_since.is_none());
-
-        let session = ExecutionSession::start(&start(), t0);
         let paused = session
             .apply(
                 &ExecutionCommand::Pause(PauseExecution {
@@ -831,20 +971,41 @@ mod tests {
                     session_id: session.id,
                     move_start,
                     move_end,
-                    actual_seconds: Some(12),
+                    actual_seconds: None,
+                    assessment_digest: None,
+                    approved_assessment_digest: None,
                 }),
                 t0 + chrono::Duration::minutes(10),
             )
             .unwrap();
 
         assert_eq!(deferred.status, ExecutionStatus::Deferred);
+        assert!(!deferred.status.is_open());
         assert_eq!(deferred.accumulated_seconds, 30);
-        assert_eq!(deferred.actual_seconds, Some(12));
+        assert_eq!(deferred.actual_seconds, Some(30));
+        assert_eq!(deferred.move_start, Some(move_start));
+        assert_eq!(deferred.move_end, Some(move_end));
+        assert_eq!(deferred.ended_at, Some(t0 + chrono::Duration::minutes(10)));
+        assert!(deferred.running_since.is_none());
         assert_eq!(deferred.paused_at, Some(t0 + chrono::Duration::seconds(30)));
         assert!(deferred.pause_until.is_none());
         assert!(deferred.pause_reason.is_none());
-        assert_eq!(deferred.move_start, Some(move_start));
-        assert_eq!(deferred.move_end, Some(move_end));
+
+        let corrected = paused
+            .apply(
+                &ExecutionCommand::Defer(DeferExecution {
+                    session_id: session.id,
+                    move_start,
+                    move_end,
+                    actual_seconds: Some(12),
+                    assessment_digest: None,
+                    approved_assessment_digest: None,
+                }),
+                t0 + chrono::Duration::minutes(10),
+            )
+            .unwrap();
+        assert_eq!(corrected.accumulated_seconds, 30);
+        assert_eq!(corrected.actual_seconds, Some(12));
     }
 
     #[test]
@@ -856,6 +1017,8 @@ mod tests {
             move_start: now + chrono::Duration::days(30),
             move_end: now + chrono::Duration::days(31),
             actual_seconds: None,
+            assessment_digest: None,
+            approved_assessment_digest: None,
         });
         assert_eq!(valid.validate(now), Ok(()));
 
@@ -864,6 +1027,8 @@ mod tests {
             move_start: now + chrono::Duration::minutes(1) + chrono::Duration::nanoseconds(1),
             move_end: now + chrono::Duration::minutes(2),
             actual_seconds: None,
+            assessment_digest: None,
+            approved_assessment_digest: None,
         });
         assert_eq!(
             nanosecond.validate(now),
@@ -876,18 +1041,24 @@ mod tests {
                 move_start: now,
                 move_end: now + chrono::Duration::minutes(1),
                 actual_seconds: None,
+                assessment_digest: None,
+                approved_assessment_digest: None,
             }),
             ExecutionCommand::Defer(DeferExecution {
                 session_id,
                 move_start: now + chrono::Duration::minutes(1),
                 move_end: now + chrono::Duration::minutes(1),
                 actual_seconds: None,
+                assessment_digest: None,
+                approved_assessment_digest: None,
             }),
             ExecutionCommand::Defer(DeferExecution {
                 session_id,
                 move_start: now + chrono::Duration::days(30),
                 move_end: now + chrono::Duration::days(31) + chrono::Duration::seconds(1),
                 actual_seconds: None,
+                assessment_digest: None,
+                approved_assessment_digest: None,
             }),
         ] {
             assert_eq!(
@@ -901,6 +1072,8 @@ mod tests {
             move_start: now + chrono::Duration::minutes(1),
             move_end: now + chrono::Duration::minutes(2),
             actual_seconds: Some(MAX_ACTUAL_SECONDS + 1),
+            assessment_digest: None,
+            approved_assessment_digest: None,
         });
         assert_eq!(
             invalid_actual.validate(now),
@@ -928,6 +1101,8 @@ mod tests {
             move_start: t0 + chrono::Duration::minutes(90),
             move_end: t0 + chrono::Duration::hours(3),
             actual_seconds: None,
+            assessment_digest: None,
+            approved_assessment_digest: None,
         });
 
         assert_eq!(command.validate(t0 + chrono::Duration::hours(1)), Ok(()));
@@ -953,13 +1128,26 @@ mod tests {
         partial["move_start"] = serde_json::json!(t0 + chrono::Duration::hours(1));
         assert!(serde_json::from_value::<ExecutionSession>(partial).is_err());
 
-        let deferred = session
+        let paused = session
+            .apply(
+                &ExecutionCommand::Pause(PauseExecution {
+                    session_id: session.id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: None,
+                }),
+                t0 + chrono::Duration::seconds(30),
+            )
+            .unwrap();
+        let deferred = paused
             .apply(
                 &ExecutionCommand::Defer(DeferExecution {
                     session_id: session.id,
                     move_start: t0 + chrono::Duration::hours(1),
                     move_end: t0 + chrono::Duration::hours(2),
                     actual_seconds: None,
+                    assessment_digest: None,
+                    approved_assessment_digest: None,
                 }),
                 t0 + chrono::Duration::minutes(1),
             )

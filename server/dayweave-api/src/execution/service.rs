@@ -11,9 +11,9 @@ use crate::{
 };
 
 use super::{
-    ExecutionCommand, ExecutionDomainError, ExecutionIdempotency, ExecutionMutation,
-    ExecutionRepository, ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot,
-    StartExecution,
+    DeferAssessment, DeferAssessmentRequest, ExecutionCommand, ExecutionDomainError,
+    ExecutionIdempotency, ExecutionMutation, ExecutionRepository, ExecutionRepositoryError,
+    ExecutionSession, ExecutionSnapshot, StartExecution,
 };
 
 const IDEMPOTENCY_TTL: StdDuration = StdDuration::from_hours(24);
@@ -73,6 +73,27 @@ impl ExecutionService {
     /// Returns a redacted repository error when state cannot be loaded.
     pub async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionServiceError> {
         Ok(self.repository.snapshot().await?)
+    }
+
+    /// Assesses an exact future replacement for the currently paused session.
+    ///
+    /// The durable repository derives duration, policy, schedule, Calendar,
+    /// and execution evidence; callers choose only the target start and an
+    /// optional corrected actual duration.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, stale-evidence, approval, or storage errors without
+    /// mutating the execution lease.
+    pub async fn assess_defer(
+        &self,
+        request: DeferAssessmentRequest,
+    ) -> Result<DeferAssessment, ExecutionServiceError> {
+        if request.expected_revision > i64::MAX as u64 {
+            return Err(ExecutionServiceError::InvalidRevision);
+        }
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
+        Ok(self.repository.assess_defer(request, now).await?)
     }
 
     /// Applies one idempotent execution command under optimistic concurrency.
@@ -523,14 +544,35 @@ mod tests {
             older.updated_at + chrono::Duration::microseconds(1)
         );
 
-        let deferred = service
+        let paused = service
             .command(
                 3,
+                ExecutionCommand::Pause(PauseExecution {
+                    session_id: newer_id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: None,
+                }),
+                idempotency(22),
+            )
+            .await
+            .unwrap()
+            .changed_session;
+        assert_eq!(
+            paused.updated_at,
+            newer.updated_at + chrono::Duration::microseconds(1)
+        );
+
+        let deferred = service
+            .command(
+                4,
                 ExecutionCommand::Defer(DeferExecution {
                     session_id: newer_id,
                     move_start: t0 + chrono::Duration::hours(1),
                     move_end: t0 + chrono::Duration::hours(2),
                     actual_seconds: None,
+                    assessment_digest: None,
+                    approved_assessment_digest: None,
                 }),
                 idempotency(21),
             )
@@ -539,7 +581,7 @@ mod tests {
             .changed_session;
         assert_eq!(
             deferred.updated_at,
-            newer.updated_at + chrono::Duration::microseconds(1)
+            newer.updated_at + chrono::Duration::microseconds(2)
         );
 
         let history = service.history(2).await.unwrap();
@@ -547,8 +589,8 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)] // Keeps both legal source states and replay in one atomic-flow test.
-    async fn defer_closes_active_and_paused_sessions_atomically_and_replays() {
+    #[allow(clippy::too_many_lines)] // Keeps pause enforcement and replay in one atomic-flow test.
+    async fn defer_requires_pause_then_closes_atomically_and_replays() {
         let (service, clock, item_id) = fixture().await;
         let first_id = Uuid::from_u128(35);
         service
@@ -571,14 +613,16 @@ mod tests {
         clock.set(clock.now() + chrono::Duration::seconds(30));
         let first_move_start = clock.now() + chrono::Duration::hours(2);
         let first_move_end = first_move_start + chrono::Duration::hours(1);
-        let defer_active = ExecutionCommand::Defer(DeferExecution {
+        let defer_first = ExecutionCommand::Defer(DeferExecution {
             session_id: first_id,
             move_start: first_move_start,
             move_end: first_move_end,
             actual_seconds: None,
+            assessment_digest: None,
+            approved_assessment_digest: None,
         });
         let stale = service
-            .command(0, defer_active.clone(), idempotency(11))
+            .command(0, defer_first.clone(), idempotency(11))
             .await
             .unwrap_err();
         assert!(matches!(
@@ -590,11 +634,36 @@ mod tests {
         ));
         assert_eq!(service.snapshot().await.unwrap().revision, 1);
 
-        let deferred = service
-            .command(1, defer_active.clone(), idempotency(12))
+        let active = service
+            .command(1, defer_first.clone(), idempotency(12))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            active,
+            ExecutionServiceError::Repository(ExecutionRepositoryError::InvalidCommand(
+                ExecutionDomainError::InvalidTransition
+            ))
+        ));
+        assert_eq!(service.snapshot().await.unwrap().revision, 1);
+
+        service
+            .command(
+                1,
+                ExecutionCommand::Pause(PauseExecution {
+                    session_id: first_id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: None,
+                }),
+                idempotency(16),
+            )
             .await
             .unwrap();
-        assert_eq!(deferred.revision, 2);
+        let deferred = service
+            .command(2, defer_first.clone(), idempotency(17))
+            .await
+            .unwrap();
+        assert_eq!(deferred.revision, 3);
         assert!(deferred.active_session.is_none());
         assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
         assert_eq!(deferred.changed_session.accumulated_seconds, 30);
@@ -604,17 +673,17 @@ mod tests {
 
         clock.set(first_move_end + chrono::Duration::seconds(1));
         let replay = service
-            .command(1, defer_active, idempotency(12))
+            .command(2, defer_first, idempotency(17))
             .await
             .unwrap();
         assert!(replay.replayed);
-        assert_eq!(replay.revision, 2);
+        assert_eq!(replay.revision, 3);
         assert_eq!(replay.changed_session, deferred.changed_session);
 
         let second_id = Uuid::from_u128(37);
         service
             .command(
-                2,
+                3,
                 ExecutionCommand::Start(StartExecution {
                     session_id: second_id,
                     item_id,
@@ -631,7 +700,7 @@ mod tests {
         clock.set(clock.now() + chrono::Duration::seconds(20));
         service
             .command(
-                3,
+                4,
                 ExecutionCommand::Pause(PauseExecution {
                     session_id: second_id,
                     duration_seconds: None,
@@ -647,18 +716,20 @@ mod tests {
         let second_move_end = second_move_start + chrono::Duration::minutes(45);
         let deferred = service
             .command(
-                4,
+                5,
                 ExecutionCommand::Defer(DeferExecution {
                     session_id: second_id,
                     move_start: second_move_start,
                     move_end: second_move_end,
                     actual_seconds: Some(7),
+                    assessment_digest: None,
+                    approved_assessment_digest: None,
                 }),
                 idempotency(15),
             )
             .await
             .unwrap();
-        assert_eq!(deferred.revision, 5);
+        assert_eq!(deferred.revision, 6);
         assert!(deferred.active_session.is_none());
         assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
         assert_eq!(deferred.changed_session.accumulated_seconds, 20);

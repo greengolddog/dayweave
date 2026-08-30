@@ -1,18 +1,41 @@
+use std::{collections::BTreeMap, fmt::Write as _, sync::Arc, time::Duration as StdDuration};
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use dayweave_core::{
+    DeferCandidateAssessmentInput, ExecutionPlanningContext, ItemId, OccurrenceId,
+    PreviousAssignment, PreviousBlock, Scheduler,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use uuid::Uuid;
 
-use crate::execution::{
-    ExecutionCommand, ExecutionIdempotency, ExecutionMutation, ExecutionRepository,
-    ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot, ExecutionStatus,
-    next_protocol_time,
+use crate::{
+    execution::{
+        DeferAssessment, DeferAssessmentRequest, DeferExecution, ExecutionCommand,
+        ExecutionDomainError, ExecutionIdempotency, ExecutionMutation, ExecutionRepository,
+        ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot, ExecutionStatus,
+        next_protocol_time,
+    },
+    scheduling::{
+        AuthoritativePlanningEvidence, ManualPlacementViolationOutput, PublishedPlanningPolicy,
+        SchedulePublicationError, assert_current_calendar_projection, assert_current_item_snapshot,
+        assert_current_planning_policy_tx, authoritative_planning_evidence_tx,
+        has_postgres_timestamp_precision, lock_owner, map_manual_placement_violations,
+        published_planning_policy_tx,
+    },
 };
 
-use super::DatabaseScope;
+use super::{DatabaseScope, lock_canonical_item_space};
 
 const IDEMPOTENCY_NAMESPACE: &str = "execution.command";
+const DEFER_ASSESSMENT_SCHEMA: &str = "dayweave-execution-defer-assessment/1";
+const DEFER_ASSESSMENT_TTL: chrono::Duration = chrono::Duration::minutes(5);
+const DEFER_ASSESSMENT_MAINTENANCE_INTERVAL: StdDuration = StdDuration::from_hours(1);
+const MAX_ACTIVE_DEFER_ASSESSMENTS: i64 = 256;
+const MAX_ACTUAL_SECONDS: u64 = 31 * 24 * 60 * 60;
 const HISTORY_SELECT: &str = "SELECT id, item_id, item_revision, occurrence_id, session_index, \
     planned_block_id, source_device_id, state, revision, accumulated_seconds, actual_seconds, \
     started_at, running_since, observed_running_since, paused_at, pause_until, pause_reason, \
@@ -30,6 +53,67 @@ const SESSION_BY_ID_FOR_UPDATE: &str = "SELECT id, item_id, item_revision, occur
     pause_reason, move_start, move_end, ended_at, created_at, updated_at FROM execution_sessions \
     WHERE workspace_id = $1 AND id = $2 FOR UPDATE";
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedDeferAssessmentContext {
+    schema: String,
+    planning_as_of: DateTime<Utc>,
+    candidate: DeferCandidateAssessmentInput,
+}
+
+#[derive(Clone, Debug)]
+struct DeferAuthorization {
+    assessment_id: Uuid,
+    authorized_by_user_id: Uuid,
+    environment_digest: [u8; 32],
+    assessment_digest: [u8; 32],
+    approved_assessment_digest: Option<[u8; 32]>,
+    assessment_expires_at: DateTime<Utc>,
+    authorization_kind: &'static str,
+    execution_epoch: i64,
+    replacement_session_index: u16,
+    planned_duration_seconds: u64,
+    effective_actual_seconds: u64,
+    credited_source_seconds: u64,
+    remaining_duration_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StoredDeferAssessment {
+    id: Uuid,
+    execution_state_revision: u64,
+    source_execution_session_id: Uuid,
+    source_execution_session_revision: u64,
+    source_schedule_revision_id: Uuid,
+    source_block_id: Uuid,
+    current_schedule_revision_id: Uuid,
+    current_schedule_revision_number: u64,
+    current_publication_hash: [u8; 32],
+    item_id: Uuid,
+    source_item_revision: u64,
+    current_item_revision: u64,
+    execution_epoch: i64,
+    occurrence_id: Option<Uuid>,
+    source_session_index: u16,
+    replacement_session_index: u16,
+    planned_duration_seconds: u64,
+    credited_before_seconds: u64,
+    effective_actual_seconds: u64,
+    credited_after_seconds: u64,
+    credited_source_seconds: u64,
+    remaining_duration_seconds: u64,
+    scheduler_slot_seconds: u64,
+    target_start: DateTime<Utc>,
+    target_end: DateTime<Utc>,
+    environment_digest: [u8; 32],
+    assessment_digest: [u8; 32],
+    approval_required: bool,
+    context: PersistedDeferAssessmentContext,
+    violations: Vec<ManualPlacementViolationOutput>,
+    assessed_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresExecutionRepository {
     pool: PgPool,
@@ -40,6 +124,42 @@ impl PostgresExecutionRepository {
     #[must_use]
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self { pool, scope }
+    }
+
+    /// Removes expired assessments that were never consumed by a durable
+    /// replacement claim. Applied evidence remains attached to execution
+    /// history for audit and exact replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted storage error if the scoped transaction cannot
+    /// complete.
+    pub async fn maintain_defer_assessment_retention(
+        &self,
+    ) -> Result<(), ExecutionRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        prune_defer_assessments(&mut transaction, self.scope, now).await?;
+        transaction.commit().await.map_err(internal)
+    }
+
+    pub(crate) fn spawn_defer_assessment_maintenance_worker(self: &Arc<Self>) {
+        let repository = Arc::clone(self);
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + DEFER_ASSESSMENT_MAINTENANCE_INTERVAL;
+            let mut interval =
+                tokio::time::interval_at(start, DEFER_ASSESSMENT_MAINTENANCE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = repository.maintain_defer_assessment_retention().await {
+                    tracing::warn!(%error, "defer assessment retention maintenance failed");
+                }
+            }
+        });
     }
 }
 
@@ -93,6 +213,17 @@ impl ExecutionRepository for PostgresExecutionRepository {
             .transpose()
     }
 
+    async fn assess_defer(
+        &self,
+        request: DeferAssessmentRequest,
+        _now: DateTime<Utc>,
+    ) -> Result<DeferAssessment, ExecutionRepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let assessment = assess_defer_transaction(&mut transaction, self.scope, &request).await?;
+        transaction.commit().await.map_err(internal)?;
+        Ok(assessment)
+    }
+
     async fn apply(
         &self,
         expected_revision: u64,
@@ -133,7 +264,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
         let changed_session = apply_command_transaction(
             &mut transaction,
-            self.scope.workspace_id,
+            self.scope,
+            current_revision,
             active_session_id,
             &command,
             transition_at,
@@ -204,14 +336,1024 @@ impl ExecutionRepository for PostgresExecutionRepository {
     }
 }
 
-async fn apply_command_transaction(
+#[allow(clippy::too_many_lines)] // Assessment must bind one ordered transactional snapshot.
+async fn assess_defer_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    request: &DeferAssessmentRequest,
+) -> Result<DeferAssessment, ExecutionRepositoryError> {
+    if request.session_id.is_nil()
+        || !has_postgres_timestamp_precision(request.move_start)
+        || request.move_start.timestamp_subsec_nanos() != 0
+        || request
+            .actual_seconds
+            .is_some_and(|seconds| seconds > MAX_ACTUAL_SECONDS)
+    {
+        return Err(ExecutionRepositoryError::InvalidCommand(
+            ExecutionDomainError::InvalidDefer,
+        ));
+    }
+
+    let initialized_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    ensure_state_transaction(transaction, scope.workspace_id, initialized_at).await?;
+    let state = sqlx::query(
+        "SELECT revision, active_session_id, updated_at FROM execution_state \
+         WHERE workspace_id = $1 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let execution_revision =
+        positive_or_zero_revision(state.try_get("revision").map_err(internal)?)?;
+    if request.expected_revision != execution_revision {
+        return Err(ExecutionRepositoryError::RevisionConflict {
+            expected: request.expected_revision,
+            actual: execution_revision,
+        });
+    }
+    let active_session_id: Option<Uuid> = state.try_get("active_session_id").map_err(internal)?;
+    let protocol_updated_at: DateTime<Utc> = state.try_get("updated_at").map_err(internal)?;
+    if active_session_id != Some(request.session_id) {
+        return Err(ExecutionRepositoryError::SessionNotFound(
+            request.session_id,
+        ));
+    }
+
+    lock_canonical_item_space(transaction, scope.workspace_id)
+        .await
+        .map_err(internal)?;
+    lock_owner(transaction, scope).await.map_err(internal)?;
+    let policy = published_planning_policy_tx(transaction, scope)
+        .await
+        .map_err(map_schedule_assessment_error)?;
+    assert_current_item_snapshot(transaction, scope, &policy.source_item_revisions)
+        .await
+        .map_err(map_schedule_assessment_error)?;
+    assert_current_calendar_projection(
+        transaction,
+        scope,
+        offset_to_chrono(policy.planning_request.horizon_start)?,
+        offset_to_chrono(policy.planning_request.horizon_end)?,
+        &policy.calendar_projection_stamps,
+    )
+    .await
+    .map_err(map_schedule_assessment_error)?;
+    assert_current_planning_policy_tx(transaction, scope, policy.revision_id)
+        .await
+        .map_err(map_schedule_assessment_error)?;
+
+    let session =
+        fetch_session_transaction(transaction, scope.workspace_id, request.session_id).await?;
+    if session.status != ExecutionStatus::Paused {
+        return Err(ExecutionRepositoryError::DeferRequiresPause);
+    }
+    let origin = defer_source_origin(transaction, scope.workspace_id, &session).await?;
+    let current_item_revision = policy
+        .source_item_revisions
+        .get(&session.item_id)
+        .copied()
+        .filter(|revision| *revision == session.item_revision)
+        .ok_or(ExecutionRepositoryError::ScheduleStale)?;
+    let evidence = authoritative_planning_evidence_tx(transaction, scope.workspace_id)
+        .await
+        .map_err(|_| ExecutionRepositoryError::DeferAssessmentUnavailable)?;
+    if evidence.execution.snapshot_revision != execution_revision
+        || evidence.published_revision_id != Some(policy.revision_id)
+    {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+
+    let credited_before_seconds = exact_work_unit_credit(&evidence.execution, &session)?;
+    let actual_seconds = request
+        .actual_seconds
+        .unwrap_or(session.accumulated_seconds);
+    let credited_after_seconds = credited_before_seconds
+        .checked_add(actual_seconds)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    let planned_duration_seconds = origin.planned_duration_seconds;
+    let credited_source_seconds = normalized_source_credit_seconds(
+        credited_before_seconds,
+        credited_after_seconds,
+        planned_duration_seconds,
+    )?;
+    let remaining_duration_seconds = planned_duration_seconds
+        .checked_sub(credited_source_seconds)
+        .filter(|seconds| *seconds > 0 && seconds % 60 == 0 && *seconds <= 24 * 60 * 60)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    let replacement_session_index = u16::try_from(
+        next_replacement_session_index(
+            transaction,
+            scope.workspace_id,
+            session.item_id,
+            session.occurrence_id,
+        )
+        .await?,
+    )
+    .map_err(|_| ExecutionRepositoryError::IndexExhausted)?;
+
+    let assessed_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    let expires_at = assessed_at + DEFER_ASSESSMENT_TTL;
+    let earliest_transition_at = next_protocol_time(
+        assessed_at,
+        (execution_revision > 0).then_some(protocol_updated_at),
+    )?;
+    let scheduler_slot_seconds = i64::from(policy.planning_request.config.slot_granularity.get())
+        .checked_mul(60)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    if request.move_start <= expires_at
+        || request.move_start <= earliest_transition_at
+        || request
+            .move_start
+            .timestamp()
+            .rem_euclid(scheduler_slot_seconds)
+            != 0
+    {
+        return Err(ExecutionRepositoryError::InvalidCommand(
+            ExecutionDomainError::InvalidDefer,
+        ));
+    }
+    let remaining_i64 = i64::try_from(remaining_duration_seconds)
+        .map_err(|_| ExecutionRepositoryError::DeferDurationConflict)?;
+    let move_end = request
+        .move_start
+        .checked_add_signed(chrono::Duration::seconds(remaining_i64))
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+
+    prune_defer_assessments(transaction, scope, assessed_at).await?;
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_defer_assessments \
+         WHERE workspace_id = $1 AND user_id = $2 AND expires_at > $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(assessed_at)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if active_count >= MAX_ACTIVE_DEFER_ASSESSMENTS {
+        return Err(ExecutionRepositoryError::DeferAssessmentUnavailable);
+    }
+
+    let assessment_id = Uuid::new_v4();
+    let mut planning_request = policy.planning_request.clone();
+    planning_request.as_of = chrono_to_offset(expires_at)?;
+    planning_request.previous_assignments = core_previous_assignments(&evidence)?;
+    let candidate = DeferCandidateAssessmentInput {
+        placement_id: assessment_id,
+        item_id: ItemId(session.item_id),
+        occurrence_id: session.occurrence_id.map(OccurrenceId),
+        source_session_index: session.session_index,
+        replacement_session_index,
+        credited_seconds_after_source: credited_after_seconds,
+        move_start: chrono_to_offset(request.move_start)?,
+        move_end: chrono_to_offset(move_end)?,
+    };
+    let core = Scheduler
+        .assess_defer_candidate(&planning_request, &evidence.execution, &candidate)
+        .map_err(|_| ExecutionRepositoryError::DeferDurationConflict)?;
+    let violations = map_manual_placement_violations(&core.assessment.violations)
+        .map_err(|_| ExecutionRepositoryError::Internal)?;
+    let approval_required = !violations.is_empty();
+    let environment_digest = core.assessment.environment_digest;
+    let context = PersistedDeferAssessmentContext {
+        schema: DEFER_ASSESSMENT_SCHEMA.to_owned(),
+        planning_as_of: expires_at,
+        candidate,
+    };
+    let assessment_digest = defer_assessment_digest(
+        scope,
+        &policy,
+        &session,
+        &origin,
+        execution_revision,
+        current_item_revision,
+        replacement_session_index,
+        credited_before_seconds,
+        actual_seconds,
+        credited_after_seconds,
+        credited_source_seconds,
+        remaining_duration_seconds,
+        request.move_start,
+        move_end,
+        assessed_at,
+        expires_at,
+        &environment_digest,
+        &violations,
+        &context,
+    )?;
+
+    let private_context =
+        serde_json::to_value(&context).map_err(|_| ExecutionRepositoryError::Internal)?;
+    let violations_json =
+        serde_json::to_value(&violations).map_err(|_| ExecutionRepositoryError::Internal)?;
+    let insert_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    if insert_at >= expires_at {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+    sqlx::query(
+        "INSERT INTO execution_defer_assessments (id, workspace_id, user_id, schema_version, \
+           execution_state_revision, source_execution_session_id, \
+           source_execution_session_revision, source_schedule_revision_id, source_block_id, \
+           current_schedule_revision_id, current_schedule_revision_number, \
+           current_publication_hash, item_id, source_item_revision, current_item_revision, \
+           execution_epoch, occurrence_id, source_session_index, replacement_session_index, \
+           planned_duration_seconds, credited_before_seconds, effective_actual_seconds, \
+           credited_after_seconds, credited_source_seconds, remaining_duration_seconds, \
+           scheduler_slot_seconds, target_start, target_end, environment_digest, \
+           assessment_digest, approval_required, private_context, violations, assessed_at, \
+           expires_at) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, \
+           $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, \
+           $30, $31, $32, $33, $34)",
+    )
+    .bind(assessment_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(revision_to_i64(execution_revision)?)
+    .bind(session.id)
+    .bind(revision_to_i64(session.revision)?)
+    .bind(origin.schedule_revision_id)
+    .bind(origin.source_block_id)
+    .bind(policy.revision_id)
+    .bind(revision_to_i64(policy.revision_number)?)
+    .bind(policy.publication_hash.as_slice())
+    .bind(session.item_id)
+    .bind(revision_to_i64(session.item_revision)?)
+    .bind(revision_to_i64(current_item_revision)?)
+    .bind(origin.execution_epoch)
+    .bind(session.occurrence_id)
+    .bind(i32::from(session.session_index))
+    .bind(i32::from(replacement_session_index))
+    .bind(seconds_to_i64(planned_duration_seconds)?)
+    .bind(seconds_to_i64(credited_before_seconds)?)
+    .bind(seconds_to_i64(actual_seconds)?)
+    .bind(seconds_to_i64(credited_after_seconds)?)
+    .bind(seconds_to_i64(credited_source_seconds)?)
+    .bind(seconds_to_i64(remaining_duration_seconds)?)
+    .bind(i32::try_from(scheduler_slot_seconds).map_err(|_| ExecutionRepositoryError::Internal)?)
+    .bind(request.move_start)
+    .bind(move_end)
+    .bind(environment_digest.as_slice())
+    .bind(assessment_digest.as_slice())
+    .bind(approval_required)
+    .bind(private_context)
+    .bind(violations_json)
+    .bind(assessed_at)
+    .bind(expires_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(|error| map_defer_assessment_insert(&error))?;
+
+    Ok(DeferAssessment {
+        session_id: session.id,
+        execution_revision,
+        session_revision: session.revision,
+        item_id: session.item_id,
+        item_revision: current_item_revision,
+        occurrence_id: session.occurrence_id,
+        source_session_index: session.session_index,
+        replacement_session_index,
+        source_schedule_revision_id: origin.schedule_revision_id,
+        source_block_id: origin.source_block_id,
+        actual_seconds,
+        credited_source_seconds,
+        planned_duration_seconds,
+        remaining_duration_seconds,
+        move_start: request.move_start,
+        move_end,
+        environment_digest: encode_prefixed_sha256(&environment_digest),
+        assessment_digest: encode_prefixed_sha256(&assessment_digest),
+        approval_required,
+        violations,
+        expires_at,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeferSourceOrigin {
+    schedule_revision_id: Uuid,
+    source_block_id: Uuid,
+    execution_epoch: i64,
+    planned_duration_seconds: u64,
+}
+
+async fn defer_source_origin(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
+    session: &ExecutionSession,
+) -> Result<DeferSourceOrigin, ExecutionRepositoryError> {
+    let row = sqlx::query(
+        "SELECT origin.schedule_revision_id, origin.source_block_id, origin.item_id, \
+           origin.item_revision, origin.execution_epoch, origin.occurrence_id, \
+           origin.session_index, origin.planned_duration_seconds \
+         FROM execution_session_schedule_origins AS origin \
+         WHERE origin.workspace_id = $1 AND origin.execution_session_id = $2 FOR SHARE",
+    )
+    .bind(workspace_id)
+    .bind(session.id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ExecutionRepositoryError::ScheduleStale)?;
+    let item_id: Uuid = row.try_get("item_id").map_err(internal)?;
+    let item_revision = positive_revision(row.try_get("item_revision").map_err(internal)?)?;
+    let execution_epoch: i64 = row.try_get("execution_epoch").map_err(internal)?;
+    let occurrence_id: Option<Uuid> = row.try_get("occurrence_id").map_err(internal)?;
+    let session_index: i32 = row.try_get("session_index").map_err(internal)?;
+    let planned_duration_seconds =
+        nonnegative_seconds(row.try_get("planned_duration_seconds").map_err(internal)?)?;
+    if item_id != session.item_id
+        || item_revision != session.item_revision
+        || execution_epoch <= 0
+        || occurrence_id != session.occurrence_id
+        || u16::try_from(session_index).ok() != Some(session.session_index)
+        || session.planned_block_id != Some(row.try_get("source_block_id").map_err(internal)?)
+        || planned_duration_seconds == 0
+        || planned_duration_seconds % 60 != 0
+    {
+        return Err(ExecutionRepositoryError::ScheduleStale);
+    }
+    Ok(DeferSourceOrigin {
+        schedule_revision_id: row.try_get("schedule_revision_id").map_err(internal)?,
+        source_block_id: row.try_get("source_block_id").map_err(internal)?,
+        execution_epoch,
+        planned_duration_seconds,
+    })
+}
+
+fn exact_work_unit_credit(
+    execution: &ExecutionPlanningContext,
+    session: &ExecutionSession,
+) -> Result<u64, ExecutionRepositoryError> {
+    let mut matching = execution.work_units.iter().filter(|unit| {
+        unit.item_id.0 == session.item_id
+            && unit.occurrence_id.map(|occurrence| occurrence.0) == session.occurrence_id
+    });
+    let unit = matching
+        .next()
+        .ok_or(ExecutionRepositoryError::DeferAssessmentStale)?;
+    if matching.next().is_some()
+        || !unit.used_session_indices.contains(&session.session_index)
+        || unit
+            .reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.session_index == session.session_index
+                    && matches!(
+                        reservation.kind,
+                        dayweave_core::ExecutionReservationKind::InFlight
+                    )
+            })
+            .count()
+            != 1
+    {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+    Ok(unit.credited_seconds)
+}
+
+fn normalized_source_credit_seconds(
+    credited_before_seconds: u64,
+    credited_after_seconds: u64,
+    planned_duration_seconds: u64,
+) -> Result<u64, ExecutionRepositoryError> {
+    let before_minutes =
+        credited_before_seconds / 60 + u64::from(!credited_before_seconds.is_multiple_of(60));
+    let after_minutes =
+        credited_after_seconds / 60 + u64::from(!credited_after_seconds.is_multiple_of(60));
+    let source_minutes = after_minutes
+        .checked_sub(before_minutes)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    Ok(source_minutes
+        .checked_mul(60)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?
+        .min(planned_duration_seconds))
+}
+
+fn core_previous_assignments(
+    evidence: &AuthoritativePlanningEvidence,
+) -> Result<Vec<PreviousAssignment>, ExecutionRepositoryError> {
+    let mut manual_ids = BTreeMap::new();
+    for retained in &evidence.retained_manual_placements {
+        for assignment in &retained.placement.assignments {
+            if manual_ids
+                .insert(
+                    (assignment.item_id, assignment.occurrence_id),
+                    retained.placement.id,
+                )
+                .is_some()
+            {
+                return Err(ExecutionRepositoryError::DeferAssessmentStale);
+            }
+        }
+    }
+    evidence
+        .previous_assignments
+        .iter()
+        .map(|assignment| {
+            Ok(PreviousAssignment {
+                item_id: ItemId(assignment.item_id),
+                occurrence_id: assignment.occurrence_id.map(OccurrenceId),
+                blocks: assignment
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        Ok(PreviousBlock {
+                            start: chrono_to_offset(block.start)?,
+                            end: chrono_to_offset(block.end)?,
+                            session_index: block.session_index,
+                        })
+                    })
+                    .collect::<Result<_, ExecutionRepositoryError>>()?,
+                pinned: assignment.pinned,
+                manual_placement_id: assignment
+                    .pinned
+                    .then(|| {
+                        manual_ids
+                            .get(&(assignment.item_id, assignment.occurrence_id))
+                            .copied()
+                    })
+                    .flatten(),
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // Every field is approval-bound explicitly.
+fn defer_assessment_digest(
+    scope: DatabaseScope,
+    policy: &PublishedPlanningPolicy,
+    session: &ExecutionSession,
+    origin: &DeferSourceOrigin,
+    execution_revision: u64,
+    current_item_revision: u64,
+    replacement_session_index: u16,
+    credited_before_seconds: u64,
+    actual_seconds: u64,
+    credited_after_seconds: u64,
+    credited_source_seconds: u64,
+    remaining_duration_seconds: u64,
+    move_start: DateTime<Utc>,
+    move_end: DateTime<Utc>,
+    assessed_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    environment_digest: &[u8; 32],
+    violations: &[ManualPlacementViolationOutput],
+    context: &PersistedDeferAssessmentContext,
+) -> Result<[u8; 32], ExecutionRepositoryError> {
+    #[derive(Serialize)]
+    struct Evidence<'a> {
+        schema: &'static str,
+        assessment_id: Uuid,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        execution_revision: u64,
+        source_session_id: Uuid,
+        source_session_revision: u64,
+        source_schedule_revision_id: Uuid,
+        source_block_id: Uuid,
+        current_schedule_revision_id: Uuid,
+        current_schedule_revision_number: u64,
+        current_publication_hash: &'a [u8; 32],
+        item_id: Uuid,
+        source_item_revision: u64,
+        current_item_revision: u64,
+        execution_epoch: i64,
+        occurrence_id: Option<Uuid>,
+        source_session_index: u16,
+        replacement_session_index: u16,
+        planned_duration_seconds: u64,
+        credited_before_seconds: u64,
+        effective_actual_seconds: u64,
+        credited_after_seconds: u64,
+        credited_source_seconds: u64,
+        remaining_duration_seconds: u64,
+        scheduler_slot_seconds: u64,
+        move_start: DateTime<Utc>,
+        move_end: DateTime<Utc>,
+        assessed_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+        environment_digest: &'a [u8; 32],
+        approval_required: bool,
+        violations: &'a [ManualPlacementViolationOutput],
+        context: &'a PersistedDeferAssessmentContext,
+    }
+    let scheduler_slot_seconds = u64::from(policy.planning_request.config.slot_granularity.get())
+        .checked_mul(60)
+        .ok_or(ExecutionRepositoryError::Internal)?;
+    let encoded = serde_json::to_vec(&Evidence {
+        schema: DEFER_ASSESSMENT_SCHEMA,
+        assessment_id: context.candidate.placement_id,
+        workspace_id: scope.workspace_id,
+        user_id: scope.user_id,
+        execution_revision,
+        source_session_id: session.id,
+        source_session_revision: session.revision,
+        source_schedule_revision_id: origin.schedule_revision_id,
+        source_block_id: origin.source_block_id,
+        current_schedule_revision_id: policy.revision_id,
+        current_schedule_revision_number: policy.revision_number,
+        current_publication_hash: &policy.publication_hash,
+        item_id: session.item_id,
+        source_item_revision: session.item_revision,
+        current_item_revision,
+        execution_epoch: origin.execution_epoch,
+        occurrence_id: session.occurrence_id,
+        source_session_index: session.session_index,
+        replacement_session_index,
+        planned_duration_seconds: origin.planned_duration_seconds,
+        credited_before_seconds,
+        effective_actual_seconds: actual_seconds,
+        credited_after_seconds,
+        credited_source_seconds,
+        remaining_duration_seconds,
+        scheduler_slot_seconds,
+        move_start,
+        move_end,
+        assessed_at,
+        expires_at,
+        environment_digest,
+        approval_required: !violations.is_empty(),
+        violations,
+        context,
+    })
+    .map_err(|_| ExecutionRepositoryError::Internal)?;
+    let mut digest = Sha256::new();
+    digest.update(b"dayweave.execution-defer-assessment.v1\0");
+    digest.update(encoded);
+    Ok(digest.finalize().into())
+}
+
+async fn prune_defer_assessments(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    now: DateTime<Utc>,
+) -> Result<(), ExecutionRepositoryError> {
+    sqlx::query(
+        "DELETE FROM execution_defer_assessments AS assessment \
+         WHERE assessment.workspace_id = $1 AND assessment.user_id = $2 \
+           AND assessment.expires_at <= $3 \
+           AND NOT EXISTS (SELECT 1 FROM execution_defer_replacement_claims AS claim \
+             WHERE claim.workspace_id = assessment.workspace_id \
+               AND claim.assessment_id = assessment.id)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+fn chrono_to_offset(
+    value: DateTime<Utc>,
+) -> Result<time::OffsetDateTime, ExecutionRepositoryError> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(value.timestamp_micros()) * 1_000)
+        .map_err(|_| ExecutionRepositoryError::Internal)
+}
+
+fn offset_to_chrono(
+    value: time::OffsetDateTime,
+) -> Result<DateTime<Utc>, ExecutionRepositoryError> {
+    let nanoseconds = value.unix_timestamp_nanos();
+    if nanoseconds % 1_000 != 0 {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+    let microseconds =
+        i64::try_from(nanoseconds / 1_000).map_err(|_| ExecutionRepositoryError::Internal)?;
+    DateTime::from_timestamp_micros(microseconds).ok_or(ExecutionRepositoryError::Internal)
+}
+
+fn encode_prefixed_sha256(value: &[u8; 32]) -> String {
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in value {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn decode_prefixed_sha256(value: &str) -> Option<[u8; 32]> {
+    let hex = value.strip_prefix("sha256:")?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return None;
+    }
+    let bytes = hex
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Some((high << 4) | low)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    bytes.try_into().ok()
+}
+
+fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn map_schedule_assessment_error(error: SchedulePublicationError) -> ExecutionRepositoryError {
+    match error {
+        SchedulePublicationError::StaleComposition
+        | SchedulePublicationError::DeferredPlacementRequired
+        | SchedulePublicationError::InvalidPayload => ExecutionRepositoryError::ScheduleStale,
+        SchedulePublicationError::AccessDenied
+        | SchedulePublicationError::IdempotencyConflict
+        | SchedulePublicationError::Unavailable => {
+            ExecutionRepositoryError::DeferAssessmentUnavailable
+        }
+    }
+}
+
+fn map_schedule_authorization_error(error: SchedulePublicationError) -> ExecutionRepositoryError {
+    match error {
+        SchedulePublicationError::StaleComposition
+        | SchedulePublicationError::DeferredPlacementRequired
+        | SchedulePublicationError::InvalidPayload => {
+            ExecutionRepositoryError::DeferAssessmentStale
+        }
+        SchedulePublicationError::AccessDenied
+        | SchedulePublicationError::IdempotencyConflict
+        | SchedulePublicationError::Unavailable => {
+            ExecutionRepositoryError::DeferAssessmentUnavailable
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)] // Every approval-bound fact is revalidated in one transaction.
+async fn authorize_defer_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    execution_revision: u64,
+    input: &DeferExecution,
+) -> Result<(ExecutionSession, DeferAuthorization), ExecutionRepositoryError> {
+    let assessment_digest = input
+        .assessment_digest
+        .as_deref()
+        .and_then(decode_prefixed_sha256)
+        .ok_or(ExecutionRepositoryError::DeferAssessmentStale)?;
+    let approved_assessment_digest = match input.approved_assessment_digest.as_deref() {
+        Some(digest) => Some(
+            decode_prefixed_sha256(digest).ok_or(ExecutionRepositoryError::DeferApprovalInvalid)?,
+        ),
+        None => None,
+    };
+    let actual_seconds = input
+        .actual_seconds
+        .ok_or(ExecutionRepositoryError::DeferAssessmentStale)?;
+    let cheaply_available: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM execution_defer_assessments \
+         WHERE workspace_id = $1 AND user_id = $2 AND assessment_digest = $3 \
+           AND expires_at > statement_timestamp())",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(assessment_digest.as_slice())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if !cheaply_available {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+
+    lock_canonical_item_space(transaction, scope.workspace_id)
+        .await
+        .map_err(internal)?;
+    lock_owner(transaction, scope).await.map_err(internal)?;
+    let policy = published_planning_policy_tx(transaction, scope)
+        .await
+        .map_err(map_schedule_authorization_error)?;
+    assert_current_item_snapshot(transaction, scope, &policy.source_item_revisions)
+        .await
+        .map_err(map_schedule_authorization_error)?;
+    assert_current_calendar_projection(
+        transaction,
+        scope,
+        offset_to_chrono(policy.planning_request.horizon_start)?,
+        offset_to_chrono(policy.planning_request.horizon_end)?,
+        &policy.calendar_projection_stamps,
+    )
+    .await
+    .map_err(map_schedule_authorization_error)?;
+    assert_current_planning_policy_tx(transaction, scope, policy.revision_id)
+        .await
+        .map_err(map_schedule_authorization_error)?;
+
+    let session =
+        fetch_session_transaction(transaction, scope.workspace_id, input.session_id).await?;
+    if session.status != ExecutionStatus::Paused {
+        return Err(ExecutionRepositoryError::DeferRequiresPause);
+    }
+    let origin = defer_source_origin(transaction, scope.workspace_id, &session).await?;
+    let current_item_revision = policy
+        .source_item_revisions
+        .get(&session.item_id)
+        .copied()
+        .filter(|revision| *revision == session.item_revision)
+        .ok_or(ExecutionRepositoryError::ScheduleStale)?;
+    let evidence = authoritative_planning_evidence_tx(transaction, scope.workspace_id)
+        .await
+        .map_err(|_| ExecutionRepositoryError::DeferAssessmentUnavailable)?;
+    if evidence.execution.snapshot_revision != execution_revision
+        || evidence.published_revision_id != Some(policy.revision_id)
+    {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+
+    let row = sqlx::query(
+        "SELECT id, execution_state_revision, source_execution_session_id, \
+           source_execution_session_revision, source_schedule_revision_id, source_block_id, \
+           current_schedule_revision_id, current_schedule_revision_number, \
+           current_publication_hash, item_id, source_item_revision, current_item_revision, \
+           execution_epoch, occurrence_id, source_session_index, replacement_session_index, \
+           planned_duration_seconds, credited_before_seconds, effective_actual_seconds, \
+           credited_after_seconds, credited_source_seconds, remaining_duration_seconds, \
+           scheduler_slot_seconds, target_start, target_end, environment_digest, \
+           assessment_digest, approval_required, private_context, violations, assessed_at, \
+           expires_at FROM execution_defer_assessments \
+         WHERE workspace_id = $1 AND user_id = $2 AND assessment_digest = $3 FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(assessment_digest.as_slice())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ExecutionRepositoryError::DeferAssessmentStale)?;
+    let stored = stored_defer_assessment_from_row(&row)?;
+    let database_now: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+
+    let scheduler_slot_seconds = u64::from(policy.planning_request.config.slot_granularity.get())
+        .checked_mul(60)
+        .ok_or(ExecutionRepositoryError::DeferAssessmentStale)?;
+    let credited_before_seconds = exact_work_unit_credit(&evidence.execution, &session)?;
+    let credited_after_seconds = credited_before_seconds
+        .checked_add(actual_seconds)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    let credited_source_seconds = normalized_source_credit_seconds(
+        credited_before_seconds,
+        credited_after_seconds,
+        origin.planned_duration_seconds,
+    )?;
+    let remaining_duration_seconds = origin
+        .planned_duration_seconds
+        .checked_sub(credited_source_seconds)
+        .filter(|seconds| *seconds > 0 && seconds % 60 == 0 && *seconds <= 24 * 60 * 60)
+        .ok_or(ExecutionRepositoryError::DeferDurationConflict)?;
+    let replacement_session_index = u16::try_from(
+        next_replacement_session_index(
+            transaction,
+            scope.workspace_id,
+            session.item_id,
+            session.occurrence_id,
+        )
+        .await?,
+    )
+    .map_err(|_| ExecutionRepositoryError::IndexExhausted)?;
+
+    if stored.assessment_digest != assessment_digest
+        || stored.execution_state_revision != execution_revision
+        || stored.source_execution_session_id != session.id
+        || stored.source_execution_session_revision != session.revision
+        || stored.source_schedule_revision_id != origin.schedule_revision_id
+        || stored.source_block_id != origin.source_block_id
+        || stored.current_schedule_revision_id != policy.revision_id
+        || stored.current_schedule_revision_number != policy.revision_number
+        || stored.current_publication_hash != policy.publication_hash
+        || stored.item_id != session.item_id
+        || stored.source_item_revision != session.item_revision
+        || stored.current_item_revision != current_item_revision
+        || stored.execution_epoch != origin.execution_epoch
+        || stored.occurrence_id != session.occurrence_id
+        || stored.source_session_index != session.session_index
+        || stored.replacement_session_index != replacement_session_index
+        || stored.planned_duration_seconds != origin.planned_duration_seconds
+        || stored.credited_before_seconds != credited_before_seconds
+        || stored.effective_actual_seconds != actual_seconds
+        || stored.credited_after_seconds != credited_after_seconds
+        || stored.credited_source_seconds != credited_source_seconds
+        || stored.remaining_duration_seconds != remaining_duration_seconds
+        || stored.scheduler_slot_seconds != scheduler_slot_seconds
+        || stored.target_start != input.move_start
+        || stored.target_end != input.move_end
+        || stored.context.schema != DEFER_ASSESSMENT_SCHEMA
+        || stored.context.planning_as_of != stored.expires_at
+        || stored.assessed_at > database_now
+        || stored.expires_at <= database_now
+    {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+
+    let expected_candidate = DeferCandidateAssessmentInput {
+        placement_id: stored.id,
+        item_id: ItemId(session.item_id),
+        occurrence_id: session.occurrence_id.map(OccurrenceId),
+        source_session_index: session.session_index,
+        replacement_session_index,
+        credited_seconds_after_source: credited_after_seconds,
+        move_start: chrono_to_offset(input.move_start)?,
+        move_end: chrono_to_offset(input.move_end)?,
+    };
+    if stored.context.candidate != expected_candidate {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+    let mut planning_request = policy.planning_request.clone();
+    planning_request.as_of = chrono_to_offset(stored.context.planning_as_of)?;
+    planning_request.previous_assignments = core_previous_assignments(&evidence)?;
+    let core = Scheduler
+        .assess_defer_candidate(&planning_request, &evidence.execution, &expected_candidate)
+        .map_err(|_| ExecutionRepositoryError::DeferAssessmentStale)?;
+    let violations = map_manual_placement_violations(&core.assessment.violations)
+        .map_err(|_| ExecutionRepositoryError::Internal)?;
+    if core.assessment.environment_digest != stored.environment_digest
+        || violations != stored.violations
+        || stored.approval_required == violations.is_empty()
+    {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+    let recomputed_digest = defer_assessment_digest(
+        scope,
+        &policy,
+        &session,
+        &origin,
+        execution_revision,
+        current_item_revision,
+        replacement_session_index,
+        credited_before_seconds,
+        actual_seconds,
+        credited_after_seconds,
+        credited_source_seconds,
+        remaining_duration_seconds,
+        input.move_start,
+        input.move_end,
+        stored.assessed_at,
+        stored.expires_at,
+        &stored.environment_digest,
+        &violations,
+        &stored.context,
+    )?;
+    if recomputed_digest != stored.assessment_digest {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
+
+    let authorization_kind = if stored.approval_required {
+        match approved_assessment_digest {
+            None => return Err(ExecutionRepositoryError::DeferApprovalRequired),
+            Some(approved) if approved == stored.assessment_digest => "explicit_approval",
+            Some(_) => return Err(ExecutionRepositoryError::DeferApprovalInvalid),
+        }
+    } else if approved_assessment_digest.is_some() {
+        return Err(ExecutionRepositoryError::DeferApprovalInvalid);
+    } else {
+        "conflict_free"
+    };
+
+    Ok((
+        session,
+        DeferAuthorization {
+            assessment_id: stored.id,
+            authorized_by_user_id: scope.user_id,
+            environment_digest: stored.environment_digest,
+            assessment_digest: stored.assessment_digest,
+            approved_assessment_digest,
+            assessment_expires_at: stored.expires_at,
+            authorization_kind,
+            execution_epoch: stored.execution_epoch,
+            replacement_session_index,
+            planned_duration_seconds: stored.planned_duration_seconds,
+            effective_actual_seconds: stored.effective_actual_seconds,
+            credited_source_seconds: stored.credited_source_seconds,
+            remaining_duration_seconds: stored.remaining_duration_seconds,
+        },
+    ))
+}
+
+fn stored_defer_assessment_from_row(
+    row: &PgRow,
+) -> Result<StoredDeferAssessment, ExecutionRepositoryError> {
+    let private_context: Value = row.try_get("private_context").map_err(internal)?;
+    let violations: Value = row.try_get("violations").map_err(internal)?;
+    Ok(StoredDeferAssessment {
+        id: row.try_get("id").map_err(internal)?,
+        execution_state_revision: positive_revision(
+            row.try_get("execution_state_revision").map_err(internal)?,
+        )?,
+        source_execution_session_id: row
+            .try_get("source_execution_session_id")
+            .map_err(internal)?,
+        source_execution_session_revision: positive_revision(
+            row.try_get("source_execution_session_revision")
+                .map_err(internal)?,
+        )?,
+        source_schedule_revision_id: row
+            .try_get("source_schedule_revision_id")
+            .map_err(internal)?,
+        source_block_id: row.try_get("source_block_id").map_err(internal)?,
+        current_schedule_revision_id: row
+            .try_get("current_schedule_revision_id")
+            .map_err(internal)?,
+        current_schedule_revision_number: positive_revision(
+            row.try_get("current_schedule_revision_number")
+                .map_err(internal)?,
+        )?,
+        current_publication_hash: fixed_sha256_from_row(row, "current_publication_hash")?,
+        item_id: row.try_get("item_id").map_err(internal)?,
+        source_item_revision: positive_revision(
+            row.try_get("source_item_revision").map_err(internal)?,
+        )?,
+        current_item_revision: positive_revision(
+            row.try_get("current_item_revision").map_err(internal)?,
+        )?,
+        execution_epoch: row.try_get("execution_epoch").map_err(internal)?,
+        occurrence_id: row.try_get("occurrence_id").map_err(internal)?,
+        source_session_index: bounded_session_index(
+            row.try_get("source_session_index").map_err(internal)?,
+        )?,
+        replacement_session_index: bounded_session_index(
+            row.try_get("replacement_session_index").map_err(internal)?,
+        )?,
+        planned_duration_seconds: nonnegative_seconds(
+            row.try_get("planned_duration_seconds").map_err(internal)?,
+        )?,
+        credited_before_seconds: nonnegative_seconds(
+            row.try_get("credited_before_seconds").map_err(internal)?,
+        )?,
+        effective_actual_seconds: nonnegative_seconds(
+            row.try_get("effective_actual_seconds").map_err(internal)?,
+        )?,
+        credited_after_seconds: nonnegative_seconds(
+            row.try_get("credited_after_seconds").map_err(internal)?,
+        )?,
+        credited_source_seconds: nonnegative_seconds(
+            row.try_get("credited_source_seconds").map_err(internal)?,
+        )?,
+        remaining_duration_seconds: nonnegative_seconds(
+            row.try_get("remaining_duration_seconds")
+                .map_err(internal)?,
+        )?,
+        scheduler_slot_seconds: u64::try_from(
+            row.try_get::<i32, _>("scheduler_slot_seconds")
+                .map_err(internal)?,
+        )
+        .map_err(|_| ExecutionRepositoryError::Internal)?,
+        target_start: row.try_get("target_start").map_err(internal)?,
+        target_end: row.try_get("target_end").map_err(internal)?,
+        environment_digest: fixed_sha256_from_row(row, "environment_digest")?,
+        assessment_digest: fixed_sha256_from_row(row, "assessment_digest")?,
+        approval_required: row.try_get("approval_required").map_err(internal)?,
+        context: serde_json::from_value(private_context)
+            .map_err(|_| ExecutionRepositoryError::DeferAssessmentStale)?,
+        violations: serde_json::from_value(violations)
+            .map_err(|_| ExecutionRepositoryError::DeferAssessmentStale)?,
+        assessed_at: row.try_get("assessed_at").map_err(internal)?,
+        expires_at: row.try_get("expires_at").map_err(internal)?,
+    })
+}
+
+fn fixed_sha256_from_row(row: &PgRow, column: &str) -> Result<[u8; 32], ExecutionRepositoryError> {
+    row.try_get::<Vec<u8>, _>(column)
+        .map_err(internal)?
+        .try_into()
+        .map_err(|_| ExecutionRepositoryError::Internal)
+}
+
+fn bounded_session_index(value: i32) -> Result<u16, ExecutionRepositoryError> {
+    u16::try_from(value).map_err(|_| ExecutionRepositoryError::Internal)
+}
+
+async fn apply_command_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    execution_revision: u64,
     active_session_id: Option<Uuid>,
     command: &ExecutionCommand,
     transition_at: DateTime<Utc>,
     observed_at: DateTime<Utc>,
 ) -> Result<ExecutionSession, ExecutionRepositoryError> {
+    let workspace_id = scope.workspace_id;
     if let ExecutionCommand::Start(input) = command {
         if active_session_id.is_some() {
             return Err(ExecutionRepositoryError::ActiveSessionConflict);
@@ -237,11 +1379,20 @@ async fn apply_command_transaction(
     if active_session_id != Some(requested_id) {
         return Err(ExecutionRepositoryError::SessionNotFound(requested_id));
     }
-    let current = fetch_session_transaction(transaction, workspace_id, requested_id).await?;
+    let (current, defer_authorization) = if let ExecutionCommand::Defer(input) = command {
+        let (session, authorization) =
+            authorize_defer_transaction(transaction, scope, execution_revision, input).await?;
+        (session, Some(authorization))
+    } else {
+        (
+            fetch_session_transaction(transaction, workspace_id, requested_id).await?,
+            None,
+        )
+    };
     let updated = current.apply_with_protocol_time(command, transition_at, observed_at)?;
     update_session(transaction, workspace_id, &updated).await?;
-    if matches!(command, ExecutionCommand::Defer(_)) {
-        insert_defer_replacement_claim(transaction, workspace_id, &updated).await?;
+    if let Some(authorization) = defer_authorization {
+        insert_defer_replacement_claim(transaction, scope, &updated, &authorization).await?;
     }
     Ok(updated)
 }
@@ -526,94 +1677,69 @@ async fn validate_start_item(
 
 async fn insert_defer_replacement_claim(
     transaction: &mut Transaction<'_, Postgres>,
-    workspace_id: Uuid,
+    scope: DatabaseScope,
     session: &ExecutionSession,
+    authorization: &DeferAuthorization,
 ) -> Result<(), ExecutionRepositoryError> {
-    let evidence = sqlx::query(
-        "SELECT session.execution_epoch, origin.planned_duration_seconds \
-         FROM execution_sessions AS session \
-         LEFT JOIN execution_session_schedule_origins AS origin \
-           ON origin.workspace_id = session.workspace_id \
-          AND origin.execution_session_id = session.id \
-         WHERE session.workspace_id = $1 AND session.id = $2",
-    )
-    .bind(workspace_id)
-    .bind(session.id)
-    .fetch_one(&mut **transaction)
-    .await
-    .map_err(internal)?;
-    let execution_epoch: i64 = evidence.try_get("execution_epoch").map_err(internal)?;
-    if execution_epoch <= 0 {
-        return Err(ExecutionRepositoryError::Internal);
-    }
-    let origin_duration: Option<i64> = evidence
-        .try_get("planned_duration_seconds")
-        .map_err(internal)?;
     let move_start = session
         .move_start
         .ok_or(ExecutionRepositoryError::Internal)?;
     let move_end = session.move_end.ok_or(ExecutionRepositoryError::Internal)?;
-    let move_duration = exact_window_seconds(move_start, move_end)?;
-    let actual_seconds = seconds_to_i64(
-        session
-            .actual_seconds
-            .ok_or(ExecutionRepositoryError::Internal)?,
-    )?;
-    let (planned_duration, duration_source, consumed_by_source) =
-        if let Some(planned_duration) = origin_duration {
-            if planned_duration <= 0 {
-                return Err(ExecutionRepositoryError::Internal);
-            }
-            (
-                planned_duration,
-                "published_origin",
-                actual_seconds.min(planned_duration),
-            )
-        } else {
-            (move_duration, "legacy_move_window", 0)
-        };
-    let remaining_duration = planned_duration
-        .checked_sub(consumed_by_source)
-        .ok_or(ExecutionRepositoryError::Internal)?;
-    if origin_duration.is_some() && (remaining_duration <= 0 || remaining_duration != move_duration)
+    if session.actual_seconds != Some(authorization.effective_actual_seconds)
+        || exact_window_seconds(move_start, move_end)?
+            != seconds_to_i64(authorization.remaining_duration_seconds)?
+        || authorization.execution_epoch <= 0
     {
         return Err(ExecutionRepositoryError::DeferDurationConflict);
     }
-
-    let replacement_session_index = next_replacement_session_index(
-        transaction,
-        workspace_id,
-        session.item_id,
-        session.occurrence_id,
-    )
-    .await?;
+    let claim_insert_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    if claim_insert_at >= authorization.assessment_expires_at {
+        return Err(ExecutionRepositoryError::DeferAssessmentStale);
+    }
 
     let inserted = sqlx::query(
         "INSERT INTO execution_defer_replacement_claims (workspace_id, \
          source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
          occurrence_id, source_session_index, replacement_session_index, \
          planned_duration_seconds, planned_duration_source, actionable, consumed_before_seconds, \
-         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, 0, $11, $12, $13, $14, $15)",
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at, \
+         authorization_schema_version, authorization_kind, assessment_id, authorized_by_user_id, \
+         environment_digest, assessment_digest, approved_assessment_digest, assessment_expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'published_origin', true, 0, $10, \
+         $11, $12, $13, $14, 1, $15, $16, $17, $18, $19, $20, $21)",
     )
-    .bind(workspace_id)
+    .bind(scope.workspace_id)
     .bind(session.id)
     .bind(session.item_id)
     .bind(revision_to_i64(session.item_revision)?)
-    .bind(execution_epoch)
+    .bind(authorization.execution_epoch)
     .bind(session.occurrence_id)
     .bind(i32::from(session.session_index))
-    .bind(replacement_session_index)
-    .bind(planned_duration)
-    .bind(duration_source)
-    .bind(consumed_by_source)
-    .bind(remaining_duration)
+    .bind(i32::from(authorization.replacement_session_index))
+    .bind(seconds_to_i64(authorization.planned_duration_seconds)?)
+    .bind(seconds_to_i64(authorization.credited_source_seconds)?)
+    .bind(seconds_to_i64(authorization.remaining_duration_seconds)?)
     .bind(move_start)
     .bind(move_end)
     .bind(session.updated_at)
+    .bind(authorization.authorization_kind)
+    .bind(authorization.assessment_id)
+    .bind(authorization.authorized_by_user_id)
+    .bind(authorization.environment_digest.as_slice())
+    .bind(authorization.assessment_digest.as_slice())
+    .bind(
+        authorization
+            .approved_assessment_digest
+            .as_ref()
+            .map(<[u8; 32]>::as_slice),
+    )
+    .bind(authorization.assessment_expires_at)
     .execute(&mut **transaction)
     .await
-    .map_err(internal)?
+    .map_err(|error| map_defer_claim_insert(&error))?
     .rows_affected();
     if inserted == 1 {
         Ok(())
@@ -930,4 +2056,69 @@ fn seconds_to_i64(value: u64) -> Result<i64, ExecutionRepositoryError> {
 
 fn internal(_: sqlx::Error) -> ExecutionRepositoryError {
     ExecutionRepositoryError::Internal
+}
+
+fn map_defer_assessment_insert(error: &sqlx::Error) -> ExecutionRepositoryError {
+    if has_sqlstate(error, "DW001") {
+        ExecutionRepositoryError::DeferAssessmentStale
+    } else {
+        ExecutionRepositoryError::Internal
+    }
+}
+
+fn map_defer_claim_insert(error: &sqlx::Error) -> ExecutionRepositoryError {
+    if has_sqlstate(error, "DW002") {
+        ExecutionRepositoryError::DeferAssessmentStale
+    } else {
+        ExecutionRepositoryError::Internal
+    }
+}
+
+fn has_sqlstate(error: &sqlx::Error, expected: &str) -> bool {
+    matches!(error, sqlx::Error::Database(database) if database.code().as_deref() == Some(expected))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        map_schedule_assessment_error, map_schedule_authorization_error,
+        normalized_source_credit_seconds,
+    };
+    use crate::{execution::ExecutionRepositoryError, scheduling::SchedulePublicationError};
+
+    #[test]
+    fn defer_credit_rounds_the_aggregate_once_across_fractional_history() {
+        assert_eq!(
+            normalized_source_credit_seconds(61, 61 + 59, 3_600).unwrap(),
+            0,
+            "61s and then 59s are two aggregate minutes, not three separately rounded minutes",
+        );
+        assert_eq!(
+            normalized_source_credit_seconds(59, 59 + 2, 3_600).unwrap(),
+            60,
+            "crossing one aggregate minute boundary credits exactly one minute",
+        );
+        assert_eq!(
+            normalized_source_credit_seconds(0, 601, 3_600).unwrap(),
+            660,
+        );
+    }
+
+    #[test]
+    fn changed_policy_evidence_is_stale_only_after_an_assessment_exists() {
+        for error in [
+            SchedulePublicationError::StaleComposition,
+            SchedulePublicationError::DeferredPlacementRequired,
+            SchedulePublicationError::InvalidPayload,
+        ] {
+            assert_eq!(
+                map_schedule_assessment_error(error),
+                ExecutionRepositoryError::ScheduleStale,
+            );
+            assert_eq!(
+                map_schedule_authorization_error(error),
+                ExecutionRepositoryError::DeferAssessmentStale,
+            );
+        }
+    }
 }

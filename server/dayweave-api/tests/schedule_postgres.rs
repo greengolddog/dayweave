@@ -16,7 +16,8 @@ use dayweave_api::{
         DeviceEnrollmentSpec, GeneratedCredential,
     },
     execution::{
-        DeferExecution, ExecutionCommand, ExecutionIdempotencyKey, ExecutionService, StartExecution,
+        DeferAssessmentRequest, DeferExecution, ExecutionCommand, ExecutionIdempotencyKey,
+        ExecutionService, PauseExecution, StartExecution,
     },
     http::router,
     items::{
@@ -2689,13 +2690,41 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
     execution
         .command(
             1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: deferred_session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess the exact replacement".to_owned()),
+            }),
+            execution_idempotency("schedule-v21-source-pause", 142),
+        )
+        .await
+        .expect("pause before assessing the replacement");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id: deferred_session_id,
+            move_start,
+            actual_seconds: Some(20 * 60),
+        })
+        .await
+        .expect("assess the exact forty-minute remainder");
+    assert_eq!(assessment.move_end, move_end);
+    let approval = assessment
+        .approval_required
+        .then(|| assessment.assessment_digest.clone());
+    execution
+        .command(
+            2,
             ExecutionCommand::Defer(DeferExecution {
                 session_id: deferred_session_id,
-                move_start,
-                move_end,
-                actual_seconds: Some(20 * 60),
+                move_start: assessment.move_start,
+                move_end: assessment.move_end,
+                actual_seconds: Some(assessment.actual_seconds),
+                assessment_digest: Some(assessment.assessment_digest),
+                approved_assessment_digest: approval,
             }),
-            execution_idempotency("schedule-v20-source-defer", 142),
+            execution_idempotency("schedule-v21-source-defer", 143),
         )
         .await
         .expect("defer with an exact forty-minute remainder");
@@ -2970,7 +2999,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
     let replacement_session_id = Uuid::new_v4();
     execution
         .command(
-            2,
+            3,
             ExecutionCommand::Start(StartExecution {
                 session_id: replacement_session_id,
                 item_id,
@@ -2980,7 +3009,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 planned_block_id: Some(restart_block_id),
                 device_id: Uuid::new_v4(),
             }),
-            execution_idempotency("schedule-v20-replacement-start", 149),
+            execution_idempotency("schedule-v21-replacement-start", 149),
         )
         .await
         .expect("consume the exact current replacement placement");
@@ -3141,14 +3170,14 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         .await
         .unwrap();
     let item = items.get(item_id).await.unwrap();
-    let execution = ExecutionService::new(
+    let execution = Arc::new(ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(
             test_database.pool.clone(),
             scope,
         )),
         items.clone(),
         Arc::new(SystemClock),
-    );
+    ));
     let mut request = compose_request();
     request.fixed_blocks.clear();
     let initial_preview = compose_canonical_schedule(&items, &schedules, request.clone())
@@ -3222,9 +3251,32 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         deferred_binding_count(&test_database.pool, scope, active_publication.revision.id).await,
         0
     );
+    execution
+        .command(
+            1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: active_session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess the exact replacement before the lock race".to_owned()),
+            }),
+            execution_idempotency("schedule-v21-race-pause", 147),
+        )
+        .await
+        .expect("pause the source before assessing its replacement");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id: active_session_id,
+            move_start,
+            actual_seconds: Some(20 * 60),
+        })
+        .await
+        .expect("assess the exact replacement before the lock race");
+    assert_eq!(assessment.move_end, move_end);
     let race_preview = compose_canonical_schedule(&items, &schedules, request.clone())
         .await
-        .expect("refresh the active evidence before the defer race");
+        .expect("refresh the paused evidence before the defer race");
 
     let before_race = publication_attestation_counts(&test_database.pool, scope).await;
     let mut blocker = test_database.pool.begin().await.unwrap();
@@ -3237,21 +3289,23 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         .execute(&mut *blocker)
         .await
         .unwrap();
-    let publisher = schedules.clone();
-    let race_access = access.clone();
-    let publish = tokio::spawn(async move {
-        publisher
-            .publish(
-                &race_access,
-                PublishScheduleSpec {
-                    idempotency_key: Uuid::new_v4(),
-                    request_hash: [148; 32],
-                    input_digest: digest_bytes(&race_preview.input_digest),
-                    timezone_name: "Europe/Madrid".to_owned(),
-                    manual_placement_approvals: Vec::new(),
-                    result: race_preview,
-                    published_at: Utc::now(),
-                },
+    let deferred_execution = execution.clone();
+    let approval = assessment
+        .approval_required
+        .then(|| assessment.assessment_digest.clone());
+    let defer = tokio::spawn(async move {
+        deferred_execution
+            .command(
+                2,
+                ExecutionCommand::Defer(DeferExecution {
+                    session_id: active_session_id,
+                    move_start: assessment.move_start,
+                    move_end: assessment.move_end,
+                    actual_seconds: Some(assessment.actual_seconds),
+                    assessment_digest: Some(assessment.assessment_digest),
+                    approved_assessment_digest: approval,
+                }),
+                execution_idempotency("schedule-v21-race-defer", 148),
             )
             .await
     });
@@ -3266,51 +3320,33 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
     .unwrap();
     assert!(
         canonical_lock_available,
-        "publication must wait before canonical item space"
+        "defer must wait before canonical item space"
     );
-    let deferred_at: chrono::DateTime<Utc> = sqlx::query_scalar(
-        "UPDATE execution_sessions SET state = 'deferred', revision = revision + 1, \
-         accumulated_seconds = 1200, actual_seconds = 1200, running_since = NULL, \
-         observed_running_since = NULL, move_start = $3, move_end = $4, \
-         ended_at = clock_timestamp(), updated_at = clock_timestamp() \
-         WHERE workspace_id = $1 AND id = $2 RETURNING updated_at",
-    )
-    .bind(scope.workspace_id)
-    .bind(active_session_id)
-    .bind(move_start)
-    .bind(move_end)
-    .fetch_one(&mut *blocker)
-    .await
-    .expect("defer the source while publication waits");
-    sqlx::query(
-        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
-         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
-         occurrence_id, source_session_index, replacement_session_index, \
-         planned_duration_seconds, planned_duration_source, actionable, consumed_before_seconds, \
-         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
-         VALUES ($1, $2, $3, $4, 1, NULL, 0, 1, 3600, 'published_origin', true, 0, 1200, \
-         2400, $5, $6, $7)",
-    )
-    .bind(scope.workspace_id)
-    .bind(active_session_id)
-    .bind(item_id)
-    .bind(i64::try_from(item.revision).unwrap())
-    .bind(move_start)
-    .bind(move_end)
-    .bind(deferred_at)
-    .execute(&mut *blocker)
-    .await
-    .expect("reserve the exact fresh replacement index");
-    sqlx::query(
-        "UPDATE execution_state SET revision = revision + 1, active_session_id = NULL, \
-         updated_at = $2 WHERE workspace_id = $1",
-    )
-    .bind(scope.workspace_id)
-    .bind(deferred_at)
-    .execute(&mut *blocker)
-    .await
-    .expect("close the execution lease");
+    let publisher = schedules.clone();
+    let race_access = access.clone();
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish(
+                &race_access,
+                PublishScheduleSpec {
+                    idempotency_key: Uuid::new_v4(),
+                    request_hash: [149; 32],
+                    input_digest: digest_bytes(&race_preview.input_digest),
+                    timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
+                    result: race_preview,
+                    published_at: Utc::now(),
+                },
+            )
+            .await
+    });
+    wait_for_blocked_queries(&test_database.pool, blocker_pid, 2).await;
     blocker.commit().await.unwrap();
+    tokio::time::timeout(StdDuration::from_secs(10), defer)
+        .await
+        .expect("assessed defer must finish without deadlocking publication")
+        .unwrap()
+        .expect("the earlier waiter applies its exact assessed defer");
     let result = tokio::time::timeout(StdDuration::from_secs(10), publish)
         .await
         .expect("publication/defer ordering must not deadlock")
@@ -3373,10 +3409,13 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         return;
     };
     let test_database = TestDatabase::create(&database_url).await;
-    MIGRATOR
-        .run(&test_database.pool)
-        .await
-        .expect("migrations apply");
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 21) {
+        test_database
+            .pool
+            .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-authorization migration applies");
+    }
     let scope = seed_scope(&test_database.pool).await;
     let items = Arc::new(ItemService::new(
         Arc::new(PostgresItemRepository::new(
@@ -3426,6 +3465,17 @@ async fn non_executable_claims_retire_without_blocking_publication() {
         "2026-09-01T13:00:00Z".parse().unwrap(),
     )
     .await;
+    let authorization_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 21)
+        .expect("execution defer authorization migration is embedded");
+    test_database
+        .pool
+        .execute(AssertSqlSafe(
+            authorization_migration.sql.as_str().to_owned(),
+        ))
+        .await
+        .expect("execution defer authorization migration applies");
     sqlx::query(
         "UPDATE execution_state SET revision = 1, active_session_id = NULL, updated_at = $2 \
          WHERE workspace_id = $1",

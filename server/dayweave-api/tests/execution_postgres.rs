@@ -7,9 +7,10 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use dayweave_api::{
     execution::{
-        DeferExecution, ExecutionCommand, ExecutionDomainError, ExecutionIdempotencyKey,
-        ExecutionRepositoryError, ExecutionService, ExecutionServiceError, ExecutionSession,
-        ExecutionStatus, FinishExecution, PauseExecution, ResumeExecution, StartExecution,
+        DeferAssessmentRequest, DeferExecution, ExecutionCommand, ExecutionDomainError,
+        ExecutionIdempotencyKey, ExecutionRepositoryError, ExecutionService, ExecutionServiceError,
+        ExecutionSession, ExecutionStatus, FinishExecution, PauseExecution, ResumeExecution,
+        StartExecution,
     },
     items::{
         IdempotencyKey as ItemIdempotencyKey, ItemKind, ItemRepositoryError, ItemService,
@@ -17,6 +18,10 @@ use dayweave_api::{
     },
     persistence::{DatabaseScope, MIGRATOR, PostgresExecutionRepository, PostgresItemRepository},
     proposals::Clock,
+    scheduling::{
+        ComposeScheduleRequest, PostgresSchedulingRepository, PublishScheduleSpec, ScheduleAccess,
+        compose_canonical_schedule,
+    },
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -32,6 +37,19 @@ const ACTIVE_CONFLICT_KEY: &str = "execution-active-conflict-001";
 const STALE_KEY: &str = "execution-stale-001";
 const ABSOLUTE_PAUSE_KEY: &str = "execution-absolute-pause-001";
 
+type DeferClaimAuthorizationRow = (
+    i16,
+    String,
+    Uuid,
+    Uuid,
+    Vec<u8>,
+    Vec<u8>,
+    Option<Vec<u8>>,
+    i64,
+    i64,
+    i64,
+);
+
 #[tokio::test]
 async fn postgres_execution_is_transactional_cross_device_and_recoverable() {
     let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
@@ -44,6 +62,19 @@ async fn postgres_execution_is_transactional_cross_device_and_recoverable() {
     // Keep cleanup outside the scenario task so assertion panics cannot leak its schema.
     test_database.destroy().await;
     scenario.expect("PostgreSQL execution scenario task succeeds");
+}
+
+#[tokio::test]
+async fn assessed_defer_is_durable_approval_bound_and_replayable() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; assessed Defer test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let scenario = tokio::spawn(run_assessed_defer(test_database.pool.clone())).await;
+
+    test_database.destroy().await;
+    scenario.expect("PostgreSQL assessed Defer scenario task succeeds");
 }
 
 #[tokio::test]
@@ -93,6 +124,735 @@ async fn run_terminal_projection_races(pool: PgPool) {
     trash_holds_execution_state_before_start(&pool).await;
 }
 
+#[allow(clippy::too_many_lines)] // One lifecycle proves the assessment, approval, claim, and replay contract together.
+async fn run_assessed_defer(pool: PgPool) {
+    const START_KEY: &str = "execution-assessed-defer-start-001";
+    const PAUSE_KEY: &str = "execution-assessed-defer-pause-001";
+    const STALE_KEY: &str = "execution-assessed-defer-stale-001";
+    const MISSING_APPROVAL_KEY: &str = "execution-assessed-defer-unapproved-001";
+    const DEFER_KEY: &str = "execution-assessed-defer-commit-001";
+
+    MIGRATOR.run(&pool).await.expect("migrations apply");
+    let scope = seed_scope(
+        &pool,
+        "execution-assessed-defer-owner",
+        "execution-assessed-defer-workspace",
+    )
+    .await;
+    let base = postgres_now(&pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    );
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Approval-bound 601-second defer", 201).await;
+    let item = items.get(item_id).await.expect("load assessment item");
+    let (source_block_id, move_start) = publish_v5_defer_policy(
+        &pool,
+        scope,
+        "execution-assessed-defer-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        item.revision,
+    )
+    .await;
+
+    let snapshot_shape: (String, String, bool) = sqlx::query_as(
+        "SELECT detail.result_snapshot ->> 'schema_version', \
+                detail.result_snapshot ->> 'scheduler_publication_schema', \
+                detail.result_snapshot ? 'planning_request' \
+           FROM schedule_revision_details AS detail \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = detail.workspace_id \
+            AND revision.id = detail.schedule_revision_id \
+          WHERE revision.workspace_id = $1 AND revision.state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load private v5 planning capsule");
+    assert_eq!(snapshot_shape.0, "5");
+    assert_eq!(snapshot_shape.1, "dayweave-scheduler-publication/5");
+    assert!(snapshot_shape.2);
+
+    // The fixture starts 601 seconds before the database wall clock and pauses
+    // at it. This records exact observed progress without pushing the durable
+    // protocol clock beyond the assessment's five-minute expiry horizon.
+    clock.set(base - Duration::seconds(601));
+    let session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id,
+                item_id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(source_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency(START_KEY, 202),
+        )
+        .await
+        .expect("start the exact published v5 source block");
+    clock.set(base);
+    let paused = execution
+        .command(
+            1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Choose an exact later window".to_owned()),
+            }),
+            execution_idempotency(PAUSE_KEY, 203),
+        )
+        .await
+        .expect("pause after exactly 601 observed seconds");
+    assert_eq!(paused.changed_session.status, ExecutionStatus::Paused);
+    assert_eq!(paused.changed_session.accumulated_seconds, 601);
+
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start,
+            actual_seconds: Some(601),
+        })
+        .await
+        .expect("assess the fixed-block-overlapping replacement");
+    assert_eq!(assessment.actual_seconds, 601);
+    assert_eq!(assessment.credited_source_seconds, 660);
+    assert_eq!(assessment.planned_duration_seconds, 3_600);
+    assert_eq!(assessment.remaining_duration_seconds, 2_940);
+    assert_eq!(assessment.move_end, move_start + Duration::minutes(49));
+    assert!(assessment.approval_required);
+    assert!(!assessment.violations.is_empty());
+
+    let assessment_digest = decode_sha256_digest(&assessment.assessment_digest);
+    let environment_digest = decode_sha256_digest(&assessment.environment_digest);
+    let stored_assessment: (i64, i64, i64, i64, i64, i32, Vec<u8>, Vec<u8>, bool) = sqlx::query_as(
+        "SELECT credited_before_seconds, effective_actual_seconds, \
+                    credited_after_seconds, credited_source_seconds, \
+                    remaining_duration_seconds, scheduler_slot_seconds, \
+                    environment_digest, assessment_digest, approval_required \
+               FROM execution_defer_assessments \
+              WHERE workspace_id = $1 AND user_id = $2 AND assessment_digest = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(assessment_digest.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("load exact private defer assessment");
+    assert_eq!(stored_assessment.0, 0);
+    assert_eq!(stored_assessment.1, 601);
+    assert_eq!(stored_assessment.2, 601);
+    assert_eq!(stored_assessment.3, 660);
+    assert_eq!(stored_assessment.4, 2_940);
+    assert_eq!(stored_assessment.5, 300);
+    assert_eq!(stored_assessment.6, environment_digest);
+    assert_eq!(stored_assessment.7, assessment_digest);
+    assert!(stored_assessment.8);
+    let expiring_unapplied_digest =
+        insert_short_lived_unapplied_assessment(&pool, scope, &assessment_digest).await;
+
+    // Command protocol time must itself fall within the short assessment
+    // lifetime; production uses the wall clock, while this fixture controls it.
+    clock.set(assessment.expires_at - Duration::minutes(1));
+    let stale_digest = format!("sha256:{}", "00".repeat(32));
+    let stale = execution
+        .command(
+            2,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: assessment.move_start,
+                move_end: assessment.move_end,
+                actual_seconds: Some(601),
+                assessment_digest: Some(stale_digest.clone()),
+                approved_assessment_digest: Some(stale_digest),
+            }),
+            execution_idempotency(STALE_KEY, 204),
+        )
+        .await
+        .expect_err("an unknown canonical assessment digest is stale");
+    assert!(matches!(
+        stale,
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferAssessmentStale)
+    ));
+
+    let unapproved = execution
+        .command(
+            2,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: assessment.move_start,
+                move_end: assessment.move_end,
+                actual_seconds: Some(601),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: None,
+            }),
+            execution_idempotency(MISSING_APPROVAL_KEY, 205),
+        )
+        .await
+        .expect_err("a conflicting assessment requires its exact approval digest");
+    assert!(matches!(
+        unapproved,
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferApprovalRequired)
+    ));
+    assert_eq!(
+        execution_idempotency_count(&pool, scope, STALE_KEY).await,
+        0
+    );
+    assert_eq!(
+        execution_idempotency_count(&pool, scope, MISSING_APPROVAL_KEY).await,
+        0
+    );
+
+    let defer_command = ExecutionCommand::Defer(DeferExecution {
+        session_id,
+        move_start: assessment.move_start,
+        move_end: assessment.move_end,
+        actual_seconds: Some(601),
+        assessment_digest: Some(assessment.assessment_digest.clone()),
+        approved_assessment_digest: Some(assessment.assessment_digest.clone()),
+    });
+    let deferred = execution
+        .command(
+            2,
+            defer_command.clone(),
+            execution_idempotency(DEFER_KEY, 206),
+        )
+        .await
+        .expect("commit the exactly approved replacement");
+    assert!(!deferred.replayed);
+    assert_eq!(deferred.revision, 3);
+    assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
+    assert_eq!(deferred.changed_session.actual_seconds, Some(601));
+
+    let claim: DeferClaimAuthorizationRow = sqlx::query_as(
+        "SELECT authorization_schema_version, authorization_kind, assessment_id, \
+                authorized_by_user_id, environment_digest, assessment_digest, \
+                approved_assessment_digest, consumed_by_source_seconds, \
+                remaining_duration_seconds, \
+                EXTRACT(EPOCH FROM (move_end - move_start))::bigint \
+           FROM execution_defer_replacement_claims \
+          WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load exact v1 replacement claim");
+    assert_eq!(claim.0, 1);
+    assert_eq!(claim.1, "explicit_approval");
+    let stored_assessment_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM execution_defer_assessments \
+          WHERE workspace_id = $1 AND assessment_digest = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(assessment_digest.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("load assessment identity");
+    assert_eq!(claim.2, stored_assessment_id);
+    assert_eq!(claim.3, scope.user_id);
+    assert_eq!(claim.4, environment_digest);
+    assert_eq!(claim.5, assessment_digest);
+    assert_eq!(claim.6.as_deref(), Some(assessment_digest.as_slice()));
+    assert_eq!(claim.7, 660);
+    assert_eq!(claim.8, 2_940);
+    assert_eq!(claim.9, 2_940);
+
+    // Replay is resolved before revision, assessment-expiry, and command-time
+    // validation. Move the service clock beyond both the assessment and its
+    // target while the 24-hour command receipt remains live.
+    clock.set(assessment.move_end + Duration::seconds(1));
+    assert!(clock.now() > assessment.expires_at);
+    let replay = execution
+        .command(2, defer_command, execution_idempotency(DEFER_KEY, 206))
+        .await
+        .expect("exact receipt replays after assessment and target expiry");
+    assert!(replay.replayed);
+    assert_eq!(replay.revision, deferred.revision);
+    assert_eq!(replay.changed_session, deferred.changed_session);
+    let claim_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM execution_defer_replacement_claims \
+          WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count replayed replacement claims");
+    assert_eq!(claim_count, 1);
+
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    PostgresExecutionRepository::new(pool.clone(), scope)
+        .maintain_defer_assessment_retention()
+        .await
+        .expect("prune expired unapplied assessment evidence");
+    let retained_assessments: (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE assessment_digest = $2), \
+                COUNT(*) FILTER (WHERE assessment_digest = $3) \
+           FROM execution_defer_assessments WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(assessment_digest.as_slice())
+    .bind(expiring_unapplied_digest.as_slice())
+    .fetch_one(&pool)
+    .await
+    .expect("inspect assessment retention result");
+    assert_eq!(retained_assessments, (1, 0));
+
+    assert_defer_clock_domains(&pool).await;
+    assert_fractional_prior_credit_rounds_the_aggregate(&pool).await;
+}
+
+#[allow(clippy::too_many_lines)] // One fixture must compare the DB wall clock and protocol clock.
+async fn assert_defer_clock_domains(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-defer-clock-owner",
+        "execution-defer-clock-workspace",
+    )
+    .await;
+    let database_base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(database_base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    );
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Defer clock domains", 208).await;
+    let (source_block_id, _) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-defer-clock-owner",
+        &items,
+        &schedules,
+        database_base,
+        item_id,
+        1,
+    )
+    .await;
+
+    let protocol_time = database_base + Duration::hours(1);
+    let session_id = Uuid::new_v4();
+    clock.set(protocol_time - Duration::seconds(1));
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id,
+                item_id,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(source_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-defer-clock-start-001", 209),
+        )
+        .await
+        .expect("start future-protocol clock fixture");
+    clock.set(protocol_time);
+    execution
+        .command(
+            1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Prove database and protocol clock separation".to_owned()),
+            }),
+            execution_idempotency("execution-defer-clock-pause-001", 210),
+        )
+        .await
+        .expect("pause future-protocol clock fixture");
+    let protocol_updated_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM execution_state WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(pool)
+            .await
+            .expect("load monotonic protocol transition time");
+    assert_eq!(protocol_updated_at, protocol_time);
+
+    let database_now = postgres_now(pool).await;
+    let after_expiry_but_before_protocol =
+        align_up_to_five_minutes(database_now) + Duration::minutes(10);
+    assert!(after_expiry_but_before_protocol > database_now + Duration::minutes(5));
+    assert!(after_expiry_but_before_protocol <= protocol_updated_at);
+    let too_early = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start: after_expiry_but_before_protocol,
+            actual_seconds: Some(1),
+        })
+        .await
+        .expect_err("target after DB expiry but before protocol transition is invalid");
+    assert!(matches!(
+        too_early,
+        ExecutionServiceError::Repository(ExecutionRepositoryError::InvalidCommand(
+            ExecutionDomainError::InvalidDefer
+        ))
+    ));
+
+    let valid_target = align_up_to_five_minutes(protocol_updated_at) + Duration::minutes(10);
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start: valid_target,
+            actual_seconds: Some(1),
+        })
+        .await
+        .expect("target after both clock bounds is assessable");
+    assert!(assessment.move_start > assessment.expires_at);
+    assert!(assessment.move_start > protocol_updated_at);
+    assert!(clock.now() > assessment.expires_at);
+
+    let deferred = execution
+        .command(
+            2,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: assessment.move_start,
+                move_end: assessment.move_end,
+                actual_seconds: Some(assessment.actual_seconds),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: assessment
+                    .approval_required
+                    .then_some(assessment.assessment_digest),
+            }),
+            execution_idempotency("execution-defer-clock-commit-001", 211),
+        )
+        .await
+        .expect("DB-wall-clock-live assessment commits despite a future service clock");
+    assert_eq!(deferred.revision, 3);
+}
+
+#[allow(clippy::too_many_lines)] // The setup creates real prior and in-flight source evidence.
+async fn assert_fractional_prior_credit_rounds_the_aggregate(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-defer-rounding-owner",
+        "execution-defer-rounding-workspace",
+    )
+    .await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    );
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Aggregate minute-credit rounding", 212).await;
+    let (first_source_block_id, _) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-defer-rounding-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        1,
+    )
+    .await;
+
+    let first_session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id: first_session_id,
+                item_id,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(first_source_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-defer-rounding-first-start-001", 213),
+        )
+        .await
+        .expect("start prior-credit source");
+    clock.set(base + Duration::seconds(61));
+    execution
+        .command(
+            1,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id: first_session_id,
+                actual_seconds: Some(61),
+            }),
+            execution_idempotency("execution-defer-rounding-first-complete-001", 214),
+        )
+        .await
+        .expect("record 61 exact prior seconds");
+
+    let (second_source_block_id, move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-defer-rounding-owner",
+        &items,
+        &schedules,
+        clock.now(),
+        item_id,
+        1,
+    )
+    .await;
+    let second_session_index: i32 = sqlx::query_scalar(
+        "SELECT (block.constraint_snapshot ->> 'session_index')::integer \
+           FROM schedule_blocks AS block \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = block.workspace_id \
+            AND revision.id = block.schedule_revision_id \
+          WHERE revision.workspace_id = $1 AND revision.state = 'published' \
+            AND block.source_block_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(second_source_block_id)
+    .fetch_one(pool)
+    .await
+    .expect("load second source session index");
+    assert_eq!(second_session_index, 1);
+
+    let second_session_id = Uuid::new_v4();
+    clock.set(base + Duration::seconds(62));
+    execution
+        .command(
+            2,
+            ExecutionCommand::Start(StartExecution {
+                session_id: second_session_id,
+                item_id,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: Some(second_source_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-defer-rounding-second-start-001", 215),
+        )
+        .await
+        .expect("start source after fractional prior credit");
+    clock.set(base + Duration::seconds(121));
+    execution
+        .command(
+            3,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: second_session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess aggregate rounding".to_owned()),
+            }),
+            execution_idempotency("execution-defer-rounding-second-pause-001", 216),
+        )
+        .await
+        .expect("pause after 59 source seconds");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 4,
+            session_id: second_session_id,
+            move_start,
+            actual_seconds: Some(59),
+        })
+        .await
+        .expect("assess source using aggregate minute rounding");
+    assert_eq!(assessment.credited_source_seconds, 0);
+    assert_eq!(
+        assessment.remaining_duration_seconds,
+        assessment.planned_duration_seconds
+    );
+    let stored: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT credited_before_seconds, effective_actual_seconds, \
+                credited_after_seconds, credited_source_seconds, \
+                planned_duration_seconds, remaining_duration_seconds \
+           FROM execution_defer_assessments \
+          WHERE workspace_id = $1 AND assessment_digest = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(decode_sha256_digest(&assessment.assessment_digest).as_slice())
+    .fetch_one(pool)
+    .await
+    .expect("load aggregate-rounding assessment evidence");
+    assert_eq!(stored.0, 61);
+    assert_eq!(stored.1, 59);
+    assert_eq!(stored.2, 120);
+    assert_eq!(stored.3, 0);
+    assert_eq!(stored.4, stored.5);
+
+    execution
+        .command(
+            4,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: second_session_id,
+                move_start: assessment.move_start,
+                move_end: assessment.move_end,
+                actual_seconds: Some(59),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: assessment
+                    .approval_required
+                    .then_some(assessment.assessment_digest),
+            }),
+            execution_idempotency("execution-defer-rounding-commit-001", 217),
+        )
+        .await
+        .expect("commit aggregate-rounded zero-source-credit defer");
+    let claim: (i64, i64) = sqlx::query_as(
+        "SELECT consumed_by_source_seconds, remaining_duration_seconds \
+           FROM execution_defer_replacement_claims \
+          WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(second_session_id)
+    .fetch_one(pool)
+    .await
+    .expect("load aggregate-rounded claim");
+    assert_eq!(claim, (0, stored.5));
+}
+
+#[allow(clippy::too_many_arguments)] // Publication setup keeps each evidence input explicit.
+async fn publish_v5_defer_policy(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    subject: &str,
+    items: &ItemService,
+    schedules: &PostgresSchedulingRepository,
+    base: DateTime<Utc>,
+    item_id: Uuid,
+    item_revision: u64,
+) -> (Uuid, DateTime<Utc>) {
+    let horizon_start = truncate_to_minute(base);
+    let availability_start = align_up_to_five_minutes(base) + Duration::minutes(10);
+    let move_start = align_up_to_five_minutes(base) + Duration::hours(4);
+    let horizon_end = horizon_start + Duration::hours(36);
+    let request: ComposeScheduleRequest = serde_json::from_value(json!({
+        "as_of": base,
+        "horizon_start": horizon_start,
+        "horizon_end": horizon_end,
+        "timezone_name": "Europe/Madrid",
+        "availability": [{
+            "start": availability_start,
+            "end": horizon_end,
+            "contexts": [],
+            "location": null,
+            "energy": "deep"
+        }],
+        "fixed_blocks": [{
+            "id": Uuid::new_v4(),
+            "is_sensitive": false,
+            "title": "Approval-required target obstacle",
+            "start": move_start,
+            "end": move_start + Duration::hours(1),
+            "source": "manual"
+        }],
+        "previous_assignments": [],
+        "config": {
+            "slot_granularity_minutes": 5,
+            "stability_weight": 4,
+            "default_soft_weight": 100
+        },
+        "recurrence_context": {}
+    }))
+    .expect("valid dynamic v5 compose request");
+    let preview = compose_canonical_schedule(items, schedules, request)
+        .await
+        .expect("compose authoritative v5 policy");
+    let source_blocks = preview
+        .plan
+        .blocks
+        .iter()
+        .filter(|block| block.item_id.is_some_and(|id| id.0 == item_id))
+        .collect::<Vec<_>>();
+    let source_block = source_blocks
+        .first()
+        .expect("assessment source must compose at least one planned block");
+    let source_block_id = source_block.id;
+    let access = ScheduleAccess {
+        subject: subject.to_owned(),
+        include_sensitive: false,
+        workspace_id: Some(scope.workspace_id),
+        user_id: Some(scope.user_id),
+    };
+    schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [207; 32],
+                input_digest: decode_sha256_digest(&preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
+                result: preview,
+                published_at: base,
+            },
+        )
+        .await
+        .expect("publish authoritative v5 planning policy");
+    let stored_revision: i64 = sqlx::query_scalar(
+        "SELECT (result_snapshot -> 'compose' -> 'source_item_revisions' ->> $2)::bigint \
+           FROM schedule_revision_details AS detail \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = detail.workspace_id \
+            AND revision.id = detail.schedule_revision_id \
+          WHERE revision.workspace_id = $1 AND revision.state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("load published item revision");
+    assert_eq!(stored_revision, i64::try_from(item_revision).unwrap());
+    (source_block_id, move_start)
+}
+
+async fn current_published_source_block(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    item_id: Uuid,
+) -> Uuid {
+    let blocks: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT block.source_block_id FROM schedule_blocks AS block \
+         JOIN schedule_revisions AS revision \
+           ON revision.workspace_id = block.workspace_id \
+          AND revision.id = block.schedule_revision_id \
+         WHERE revision.workspace_id = $1 AND revision.state = 'published' \
+           AND block.item_id = $2 ORDER BY block.ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .expect("load current published item block");
+    let [source_block_id] = blocks.as_slice() else {
+        panic!("fixture item must have exactly one current published block");
+    };
+    *source_block_id
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_deferred_start_attestation(pool: PgPool) {
     MIGRATOR.run(&pool).await.expect("migrations apply");
@@ -108,6 +868,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
@@ -118,15 +879,26 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     create_item(&items, item_a, "Attested deferred slot", 91).await;
     create_item(&items, item_b, "Superseded attestation slot", 92).await;
 
-    let occurrence_a = Some(Uuid::new_v4());
+    let (source_block_a, move_start_a) = publish_v5_defer_policy(
+        &pool,
+        scope,
+        "execution-attestation-owner",
+        &items,
+        &schedules,
+        base,
+        item_a,
+        1,
+    )
+    .await;
+    let occurrence_a = None;
     let first_session_a = Uuid::new_v4();
     let first_start_a = ExecutionCommand::Start(StartExecution {
         session_id: first_session_a,
         item_id: item_a,
         item_revision: 1,
         occurrence_id: occurrence_a,
-        session_index: 7,
-        planned_block_id: None,
+        session_index: 0,
+        planned_block_id: Some(source_block_a),
         device_id: Uuid::new_v4(),
     });
     execution
@@ -136,18 +908,43 @@ async fn run_deferred_start_attestation(pool: PgPool) {
             execution_idempotency("execution-attestation-first-start-001", 93),
         )
         .await
-        .expect("legacy first Start remains valid");
+        .expect("attested first Start remains valid");
     clock.set(base + Duration::seconds(10));
-    let move_start_a = base + Duration::hours(2);
-    let move_end_a = move_start_a + Duration::minutes(40);
-    let deferred_a = execution
+    execution
         .command(
             1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: first_session_a,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Choose an attested replacement".to_owned()),
+            }),
+            execution_idempotency("execution-attestation-first-pause-001", 190),
+        )
+        .await
+        .expect("pause before assessing first semantic slot");
+    let assessment_a = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id: first_session_a,
+            move_start: move_start_a,
+            actual_seconds: Some(10),
+        })
+        .await
+        .expect("assess first semantic slot");
+    let move_end_a = assessment_a.move_end;
+    let deferred_a = execution
+        .command(
+            2,
             ExecutionCommand::Defer(DeferExecution {
                 session_id: first_session_a,
                 move_start: move_start_a,
                 move_end: move_end_a,
                 actual_seconds: Some(10),
+                assessment_digest: Some(assessment_a.assessment_digest.clone()),
+                approved_assessment_digest: assessment_a
+                    .approval_required
+                    .then_some(assessment_a.assessment_digest),
             }),
             execution_idempotency("execution-attestation-first-defer-001", 94),
         )
@@ -165,18 +962,18 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         .expect("exact historical Start retry replays ahead of the guard");
     assert!(historical.replayed);
     assert_eq!(historical.revision, 1);
-    assert_eq!(execution.snapshot().await.unwrap().revision, 2);
+    assert_eq!(execution.snapshot().await.unwrap().revision, 3);
 
     let missing_key = "execution-attestation-missing-block-001";
     let missing = execution
         .command(
-            2,
+            3,
             ExecutionCommand::Start(StartExecution {
                 session_id: Uuid::new_v4(),
                 item_id: item_a,
                 item_revision: 1,
                 occurrence_id: occurrence_a,
-                session_index: 7,
+                session_index: 0,
                 planned_block_id: None,
                 device_id: Uuid::new_v4(),
             }),
@@ -188,19 +985,19 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         missing,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, missing_key, 2, 1, 2).await;
+    assert_failed_start_rolled_back(&pool, scope, missing_key, 3, 1, 3).await;
 
     let wrong_block = Uuid::new_v4();
     let wrong_key = "execution-attestation-wrong-block-001";
     let wrong = execution
         .command(
-            2,
+            3,
             ExecutionCommand::Start(StartExecution {
                 session_id: Uuid::new_v4(),
                 item_id: item_a,
                 item_revision: 1,
                 occurrence_id: occurrence_a,
-                session_index: 7,
+                session_index: 0,
                 planned_block_id: Some(wrong_block),
                 device_id: Uuid::new_v4(),
             }),
@@ -212,7 +1009,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         wrong,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, wrong_key, 2, 1, 2).await;
+    assert_failed_start_rolled_back(&pool, scope, wrong_key, 3, 1, 3).await;
 
     let raw_without_binding = raw_active_start(
         &pool,
@@ -220,7 +1017,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         item_a,
         1,
         occurrence_a,
-        7,
+        0,
         None,
         base + Duration::seconds(11),
     )
@@ -273,7 +1070,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     );
     let unpublished = execution
         .command(
-            2,
+            3,
             exact_start_a.clone(),
             execution_idempotency(exact_key_a, 97),
         )
@@ -283,13 +1080,13 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         unpublished,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, exact_key_a, 2, 103, 2).await;
+    assert_failed_start_rolled_back(&pool, scope, exact_key_a, 3, 103, 3).await;
 
     publish_schedule_revision(&pool, scope, revision_a).await;
     let published_wrong_key = "execution-attestation-published-wrong-block-001";
     let published_wrong = execution
         .command(
-            2,
+            3,
             ExecutionCommand::Start(StartExecution {
                 session_id: Uuid::new_v4(),
                 item_id: item_a,
@@ -307,16 +1104,16 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         published_wrong,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, published_wrong_key, 2, 103, 2).await;
+    assert_failed_start_rolled_back(&pool, scope, published_wrong_key, 3, 103, 3).await;
     let started_a = execution
         .command(
-            2,
+            3,
             exact_start_a.clone(),
             execution_idempotency(exact_key_a, 97),
         )
         .await
         .expect("exact published binding permits Start");
-    assert_eq!(started_a.revision, 3);
+    assert_eq!(started_a.revision, 4);
     let origin_a: (Uuid, Uuid, i64, i64) = sqlx::query_as(
         "SELECT schedule_revision_id, source_block_id, execution_epoch, \
          planned_duration_seconds FROM execution_session_schedule_origins \
@@ -327,7 +1124,15 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     .fetch_one(&pool)
     .await
     .expect("exact current published Start records its origin");
-    assert_eq!(origin_a, (revision_a, exact_block_a, 1, 40 * 60));
+    assert_eq!(
+        origin_a,
+        (
+            revision_a,
+            exact_block_a,
+            1,
+            i64::try_from(assessment_a.remaining_duration_seconds).unwrap(),
+        )
+    );
     let consumed_source_a: Uuid = sqlx::query_scalar(
         "SELECT source_deferred_session_id FROM execution_defer_replacement_consumptions \
          WHERE workspace_id = $1 AND replacement_execution_session_id = $2",
@@ -341,7 +1146,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     clock.set(base + Duration::seconds(20));
     execution
         .command(
-            3,
+            4,
             ExecutionCommand::Complete(FinishExecution {
                 session_id: replacement_session_a,
                 actual_seconds: Some(10),
@@ -352,11 +1157,11 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         .expect("complete attested replacement");
 
     let exact_replay = execution
-        .command(2, exact_start_a, execution_idempotency(exact_key_a, 97))
+        .command(3, exact_start_a, execution_idempotency(exact_key_a, 97))
         .await
         .expect("successful attested Start replays after the session completes");
     assert!(exact_replay.replayed);
-    assert_eq!(exact_replay.revision, 3);
+    assert_eq!(exact_replay.revision, 4);
     assert_eq!(exact_replay.changed_session.id, replacement_session_a);
     let replayed_origin_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM execution_session_schedule_origins \
@@ -369,13 +1174,13 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     .expect("count replayed Start origin");
     assert_eq!(replayed_origin_count, 1);
     let after_exact_replay = execution.snapshot().await.unwrap();
-    assert_eq!(after_exact_replay.revision, 4);
+    assert_eq!(after_exact_replay.revision, 5);
     assert!(after_exact_replay.active_session.is_none());
 
     let completed_key = "execution-attestation-completed-head-001";
     let completed = execution
         .command(
-            4,
+            5,
             ExecutionCommand::Start(StartExecution {
                 session_id: Uuid::new_v4(),
                 item_id: item_a,
@@ -393,7 +1198,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         completed,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, completed_key, 4, 104, 4).await;
+    assert_failed_start_rolled_back(&pool, scope, completed_key, 5, 104, 5).await;
     assert!(
         raw_active_start(
             &pool,
@@ -410,26 +1215,69 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         "raw Start cannot resurrect a completed semantic head"
     );
 
+    let (source_block_b, move_start_b) = publish_v5_defer_policy(
+        &pool,
+        scope,
+        "execution-attestation-owner",
+        &items,
+        &schedules,
+        clock.now(),
+        item_b,
+        1,
+    )
+    .await;
     let first_session_b = Uuid::new_v4();
     execution
         .command(
-            4,
-            start_command(first_session_b, item_b, Uuid::new_v4()),
+            5,
+            ExecutionCommand::Start(StartExecution {
+                session_id: first_session_b,
+                item_id: item_b,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(source_block_b),
+                device_id: Uuid::new_v4(),
+            }),
             execution_idempotency("execution-attestation-second-start-001", 100),
         )
         .await
         .expect("first Start for second semantic slot");
     clock.set(base + Duration::seconds(30));
-    let move_start_b = base + Duration::hours(3);
-    let move_end_b = move_start_b + Duration::minutes(30);
+    execution
+        .command(
+            6,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: first_session_b,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Choose a superseded replacement".to_owned()),
+            }),
+            execution_idempotency("execution-attestation-second-pause-001", 191),
+        )
+        .await
+        .expect("pause before assessing second semantic slot");
+    let assessment_b = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 7,
+            session_id: first_session_b,
+            move_start: move_start_b,
+            actual_seconds: Some(10),
+        })
+        .await
+        .expect("assess second semantic slot");
     let deferred_b = execution
         .command(
-            5,
+            7,
             ExecutionCommand::Defer(DeferExecution {
                 session_id: first_session_b,
                 move_start: move_start_b,
-                move_end: move_end_b,
+                move_end: assessment_b.move_end,
                 actual_seconds: Some(10),
+                assessment_digest: Some(assessment_b.assessment_digest.clone()),
+                approved_assessment_digest: assessment_b
+                    .approval_required
+                    .then_some(assessment_b.assessment_digest),
             }),
             execution_idempotency("execution-attestation-second-defer-001", 101),
         )
@@ -445,7 +1293,7 @@ async fn run_deferred_start_attestation(pool: PgPool) {
     let superseded_key = "execution-attestation-superseded-block-001";
     let replacement_b = execution
         .command(
-            6,
+            8,
             ExecutionCommand::Start(StartExecution {
                 session_id: Uuid::new_v4(),
                 item_id: item_b,
@@ -463,9 +1311,9 @@ async fn run_deferred_start_attestation(pool: PgPool) {
         replacement_b,
         ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale)
     ));
-    assert_failed_start_rolled_back(&pool, scope, superseded_key, 6, 105, 6).await;
-    assert_eq!(execution_outbox_count(&pool, scope).await, 6);
-    assert_eq!(execution.snapshot().await.unwrap().revision, 6);
+    assert_failed_start_rolled_back(&pool, scope, superseded_key, 8, 105, 8).await;
+    assert_eq!(execution_outbox_count(&pool, scope).await, 8);
+    assert_eq!(execution.snapshot().await.unwrap().revision, 8);
 
     assert_attested_defer_uses_origin_duration(&pool).await;
 }
@@ -1095,22 +1943,20 @@ async fn run_legacy_clock_upgrade(pool: PgPool) {
         items,
         clock.clone(),
     );
-    let deferred = execution
+    let completed = execution
         .command(
             3,
-            ExecutionCommand::Defer(DeferExecution {
+            ExecutionCommand::Complete(FinishExecution {
                 session_id: legacy_active_session,
-                move_start: latest + Duration::hours(1),
-                move_end: latest + Duration::hours(2),
                 actual_seconds: None,
             }),
-            execution_idempotency("execution-upgrade-defer-001", 41),
+            execution_idempotency("execution-upgrade-complete-001", 41),
         )
         .await
-        .expect("post-upgrade legacy defer");
-    assert_eq!(deferred.changed_session.accumulated_seconds, 10);
+        .expect("post-upgrade legacy completion");
+    assert_eq!(completed.changed_session.accumulated_seconds, 10);
     assert_eq!(
-        deferred.changed_session.updated_at,
+        completed.changed_session.updated_at,
         latest + Duration::microseconds(1)
     );
 
@@ -1420,6 +2266,7 @@ async fn run_scenario(pool: PgPool) {
     assert_claim_allocation_preserves_published_split_high_water(&pool).await;
 }
 
+#[allow(clippy::too_many_lines)] // Both recurrence occurrences share one durable-policy lifecycle.
 async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
     let scope = seed_scope(
         pool,
@@ -1433,18 +2280,67 @@ async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
         clock.clone(),
     );
     let item_id = Uuid::new_v4();
-    let occurrence_a = Uuid::new_v4();
-    let occurrence_b = Uuid::new_v4();
     create_item(&items, item_id, "Occurrence-scoped execution", 116).await;
+    let item = items
+        .get(item_id)
+        .await
+        .expect("load recurring fixture item");
+    let mut recurring = item_replacement(&item, item.status);
+    recurring.recurrence = Some(json!({"type": "daily", "times_per_day": 2}));
+    let recurring = items
+        .replace(
+            item_id,
+            item.revision,
+            recurring,
+            ItemIdempotencyKey {
+                key: "execution-occurrence-recurrence-001".to_owned(),
+                fingerprint: [195; 32],
+            },
+        )
+        .await
+        .expect("make fixture item recur twice per day")
+        .item;
+    let _ = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-occurrence-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        recurring.revision,
+    )
+    .await;
+    let source_blocks: Vec<(Uuid, Uuid, i32, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT block.source_block_id, \
+                (block.constraint_snapshot ->> 'occurrence_id')::uuid, \
+                (block.constraint_snapshot ->> 'session_index')::integer, block.starts_at \
+           FROM schedule_blocks AS block \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = block.workspace_id \
+            AND revision.id = block.schedule_revision_id \
+          WHERE revision.workspace_id = $1 AND revision.state = 'published' \
+            AND block.item_id = $2 ORDER BY block.ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .expect("load exact recurring source blocks");
+    let source_blocks = source_blocks.into_iter().take(2).collect::<Vec<_>>();
+    assert_eq!(source_blocks.len(), 2);
 
-    for (ordinal, occurrence_id) in [occurrence_a, occurrence_b].into_iter().enumerate() {
-        let expected_revision = u64::try_from(ordinal * 2).expect("fixture revision fits u64");
+    for (ordinal, (source_block_id, occurrence_id, session_index, source_start)) in
+        source_blocks.iter().copied().enumerate()
+    {
+        let expected_revision = u64::try_from(ordinal * 3).expect("fixture revision fits u64");
         let session_id = Uuid::new_v4();
         execution
             .command(
@@ -1452,10 +2348,10 @@ async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
                 ExecutionCommand::Start(StartExecution {
                     session_id,
                     item_id,
-                    item_revision: 1,
+                    item_revision: recurring.revision,
                     occurrence_id: Some(occurrence_id),
-                    session_index: 0,
-                    planned_block_id: None,
+                    session_index: u16::try_from(session_index).expect("session index fits u16"),
+                    planned_block_id: Some(source_block_id),
                     device_id: Uuid::new_v4(),
                 }),
                 execution_idempotency(
@@ -1466,15 +2362,44 @@ async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
             .await
             .expect("Start occurrence-scoped execution");
         clock.set(base + Duration::seconds(i64::try_from(ordinal + 1).unwrap()));
-        let move_start = base + Duration::hours(i64::try_from(ordinal + 2).unwrap());
         execution
             .command(
                 expected_revision + 1,
+                ExecutionCommand::Pause(PauseExecution {
+                    session_id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: Some("Assess one recurrence occurrence".to_owned()),
+                }),
+                execution_idempotency(
+                    &format!("execution-occurrence-pause-{ordinal:03}"),
+                    u8::try_from(197 + ordinal).expect("fixture marker fits u8"),
+                ),
+            )
+            .await
+            .expect("Pause occurrence-scoped execution");
+        let move_start = source_start + Duration::hours(2);
+        let assessment = execution
+            .assess_defer(DeferAssessmentRequest {
+                expected_revision: expected_revision + 2,
+                session_id,
+                move_start,
+                actual_seconds: Some(0),
+            })
+            .await
+            .expect("Assess occurrence-scoped execution");
+        execution
+            .command(
+                expected_revision + 2,
                 ExecutionCommand::Defer(DeferExecution {
                     session_id,
                     move_start,
-                    move_end: move_start + Duration::minutes(30),
+                    move_end: assessment.move_end,
                     actual_seconds: Some(0),
+                    assessment_digest: Some(assessment.assessment_digest.clone()),
+                    approved_assessment_digest: assessment
+                        .approval_required
+                        .then_some(assessment.assessment_digest),
                 }),
                 execution_idempotency(
                     &format!("execution-occurrence-defer-{ordinal:03}"),
@@ -1496,12 +2421,16 @@ async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
     .expect("load occurrence-scoped claims");
     assert_eq!(claims.len(), 2);
     assert!(claims.iter().all(|(_, index)| *index == 1));
+    let expected_occurrences = source_blocks
+        .iter()
+        .map(|(_, occurrence_id, _, _)| *occurrence_id)
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(
         claims
             .iter()
             .map(|(occurrence, _)| *occurrence)
             .collect::<std::collections::BTreeSet<_>>(),
-        std::collections::BTreeSet::from([occurrence_a, occurrence_b])
+        expected_occurrences
     );
 }
 
@@ -1631,75 +2560,59 @@ async fn assert_claim_allocation_preserves_published_split_high_water(pool: &PgP
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
         clock.clone(),
     );
     let item_id = Uuid::new_v4();
-    let schedule_revision_id = Uuid::new_v4();
-    let source_block_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
     create_item(&items, item_id, "Published split high-water", 126).await;
-    sqlx::query(
-        "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
-         horizon_start, horizon_end, timezone_name, solver_version, input_digest, \
-         created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', $3, $4, \
-         'Europe/Madrid', 'execution-published-high-water-test', $5, $6, $3)",
-    )
-    .bind(schedule_revision_id)
-    .bind(scope.workspace_id)
-    .bind(base)
-    .bind(base + Duration::days(1))
-    .bind(vec![126_u8; 32])
-    .bind(scope.user_id)
-    .execute(pool)
-    .await
-    .expect("insert published high-water draft");
-    let item_key = item_id.to_string();
-    let mut result_snapshot = json!({"compose": {"source_item_revisions": {}}});
-    result_snapshot["compose"]["source_item_revisions"][item_key.as_str()] = json!(1);
-    sqlx::query(
-        "INSERT INTO schedule_revision_details (workspace_id, user_id, schedule_revision_id, \
-         result_snapshot, created_at) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(scope.workspace_id)
-    .bind(scope.user_id)
-    .bind(schedule_revision_id)
-    .bind(result_snapshot)
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect("insert published high-water details");
-    for (index, source_block_id) in source_block_ids.into_iter().enumerate() {
-        let index = i32::try_from(index).expect("fixture index fits i32");
-        let starts_at = base + Duration::hours(i64::from(index + 1));
-        sqlx::query(
-            "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, \
-             schedule_revision_id, item_id, block_kind, title_snapshot, starts_at, ends_at, \
-             timezone_name, ordinal, is_fixed, constraint_snapshot, created_at) \
-             VALUES ($1, $2, $3, $4, $5, 'planned', 'Published split high-water', $6, $7, \
-             'Europe/Madrid', $8, false, $9, $10)",
+    let item = items.get(item_id).await.expect("load split fixture item");
+    let mut split = item_replacement(&item, item.status);
+    split.split_policy = SplitPolicy::Splittable {
+        minimum_chunk_seconds: 1_200,
+        maximum_chunk_seconds: 1_200,
+    };
+    let split = items
+        .replace(
+            item_id,
+            item.revision,
+            split,
+            ItemIdempotencyKey {
+                key: "execution-published-high-water-split-001".to_owned(),
+                fingerprint: [196; 32],
+            },
         )
-        .bind(Uuid::new_v4())
-        .bind(source_block_id)
-        .bind(scope.workspace_id)
-        .bind(schedule_revision_id)
-        .bind(item_id)
-        .bind(starts_at)
-        .bind(starts_at + Duration::minutes(30))
-        .bind(index)
-        .bind(json!({
-            "source_block_id": source_block_id,
-            "occurrence_id": null,
-            "session_index": index,
-            "core_kind": "planned"
-        }))
-        .bind(base)
-        .execute(pool)
         .await
-        .expect("insert published split block");
-    }
-    publish_schedule_revision(pool, scope, schedule_revision_id).await;
+        .expect("make high-water fixture exactly three-way splittable")
+        .item;
+    let (source_block_id, move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-published-high-water-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        split.revision,
+    )
+    .await;
+    let published_indices: Vec<i32> = sqlx::query_scalar(
+        "SELECT (block.constraint_snapshot ->> 'session_index')::integer \
+           FROM schedule_blocks AS block \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = block.workspace_id \
+            AND revision.id = block.schedule_revision_id \
+          WHERE revision.workspace_id = $1 AND revision.state = 'published' \
+            AND block.item_id = $2 ORDER BY block.ordinal",
+    )
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .fetch_all(pool)
+    .await
+    .expect("load published split indices");
+    assert_eq!(published_indices, vec![0, 1, 2]);
 
     let session_id = Uuid::new_v4();
     execution
@@ -1708,10 +2621,10 @@ async fn assert_claim_allocation_preserves_published_split_high_water(pool: &PgP
             ExecutionCommand::Start(StartExecution {
                 session_id,
                 item_id,
-                item_revision: 1,
+                item_revision: split.revision,
                 occurrence_id: None,
                 session_index: 0,
-                planned_block_id: Some(source_block_ids[0]),
+                planned_block_id: Some(source_block_id),
                 device_id: Uuid::new_v4(),
             }),
             execution_idempotency("execution-published-high-water-start-001", 127),
@@ -1719,15 +2632,40 @@ async fn assert_claim_allocation_preserves_published_split_high_water(pool: &PgP
         .await
         .expect("Start first published split block");
     clock.set(base + Duration::seconds(1));
-    let move_start = base + Duration::hours(5);
     execution
         .command(
             1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess split high-water allocation".to_owned()),
+            }),
+            execution_idempotency("execution-published-high-water-pause-001", 199),
+        )
+        .await
+        .expect("pause first published split block");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start,
+            actual_seconds: Some(0),
+        })
+        .await
+        .expect("assess zero-credit split defer");
+    execution
+        .command(
+            2,
             ExecutionCommand::Defer(DeferExecution {
                 session_id,
                 move_start,
-                move_end: move_start + Duration::minutes(30),
+                move_end: assessment.move_end,
                 actual_seconds: Some(0),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: assessment
+                    .approval_required
+                    .then_some(assessment.assessment_digest),
             }),
             execution_idempotency("execution-published-high-water-defer-001", 128),
         )
@@ -1743,7 +2681,7 @@ async fn assert_claim_allocation_preserves_published_split_high_water(pool: &PgP
     .fetch_one(pool)
     .await
     .expect("load published high-water replacement claim");
-    assert_eq!(claim, (3, 0, 30 * 60));
+    assert_eq!(claim, (3, 0, 20 * 60));
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1759,6 +2697,7 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
@@ -1768,12 +2707,32 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     let second_item = Uuid::new_v4();
     create_item(&items, first_item, "Defer active task", 31).await;
     create_item(&items, second_item, "Defer paused task", 32).await;
+    let (first_source_block, first_move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-defer-owner",
+        &items,
+        &schedules,
+        base,
+        first_item,
+        1,
+    )
+    .await;
+    let second_source_block = current_published_source_block(pool, scope, second_item).await;
 
     let first_session = Uuid::from_u128(2_000);
     execution
         .command(
             0,
-            start_command(first_session, first_item, Uuid::new_v4()),
+            ExecutionCommand::Start(StartExecution {
+                session_id: first_session,
+                item_id: first_item,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(first_source_block),
+                device_id: Uuid::new_v4(),
+            }),
             execution_idempotency("execution-defer-first-start-001", 33),
         )
         .await
@@ -1788,6 +2747,8 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
                 move_start: clock.now(),
                 move_end: clock.now() + Duration::minutes(30),
                 actual_seconds: None,
+                assessment_digest: None,
+                approved_assessment_digest: None,
             }),
             execution_idempotency(INVALID_KEY, 34),
         )
@@ -1798,20 +2759,16 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
         ExecutionServiceError::Domain(ExecutionDomainError::InvalidDefer)
     ));
 
-    let first_move_start = clock.now() + Duration::hours(1);
-    let first_move_end = first_move_start + Duration::hours(1);
-    let defer_active = ExecutionCommand::Defer(DeferExecution {
+    let stale_defer = ExecutionCommand::Defer(DeferExecution {
         session_id: first_session,
         move_start: first_move_start,
-        move_end: first_move_end,
-        actual_seconds: None,
+        move_end: first_move_start + Duration::hours(1),
+        actual_seconds: Some(45),
+        assessment_digest: None,
+        approved_assessment_digest: None,
     });
     let stale = execution
-        .command(
-            0,
-            defer_active.clone(),
-            execution_idempotency(STALE_DEFER_KEY, 35),
-        )
+        .command(0, stale_defer, execution_idempotency(STALE_DEFER_KEY, 35))
         .await
         .unwrap_err();
     assert!(matches!(
@@ -1822,15 +2779,48 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
         })
     ));
 
-    let deferred = execution
+    execution
         .command(
             1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: first_session,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess the exact remainder".to_owned()),
+            }),
+            execution_idempotency("execution-defer-first-pause-001", 192),
+        )
+        .await
+        .expect("pause first defer fixture");
+    let first_assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id: first_session,
+            move_start: first_move_start,
+            actual_seconds: None,
+        })
+        .await
+        .expect("assess first exact defer");
+    let first_move_end = first_assessment.move_end;
+    let defer_active = ExecutionCommand::Defer(DeferExecution {
+        session_id: first_session,
+        move_start: first_move_start,
+        move_end: first_move_end,
+        actual_seconds: Some(first_assessment.actual_seconds),
+        assessment_digest: Some(first_assessment.assessment_digest.clone()),
+        approved_assessment_digest: first_assessment
+            .approval_required
+            .then_some(first_assessment.assessment_digest),
+    });
+    let deferred = execution
+        .command(
+            2,
             defer_active.clone(),
             execution_idempotency(DEFER_KEY, 36),
         )
         .await
         .unwrap();
-    assert_eq!(deferred.revision, 2);
+    assert_eq!(deferred.revision, 3);
     assert!(deferred.active_session.is_none());
     assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
     assert_eq!(deferred.changed_session.accumulated_seconds, 45);
@@ -1851,16 +2841,16 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     .expect("first Defer replacement claim");
     assert_eq!(
         first_claim,
-        (1, 1, "legacy_move_window".to_owned(), 3600, 0, 3600)
+        (1, 1, "published_origin".to_owned(), 3600, 60, 3540)
     );
 
     clock.set(first_move_end + Duration::seconds(1));
     let replay = execution
-        .command(1, defer_active, execution_idempotency(DEFER_KEY, 36))
+        .command(2, defer_active, execution_idempotency(DEFER_KEY, 36))
         .await
         .unwrap();
     assert!(replay.replayed);
-    assert_eq!(replay.revision, 2);
+    assert_eq!(replay.revision, 3);
     assert_eq!(replay.changed_session, deferred.changed_session);
     let replayed_claim_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM execution_defer_replacement_claims \
@@ -1880,8 +2870,16 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     let second_session = Uuid::from_u128(1_000);
     let started_second = execution
         .command(
-            2,
-            start_command(second_session, second_item, Uuid::new_v4()),
+            3,
+            ExecutionCommand::Start(StartExecution {
+                session_id: second_session,
+                item_id: second_item,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(second_source_block),
+                device_id: Uuid::new_v4(),
+            }),
             execution_idempotency("execution-defer-second-start-001", 37),
         )
         .await
@@ -1893,7 +2891,7 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     clock.set(rollback_start + Duration::seconds(20));
     execution
         .command(
-            3,
+            4,
             ExecutionCommand::Pause(PauseExecution {
                 session_id: second_session,
                 duration_seconds: None,
@@ -1904,23 +2902,35 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
         )
         .await
         .unwrap();
-    clock.set(clock.now() + Duration::minutes(10));
-    let second_move_start = clock.now() + Duration::days(30);
-    let second_move_end = second_move_start + Duration::hours(24);
+    let second_move_start = first_move_start + Duration::hours(2);
+    let second_assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 5,
+            session_id: second_session,
+            move_start: second_move_start,
+            actual_seconds: Some(7),
+        })
+        .await
+        .expect("assess paused exact defer after host-clock rollback");
+    let second_move_end = second_assessment.move_end;
     let deferred_paused = execution
         .command(
-            4,
+            5,
             ExecutionCommand::Defer(DeferExecution {
                 session_id: second_session,
                 move_start: second_move_start,
                 move_end: second_move_end,
                 actual_seconds: Some(7),
+                assessment_digest: Some(second_assessment.assessment_digest.clone()),
+                approved_assessment_digest: second_assessment
+                    .approval_required
+                    .then_some(second_assessment.assessment_digest),
             }),
             execution_idempotency("execution-defer-paused-001", 39),
         )
         .await
         .unwrap();
-    assert_eq!(deferred_paused.revision, 5);
+    assert_eq!(deferred_paused.revision, 6);
     assert!(deferred_paused.active_session.is_none());
     assert_eq!(
         deferred_paused.changed_session.status,
@@ -2005,7 +3015,7 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     .await
     .unwrap();
     assert_eq!(deferred_outbox_count, 2);
-    assert_execution_side_effects(pool, scope, 5).await;
+    assert_execution_side_effects(pool, scope, 6).await;
     for failed_key in [INVALID_KEY, STALE_DEFER_KEY] {
         assert_eq!(
             execution_idempotency_count(pool, scope, failed_key).await,
@@ -2037,6 +3047,7 @@ async fn assert_postgres_defer_transitions(pool: &PgPool) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // The race requires a complete assessed source fixture.
 async fn assert_concurrent_defer_allocates_one_claim(pool: &PgPool) {
     let scope = seed_scope(
         pool,
@@ -2050,6 +3061,7 @@ async fn assert_concurrent_defer_allocates_one_claim(pool: &PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
@@ -2058,29 +3070,74 @@ async fn assert_concurrent_defer_allocates_one_claim(pool: &PgPool) {
     let item_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     create_item(&items, item_id, "Concurrent defer claim", 103).await;
+    let (source_block_id, move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-defer-race-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        1,
+    )
+    .await;
     execution
         .command(
             0,
-            start_command(session_id, item_id, Uuid::new_v4()),
+            ExecutionCommand::Start(StartExecution {
+                session_id,
+                item_id,
+                item_revision: 1,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(source_block_id),
+                device_id: Uuid::new_v4(),
+            }),
             execution_idempotency("execution-defer-race-start-001", 104),
         )
         .await
         .expect("start concurrent defer fixture");
     clock.set(base + Duration::seconds(5));
+    execution
+        .command(
+            1,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Race exact approval".to_owned()),
+            }),
+            execution_idempotency("execution-defer-race-pause-001", 193),
+        )
+        .await
+        .expect("pause concurrent defer fixture");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start,
+            actual_seconds: Some(5),
+        })
+        .await
+        .expect("assess concurrent defer fixture");
     let command = ExecutionCommand::Defer(DeferExecution {
         session_id,
-        move_start: base + Duration::hours(1),
-        move_end: base + Duration::hours(2),
+        move_start,
+        move_end: assessment.move_end,
         actual_seconds: Some(5),
+        assessment_digest: Some(assessment.assessment_digest.clone()),
+        approved_assessment_digest: assessment
+            .approval_required
+            .then_some(assessment.assessment_digest),
     });
     let (left, right) = tokio::join!(
         execution.command(
-            1,
+            2,
             command.clone(),
             execution_idempotency("execution-defer-race-left-001", 105),
         ),
         execution.command(
-            1,
+            2,
             command,
             execution_idempotency("execution-defer-race-right-001", 106),
         )
@@ -2091,8 +3148,8 @@ async fn assert_concurrent_defer_allocates_one_claim(pool: &PgPool) {
             assert!(matches!(
                 loser,
                 ExecutionServiceError::Repository(ExecutionRepositoryError::RevisionConflict {
-                    expected: 1,
-                    actual: 2
+                    expected: 2,
+                    actual: 3
                 })
             ));
         }
@@ -2110,8 +3167,8 @@ async fn assert_concurrent_defer_allocates_one_claim(pool: &PgPool) {
     assert_eq!(claims, 1);
 }
 
+#[allow(clippy::too_many_lines)] // The exhaustion guard needs real published execution evidence.
 async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
-    const EXHAUSTED_KEY: &str = "execution-defer-index-exhausted-001";
     let scope = seed_scope(
         pool,
         "execution-index-exhausted-owner",
@@ -2124,6 +3181,7 @@ async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
@@ -2132,6 +3190,17 @@ async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
     let item_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
     create_item(&items, item_id, "Exhaust replacement index", 107).await;
+    let (source_block_id, move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-index-exhausted-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        1,
+    )
+    .await;
     execution
         .command(
             0,
@@ -2140,26 +3209,44 @@ async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
                 item_id,
                 item_revision: 1,
                 occurrence_id: None,
-                session_index: u16::MAX,
-                planned_block_id: None,
+                session_index: 0,
+                planned_block_id: Some(source_block_id),
                 device_id: Uuid::new_v4(),
             }),
             execution_idempotency("execution-index-exhausted-start-001", 108),
         )
         .await
-        .expect("start maximum-index fixture");
+        .expect("start attested index-exhaustion fixture");
     clock.set(base + Duration::seconds(5));
-    let exhausted = execution
+    execution
         .command(
             1,
-            ExecutionCommand::Defer(DeferExecution {
+            ExecutionCommand::Pause(PauseExecution {
                 session_id,
-                move_start: base + Duration::hours(1),
-                move_end: base + Duration::hours(2),
-                actual_seconds: Some(5),
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess an exhausted replacement index".to_owned()),
             }),
-            execution_idempotency(EXHAUSTED_KEY, 109),
+            execution_idempotency("execution-index-exhausted-pause-001", 194),
         )
+        .await
+        .expect("pause index-exhaustion fixture");
+    insert_terminal_history_row(
+        pool,
+        scope,
+        item_id,
+        None,
+        i32::from(u16::MAX),
+        base - Duration::seconds(1),
+    )
+    .await;
+    let exhausted = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start,
+            actual_seconds: Some(5),
+        })
         .await
         .unwrap_err();
     assert!(matches!(
@@ -2170,14 +3257,14 @@ async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
         .snapshot()
         .await
         .expect("snapshot after exhaustion");
-    assert_eq!(snapshot.revision, 1);
+    assert_eq!(snapshot.revision, 2);
     assert_eq!(
         snapshot.active_session.as_ref().map(|session| session.id),
         Some(session_id)
     );
     assert_eq!(
         snapshot.active_session.map(|session| session.status),
-        Some(ExecutionStatus::Active)
+        Some(ExecutionStatus::Paused)
     );
     let claims: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM execution_defer_replacement_claims WHERE workspace_id = $1",
@@ -2187,11 +3274,7 @@ async fn assert_index_exhaustion_rolls_back(pool: &PgPool) {
     .await
     .expect("count exhausted claims");
     assert_eq!(claims, 0);
-    assert_eq!(
-        execution_idempotency_count(pool, scope, EXHAUSTED_KEY).await,
-        0
-    );
-    assert_eq!(execution_outbox_count(pool, scope).await, 1);
+    assert_eq!(execution_outbox_count(pool, scope).await, 2);
 }
 
 #[allow(clippy::too_many_lines)] // One schedule-origin fixture proves the full Start-to-Defer evidence chain.
@@ -2208,6 +3291,7 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
         Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
         clock.clone(),
     ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(pool.clone(), scope));
     let execution = ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
         items.clone(),
@@ -2215,22 +3299,9 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
     );
     let item_id = Uuid::new_v4();
     let session_id = Uuid::new_v4();
-    let root_only_item_id = Uuid::new_v4();
-    let root_only_session_id = Uuid::new_v4();
     let fully_consumed_item_id = Uuid::new_v4();
     let fully_consumed_session_id = Uuid::new_v4();
-    let schedule_revision_id = Uuid::new_v4();
-    let source_block_id = Uuid::new_v4();
-    let root_only_source_block_id = Uuid::new_v4();
-    let fully_consumed_source_block_id = Uuid::new_v4();
     create_item(&items, item_id, "Attested defer duration", 110).await;
-    create_item(
-        &items,
-        root_only_item_id,
-        "Misleading root-only source revision",
-        113,
-    )
-    .await;
     create_item(
         &items,
         fully_consumed_item_id,
@@ -2238,115 +3309,19 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
         130,
     )
     .await;
-
-    sqlx::query(
-        "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
-         horizon_start, horizon_end, timezone_name, solver_version, input_digest, \
-         created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', $3, $4, \
-         'Europe/Madrid', 'execution-origin-defer-test', $5, $6, $3)",
+    let (source_block_id, move_start) = publish_v5_defer_policy(
+        pool,
+        scope,
+        "execution-origin-defer-owner",
+        &items,
+        &schedules,
+        base,
+        item_id,
+        1,
     )
-    .bind(schedule_revision_id)
-    .bind(scope.workspace_id)
-    .bind(base)
-    .bind(base + Duration::days(1))
-    .bind(vec![110_u8; 32])
-    .bind(scope.user_id)
-    .execute(pool)
-    .await
-    .expect("insert attested defer schedule draft");
-    let mut result_snapshot = json!({
-        "compose": {"source_item_revisions": {}},
-        "source_item_revisions": {}
-    });
-    let item_key = item_id.to_string();
-    let root_only_item_key = root_only_item_id.to_string();
-    let fully_consumed_item_key = fully_consumed_item_id.to_string();
-    result_snapshot["compose"]["source_item_revisions"][item_key.as_str()] = json!(1);
-    result_snapshot["compose"]["source_item_revisions"][fully_consumed_item_key.as_str()] =
-        json!(1);
-    result_snapshot["source_item_revisions"][root_only_item_key.as_str()] = json!(1);
-    sqlx::query(
-        "INSERT INTO schedule_revision_details (workspace_id, user_id, schedule_revision_id, \
-         result_snapshot, created_at) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(scope.workspace_id)
-    .bind(scope.user_id)
-    .bind(schedule_revision_id)
-    .bind(result_snapshot)
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect("insert attested defer schedule details");
-    sqlx::query(
-        "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, schedule_revision_id, \
-         item_id, block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal, \
-         is_fixed, constraint_snapshot, created_at) VALUES ($1, $2, $3, $4, $5, 'planned', \
-         'Attested defer duration', $6, $7, 'Europe/Madrid', 0, false, $8, $9)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(source_block_id)
-    .bind(scope.workspace_id)
-    .bind(schedule_revision_id)
-    .bind(item_id)
-    .bind(base + Duration::hours(1))
-    .bind(base + Duration::hours(2))
-    .bind(json!({
-        "source_block_id": source_block_id,
-        "occurrence_id": null,
-        "session_index": 4,
-        "core_kind": "planned"
-    }))
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect("insert attested defer schedule block");
-    sqlx::query(
-        "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, schedule_revision_id, \
-         item_id, block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal, \
-         is_fixed, constraint_snapshot, created_at) VALUES ($1, $2, $3, $4, $5, 'planned', \
-         'Misleading root-only source revision', $6, $7, 'Europe/Madrid', 1, false, $8, $9)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(root_only_source_block_id)
-    .bind(scope.workspace_id)
-    .bind(schedule_revision_id)
-    .bind(root_only_item_id)
-    .bind(base + Duration::hours(2))
-    .bind(base + Duration::hours(2) + Duration::minutes(30))
-    .bind(json!({
-        "source_block_id": root_only_source_block_id,
-        "occurrence_id": null,
-        "session_index": 0,
-        "core_kind": "planned"
-    }))
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect("insert misleading root-only schedule block");
-    sqlx::query(
-        "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, schedule_revision_id, \
-         item_id, block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal, \
-         is_fixed, constraint_snapshot, created_at) VALUES ($1, $2, $3, $4, $5, 'planned', \
-         'Fully consumed attested defer', $6, $7, 'Europe/Madrid', 2, false, $8, $9)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(fully_consumed_source_block_id)
-    .bind(scope.workspace_id)
-    .bind(schedule_revision_id)
-    .bind(fully_consumed_item_id)
-    .bind(base + Duration::hours(3))
-    .bind(base + Duration::hours(3) + Duration::minutes(30))
-    .bind(json!({
-        "source_block_id": fully_consumed_source_block_id,
-        "occurrence_id": null,
-        "session_index": 0,
-        "core_kind": "planned"
-    }))
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect("insert fully consumed attested schedule block");
-    publish_schedule_revision(pool, scope, schedule_revision_id).await;
+    .await;
+    let fully_consumed_source_block_id =
+        current_published_source_block(pool, scope, fully_consumed_item_id).await;
 
     execution
         .command(
@@ -2356,7 +3331,7 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
                 item_id,
                 item_revision: 1,
                 occurrence_id: None,
-                session_index: 4,
+                session_index: 0,
                 planned_block_id: Some(source_block_id),
                 device_id: Uuid::new_v4(),
             }),
@@ -2377,47 +3352,52 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
     assert_eq!(origin, (1, 3600));
 
     clock.set(base + Duration::seconds(600));
-    let move_start = base + Duration::hours(3);
-    let move_end = move_start + Duration::seconds(3000);
-    let fractional_key = "execution-origin-defer-fractional-window-001";
-    let fractional = execution
+    execution
         .command(
             1,
-            ExecutionCommand::Defer(DeferExecution {
+            ExecutionCommand::Pause(PauseExecution {
                 session_id,
-                move_start,
-                move_end: move_start + Duration::seconds(2999) + Duration::microseconds(1),
-                actual_seconds: Some(600),
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Assess published-origin duration".to_owned()),
             }),
-            execution_idempotency(fractional_key, 130),
+            execution_idempotency("execution-origin-defer-pause-001", 200),
         )
         .await
-        .expect_err("fractional window cannot round up to the exact remainder");
-    assert!(matches!(
-        fractional,
-        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferDurationConflict)
-    ));
-    assert_eq!(
-        execution_idempotency_count(pool, scope, fractional_key).await,
-        0
-    );
+        .expect("pause published-origin duration fixture");
+    let assessment = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 2,
+            session_id,
+            move_start,
+            actual_seconds: Some(600),
+        })
+        .await
+        .expect("assess exact published-origin remainder");
+    assert_eq!(assessment.planned_duration_seconds, 3_600);
+    assert_eq!(assessment.credited_source_seconds, 600);
+    assert_eq!(assessment.remaining_duration_seconds, 3_000);
     let mismatch_key = "execution-origin-defer-duration-mismatch-001";
     let mismatch = execution
         .command(
-            1,
+            2,
             ExecutionCommand::Defer(DeferExecution {
                 session_id,
                 move_start,
-                move_end: move_end - Duration::seconds(1),
+                move_end: assessment.move_end - Duration::seconds(1),
                 actual_seconds: Some(600),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: assessment
+                    .approval_required
+                    .then_some(assessment.assessment_digest.clone()),
             }),
             execution_idempotency(mismatch_key, 131),
         )
         .await
-        .expect_err("attested Defer rejects a mismatched remaining window");
+        .expect_err("assessment authorization binds the exact remaining window");
     assert!(matches!(
         mismatch,
-        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferDurationConflict)
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferAssessmentStale)
     ));
     assert_eq!(
         execution_idempotency_count(pool, scope, mismatch_key).await,
@@ -2444,12 +3424,16 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
     assert_eq!(mismatched_claims, 0);
     execution
         .command(
-            1,
+            2,
             ExecutionCommand::Defer(DeferExecution {
                 session_id,
                 move_start,
-                move_end,
+                move_end: assessment.move_end,
                 actual_seconds: Some(600),
+                assessment_digest: Some(assessment.assessment_digest.clone()),
+                approved_assessment_digest: assessment
+                    .approval_required
+                    .then_some(assessment.assessment_digest),
             }),
             execution_idempotency("execution-origin-defer-command-001", 112),
         )
@@ -2469,12 +3453,12 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
     .expect("load attested Defer claim");
     assert_eq!(
         claim,
-        ("published_origin".to_owned(), 3600, 600, 3000, 5, 1)
+        ("published_origin".to_owned(), 3600, 600, 3000, 1, 1)
     );
 
     execution
         .command(
-            2,
+            3,
             ExecutionCommand::Start(StartExecution {
                 session_id: fully_consumed_session_id,
                 item_id: fully_consumed_item_id,
@@ -2488,29 +3472,33 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
         )
         .await
         .expect("Start fully consumed attested fixture");
-    let fully_consumed_key = "execution-origin-fully-consumed-defer-001";
-    let fully_consumed_move_start = base + Duration::hours(5);
-    let fully_consumed = execution
+    clock.set(base + Duration::seconds(1_800));
+    execution
         .command(
-            3,
-            ExecutionCommand::Defer(DeferExecution {
+            4,
+            ExecutionCommand::Pause(PauseExecution {
                 session_id: fully_consumed_session_id,
-                move_start: fully_consumed_move_start,
-                move_end: fully_consumed_move_start + Duration::minutes(30),
-                actual_seconds: Some(30 * 60),
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("No remainder should be deferrable".to_owned()),
             }),
-            execution_idempotency(fully_consumed_key, 133),
+            execution_idempotency("execution-origin-fully-consumed-pause-001", 201),
         )
+        .await
+        .expect("pause fully consumed attested fixture");
+    let fully_consumed = execution
+        .assess_defer(DeferAssessmentRequest {
+            expected_revision: 5,
+            session_id: fully_consumed_session_id,
+            move_start: move_start + Duration::hours(2),
+            actual_seconds: Some(3_600),
+        })
         .await
         .expect_err("fully consumed attested block has no defer replacement");
     assert!(matches!(
         fully_consumed,
         ExecutionServiceError::Repository(ExecutionRepositoryError::DeferDurationConflict)
     ));
-    assert_eq!(
-        execution_idempotency_count(pool, scope, fully_consumed_key).await,
-        0
-    );
     let fully_consumed_claims: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM execution_defer_replacement_claims \
          WHERE workspace_id = $1 AND source_deferred_session_id = $2",
@@ -2523,73 +3511,15 @@ async fn assert_attested_defer_uses_origin_duration(pool: &PgPool) {
     assert_eq!(fully_consumed_claims, 0);
     execution
         .command(
-            3,
+            5,
             ExecutionCommand::Complete(FinishExecution {
                 session_id: fully_consumed_session_id,
-                actual_seconds: Some(30 * 60),
+                actual_seconds: Some(3_600),
             }),
             execution_idempotency("execution-origin-fully-consumed-complete-001", 134),
         )
         .await
         .expect("close fully consumed rollback fixture");
-
-    execution
-        .command(
-            4,
-            ExecutionCommand::Start(StartExecution {
-                session_id: root_only_session_id,
-                item_id: root_only_item_id,
-                item_revision: 1,
-                occurrence_id: None,
-                session_index: 0,
-                planned_block_id: Some(root_only_source_block_id),
-                device_id: Uuid::new_v4(),
-            }),
-            execution_idempotency("execution-origin-root-only-start-001", 114),
-        )
-        .await
-        .expect("root-only source revision remains passive-compatible");
-    let root_only_origins: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM execution_session_schedule_origins \
-         WHERE workspace_id = $1 AND execution_session_id = $2",
-    )
-    .bind(scope.workspace_id)
-    .bind(root_only_session_id)
-    .fetch_one(pool)
-    .await
-    .expect("count misleading root-only Start origins");
-    assert_eq!(root_only_origins, 0);
-    let root_only_direct_origin = sqlx::query(
-        "INSERT INTO execution_session_schedule_origins (workspace_id, \
-         execution_session_id, schedule_revision_id, source_block_id, item_id, item_revision, \
-         execution_epoch, occurrence_id, session_index, planned_duration_seconds, created_at) \
-         VALUES ($1, $2, $3, $4, $5, 1, 1, NULL, 0, 1800, $6)",
-    )
-    .bind(scope.workspace_id)
-    .bind(root_only_session_id)
-    .bind(schedule_revision_id)
-    .bind(root_only_source_block_id)
-    .bind(root_only_item_id)
-    .bind(base)
-    .execute(pool)
-    .await
-    .expect_err("database guard rejects misleading root-only source revision");
-    assert!(
-        root_only_direct_origin
-            .to_string()
-            .contains("execution schedule origin must be captured by Start")
-    );
-    execution
-        .command(
-            5,
-            ExecutionCommand::Complete(FinishExecution {
-                session_id: root_only_session_id,
-                actual_seconds: Some(0),
-            }),
-            execution_idempotency("execution-origin-root-only-complete-001", 115),
-        )
-        .await
-        .expect("close root-only compatibility fixture");
 
     let immutable_origin = sqlx::query(
         "UPDATE execution_session_schedule_origins SET created_at = created_at \
@@ -2737,6 +3667,86 @@ async fn postgres_now(pool: &PgPool) -> DateTime<Utc> {
         .expect("read PostgreSQL fixture time");
     DateTime::from_timestamp_micros(now.timestamp_micros())
         .expect("PostgreSQL fixture time remains representable at microsecond precision")
+}
+
+fn truncate_to_minute(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp(value.timestamp().div_euclid(60) * 60, 0)
+        .expect("fixture minute remains representable")
+}
+
+fn align_up_to_five_minutes(value: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = value.timestamp();
+    let aligned = seconds
+        .div_euclid(300)
+        .checked_add(1)
+        .and_then(|slot| slot.checked_mul(300))
+        .expect("fixture grid remains representable");
+    DateTime::from_timestamp(aligned, 0).expect("fixture grid timestamp remains representable")
+}
+
+async fn insert_short_lived_unapplied_assessment(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    source_digest: &[u8; 32],
+) -> [u8; 32] {
+    let assessment_id = Uuid::new_v4();
+    let assessment_digest = [0x5a; 32];
+    let inserted = sqlx::query(
+        "INSERT INTO execution_defer_assessments (id, workspace_id, user_id, schema_version, \
+           execution_state_revision, source_execution_session_id, \
+           source_execution_session_revision, source_schedule_revision_id, source_block_id, \
+           current_schedule_revision_id, current_schedule_revision_number, \
+           current_publication_hash, item_id, source_item_revision, current_item_revision, \
+           execution_epoch, occurrence_id, source_session_index, replacement_session_index, \
+           planned_duration_seconds, credited_before_seconds, effective_actual_seconds, \
+           credited_after_seconds, credited_source_seconds, remaining_duration_seconds, \
+           scheduler_slot_seconds, target_start, target_end, environment_digest, \
+           assessment_digest, approval_required, private_context, violations, assessed_at, \
+           expires_at) \
+         SELECT $4, workspace_id, user_id, schema_version, execution_state_revision, \
+           source_execution_session_id, source_execution_session_revision, \
+           source_schedule_revision_id, source_block_id, current_schedule_revision_id, \
+           current_schedule_revision_number, current_publication_hash, item_id, \
+           source_item_revision, current_item_revision, execution_epoch, occurrence_id, \
+           source_session_index, replacement_session_index, planned_duration_seconds, \
+           credited_before_seconds, effective_actual_seconds, credited_after_seconds, \
+           credited_source_seconds, remaining_duration_seconds, scheduler_slot_seconds, \
+           target_start, target_end, environment_digest, $5, approval_required, \
+           jsonb_set(private_context, '{candidate,placement_id}', to_jsonb($4::text), false), \
+           violations, statement_timestamp(), \
+           statement_timestamp() + interval '250 milliseconds' \
+         FROM execution_defer_assessments \
+         WHERE workspace_id = $1 AND user_id = $2 AND assessment_digest = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(source_digest.as_slice())
+    .bind(assessment_id)
+    .bind(assessment_digest.as_slice())
+    .execute(pool)
+    .await
+    .expect("insert a short-lived unapplied assessment fixture")
+    .rows_affected();
+    assert_eq!(inserted, 1);
+    assessment_digest
+}
+
+fn decode_sha256_digest(value: &str) -> [u8; 32] {
+    let hex = value
+        .strip_prefix("sha256:")
+        .expect("fixture digest has canonical prefix")
+        .as_bytes();
+    assert_eq!(hex.len(), 64);
+    let mut output = [0_u8; 32];
+    for (index, pair) in hex.chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => panic!("fixture digest is lowercase hexadecimal"),
+        };
+        output[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    output
 }
 
 async fn assert_fixture_idempotency_expiry_is_future(pool: &PgPool, base: DateTime<Utc>) {

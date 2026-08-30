@@ -202,16 +202,44 @@ committed and tells the client to discard the journal and recompose; generic,
 transport, unavailable, and idempotency-conflict failures remain ambiguous and
 must retain the exact journal for operator recovery or retry.
 
-A deferred execution session permanently closes its physical session index and
-atomically claims a strictly higher, previously unused replacement index. For
-an attested Start, the remaining duration is derived from its published origin
-minus already credited execution; legacy sources use their requested move
-window as the only duration evidence. Move windows must be positive, no longer
-than 24 hours, and exactly equal to a positive whole-second remainder. A
-fractional or otherwise mismatched window returns the detail-free
-`409 execution_defer_duration_conflict`. Index exhaustion returns the
-detail-free `409 execution_index_exhausted`. Raw database writes cannot
-commit a deferred session without the matching immutable claim.
+“Will do later” is a two-phase, server-authoritative operation. The client first
+pauses the active session, then posts the exact paused execution revision,
+session ID, target start, and optional corrected actual duration to
+`POST /v1/execution/defer-assessments`. Assessment requires the current private
+v5 planning policy, exact item and Calendar projections, the immutable source
+schedule origin, and the current execution ledger. It returns the server-derived
+actual duration, normalized whole-minute credit, remaining duration and target
+end, a content-free conflict list, a five-minute expiry, and a canonical
+`sha256:` assessment digest. The target must begin after that expiry.
+
+The final `defer` command must copy the assessment's actual duration, start,
+end, and digest exactly. If conflicts were reported, it must also carry the same
+digest as `approved_assessment_digest`; conflict-free assessments forbid an
+approval field. The command transaction reloads and recomputes the complete
+policy, item, Calendar, execution, source-origin, fresh-index, environment, and
+violation evidence before accepting the digest. Missing, expired, or changed
+evidence is `409 execution_defer_assessment_stale`; a missing required approval
+is `409 execution_defer_approval_required`; an extra or mismatched approval is
+`409 execution_defer_approval_invalid`. An exact command already committed
+under its idempotency key replays before these live checks, including after the
+assessment expires.
+
+Expired assessments that were never applied are removed at server startup and
+by an hourly retention worker, so their private planning context remains for no
+more than roughly one maintenance interval after expiry while the service is
+running. Applied assessment evidence remains attached to its immutable claim
+for execution audit and exact idempotent replay.
+
+A successful deferred session permanently closes its physical session index
+and atomically claims the assessment's strictly higher, previously unused
+replacement index. Remaining duration is the attested published-origin duration
+minus the aggregate, once-rounded credit attributable to this source session.
+The exact move window must equal that positive whole-minute remainder and remain
+no longer than 24 hours. A mismatch returns the detail-free
+`409 execution_defer_duration_conflict`; index exhaustion returns
+`409 execution_index_exhausted`. Raw database writes cannot mint a new legacy
+claim or commit a deferred session without the matching live immutable v1
+assessment and, when needed, its exact approval.
 
 If a live, current-epoch claim overlaps the candidate horizon, a fresh
 publication must contain exactly one `pinned` block for the current item
@@ -331,9 +359,9 @@ boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
 
 Production publication, immutable reads, transactional MCP proposal submission,
-execution defer, and attested restart require migrations through
-`0020_execution_progress_ledger.sql`. Deploy the migrated server before
-enabling clients that produce deferred restart commands.
+execution defer assessment/approval, and attested restart require migrations
+through `0021_execution_defer_approval.sql`. Deploy the migrated server before
+enabling clients that produce assessed deferred restart commands.
 
 An upgrade from migrations 1–11 safely seals any legacy published revision but
 cannot invent the missing durable detail/evidence snapshot. Schedule and item

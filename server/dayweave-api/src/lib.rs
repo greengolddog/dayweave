@@ -58,6 +58,7 @@ type Repositories = (
     Arc<dyn ProposalRepository>,
     Arc<dyn ItemRepository>,
     Arc<dyn ExecutionRepository>,
+    Option<Arc<PostgresExecutionRepository>>,
     Option<Arc<Mutex<()>>>,
     Arc<dyn GoogleOAuthRepository>,
     Option<Arc<dyn GoogleSyncRepository>>,
@@ -87,6 +88,14 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             .maintain_retention()
             .await
             .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
+        let postgres_execution = Arc::new(PostgresExecutionRepository::new(
+            database.pool().clone(),
+            database.scope(),
+        ));
+        postgres_execution
+            .maintain_defer_assessment_retention()
+            .await
+            .map_err(|_| PersistenceError::IntegrationInitializationFailed)?;
         return Ok((
             Arc::new(PostgresProposalRepository::new(
                 database.pool().clone(),
@@ -96,10 +105,8 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             )),
-            Arc::new(PostgresExecutionRepository::new(
-                database.pool().clone(),
-                database.scope(),
-            )),
+            postgres_execution.clone(),
+            Some(postgres_execution),
             None,
             Arc::new(PostgresGoogleOAuthRepository::new(
                 database.pool().clone(),
@@ -138,6 +145,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
         Arc::new(InMemoryProposalRepository::default()),
         item_repository,
         execution_repository,
+        None,
         Some(execution_item_gate),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
         None,
@@ -188,6 +196,7 @@ impl AppState {
             repository,
             item_repository,
             execution_repository,
+            postgres_execution,
             execution_item_gate,
             google_oauth_repository,
             google_sync_repository,
@@ -323,6 +332,9 @@ impl AppState {
 
         if let Some(repository) = proposal_applications.as_ref() {
             repository.spawn_maintenance_worker();
+        }
+        if let Some(repository) = postgres_execution.as_ref() {
+            repository.spawn_defer_assessment_maintenance_worker();
         }
         if let Some(repository) = scheduling.as_ref() {
             repository.spawn_simulation_maintenance_worker();

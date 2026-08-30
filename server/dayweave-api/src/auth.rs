@@ -378,7 +378,9 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
         (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
         (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history") => Some(Scope::ExecutionRead),
-        (&Method::POST, "/execution/commands") => Some(Scope::ExecutionWrite),
+        (&Method::POST, "/execution/commands" | "/execution/defer-assessments") => {
+            Some(Scope::ExecutionWrite)
+        }
         (
             &Method::GET,
             "/integrations/google/accounts"

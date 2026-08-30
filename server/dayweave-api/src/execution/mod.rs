@@ -9,8 +9,8 @@ pub use domain::{
 };
 pub(crate) use repository::next_protocol_time;
 pub use repository::{
-    ExecutionIdempotency, ExecutionMutation, ExecutionRepository, ExecutionRepositoryError,
-    ExecutionSnapshot, InMemoryExecutionRepository,
+    DeferAssessment, DeferAssessmentRequest, ExecutionIdempotency, ExecutionMutation,
+    ExecutionRepository, ExecutionRepositoryError, ExecutionSnapshot, InMemoryExecutionRepository,
 };
 pub use service::{
     ExecutionHistoryPage, ExecutionIdempotencyKey, ExecutionService, ExecutionServiceError,

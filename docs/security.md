@@ -134,6 +134,23 @@ effects must flow through an auditable proposal or outbox boundary.
   canonical state.
 - Sensitive schedule material is redacted at the projection boundary, before
   it reaches MCP serialization.
+- A first-party credential with `execution_write` acts with the configured
+  personal owner's execution authority. For “Will do later,” an
+  `approved_assessment_digest` is durable, content-bound command intent from
+  that trusted client, not cryptographic proof of human presence. Native clients
+  require and persist an explicit tap before emitting it; MCP credentials cannot
+  receive `execution_write`. A compromised execution-write device credential
+  can nevertheless echo the digest, so revocation and device protection remain
+  part of this boundary.
+- Defer assessment and claim triggers are database defense-in-depth for
+  repository mistakes and races. Core conflict recomputation remains an API
+  responsibility; a role allowed arbitrary direct table writes is inside the
+  trusted service boundary (and a database superuser can bypass any such
+  trigger). Production database grants must restrict these tables to the
+  application migration/runtime roles and prohibit ad-hoc writer roles.
+- Unapplied defer assessments are short-lived: expired rows are pruned on
+  startup, hourly, and before new assessments. Applied evidence is retained
+  with its immutable execution claim for audit and exact replay.
 - Database URLs and storage failures are redacted in application-facing errors.
   HTTP traces carry correlation metadata without deliberately logging request
   bodies, authorization headers, titles, notes, or assistant prompts.
@@ -255,6 +272,8 @@ ready:
   sensitive fields with a key held separately from PostgreSQL and backups;
 - enforce ingress and per-principal rate limits and suspicious-authentication
   alerts;
+- provision and verify least-privilege PostgreSQL migration/runtime roles so no
+  unrelated role can write canonical execution, assessment, or claim tables;
 - provision least-privilege Nebius identities, private versioned storage,
   tunnel HTTPS, budget alerts, and automated security patch/restart reporting;
 - rehearse backup restore and credential/key rotation against the deployed

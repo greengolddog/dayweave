@@ -9,7 +9,8 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
 use dayweave_core::{
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
-    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, ScheduleBlockKind, Scheduler,
+    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, PlanRequest, ScheduleBlockKind,
+    Scheduler,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -93,6 +94,17 @@ pub(crate) struct AuthoritativePlanningEvidence {
     pub(crate) published_revision_id: Option<Uuid>,
     pub(crate) previous_assignments: Vec<PreviousAssignmentInput>,
     pub(crate) retained_manual_placements: Vec<PersistedManualPlacementState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub(crate) struct PublishedPlanningPolicy {
+    pub(crate) revision_id: Uuid,
+    pub(crate) revision_number: u64,
+    pub(crate) publication_hash: [u8; 32],
+    pub(crate) timezone_name: String,
+    pub(crate) source_item_revisions: BTreeMap<Uuid, u64>,
+    pub(crate) calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    pub(crate) planning_request: PlanRequest,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -807,6 +819,134 @@ impl PostgresSchedulingRepository {
         self.require_access(access)
             .map_err(|_| SchedulingPortError::NotFound)
     }
+}
+
+/// Loads the exact private v5 policy capsule from the current immutable
+/// publication. Callers must separately fence canonical items, Calendar, and
+/// the current revision before authorizing a mutation from this snapshot.
+pub(crate) async fn published_planning_policy_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+) -> Result<PublishedPlanningPolicy, SchedulePublicationError> {
+    let row = sqlx::query(
+        "SELECT revision.id, revision.revision_number, revision.publication_hash, \
+           revision.solver_version, revision.timezone_name, \
+           revision.horizon_start, revision.horizon_end, detail.result_snapshot \
+         FROM schedule_revisions AS revision \
+         JOIN schedule_revision_details AS detail \
+           ON detail.workspace_id = revision.workspace_id \
+          AND detail.schedule_revision_id = revision.id \
+         WHERE revision.workspace_id = $1 AND revision.created_by_user_id = $2 \
+           AND revision.state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| SchedulePublicationError::Unavailable)?
+    .ok_or(SchedulePublicationError::StaleComposition)?;
+    let revision_id: Uuid = row
+        .try_get("id")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    let revision_number = u64::try_from(
+        row.try_get::<i64, _>("revision_number")
+            .map_err(|_| SchedulePublicationError::Unavailable)?,
+    )
+    .ok()
+    .filter(|number| *number > 0)
+    .ok_or(SchedulePublicationError::StaleComposition)?;
+    let publication_hash: [u8; 32] = row
+        .try_get::<Vec<u8>, _>("publication_hash")
+        .map_err(|_| SchedulePublicationError::Unavailable)?
+        .try_into()
+        .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    let solver_version: String = row
+        .try_get("solver_version")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    let timezone_name: String = row
+        .try_get("timezone_name")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    let horizon_start: DateTime<Utc> = row
+        .try_get("horizon_start")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    let horizon_end: DateTime<Utc> = row
+        .try_get("horizon_end")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    let snapshot: Value = row
+        .try_get("result_snapshot")
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    if solver_version != SCHEDULER_PUBLICATION_SCHEMA
+        || snapshot.get("schema_version").and_then(Value::as_u64) != Some(5)
+        || snapshot
+            .get("scheduler_publication_schema")
+            .and_then(Value::as_str)
+            != Some(SCHEDULER_PUBLICATION_SCHEMA)
+    {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    let planning_request: PlanRequest = serde_json::from_value(
+        snapshot
+            .get("planning_request")
+            .cloned()
+            .ok_or(SchedulePublicationError::StaleComposition)?,
+    )
+    .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    let source_item_revisions = serde_json::from_value(
+        snapshot
+            .pointer("/compose/source_item_revisions")
+            .cloned()
+            .ok_or(SchedulePublicationError::StaleComposition)?,
+    )
+    .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    let calendar_projection_stamps = serde_json::from_value(
+        snapshot
+            .pointer("/evidence/calendar_projection_stamps")
+            .cloned()
+            .ok_or(SchedulePublicationError::StaleComposition)?,
+    )
+    .map_err(|_| SchedulePublicationError::StaleComposition)?;
+    if offset_to_chrono(planning_request.horizon_start)? != horizon_start
+        || offset_to_chrono(planning_request.horizon_end)? != horizon_end
+        || timezone_name.trim().is_empty()
+        || timezone_name.len() > 100
+        || timezone_name.parse::<chrono_tz::Tz>().is_err()
+    {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    Ok(PublishedPlanningPolicy {
+        revision_id,
+        revision_number,
+        publication_hash,
+        timezone_name,
+        source_item_revisions,
+        calendar_projection_stamps,
+        planning_request,
+    })
+}
+
+/// Share-locks the current publication and proves it is still the v5 policy
+/// capsule loaded earlier in the transaction.
+pub(crate) async fn assert_current_planning_policy_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    expected_revision_id: Uuid,
+) -> Result<(), SchedulePublicationError> {
+    let current: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, solver_version FROM schedule_revisions \
+         WHERE workspace_id = $1 AND created_by_user_id = $2 AND state = 'published' \
+         FOR SHARE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| SchedulePublicationError::Unavailable)?;
+    if current.as_ref().map(|value| value.0) != Some(expected_revision_id)
+        || current.as_ref().map(|value| value.1.as_str()) != Some(SCHEDULER_PUBLICATION_SCHEMA)
+    {
+        return Err(SchedulePublicationError::StaleComposition);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -2150,7 +2290,7 @@ struct CurrentExecutionItem {
 }
 
 #[allow(clippy::too_many_lines)] // One ordered snapshot assembly keeps every execution invariant under the same transaction.
-async fn authoritative_planning_evidence_tx(
+pub(crate) async fn authoritative_planning_evidence_tx(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
 ) -> Result<AuthoritativePlanningEvidence, ExecutionPlanningEvidenceError> {
@@ -3297,7 +3437,7 @@ fn revision_from_row(
     })
 }
 
-async fn assert_current_item_snapshot(
+pub(crate) async fn assert_current_item_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     expected: &BTreeMap<Uuid, u64>,
@@ -3332,7 +3472,7 @@ async fn assert_current_item_snapshot(
 /// concurrent configuration update from introducing a new blocking source as
 /// a publication is sealed.
 #[allow(clippy::too_many_lines)] // Lock, eligibility, freshness, and exact stamp checks are one fence.
-async fn assert_current_calendar_projection(
+pub(crate) async fn assert_current_calendar_projection(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     horizon_start: DateTime<Utc>,
@@ -3478,7 +3618,7 @@ async fn assert_current_calendar_projection(
     Ok(())
 }
 
-async fn lock_owner(
+pub(crate) async fn lock_owner(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
 ) -> Result<(), sqlx::Error> {

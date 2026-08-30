@@ -1437,7 +1437,7 @@ fn prefixed_sha256(bytes: &[u8]) -> Result<String, ComposeScheduleError> {
     Ok(encoded)
 }
 
-fn map_manual_placement_violations(
+pub(crate) fn map_manual_placement_violations(
     violations: &[dayweave_core::ManualPlacementViolation],
 ) -> Result<Vec<ManualPlacementViolationOutput>, ComposeScheduleError> {
     violations

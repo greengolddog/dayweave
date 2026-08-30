@@ -1,14 +1,23 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::Body,
     http::{Request, Response, StatusCode, header},
 };
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dayweave_api::{
     AppState,
     auth::StaticTokenAuthenticator,
+    execution::{
+        DeferAssessment, DeferAssessmentRequest, ExecutionCommand, ExecutionIdempotency,
+        ExecutionMutation, ExecutionRepository, ExecutionRepositoryError, ExecutionService,
+        ExecutionSnapshot, InMemoryExecutionRepository,
+    },
     http::router,
     proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock},
     readiness::Readiness,
@@ -20,7 +29,7 @@ use uuid::Uuid;
 
 const TOKEN: &str = "execution-api-test-token";
 
-fn test_app() -> Router {
+fn test_state() -> AppState {
     let proposals: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
     let proposals = Arc::new(ProposalService::new(
         proposals,
@@ -30,7 +39,83 @@ fn test_app() -> Router {
     let authenticator = Arc::new(StaticTokenAuthenticator::from_plaintext(&[TOKEN]));
     let readiness = Readiness::default();
     readiness.set_ready(true);
-    router(AppState::new(proposals, authenticator, readiness))
+    AppState::new(proposals, authenticator, readiness)
+}
+
+fn test_app() -> Router {
+    router(test_state())
+}
+
+#[derive(Clone)]
+struct AssessmentRepository {
+    assessment: DeferAssessment,
+    requests: Arc<Mutex<Vec<DeferAssessmentRequest>>>,
+    fallback: InMemoryExecutionRepository,
+}
+
+#[async_trait]
+impl ExecutionRepository for AssessmentRepository {
+    async fn snapshot(&self) -> Result<ExecutionSnapshot, ExecutionRepositoryError> {
+        self.fallback.snapshot().await
+    }
+
+    async fn replay(
+        &self,
+        now: DateTime<Utc>,
+        idempotency: &ExecutionIdempotency,
+    ) -> Result<Option<ExecutionMutation>, ExecutionRepositoryError> {
+        self.fallback.replay(now, idempotency).await
+    }
+
+    async fn assess_defer(
+        &self,
+        request: DeferAssessmentRequest,
+        _now: DateTime<Utc>,
+    ) -> Result<DeferAssessment, ExecutionRepositoryError> {
+        self.requests
+            .lock()
+            .expect("assessment request lock")
+            .push(request);
+        Ok(self.assessment.clone())
+    }
+
+    async fn apply(
+        &self,
+        expected_revision: u64,
+        command: ExecutionCommand,
+        now: DateTime<Utc>,
+        idempotency: ExecutionIdempotency,
+    ) -> Result<ExecutionMutation, ExecutionRepositoryError> {
+        self.fallback
+            .apply(expected_revision, command, now, idempotency)
+            .await
+    }
+
+    async fn history(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<dayweave_api::execution::ExecutionSession>, ExecutionRepositoryError> {
+        self.fallback.history(limit, offset).await
+    }
+}
+
+fn test_app_with_assessment(
+    assessment: DeferAssessment,
+) -> (Router, Arc<Mutex<Vec<DeferAssessmentRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let repository: Arc<dyn ExecutionRepository> = Arc::new(AssessmentRepository {
+        assessment,
+        requests: requests.clone(),
+        fallback: InMemoryExecutionRepository::default(),
+    });
+    let mut state = test_state();
+    state.execution = Arc::new(ExecutionService::new(
+        repository,
+        state.items.clone(),
+        Arc::new(SystemClock),
+    ));
+    (router(state), requests)
 }
 
 fn request(
@@ -701,6 +786,234 @@ async fn execution_rejects_malformed_breaks_and_unknown_fields() {
 }
 
 #[tokio::test]
+async fn defer_assessment_route_returns_the_exact_envelope_and_forwards_the_closed_body() {
+    let session_id = Uuid::new_v4();
+    let item_id = Uuid::new_v4();
+    let occurrence_id = Uuid::new_v4();
+    let source_schedule_revision_id = Uuid::new_v4();
+    let source_block_id = Uuid::new_v4();
+    let move_start = "2026-10-02T09:30:00Z".parse().unwrap();
+    let move_end = "2026-10-02T10:15:00Z".parse().unwrap();
+    let expires_at = "2026-09-01T10:05:00Z".parse().unwrap();
+    let assessment = DeferAssessment {
+        session_id,
+        execution_revision: 7,
+        session_revision: 3,
+        item_id,
+        item_revision: 11,
+        occurrence_id: Some(occurrence_id),
+        source_session_index: 2,
+        replacement_session_index: 4,
+        source_schedule_revision_id,
+        source_block_id,
+        actual_seconds: 601,
+        credited_source_seconds: 660,
+        planned_duration_seconds: 3_600,
+        remaining_duration_seconds: 2_940,
+        move_start,
+        move_end,
+        environment_digest: format!("sha256:{}", "a".repeat(64)),
+        assessment_digest: format!("sha256:{}", "b".repeat(64)),
+        approval_required: false,
+        violations: Vec::new(),
+        expires_at,
+    };
+    let assessment_request = DeferAssessmentRequest {
+        expected_revision: 7,
+        session_id,
+        move_start,
+        actual_seconds: Some(601),
+    };
+    let (app, captured) = test_app_with_assessment(assessment.clone());
+
+    let response = app
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(serde_json::to_value(&assessment_request).unwrap()),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        body_json(response).await,
+        json!({ "assessment": assessment })
+    );
+    assert_eq!(
+        *captured.lock().expect("assessment request lock"),
+        vec![assessment_request]
+    );
+}
+
+#[tokio::test]
+async fn defer_assessment_body_is_closed_and_memory_mode_fails_without_mutation() {
+    let app = test_app();
+    let session_id = Uuid::new_v4();
+    let move_start = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+        .unwrap()
+        + ChronoDuration::hours(1);
+    let valid = json!({
+        "expected_revision": 0,
+        "session_id": session_id,
+        "move_start": move_start,
+        "actual_seconds": null
+    });
+
+    let mut unknown = valid.clone();
+    unknown["client_assessment"] = json!("must not be trusted");
+    let unknown = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(unknown),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+    let missing = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(json!({
+                "expected_revision": 0,
+                "session_id": session_id
+            })),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+
+    let unsupported_revision = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(json!({
+                "expected_revision": (i64::MAX as u64) + 1,
+                "session_id": session_id,
+                "move_start": move_start,
+                "actual_seconds": null
+            })),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        unsupported_revision.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let unavailable = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/defer-assessments",
+            Some(valid),
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable = body_json(unavailable).await;
+    assert_eq!(unavailable["error"]["code"], "service_unavailable");
+    assert!(unavailable["error"].get("details").is_none());
+
+    let snapshot = app
+        .oneshot(request("GET", "/v1/execution", None, true, None))
+        .await
+        .unwrap();
+    let snapshot = body_json(snapshot).await;
+    assert_eq!(snapshot["execution"]["revision"], 0);
+    assert!(snapshot["execution"]["active_session"].is_null());
+}
+
+#[tokio::test]
+async fn defer_command_requires_canonical_matching_assessment_digests_at_the_http_boundary() {
+    let app = test_app();
+    let move_start = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+        .unwrap()
+        + ChronoDuration::days(30);
+    let move_end = move_start + ChronoDuration::minutes(30);
+    let canonical = format!("sha256:{}", "a".repeat(64));
+    let other = format!("sha256:{}", "b".repeat(64));
+    let invalid_digests = [
+        (Some("sha256:abc".to_owned()), None),
+        (Some(format!("sha256:{}", "A".repeat(64))), None),
+        (Some(format!("sha256:{}", "g".repeat(64))), None),
+        (Some(format!("SHA256:{}", "a".repeat(64))), None),
+        (None, Some(canonical.clone())),
+        (Some(canonical.clone()), Some(other)),
+    ];
+
+    for (index, (assessment_digest, approved_assessment_digest)) in
+        invalid_digests.into_iter().enumerate()
+    {
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(command(
+                    0,
+                    json!({
+                        "type": "defer",
+                        "session_id": Uuid::new_v4(),
+                        "move_start": move_start,
+                        "move_end": move_end,
+                        "actual_seconds": 0,
+                        "assessment_digest": assessment_digest,
+                        "approved_assessment_digest": approved_assessment_digest
+                    }),
+                )),
+                true,
+                Some(&format!("execution-invalid-assessment-digest-{index:03}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            body_json(response).await["error"]["code"],
+            "validation_failed"
+        );
+    }
+
+    let accepted_at_boundary = app
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                0,
+                json!({
+                    "type": "defer",
+                    "session_id": Uuid::new_v4(),
+                    "move_start": move_start,
+                    "move_end": move_end,
+                    "actual_seconds": 0,
+                    "assessment_digest": canonical,
+                    "approved_assessment_digest": canonical
+                }),
+            )),
+            true,
+            Some("execution-valid-assessment-digest-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted_at_boundary.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)] // Covers response compatibility and replay as one public contract.
 async fn execution_defer_is_terminal_exact_and_replayable_over_http() {
     let app = test_app();
@@ -758,8 +1071,56 @@ async fn execution_defer_is_terminal_exact_and_replayable_over_http() {
     let exact_now = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
     let move_start = exact_now + ChronoDuration::days(30) + ChronoDuration::microseconds(1);
     let move_end = move_start + ChronoDuration::hours(24);
+
+    let active_defer = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                1,
+                json!({
+                    "type": "defer",
+                    "session_id": session_id,
+                    "move_start": move_start,
+                    "move_end": move_end
+                }),
+            )),
+            true,
+            Some("execution-active-defer-rejected-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(active_defer.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(active_defer).await["error"]["code"], "conflict");
+
+    let paused = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                1,
+                json!({
+                    "type": "pause",
+                    "session_id": session_id,
+                    "duration_seconds": null,
+                    "pause_until": null,
+                    "reason": "Choose a later time"
+                }),
+            )),
+            true,
+            Some("execution-defer-pause-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(paused.status(), StatusCode::OK);
+    let paused = body_json(paused).await;
+    assert_eq!(paused["mutation"]["revision"], 2);
+    assert_eq!(paused["mutation"]["active_session"]["status"], "paused");
+
     let defer = command(
-        1,
+        2,
         json!({
             "type": "defer",
             "session_id": session_id,
@@ -781,7 +1142,7 @@ async fn execution_defer_is_terminal_exact_and_replayable_over_http() {
     assert_eq!(deferred.status(), StatusCode::OK);
     assert_eq!(deferred.headers()["idempotency-replayed"], "false");
     let deferred = body_json(deferred).await;
-    assert_eq!(deferred["mutation"]["revision"], 2);
+    assert_eq!(deferred["mutation"]["revision"], 3);
     assert!(deferred["mutation"]["active_session"].is_null());
     assert_eq!(
         deferred["mutation"]["changed_session"]["status"],
@@ -864,12 +1225,38 @@ async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
             .unwrap();
         assert_eq!(started.status(), StatusCode::OK);
 
+        let terminal_revision = if terminal_type == "deferred" {
+            let paused = app
+                .clone()
+                .oneshot(request(
+                    "POST",
+                    "/v1/execution/commands",
+                    Some(command(
+                        1,
+                        json!({
+                            "type": "pause",
+                            "session_id": first_session_id,
+                            "duration_seconds": null,
+                            "pause_until": null,
+                            "reason": null
+                        }),
+                    )),
+                    true,
+                    Some(&format!("execution-terminal-{terminal_type}-pause-001")),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(paused.status(), StatusCode::OK);
+            2
+        } else {
+            1
+        };
         let terminal = if terminal_type == "deferred" {
             let exact_now =
                 chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
             let move_start = exact_now + ChronoDuration::days(30);
             command(
-                1,
+                terminal_revision,
                 json!({
                     "type": "defer",
                     "session_id": first_session_id,
@@ -884,7 +1271,7 @@ async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
                 _ => unreachable!(),
             };
             command(
-                1,
+                terminal_revision,
                 json!({
                     "type": command_type,
                     "session_id": first_session_id,
@@ -904,6 +1291,7 @@ async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
             .await
             .unwrap();
         assert_eq!(terminal.status(), StatusCode::OK, "{terminal_type}");
+        let final_revision = terminal_revision + 1;
 
         let replacement = app
             .clone()
@@ -911,7 +1299,7 @@ async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
                 "POST",
                 "/v1/execution/commands",
                 Some(command(
-                    2,
+                    final_revision,
                     json!({
                         "type": "start",
                         "session_id": Uuid::new_v4(),
@@ -962,7 +1350,7 @@ async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
             .await
             .unwrap();
         let snapshot = body_json(snapshot).await;
-        assert_eq!(snapshot["execution"]["revision"], 2);
+        assert_eq!(snapshot["execution"]["revision"], final_revision);
         assert!(snapshot["execution"]["active_session"].is_null());
     }
 }
