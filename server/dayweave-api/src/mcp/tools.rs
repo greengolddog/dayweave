@@ -530,7 +530,7 @@ impl ProposalSubmissionPort for InMemoryProposalSubmissionPort {
             &access.subject,
             &spec,
             &consumption.proposal_evidence,
-            Utc::now(),
+            self.proposals.current_time(),
         )?;
         let proposal = self
             .proposals

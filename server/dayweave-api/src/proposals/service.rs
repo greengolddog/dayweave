@@ -64,6 +64,17 @@ impl ProposalService {
         self.clock.now() + self.default_ttl
     }
 
+    /// Returns the same authoritative instant used for proposal validation.
+    ///
+    /// In-memory adapters that prepare a proposal before persistence must not
+    /// fall back to the process wall clock between request validation and the
+    /// domain constructor. Durable adapters obtain their transaction time from
+    /// the database instead.
+    #[must_use]
+    pub(crate) fn current_time(&self) -> DateTime<Utc> {
+        self.clock.now()
+    }
+
     /// Validates and stores a proposal.
     ///
     /// # Errors
