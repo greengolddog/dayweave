@@ -11,6 +11,11 @@ import org.junit.Test
 
 class CanonicalAuthoringModelsTest {
     @Test
+    fun recoverableCanonicalTrashUsesTheAcceptedThirtyDayWindow() {
+        assertEquals(30L * 24L * 60L * 60L, CanonicalTrashRetentionPolicy.RETENTION_SECONDS)
+    }
+
+    @Test
     fun allSixKindsHaveAValidTypedInboxOrPlannedDraft() {
         val drafts = listOf(
             taskDraft(),

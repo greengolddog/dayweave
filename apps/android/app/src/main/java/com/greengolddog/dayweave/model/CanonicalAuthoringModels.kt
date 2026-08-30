@@ -807,7 +807,7 @@ internal object CanonicalTrashRetentionPolicy {
     const val MAX_ENTRIES = 500
     const val MAX_ITEM_BYTES = 256 * 1_024
     const val MAX_RETAINED_ITEM_BYTES = 4 * 1_024 * 1_024
-    const val RETENTION_SECONDS = 7L * 24L * 60L * 60L
+    const val RETENTION_SECONDS = 30L * 24L * 60L * 60L
 }
 
 internal fun canonicalTrashItemBytes(item: CanonicalItemSnapshot): Int =
@@ -816,7 +816,7 @@ internal fun canonicalTrashItemBytes(item: CanonicalItemSnapshot): Int =
         .size
 
 /**
- * Keeps restore metadata for queued restores even after the ordinary seven-day window, while
+ * Keeps restore metadata for queued restores even after the ordinary thirty-day window, while
  * stripping expired or over-budget item bodies. A tombstone revision remains useful without its
  * body and therefore does not need to grow encrypted storage without bound.
  */

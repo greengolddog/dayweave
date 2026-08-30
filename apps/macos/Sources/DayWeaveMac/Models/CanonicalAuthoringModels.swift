@@ -408,7 +408,7 @@ struct DayWeaveCanonicalTrashEntry: Codable, Equatable, Identifiable, Sendable {
 
     /// Remote clocks are not a retention authority. Persist the first local
     /// observation as the latest possible deletion timestamp so a future-dated
-    /// tombstone cannot extend the seven-day privacy window indefinitely.
+    /// tombstone cannot extend the thirty-day privacy window indefinitely.
     func clampingDeletedAt(to localObservation: Date) -> Self {
         guard deletedAt > localObservation else { return self }
         return Self(

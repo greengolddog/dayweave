@@ -8,6 +8,11 @@ import Testing
 @Suite("Canonical authoring store", .serialized)
 @MainActor
 struct CanonicalAuthoringStoreTests {
+    @Test("recoverable canonical trash follows the accepted thirty-day window")
+    func trashRetentionPolicyIsThirtyDays() {
+        #expect(PlannerStore.canonicalTrashRetentionInterval == 30 * 24 * 60 * 60)
+    }
+
     @Test("a sensitive title-only Inbox draft is encrypted and restart-safe")
     func encryptedOfflineCreateRoundTrip() throws {
         let context = try Self.makePersistence()

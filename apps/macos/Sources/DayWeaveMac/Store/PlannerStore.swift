@@ -162,7 +162,7 @@ final class PlannerStore: ObservableObject {
     static let maximumCanonicalTrashEntries = 500
     static let maximumCanonicalTrashItemBytes = 256 * 1_024
     static let maximumCanonicalTrashRetainedItemBytes = 4 * 1_024 * 1_024
-    static let canonicalTrashRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
+    static let canonicalTrashRetentionInterval: TimeInterval = 30 * 24 * 60 * 60
     @Published var destination: SidebarDestination? = .today {
         didSet { scheduleAutosave() }
     }
@@ -1737,7 +1737,7 @@ final class PlannerStore: ObservableObject {
 
     /// Trash and restore requests need only item identity, expected revision,
     /// and their stable idempotency key. A full base body improves short-term
-    /// response validation, but must not outlive the same seven-day privacy
+    /// response validation, but must not outlive the same thirty-day privacy
     /// boundary as Recently Deleted. Rebuilding with the same mutation ID
     /// preserves the exact request identity and every sync/conflict fence.
     private static func boundedCanonicalAuthoringMutations(
@@ -1777,7 +1777,7 @@ final class PlannerStore: ObservableObject {
 
     /// Recently deleted metadata is useful for recovery, but retaining every
     /// full item body forever lets ordinary deletion history exhaust the
-    /// encrypted snapshot. Keep seven days of bounded metadata and retain full
+    /// encrypted snapshot. Keep thirty days of bounded metadata and retain full
     /// bodies newest-first within a separate byte budget. Tombstone revision
     /// watermarks remain independent, so pruning can never resurrect an item.
     private static func boundedCanonicalTrash(
