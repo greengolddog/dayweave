@@ -3,6 +3,7 @@ import SwiftUI
 
 struct GoogleIntegrationSettingsView: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
+    @EnvironmentObject private var outbound: GoogleOutboundStore
     @State private var disconnectCandidate: GoogleAccount?
     @State private var resetRecoveryConfirmationPresented = false
     @State private var abandonRecoveryConfirmationPresented = false
@@ -22,6 +23,26 @@ struct GoogleIntegrationSettingsView: View {
                 .accessibilityIdentifier("google.cleanup.warning")
             }
 
+            if outbound.hasPendingRecovery {
+                VStack(alignment: .leading, spacing: 7) {
+                    Label(
+                        "Recover the encrypted Calendar publication from its Inbox item before changing Google accounts or source policies.",
+                        systemImage: "arrow.up.circle.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    if outbound.status == .expired {
+                        GoogleExpiredRecoveryDiscardButton(
+                            title: "Discard expired Calendar recovery",
+                            accessibilityIdentifier: "google.outbound.settings-discard-expired"
+                        )
+                        .controlSize(.small)
+                    }
+                }
+                .accessibilityIdentifier("google.outbound.settings-recovery")
+            }
+
             connectionActions
 
             if store.recoveryResetRequired {
@@ -29,7 +50,10 @@ struct GoogleIntegrationSettingsView: View {
                     resetRecoveryConfirmationPresented = true
                 }
                 .controlSize(.small)
-                .disabled(store.isBusy || store.credentialTransitionInProgress)
+                .disabled(
+                    store.isBusy || store.credentialTransitionInProgress
+                        || outbound.hasPendingRecovery
+                )
                 .accessibilityIdentifier("google.recovery.reset")
             }
 
@@ -38,12 +62,15 @@ struct GoogleIntegrationSettingsView: View {
                     abandonRecoveryConfirmationPresented = true
                 }
                 .controlSize(.small)
-                .disabled(store.isBusy || store.credentialTransitionInProgress)
+                .disabled(
+                    store.isBusy || store.credentialTransitionInProgress
+                        || outbound.hasPendingRecovery
+                )
                 .accessibilityIdentifier("google.recovery.abandon")
             }
 
             if store.accounts.isEmpty {
-                Text("Connect Google Calendar and Google Tasks to choose which sources DayWeave may import. This connection requests read-only provider access.")
+                Text("Connect Google Calendar and Google Tasks to choose which sources DayWeave may import. Calendar publishing can be enabled separately with an explicit Google approval.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -149,6 +176,7 @@ struct GoogleIntegrationSettingsView: View {
             .controlSize(.small)
             .disabled(
                 store.isBusy || store.credentialTransitionInProgress
+                    || outbound.hasPendingRecovery
                     || statusIsPrivacyProtected
             )
             .help("Reload connected accounts, source policies, and import status")
@@ -198,7 +226,7 @@ struct GoogleIntegrationSettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canStartConnection)
-                    .help("Requests read-only Google Calendar and Google Tasks access")
+                    .help("Requests Google Calendar and Google Tasks read access; publishing is a separate approval")
                     .accessibilityIdentifier("google.authorization.connect")
                 }
 
@@ -211,6 +239,7 @@ struct GoogleIntegrationSettingsView: View {
             .controlSize(.small)
             .disabled(
                 store.isBusy || store.credentialTransitionInProgress
+                    || outbound.hasPendingRecovery
                     || store.mutationRecoveryRequired
                     || store.disconnectRecoveryRequiresAttention
                     || store.refreshCompletionRecoveryResetRequired
@@ -283,6 +312,7 @@ struct GoogleIntegrationSettingsView: View {
     private var canStartConnection: Bool {
         guard !store.isBusy,
               !store.credentialTransitionInProgress,
+              !outbound.hasPendingRecovery,
               !store.hasPendingRecovery,
               !store.authorizationStartIsFenced,
               !store.canOpenAuthorization,
@@ -343,6 +373,7 @@ struct GoogleIntegrationSettingsView: View {
 
 private struct GoogleAccountSettingsCard: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
+    @EnvironmentObject private var outbound: GoogleOutboundStore
     @State private var sourcesAreExpanded = false
 
     let account: GoogleAccount
@@ -430,6 +461,15 @@ private struct GoogleAccountSettingsCard: View {
                 }
                 .accessibilityIdentifier("google.account.\(ordinal).disconnect-retry")
             } else {
+                if store.canEnableCalendarPublishing(for: account) {
+                    Button("Enable Calendar publishing") {
+                        Task { await store.enableCalendarPublishing(for: account) }
+                    }
+                    .accessibilityIdentifier(
+                        "google.account.\(ordinal).enable-calendar-publishing"
+                    )
+                }
+
                 if canReauthorize
                     && (!pendingRefreshRecovery
                         || store.requiresReauthorization(for: account)) {
@@ -464,6 +504,7 @@ private struct GoogleAccountSettingsCard: View {
         .controlSize(.small)
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
+                || outbound.hasPendingRecovery
                 || store.mutationRecoveryRequired || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryResetRequired
                 || store.refreshCompletionRecoveryResetRequired
@@ -508,6 +549,7 @@ private struct GoogleAccountSettingsCard: View {
         .controlSize(.small)
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
+                || outbound.hasPendingRecovery
                 || store.mutationRecoveryRequired || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryRequiresAttention
                 || store.refreshCompletionRecoveryResetRequired
@@ -574,7 +616,9 @@ private struct GoogleAccountSettingsCard: View {
     private var accountDetail: String {
         switch account.status {
         case .active:
-            "Read-only Calendar and Tasks imports are enabled for the selected sources."
+            store.hasCalendarPublishingScope(for: account)
+                ? "Calendar publishing is authorized; only calendars explicitly marked Publish can receive reviewed DayWeave events. Tasks remain read-only."
+                : "Calendar and Tasks imports are enabled for selected sources. Calendar publishing needs a separate approval."
         case .paused:
             "Imports are paused. Existing DayWeave data remains available."
         case .reauthorizationRequired:
@@ -604,6 +648,7 @@ private struct GoogleAccountSettingsCard: View {
 
 private struct GoogleSourceSettingsRow: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
+    @EnvironmentObject private var outbound: GoogleOutboundStore
 
     let collection: GoogleSyncCollection
     let accountOrdinal: Int
@@ -630,7 +675,7 @@ private struct GoogleSourceSettingsRow: View {
 
             if requiresReadOnlyDowngrade {
                 Label(
-                    "This source has a server-side write policy. This macOS build will not preserve or exercise that authority.",
+                    "This source has a publishing policy that is no longer supported by its current Google grant or provider role.",
                     systemImage: "exclamationmark.shield"
                 )
                 .font(.caption2)
@@ -664,11 +709,34 @@ private struct GoogleSourceSettingsRow: View {
                     Picker("Scheduling", selection: roleBinding) {
                         Text("Reference").tag(GoogleSyncRole.readOnly)
                         Text("Blocks time").tag(GoogleSyncRole.blocking)
+                        if canPublishToCollection {
+                            Text("Publish").tag(GoogleSyncRole.writable)
+                        }
                     }
                     .pickerStyle(.segmented)
                     .controlSize(.small)
                     .accessibilityIdentifier(sourceIdentifier("role"))
-                    .help("Reference sources are visible context; blocking calendars reserve busy time")
+                    .help("Reference sources are context, blocking calendars reserve time, and Publish calendars may receive explicitly reviewed DayWeave events")
+
+                    if collection.syncRole == .writable {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Optional event types")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 12) {
+                                Toggle("All-day", isOn: publishAllDayBinding)
+                                Toggle("Tentative", isOn: publishTentativeBinding)
+                                Toggle("Free", isOn: publishFreeBinding)
+                            }
+                            .toggleStyle(.checkbox)
+                            .controlSize(.small)
+                            Text("Confirmed busy timed events are allowed by default. Every external change still requires a separate preview and approval.")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .accessibilityIdentifier(sourceIdentifier("publication-policy"))
+                    }
                 } else {
                     LabeledContent("Scheduling", value: "Reference only")
                         .font(.caption)
@@ -692,6 +760,7 @@ private struct GoogleSourceSettingsRow: View {
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 9))
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
+                || outbound.hasPendingRecovery
                 || store.mutationRecoveryRequired
                 || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryRequiresAttention
@@ -711,7 +780,7 @@ private struct GoogleSourceSettingsRow: View {
                         collection,
                         selected: selected,
                         visible: collection.visible,
-                        role: collection.syncRole
+                        role: selected ? collection.syncRole : .readOnly
                     )
                 }
             }
@@ -741,7 +810,7 @@ private struct GoogleSourceSettingsRow: View {
                 Task {
                     await store.configureSource(
                         collection,
-                        selected: collection.selected,
+                        selected: role == .writable ? true : collection.selected,
                         visible: collection.visible,
                         role: role
                     )
@@ -751,7 +820,64 @@ private struct GoogleSourceSettingsRow: View {
     }
 
     private var requiresReadOnlyDowngrade: Bool {
-        collection.syncRole == .writable || !collection.calendarPolicy.isReadOnlySafe
+        (collection.syncRole == .writable && !canPublishToCollection)
+            || (collection.syncRole != .writable && !collection.calendarPolicy.isReadOnlySafe)
+            || (collection.kind == .taskList && collection.syncRole != .readOnly)
+    }
+
+    private var canPublishToCollection: Bool {
+        guard collection.kind == .calendar,
+              !collection.providerDeleted,
+              let account = store.accounts.first(where: { $0.id == collection.accountID }),
+              store.hasCalendarPublishingScope(for: account),
+              let access = collection.providerAccessRole?.lowercased() else {
+            return false
+        }
+        return access == "owner" || access == "writer"
+    }
+
+    private var publishAllDayBinding: Binding<Bool> {
+        publicationBinding(\.publishAllDay)
+    }
+
+    private var publishTentativeBinding: Binding<Bool> {
+        publicationBinding(\.publishTentative)
+    }
+
+    private var publishFreeBinding: Binding<Bool> {
+        publicationBinding(\.publishFree)
+    }
+
+    private func publicationBinding(
+        _ keyPath: KeyPath<GoogleCalendarPolicy, Bool>
+    ) -> Binding<Bool> {
+        Binding(
+            get: { collection.calendarPolicy[keyPath: keyPath] },
+            set: { value in
+                let current = collection.calendarPolicy
+                let policy = GoogleCalendarPolicy(
+                    confirmedBusy: current.confirmedBusy,
+                    tentative: current.tentative,
+                    free: current.free,
+                    allDay: current.allDay,
+                    publishAllDay: keyPath == \.publishAllDay
+                        ? value : current.publishAllDay,
+                    publishTentative: keyPath == \.publishTentative
+                        ? value : current.publishTentative,
+                    publishFree: keyPath == \.publishFree
+                        ? value : current.publishFree
+                )
+                Task {
+                    await store.configureSource(
+                        collection,
+                        selected: true,
+                        visible: collection.visible,
+                        role: .writable,
+                        calendarPolicy: policy
+                    )
+                }
+            }
+        )
     }
 
     private var kindTitle: String {
@@ -810,6 +936,11 @@ private struct GoogleSyncSummaryView: View {
                     GoogleSyncMetric(title: "Removed", value: run.deletedCount)
                     GoogleSyncMetric(title: "Conflicts", value: run.conflictCount)
                     GoogleSyncMetric(title: "Rejected", value: run.rejectedCount)
+                    GoogleSyncMetric(title: "Publishing", value: sync.pendingOutbound)
+                    GoogleSyncMetric(
+                        title: "Publish issues",
+                        value: outboundIssueCount
+                    )
                 }
 
                 if run.state == .backoff {
@@ -836,11 +967,50 @@ private struct GoogleSyncSummaryView: View {
                 .foregroundStyle(.orange)
                 .accessibilityIdentifier("google.account.\(accountOrdinal).sync.conflicts")
             }
+
+            if sync.pendingOutbound > 0 {
+                Label(
+                    "\(sync.pendingOutbound) reviewed Calendar change\(sync.pendingOutbound == 1 ? " is" : "s are") queued for delivery.",
+                    systemImage: "arrow.up.circle"
+                )
+                .font(.caption2)
+                .foregroundStyle(.blue)
+                .accessibilityIdentifier(
+                    "google.account.\(accountOrdinal).sync.outbound-pending"
+                )
+            }
+
+            if outboundIssueCount > 0 {
+                Label(
+                    "\(outboundIssueCount) Calendar publication\(outboundIssueCount == 1 ? " needs" : "s need") review. Provider details remain hidden.",
+                    systemImage: "exclamationmark.arrow.triangle.2.circlepath"
+                )
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .accessibilityIdentifier(
+                    "google.account.\(accountOrdinal).sync.outbound-issues"
+                )
+            } else if let nextAttempt = sync.nextOutboundAttemptAt,
+                      sync.pendingOutbound > 0 {
+                Label(
+                    "Next safe Calendar delivery attempt \(nextAttempt.formatted(date: .abbreviated, time: .shortened)).",
+                    systemImage: "clock.arrow.circlepath"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
         }
         .padding(9)
         .background(.quaternary.opacity(0.32), in: RoundedRectangle(cornerRadius: 9))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("google.account.\(accountOrdinal).sync")
+    }
+
+    private var outboundIssueCount: UInt64 {
+        let (sum, overflow) = sync.conflictedOutbound.addingReportingOverflow(
+            sync.failedOutbound
+        )
+        return overflow ? .max : sum
     }
 
     private func stateTitle(_ state: GoogleSyncRunState) -> String {

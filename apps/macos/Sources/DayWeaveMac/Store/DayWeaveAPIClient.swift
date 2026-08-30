@@ -619,7 +619,7 @@ enum DayWeaveDiagnosticSanitizer {
             with: "Bearer [redacted]"
         )
         value = replacingPattern(
-            #"\bdw_(?:en1|da1|dr1|mc1)_[A-Za-z0-9_-]{20,}\b"#,
+            #"\bdw_(?:en1|da1|dr1|mc1|ga1)_[A-Za-z0-9_-]{20,}\b"#,
             in: value,
             with: "[redacted]"
         )
@@ -659,6 +659,26 @@ enum DayWeaveDiagnosticSanitizer {
             withTemplate: replacement
         )
     }
+}
+
+protocol GoogleOutboundTransport: Sendable {
+    var configurationIdentifier: String { get }
+
+    func previewGoogleOutbound(
+        accountID: UUID,
+        request: GoogleOutboundPreviewRequest
+    ) async throws -> GoogleOutboundPreview
+
+    func approveGoogleOutbound(
+        accountID: UUID,
+        previewID: UUID,
+        expectedPreviewHash: String
+    ) async throws -> GoogleOutboundApproval
+
+    func enqueueGoogleOutbound(
+        accountID: UUID,
+        request: GoogleOutboundEnqueueRequest
+    ) async throws -> GoogleOutboundAccepted
 }
 
 struct DayWeaveAPIClient: Sendable {
@@ -763,18 +783,21 @@ struct DayWeaveAPIClient: Sendable {
     private let bearerToken: String?
     private let authCoordinator: DurableAuthCoordinator?
     private let expectedBindingIdentifier: String
+    private let now: @Sendable () -> Date
 
     let configurationIdentifier: String
 
     init(
         baseURL: DayWeaveAPIBaseURL,
         session: URLSession = makeDayWeaveEphemeralSession(),
-        bearerToken: String?
+        bearerToken: String?,
+        now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.baseURL = baseURL
         self.session = session
         self.bearerToken = bearerToken
         authCoordinator = nil
+        self.now = now
         let binding = Self.staticBindingIdentifier(token: bearerToken)
         expectedBindingIdentifier = binding
         configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
@@ -783,14 +806,35 @@ struct DayWeaveAPIClient: Sendable {
     init(
         baseURL: DayWeaveAPIBaseURL,
         session: URLSession = makeDayWeaveEphemeralSession(),
-        authCoordinator: DurableAuthCoordinator
+        authCoordinator: DurableAuthCoordinator,
+        now: @escaping @Sendable () -> Date = Date.init
     ) {
         self.baseURL = baseURL
         self.session = session
         bearerToken = nil
         self.authCoordinator = authCoordinator
+        self.now = now
         let binding = (try? authCoordinator.bindingIdentifier(boundTo: baseURL))
             ?? "device-v1-unavailable:\(baseURL.canonicalConfigurationIdentifier)"
+        expectedBindingIdentifier = binding
+        configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
+    }
+
+    /// Outbound authority must prove a durable device binding before its caller
+    /// persists intent. Unlike the general client initializer, this never
+    /// manufactures an unavailable fallback identifier.
+    init(
+        baseURL: DayWeaveAPIBaseURL,
+        session: URLSession = makeDayWeaveEphemeralSession(),
+        durableAuthCoordinator authCoordinator: DurableAuthCoordinator,
+        now: @escaping @Sendable () -> Date = Date.init
+    ) throws {
+        self.baseURL = baseURL
+        self.session = session
+        bearerToken = nil
+        self.authCoordinator = authCoordinator
+        self.now = now
+        let binding = try authCoordinator.durableBindingIdentifier(boundTo: baseURL)
         expectedBindingIdentifier = binding
         configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
     }
@@ -948,10 +992,15 @@ struct DayWeaveAPIClient: Sendable {
     ) async throws -> GoogleSyncCollection {
         try validateGoogleIdentity(accountID)
         try validateGoogleIdentity(collectionID)
+        let publicationPolicyIsValid = switch role {
+        case .readOnly, .blocking:
+            calendarPolicy.isReadOnlySafe
+        case .writable:
+            true
+        }
         guard expectedRevision > 0,
               expectedRevision < UInt64(Int64.max),
-              role != .writable,
-              calendarPolicy.isReadOnlySafe else {
+              publicationPolicyIsValid else {
             throw DayWeaveAPIError.requestEncodingFailed
         }
         let snapshot: GoogleCollectionSnapshot = try await send(
@@ -977,7 +1026,7 @@ struct DayWeaveAPIClient: Sendable {
               collection.visible == visible,
               collection.syncRole == role,
               collection.calendarPolicy == calendarPolicy,
-              role != .blocking || collection.kind == .calendar else {
+              role == .readOnly || collection.kind == .calendar else {
             throw DayWeaveAPIError.responseDecodingFailed
         }
         return collection
@@ -1015,6 +1064,86 @@ struct DayWeaveAPIClient: Sendable {
             throw DayWeaveAPIError.responseDecodingFailed
         }
         return snapshot.refresh
+    }
+
+    func previewGoogleOutbound(
+        accountID: UUID,
+        request: GoogleOutboundPreviewRequest
+    ) async throws -> GoogleOutboundPreview {
+        try validateGoogleIdentity(accountID)
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let snapshot: GoogleOutboundPreviewSnapshot = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + ["outbound", "previews"],
+            body: try encode(request),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        let preview = snapshot.preview
+        let remaining = preview.expiresAt.timeIntervalSince(now())
+        guard preview.accountID == accountID,
+              preview.collectionID == request.collectionID,
+              preview.itemID == request.itemID,
+              preview.itemRevision == request.expectedItemRevision,
+              preview.operation == request.operation,
+              remaining >= -GoogleOutboundRecoveryJournal.maximumClockSkew,
+              remaining <= GoogleOutboundRecoveryJournal.maximumIntentLifetime else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return preview
+    }
+
+    func approveGoogleOutbound(
+        accountID: UUID,
+        previewID: UUID,
+        expectedPreviewHash: String
+    ) async throws -> GoogleOutboundApproval {
+        try validateGoogleIdentity(accountID)
+        try validateGoogleIdentity(previewID)
+        let request = GoogleOutboundApprovalRequest(
+            expectedPreviewHash: expectedPreviewHash
+        )
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let snapshot: GoogleOutboundApprovalSnapshot = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + [
+                "outbound", "previews", previewID.uuidString.lowercased(), "approve",
+            ],
+            body: try encode(request),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        let approval = snapshot.approval
+        let remaining = approval.expiresAt.timeIntervalSince(now())
+        guard approval.previewID == previewID,
+              remaining >= -GoogleOutboundRecoveryJournal.maximumClockSkew,
+              remaining <= GoogleOutboundRecoveryJournal.maximumIntentLifetime else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return approval
+    }
+
+    func enqueueGoogleOutbound(
+        accountID: UUID,
+        request: GoogleOutboundEnqueueRequest
+    ) async throws -> GoogleOutboundAccepted {
+        try validateGoogleIdentity(accountID)
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let snapshot: GoogleOutboundAcceptedSnapshot = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + ["outbound"],
+            body: try encode(request),
+            requiredStatusCode: 202,
+            requiresDurableAuthorization: true,
+            additionalSecretsToRedact: [request.approvalCapability]
+        )
+        return snapshot.outbound
     }
 
     private func googleAccountPath(_ accountID: UUID) -> [String] {
@@ -1703,7 +1832,8 @@ struct DayWeaveAPIClient: Sendable {
         headers: [String: String] = [:],
         body: Data? = nil,
         requiredStatusCode: Int? = nil,
-        requiresDurableAuthorization: Bool = false
+        requiresDurableAuthorization: Bool = false,
+        additionalSecretsToRedact: [String] = []
     ) async throws -> Response {
         if let body, body.count > Self.maximumRequestBytes {
             throw DayWeaveAPIError.requestEncodingFailed
@@ -1757,7 +1887,7 @@ struct DayWeaveAPIClient: Sendable {
             throw DayWeaveAPIError.durableAuthentication(.enrollmentRequired)
         }
 
-        var tokensToRedact = [initialAuthorization.bearerToken]
+        var tokensToRedact = additionalSecretsToRedact + [initialAuthorization.bearerToken]
         var replayedAuthorization: DurableAuthorization?
         var result = try await perform(
             pristineRequest,
@@ -1884,7 +2014,13 @@ struct DayWeaveAPIClient: Sendable {
         }
 
         do {
+            if pathComponents.contains("outbound"),
+               !StrictJSONObjectKeyScanner.hasUniqueKeys(in: data) {
+                throw DayWeaveAPIError.responseDecodingFailed
+            }
             return try makeDecoder().decode(Response.self, from: data)
+        } catch let error as DayWeaveAPIError {
+            throw error
         } catch {
             throw DayWeaveAPIError.responseDecodingFailed
         }
@@ -2304,6 +2440,8 @@ struct DayWeaveAPIClient: Sendable {
         "\(baseURL.canonicalConfigurationIdentifier)|auth=\(binding)"
     }
 }
+
+extension DayWeaveAPIClient: GoogleOutboundTransport {}
 
 /// Foundation's JSON object decoders collapse duplicate member names before a
 /// keyed container can inspect them. Destructive trust promotion therefore

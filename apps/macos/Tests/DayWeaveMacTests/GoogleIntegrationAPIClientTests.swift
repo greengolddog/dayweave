@@ -64,6 +64,61 @@ struct GoogleIntegrationAPIClientTests {
         }
     }
 
+    @Test("OAuth permits only the bounded Calendar write-scope upgrade")
+    func oauthCalendarWriteUpgradeUsesExactServiceShape() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 201, body: Self.authorizationEnvelope())
+        )
+        let client = makeClient()
+
+        _ = try await client.startGoogleOAuth(
+            .init(services: [.calendar], forceConsent: true, accountID: Self.accountID),
+            idempotencyKey: "google.calendar-upgrade_01"
+        )
+
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
+        #expect(request.url.path == "/gateway/v1/integrations/google/oauth/start")
+        #expect(request.jsonBody?["services"] as? [String] == ["calendar"])
+        #expect(request.jsonBody?["account_id"] as? String == Self.accountID.uuidString)
+
+        for services: [GoogleService] in [
+            [.calendarReadOnly], [.tasks], [.calendar, .tasks], [.calendar, .calendar],
+        ] {
+            do {
+                _ = try await client.startGoogleOAuth(
+                    .init(services: services),
+                    idempotencyKey: "google.calendar-upgrade_02"
+                )
+                Issue.record("An unsupported Google scope combination was accepted")
+            } catch let error as DayWeaveAPIError {
+                #expect(error == .requestEncodingFailed)
+            }
+        }
+        for request in [
+            GoogleOAuthStartRequest(services: [.calendar]),
+            GoogleOAuthStartRequest(services: [.calendar], accountID: Self.accountID),
+            GoogleOAuthStartRequest(services: [.calendar], forceConsent: true),
+            GoogleOAuthStartRequest(
+                services: [.calendar],
+                forceConsent: true,
+                accountID: Self.accountID,
+                connectNew: true
+            ),
+        ] {
+            do {
+                _ = try await client.startGoogleOAuth(
+                    request,
+                    idempotencyKey: "google.calendar-upgrade_03"
+                )
+                Issue.record("A Calendar scope request without an explicit existing-account upgrade was accepted")
+            } catch let error as DayWeaveAPIError {
+                #expect(error == .requestEncodingFailed)
+            }
+        }
+        #expect(URLProtocolStub.storage.requests(for: Self.apiToken).count == 1)
+    }
+
     @Test("account lifecycle binds identity, revision, status, and retry headers")
     func accountLifecycleUsesRevisionGuardedEndpoints() async throws {
         URLProtocolStub.storage.enqueue(
@@ -315,6 +370,333 @@ struct GoogleIntegrationAPIClientTests {
         #expect(encodedPolicy["publish_free"] as? Bool == false)
     }
 
+    @Test("outbound preview, approval, and enqueue use exact bound contracts")
+    func outboundFlowUsesExactContracts() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Self.outboundPreviewEnvelope()),
+            .init(statusCode: 200, body: Self.outboundApprovalEnvelope()),
+            .init(statusCode: 202, body: Self.outboundAcceptedEnvelope())
+        )
+        let client = makeClient()
+        let previewRequest = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert
+        )
+
+        let preview = try await client.previewGoogleOutbound(
+            accountID: Self.accountID,
+            request: previewRequest
+        )
+        let approval = try await client.approveGoogleOutbound(
+            accountID: Self.accountID,
+            previewID: preview.id,
+            expectedPreviewHash: preview.previewHash
+        )
+        let accepted = try await client.enqueueGoogleOutbound(
+            accountID: Self.accountID,
+            request: .init(
+                collectionID: Self.collectionID,
+                itemID: Self.itemID,
+                expectedItemRevision: 9,
+                operation: .upsert,
+                approvalCapability: approval.approvalCapability
+            )
+        )
+
+        #expect(preview.accountID == Self.accountID)
+        #expect(preview.collectionID == Self.collectionID)
+        #expect(preview.itemID == Self.itemID)
+        #expect(preview.itemRevision == 9)
+        #expect(preview.entityKind == .calendarEvent)
+        #expect(preview.operation == .upsert)
+        #expect(preview.providerResourceID == nil)
+        #expect(preview.providerETag == nil)
+        #expect(preview.providerPayload["summary"] == .string("Private planning canary"))
+        #expect(approval.previewID == Self.previewID)
+        #expect(accepted.outboxID == Self.outboxID)
+        #expect(accepted.replayed == false)
+
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        let accountPath = "/gateway/v1/integrations/google/accounts/\(Self.accountID.uuidString.lowercased())"
+        #expect(requests.map(\.method) == ["POST", "POST", "POST"])
+        #expect(requests[0].url.path == accountPath + "/outbound/previews")
+        #expect(requests[1].url.path == accountPath + "/outbound/previews/\(Self.previewID.uuidString.lowercased())/approve")
+        #expect(requests[2].url.path == accountPath + "/outbound")
+        let previewBody = try #require(requests[0].jsonBody)
+        #expect(Set(previewBody.keys) == Set([
+            "collection_id", "item_id", "expected_item_revision", "operation",
+        ]))
+        #expect(previewBody["collection_id"] as? String == Self.collectionID.uuidString)
+        #expect(previewBody["item_id"] as? String == Self.itemID.uuidString)
+        #expect((previewBody["expected_item_revision"] as? NSNumber)?.uint64Value == 9)
+        #expect(previewBody["operation"] as? String == "upsert")
+        let approvalBody = try #require(requests[1].jsonBody)
+        #expect(Set(approvalBody.keys) == ["expected_preview_hash"])
+        #expect(approvalBody["expected_preview_hash"] as? String == Self.previewHash)
+        let enqueueBody = try #require(requests[2].jsonBody)
+        #expect(Set(enqueueBody.keys) == Set([
+            "collection_id", "item_id", "expected_item_revision", "operation",
+            "approval_capability",
+        ]))
+        #expect(enqueueBody["approval_capability"] as? String == Self.approvalCapability)
+    }
+
+    @Test("outbound expiry validation tolerates the supported device clock skew")
+    func outboundExpiryBoundsTolerateClockSkew() async throws {
+        let reference = Date(timeIntervalSince1970: 1_788_076_800)
+        let acceptedOffsets: [TimeInterval] = [-5 * 60, 30 * 60, 35 * 60]
+        let rejectedOffsets: [TimeInterval] = [-(5 * 60) - 1, (35 * 60) + 1]
+        for offset in acceptedOffsets + rejectedOffsets {
+            URLProtocolStub.storage.enqueue(
+                key: Self.apiToken,
+                .init(
+                    statusCode: 200,
+                    body: Self.outboundPreviewEnvelope(
+                        expiry: reference.addingTimeInterval(offset)
+                    )
+                )
+            )
+        }
+        for offset in acceptedOffsets + rejectedOffsets {
+            URLProtocolStub.storage.enqueue(
+                key: Self.apiToken,
+                .init(
+                    statusCode: 200,
+                    body: Self.outboundApprovalEnvelope(
+                        expiry: reference.addingTimeInterval(offset)
+                    )
+                )
+            )
+        }
+        let client = makeClient(now: { reference })
+        let request = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert
+        )
+
+        for _ in acceptedOffsets {
+            _ = try await client.previewGoogleOutbound(
+                accountID: Self.accountID,
+                request: request
+            )
+        }
+        for _ in rejectedOffsets {
+            await expectResponseDecodingFailure {
+                _ = try await client.previewGoogleOutbound(
+                    accountID: Self.accountID,
+                    request: request
+                )
+            }
+        }
+        for _ in acceptedOffsets {
+            _ = try await client.approveGoogleOutbound(
+                accountID: Self.accountID,
+                previewID: Self.previewID,
+                expectedPreviewHash: Self.previewHash
+            )
+        }
+        for _ in rejectedOffsets {
+            await expectResponseDecodingFailure {
+                _ = try await client.approveGoogleOutbound(
+                    accountID: Self.accountID,
+                    previewID: Self.previewID,
+                    expectedPreviewHash: Self.previewHash
+                )
+            }
+        }
+    }
+
+    @Test("outbound methods require exact statuses and strict response wrappers")
+    func outboundResponsesFailClosed() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 201, body: Self.outboundPreviewEnvelope()),
+            .init(statusCode: 201, body: Self.outboundApprovalEnvelope()),
+            .init(statusCode: 200, body: Self.outboundAcceptedEnvelope()),
+            .init(statusCode: 200, body: Self.outboundPreviewEnvelope(extraEnvelopeField: true)),
+            .init(statusCode: 200, body: Self.outboundPreviewEnvelope(extraPreviewField: true)),
+            .init(statusCode: 200, body: Self.outboundApprovalEnvelope(extraApprovalField: true)),
+            .init(statusCode: 202, body: Self.outboundAcceptedEnvelope(extraOutboundField: true))
+        )
+        let client = makeClient()
+        let previewRequest = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert
+        )
+        let enqueueRequest = GoogleOutboundEnqueueRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert,
+            approvalCapability: Self.approvalCapability
+        )
+
+        do {
+            _ = try await client.previewGoogleOutbound(
+                accountID: Self.accountID,
+                request: previewRequest
+            )
+            Issue.record("Preview accepted HTTP 201")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .server(statusCode: 201, code: nil, message: nil, requestID: nil))
+        }
+        do {
+            _ = try await client.approveGoogleOutbound(
+                accountID: Self.accountID,
+                previewID: Self.previewID,
+                expectedPreviewHash: Self.previewHash
+            )
+            Issue.record("Approval accepted HTTP 201")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .server(statusCode: 201, code: nil, message: nil, requestID: nil))
+        }
+        do {
+            _ = try await client.enqueueGoogleOutbound(
+                accountID: Self.accountID,
+                request: enqueueRequest
+            )
+            Issue.record("Enqueue accepted HTTP 200")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .server(statusCode: 200, code: nil, message: nil, requestID: nil))
+        }
+
+        for operation in 0..<4 {
+            do {
+                switch operation {
+                case 0, 1:
+                    _ = try await client.previewGoogleOutbound(
+                        accountID: Self.accountID,
+                        request: previewRequest
+                    )
+                case 2:
+                    _ = try await client.approveGoogleOutbound(
+                        accountID: Self.accountID,
+                        previewID: Self.previewID,
+                        expectedPreviewHash: Self.previewHash
+                    )
+                default:
+                    _ = try await client.enqueueGoogleOutbound(
+                        accountID: Self.accountID,
+                        request: enqueueRequest
+                    )
+                }
+                Issue.record("Unknown outbound response field was accepted")
+            } catch let error as DayWeaveAPIError {
+                #expect(error == .responseDecodingFailed)
+            }
+        }
+    }
+
+    @Test("outbound success rejects nested duplicate keys and oversized provider payloads")
+    func outboundSuccessResourceGuards() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Self.outboundPreviewWithDuplicatePayloadKey()),
+            .init(statusCode: 200, body: Self.outboundApprovalWithDuplicateKey()),
+            .init(statusCode: 202, body: Self.outboundAcceptedWithDuplicateKey()),
+            .init(statusCode: 200, body: try Self.oversizedOutboundPreviewEnvelope())
+        )
+        let client = makeClient()
+        let previewRequest = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert
+        )
+        let enqueueRequest = GoogleOutboundEnqueueRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert,
+            approvalCapability: Self.approvalCapability
+        )
+
+        for operation in 0..<4 {
+            do {
+                switch operation {
+                case 0, 3:
+                    _ = try await client.previewGoogleOutbound(
+                        accountID: Self.accountID,
+                        request: previewRequest
+                    )
+                case 1:
+                    _ = try await client.approveGoogleOutbound(
+                        accountID: Self.accountID,
+                        previewID: Self.previewID,
+                        expectedPreviewHash: Self.previewHash
+                    )
+                default:
+                    _ = try await client.enqueueGoogleOutbound(
+                        accountID: Self.accountID,
+                        request: enqueueRequest
+                    )
+                }
+                Issue.record("Unsafe outbound success response was accepted")
+            } catch let error as DayWeaveAPIError {
+                #expect(error == .responseDecodingFailed)
+            }
+        }
+    }
+
+    @Test("outbound capabilities never enter diagnostics or server errors")
+    func outboundCapabilityDiagnosticsAreSecretSafe() async throws {
+        let capability = Self.approvalCapability
+        let errorBody = Data(
+            "{\"error\":{\"code\":\"conflict\",\"message\":\"capability \(capability) rejected\"}}".utf8
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 409, body: errorBody)
+        )
+        let client = makeClient()
+        let request = GoogleOutboundEnqueueRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .delete,
+            approvalCapability: capability
+        )
+        let approval = GoogleOutboundApproval(
+            previewID: Self.previewID,
+            approvalCapability: capability,
+            expiresAt: Date().addingTimeInterval(10 * 60)
+        )
+
+        for diagnostics in [
+            String(describing: request), String(reflecting: request), Self.reflectedChildren(request),
+            String(describing: approval), String(reflecting: approval),
+            Self.reflectedChildren(approval),
+        ] {
+            #expect(!diagnostics.contains(capability))
+        }
+
+        do {
+            _ = try await client.enqueueGoogleOutbound(
+                accountID: Self.accountID,
+                request: request
+            )
+            Issue.record("Outbound error response unexpectedly succeeded")
+        } catch let error as DayWeaveAPIError {
+            let diagnostics = [
+                String(describing: error), String(reflecting: error),
+                Self.reflectedChildren(error),
+            ].joined(separator: " ")
+            #expect(!diagnostics.contains(capability))
+            guard case let .server(_, _, message, _) = error else {
+                Issue.record("Expected a typed server error")
+                return
+            }
+            #expect(message == "capability [redacted] rejected")
+        }
+    }
+
     @Test("read-only and idempotency gates fail before transport")
     func unsafeRequestsFailLocally() async throws {
         let client = makeClient()
@@ -332,6 +714,8 @@ struct GoogleIntegrationAPIClientTests {
         }
         for request in [
             GoogleOAuthStartRequest(services: [.calendarReadOnly]),
+            GoogleOAuthStartRequest(services: [.tasks]),
+            GoogleOAuthStartRequest(services: [.calendar, .tasks]),
             GoogleOAuthStartRequest(loginHint: ""),
             GoogleOAuthStartRequest(accountID: Self.accountID, connectNew: true),
         ] {
@@ -362,24 +746,49 @@ struct GoogleIntegrationAPIClientTests {
                 expectedRevision: 3,
                 selected: true,
                 visible: true,
-                role: .writable,
-                calendarPolicy: .init()
-            )
-            Issue.record("Writable collection role was accepted")
-        } catch let error as DayWeaveAPIError {
-            #expect(error == .requestEncodingFailed)
-        }
-        do {
-            _ = try await client.configureGoogleCollection(
-                accountID: Self.accountID,
-                collectionID: Self.collectionID,
-                expectedRevision: 3,
-                selected: true,
-                visible: true,
                 role: .readOnly,
                 calendarPolicy: .init(publishAllDay: true)
             )
             Issue.record("Outbound publication policy was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .requestEncodingFailed)
+        }
+        do {
+            _ = try await client.previewGoogleOutbound(
+                accountID: Self.accountID,
+                request: .init(
+                    collectionID: Self.collectionID,
+                    itemID: Self.itemID,
+                    expectedItemRevision: 0,
+                    operation: .upsert
+                )
+            )
+            Issue.record("Zero outbound item revision was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .requestEncodingFailed)
+        }
+        do {
+            _ = try await client.approveGoogleOutbound(
+                accountID: Self.accountID,
+                previewID: Self.previewID,
+                expectedPreviewHash: String(repeating: "A", count: 64)
+            )
+            Issue.record("Non-canonical outbound preview hash was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .requestEncodingFailed)
+        }
+        do {
+            _ = try await client.enqueueGoogleOutbound(
+                accountID: Self.accountID,
+                request: .init(
+                    collectionID: Self.collectionID,
+                    itemID: Self.itemID,
+                    expectedItemRevision: 9,
+                    operation: .upsert,
+                    approvalCapability: "true"
+                )
+            )
+            Issue.record("Invalid outbound approval capability was accepted")
         } catch let error as DayWeaveAPIError {
             #expect(error == .requestEncodingFailed)
         }
@@ -424,6 +833,35 @@ struct GoogleIntegrationAPIClientTests {
             Issue.record("A legacy coordinator bearer reached a Google endpoint")
         } catch let error as DayWeaveAPIError {
             #expect(error == .durableAuthentication(.enrollmentRequired))
+        }
+
+        do {
+            _ = try DayWeaveAPIClient(
+                baseURL: baseURL,
+                session: URLProtocolStub.makeSession(),
+                durableAuthCoordinator: legacyCoordinator
+            )
+            Issue.record("Outbound client accepted a legacy credential before journal creation")
+        } catch let error as DurableAuthError {
+            #expect(error == .enrollmentRequired)
+        }
+
+        let unreadableCoordinator = DurableAuthCoordinator(
+            stateStore: GoogleAPITestDurableAuthStateStore(
+                initial: nil,
+                loadFailure: true
+            ),
+            legacyStore: GoogleAPITestBearerTokenStore()
+        )
+        do {
+            _ = try DayWeaveAPIClient(
+                baseURL: baseURL,
+                session: URLProtocolStub.makeSession(),
+                durableAuthCoordinator: unreadableCoordinator
+            )
+            Issue.record("Outbound client manufactured a binding after a Keychain read failure")
+        } catch let error as DurableAuthError {
+            #expect(error == .localStateUnavailable)
         }
 
         #expect(URLProtocolStub.storage.requests(for: Self.apiToken).isEmpty)
@@ -508,7 +946,7 @@ struct GoogleIntegrationAPIClientTests {
         }
     }
 
-    @Test("task lists reject blocking while existing writable inventory remains representable")
+    @Test("writable configuration is Calendar-only while writable inventory remains representable")
     func collectionRoleResponsesFailClosed() async throws {
         URLProtocolStub.storage.enqueue(
             key: Self.apiToken,
@@ -520,6 +958,27 @@ struct GoogleIntegrationAPIClientTests {
                     visible: true,
                     role: "blocking",
                     kind: "task_list"
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Self.collectionEnvelope(
+                    revision: 4,
+                    selected: true,
+                    visible: true,
+                    role: "writable",
+                    publicationEnabled: true
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Self.collectionEnvelope(
+                    revision: 4,
+                    selected: true,
+                    visible: true,
+                    role: "writable",
+                    kind: "task_list",
+                    publicationEnabled: true
                 )
             ),
             .init(
@@ -542,11 +1001,44 @@ struct GoogleIntegrationAPIClientTests {
         } catch let error as DayWeaveAPIError {
             #expect(error == .responseDecodingFailed)
         }
+        let publicationPolicy = GoogleCalendarPolicy(
+            publishAllDay: true,
+            publishTentative: true,
+            publishFree: true
+        )
+        let writableCalendar = try await client.configureGoogleCollection(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            expectedRevision: 3,
+            selected: true,
+            visible: true,
+            role: .writable,
+            calendarPolicy: publicationPolicy
+        )
+        #expect(writableCalendar.kind == .calendar)
+        #expect(writableCalendar.syncRole == .writable)
+        #expect(writableCalendar.calendarPolicy == publicationPolicy)
+        do {
+            _ = try await client.configureGoogleCollection(
+                accountID: Self.accountID,
+                collectionID: Self.collectionID,
+                expectedRevision: 3,
+                selected: true,
+                visible: true,
+                role: .writable,
+                calendarPolicy: publicationPolicy
+            )
+            Issue.record("A writable task list response was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .responseDecodingFailed)
+        }
         let existingWritable = try await client.googleCollections(accountID: Self.accountID)
         #expect(existingWritable.first?.syncRole == .writable)
     }
 
-    private func makeClient() -> DayWeaveAPIClient {
+    private func makeClient(
+        now: @escaping @Sendable () -> Date = Date.init
+    ) -> DayWeaveAPIClient {
         let baseURL = Self.baseURL
         let issuedAt = Date()
         let clientInstanceID = UUID(uuidString: "55555555-eeee-4eee-8eee-555555555555")!
@@ -586,8 +1078,22 @@ struct GoogleIntegrationAPIClientTests {
         return DayWeaveAPIClient(
             baseURL: baseURL,
             session: URLProtocolStub.makeSession(),
-            authCoordinator: coordinator
+            authCoordinator: coordinator,
+            now: now
         )
+    }
+
+    private func expectResponseDecodingFailure(
+        _ operation: () async throws -> Void
+    ) async {
+        do {
+            try await operation()
+            Issue.record("An out-of-bounds outbound expiry was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .responseDecodingFailed)
+        } catch {
+            Issue.record("An unexpected outbound expiry error was returned")
+        }
     }
 
     private static let baseURL = try! DayWeaveAPIBaseURL("https://api.example.com/gateway")
@@ -598,6 +1104,17 @@ struct GoogleIntegrationAPIClientTests {
     )!
     private static let otherAccountID = UUID(uuidString: "22222222-bbbb-4bbb-8bbb-222222222222")!
     private static let collectionID = UUID(uuidString: "33333333-cccc-4ccc-8ccc-333333333333")!
+    private static let itemID = UUID(uuidString: "44444444-dddd-4ddd-8ddd-444444444444")!
+    private static let previewID = UUID(uuidString: "77777777-aaaa-4aaa-8aaa-777777777777")!
+    private static let outboxID = UUID(uuidString: "88888888-bbbb-4bbb-8bbb-888888888888")!
+    private static let previewHash = String(repeating: "a", count: 64)
+    private static let approvalCapability: String = {
+        let payload = Data([UInt8](repeating: 7, count: 32)).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "dw_" + "ga1_" + payload
+    }()
 
     private static func reflectedChildren(_ value: Any) -> String {
         Mirror(reflecting: value).children
@@ -697,10 +1214,11 @@ struct GoogleIntegrationAPIClientTests {
         selected: Bool,
         visible: Bool,
         role: String,
-        kind: String = "calendar"
+        kind: String = "calendar",
+        publicationEnabled: Bool = false
     ) -> Data {
         Data(
-            "{\"collection\":\(collectionObject(revision: revision, selected: selected, visible: visible, role: role, kind: kind))}".utf8
+            "{\"collection\":\(collectionObject(revision: revision, selected: selected, visible: visible, role: role, kind: kind, publicationEnabled: publicationEnabled))}".utf8
         )
     }
 
@@ -710,7 +1228,8 @@ struct GoogleIntegrationAPIClientTests {
         selected: Bool = false,
         visible: Bool = true,
         role: String = "read_only",
-        kind: String = "calendar"
+        kind: String = "calendar",
+        publicationEnabled: Bool = false
     ) -> String {
         """
         {
@@ -727,7 +1246,7 @@ struct GoogleIntegrationAPIClientTests {
           "selected":\(selected),
           "visible":\(visible),
           "sync_role":"\(role)",
-          "calendar_policy":\(calendarPolicyObject()),
+          "calendar_policy":\(calendarPolicyObject(publicationEnabled: publicationEnabled)),
           "revision":\(revision),
           "discovered_at":"2026-08-30T09:00:00Z",
           "configured_at":null,
@@ -744,18 +1263,128 @@ struct GoogleIntegrationAPIClientTests {
         """
     }
 
-    private static func calendarPolicyObject() -> String {
+    private static func calendarPolicyObject(publicationEnabled: Bool = false) -> String {
         """
         {
           "confirmed_busy":"blocking",
           "tentative":"visible_nonblocking",
           "free":"visible_nonblocking",
           "all_day":"visible_nonblocking",
-          "publish_all_day":false,
-          "publish_tentative":false,
-          "publish_free":false
+          "publish_all_day":\(publicationEnabled),
+          "publish_tentative":\(publicationEnabled),
+          "publish_free":\(publicationEnabled)
         }
         """
+    }
+
+    private static func outboundPreviewEnvelope(
+        expiry: Date = Date().addingTimeInterval(10 * 60),
+        extraEnvelopeField: Bool = false,
+        extraPreviewField: Bool = false
+    ) -> Data {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let expiry = formatter.string(from: expiry)
+        let previewExtra = extraPreviewField ? ",\"unknown\":true" : ""
+        let envelopeExtra = extraEnvelopeField ? ",\"unknown\":true" : ""
+        return Data(
+            """
+            {
+              "preview":{
+                "id":"\(previewID.uuidString.lowercased())",
+                "account_id":"\(accountID.uuidString.lowercased())",
+                "collection_id":"\(collectionID.uuidString.lowercased())",
+                "collection_revision":4,
+                "collection_display_name":"Primary calendar",
+                "item_id":"\(itemID.uuidString.lowercased())",
+                "item_revision":9,
+                "entity_kind":"calendar_event",
+                "operation":"upsert",
+                "provider_resource_id":null,
+                "provider_etag":null,
+                "preview_hash":"\(previewHash)",
+                "provider_payload":{"summary":"Private planning canary"},
+                "expires_at":"\(expiry)"\(previewExtra)
+              }\(envelopeExtra)
+            }
+            """.utf8
+        )
+    }
+
+    private static func outboundApprovalEnvelope(
+        expiry: Date = Date().addingTimeInterval(10 * 60),
+        extraApprovalField: Bool = false
+    ) -> Data {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let expiry = formatter.string(from: expiry)
+        let extra = extraApprovalField ? ",\"unknown\":true" : ""
+        return Data(
+            """
+            {"approval":{
+              "preview_id":"\(previewID.uuidString.lowercased())",
+              "approval_capability":"\(approvalCapability)",
+              "expires_at":"\(expiry)"\(extra)
+            }}
+            """.utf8
+        )
+    }
+
+    private static func outboundAcceptedEnvelope(extraOutboundField: Bool = false) -> Data {
+        let extra = extraOutboundField ? ",\"unknown\":true" : ""
+        return Data(
+            "{\"outbound\":{\"outbox_id\":\"\(outboxID.uuidString.lowercased())\",\"replayed\":false\(extra)}}".utf8
+        )
+    }
+
+    private static func outboundPreviewWithDuplicatePayloadKey() -> Data {
+        replacing(
+            in: outboundPreviewEnvelope(),
+            target: #""summary":"Private planning canary""#,
+            replacement: #""summary":"Private planning canary","\u0073ummary":"forged""#
+        )
+    }
+
+    private static func outboundApprovalWithDuplicateKey() -> Data {
+        let identity = previewID.uuidString.lowercased()
+        return replacing(
+            in: outboundApprovalEnvelope(),
+            target: "\"preview_id\":\"\(identity)\"",
+            replacement: "\"preview_id\":\"\(identity)\",\"\\u0070review_id\":\"\(identity)\""
+        )
+    }
+
+    private static func outboundAcceptedWithDuplicateKey() -> Data {
+        replacing(
+            in: outboundAcceptedEnvelope(),
+            target: "\"replayed\":false",
+            replacement: "\"replayed\":false,\"\\u0072eplayed\":true"
+        )
+    }
+
+    private static func oversizedOutboundPreviewEnvelope() throws -> Data {
+        var envelope = try #require(
+            JSONSerialization.jsonObject(with: outboundPreviewEnvelope())
+                as? [String: Any]
+        )
+        var preview = try #require(envelope["preview"] as? [String: Any])
+        preview["provider_payload"] = [
+            "values": [Any](repeating: NSNull(), count: 20_001),
+        ]
+        envelope["preview"] = preview
+        return try JSONSerialization.data(withJSONObject: envelope)
+    }
+
+    private static func replacing(
+        in data: Data,
+        target: String,
+        replacement: String
+    ) -> Data {
+        Data(
+            String(decoding: data, as: UTF8.self)
+                .replacingOccurrences(of: target, with: replacement)
+                .utf8
+        )
     }
 
     private static func syncStatusEnvelope(accountID: UUID = accountID) -> Data {
@@ -811,13 +1440,16 @@ private final class GoogleAPITestDurableAuthStateStore: DurableAuthStateStoring,
 {
     private let lock = NSLock()
     private var envelope: DurableAuthEnvelope?
+    private let loadFailure: Bool
 
-    init(initial: DurableAuthEnvelope?) {
+    init(initial: DurableAuthEnvelope?, loadFailure: Bool = false) {
         envelope = initial
+        self.loadFailure = loadFailure
     }
 
-    func loadEnvelope() -> DurableAuthEnvelope? {
-        lock.withLock { envelope }
+    func loadEnvelope() throws -> DurableAuthEnvelope? {
+        if loadFailure { throw GoogleAPITestStateFailure.unreadable }
+        return lock.withLock { envelope }
     }
 
     func compareAndSwap(
@@ -830,6 +1462,10 @@ private final class GoogleAPITestDurableAuthStateStore: DurableAuthStateStoring,
             return true
         }
     }
+}
+
+private enum GoogleAPITestStateFailure: Error {
+    case unreadable
 }
 
 private struct GoogleAPITestBearerTokenStore: BearerTokenStoring {

@@ -76,10 +76,10 @@ All routes below require the normal DayWeave bearer token. Provider access and
 refresh tokens never leave the server and must never appear in logs or API
 responses.
 
-#### macOS read-only owner flow
+#### macOS owner flow
 
-The native Mac client exposes the safe import subset after durable DayWeave
-device enrollment is active:
+The native Mac client exposes import and explicitly reviewed Calendar
+publication after durable DayWeave device enrollment is active:
 
 1. Open **Settings → Accounts → Google** and choose **Connect Calendar & Tasks**.
    The client explicitly sends `"services":[]`; by server contract this requests
@@ -92,10 +92,7 @@ device enrollment is active:
    browser attempt, so the client keeps that attempt's recovery journal until
    expiry. The authorization URL is never persisted.
 3. Choose **Discover sources** for an active account. Select Calendar sources as
-   reference-only or blocking and select Task lists as reference-only. This
-   client can display a pre-existing writable Calendar policy only so the owner
-   can explicitly downgrade it; outgoing writable roles, blocking Task lists,
-   and every publication flag are rejected locally.
+   reference-only or blocking and select Task lists as reference-only.
 4. Choose **Refresh import**. The returned `202` is only durable queue
    acceptance. DayWeave polls sync status and pulls/recomposes canonical items
    only after the accepted monotonic refresh generation is completed by an idle
@@ -112,6 +109,43 @@ device enrollment is active:
    the retry completed. If sync status requires reauthorization while the
    provider account still appears active, the Reauthorize action remains
    available and preserves the pending completion marker.
+5. To publish, choose **Enable Calendar publishing** for that existing account.
+   The Mac requests exactly the broad Calendar service with forced incremental
+   consent; it does not request Tasks write scope. After the authoritative
+   account snapshot reports the grant, mark a selected Calendar **Publish**.
+   The Mac offers this role only when Google reports `owner` or `writer` access.
+   Confirmed busy timed events are enabled by default; all-day, tentative, and
+   free event publication are separate collection switches. Task lists remain
+   read-only in this client.
+6. In the Items Inbox, select a synced, app-authored fixed event and choose
+   **Publish Calendar**. The client accepts only an owned `dayweave_firm_block` (or
+   its recoverably trashed mapped event for deletion), requests the exact
+   preview, and displays the reviewed provider payload. Server-managed private
+   ownership-proof values are redacted from that view. **Approve & Queue** is the sole
+   path that creates approval authority. Preview, approval, and enqueue require
+   exact HTTP `200`, `200`, and `202` responses and validate every bound ID,
+   revision, operation, hash, entity kind, and expiry. Expiry validation tolerates
+   the supported five-minute device clock skew while locally elapsed authority
+   remains non-actionable.
+
+Before preview transport, the Mac synchronously saves the exact intent to its
+encrypted planner snapshot. It persists the returned preview before display and
+persists the expiring approval capability before enqueue. Relaunch recovery may
+replay an intent or approved enqueue exactly, but it never approves a preview
+automatically. Because capability issuance is one-shot, the Mac also persists an
+approval-attempt fence before that request. If its response is lost, it does not
+offer approval again or enqueue anything; recovery remains until the reviewed
+preview expires. The record is cleared only after authoritative outbox acceptance.
+Lock/sleep redacts the preview and fences late results. API credential changes,
+Google account/source mutations, imports, and canonical cache reset are blocked
+while live recovery authority remains. An expired preview or capability is
+server-unusable; destructive discard waits one additional five-minute skew window
+and requires a separate warning confirmation plus exact journal comparison. An
+approved-stage warning also explains that a prior enqueue response may have been
+lost and asks the owner to verify Calendar or server state before retrying. This
+recovery can be discarded after its old authentication binding is unavailable. No Google token,
+approval capability, callback material, or provider credential belongs in this
+public repository or in plaintext planner state.
 
 OAuth start keeps only a non-secret, expiring request/idempotency journal for an
 exact lost-response retry. Disconnect separately retains its exact account,

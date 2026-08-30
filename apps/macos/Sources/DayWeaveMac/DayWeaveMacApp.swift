@@ -36,6 +36,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
     @StateObject private var googleIntegration: GoogleIntegrationStore
+    @StateObject private var googleOutbound: GoogleOutboundStore
     @StateObject private var serviceCoordinator: DayWeaveServiceCoordinator
     @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
@@ -80,8 +81,27 @@ struct DayWeaveMacApp: App {
             await canonicalSync.syncThroughFreshComposition()
         }
         _googleIntegration = StateObject(wrappedValue: googleIntegration)
+        let outboundConfiguration = UserDefaultsSuggestionAPIConfigurationStore()
+        let outboundSession = makeDayWeaveEphemeralSession()
+        let googleOutbound = GoogleOutboundStore(
+            recoveryStore: store,
+            transportProvider: {
+                guard let value = outboundConfiguration.loadBaseURL(),
+                      !value.isEmpty else {
+                    throw DayWeaveAPIError.credentialUnavailable
+                }
+                let baseURL = try DayWeaveAPIBaseURL(value)
+                return try DayWeaveAPIClient(
+                    baseURL: baseURL,
+                    session: outboundSession,
+                    durableAuthCoordinator: authCoordinator
+                )
+            }
+        )
+        _googleOutbound = StateObject(wrappedValue: googleOutbound)
         _serviceCoordinator = StateObject(wrappedValue: DayWeaveServiceCoordinator(
             proposalApplications: proposalApplications,
+            googleOutbound: googleOutbound,
             executionSync: executionSync,
             canonicalSync: canonicalSync
         ))
@@ -106,6 +126,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
                 .environmentObject(googleIntegration)
+                .environmentObject(googleOutbound)
                 .environmentObject(serviceCoordinator)
                 .environmentObject(durableAuth)
                 .environmentObject(appLock)
@@ -277,6 +298,7 @@ struct DayWeaveMacApp: App {
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
                         .environmentObject(googleIntegration)
+                        .environmentObject(googleOutbound)
                         .environmentObject(durableAuth)
                 } else {
                     AppLockedView()
@@ -292,12 +314,14 @@ struct DayWeaveMacApp: App {
 
     private func activateServices() {
         guard appLock.isContentAvailable else { return }
+        googleOutbound.setPrivacyAvailable(true)
         codex.startIfNeeded()
         googleIntegration.activate()
         serviceCoordinator.activate()
     }
 
     private func deactivateServices() {
+        googleOutbound.setPrivacyAvailable(false)
         serviceCoordinator.deactivate()
         googleIntegration.suspendForPrivacyBoundary()
         codexConversation.suspendForPrivacyBoundary()

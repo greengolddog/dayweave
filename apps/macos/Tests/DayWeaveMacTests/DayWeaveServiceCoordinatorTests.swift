@@ -8,6 +8,82 @@ import Testing
 @Suite("Foreground service coordination")
 @MainActor
 struct DayWeaveServiceCoordinatorTests {
+    @Test("startup recovers proposal and Google outbound journals before reconciliation")
+    func startupRecoversPendingJournalsInOrder() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(
+            hasPendingRecovery: true,
+            resolvesRecovery: true,
+            reportedResult: true,
+            events: events
+        )
+        let googleOutbound = GoogleOutboundRecoveryDouble(
+            hasPendingRecovery: true,
+            resolvesRecovery: true,
+            reportedResult: true,
+            events: events
+        )
+        let execution = ExecutionServiceDouble(events: events)
+        let canonical = CanonicalServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: proposals,
+            googleOutbound: googleOutbound,
+            executionSync: execution,
+            canonicalSync: canonical
+        )
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+
+        #expect(coordinator.servicesAreActive)
+        #expect(!proposals.hasPendingRecovery)
+        #expect(!googleOutbound.hasPendingRecovery)
+        #expect(events.values == [
+            "proposal.recover",
+            "google-outbound.recover",
+            "execution.refresh",
+            "canonical.sync",
+            "execution.poll",
+        ])
+    }
+
+    @Test("failed Google outbound recovery preserves local foreground services")
+    func failedGoogleRecoveryKeepsForegroundServicesAvailable() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(
+            hasPendingRecovery: false,
+            resolvesRecovery: false,
+            reportedResult: false,
+            events: events
+        )
+        let googleOutbound = GoogleOutboundRecoveryDouble(
+            hasPendingRecovery: true,
+            resolvesRecovery: false,
+            reportedResult: false,
+            events: events
+        )
+        let execution = ExecutionServiceDouble(events: events)
+        let canonical = CanonicalServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: proposals,
+            googleOutbound: googleOutbound,
+            executionSync: execution,
+            canonicalSync: canonical
+        )
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+
+        #expect(coordinator.servicesAreActive)
+        #expect(googleOutbound.hasPendingRecovery)
+        #expect(events.values == [
+            "google-outbound.recover",
+            "execution.refresh",
+            "canonical.sync",
+            "execution.poll",
+        ])
+    }
+
     @Test("manual proposal recovery resumes execution, canonical sync, then polling")
     func manualRecoveryResumesOrderedServices() async {
         let events = ServiceEventLog()
@@ -96,6 +172,34 @@ private final class ProposalRecoveryDouble: ProposalApplicationRecovering {
 
     func recoverPendingMutation() async -> Bool {
         events.values.append("proposal.recover")
+        if resolvesRecovery {
+            hasPendingRecovery = false
+        }
+        return reportedResult
+    }
+}
+
+@MainActor
+private final class GoogleOutboundRecoveryDouble: GoogleOutboundRecovering {
+    var hasPendingRecovery: Bool
+    private let resolvesRecovery: Bool
+    private let reportedResult: Bool
+    private let events: ServiceEventLog
+
+    init(
+        hasPendingRecovery: Bool,
+        resolvesRecovery: Bool,
+        reportedResult: Bool,
+        events: ServiceEventLog
+    ) {
+        self.hasPendingRecovery = hasPendingRecovery
+        self.resolvesRecovery = resolvesRecovery
+        self.reportedResult = reportedResult
+        self.events = events
+    }
+
+    func recoverPendingOperation() async -> Bool {
+        events.values.append("google-outbound.recover")
         if resolvesRecovery {
             hasPendingRecovery = false
         }

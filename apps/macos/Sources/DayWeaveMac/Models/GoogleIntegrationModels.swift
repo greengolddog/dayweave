@@ -214,9 +214,10 @@ enum GoogleService: String, Codable, Equatable, Sendable {
     case tasks
 }
 
-/// The macOS read-only connection deliberately sends an explicit empty service
+/// The default macOS connection deliberately sends an explicit empty service
 /// array. The server contract interprets that exact value as Calendar and Tasks
-/// read-only, while keeping writable Google scopes outside this client surface.
+/// read-only. A single Calendar write scope is the only supported upgrade; Tasks
+/// write access and mixed/full-scope requests remain outside this client surface.
 struct GoogleOAuthStartRequest: Codable, Equatable, Sendable {
     let services: [GoogleService]
     let forceConsent: Bool
@@ -242,7 +243,15 @@ struct GoogleOAuthStartRequest: Codable, Equatable, Sendable {
     }
 
     var isValid: Bool {
-        services.isEmpty
+        let serviceSelectionIsValid = if services.isEmpty {
+            true
+        } else {
+            services == [.calendar]
+                && accountID != nil
+                && forceConsent
+                && !connectNew
+        }
+        return serviceSelectionIsValid
             && (!connectNew || accountID == nil)
             && (loginHint.map { hint in
                 !hint.isEmpty
@@ -353,6 +362,457 @@ extension GoogleOAuthAuthorization: CustomStringConvertible, CustomDebugStringCo
     var debugDescription: String { description }
     var customMirror: Mirror {
         Mirror(self, children: ["summary": description], displayStyle: .struct)
+    }
+}
+
+enum GoogleOutboundOperation: String, Codable, Equatable, Sendable {
+    case upsert
+    case delete
+}
+
+struct GoogleOutboundPreviewRequest: Codable, Equatable, Sendable {
+    let collectionID: UUID
+    let itemID: UUID
+    let expectedItemRevision: UInt64
+    let operation: GoogleOutboundOperation
+
+    init(
+        collectionID: UUID,
+        itemID: UUID,
+        expectedItemRevision: UInt64,
+        operation: GoogleOutboundOperation
+    ) {
+        self.collectionID = collectionID
+        self.itemID = itemID
+        self.expectedItemRevision = expectedItemRevision
+        self.operation = operation
+    }
+
+    var isValid: Bool {
+        collectionID != .googleZero
+            && itemID != .googleZero
+            && expectedItemRevision > 0
+            && expectedItemRevision <= UInt64(Int64.max)
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case collectionID = "collection_id"
+        case itemID = "item_id"
+        case expectedItemRevision = "expected_item_revision"
+        case operation
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        collectionID = try container.decode(UUID.self, forKey: .collectionID)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        expectedItemRevision = try container.decode(UInt64.self, forKey: .expectedItemRevision)
+        operation = try container.decode(GoogleOutboundOperation.self, forKey: .operation)
+        guard isValid else {
+            throw googleDecodingError(
+                codingPath: decoder.codingPath,
+                "Google outbound preview request is invalid"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard isValid else {
+            throw googleEncodingError(
+                codingPath: encoder.codingPath,
+                "Google outbound preview request is invalid"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(collectionID, forKey: .collectionID)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(expectedItemRevision, forKey: .expectedItemRevision)
+        try container.encode(operation, forKey: .operation)
+    }
+}
+
+struct GoogleOutboundApprovalRequest: Codable, Equatable, Sendable {
+    let expectedPreviewHash: String
+
+    init(expectedPreviewHash: String) {
+        self.expectedPreviewHash = expectedPreviewHash
+    }
+
+    var isValid: Bool { isValidGoogleOutboundHash(expectedPreviewHash) }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case expectedPreviewHash = "expected_preview_hash"
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        expectedPreviewHash = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(String.self, forKey: .expectedPreviewHash)
+        guard isValid else {
+            throw googleDecodingError(
+                codingPath: decoder.codingPath,
+                "Google outbound approval request is invalid"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard isValid else {
+            throw googleEncodingError(
+                codingPath: encoder.codingPath,
+                "Google outbound approval request is invalid"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(expectedPreviewHash, forKey: .expectedPreviewHash)
+    }
+}
+
+struct GoogleOutboundEnqueueRequest: Codable, Equatable, Sendable {
+    let collectionID: UUID
+    let itemID: UUID
+    let expectedItemRevision: UInt64
+    let operation: GoogleOutboundOperation
+    let approvalCapability: String
+
+    init(
+        collectionID: UUID,
+        itemID: UUID,
+        expectedItemRevision: UInt64,
+        operation: GoogleOutboundOperation,
+        approvalCapability: String
+    ) {
+        self.collectionID = collectionID
+        self.itemID = itemID
+        self.expectedItemRevision = expectedItemRevision
+        self.operation = operation
+        self.approvalCapability = approvalCapability
+    }
+
+    var isValid: Bool {
+        collectionID != .googleZero
+            && itemID != .googleZero
+            && expectedItemRevision > 0
+            && expectedItemRevision <= UInt64(Int64.max)
+            && isValidGoogleOutboundCapability(approvalCapability)
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case collectionID = "collection_id"
+        case itemID = "item_id"
+        case expectedItemRevision = "expected_item_revision"
+        case operation
+        case approvalCapability = "approval_capability"
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        collectionID = try container.decode(UUID.self, forKey: .collectionID)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        expectedItemRevision = try container.decode(UInt64.self, forKey: .expectedItemRevision)
+        operation = try container.decode(GoogleOutboundOperation.self, forKey: .operation)
+        approvalCapability = try container.decode(String.self, forKey: .approvalCapability)
+        guard isValid else {
+            throw googleDecodingError(
+                codingPath: decoder.codingPath,
+                "Google outbound enqueue request is invalid"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard isValid else {
+            throw googleEncodingError(
+                codingPath: encoder.codingPath,
+                "Google outbound enqueue request is invalid"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(collectionID, forKey: .collectionID)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(expectedItemRevision, forKey: .expectedItemRevision)
+        try container.encode(operation, forKey: .operation)
+        try container.encode(approvalCapability, forKey: .approvalCapability)
+    }
+}
+
+extension GoogleOutboundEnqueueRequest: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    var description: String { "Google outbound \(operation.rawValue) request" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["summary": description], displayStyle: .struct)
+    }
+}
+
+enum GoogleOutboundEntityKind: String, Codable, Equatable, Sendable {
+    case calendarEvent = "calendar_event"
+    case task
+}
+
+struct GoogleOutboundPreview: Codable, Equatable, Sendable {
+    let id: UUID
+    let accountID: UUID
+    let collectionID: UUID
+    let collectionRevision: UInt64
+    let collectionDisplayName: String
+    let itemID: UUID
+    let itemRevision: UInt64
+    let entityKind: GoogleOutboundEntityKind
+    let operation: GoogleOutboundOperation
+    let providerResourceID: String?
+    let providerETag: String?
+    let previewHash: String
+    let providerPayload: [String: JSONValue]
+    let expiresAt: Date
+
+    init(
+        id: UUID,
+        accountID: UUID,
+        collectionID: UUID,
+        collectionRevision: UInt64,
+        collectionDisplayName: String,
+        itemID: UUID,
+        itemRevision: UInt64,
+        entityKind: GoogleOutboundEntityKind,
+        operation: GoogleOutboundOperation,
+        providerResourceID: String?,
+        providerETag: String?,
+        previewHash: String,
+        providerPayload: [String: JSONValue],
+        expiresAt: Date
+    ) {
+        self.id = id
+        self.accountID = accountID
+        self.collectionID = collectionID
+        self.collectionRevision = collectionRevision
+        self.collectionDisplayName = collectionDisplayName
+        self.itemID = itemID
+        self.itemRevision = itemRevision
+        self.entityKind = entityKind
+        self.operation = operation
+        self.providerResourceID = providerResourceID
+        self.providerETag = providerETag
+        self.previewHash = previewHash
+        self.providerPayload = providerPayload
+        self.expiresAt = expiresAt
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case id
+        case accountID = "account_id"
+        case collectionID = "collection_id"
+        case collectionRevision = "collection_revision"
+        case collectionDisplayName = "collection_display_name"
+        case itemID = "item_id"
+        case itemRevision = "item_revision"
+        case entityKind = "entity_kind"
+        case operation
+        case providerResourceID = "provider_resource_id"
+        case providerETag = "provider_etag"
+        case previewHash = "preview_hash"
+        case providerPayload = "provider_payload"
+        case expiresAt = "expires_at"
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        accountID = try container.decode(UUID.self, forKey: .accountID)
+        collectionID = try container.decode(UUID.self, forKey: .collectionID)
+        collectionRevision = try container.decode(UInt64.self, forKey: .collectionRevision)
+        collectionDisplayName = try container.decode(String.self, forKey: .collectionDisplayName)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        itemRevision = try container.decode(UInt64.self, forKey: .itemRevision)
+        entityKind = try container.decode(GoogleOutboundEntityKind.self, forKey: .entityKind)
+        operation = try container.decode(GoogleOutboundOperation.self, forKey: .operation)
+        providerResourceID = try container.decodeIfPresent(String.self, forKey: .providerResourceID)
+        providerETag = try container.decodeIfPresent(String.self, forKey: .providerETag)
+        previewHash = try container.decode(String.self, forKey: .previewHash)
+        providerPayload = try container.decode([String: JSONValue].self, forKey: .providerPayload)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+        try validateGoogleOutboundPreview(self, codingPath: decoder.codingPath)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        try validateGoogleOutboundPreview(self, codingPath: encoder.codingPath, encoding: true)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(accountID, forKey: .accountID)
+        try container.encode(collectionID, forKey: .collectionID)
+        try container.encode(collectionRevision, forKey: .collectionRevision)
+        try container.encode(collectionDisplayName, forKey: .collectionDisplayName)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(itemRevision, forKey: .itemRevision)
+        try container.encode(entityKind, forKey: .entityKind)
+        try container.encode(operation, forKey: .operation)
+        try encodeGoogleNullable(providerResourceID, forKey: .providerResourceID, into: &container)
+        try encodeGoogleNullable(providerETag, forKey: .providerETag, into: &container)
+        try container.encode(previewHash, forKey: .previewHash)
+        try container.encode(providerPayload, forKey: .providerPayload)
+        try container.encode(expiresAt, forKey: .expiresAt)
+    }
+}
+
+extension GoogleOutboundPreview: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    var description: String { "Google outbound \(operation.rawValue) preview" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["summary": description], displayStyle: .struct)
+    }
+}
+
+struct GoogleOutboundApproval: Codable, Equatable, Sendable {
+    let previewID: UUID
+    let approvalCapability: String
+    let expiresAt: Date
+
+    init(previewID: UUID, approvalCapability: String, expiresAt: Date) {
+        self.previewID = previewID
+        self.approvalCapability = approvalCapability
+        self.expiresAt = expiresAt
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case previewID = "preview_id"
+        case approvalCapability = "approval_capability"
+        case expiresAt = "expires_at"
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        previewID = try container.decode(UUID.self, forKey: .previewID)
+        approvalCapability = try container.decode(String.self, forKey: .approvalCapability)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+        try validateGoogleOutboundApproval(self, codingPath: decoder.codingPath)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        try validateGoogleOutboundApproval(self, codingPath: encoder.codingPath, encoding: true)
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(previewID, forKey: .previewID)
+        try container.encode(approvalCapability, forKey: .approvalCapability)
+        try container.encode(expiresAt, forKey: .expiresAt)
+    }
+}
+
+extension GoogleOutboundApproval: CustomStringConvertible, CustomDebugStringConvertible,
+    CustomReflectable
+{
+    var description: String { "Google outbound approval" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["summary": description], displayStyle: .struct)
+    }
+}
+
+struct GoogleOutboundAccepted: Codable, Equatable, Sendable {
+    let outboxID: UUID
+    let replayed: Bool
+
+    init(outboxID: UUID, replayed: Bool) {
+        self.outboxID = outboxID
+        self.replayed = replayed
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case outboxID = "outbox_id"
+        case replayed
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        outboxID = try container.decode(UUID.self, forKey: .outboxID)
+        replayed = try container.decode(Bool.self, forKey: .replayed)
+        guard outboxID != .googleZero else {
+            throw googleDecodingError(
+                codingPath: decoder.codingPath,
+                "Google outbound acceptance is invalid"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard outboxID != .googleZero else {
+            throw googleEncodingError(
+                codingPath: encoder.codingPath,
+                "Google outbound acceptance is invalid"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(outboxID, forKey: .outboxID)
+        try container.encode(replayed, forKey: .replayed)
+    }
+}
+
+// Exact top-level server envelopes are Codable so durable test journals can
+// verify the same strict shape used at the network boundary.
+struct GoogleOutboundPreviewSnapshot: Codable, Equatable, Sendable {
+    let preview: GoogleOutboundPreview
+
+    private enum CodingKeys: String, CodingKey, CaseIterable { case preview }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        preview = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(GoogleOutboundPreview.self, forKey: .preview)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(preview, forKey: .preview)
+    }
+}
+
+struct GoogleOutboundApprovalSnapshot: Codable, Equatable, Sendable {
+    let approval: GoogleOutboundApproval
+
+    private enum CodingKeys: String, CodingKey, CaseIterable { case approval }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        approval = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(GoogleOutboundApproval.self, forKey: .approval)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(approval, forKey: .approval)
+    }
+}
+
+extension GoogleOutboundApprovalSnapshot: CustomStringConvertible,
+    CustomDebugStringConvertible, CustomReflectable
+{
+    var description: String { "Google outbound approval response" }
+    var debugDescription: String { description }
+    var customMirror: Mirror {
+        Mirror(self, children: ["summary": description], displayStyle: .struct)
+    }
+}
+
+struct GoogleOutboundAcceptedSnapshot: Codable, Equatable, Sendable {
+    let outbound: GoogleOutboundAccepted
+
+    private enum CodingKeys: String, CodingKey, CaseIterable { case outbound }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactGoogleKeys(CodingKeys.self, from: decoder)
+        outbound = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(GoogleOutboundAccepted.self, forKey: .outbound)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(outbound, forKey: .outbound)
     }
 }
 
@@ -1042,6 +1502,156 @@ private func validateGoogleCounts(
         }
         throw googleDecodingError(codingPath: codingPath, description)
     }
+}
+
+private func validateGoogleOutboundPreview(
+    _ preview: GoogleOutboundPreview,
+    codingPath: [any CodingKey],
+    encoding: Bool = false
+) throws {
+    let providerBindingIsValid = switch (
+        preview.providerResourceID,
+        preview.providerETag,
+        preview.operation
+    ) {
+    case (nil, nil, .upsert):
+        true
+    case let (resourceID?, etag?, _):
+        validGoogleText(resourceID, maximumUTF8Bytes: 2_048)
+            && validGoogleText(etag, maximumUTF8Bytes: 2_048)
+    default:
+        false
+    }
+    let payloadIsValid = preview.providerPayload.count <= 10_000
+        && preview.providerPayload.keys.allSatisfy {
+            validGoogleText($0, maximumUTF8Bytes: 1_024)
+        }
+        && validGoogleOutboundProviderPayload(preview.providerPayload)
+    let operationPayloadIsValid = switch preview.operation {
+    case .upsert: !preview.providerPayload.isEmpty
+    case .delete: preview.providerPayload.isEmpty
+    }
+    let valid = preview.id != .googleZero
+        && preview.accountID != .googleZero
+        && preview.collectionID != .googleZero
+        && preview.itemID != .googleZero
+        && preview.collectionRevision > 0
+        && preview.collectionRevision <= UInt64(Int64.max)
+        && preview.itemRevision > 0
+        && preview.itemRevision <= UInt64(Int64.max)
+        && validGoogleText(preview.collectionDisplayName, maximumUTF8Bytes: 4_096)
+        && isValidGoogleOutboundHash(preview.previewHash)
+        && providerBindingIsValid
+        && payloadIsValid
+        && operationPayloadIsValid
+        && preview.expiresAt.timeIntervalSinceReferenceDate.isFinite
+    guard valid else {
+        if encoding {
+            throw googleEncodingError(
+                codingPath: codingPath,
+                "Google outbound preview is invalid"
+            )
+        }
+        throw googleDecodingError(codingPath: codingPath, "Google outbound preview is invalid")
+    }
+}
+
+private func validGoogleOutboundProviderPayload(
+    _ payload: [String: JSONValue]
+) -> Bool {
+    struct Budget {
+        var nodes = 0
+        var stringBytes = 0
+    }
+    let maximumDepth = 32
+    let maximumNodes = 20_000
+    let maximumStringBytes = 1_048_576
+    let maximumContainerEntries = 10_000
+    let maximumValueStringBytes = 256 * 1_024
+    var budget = Budget()
+
+    func validate(_ value: JSONValue, depth: Int, budget: inout Budget) -> Bool {
+        guard depth <= maximumDepth, budget.nodes < maximumNodes else { return false }
+        budget.nodes += 1
+        switch value {
+        case let .object(object):
+            guard object.count <= maximumContainerEntries else { return false }
+            for (key, child) in object {
+                let bytes = key.utf8.count
+                guard validGoogleText(key, maximumUTF8Bytes: 1_024),
+                      budget.stringBytes <= maximumStringBytes - bytes else { return false }
+                budget.stringBytes += bytes
+                guard validate(child, depth: depth + 1, budget: &budget) else { return false }
+            }
+            return true
+        case let .array(array):
+            guard array.count <= maximumContainerEntries else { return false }
+            for child in array {
+                guard validate(child, depth: depth + 1, budget: &budget) else { return false }
+            }
+            return true
+        case let .string(string):
+            let bytes = string.utf8.count
+            guard bytes <= maximumValueStringBytes,
+                  budget.stringBytes <= maximumStringBytes - bytes else { return false }
+            budget.stringBytes += bytes
+            return true
+        case let .number(number):
+            return number.displayDescription.utf8.count <= 128
+        case .bool, .null:
+            return true
+        }
+    }
+
+    return validate(.object(payload), depth: 0, budget: &budget)
+}
+
+private func validateGoogleOutboundApproval(
+    _ approval: GoogleOutboundApproval,
+    codingPath: [any CodingKey],
+    encoding: Bool = false
+) throws {
+    guard approval.previewID != .googleZero,
+          isValidGoogleOutboundCapability(approval.approvalCapability),
+          approval.expiresAt.timeIntervalSinceReferenceDate.isFinite else {
+        if encoding {
+            throw googleEncodingError(
+                codingPath: codingPath,
+                "Google outbound approval is invalid"
+            )
+        }
+        throw googleDecodingError(codingPath: codingPath, "Google outbound approval is invalid")
+    }
+}
+
+private func isValidGoogleOutboundHash(_ value: String) -> Bool {
+    value.utf8.count == 64
+        && value.utf8.allSatisfy { byte in
+            (byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)
+        }
+}
+
+private func isValidGoogleOutboundCapability(_ value: String) -> Bool {
+    let prefix = "dw_ga1_"
+    guard value.hasPrefix(prefix) else { return false }
+    let payload = String(value.dropFirst(prefix.count))
+    guard payload.utf8.count == 43,
+          payload.utf8.allSatisfy({ byte in
+              (byte >= 65 && byte <= 90)
+                  || (byte >= 97 && byte <= 122)
+                  || (byte >= 48 && byte <= 57)
+                  || byte == 45
+                  || byte == 95
+          }) else { return false }
+    let standard = payload
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/") + "="
+    guard let decoded = Data(base64Encoded: standard), decoded.count == 32 else { return false }
+    let canonical = decoded.base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+        .replacingOccurrences(of: "=", with: "")
+    return canonical == payload
 }
 
 private func validGoogleText(_ value: String, maximumUTF8Bytes: Int) -> Bool {

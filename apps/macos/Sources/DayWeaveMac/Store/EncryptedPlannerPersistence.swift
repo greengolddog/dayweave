@@ -419,10 +419,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// schedule-publication replay journal, and version 9 adds exact pending
     /// proposal-application/undo requests plus bounded content-free receipts,
     /// and version 10 adds canonical authoring journals, deleted-item records,
-    /// and a destination-aware canonical selection.
+    /// and a destination-aware canonical selection. Version 11 adds the
+    /// encrypted Google outbound preview/approval/enqueue recovery fence.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 10
+    static let currentSchemaVersion = 11
 
     let schemaVersion: Int
     let savedAt: Date
@@ -450,6 +451,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]?
     let pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]?
     let canonicalTrash: [DayWeaveCanonicalTrashEntry]?
+    let googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
 
@@ -480,6 +482,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]? = [],
         pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]? = [],
         canonicalTrash: [DayWeaveCanonicalTrashEntry]? = [],
+        googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty
     ) {
@@ -509,6 +512,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.proposalApplicationReceipts = proposalApplicationReceipts
         self.pendingCanonicalAuthoringMutations = pendingCanonicalAuthoringMutations
         self.canonicalTrash = canonicalTrash
+        self.googleOutboundRecoveryJournal = googleOutboundRecoveryJournal
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
     }
@@ -531,10 +535,59 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                       canonicalItems: canonicalItems ?? [],
                       tombstoneRevisions: canonicalTombstoneRevisions ?? [:],
                       configurationIdentifier: canonicalConfigurationIdentifier
-                  ) else {
+                  ),
+                  googleOutboundRecoveryJournal?.hasValidShape != false else {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 10:
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil,
+                  let proposalApplicationReceipts,
+                  let pendingCanonicalAuthoringMutations,
+                  let canonicalTrash,
+                  PlannerProposalApplicationJournalValidator.isValidState(
+                      pending: pendingProposalApplicationMutation,
+                      receipts: proposalApplicationReceipts
+                  ),
+                  PlannerCanonicalAuthoringJournalValidator.isValidState(
+                      mutations: pendingCanonicalAuthoringMutations,
+                      trash: canonicalTrash,
+                      canonicalItems: canonicalItems ?? [],
+                      tombstoneRevisions: canonicalTombstoneRevisions ?? [:],
+                      configurationIdentifier: canonicalConfigurationIdentifier
+                  ) else {
+                throw .snapshotDecodingFailed
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: nil,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 9:
             guard executionState != nil,
                   pendingCanonicalSensitivityMutations != nil,

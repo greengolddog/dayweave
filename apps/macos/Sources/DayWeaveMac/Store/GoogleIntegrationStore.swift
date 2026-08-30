@@ -223,7 +223,6 @@ struct GoogleOAuthStartJournal: Codable, Equatable, Sendable {
     ) -> Bool {
         version == currentVersion
             && request.isValid
-            && request.services.isEmpty
             && request.loginHint == nil
             && GoogleDisconnectRetryJournal.isValidConfigurationIdentifier(
                 configurationIdentifier
@@ -361,9 +360,9 @@ private enum GoogleIntegrationLocalError: LocalizedError {
         case .recoveryBelongsToAnotherConfiguration:
             "A Google connection request belongs to another DayWeave API session. Restore that session or wait for the request to expire."
         case .invalidCollectionRole:
-            "This read-only build permits Calendar reference or blocking import and Tasks reference import only."
+            "Publishing requires an active Google Calendar write grant and an owner or writer calendar. Google Tasks remain read-only."
         case .publicationPolicyForbidden:
-            "Google publication remains disabled in this read-only build."
+            "Publication options are available only on a writable Google Calendar."
         case .invalidMutationResponse:
             "The Google integration returned a result for the wrong account, source, or revision. Refresh before trying again."
         case .refreshCompletionPending:
@@ -374,6 +373,7 @@ private enum GoogleIntegrationLocalError: LocalizedError {
 
 @MainActor
 final class GoogleIntegrationStore: ObservableObject {
+    static let googleCalendarWriteScope = "https://www.googleapis.com/auth/calendar"
     typealias TransportProvider = () throws -> any GoogleIntegrationTransport
     typealias AuthorizationOpener = (URL) -> Bool
     typealias Sleep = @Sendable (Duration) async throws -> Void
@@ -935,6 +935,59 @@ final class GoogleIntegrationStore: ObservableObject {
         await startAuthorization(request: request, existingJournal: nil)
     }
 
+    /// Requests only the additional Calendar write scope for an existing
+    /// account. Google Tasks stay read-only in this client slice, and the
+    /// returned provider grant still has to be observed authoritatively before
+    /// any calendar may be configured as writable.
+    func enableCalendarPublishing(for account: GoogleAccount) async {
+        guard mutationRecoveryIsClear() else { return }
+        guard !authorizationStartIsFenced else {
+            status = .failed(
+                "Google cleanup must finish before expanding Calendar access."
+            )
+            return
+        }
+        guard accountIsCurrent(account),
+              account.status == .active || account.status == .paused else {
+            status = .failed(GoogleIntegrationLocalError.invalidMutationResponse.localizedDescription)
+            return
+        }
+        guard !hasPendingRefreshCompletion(for: account) else {
+            status = .failed(
+                "Finish the accepted import and canonical recomposition before expanding Calendar access."
+            )
+            return
+        }
+        guard !hasCalendarPublishingScope(for: account) else {
+            status = .connected(
+                updatedAt: now(),
+                message: "Calendar publishing access is already enabled"
+            )
+            return
+        }
+        let request = GoogleOAuthStartRequest(
+            services: [.calendar],
+            forceConsent: true,
+            loginHint: nil,
+            accountID: account.id,
+            connectNew: false,
+            makeDefault: account.isDefault
+        )
+        await startAuthorization(request: request, existingJournal: nil)
+    }
+
+    func hasCalendarPublishingScope(for account: GoogleAccount) -> Bool {
+        account.grantedScopes.contains(Self.googleCalendarWriteScope)
+    }
+
+    func canEnableCalendarPublishing(for account: GoogleAccount) -> Bool {
+        accountIsCurrent(account)
+            && (account.status == .active || account.status == .paused)
+            && !hasCalendarPublishingScope(for: account)
+            && !authorizationStartIsFenced
+            && !hasPendingRefreshCompletion(for: account)
+    }
+
     func requiresReauthorization(for account: GoogleAccount) -> Bool {
         account.status == .reauthorizationRequired
             || syncStatusByAccount[account.id]?.run?.state == .reauthorizationRequired
@@ -977,7 +1030,10 @@ final class GoogleIntegrationStore: ObservableObject {
             status = .failed(GoogleIntegrationLocalError.invalidMutationResponse.localizedDescription)
             return
         }
-        guard let operation = beginOperation(message: "Preparing a read-only Google connection…")
+        let authorizationPurpose = request.services == [.calendar]
+            ? "Preparing Google Calendar publishing access…"
+            : "Preparing a Google connection…"
+        guard let operation = beginOperation(message: authorizationPurpose)
         else { return }
 
         let journal: GoogleOAuthStartJournal
@@ -1462,15 +1518,36 @@ final class GoogleIntegrationStore: ObservableObject {
         _ collection: GoogleSyncCollection,
         selected: Bool,
         visible: Bool,
-        role: GoogleSyncRole
+        role: GoogleSyncRole,
+        calendarPolicy: GoogleCalendarPolicy? = nil
     ) async {
         guard sourceIsCurrent(collection) else {
             status = .failed(GoogleIntegrationLocalError.invalidMutationResponse.localizedDescription)
             return
         }
-        guard Self.roleIsReadOnlySafe(role, for: collection.kind) else {
+        guard Self.roleIsSupported(role, for: collection.kind),
+              role != .writable || selected,
+              role != .writable || collection.providerAccessRole.map({
+                  $0.caseInsensitiveCompare("owner") == .orderedSame
+                      || $0.caseInsensitiveCompare("writer") == .orderedSame
+              }) == true,
+              role != .writable || accounts.first(where: {
+                  $0.id == collection.accountID
+              }).map({ hasCalendarPublishingScope(for: $0) }) == true else {
             status = .failed(GoogleIntegrationLocalError.invalidCollectionRole.localizedDescription)
             return
+        }
+        let targetPolicy: GoogleCalendarPolicy
+        if role == .writable {
+            targetPolicy = calendarPolicy ?? collection.calendarPolicy
+        } else {
+            guard calendarPolicy == nil || calendarPolicy?.isReadOnlySafe == true else {
+                status = .failed(
+                    GoogleIntegrationLocalError.publicationPolicyForbidden.localizedDescription
+                )
+                return
+            }
+            targetPolicy = (calendarPolicy ?? collection.calendarPolicy).withoutPublication
         }
         guard let operation = beginMutationOperation(message: "Saving the Google source policy…") else {
             return
@@ -1481,7 +1558,8 @@ final class GoogleIntegrationStore: ObservableObject {
                 collection: collection,
                 selected: selected,
                 visible: visible,
-                role: role
+                role: role,
+                targetPolicy: targetPolicy
             )
         }
         activeTask = task
@@ -1493,10 +1571,10 @@ final class GoogleIntegrationStore: ObservableObject {
         collection: GoogleSyncCollection,
         selected: Bool,
         visible: Bool,
-        role: GoogleSyncRole
+        role: GoogleSyncRole,
+        targetPolicy: GoogleCalendarPolicy
     ) async {
         defer { finishOperation(operation.id) }
-        let targetPolicy = collection.calendarPolicy.withoutPublication
         do {
             let updated: GoogleSyncCollection
             do {
@@ -2841,13 +2919,14 @@ final class GoogleIntegrationStore: ObservableObject {
         }
     }
 
-    private static func roleIsReadOnlySafe(
+    private static func roleIsSupported(
         _ role: GoogleSyncRole,
         for kind: GoogleCollectionKind
     ) -> Bool {
         switch (kind, role) {
-        case (.calendar, .readOnly), (.calendar, .blocking), (.taskList, .readOnly): true
-        case (_, .writable), (.taskList, .blocking): false
+        case (.calendar, .readOnly), (.calendar, .blocking), (.calendar, .writable),
+             (.taskList, .readOnly): true
+        case (.taskList, .writable), (.taskList, .blocking): false
         }
     }
 

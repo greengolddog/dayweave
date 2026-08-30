@@ -1494,6 +1494,23 @@ actor DurableAuthCoordinator {
         return Self.legacyBinding(token: token)
     }
 
+    nonisolated func durableBindingIdentifier(
+        boundTo baseURL: DayWeaveAPIBaseURL
+    ) throws -> String {
+        let identifier: String
+        do {
+            identifier = try bindingIdentifier(boundTo: baseURL)
+        } catch let error as DurableAuthError {
+            throw error
+        } catch {
+            throw DurableAuthError.localStateUnavailable
+        }
+        guard identifier.hasPrefix("device-v1:") else {
+            throw DurableAuthError.enrollmentRequired
+        }
+        return identifier
+    }
+
     nonisolated func presentation(boundTo baseURL: DayWeaveAPIBaseURL?) -> DurableAuthPresentation {
         let envelope: DurableAuthEnvelope?
         do {

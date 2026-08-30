@@ -142,6 +142,23 @@ enum CanonicalSensitivityPresentation: Equatable, Sendable {
     case inherited
 }
 
+enum PlannerGoogleOutboundRecoveryError: Error, Equatable, Sendable, LocalizedError {
+    case encryptedPersistenceRequired
+    case invalidJournal
+    case journalConflict
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Google publication recovery requires the healthy encrypted planner store."
+        case .invalidJournal:
+            "The Google publication recovery transition is invalid."
+        case .journalConflict:
+            "Another Google publication recovery transition changed the encrypted record."
+        }
+    }
+}
+
 private struct CanonicalSessionKey: Hashable {
     let itemID: UUID
     let occurrenceID: UUID?
@@ -226,6 +243,10 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var canonicalTrash: [DayWeaveCanonicalTrashEntry] {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var googleOutboundRecoveryJournal:
+        GoogleOutboundRecoveryJournal? {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localCaptureDiagnostics: [UUID: String] {
         didSet { scheduleAutosave() }
     }
@@ -275,6 +296,7 @@ final class PlannerStore: ObservableObject {
         proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt] = [],
         pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation] = [],
         canonicalTrash: [DayWeaveCanonicalTrashEntry] = [],
+        googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
         selectedCanonicalItemID: UUID? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
@@ -366,6 +388,13 @@ final class PlannerStore: ObservableObject {
             tombstoneRevisions: initialCanonicalTombstoneRevisions,
             configurationIdentifier: initialCanonicalConfigurationIdentifier
         ) {
+            restorationError = .snapshotDecodingFailed
+        }
+        let initialGoogleOutboundRecoveryJournal = restoredSnapshot == nil
+            ? googleOutboundRecoveryJournal
+            : restoredSnapshot?.googleOutboundRecoveryJournal
+        self.googleOutboundRecoveryJournal = initialGoogleOutboundRecoveryJournal
+        if initialGoogleOutboundRecoveryJournal?.hasValidShape == false {
             restorationError = .snapshotDecodingFailed
         }
         self.localCaptureDiagnostics = restoredSnapshot?.localCaptureDiagnostics
@@ -480,7 +509,8 @@ final class PlannerStore: ObservableObject {
     func beginCanonicalSync() -> Bool {
         guard canPersistPlan,
               !isCanonicalSyncLocked,
-              pendingProposalApplicationMutation == nil else { return false }
+              pendingProposalApplicationMutation == nil,
+              googleOutboundRecoveryJournal == nil else { return false }
         isCanonicalSyncLocked = true
         return true
     }
@@ -3634,6 +3664,7 @@ final class PlannerStore: ObservableObject {
             pendingCanonicalAuthoringMutations: canonicalAuthoringMutationsOverride
                 ?? pendingCanonicalAuthoringMutations,
             canonicalTrash: canonicalTrashOverride ?? canonicalTrash,
+            googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )
@@ -3744,5 +3775,111 @@ final class PlannerStore: ObservableObject {
             assistantMessages: messages,
             lastScheduleMessage: "Schedule is balanced"
         )
+    }
+}
+
+extension PlannerStore: GoogleOutboundRecoveryStoring {
+    func loadGoogleOutboundRecoveryJournal() throws -> GoogleOutboundRecoveryJournal? {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleOutboundRecoveryError.encryptedPersistenceRequired
+        }
+        guard googleOutboundRecoveryJournal?.hasValidShape != false else {
+            throw PlannerGoogleOutboundRecoveryError.invalidJournal
+        }
+        return googleOutboundRecoveryJournal
+    }
+
+    func saveGoogleOutboundRecoveryJournal(
+        _ journal: GoogleOutboundRecoveryJournal
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleOutboundRecoveryError.encryptedPersistenceRequired
+        }
+        guard journal.hasValidShape,
+              Self.googleOutboundTransitionIsValid(
+                  from: googleOutboundRecoveryJournal,
+                  to: journal
+              ) else {
+            throw PlannerGoogleOutboundRecoveryError.journalConflict
+        }
+        guard googleOutboundRecoveryJournal != journal else { return }
+
+        let previous = googleOutboundRecoveryJournal
+        googleOutboundRecoveryJournal = journal
+        flushPersistence()
+        if let persistenceError {
+            googleOutboundRecoveryJournal = previous
+            throw persistenceError
+        }
+    }
+
+    func clearGoogleOutboundRecoveryJournal(
+        _ expected: GoogleOutboundRecoveryJournal
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleOutboundRecoveryError.encryptedPersistenceRequired
+        }
+        guard expected.hasValidShape,
+              googleOutboundRecoveryJournal == expected else {
+            throw PlannerGoogleOutboundRecoveryError.journalConflict
+        }
+
+        googleOutboundRecoveryJournal = nil
+        flushPersistence()
+        if let persistenceError {
+            googleOutboundRecoveryJournal = expected
+            throw persistenceError
+        }
+    }
+
+    private static func googleOutboundTransitionIsValid(
+        from existing: GoogleOutboundRecoveryJournal?,
+        to replacement: GoogleOutboundRecoveryJournal
+    ) -> Bool {
+        guard replacement.hasValidShape else { return false }
+        guard let existing else { return replacement.stage == .intent }
+        guard existing.hasValidShape else { return false }
+        if existing == replacement { return true }
+
+        guard existing.recoveryID == replacement.recoveryID,
+              existing.operationGeneration == replacement.operationGeneration,
+              existing.configurationIdentifier == replacement.configurationIdentifier,
+              existing.accountID == replacement.accountID,
+              existing.collectionID == replacement.collectionID,
+              existing.itemID == replacement.itemID,
+              existing.expectedItemRevision == replacement.expectedItemRevision,
+              existing.operation == replacement.operation,
+              existing.intentExpiresAt == replacement.intentExpiresAt,
+              existing.createdAt == replacement.createdAt else {
+            return false
+        }
+
+        switch (existing.stage, replacement.stage) {
+        case (.intent, .previewed):
+            guard let preview = replacement.preview else { return false }
+            return (try? existing.recording(preview: preview)) == replacement
+        case (.previewed, .approvalAttempted):
+            return (try? existing.recordingApprovalAttempt()) == replacement
+        case (.approvalAttempted, .approved):
+            guard let preview = existing.preview,
+                  let capability = replacement.approvalCapability,
+                  let expiresAt = replacement.approvalExpiresAt else {
+                return false
+            }
+            let approval = GoogleOutboundApproval(
+                previewID: preview.id,
+                approvalCapability: capability,
+                expiresAt: expiresAt
+            )
+            return (try? existing.recording(approval: approval)) == replacement
+        case (.intent, .intent), (.previewed, .previewed),
+             (.approvalAttempted, .approvalAttempted), (.approved, .approved),
+             (.intent, .approvalAttempted), (.intent, .approved),
+             (.previewed, .intent), (.previewed, .approved),
+             (.approvalAttempted, .intent), (.approvalAttempted, .previewed),
+             (.approved, .intent), (.approved, .previewed),
+             (.approved, .approvalAttempted):
+            return false
+        }
     }
 }

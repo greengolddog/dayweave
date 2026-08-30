@@ -119,10 +119,12 @@ DayWeave session; legacy static bearers are not used by the live Google client.
 
 Connected accounts expose discovery, pause/resume, reauthorization, and an
 explicitly confirmed disconnect. Calendars can be imported as visible reference
-data or complete blocking constraints. Task lists are reference-only in this
-slice. Existing server-side writable Calendar policies remain representable so
-the owner can explicitly downgrade them to read-only; this client never sends a
-writable role, blocking Task-list role, or provider-publication policy.
+data or complete blocking constraints. Task lists remain reference-only on the
+Mac. **Enable Calendar publishing** performs an incremental consent upgrade for
+an existing account; only a selected Calendar for which Google reports
+`owner` or `writer` access can then be marked **Publish**. Writable Task lists,
+blocking Task lists, and unsupported provider-publication policies are rejected
+locally.
 Collection changes use optimistic revisions; a lost response or conflict is
 reconciled with an authoritative GET before the app permits another conclusion.
 Disconnect persists its exact account, revision, and idempotency key before the
@@ -156,9 +158,34 @@ does, **Reauthorize** remains available without dropping that marker. Backoff,
 reauthorization, conflicts,
 offline state, and still-queued work remain visible without displaying provider
 IDs, scopes, tokens, or raw error codes. Server cleanup fences block new OAuth
-starts before a local request journal is created. Google outbound publication is deliberately absent from this
-read-only macOS slice; the server's separately approved outbound flow remains a
-future client surface.
+starts before a local request journal is created.
+
+The Inbox inspector can publish only a synced, app-authored event containing an
+owned `dayweave_firm_block`, or delete its recoverably trashed mapped event. It
+first requests and displays the reviewed private Google Calendar payload; the
+server redacts its managed ownership-proof values from that view. Nothing
+is queued until the owner chooses **Approve & Queue** on that exact preview.
+The client then obtains one expiring, preview-bound capability and submits the
+same account, collection, item revision, and operation to the durable server
+outbox. Preview, approval, and enqueue accept exactly HTTP `200`, `200`, and
+`202`; identity, revision, hash, operation, entity, collection, and expiry are
+validated before any local trust promotion.
+
+The complete intent is synchronously saved in the encrypted planner snapshot
+before the first request. A preview is never approved during automatic
+recovery. A one-shot approval-attempt fence is persisted before requesting the
+capability, so a lost response never enables a second approval ceremony or an
+enqueue without that capability. An already approved capability is replayed
+exactly after a timeout or restart and is cleared only after authoritative outbox acceptance. App lock
+redacts the preview and fences late results. API credentials, Google account
+policy, source roles, imports, and canonical cache reset remain blocked while
+live recovery authority exists. Expiry checks tolerate five minutes of device
+clock skew while locally elapsed authority stays non-actionable. Once authority
+has expired, destructive discard waits another five-minute skew window and then
+requires an explicit warning confirmation and exact-record comparison so canonical
+sync cannot remain stranded. Approved-stage recovery warns that a prior enqueue
+response may have been lost before the owner retries.
+Google Tasks publication is intentionally disabled.
 
 The unified Inbox separates **Items** from **Suggestions**. Items are canonical,
 encrypted local drafts: Quick Capture needs only a title, while the detailed

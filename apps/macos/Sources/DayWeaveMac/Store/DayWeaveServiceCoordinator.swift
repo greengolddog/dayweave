@@ -12,6 +12,16 @@ protocol ProposalApplicationRecovering: AnyObject {
 extension ProposalApplicationStore: ProposalApplicationRecovering {}
 
 @MainActor
+protocol GoogleOutboundRecovering: AnyObject {
+    var hasPendingRecovery: Bool { get }
+
+    @discardableResult
+    func recoverPendingOperation() async -> Bool
+}
+
+extension GoogleOutboundStore: GoogleOutboundRecovering {}
+
+@MainActor
 protocol CanonicalServiceSynchronizing: AnyObject {
     var isConfigured: Bool { get }
 
@@ -38,6 +48,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     @Published private(set) var servicesAreActive = false
 
     private let proposalApplications: any ProposalApplicationRecovering
+    private let googleOutbound: (any GoogleOutboundRecovering)?
     private let executionSync: any ExecutionServiceSynchronizing
     private let canonicalSync: any CanonicalServiceSynchronizing
     private var activationTask: Task<Void, Never>?
@@ -45,10 +56,12 @@ final class DayWeaveServiceCoordinator: ObservableObject {
 
     init(
         proposalApplications: any ProposalApplicationRecovering,
+        googleOutbound: (any GoogleOutboundRecovering)? = nil,
         executionSync: any ExecutionServiceSynchronizing,
         canonicalSync: any CanonicalServiceSynchronizing
     ) {
         self.proposalApplications = proposalApplications
+        self.googleOutbound = googleOutbound
         self.executionSync = executionSync
         self.canonicalSync = canonicalSync
     }
@@ -84,6 +97,10 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         guard !proposalApplications.hasPendingRecovery, !Task.isCancelled else {
             return false
         }
+        if googleOutbound?.hasPendingRecovery == true {
+            _ = await googleOutbound?.recoverPendingOperation()
+        }
+        guard !Task.isCancelled else { return false }
 
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
@@ -116,6 +133,11 @@ final class DayWeaveServiceCoordinator: ObservableObject {
                 }
                 return
             }
+        }
+
+        if googleOutbound?.hasPendingRecovery == true {
+            _ = await googleOutbound?.recoverPendingOperation()
+            guard operationIsCurrent(generation) else { return }
         }
 
         guard await reconcileAndStartPolling(generation: generation) else {

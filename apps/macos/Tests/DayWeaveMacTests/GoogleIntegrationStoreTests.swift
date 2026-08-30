@@ -279,6 +279,120 @@ struct GoogleIntegrationStoreTests {
         #expect(store.status.isFailure)
     }
 
+    @Test("Calendar publishing scope upgrade is explicit and crash recoverable")
+    func calendarPublishingScopeUpgradeIsExplicit() async throws {
+        let account = try Self.account()
+        let snapshot = try Self.accountsSnapshot(accounts: [account])
+        let authorization = try Self.authorization()
+        let journalStore = InMemoryGoogleOAuthStartJournalStore()
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(snapshot), .value(snapshot)],
+            oauthStarts: [.value(authorization)],
+            collections: [.value([])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: account.id))]
+        )
+        let store = Self.store(transport: transport, journalStore: journalStore)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        #expect(store.canEnableCalendarPublishing(for: account))
+        await store.enableCalendarPublishing(for: account)
+
+        let record = try #require((await transport.oauthStartRecords()).last)
+        #expect(record.request.services == [.calendar])
+        #expect(record.request.forceConsent)
+        #expect(record.request.accountID == account.id)
+        #expect(!record.request.connectNew)
+        #expect(record.request.makeDefault)
+        #expect(journalStore.journal?.request == record.request)
+        #expect(store.canOpenAuthorization)
+    }
+
+    @Test("owner Calendar with full scope can become writable with exact policy")
+    func writableCalendarConfigurationPreservesPublicationPolicy() async throws {
+        let account = try Self.account(calendarWrite: true)
+        let initial = try Self.collection(accountID: account.id)
+        let policy = GoogleCalendarPolicy(
+            publishAllDay: true,
+            publishTentative: false,
+            publishFree: true
+        )
+        let updated = try Self.collection(
+            accountID: account.id,
+            selected: true,
+            role: .writable,
+            revision: 2,
+            publishAllDay: true,
+            publishFree: true
+        )
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
+            collections: [.value([initial])],
+            configurations: [.value(updated)],
+            syncStatuses: [.value(try Self.syncStatus(accountID: account.id))]
+        )
+        let store = Self.store(transport: transport)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        await store.configureSource(
+            initial,
+            selected: true,
+            visible: true,
+            role: .writable,
+            calendarPolicy: policy
+        )
+
+        let record = try #require((await transport.configureRecords()).last)
+        #expect(record.role == .writable)
+        #expect(record.selected)
+        #expect(record.calendarPolicy == policy)
+        #expect(store.collectionsByAccount[account.id] == [updated])
+        #expect(!store.status.isFailure)
+    }
+
+    @Test("Calendar publishing rejects missing scope and non-writer roles locally")
+    func writableCalendarRequiresScopeAndProviderRole() async throws {
+        let readOnlyAccount = try Self.account()
+        let owner = try Self.collection(accountID: readOnlyAccount.id)
+        let missingScopeTransport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [readOnlyAccount]))],
+            collections: [.value([owner])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: readOnlyAccount.id))]
+        )
+        let missingScopeStore = Self.store(transport: missingScopeTransport)
+        missingScopeStore.activate(automaticallyReload: false)
+        await missingScopeStore.reload()
+        await missingScopeStore.configureSource(
+            owner,
+            selected: true,
+            visible: true,
+            role: .writable
+        )
+        #expect(await missingScopeTransport.configureRecords().isEmpty)
+
+        let writableAccount = try Self.account(calendarWrite: true)
+        let reader = try Self.collection(
+            accountID: writableAccount.id,
+            providerAccessRole: "reader"
+        )
+        let readerTransport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [writableAccount]))],
+            collections: [.value([reader])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: writableAccount.id))]
+        )
+        let readerStore = Self.store(transport: readerTransport)
+        readerStore.activate(automaticallyReload: false)
+        await readerStore.reload()
+        await readerStore.configureSource(
+            reader,
+            selected: true,
+            visible: true,
+            role: .writable
+        )
+        #expect(await readerTransport.configureRecords().isEmpty)
+    }
+
     @Test("failed discovery refreshes inventory without claiming completion")
     func failedDiscoveryKeepsUncertainOutcome() async throws {
         let account = try Self.account()
@@ -1646,13 +1760,17 @@ struct GoogleIntegrationStoreTests {
     private static func account(
         label: String = "owner@example.com",
         revision: UInt64 = 1,
-        status: GoogleAccountStatus = .active
+        status: GoogleAccountStatus = .active,
+        calendarWrite: Bool = false
     ) throws -> GoogleAccount {
         let syncEnabled = status == .active ? "true" : "false"
         let isDefault = status == .revoked ? "false" : "true"
+        let calendarScope = calendarWrite
+            ? "https://www.googleapis.com/auth/calendar"
+            : "https://www.googleapis.com/auth/calendar.readonly"
         let scopes = status == .revoked
             ? "[]"
-            : "[\"openid\",\"https://www.googleapis.com/auth/calendar.readonly\",\"https://www.googleapis.com/auth/tasks.readonly\"]"
+            : "[\"openid\",\"\(calendarScope)\",\"https://www.googleapis.com/auth/tasks.readonly\"]"
         let tokenExpiresAt = status == .revoked
             ? "null"
             : "\"\(timestamp(now.addingTimeInterval(3_600)))\""
@@ -1715,9 +1833,14 @@ struct GoogleIntegrationStoreTests {
         selected: Bool = false,
         visible: Bool = true,
         role: GoogleSyncRole = .readOnly,
-        revision: UInt64 = 1
+        revision: UInt64 = 1,
+        providerAccessRole: String? = "owner",
+        publishAllDay: Bool = false,
+        publishTentative: Bool = false,
+        publishFree: Bool = false
     ) throws -> GoogleSyncCollection {
-        try decode(
+        let encodedProviderAccessRole = providerAccessRole.map { "\"\($0)\"" } ?? "null"
+        return try decode(
             GoogleSyncCollection.self,
             """
             {
@@ -1726,7 +1849,7 @@ struct GoogleIntegrationStoreTests {
               "kind":"\(kind.rawValue)",
               "remote_collection_id":"primary",
               "display_name":"Primary source",
-              "provider_access_role":"owner",
+              "provider_access_role":\(encodedProviderAccessRole),
               "provider_primary":true,
               "provider_selected":true,
               "provider_hidden":false,
@@ -1739,9 +1862,9 @@ struct GoogleIntegrationStoreTests {
                 "tentative":"visible_nonblocking",
                 "free":"visible_nonblocking",
                 "all_day":"visible_nonblocking",
-                "publish_all_day":false,
-                "publish_tentative":false,
-                "publish_free":false
+                "publish_all_day":\(publishAllDay),
+                "publish_tentative":\(publishTentative),
+                "publish_free":\(publishFree)
               },
               "revision":\(revision),
               "discovered_at":"\(timestamp(now.addingTimeInterval(-3_600)))",
