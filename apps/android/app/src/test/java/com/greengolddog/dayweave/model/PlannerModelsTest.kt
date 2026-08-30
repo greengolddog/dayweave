@@ -49,20 +49,30 @@ class PlannerModelsTest {
 
     @Test
     fun currentPlanRequiresTheCurrentDeviceZone() {
+        val revision = PublishedScheduleRevisionSnapshot(
+            id = "11111111-1111-4111-8111-111111111111",
+            revision = "1:11111111-1111-4111-8111-111111111111",
+            revisionNumber = 1uL,
+            inputDigest = "sha256:${"a".repeat(64)}",
+            horizonStart = "2026-09-01T00:00:00Z",
+            horizonEnd = "2026-09-02T00:00:00Z",
+            timezoneName = "Europe/Madrid",
+            publishedAt = "2026-09-01T07:00:00Z",
+        )
         val state = DayWeaveUiState(
             canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1",
             scheduleInputDigest = "sha256:${"a".repeat(64)}",
             scheduleGeneratedAt = "2026-09-01T07:00:00Z",
             schedulePlanningZoneId = "Europe/Madrid",
-            publishedScheduleRevision = PublishedScheduleRevisionSnapshot(
-                id = "11111111-1111-4111-8111-111111111111",
-                revision = "1:11111111-1111-4111-8111-111111111111",
-                revisionNumber = 1uL,
-                inputDigest = "sha256:${"a".repeat(64)}",
-                horizonStart = "2026-09-01T00:00:00Z",
-                horizonEnd = "2026-09-02T00:00:00Z",
-                timezoneName = "Europe/Madrid",
-                publishedAt = "2026-09-01T07:00:00Z",
+            publishedScheduleRevision = revision,
+            publishedScheduleProof = PublishedScheduleProofSnapshot(
+                schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+                syncOrigin = "https://api.example.test/",
+                configurationId = "connection-1",
+                revision = revision,
+                asOf = "2026-09-01T07:00:00Z",
+                blocks = emptyList(),
             ),
         )
 

@@ -327,6 +327,40 @@ class PlannerPersistenceTest {
         migrated.close()
     }
 
+    @Test
+    fun migrationEightToNinePreservesV7PayloadUntilRepositoryRewrite() {
+        System.loadLibrary("sqlcipher")
+        migrationHelper.createDatabase(MIGRATION_DATABASE, 8).apply {
+            execSQL(
+                "INSERT INTO planner_snapshot " +
+                    "(singletonId, payload, updatedAtEpochMillis, payloadFormat) " +
+                    "VALUES (1, '{\"canary\":\"SYNTHETIC-PUBLICATION-PROOF-ANDROID\"}', " +
+                    "1291, '${PlannerSnapshotFormats.JSON_V7}')",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_DATABASE,
+            9,
+            true,
+            PlannerDatabaseMigrations.MIGRATION_8_9,
+        )
+        migrated.query(
+            "SELECT payload, updatedAtEpochMillis, payloadFormat " +
+                "FROM planner_snapshot WHERE singletonId = 1",
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(
+                "{\"canary\":\"SYNTHETIC-PUBLICATION-PROOF-ANDROID\"}",
+                cursor.getString(0),
+            )
+            assertEquals(1291L, cursor.getLong(1))
+            assertEquals(PlannerSnapshotFormats.JSON_V7, cursor.getString(2))
+        }
+        migrated.close()
+    }
+
     private companion object {
         const val RESTORE_DATABASE = "planner-persistence-restore-test.db"
         const val MIGRATION_DATABASE = "planner-persistence-migration-test.db"

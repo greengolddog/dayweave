@@ -128,6 +128,8 @@ class ExecutionSyncManager(
             ?: throw InvalidExecutionStateException("This block is not canonical.")
         val itemRevision = context.block.canonicalRevision
             ?: throw InvalidExecutionStateException("The canonical item revision is unavailable.")
+        val sessionIndex = context.block.sessionIndex
+            ?: throw InvalidExecutionStateException("The server session index is unavailable.")
         val sessionId = newUuid().toString()
         CommandSpec(
             type = "start",
@@ -136,7 +138,7 @@ class ExecutionSyncManager(
                 itemId = itemId,
                 itemRevision = itemRevision,
                 occurrenceId = context.block.occurrenceId,
-                sessionIndex = context.block.sessionIndex,
+                sessionIndex = sessionIndex,
                 plannedBlockId = context.block.id,
                 sourceDeviceId = context.deviceId,
             ),
@@ -147,7 +149,7 @@ class ExecutionSyncManager(
                 put("item_id", itemId)
                 put("item_revision", itemRevision)
                 context.block.occurrenceId?.let { put("occurrence_id", it) }
-                put("session_index", context.block.sessionIndex)
+                put("session_index", sessionIndex)
                 put("planned_block_id", context.block.id)
                 put("device_id", context.deviceId)
             },

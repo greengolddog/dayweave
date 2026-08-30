@@ -6,6 +6,9 @@ import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
@@ -175,10 +178,7 @@ class ExecutionSyncManagerTest {
             if (attempts == 1) throw IOException("response lost")
             RemoteExecutionMutation(1, changed, changed, replayed = true)
         }
-        val initial = DayWeaveUiState(
-            schedule = listOf(scheduleItem(BLOCK_ID, 0)),
-            canonicalSyncOrigin = "https://api.example.test/",
-        )
+        val initial = plannerStore().state.value
         val firstStore = PlannerStore(initial, repository, firstScope)
         withTimeout(3_000) { firstStore.loadState.first { it == PlannerLoadState.READY } }
         try {
@@ -228,6 +228,25 @@ class ExecutionSyncManagerTest {
         assertNull(store.state.value.pendingExecutionCommand)
         assertNotNull(store.state.value.executionDeviceId)
         assertTrue(transport.commandBodies.isEmpty())
+    }
+
+    @Test
+    fun canonicalStartRejectsMissingServerSessionIndexWithoutSendingCommand() = runBlocking {
+        val published = plannerStore().state.value
+        val store = PlannerStore(
+            published.copy(
+                schedule = listOf(published.schedule.single().copy(sessionIndex = null)),
+            ),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val transport = FakeExecutionTransport()
+
+        val outcome = manager(store, transport).start(BLOCK_ID)
+
+        assertEquals(ExecutionSyncOutcome.INVALID_LOCAL_STATE, outcome)
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertTrue(transport.commandBodies.isEmpty())
+        assertEquals(ItemStatus.SCHEDULED, store.state.value.schedule.single().status)
     }
 
     @Test
@@ -959,7 +978,7 @@ class ExecutionSyncManagerTest {
 
         assertEquals(
             ExecutionSyncOutcome.INVALID_LOCAL_STATE,
-            manager(regressed, transport).start(BLOCK_ID),
+            manager(regressed, transport, ExecutionCredentialStore(null)).start(BLOCK_ID),
         )
         assertTrue(transport.commandBodies.isEmpty())
         assertEquals(ItemStatus.COMPLETED, regressed.state.value.schedule.single().status)
@@ -1239,6 +1258,7 @@ class ExecutionSyncManagerTest {
                 schedule = listOf(block),
                 canonicalItems = listOf(canonicalItem),
                 canonicalSyncOrigin = "https://api.example.test/",
+                canonicalConfigurationId = DEFAULT_CONFIGURATION_ID,
                 occurrenceSeriesItemIds = mapOf(OCCURRENCE_ID to ITEM_ID),
             ),
             nowEpochMillis = { NOW.toEpochMilli() },
@@ -1837,19 +1857,74 @@ class ExecutionSyncManagerTest {
 
     private fun plannerStore(
         split: Boolean = false,
-        configurationId: String? = null,
+        configurationId: String = DEFAULT_CONFIGURATION_ID,
     ): PlannerStore {
         val blocks = mutableListOf(scheduleItem(BLOCK_ID, 0))
         if (split) blocks += scheduleItem(SECOND_BLOCK_ID, 1)
+        val revision = publishedRevision()
         return PlannerStore(
             initialState = DayWeaveUiState(
                 schedule = blocks,
+                canonicalItems = listOf(canonicalItem()),
                 canonicalSyncOrigin = "https://api.example.test/",
                 canonicalConfigurationId = configurationId,
+                publishedScheduleRevision = revision,
+                publishedScheduleProof = PublishedScheduleProofSnapshot(
+                    schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+                    syncOrigin = "https://api.example.test/",
+                    configurationId = configurationId,
+                    revision = revision,
+                    asOf = NOW.toString(),
+                    blocks = blocks.map(::publishedBlockProof),
+                ),
+                scheduleInputDigest = revision.inputDigest,
+                scheduleGeneratedAt = NOW.toString(),
+                schedulePlanningZoneId = "Europe/Madrid",
             ),
             nowEpochMillis = { NOW.toEpochMilli() },
         )
     }
+
+    private fun canonicalItem() = CanonicalItemSnapshot(
+        id = ITEM_ID,
+        kind = "task",
+        status = "planned",
+        title = "Write test plan",
+        timezoneName = "Europe/Madrid",
+        durationSeconds = 1_800,
+        flexibleConstraintsJson = "{}",
+        splitPolicyJson = "{\"type\":\"indivisible\"}",
+        importance = 50,
+        urgency = 50,
+        siblingOrder = 0,
+        isExecutable = true,
+        revision = 7,
+        createdAt = NOW.toString(),
+        updatedAt = NOW.toString(),
+    )
+
+    private fun publishedRevision() = PublishedScheduleRevisionSnapshot(
+        id = PUBLISHED_REVISION_ID,
+        revision = "1:$PUBLISHED_REVISION_ID",
+        revisionNumber = 1uL,
+        inputDigest = "sha256:${"a".repeat(64)}",
+        horizonStart = "2026-09-01T00:00:00Z",
+        horizonEnd = "2026-09-02T00:00:00Z",
+        timezoneName = "Europe/Madrid",
+        publishedAt = NOW.toString(),
+    )
+
+    private fun publishedBlockProof(block: ScheduleItem) =
+        PublishedScheduleBlockProofSnapshot(
+            id = block.id,
+            itemId = requireNotNull(block.canonicalItemId),
+            itemRevision = requireNotNull(block.canonicalRevision),
+            occurrenceId = block.occurrenceId,
+            sessionIndex = requireNotNull(block.sessionIndex),
+            start = requireNotNull(block.absoluteStartAt),
+            end = requireNotNull(block.absoluteEndAt),
+            kind = requireNotNull(block.canonicalBlockKind),
+        )
 
     private fun scheduleItem(id: String, sessionIndex: Int) = ScheduleItem(
         id = id,
@@ -1961,11 +2036,13 @@ class ExecutionSyncManagerTest {
         const val OTHER_SESSION_ID = "66666666-6666-4666-8666-666666666666"
         const val OCCURRENCE_ID = "77777777-7777-4777-8777-777777777777"
         const val OTHER_DEVICE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        const val PUBLISHED_REVISION_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+        const val DEFAULT_CONFIGURATION_ID = "configuration-1"
     }
 }
 
 private class ExecutionCredentialStore(
-    private val configurationId: String? = null,
+    private val configurationId: String? = "configuration-1",
 ) : ApiCredentialStore {
     override fun snapshot() = ApiConnectionSnapshot(
         baseUrl = "https://api.example.test/",

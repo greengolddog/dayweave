@@ -18,6 +18,8 @@ import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
@@ -263,16 +265,137 @@ class PlannerStoreTest {
         assertFalse(store.state.value.isCanonicalPlanCurrent(Instant.EPOCH, java.time.ZoneOffset.UTC))
 
         val revision = publishedRevision()
-        assertNotNull(store.commitSchedulePublication(pending, revision))
+        assertNotNull(store.commitSchedulePublication(pending, revision, replayed = false))
         assertEquals(null, store.state.value.pendingSchedulePublication)
         assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
         assertEquals(8L, store.state.value.canonicalItems.single().revision)
         assertEquals(revision, store.state.value.publishedScheduleRevision)
+        assertNotNull(store.state.value.publishedScheduleProof)
         assertTrue(store.state.value.isCanonicalPlanCurrent(Instant.EPOCH, java.time.ZoneId.of("UTC")))
 
-        val stale = runCatching { store.commitSchedulePublication(pending, revision) }
+        val stale = runCatching {
+            store.commitSchedulePublication(pending, revision, replayed = false)
+        }
         assertTrue(stale.isFailure)
         assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
+    fun replayedPublicationCannotMintProofAtStoreBoundary() {
+        val candidate = canonicalUpdate(
+            item = canonicalItem("planned", 8),
+            block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+            cursor = "cursor-replay",
+        )
+        val pending = publication(candidate)
+        val store = PlannerStore(DayWeaveUiState())
+        assertNotNull(store.stageSchedulePublication(pending))
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            store.commitSchedulePublication(
+                expected = pending,
+                revision = publishedRevision(),
+                replayed = true,
+            )
+        }
+
+        assertEquals(pending, store.state.value.pendingSchedulePublication)
+        assertNull(store.state.value.publishedScheduleProof)
+        assertTrue(store.state.value.schedule.isEmpty())
+    }
+
+    @Test
+    fun overlappingPublishedBlockRetainsExactProofAcrossHorizonBoundary() {
+        val overlapping = canonicalBlock(ItemStatus.SCHEDULED, 8).copy(
+            startMinute = 0,
+            durationMinutes = 60,
+            absoluteStartAt = "1969-12-31T23:00:00Z",
+            absoluteEndAt = "1970-01-01T01:00:00Z",
+        )
+        val candidate = canonicalUpdate(
+            item = canonicalItem("planned", 8),
+            block = overlapping,
+            cursor = "cursor-overlap",
+        )
+        val pending = publication(candidate)
+        val store = PlannerStore(DayWeaveUiState())
+        assertNotNull(store.stageSchedulePublication(pending))
+
+        assertNotNull(
+            store.commitSchedulePublication(
+                expected = pending,
+                revision = publishedRevision(),
+                replayed = false,
+            ),
+        )
+
+        val proof = requireNotNull(store.state.value.publishedScheduleProof)
+        assertTrue(proof.hasValidShape())
+        assertTrue(proof.matches(store.state.value.schedule.single()))
+    }
+
+    @Test
+    fun canonicalStartRequiresExactBlockProofAndServerSessionIndex() {
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7)
+        val actionable = publishedCanonicalState(block = block).copy(
+            canonicalExecutionSyncOrigin = CANONICAL_ORIGIN,
+            canonicalExecutionConfigurationId = "connection-1",
+            canonicalExecutionHistoryVerified = true,
+        )
+        assertFalse(PlannerStore(actionable).isCanonicalExecutionStartBlocked(block.id))
+
+        val shifted = actionable.copy(
+            schedule = listOf(
+                block.copy(absoluteStartAt = "1970-01-01T01:05:00Z"),
+            ),
+        )
+        assertTrue(PlannerStore(shifted).isCanonicalExecutionStartBlocked(block.id))
+
+        val missingServerIndex = actionable.copy(
+            schedule = listOf(block.copy(sessionIndex = null)),
+        )
+        assertTrue(
+            PlannerStore(missingServerIndex).isCanonicalExecutionStartBlocked(block.id),
+        )
+
+        val localHelper = actionable.copy(publishedScheduleProof = null)
+        assertEquals(listOf(block), localHelper.schedule)
+        assertTrue(PlannerStore(localHelper).isCanonicalExecutionStartBlocked(block.id))
+
+        val extraCanonicalBlock = block.copy(
+            id = "55555555-5555-4555-8555-555555555555",
+            sessionIndex = 8,
+            absoluteStartAt = "1970-01-01T02:00:00Z",
+            absoluteEndAt = "1970-01-01T03:00:00Z",
+        )
+        val planSetMismatch = actionable.copy(
+            schedule = listOf(block, extraCanonicalBlock),
+        )
+        assertTrue(
+            PlannerStore(planSetMismatch).isCanonicalExecutionStartBlocked(block.id),
+        )
+    }
+
+    @Test
+    fun localShiftAndRecomposeInvalidateProofWithoutHidingSchedule() {
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7)
+        val shiftedStore = PlannerStore(
+            publishedCanonicalState(block = block).copy(
+                activeSession = ActiveSession(
+                    itemId = block.id,
+                    elapsedMinutes = 0,
+                    isPaused = false,
+                ),
+            ),
+        )
+        shiftedStore.doActiveLater()
+        assertEquals(block.startMinute + 60, shiftedStore.state.value.schedule.single().startMinute)
+        assertNull(shiftedStore.state.value.publishedScheduleProof)
+
+        val recomposedStore = PlannerStore(publishedCanonicalState(block = block))
+        recomposedStore.recompose()
+        assertEquals(listOf(block), recomposedStore.state.value.schedule)
+        assertNull(recomposedStore.state.value.publishedScheduleProof)
     }
 
     @Test
@@ -303,7 +426,11 @@ class PlannerStoreTest {
             store.state.value.copy(pendingSchedulePublication = pending),
         )
         org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
-            recoveryStore.commitSchedulePublication(pending, publishedRevision())
+            recoveryStore.commitSchedulePublication(
+                pending,
+                publishedRevision(),
+                replayed = false,
+            )
         }
         assertEquals(pending, recoveryStore.state.value.pendingSchedulePublication)
         assertNull(recoveryStore.state.value.publishedScheduleRevision)
@@ -1786,7 +1913,8 @@ class PlannerStoreTest {
             ),
         )
         assertEquals(ItemStatus.SCHEDULED, restarted.state.value.schedule.single().status)
-        assertFalse(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
+        // A fresh preview without a publication commit stays visible but cannot be started.
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
         requireNotNull(
             restarted.reconcileCanonicalExecution(
                 CANONICAL_ORIGIN,
@@ -1798,7 +1926,7 @@ class PlannerStoreTest {
             ),
         )
         assertEquals(ItemStatus.SCHEDULED, restarted.state.value.schedule.single().status)
-        assertFalse(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
         assertEquals(
             "user_kept_latest_item",
             restarted.state.value.terminalExecutionOutcomes.getValue(EXECUTION_ID)
@@ -2026,6 +2154,7 @@ class PlannerStoreTest {
         status = status,
         canonicalItemId = CANONICAL_ITEM_ID,
         canonicalRevision = revision,
+        sessionIndex = 0,
         absoluteStartAt = "1970-01-01T01:00:00Z",
         absoluteEndAt = "1970-01-01T02:00:00Z",
         planningZoneId = "UTC",
@@ -2104,16 +2233,43 @@ class PlannerStoreTest {
     private fun publishedCanonicalState(
         item: CanonicalItemSnapshot = canonicalItem("planned", 7),
         block: ScheduleItem = canonicalBlock(ItemStatus.SCHEDULED, 7),
-    ) = DayWeaveUiState(
-        canonicalItems = listOf(item),
-        canonicalSyncOrigin = CANONICAL_ORIGIN,
-        canonicalConfigurationId = "connection-1",
-        canonicalDeltaCursor = "cursor-1",
-        schedule = listOf(block),
-        publishedScheduleRevision = publishedRevision(),
-        scheduleInputDigest = publishedRevision().inputDigest,
-        scheduleGeneratedAt = "1970-01-01T00:00:00Z",
-        schedulePlanningZoneId = "UTC",
+    ): DayWeaveUiState {
+        val revision = publishedRevision()
+        return DayWeaveUiState(
+            canonicalItems = listOf(item),
+            canonicalSyncOrigin = CANONICAL_ORIGIN,
+            canonicalConfigurationId = "connection-1",
+            canonicalDeltaCursor = "cursor-1",
+            schedule = listOf(block),
+            publishedScheduleRevision = revision,
+            publishedScheduleProof = publishedProof(block, revision),
+            scheduleInputDigest = revision.inputDigest,
+            scheduleGeneratedAt = "1970-01-01T00:00:00Z",
+            schedulePlanningZoneId = "UTC",
+        )
+    }
+
+    private fun publishedProof(
+        block: ScheduleItem,
+        revision: PublishedScheduleRevisionSnapshot = publishedRevision(),
+    ) = PublishedScheduleProofSnapshot(
+        schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+        syncOrigin = CANONICAL_ORIGIN,
+        configurationId = "connection-1",
+        revision = revision,
+        asOf = "1970-01-01T00:00:00Z",
+        blocks = listOf(
+            PublishedScheduleBlockProofSnapshot(
+                id = block.id,
+                itemId = requireNotNull(block.canonicalItemId),
+                itemRevision = requireNotNull(block.canonicalRevision),
+                occurrenceId = block.occurrenceId,
+                sessionIndex = requireNotNull(block.sessionIndex),
+                start = requireNotNull(block.absoluteStartAt),
+                end = requireNotNull(block.absoluteEndAt),
+                kind = requireNotNull(block.canonicalBlockKind),
+            ),
+        ),
     )
 
     private fun canonicalMutation(
@@ -2139,6 +2295,7 @@ class PlannerStoreTest {
 
     private fun assertPublishedPlanInvalidated(store: PlannerStore) {
         assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.publishedScheduleProof)
         assertNull(store.state.value.scheduleInputDigest)
     }
 

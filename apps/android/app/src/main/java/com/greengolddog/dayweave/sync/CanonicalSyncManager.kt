@@ -217,6 +217,7 @@ class CanonicalSyncManager(
             planner.pendingProposalApplicationMutation != null ||
             planner.proposalApplications.isNotEmpty() ||
             planner.publishedScheduleRevision != null ||
+            planner.publishedScheduleProof != null ||
             planner.schedule.any { it.canonicalItemId != null } ||
             planner.canonicalExecutionSyncOrigin != null ||
             planner.canonicalExecutionSession != null ||
@@ -831,7 +832,11 @@ class CanonicalSyncManager(
             throw ReplayedSchedulePublicationNeedsFreshSnapshotException()
         }
         val committed = try {
-            plannerStore.commitSchedulePublication(pending, revision)
+            plannerStore.commitSchedulePublication(
+                expected = pending,
+                revision = revision,
+                replayed = response.replayed,
+            )
         } catch (error: IllegalArgumentException) {
             throw CanonicalConfigurationChangedException()
         }
@@ -876,8 +881,14 @@ class CanonicalSyncManager(
     }
 
     suspend fun start(blockId: String): CanonicalRefreshOutcome = focusTransitionMutex.withLock {
-        if (!plannerStore.state.value.isCanonicalPlanCurrent(now(), zoneId())) {
+        val current = plannerStore.state.value
+        if (!current.isCanonicalPlanCurrent(now(), zoneId())) {
             updateError("This cached plan is not for today. Recompose before starting new work.")
+            return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        val block = current.schedule.firstOrNull { it.id == blockId }
+        if (block?.canonicalItemId != null && !current.hasPublishedExecutionAuthority(block)) {
+            updateError("This block has no durable exact publication proof. Recompose first.")
             return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
         }
         if (hasUnscheduledRemaining(blockId)) {
@@ -2295,7 +2306,7 @@ class CanonicalSyncManager(
                     PreviousScheduleBlockRequest(
                         start = parseTimestamp(start).toInstant().toString(),
                         end = parseTimestamp(end).toInstant().toString(),
-                        sessionIndex = block.sessionIndex,
+                        sessionIndex = block.sessionIndex ?: return@mapNotNull null,
                     )
                 }
                 PreviousScheduleAssignmentRequest(
@@ -2734,8 +2745,10 @@ class CanonicalSyncManager(
             occurrenceId = block.occurrenceId,
             canonicalRevision = canonical.revision,
             sessionIndex = block.sessionIndex,
-            absoluteStartAt = start.toInstant().toString(),
-            absoluteEndAt = end.toInstant().toString(),
+            // The UI duration is clipped to today's visible lane, but publication/execution
+            // identity retains the server's exact bounds (including overnight pinned events).
+            absoluteStartAt = actualStart.toInstant().toString(),
+            absoluteEndAt = actualEnd.toInstant().toString(),
             planningZoneId = planningZone.id,
             canonicalBlockKind = block.kind,
         )
@@ -2919,7 +2932,8 @@ class CanonicalSyncManager(
             current.canonicalRecentlyDeleted.isNotEmpty() ||
             current.pendingCanonicalAuthoringMutations.isNotEmpty() ||
             current.pendingCanonicalMutation != null ||
-            current.publishedScheduleRevision != null
+            current.publishedScheduleRevision != null ||
+            current.publishedScheduleProof != null
         val pendingPublicationMismatch = current.pendingSchedulePublication?.let { pending ->
             pending.syncOrigin != origin || pending.configurationId != configurationId
         } ?: false

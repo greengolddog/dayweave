@@ -7,6 +7,7 @@ import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -108,7 +109,8 @@ data class ScheduleItem(
     val canonicalItemId: String? = null,
     val occurrenceId: String? = null,
     val canonicalRevision: Long? = null,
-    val sessionIndex: Int = 0,
+    /** Server-assigned execution identity. Null for local helpers and legacy cached blocks. */
+    val sessionIndex: Int? = null,
     /** Exact composed instants retained for DST-safe stability and overlap calculations. */
     val absoluteStartAt: String? = null,
     val absoluteEndAt: String? = null,
@@ -425,6 +427,137 @@ data class PublishedScheduleRevisionSnapshot(
     val publishedAt: String,
 )
 
+/** Exact immutable identity of one item-backed block accepted for schedule publication. */
+@Serializable
+data class PublishedScheduleBlockProofSnapshot(
+    val id: String,
+    val itemId: String,
+    val itemRevision: Long,
+    val occurrenceId: String? = null,
+    val sessionIndex: Int,
+    val start: String,
+    val end: String,
+    val kind: String,
+) {
+    fun hasValidShape(horizonStart: Instant, horizonEnd: Instant): Boolean = runCatching {
+        requireCanonicalUuid(id, "published schedule block")
+        requireCanonicalUuid(itemId, "published schedule item")
+        occurrenceId?.let { requireCanonicalUuid(it, "published schedule occurrence") }
+        require(itemRevision > 0)
+        require(sessionIndex in 0..UShort.MAX_VALUE.toInt())
+        require(kind.isNotBlank() && kind.length <= 128 && kind.none(Char::isISOControl))
+        val blockStart = Instant.parse(start)
+        val blockEnd = Instant.parse(end)
+        require(blockStart < blockEnd)
+        // Calendar and pinned blocks may retain their original overnight bounds. Publication
+        // authority therefore requires exact overlap with the receipt horizon, not containment.
+        require(blockStart < horizonEnd && horizonStart < blockEnd)
+    }.isSuccess
+
+    fun matches(block: ScheduleItem): Boolean =
+        block.id == id &&
+            block.canonicalItemId == itemId &&
+            block.canonicalRevision == itemRevision &&
+            block.occurrenceId == occurrenceId &&
+            block.sessionIndex == sessionIndex &&
+            block.canonicalBlockKind == kind &&
+            sameInstant(block.absoluteStartAt, start) &&
+            sameInstant(block.absoluteEndAt, end)
+
+    private fun sameInstant(left: String?, right: String): Boolean =
+        left?.let { raw -> runCatching { Instant.parse(raw) }.getOrNull() } ==
+            runCatching { Instant.parse(right) }.getOrNull()
+}
+
+/**
+ * Durable positive authority for the exact candidate installed after a validated, non-replayed
+ * schedule publication. It is encrypted as part of the same planner snapshot generation.
+ */
+@Serializable
+data class PublishedScheduleProofSnapshot(
+    val schemaVersion: Int,
+    val syncOrigin: String,
+    val configurationId: String,
+    val revision: PublishedScheduleRevisionSnapshot,
+    val asOf: String,
+    val blocks: List<PublishedScheduleBlockProofSnapshot>,
+) {
+    fun hasValidShape(): Boolean = runCatching {
+        require(schemaVersion == CURRENT_SCHEMA_VERSION)
+        require(
+            syncOrigin.isNotBlank() && syncOrigin.length <= 4_096 &&
+                syncOrigin.none(Char::isISOControl),
+        )
+        require(
+            configurationId.isNotBlank() && configurationId.length <= 4_096 &&
+                configurationId.none(Char::isISOControl),
+        )
+        val revisionId = UUID.fromString(revision.id)
+        require(revisionId != NIL_PUBLICATION_UUID && revisionId.toString() == revision.id)
+        require(revision.revisionNumber > 0uL)
+        require(revision.revision == "${revision.revisionNumber}:${revision.id}")
+        require(
+            revision.inputDigest.length == 71 &&
+                revision.inputDigest.startsWith("sha256:") &&
+                revision.inputDigest.drop(7).all { it in '0'..'9' || it in 'a'..'f' },
+        )
+        val exactAsOf = Instant.parse(asOf)
+        val horizonStart = Instant.parse(revision.horizonStart)
+        val horizonEnd = Instant.parse(revision.horizonEnd)
+        require(horizonStart <= exactAsOf && exactAsOf < horizonEnd)
+        require(
+            revision.timezoneName.isNotBlank() && revision.timezoneName.length <= 255 &&
+                revision.timezoneName.none(Char::isISOControl),
+        )
+        requireNotNull(runCatching { ZoneId.of(revision.timezoneName) }.getOrNull())
+        requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
+        require(blocks.size <= MAX_PUBLISHED_BLOCKS)
+        require(blocks.map { it.id }.distinct().size == blocks.size)
+        require(blocks.all { it.hasValidShape(horizonStart, horizonEnd) })
+    }.isSuccess
+
+    fun matchesStateBinding(state: DayWeaveUiState): Boolean =
+        hasValidShape() &&
+            state.canonicalSyncOrigin == syncOrigin &&
+            state.canonicalConfigurationId == configurationId &&
+            state.publishedScheduleRevision == revision &&
+            state.scheduleInputDigest == revision.inputDigest &&
+            sameInstant(state.scheduleGeneratedAt, asOf) &&
+            state.schedulePlanningZoneId == revision.timezoneName
+
+    fun matches(block: ScheduleItem): Boolean =
+        hasValidShape() && blocks.singleOrNull { it.id == block.id }?.matches(block) == true
+
+    /**
+     * Verifies the complete canonical plan accepted by publication, rather than granting
+     * authority block-by-block while an unproved canonical placement is also present. Execution
+     * lease projections arrive after publication and local rows have no canonical item identity,
+     * so neither belongs to the publication-backed set.
+     */
+    fun matchesPublishedPlan(schedule: List<ScheduleItem>): Boolean {
+        if (!hasValidShape()) return false
+        val publicationBacked = schedule.filter { block ->
+            block.canonicalItemId != null &&
+                block.canonicalBlockKind != REMOTE_EXECUTION_LEASE_KIND
+        }
+        if (publicationBacked.size != blocks.size) return false
+        val scheduleById = publicationBacked.associateBy(ScheduleItem::id)
+        if (scheduleById.size != publicationBacked.size) return false
+        return blocks.all { proof -> scheduleById[proof.id]?.let(proof::matches) == true }
+    }
+
+    private fun sameInstant(left: String?, right: String): Boolean =
+        left?.let { raw -> runCatching { Instant.parse(raw) }.getOrNull() } ==
+            runCatching { Instant.parse(right) }.getOrNull()
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+        private const val MAX_PUBLISHED_BLOCKS = 10_000
+        private const val REMOTE_EXECUTION_LEASE_KIND = "remote_execution_lease"
+        private val NIL_PUBLICATION_UUID = UUID(0L, 0L)
+    }
+}
+
 /**
  * Crash-replay journal written before a schedule publication can leave the device.
  *
@@ -621,6 +754,8 @@ data class DayWeaveUiState(
     val proposalApplications: Map<String, ProposalApplicationReceiptSnapshot> = emptyMap(),
     /** Receipt proving that [scheduleInputDigest] was published under this exact binding. */
     val publishedScheduleRevision: PublishedScheduleRevisionSnapshot? = null,
+    /** Exact, encrypted publication authority. Legacy revision receipts are not actionable. */
+    val publishedScheduleProof: PublishedScheduleProofSnapshot? = null,
     val scheduleInputDigest: String? = null,
     val scheduleGeneratedAt: String? = null,
     val schedulePlanningZoneId: String? = null,
@@ -741,13 +876,30 @@ data class DayWeaveUiState(
     ): Boolean {
         if (pendingSchedulePublication != null) return false
         if (canonicalSyncOrigin == null) return true
-        val published = publishedScheduleRevision ?: return false
-        if (published.inputDigest != scheduleInputDigest) return false
+        val proof = publishedScheduleProof ?: return false
+        if (!proof.matchesStateBinding(this) || !proof.matchesPublishedPlan(schedule)) return false
         val zone = schedulePlanningZoneId?.let { raw ->
             runCatching { ZoneId.of(raw) }.getOrNull()
         } ?: return false
-        return published.timezoneName == zone.id && zone == currentZone &&
+        return proof.revision.timezoneName == zone.id && zone == currentZone &&
             canonicalPlanningDate() == reference.atZone(currentZone).toLocalDate()
+    }
+
+    /** Exact publication authority for one unchanged canonical server block. */
+    fun hasPublishedExecutionAuthority(block: ScheduleItem): Boolean {
+        if (pendingSchedulePublication != null || block.sessionIndex == null) return false
+        val proof = publishedScheduleProof ?: return false
+        if (
+            !proof.matchesStateBinding(this) || !proof.matchesPublishedPlan(schedule) ||
+            !proof.matches(block)
+        ) {
+            return false
+        }
+        val itemId = block.canonicalItemId ?: return false
+        val itemRevision = block.canonicalRevision ?: return false
+        return canonicalItems.singleOrNull { it.id == itemId }?.let { item ->
+            item.revision == itemRevision && item.isExecutable && item.deletedAt == null
+        } == true
     }
 
     companion object {

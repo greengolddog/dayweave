@@ -43,11 +43,12 @@ object PlannerSnapshotFormats {
     const val JSON_V5 = "json-v5-schedule-publication-journal"
     const val JSON_V6 = "json-v6-proposal-application-journal"
     const val JSON_V7 = "json-v7-canonical-authoring"
+    const val JSON_V8 = "json-v8-exact-schedule-publication-proof"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -111,6 +112,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_7_8 = object : Migration(7, 8) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * The encrypted payload gains exact per-block publication authority. No plaintext columns
+     * change; the Room version prevents rollback to a binary that could ignore this start gate.
+     */
+    val MIGRATION_8_9 = object : Migration(8, 9) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -158,6 +167,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_5_6,
                 PlannerDatabaseMigrations.MIGRATION_6_7,
                 PlannerDatabaseMigrations.MIGRATION_7_8,
+                PlannerDatabaseMigrations.MIGRATION_8_9,
             )
             .build()
     }

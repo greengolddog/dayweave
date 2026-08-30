@@ -32,6 +32,8 @@ import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
@@ -183,7 +185,10 @@ class PlannerStore(
 
     fun startItem(id: String) {
         mutate { current ->
-            if (current.schedule.none { it.id == id }) return@mutate current
+            val target = current.schedule.firstOrNull { it.id == id } ?: return@mutate current
+            // Canonical and helper-composed canonical-looking blocks must enter through the
+            // server-authoritative execution path, never this device-local timer.
+            if (target.canonicalItemId != null) return@mutate current
 
             val schedule = current.schedule.map { item ->
                 when {
@@ -275,6 +280,7 @@ class PlannerStore(
                     }
                 }.sortedBy { it.startMinute },
                 activeSession = null,
+                publishedScheduleProof = null,
                 scheduleMessage = "Moved one hour later · no hard constraints were crossed",
             )
         }
@@ -467,7 +473,10 @@ class PlannerStore(
             require(current.pendingProposalApplicationMutation == null) {
                 "A proposal application must be reconciled before direct plan replacement"
             }
-            canonicalPlanState(current, update).copy(publishedScheduleRevision = null)
+            canonicalPlanState(current, update).copy(
+                publishedScheduleRevision = null,
+                publishedScheduleProof = null,
+            )
         }
     }
 
@@ -695,6 +704,9 @@ class PlannerStore(
                 publishedScheduleRevision = current.publishedScheduleRevision.takeUnless {
                     authoringProofInvalidated
                 },
+                publishedScheduleProof = current.publishedScheduleProof.takeUnless {
+                    authoringProofInvalidated
+                },
                 scheduleInputDigest = update.inputDigest.takeUnless { authoringProofInvalidated },
                 scheduleGeneratedAt = update.generatedAt,
                 schedulePlanningZoneId = update.planningZoneId,
@@ -780,9 +792,12 @@ class PlannerStore(
     fun commitSchedulePublication(
         expected: PendingSchedulePublication,
         revision: PublishedScheduleRevisionSnapshot,
+        replayed: Boolean,
     ): PlannerPersistenceReceipt? {
         validateSchedulePublicationJournal(expected)
         validatePublishedScheduleRevision(expected, revision)
+        require(!replayed) { "A replayed publication cannot grant execution authority" }
+        val proof = publishedScheduleProof(expected, revision)
         return mutateDurably { current ->
             require(current.pendingSchedulePublication == expected) {
                 "Schedule publication changed before its response was committed"
@@ -794,6 +809,7 @@ class PlannerStore(
             accepted.copy(
                 pendingSchedulePublication = null,
                 publishedScheduleRevision = revision,
+                publishedScheduleProof = proof,
             )
         }
     }
@@ -816,6 +832,7 @@ class PlannerStore(
             current.copy(
                 pendingSchedulePublication = null,
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage =
                     "An exact publication replay may be superseded · recomposing before use",
@@ -835,6 +852,7 @@ class PlannerStore(
             current.copy(
                 pendingSchedulePublication = null,
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage =
                     "The validated preview became stale · recomposing before schedule use",
@@ -1053,6 +1071,7 @@ class PlannerStore(
         },
         inbox = inbox.filterNot { it.id == "proposal-${receipt.proposalId}" },
         publishedScheduleRevision = null,
+        publishedScheduleProof = null,
         scheduleInputDigest = null,
     )
 
@@ -1174,6 +1193,58 @@ class PlannerStore(
         require(revision.horizonEnd == request.schedule.horizonEnd)
         require(revision.timezoneName == request.schedule.timezoneName)
         requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
+    }
+
+    private fun publishedScheduleProof(
+        publication: PendingSchedulePublication,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PublishedScheduleProofSnapshot {
+        val configurationId = requireNotNull(publication.configurationId) {
+            "A schedule publication needs an opaque credential binding"
+        }
+        val request = validateSchedulePublishHttpRequest(
+            expectedBaseUrl = publication.syncOrigin,
+            request = publication.request,
+        )
+        val itemBackedBlocks = publication.candidate.schedule.filter {
+            it.canonicalItemId != null
+        }
+        val blocks = itemBackedBlocks.map { block ->
+            PublishedScheduleBlockProofSnapshot(
+                id = block.id,
+                itemId = requireNotNull(block.canonicalItemId),
+                itemRevision = requireNotNull(block.canonicalRevision) {
+                    "A published block needs an exact item revision"
+                },
+                occurrenceId = block.occurrenceId,
+                sessionIndex = requireNotNull(block.sessionIndex) {
+                    "A published block needs its server session index"
+                },
+                start = requireNotNull(block.absoluteStartAt) {
+                    "A published block needs an exact start"
+                },
+                end = requireNotNull(block.absoluteEndAt) {
+                    "A published block needs an exact end"
+                },
+                kind = requireNotNull(block.canonicalBlockKind) {
+                    "A published block needs its server kind"
+                },
+            )
+        }.sortedBy { it.id }
+        val proof = PublishedScheduleProofSnapshot(
+            schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+            syncOrigin = publication.syncOrigin,
+            configurationId = configurationId,
+            revision = revision,
+            asOf = request.schedule.asOf,
+            blocks = blocks,
+        )
+        require(proof.hasValidShape()) { "Published schedule proof is invalid" }
+        require(proof.blocks.size == itemBackedBlocks.size)
+        require(proof.matchesPublishedPlan(publication.candidate.schedule)) {
+            "Published schedule proof does not match the accepted candidate"
+        }
+        return proof
     }
 
     fun canonicalAuthoringMutation(id: String): PendingCanonicalAuthoringMutation? =
@@ -1332,6 +1403,7 @@ class PlannerStore(
                 current.copy(
                     pendingCanonicalAuthoringMutations = mutations,
                     publishedScheduleRevision = null,
+                    publishedScheduleProof = null,
                     scheduleInputDigest = null,
                     scheduleMessage =
                         "Queued hierarchy changes rebased to authoritative parent revisions",
@@ -1488,6 +1560,7 @@ class PlannerStore(
                 pendingCanonicalAuthoringMutations = current.pendingCanonicalAuthoringMutations
                     .replaceAt(index, replacement),
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage = "Canonical draft updated locally",
             )
@@ -1581,6 +1654,7 @@ class PlannerStore(
                 pendingCanonicalAuthoringMutations =
                     current.pendingCanonicalAuthoringMutations + mutation,
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage = "Canonical ${operation.name.lowercase()} saved locally",
             )
@@ -1783,6 +1857,7 @@ class PlannerStore(
                 schedule = current.schedule.filterNot { it.id in removedBlockIds },
                 activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage = "Canonical ${durableExpected.operation.name.lowercase()} confirmed · recompose required",
             )
@@ -1877,6 +1952,7 @@ class PlannerStore(
                 schedule = current.schedule.filterNot { it.id in removedBlockIds },
                 activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
                 publishedScheduleRevision = null,
+                publishedScheduleProof = null,
                 scheduleInputDigest = null,
                 scheduleMessage = "Canonical deletion retained for restore",
             )
@@ -2409,6 +2485,7 @@ class PlannerStore(
             schedule = current.schedule.filterNot { it.canonicalItemId == pending.itemId },
             activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
             publishedScheduleRevision = null,
+            publishedScheduleProof = null,
             scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             terminalExecutionOutcomes = current.terminalExecutionOutcomes + (
@@ -2469,6 +2546,8 @@ class PlannerStore(
     fun isCanonicalExecutionStartBlocked(blockId: String): Boolean {
         val current = state.value
         val block = current.schedule.firstOrNull { it.id == blockId } ?: return true
+        if (block.status != ItemStatus.SCHEDULED) return true
+        if (!current.hasPublishedExecutionAuthority(block)) return true
         val itemId = block.canonicalItemId ?: return true
         val origin = current.canonicalSyncOrigin ?: return true
         if (
@@ -2659,6 +2738,12 @@ class PlannerStore(
         if (command.commandType == "start") {
             require(command.plannedBlockId == focused.id)
             require(command.sourceDeviceId == current.executionDeviceId)
+            require(focused.status == ItemStatus.SCHEDULED) {
+                "Only a scheduled canonical block can start"
+            }
+            require(current.hasPublishedExecutionAuthority(focused)) {
+                "The focused block has no durable exact publication authority"
+            }
         } else {
             val authoritative = current.canonicalExecutionSession
                 ?: throw IllegalArgumentException("The authoritative execution lease is unavailable")
@@ -3136,6 +3221,8 @@ class PlannerStore(
             recurrenceCompletionAnchors = completionAnchors,
             publishedScheduleRevision = current.publishedScheduleRevision
                 .takeUnless { recurrenceChanged },
+            publishedScheduleProof = current.publishedScheduleProof
+                .takeUnless { recurrenceChanged },
             scheduleInputDigest = current.scheduleInputDigest.takeUnless { recurrenceChanged },
             scheduleMessage = when {
                 authoritativeActiveSession != null && activeBlock == null ->
@@ -3170,6 +3257,7 @@ class PlannerStore(
             pendingProposalApplicationMutation = null,
             proposalApplications = emptyMap(),
             publishedScheduleRevision = null,
+            publishedScheduleProof = null,
             schedule = current.schedule.filter { it.canonicalItemId == null },
             activeSession = current.activeSession?.takeUnless { it.itemId in canonicalBlockIds },
             scheduleInputDigest = null,
@@ -3338,6 +3426,7 @@ class PlannerStore(
             schedule = updatedSchedule,
             activeSession = activeSession,
             publishedScheduleRevision = null,
+            publishedScheduleProof = null,
             scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             terminalExecutionOutcomes = terminalExecutionOutcomes,
@@ -3394,6 +3483,7 @@ class PlannerStore(
             canonicalItems = updatedItems,
             schedule = updatedSchedule,
             publishedScheduleRevision = null,
+            publishedScheduleProof = null,
             scheduleInputDigest = null,
             pendingCanonicalMutation = null,
             scheduleMessage = if (item.isSensitive) {
@@ -3555,6 +3645,8 @@ class PlannerStore(
             recurrenceCompletionAnchors = completionAnchors,
             publishedScheduleRevision = current.publishedScheduleRevision
                 .takeUnless { recurrenceChanged },
+            publishedScheduleProof = current.publishedScheduleProof
+                .takeUnless { recurrenceChanged },
             scheduleInputDigest = current.scheduleInputDigest.takeUnless { recurrenceChanged },
             scheduleMessage = when (displayStatus) {
                 ItemStatus.ACTIVE -> "Started this scheduled session"
@@ -3619,6 +3711,7 @@ class PlannerStore(
             activeSession = current.activeSession?.takeUnless { it.itemId in targetIds },
             recurrenceMoves = moves,
             publishedScheduleRevision = null,
+            publishedScheduleProof = null,
             scheduleInputDigest = null,
             scheduleMessage =
                 "Move requested · the previous placement remains visible until server validation",
@@ -3676,7 +3769,11 @@ class PlannerStore(
 
     fun recompose() {
         mutate {
-            it.copy(scheduleMessage = "Recomposed · hard commitments and the focus horizon stayed fixed")
+            it.copy(
+                publishedScheduleProof = null,
+                scheduleMessage =
+                    "Recomposed · hard commitments and the focus horizon stayed fixed",
+            )
         }
     }
 
@@ -4316,7 +4413,7 @@ class PlannerStore(
     private data class ScheduleIdentity(
         val itemId: String?,
         val occurrenceId: String?,
-        val sessionIndex: Int,
+        val sessionIndex: Int?,
     ) {
         companion object {
             fun from(block: ScheduleItem): ScheduleIdentity = ScheduleIdentity(

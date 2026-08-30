@@ -14,6 +14,9 @@ import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
@@ -34,7 +37,7 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV7() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV8() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -49,7 +52,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -87,7 +90,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -140,7 +143,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -158,7 +161,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -171,6 +174,93 @@ class PlannerStateRepositoryTest {
             runBlocking { repository.load() }
         }
         Unit
+    }
+
+    @Test
+    fun exactSchedulePublicationProofRoundTripsAndBlockTamperingFailsClosed() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 23 }
+        val state = publishedScheduleState()
+
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(state.publishedScheduleProof, restored.publishedScheduleProof)
+        assertTrue(
+            requireNotNull(restored.publishedScheduleProof)
+                .matches(restored.schedule.single()),
+        )
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payload = requireNotNull(dao.snapshot).payload.replaceFirst(
+                "2026-08-29T09:00:00Z",
+                "2026-08-29T09:05:00Z",
+            ),
+        )
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        Unit
+    }
+
+    @Test
+    fun exactSchedulePublicationProofRequiresTheWholePublishedBlockSet() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 27 }
+        val state = publishedScheduleState()
+        val published = state.schedule.single()
+        val extraPublished = published.copy(
+            id = "55555555-5555-4555-8555-555555555555",
+            sessionIndex = 3,
+            absoluteStartAt = "2026-08-29T10:00:00Z",
+            absoluteEndAt = "2026-08-29T10:30:00Z",
+        )
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.save(state.copy(schedule = listOf(published, extraPublished))) }
+        }
+
+        val localHelper = ScheduleItem(
+            id = "local-helper",
+            title = "Visible local helper",
+            kind = ItemKind.ROUTINE,
+            startMinute = 12 * 60,
+            durationMinutes = 15,
+            status = ItemStatus.SCHEDULED,
+        )
+        val remoteLease = published.copy(
+            id = "66666666-6666-4666-8666-666666666666",
+            status = ItemStatus.ACTIVE,
+            canonicalBlockKind = "remote_execution_lease",
+            absoluteStartAt = "2026-08-29T10:00:00Z",
+            absoluteEndAt = null,
+        )
+        repository.save(state.copy(schedule = listOf(published, localHelper, remoteLease)))
+
+        val restored = requireNotNull(repository.load())
+        assertEquals(listOf(published, localHelper, remoteLease), restored.schedule)
+        assertTrue(
+            requireNotNull(restored.publishedScheduleProof)
+                .matchesPublishedPlan(restored.schedule),
+        )
+    }
+
+    @Test
+    fun v7MigrationDiscardsEvenInjectedExactPublicationProof() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 29 }
+        repository.save(publishedScheduleState())
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("publishedScheduleProof"))
+        dao.snapshot = requireNotNull(dao.snapshot).copy(
+            payloadFormat = PlannerSnapshotFormats.JSON_V7,
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(null, restored.publishedScheduleProof)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
     @Test
@@ -239,7 +329,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -347,7 +437,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -371,7 +461,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 
@@ -497,6 +587,75 @@ class PlannerStateRepositoryTest {
                 ),
                 candidate = candidate,
             ),
+        )
+    }
+
+    private fun publishedScheduleState(): DayWeaveUiState {
+        val origin = "https://api.example.test/"
+        val configurationId = "connection-1"
+        val itemId = "11111111-1111-4111-8111-111111111111"
+        val blockId = "22222222-2222-4222-8222-222222222222"
+        val digest = "sha256:${"b".repeat(64)}"
+        val revision = PublishedScheduleRevisionSnapshot(
+            id = "33333333-3333-4333-8333-333333333333",
+            revision = "4:33333333-3333-4333-8333-333333333333",
+            revisionNumber = 4uL,
+            inputDigest = digest,
+            horizonStart = "2026-08-29T00:00:00Z",
+            horizonEnd = "2026-08-30T00:00:00Z",
+            timezoneName = "UTC",
+            publishedAt = "2026-08-29T08:00:00Z",
+        )
+        val block = ScheduleItem(
+            id = blockId,
+            title = "Published task",
+            kind = ItemKind.TASK,
+            startMinute = 9 * 60,
+            durationMinutes = 30,
+            status = ItemStatus.SCHEDULED,
+            canonicalItemId = itemId,
+            canonicalRevision = 7,
+            sessionIndex = 2,
+            absoluteStartAt = "2026-08-29T09:00:00Z",
+            absoluteEndAt = "2026-08-29T09:30:00Z",
+            planningZoneId = "UTC",
+            canonicalBlockKind = "planned",
+        )
+        return DayWeaveUiState(
+            schedule = listOf(block),
+            canonicalItems = listOf(
+                sensitiveCanonicalItem().copy(
+                    id = itemId,
+                    isSensitive = false,
+                    title = block.title,
+                    revision = 7,
+                ),
+            ),
+            canonicalSyncOrigin = origin,
+            canonicalConfigurationId = configurationId,
+            canonicalDeltaCursor = "cursor-7",
+            publishedScheduleRevision = revision,
+            publishedScheduleProof = PublishedScheduleProofSnapshot(
+                schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+                syncOrigin = origin,
+                configurationId = configurationId,
+                revision = revision,
+                asOf = "2026-08-29T08:00:00Z",
+                blocks = listOf(
+                    PublishedScheduleBlockProofSnapshot(
+                        id = blockId,
+                        itemId = itemId,
+                        itemRevision = 7,
+                        sessionIndex = 2,
+                        start = "2026-08-29T09:00:00Z",
+                        end = "2026-08-29T09:30:00Z",
+                        kind = "planned",
+                    ),
+                ),
+            ),
+            scheduleInputDigest = digest,
+            scheduleGeneratedAt = "2026-08-29T08:00:00Z",
+            schedulePlanningZoneId = "UTC",
         )
     }
 

@@ -187,6 +187,7 @@ class CanonicalAuthoringStoreTest {
             status = ItemStatus.ACTIVE,
             canonicalItemId = active.id,
             canonicalRevision = active.revision,
+            sessionIndex = 0,
         )
         val store = PlannerStore(
             boundState(active).copy(

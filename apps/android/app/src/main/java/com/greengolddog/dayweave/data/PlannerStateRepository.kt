@@ -55,16 +55,25 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V7 -> {
+            PlannerSnapshotFormats.JSON_V8 -> {
                 val decoded = decodeCurrentSnapshot(snapshot.payload)
                 if (SNAPSHOT_JSON.encodeToString(decoded) != snapshot.payload) save(decoded)
                 decoded
+            }
+            PlannerSnapshotFormats.JSON_V7 -> {
+                val migrated = decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requirePublicationProofField = false,
+                ).copy(publishedScheduleProof = null)
+                save(migrated)
+                migrated
             }
             PlannerSnapshotFormats.JSON_V6 -> {
                 val migrated = decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireCanonicalAuthoringFields = false,
-                )
+                    requirePublicationProofField = false,
+                ).copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -73,12 +82,14 @@ class RoomPlannerStateRepository(
                     payload = snapshot.payload,
                     requireProposalApplicationFields = false,
                     requireCanonicalAuthoringFields = false,
-                )
+                    requirePublicationProofField = false,
+                ).copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
             PlannerSnapshotFormats.JSON_V4 -> {
                 val migrated = decodeVersionFourSnapshot(snapshot.payload)
+                    .copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -86,7 +97,7 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     requireExistingSensitivity = true,
-                )
+                ).copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -94,7 +105,7 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                )
+                ).copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -102,7 +113,7 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                )
+                ).copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -121,7 +132,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V7,
+                payloadFormat = PlannerSnapshotFormats.JSON_V8,
             ),
         )
     }
@@ -130,11 +141,21 @@ class RoomPlannerStateRepository(
         payload: String,
         requireProposalApplicationFields: Boolean = true,
         requireCanonicalAuthoringFields: Boolean = true,
+        requirePublicationProofField: Boolean = true,
     ): DayWeaveUiState {
-        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val root = if (requirePublicationProofField) {
+            parsedRoot
+        } else {
+            // Older format labels can never gain authority from an injected newer field.
+            JsonObject(parsedRoot - "publishedScheduleProof")
+        }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
             throw SerializationException("Current schedule publication fields are required")
+        }
+        if (requirePublicationProofField && !root.containsKey("publishedScheduleProof")) {
+            throw SerializationException("Current exact schedule publication proof is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -187,7 +208,9 @@ class RoomPlannerStateRepository(
 
     /** V4 already required explicit sensitivity and an exact pending replacement target. */
     private fun decodeVersionFourSnapshot(payload: String): DayWeaveUiState {
-        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val root = JsonObject(
+            SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject - "publishedScheduleProof",
+        )
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
         requireExplicitSensitivity(root, "inbox")
@@ -229,7 +252,10 @@ class RoomPlannerStateRepository(
         requireExistingSensitivity: Boolean = false,
         allowPreSensitivityJournal: Boolean = false,
     ): DayWeaveUiState {
-        val legacyRoot = LEGACY_SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val legacyRoot = JsonObject(
+            LEGACY_SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject -
+                "publishedScheduleProof",
+        )
         if (requireExistingSensitivity) {
             requireExplicitSensitivity(legacyRoot, "schedule")
             requireExplicitSensitivity(legacyRoot, "canonicalItems")
@@ -302,7 +328,8 @@ class RoomPlannerStateRepository(
             throw SerializationException("Canonical authoring crosses another uncertainty fence")
         }
         if (hasPendingAuthoringOverlay &&
-            (state.publishedScheduleRevision != null || state.scheduleInputDigest != null)) {
+            (state.publishedScheduleRevision != null || state.publishedScheduleProof != null ||
+                state.scheduleInputDigest != null)) {
             throw SerializationException("Pending canonical authoring retains a current-plan proof")
         }
         mutations.filter { it.syncOrigin != null }.forEach { mutation ->
@@ -459,6 +486,14 @@ class RoomPlannerStateRepository(
                 state.schedulePlanningZoneId != published.timezoneName
             ) {
                 throw SerializationException("Published schedule receipt does not match the cache")
+            }
+        }
+        state.publishedScheduleProof?.let { proof ->
+            if (
+                !proof.hasValidShape() || !proof.matchesStateBinding(state) ||
+                !proof.matchesPublishedPlan(state.schedule)
+            ) {
+                throw SerializationException("Exact published schedule proof does not match cache")
             }
         }
     }
