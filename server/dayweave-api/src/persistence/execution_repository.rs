@@ -227,6 +227,7 @@ async fn apply_command_transaction(
         if session_exists(transaction, input.session_id).await? {
             return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
         }
+        validate_start_schedule(transaction, workspace_id, active_session_id, input).await?;
         let session = ExecutionSession::start_with_protocol_time(input, transition_at, observed_at);
         insert_session(transaction, workspace_id, &session).await?;
         return Ok(session);
@@ -240,6 +241,83 @@ async fn apply_command_transaction(
     let updated = current.apply_with_protocol_time(command, transition_at, observed_at)?;
     update_session(transaction, workspace_id, &updated).await?;
     Ok(updated)
+}
+
+async fn validate_start_schedule(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    active_session_id: Option<Uuid>,
+    input: &crate::execution::StartExecution,
+) -> Result<(), ExecutionRepositoryError> {
+    let head = sqlx::query(
+        "SELECT id, state, move_start, move_end FROM execution_sessions \
+         WHERE workspace_id = $1 AND item_id = $2 AND item_revision = $3 \
+         AND occurrence_id IS NOT DISTINCT FROM $4 AND session_index = $5 \
+         ORDER BY CASE WHEN id = $6 THEN 1 ELSE 0 END DESC, updated_at DESC, id DESC \
+         LIMIT 1 FOR SHARE",
+    )
+    .bind(workspace_id)
+    .bind(input.item_id)
+    .bind(revision_to_i64(input.item_revision)?)
+    .bind(input.occurrence_id)
+    .bind(i32::from(input.session_index))
+    .bind(active_session_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let Some(head) = head else {
+        // Legacy first execution of a semantic slot does not need a schedule attestation.
+        return Ok(());
+    };
+    let state: String = head.try_get("state").map_err(internal)?;
+    if matches!(state.as_str(), "active" | "paused") {
+        return Err(ExecutionRepositoryError::ActiveSessionConflict);
+    }
+    if matches!(state.as_str(), "completed" | "skipped") {
+        return Err(ExecutionRepositoryError::ScheduleStale);
+    }
+    if state != "deferred" {
+        return Err(ExecutionRepositoryError::Internal);
+    }
+
+    let Some(planned_block_id) = input.planned_block_id else {
+        return Err(ExecutionRepositoryError::ScheduleStale);
+    };
+    let deferred_execution_session_id: Uuid = head.try_get("id").map_err(internal)?;
+    let move_start: DateTime<Utc> = head.try_get("move_start").map_err(internal)?;
+    let move_end: DateTime<Utc> = head.try_get("move_end").map_err(internal)?;
+    let attested: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM schedule_deferred_placements AS placement \
+         JOIN schedule_revisions AS revision \
+           ON revision.workspace_id = placement.workspace_id \
+          AND revision.id = placement.schedule_revision_id \
+         WHERE placement.workspace_id = $1 \
+           AND placement.deferred_execution_session_id = $2 \
+           AND placement.source_block_id = $3 \
+           AND placement.item_id = $4 \
+           AND placement.item_revision = $5 \
+           AND placement.occurrence_id IS NOT DISTINCT FROM $6 \
+           AND placement.session_index = $7 \
+           AND placement.move_start = $8 AND placement.move_end = $9 \
+           AND revision.state IN ('published', 'superseded'))",
+    )
+    .bind(workspace_id)
+    .bind(deferred_execution_session_id)
+    .bind(planned_block_id)
+    .bind(input.item_id)
+    .bind(revision_to_i64(input.item_revision)?)
+    .bind(input.occurrence_id)
+    .bind(i32::from(input.session_index))
+    .bind(move_start)
+    .bind(move_end)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if attested {
+        Ok(())
+    } else {
+        Err(ExecutionRepositoryError::ScheduleStale)
+    }
 }
 
 async fn ensure_state_pool(

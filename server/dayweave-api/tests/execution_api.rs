@@ -816,6 +816,158 @@ async fn execution_defer_is_terminal_exact_and_replayable_over_http() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers all terminal states and exact replay as one contract.
+async fn terminal_semantic_slots_fail_closed_without_schedule_attestation() {
+    for terminal_type in ["completed", "skipped", "deferred"] {
+        let app = test_app();
+        let item_id = Uuid::new_v4();
+        let first_session_id = Uuid::new_v4();
+        let start_key = format!("execution-terminal-{terminal_type}-start-001");
+        let terminal_key = format!("execution-terminal-{terminal_type}-close-001");
+        let retry_key = format!("execution-terminal-{terminal_type}-retry-001");
+        let created = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/items",
+                Some(item(item_id)),
+                true,
+                Some(&format!("execution-terminal-{terminal_type}-item-001")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let first_start = command(
+            0,
+            json!({
+                "type": "start",
+                "session_id": first_session_id,
+                "item_id": item_id,
+                "item_revision": 1,
+                "occurrence_id": null,
+                "session_index": 0,
+                "planned_block_id": null,
+                "device_id": Uuid::new_v4()
+            }),
+        );
+        let started = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(first_start.clone()),
+                true,
+                Some(&start_key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(started.status(), StatusCode::OK);
+
+        let terminal = if terminal_type == "deferred" {
+            let exact_now =
+                chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+            let move_start = exact_now + ChronoDuration::days(30);
+            command(
+                1,
+                json!({
+                    "type": "defer",
+                    "session_id": first_session_id,
+                    "move_start": move_start,
+                    "move_end": move_start + ChronoDuration::minutes(30)
+                }),
+            )
+        } else {
+            let command_type = match terminal_type {
+                "completed" => "complete",
+                "skipped" => "skip",
+                _ => unreachable!(),
+            };
+            command(
+                1,
+                json!({
+                    "type": command_type,
+                    "session_id": first_session_id,
+                    "actual_seconds": 0
+                }),
+            )
+        };
+        let terminal = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(terminal),
+                true,
+                Some(&terminal_key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(terminal.status(), StatusCode::OK, "{terminal_type}");
+
+        let replacement = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(command(
+                    2,
+                    json!({
+                        "type": "start",
+                        "session_id": Uuid::new_v4(),
+                        "item_id": item_id,
+                        "item_revision": 1,
+                        "occurrence_id": null,
+                        "session_index": 0,
+                        "planned_block_id": Uuid::new_v4(),
+                        "device_id": Uuid::new_v4()
+                    }),
+                )),
+                true,
+                Some(&retry_key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            replacement.status(),
+            StatusCode::CONFLICT,
+            "{terminal_type}"
+        );
+        let replacement = body_json(replacement).await;
+        assert_eq!(
+            replacement["error"]["code"], "execution_schedule_stale",
+            "{terminal_type}"
+        );
+        assert!(replacement["error"].get("details").is_none());
+
+        // Repository replay remains ahead of the semantic guard: an exact historical retry
+        // returns the original success even though that semantic slot is now terminal.
+        let replay = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(first_start),
+                true,
+                Some(&start_key),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.headers()["idempotency-replayed"], "true");
+
+        let snapshot = app
+            .clone()
+            .oneshot(request("GET", "/v1/execution", None, true, None))
+            .await
+            .unwrap();
+        let snapshot = body_json(snapshot).await;
+        assert_eq!(snapshot["execution"]["revision"], 2);
+        assert!(snapshot["execution"]["active_session"].is_null());
+    }
+}
+
+#[tokio::test]
 async fn execution_defer_rejects_invalid_windows_missing_fields_and_unknown_fields() {
     let app = test_app();
     let now = Utc::now();

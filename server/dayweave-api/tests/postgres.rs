@@ -25,12 +25,13 @@ use sqlx::{
 use uuid::Uuid;
 
 #[test]
+#[allow(clippy::too_many_lines)] // One inventory assertion covers every embedded migration contract.
 fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_access() {
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
 
@@ -53,6 +54,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0016_mcp_simulation_evidence.sql"),
         include_str!("../migrations/0017_google_refresh_generations.sql"),
         include_str!("../migrations/0018_execution_defer.sql"),
+        include_str!("../migrations/0019_schedule_deferred_placements.sql"),
     ]
     .join("\n");
     for table in [
@@ -80,6 +82,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "item_changes",
         "execution_sessions",
         "execution_state",
+        "schedule_deferred_placements",
         "google_oauth_sessions",
         "google_oauth_cleanup_tokens",
         "google_oauth_scope_state",
@@ -110,6 +113,12 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("move_start > ended_at"));
     assert!(schema.contains("UPDATE execution_state AS state"));
     assert!(schema.contains("max(updated_at) AS updated_at"));
+    assert!(schema.contains("execution_sessions_semantic_head_idx"));
+    assert!(schema.contains("deferred_execution_session_id"));
+    assert!(schema.contains("guard_schedule_deferred_placement"));
+    assert!(schema.contains("guard_execution_session_semantic_start"));
+    assert!(schema.contains("FOR UPDATE"));
+    assert!(schema.contains("revision.state IN ('published', 'superseded')"));
     assert!(schema.contains("timestamptz"));
     assert!(!schema.contains("timestamp without time zone"));
     assert!(schema.contains("trashed_at"));
@@ -121,6 +130,408 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("schedule_simulations_evidence_guard"));
     assert!(schema.contains("mcp_proposal_submissions_verify_simulation"));
     assert!(schema.contains("compiled_payload_hash IS NOT NULL"));
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)]
+async fn deferred_placement_migration_seals_exact_restart_evidence() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+
+    let scope = seed_scope(pool).await;
+    let item_id = Uuid::new_v4();
+    let first_session_id = Uuid::new_v4();
+    let source_device_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let deferred_at = started_at + ChronoDuration::minutes(1);
+    let move_start = deferred_at + ChronoDuration::hours(2);
+    let move_end = move_start + ChronoDuration::minutes(45);
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         timezone_name, duration_seconds, revision, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'task', 'planned', 'Deferred migration proof', 'UTC', \
+         2700, 1, $4, $4)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(started_at)
+    .execute(pool)
+    .await
+    .expect("seed executable item");
+
+    // A semantic session with no history remains a valid legacy first Start.
+    // The trigger also materializes execution_state before inspecting history.
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, NULL, $4, \
+         'active', 1, 0, NULL, $5, $5, $5, NULL, NULL, NULL, NULL, NULL, NULL, $5, $5)",
+    )
+    .bind(first_session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(source_device_id)
+    .bind(started_at)
+    .execute(pool)
+    .await
+    .expect("legacy first Start");
+    let materialized_state: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM execution_state WHERE workspace_id = $1)")
+            .bind(scope.workspace_id)
+            .fetch_one(pool)
+            .await
+            .expect("inspect materialized execution state");
+    assert!(materialized_state);
+    sqlx::query(
+        "UPDATE execution_state SET revision = 1, active_session_id = $2, updated_at = $3 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_session_id)
+    .bind(started_at)
+    .execute(pool)
+    .await
+    .expect("point at first session");
+    sqlx::query(
+        "UPDATE execution_sessions SET state = 'deferred', revision = 2, \
+         accumulated_seconds = 60, actual_seconds = 60, running_since = NULL, \
+         observed_running_since = NULL, move_start = $3, move_end = $4, ended_at = $5, \
+         updated_at = $5 WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_session_id)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("defer first session");
+    sqlx::query(
+        "UPDATE execution_state SET revision = 2, active_session_id = NULL, updated_at = $2 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("close first execution lease");
+
+    let unbound_restart = sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, $4, $5, \
+         'active', 1, 0, NULL, $6, $6, $6, NULL, NULL, NULL, NULL, NULL, NULL, $6, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(Uuid::new_v4())
+    .bind(source_device_id)
+    .bind(move_start)
+    .execute(pool)
+    .await
+    .expect_err("deferred restart requires attestation");
+    assert!(
+        unbound_restart
+            .to_string()
+            .contains("deferred execution requires an exact published schedule binding")
+    );
+
+    let revision_id = Uuid::new_v4();
+    let source_block_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
+         horizon_start, horizon_end, timezone_name, solver_version, input_digest, \
+         created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', $3, $4, 'UTC', \
+         'deferred-placement-test', $5, $6, $7)",
+    )
+    .bind(revision_id)
+    .bind(scope.workspace_id)
+    .bind(move_start - ChronoDuration::hours(1))
+    .bind(move_end + ChronoDuration::hours(1))
+    .bind(vec![7_u8; 32])
+    .bind(scope.user_id)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("draft schedule revision");
+    sqlx::query(
+        "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, \
+         schedule_revision_id, item_id, block_kind, title_snapshot, starts_at, ends_at, \
+         timezone_name, ordinal, is_fixed, is_sensitive, constraint_snapshot) \
+         VALUES ($1, $2, $3, $4, $5, 'pinned', 'Deferred migration proof', $6, $7, \
+         'UTC', 0, true, false, $8)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(source_block_id)
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(item_id)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(json!({
+        "schema_version": 1,
+        "source_block_id": source_block_id,
+        "occurrence_id": null,
+        "session_index": 0,
+        "core_kind": "pinned",
+        "explanations": [],
+    }))
+    .execute(pool)
+    .await
+    .expect("exact pinned block");
+
+    let mismatched_binding = sqlx::query(
+        "INSERT INTO schedule_deferred_placements (workspace_id, schedule_revision_id, \
+         deferred_execution_session_id, source_block_id, item_id, item_revision, \
+         occurrence_id, session_index, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, NULL, 0, $6, $7, $8)",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(first_session_id)
+    .bind(source_block_id)
+    .bind(item_id)
+    .bind(move_start)
+    .bind(move_end - ChronoDuration::minutes(1))
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect_err("mismatched defer window is rejected");
+    assert!(
+        mismatched_binding
+            .to_string()
+            .contains("does not match the deferred execution session")
+    );
+    sqlx::query(
+        "INSERT INTO schedule_deferred_placements (workspace_id, schedule_revision_id, \
+         deferred_execution_session_id, source_block_id, item_id, item_revision, \
+         occurrence_id, session_index, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, NULL, 0, $6, $7, $8)",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(first_session_id)
+    .bind(source_block_id)
+    .bind(item_id)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("exact deferred placement binding");
+
+    for statement in [
+        "UPDATE schedule_deferred_placements SET created_at = created_at + interval '1 second' \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2",
+        "DELETE FROM schedule_deferred_placements \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    ] {
+        let error = sqlx::query(statement)
+            .bind(scope.workspace_id)
+            .bind(revision_id)
+            .execute(pool)
+            .await
+            .expect_err("deferred placement evidence is immutable");
+        assert!(error.to_string().contains("evidence is immutable"));
+    }
+    let block_mutation = sqlx::query(
+        "UPDATE schedule_blocks SET starts_at = starts_at + interval '1 second' \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2 AND source_block_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(source_block_id)
+    .execute(pool)
+    .await
+    .expect_err("bound schedule block is immutable");
+    assert!(
+        block_mutation
+            .to_string()
+            .contains("bound deferred schedule blocks are immutable")
+    );
+    let session_mutation = sqlx::query(
+        "UPDATE execution_sessions SET pause_reason = 'tampered' \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_session_id)
+    .execute(pool)
+    .await
+    .expect_err("bound deferred session is immutable");
+    assert!(
+        session_mutation
+            .to_string()
+            .contains("bound deferred execution sessions are immutable")
+    );
+
+    // A binding remains unusable until its immutable revision is sealed.
+    let draft_restart = sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, $4, $5, \
+         'active', 1, 0, NULL, $6, $6, $6, NULL, NULL, NULL, NULL, NULL, NULL, $6, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(source_block_id)
+    .bind(source_device_id)
+    .bind(move_start)
+    .execute(pool)
+    .await
+    .expect_err("draft binding is not Start authority");
+    assert!(
+        draft_restart
+            .to_string()
+            .contains("deferred execution requires an exact published schedule binding")
+    );
+
+    sqlx::query(
+        "INSERT INTO schedule_revision_details (workspace_id, user_id, schedule_revision_id, \
+         result_snapshot, created_at) VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(revision_id)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("schedule revision detail");
+    sqlx::query(
+        "UPDATE schedule_revisions SET state = 'published', published_at = $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect("publish bound schedule revision");
+    let late_binding = sqlx::query(
+        "INSERT INTO schedule_deferred_placements (workspace_id, schedule_revision_id, \
+         deferred_execution_session_id, source_block_id, item_id, item_revision, \
+         occurrence_id, session_index, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, $4, $5, 1, NULL, 0, $6, $7, $8)",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(first_session_id)
+    .bind(source_block_id)
+    .bind(item_id)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(deferred_at)
+    .execute(pool)
+    .await
+    .expect_err("sealed revisions reject placement insertion");
+    assert!(
+        late_binding
+            .to_string()
+            .contains("require a draft revision")
+    );
+
+    let restarted_session_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, $4, $5, \
+         'active', 1, 0, NULL, $6, $6, $6, NULL, NULL, NULL, NULL, NULL, NULL, $6, $6)",
+    )
+    .bind(restarted_session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(source_block_id)
+    .bind(source_device_id)
+    .bind(move_start)
+    .execute(pool)
+    .await
+    .expect("exact published binding authorizes Start");
+    sqlx::query(
+        "UPDATE execution_state SET revision = 3, active_session_id = $2, updated_at = $3 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(restarted_session_id)
+    .bind(move_start)
+    .execute(pool)
+    .await
+    .expect("point at restarted session");
+    let completed_at = move_start + ChronoDuration::minutes(5);
+    sqlx::query(
+        "UPDATE execution_sessions SET state = 'completed', revision = 2, \
+         accumulated_seconds = 300, actual_seconds = 300, running_since = NULL, \
+         observed_running_since = NULL, ended_at = $3, updated_at = $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(restarted_session_id)
+    .bind(completed_at)
+    .execute(pool)
+    .await
+    .expect("complete restarted session");
+    sqlx::query(
+        "UPDATE execution_state SET revision = 4, active_session_id = NULL, updated_at = $2 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(completed_at)
+    .execute(pool)
+    .await
+    .expect("close restarted execution lease");
+    let terminal_rewrite = sqlx::query(
+        "UPDATE execution_sessions SET state = 'active', revision = revision + 1, \
+         actual_seconds = NULL, running_since = $3, observed_running_since = $3, \
+         ended_at = NULL, updated_at = $3 WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(restarted_session_id)
+    .bind(completed_at + ChronoDuration::seconds(1))
+    .execute(pool)
+    .await
+    .expect_err("terminal history cannot be rewritten into an active lease");
+    assert!(
+        terminal_rewrite
+            .to_string()
+            .contains("terminal execution semantics cannot be rewritten as active")
+    );
+    let resurrection = sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, $4, $5, \
+         'active', 1, 0, NULL, $6, $6, $6, NULL, NULL, NULL, NULL, NULL, NULL, $6, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(source_block_id)
+    .bind(source_device_id)
+    .bind(completed_at + ChronoDuration::minutes(1))
+    .execute(pool)
+    .await
+    .expect_err("completed semantic session cannot be resurrected");
+    assert!(
+        resurrection
+            .to_string()
+            .contains("completed or skipped execution semantics cannot be restarted")
+    );
+
+    test_database.destroy().await;
 }
 
 #[tokio::test]

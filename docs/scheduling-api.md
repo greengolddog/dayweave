@@ -111,6 +111,28 @@ committed and tells the client to discard the journal and recompose; generic,
 transport, unavailable, and idempotency-conflict failures remain ambiguous and
 must retain the exact journal for operator recovery or retry.
 
+A deferred execution session adds one more publication fence. If its requested
+move window overlaps the candidate horizon, a fresh publication must contain
+exactly one `pinned` block for the same item revision, occurrence, and session
+index, at the exact requested start and end. Omitting, clipping, duplicating, or
+changing that block returns the same detail-free
+`409 schedule_publication_stale` and commits no draft, receipt, binding, or
+audit row. A disjoint horizon has no such obligation. Successful publication
+stores an immutable binding between the deferred session and block before the
+revision is sealed. A same-content revision created before that evidence
+existed is not reused; after a binding exists, normal same-content reuse is
+allowed. The evidence remains valid if the revision is later superseded.
+
+Starting the same semantic execution slot after a defer requires the bound
+block ID from a published or superseded revision. A missing, draft-only,
+mismatched, or unattested block returns the detail-free
+`409 execution_schedule_stale`; completed and skipped slots cannot be
+resurrected. Exact successful command retries still return their historical
+idempotency response before these fresh-state checks. The first execution of a
+semantic slot remains compatible with records created before attestation, but
+there is no binding backfill. The in-memory fallback cannot prove publication
+and therefore fails closed after any terminal history for that slot.
+
 Both first publication and exact idempotent replay return `200`; `replayed` is
 the sole distinction:
 
@@ -194,9 +216,10 @@ rejected with `422` before digesting or journaling. The API resolves local day
 boundaries from `timezone_name`, including 23- and 25-hour DST days. A horizon
 must be positive and no longer than 90 days.
 
-Production publication, immutable reads, and transactional MCP proposal
-submission require migrations through
-`0016_mcp_simulation_evidence.sql`.
+Production publication, immutable reads, transactional MCP proposal submission,
+execution defer, and attested restart require migrations through
+`0019_schedule_deferred_placements.sql`. Deploy the migrated server before
+enabling clients that produce deferred restart commands.
 
 An upgrade from migrations 1–11 safely seals any legacy published revision but
 cannot invent the missing durable detail/evidence snapshot. Schedule and item

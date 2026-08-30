@@ -509,7 +509,7 @@ mod tests {
                     item_id,
                     item_revision: 1,
                     occurrence_id: None,
-                    session_index: 0,
+                    session_index: 1,
                     planned_block_id: None,
                     device_id: Uuid::from_u128(201),
                 }),

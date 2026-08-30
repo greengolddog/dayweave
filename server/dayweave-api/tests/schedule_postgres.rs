@@ -27,18 +27,19 @@ use dayweave_api::{
     readiness::Readiness,
     scheduling::{
         ComposeScheduleRequest, ConflictQuery, ItemSearchQuery, PlanOperation, PlanOperationKind,
-        PlanningSimulationPort, PostgresSchedulingRepository, ProposalSubmissionError,
-        ProposalSubmissionPort, ProposalSubmissionSpec, PublishScheduleSpec, ScheduleAccess,
-        ScheduleDetail, SchedulePublicationError, ScheduleQuery, ScheduleQueryPort,
-        SchedulingPortError, SimulationRequest, compose_canonical_schedule,
-        simulation_request_digest, simulation_request_hash,
+        PlanningSimulationPort, PostgresSchedulingRepository, PreviousAssignmentInput,
+        PreviousBlockInput, ProposalSubmissionError, ProposalSubmissionPort,
+        ProposalSubmissionSpec, PublishScheduleSpec, ScheduleAccess, ScheduleDetail,
+        SchedulePublicationError, ScheduleQuery, ScheduleQueryPort, SchedulingPortError,
+        SimulationRequest, compose_canonical_schedule, simulation_request_digest,
+        simulation_request_hash,
     },
 };
 use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    AssertSqlSafe, ConnectOptions, Executor, PgPool,
+    AssertSqlSafe, ConnectOptions, Executor, PgPool, Postgres, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tower::ServiceExt as _;
@@ -62,6 +63,16 @@ type SubmissionProofRow = (
     Option<Vec<u8>>,
     Vec<u8>,
     bool,
+);
+type DeferredBindingRow = (
+    Uuid,
+    Uuid,
+    Uuid,
+    i64,
+    Option<Uuid>,
+    i32,
+    chrono::DateTime<Utc>,
+    chrono::DateTime<Utc>,
 );
 
 #[tokio::test]
@@ -2041,6 +2052,565 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // One lifecycle proves pre-defer reuse, binding, replay, and supersession together.
+async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_receipts() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let item_repository = Arc::new(PostgresItemRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let access = owner_access(scope, "auth0|deferred-publication-owner");
+    let item_id = Uuid::new_v4();
+    items
+        .create(
+            task(
+                item_id,
+                "Keep the exact deferred promise",
+                false,
+                None,
+                json!({}),
+            ),
+            idempotency(141),
+        )
+        .await
+        .unwrap();
+    let item = items.get(item_id).await.unwrap();
+    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
+    let move_end: chrono::DateTime<Utc> = "2026-09-01T12:00:00Z".parse().unwrap();
+
+    let exact_request = deferred_compose_request(item_id, item.revision, move_start, move_end);
+    let exact_preview = compose_canonical_schedule(&items, &schedules, exact_request.clone())
+        .await
+        .unwrap();
+    let exact_blocks = exact_preview
+        .plan
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .collect::<Vec<_>>();
+    let [exact_block] = exact_blocks.as_slice() else {
+        panic!("the pinned fixture must emit exactly one semantic block");
+    };
+    assert_eq!(
+        serde_json::to_value(exact_block.kind).unwrap(),
+        json!("pinned")
+    );
+    assert_eq!(exact_block.session_index, 0);
+    let source_block_id = exact_block.id;
+
+    // The same content is a normal revision before any defer exists.
+    let pre_defer_spec = PublishScheduleSpec {
+        idempotency_key: Uuid::new_v4(),
+        request_hash: [141; 32],
+        input_digest: digest_bytes(&exact_preview.input_digest),
+        timezone_name: "Europe/Madrid".to_owned(),
+        result: exact_preview.clone(),
+        published_at: Utc::now(),
+    };
+    let pre_defer = schedules
+        .publish(&access, pre_defer_spec.clone())
+        .await
+        .unwrap();
+    assert_eq!(pre_defer.revision.revision_number, 1);
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, pre_defer.revision.id).await,
+        0
+    );
+
+    let deferred_session_id = insert_deferred_session(
+        &test_database.pool,
+        scope,
+        item_id,
+        item.revision,
+        0,
+        "2026-09-01T06:30:00Z".parse().unwrap(),
+        move_start,
+        move_end,
+    )
+    .await;
+    ensure_inactive_execution_state(&test_database.pool, scope).await;
+
+    // An old exact receipt wins before fresh defer guards, even though that
+    // historical revision predates the binding protocol.
+    let replay = schedules
+        .publish(&access, pre_defer_spec.clone())
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.revision.id, pre_defer.revision.id);
+
+    let mut omission_request = exact_request.clone();
+    omission_request.previous_assignments.clear();
+    let omission = compose_canonical_schedule(&items, &schedules, omission_request)
+        .await
+        .unwrap();
+    let before_stale = publication_attestation_counts(&test_database.pool, scope).await;
+    assert!(matches!(
+        schedules
+            .publish(
+                &access,
+                PublishScheduleSpec {
+                    idempotency_key: Uuid::new_v4(),
+                    request_hash: [142; 32],
+                    input_digest: digest_bytes(&omission.input_digest),
+                    timezone_name: "Europe/Madrid".to_owned(),
+                    result: omission.clone(),
+                    published_at: Utc::now(),
+                },
+            )
+            .await,
+        Err(SchedulePublicationError::DeferredPlacementRequired)
+    ));
+    assert_eq!(
+        publication_attestation_counts(&test_database.pool, scope).await,
+        before_stale
+    );
+
+    // A binding write failure must roll back the draft, its blocks/details,
+    // request receipt, audit row, and attempted current-head transition. The
+    // same key then remains usable once storage recovers.
+    let post_defer_spec = PublishScheduleSpec {
+        idempotency_key: Uuid::new_v4(),
+        request_hash: [143; 32],
+        input_digest: digest_bytes(&exact_preview.input_digest),
+        timezone_name: "Europe/Madrid".to_owned(),
+        result: exact_preview.clone(),
+        published_at: Utc::now(),
+    };
+    test_database
+        .pool
+        .execute(
+            "CREATE FUNCTION fail_test_deferred_binding() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN RAISE EXCEPTION 'synthetic deferred binding failure'; END $$; \
+             CREATE TRIGGER fail_test_deferred_binding BEFORE INSERT \
+             ON schedule_deferred_placements FOR EACH ROW \
+             EXECUTE FUNCTION fail_test_deferred_binding();",
+        )
+        .await
+        .unwrap();
+    let before_binding_failure = publication_attestation_counts(&test_database.pool, scope).await;
+    assert!(matches!(
+        schedules.publish(&access, post_defer_spec.clone()).await,
+        Err(SchedulePublicationError::Unavailable)
+    ));
+    assert_eq!(
+        publication_attestation_counts(&test_database.pool, scope).await,
+        before_binding_failure
+    );
+    let current_after_failure: Uuid = sqlx::query_scalar(
+        "SELECT id FROM schedule_revisions WHERE workspace_id = $1 AND state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(current_after_failure, pre_defer.revision.id);
+    test_database
+        .pool
+        .execute(
+            "DROP TRIGGER fail_test_deferred_binding ON schedule_deferred_placements; \
+             DROP FUNCTION fail_test_deferred_binding();",
+        )
+        .await
+        .unwrap();
+
+    // Although its content hash equals revision 1, the first successful
+    // post-defer seal must create revision 2 to carry immutable evidence.
+    let post_defer = schedules.publish(&access, post_defer_spec).await.unwrap();
+    assert_eq!(post_defer.revision.revision_number, 2);
+    assert_ne!(post_defer.revision.id, pre_defer.revision.id);
+    let binding: DeferredBindingRow = sqlx::query_as(
+        "SELECT deferred_execution_session_id, source_block_id, item_id, item_revision, \
+             occurrence_id, session_index, move_start, move_end \
+             FROM schedule_deferred_placements \
+             WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(post_defer.revision.id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        binding,
+        (
+            deferred_session_id,
+            source_block_id,
+            item_id,
+            i64::try_from(item.revision).unwrap(),
+            None,
+            0,
+            move_start,
+            move_end,
+        )
+    );
+
+    // Once the current revision contains every exact binding, identical
+    // content can use the existing same-content shortcut.
+    let same_content = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [144; 32],
+                input_digest: digest_bytes(&exact_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: exact_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!same_content.replayed);
+    assert_eq!(same_content.revision.id, post_defer.revision.id);
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, post_defer.revision.id).await,
+        1
+    );
+
+    // A disjoint horizon has no obligation and may supersede the bound
+    // revision without deleting its historical attestation.
+    let mut disjoint_request = compose_request();
+    disjoint_request.fixed_blocks.clear();
+    disjoint_request.horizon_end = "2026-09-01T10:00:00Z".parse().unwrap();
+    disjoint_request.availability[0].end = "2026-09-01T09:00:00Z".parse().unwrap();
+    let disjoint = compose_canonical_schedule(&items, &schedules, disjoint_request)
+        .await
+        .unwrap();
+    let disjoint_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [145; 32],
+                input_digest: digest_bytes(&disjoint.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: disjoint,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(disjoint_publication.revision.revision_number, 3);
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, post_defer.revision.id).await,
+        1
+    );
+
+    // A later overlapping legacy payload still cannot replace the current
+    // disjoint head while silently erasing the deferred promise.
+    let before_legacy_omission = publication_attestation_counts(&test_database.pool, scope).await;
+    assert!(matches!(
+        schedules
+            .publish(
+                &access,
+                PublishScheduleSpec {
+                    idempotency_key: Uuid::new_v4(),
+                    request_hash: [148; 32],
+                    input_digest: digest_bytes(&omission.input_digest),
+                    timezone_name: "Europe/Madrid".to_owned(),
+                    result: omission,
+                    published_at: Utc::now(),
+                },
+            )
+            .await,
+        Err(SchedulePublicationError::DeferredPlacementRequired)
+    ));
+    assert_eq!(
+        publication_attestation_counts(&test_database.pool, scope).await,
+        before_legacy_omission
+    );
+    let current_after_legacy_omission: Uuid = sqlx::query_scalar(
+        "SELECT id FROM schedule_revisions WHERE workspace_id = $1 AND state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        current_after_legacy_omission,
+        disjoint_publication.revision.id
+    );
+
+    let historical_replay = schedules
+        .publish(&access, pre_defer_spec.clone())
+        .await
+        .unwrap();
+    assert!(historical_replay.replayed);
+    assert_eq!(historical_replay.revision.id, pre_defer.revision.id);
+
+    // Scope claims alone cannot replay an owner's durable receipt after a role
+    // downgrade or removal. Both the HTTP preflight adapter and publication
+    // transaction retain the database ownership fence.
+    sqlx::query(
+        "UPDATE workspace_members SET role = 'viewer' \
+         WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        schedules
+            .publication_receipt(
+                &access,
+                pre_defer_spec.idempotency_key,
+                &pre_defer_spec.request_hash,
+            )
+            .await,
+        Err(SchedulePublicationError::Unavailable)
+    ));
+    assert!(matches!(
+        schedules.publish(&access, pre_defer_spec.clone()).await,
+        Err(SchedulePublicationError::Unavailable)
+    ));
+    sqlx::query(
+        "UPDATE workspace_members SET role = 'owner' \
+         WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE workspace_members SET removed_at = clock_timestamp() \
+         WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        schedules
+            .publication_receipt(
+                &access,
+                pre_defer_spec.idempotency_key,
+                &pre_defer_spec.request_hash,
+            )
+            .await,
+        Err(SchedulePublicationError::Unavailable)
+    ));
+    assert!(matches!(
+        schedules.publish(&access, pre_defer_spec).await,
+        Err(SchedulePublicationError::Unavailable)
+    ));
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // The two orderings establish precedence and the execution-lock race.
+async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execution_state() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let item_repository = Arc::new(PostgresItemRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let items = Arc::new(ItemService::new(item_repository, Arc::new(SystemClock)));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let access = owner_access(scope, "auth0|execution-precedence-owner");
+    let item_id = Uuid::new_v4();
+    items
+        .create(
+            task(
+                item_id,
+                "Execution precedence fixture",
+                false,
+                None,
+                json!({}),
+            ),
+            idempotency(146),
+        )
+        .await
+        .unwrap();
+    let item = items.get(item_id).await.unwrap();
+    let active_session_id = insert_active_session(
+        &test_database.pool,
+        scope,
+        item_id,
+        item.revision,
+        0,
+        "2026-09-01T06:20:00Z".parse().unwrap(),
+    )
+    .await;
+    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
+    let move_end: chrono::DateTime<Utc> = "2026-09-01T12:00:00Z".parse().unwrap();
+    insert_deferred_session(
+        &test_database.pool,
+        scope,
+        item_id,
+        item.revision,
+        0,
+        "2026-09-01T06:30:00Z".parse().unwrap(),
+        move_start,
+        move_end,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE execution_state SET revision = 1, active_session_id = $2, updated_at = $3 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(active_session_id)
+    .bind(
+        "2026-09-01T06:20:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap(),
+    )
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+
+    let mut request = compose_request();
+    request.fixed_blocks.clear();
+    let omission = compose_canonical_schedule(&items, &schedules, request)
+        .await
+        .unwrap();
+    let publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [146; 32],
+                input_digest: digest_bytes(&omission.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: omission.clone(),
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("authoritative active session supersedes newer defer history");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, publication.revision.id).await,
+        0
+    );
+
+    // Close the active row so a new defer can become the semantic head.
+    let completed_at: chrono::DateTime<Utc> = "2026-09-01T06:40:00Z".parse().unwrap();
+    sqlx::query(
+        "UPDATE execution_sessions SET state = 'completed', revision = revision + 1, \
+         accumulated_seconds = 1200, actual_seconds = 1200, running_since = NULL, \
+         observed_running_since = NULL, ended_at = $3, updated_at = $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(active_session_id)
+    .bind(completed_at)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE execution_state SET revision = revision + 1, active_session_id = NULL, \
+         updated_at = $2 WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(completed_at)
+    .execute(&test_database.pool)
+    .await
+    .unwrap();
+
+    let before_race = publication_attestation_counts(&test_database.pool, scope).await;
+    let mut blocker = test_database.pool.begin().await.unwrap();
+    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    sqlx::query("SELECT workspace_id FROM execution_state WHERE workspace_id = $1 FOR UPDATE")
+        .bind(scope.workspace_id)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let publisher = schedules.clone();
+    let race_access = access.clone();
+    let publish = tokio::spawn(async move {
+        publisher
+            .publish(
+                &race_access,
+                PublishScheduleSpec {
+                    idempotency_key: Uuid::new_v4(),
+                    request_hash: [147; 32],
+                    input_digest: digest_bytes(&omission.input_digest),
+                    timezone_name: "Europe/Madrid".to_owned(),
+                    result: omission,
+                    published_at: Utc::now(),
+                },
+            )
+            .await
+    });
+    wait_for_blocked_queries(&test_database.pool, blocker_pid, 1).await;
+    let canonical_lock_available: bool = sqlx::query_scalar(
+        "SELECT pg_try_advisory_xact_lock( \
+         hashtextextended('dayweave.items.v1:' || $1::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+    assert!(
+        canonical_lock_available,
+        "publication must wait before canonical item space"
+    );
+    insert_deferred_session_tx(
+        &mut blocker,
+        scope,
+        item_id,
+        item.revision,
+        0,
+        "2026-09-01T06:50:00Z".parse().unwrap(),
+        move_start,
+        move_end,
+    )
+    .await;
+    blocker.commit().await.unwrap();
+    let result = tokio::time::timeout(StdDuration::from_secs(10), publish)
+        .await
+        .expect("publication/defer ordering must not deadlock")
+        .unwrap();
+    assert!(matches!(
+        result,
+        Err(SchedulePublicationError::DeferredPlacementRequired)
+    ));
+    assert_eq!(
+        publication_attestation_counts(&test_database.pool, scope).await,
+        before_race
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
 #[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
 #[allow(clippy::too_many_lines)] // The migration cutover is one ordered, auditable rehearsal.
 async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() {
@@ -2179,6 +2749,25 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         ))
         .await
         .expect("MCP simulation evidence migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0017_google_refresh_generations.sql"
+        ))
+        .await
+        .expect("Google refresh generation migration applies");
+    test_database
+        .pool
+        .execute(include_str!("../migrations/0018_execution_defer.sql"))
+        .await
+        .expect("execution defer migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0019_schedule_deferred_placements.sql"
+        ))
+        .await
+        .expect("deferred placement migration applies");
 
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
@@ -2830,6 +3419,166 @@ fn compose_request() -> ComposeScheduleRequest {
         "recurrence_context": {}
     }))
     .unwrap()
+}
+
+fn deferred_compose_request(
+    item_id: Uuid,
+    item_revision: u64,
+    move_start: chrono::DateTime<Utc>,
+    move_end: chrono::DateTime<Utc>,
+) -> ComposeScheduleRequest {
+    let mut request = compose_request();
+    request.fixed_blocks.clear();
+    request.previous_assignments = vec![PreviousAssignmentInput {
+        item_id,
+        item_revision,
+        occurrence_id: None,
+        blocks: vec![PreviousBlockInput {
+            start: move_start,
+            end: move_end,
+            session_index: 0,
+        }],
+        pinned: true,
+    }];
+    request
+}
+
+async fn insert_active_session(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    item_revision: u64,
+    session_index: i32,
+    updated_at: chrono::DateTime<Utc>,
+) -> Uuid {
+    let session_id = Uuid::new_v4();
+    let started_at = updated_at - chrono::Duration::minutes(20);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, 'active', 1, 0, NULL, $7, $7, $7, \
+         NULL, NULL, NULL, NULL, NULL, NULL, $7, $8)",
+    )
+    .bind(session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(i64::try_from(item_revision).unwrap())
+    .bind(session_index)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(updated_at)
+    .execute(pool)
+    .await
+    .unwrap();
+    session_id
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_deferred_session(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    item_revision: u64,
+    session_index: i32,
+    ended_at: chrono::DateTime<Utc>,
+    move_start: chrono::DateTime<Utc>,
+    move_end: chrono::DateTime<Utc>,
+) -> Uuid {
+    insert_deferred_session_with(
+        pool,
+        scope,
+        item_id,
+        item_revision,
+        session_index,
+        ended_at,
+        move_start,
+        move_end,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_deferred_session_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    item_revision: u64,
+    session_index: i32,
+    ended_at: chrono::DateTime<Utc>,
+    move_start: chrono::DateTime<Utc>,
+    move_end: chrono::DateTime<Utc>,
+) -> Uuid {
+    insert_deferred_session_with(
+        &mut **transaction,
+        scope,
+        item_id,
+        item_revision,
+        session_index,
+        ended_at,
+        move_start,
+        move_end,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_deferred_session_with<'e, E>(
+    executor: E,
+    scope: DatabaseScope,
+    item_id: Uuid,
+    item_revision: u64,
+    session_index: i32,
+    ended_at: chrono::DateTime<Utc>,
+    move_start: chrono::DateTime<Utc>,
+    move_end: chrono::DateTime<Utc>,
+) -> Uuid
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    let session_id = Uuid::new_v4();
+    let started_at = ended_at - chrono::Duration::minutes(20);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, 'deferred', 1, 1200, 1200, $7, NULL, \
+         NULL, NULL, NULL, NULL, $8, $9, $10, $7, $10)",
+    )
+    .bind(session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(i64::try_from(item_revision).unwrap())
+    .bind(session_index)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(ended_at)
+    .execute(executor)
+    .await
+    .unwrap();
+    session_id
+}
+
+async fn ensure_inactive_execution_state(pool: &PgPool, scope: DatabaseScope) {
+    sqlx::query(
+        "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
+         VALUES ($1, 1, NULL, $2) ON CONFLICT (workspace_id) DO NOTHING",
+    )
+    .bind(scope.workspace_id)
+    .bind(
+        "2026-09-01T06:30:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap(),
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 fn goal(id: Uuid, title: &str, sensitive: bool, parent_id: Option<Uuid>) -> NewItem {
@@ -3496,6 +4245,38 @@ async fn publication_counts(pool: &PgPool, scope: DatabaseScope) -> (i64, i64, i
              AND operation_type = 'schedule.published')",
     )
     .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn publication_attestation_counts(
+    pool: &PgPool,
+    scope: DatabaseScope,
+) -> (i64, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT \
+           (SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM schedule_blocks WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM schedule_revision_details WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM schedule_deferred_placements WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM schedule_publication_requests WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM audit_operations WHERE workspace_id = $1 \
+             AND operation_type = 'schedule.published')",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn deferred_binding_count(pool: &PgPool, scope: DatabaseScope, revision_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM schedule_deferred_placements \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
     .fetch_one(pool)
     .await
     .unwrap()

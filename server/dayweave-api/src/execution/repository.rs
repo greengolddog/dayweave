@@ -55,6 +55,8 @@ pub enum ExecutionRepositoryError {
     ItemRevisionConflict,
     #[error("item is not an executable active leaf")]
     ItemNotExecutable,
+    #[error("execution start is not attested by the deferred schedule placement")]
+    ScheduleStale,
     #[error("idempotency key was used for different execution content")]
     IdempotencyConflict,
     #[error(transparent)]
@@ -174,6 +176,15 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             if next.sessions.contains_key(&input.session_id) {
                 return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
             }
+            if let Some(head) = newest_semantic_session(&next, input) {
+                if head.status.is_open() {
+                    return Err(ExecutionRepositoryError::ActiveSessionConflict);
+                }
+                // The in-memory fallback deliberately has no durable schedule-publication
+                // attestation. It may create the first execution for a semantic slot, but it
+                // must fail closed once that slot has terminal history.
+                return Err(ExecutionRepositoryError::ScheduleStale);
+            }
             let session = ExecutionSession::start_with_protocol_time(input, transition_at, now);
             next.active_session_id = Some(session.id);
             next.sessions.insert(session.id, session.clone());
@@ -241,6 +252,27 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         });
         Ok(sessions.into_iter().skip(offset).take(limit).collect())
     }
+}
+
+fn newest_semantic_session<'a>(
+    state: &'a MemoryState,
+    input: &super::StartExecution,
+) -> Option<&'a ExecutionSession> {
+    state
+        .sessions
+        .values()
+        .filter(|session| {
+            session.item_id == input.item_id
+                && session.item_revision == input.item_revision
+                && session.occurrence_id == input.occurrence_id
+                && session.session_index == input.session_index
+        })
+        .max_by(|left, right| {
+            (Some(left.id) == state.active_session_id)
+                .cmp(&(Some(right.id) == state.active_session_id))
+                .then_with(|| left.updated_at.cmp(&right.updated_at))
+                .then_with(|| left.id.cmp(&right.id))
+        })
 }
 
 pub(crate) fn next_protocol_time(

@@ -215,6 +215,11 @@ fn map_execution_error(error: ExecutionServiceError) -> ApiError {
         | ExecutionServiceError::ItemNotExecutable => {
             ApiError::conflict("only an active leaf item can be executed")
         }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::ScheduleStale) => {
+            ApiError::execution_schedule_stale(
+                "the execution slot is not startable from the current published schedule",
+            )
+        }
         ExecutionServiceError::InvalidIdempotencyKey => {
             ApiError::validation("Idempotency-Key must be 8-128 URL-safe ASCII characters")
         }

@@ -165,8 +165,13 @@ fn map_publication_error(error: SchedulePublicationError) -> ApiError {
             )
         }
         SchedulePublicationError::StaleComposition => ApiError::schedule_publication_stale(
-            "Canonical items changed during publication; preview again",
+            "Schedule inputs changed during publication; preview again",
         ),
+        SchedulePublicationError::DeferredPlacementRequired => {
+            ApiError::schedule_publication_stale(
+                "Deferred work requires its exact pinned placement; preview again",
+            )
+        }
         SchedulePublicationError::InvalidPayload => {
             ApiError::validation("Schedule publication payload is invalid")
         }

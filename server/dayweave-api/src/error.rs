@@ -69,6 +69,11 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn execution_schedule_stale(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "execution_schedule_stale", message)
+    }
+
+    #[must_use]
     pub(crate) fn schedule_publication_idempotency_conflict(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::CONFLICT,

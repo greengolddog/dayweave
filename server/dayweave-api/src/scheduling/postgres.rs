@@ -20,7 +20,7 @@ use zeroize::Zeroize;
 use crate::{
     persistence::{
         DatabaseScope, fetch_item_batch_tx, insert_proposal_tx, lock_canonical_item_space,
-        proposal_from_row,
+        lock_execution_and_canonical_item_space, proposal_from_row,
     },
     proposals::{PROPOSAL_CHANGE_SET_SCHEMA_V1, ProposalCommand},
 };
@@ -77,6 +77,18 @@ pub struct PublishScheduleSpec {
     pub published_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RequiredDeferredPlacement {
+    deferred_session_id: Uuid,
+    source_block_id: Uuid,
+    item_id: Uuid,
+    item_revision: i64,
+    occurrence_id: Option<Uuid>,
+    session_index: i32,
+    move_start: DateTime<Utc>,
+    move_end: DateTime<Utc>,
+}
+
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum SchedulePublicationError {
     #[error("the authenticated principal does not own this schedule scope")]
@@ -85,6 +97,8 @@ pub enum SchedulePublicationError {
     IdempotencyConflict,
     #[error("the canonical item snapshot changed before publication")]
     StaleComposition,
+    #[error("an overlapping execution defer requires its exact pinned placement")]
+    DeferredPlacementRequired,
     #[error("the schedule publication payload is invalid")]
     InvalidPayload,
     #[error("schedule publication storage is unavailable")]
@@ -305,36 +319,25 @@ impl PostgresSchedulingRepository {
         request_hash: &[u8; 32],
     ) -> Result<Option<SchedulePublication>, SchedulePublicationError> {
         self.require_access(access)?;
-        let row = sqlx::query(
-            "SELECT publication.request_hash, revision.id, revision.revision_number, \
-             revision.input_digest, revision.horizon_start, revision.horizon_end, \
-             revision.timezone_name, revision.published_at \
-             FROM schedule_publication_requests AS publication \
-             JOIN schedule_revisions AS revision \
-               ON revision.workspace_id = publication.workspace_id \
-              AND revision.id = publication.schedule_revision_id \
-             WHERE publication.workspace_id = $1 AND publication.user_id = $2 \
-               AND publication.idempotency_key = $3",
-        )
-        .bind(self.scope.workspace_id)
-        .bind(self.scope.user_id)
-        .bind(idempotency_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| SchedulePublicationError::Unavailable)?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let stored_hash: Vec<u8> = row
-            .try_get("request_hash")
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
-        if stored_hash.as_slice() != request_hash {
-            return Err(SchedulePublicationError::IdempotencyConflict);
-        }
-        Ok(Some(SchedulePublication {
-            revision: revision_from_row(&row)?,
-            replayed: true,
-        }))
+        lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
+            .await
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        lock_owner(&mut transaction, self.scope)
+            .await
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let receipt =
+            publication_receipt_tx(&mut transaction, self.scope, idempotency_key, request_hash)
+                .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        Ok(receipt)
     }
 
     /// Atomically publishes one immutable schedule revision, or returns the
@@ -371,13 +374,19 @@ impl PostgresSchedulingRepository {
             .begin()
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
-        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+
+        // Execution Start owns this mutex before it enters canonical item
+        // space. Publication follows the same order so a defer cannot race a
+        // schedule seal that omits or changes its promised placement.
+        lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         lock_owner(&mut transaction, self.scope)
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
 
+        // Historical receipts remain authoritative after the durable owner
+        // fence, but before any fresh item, Calendar, or defer validation.
         if let Some(replayed) = publication_receipt_tx(
             &mut transaction,
             self.scope,
@@ -397,6 +406,14 @@ impl PostgresSchedulingRepository {
             &mut transaction,
             self.scope,
             &spec.result.source_item_revisions,
+        )
+        .await?;
+        let deferred_placements = required_deferred_placements_tx(
+            &mut transaction,
+            self.scope,
+            horizon_start,
+            horizon_end,
+            &spec.result,
         )
         .await?;
         assert_current_calendar_projection(
@@ -449,7 +466,15 @@ impl PostgresSchedulingRepository {
             let stored_publication_hash: Option<Vec<u8>> = current
                 .try_get("publication_hash")
                 .map_err(|_| SchedulePublicationError::Unavailable)?;
-            if stored_publication_hash.as_deref() == Some(publication_hash.as_slice()) {
+            if stored_publication_hash.as_deref() == Some(publication_hash.as_slice())
+                && revision_has_deferred_placements_tx(
+                    &mut transaction,
+                    self.scope.workspace_id,
+                    parent_id.ok_or(SchedulePublicationError::Unavailable)?,
+                    &deferred_placements,
+                )
+                .await?
+            {
                 bind_publication_key_tx(
                     &mut transaction,
                     self.scope,
@@ -542,6 +567,15 @@ impl PostgresSchedulingRepository {
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         }
+
+        insert_deferred_placements_tx(
+            &mut transaction,
+            self.scope.workspace_id,
+            revision_id,
+            &deferred_placements,
+            published_at,
+        )
+        .await?;
 
         sqlx::query(
             "INSERT INTO schedule_revision_details (workspace_id, user_id, \
@@ -1907,6 +1941,185 @@ pub(crate) fn publication_content_hash(
     Ok(Sha256::digest(bytes).into())
 }
 
+/// Selects the authoritative execution head for every semantic work session,
+/// then turns each current-revision defer that touches this horizon into an
+/// exact publication obligation.
+///
+/// The window/state filters intentionally live outside the ranking CTE. A
+/// newer active lease for the same semantic identity supersedes an older defer
+/// even when the active row has an earlier protocol timestamp.
+async fn required_deferred_placements_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    horizon_start: DateTime<Utc>,
+    horizon_end: DateTime<Utc>,
+    result: &ComposeScheduleResult,
+) -> Result<Vec<RequiredDeferredPlacement>, SchedulePublicationError> {
+    let rows = sqlx::query(
+        "WITH semantic_heads AS MATERIALIZED ( \
+           SELECT session.id, session.item_id, session.item_revision, session.occurrence_id, \
+             session.session_index, session.state, session.move_start, session.move_end, \
+             ROW_NUMBER() OVER ( \
+               PARTITION BY session.item_id, session.item_revision, session.occurrence_id, \
+                 session.session_index \
+               ORDER BY CASE WHEN session.id = execution_state.active_session_id \
+                 THEN 1 ELSE 0 END DESC, session.updated_at DESC, session.id DESC \
+             ) AS semantic_rank \
+           FROM execution_sessions AS session \
+           JOIN execution_state ON execution_state.workspace_id = session.workspace_id \
+           WHERE session.workspace_id = $1 \
+         ) \
+         SELECT head.id, head.item_id, head.item_revision, head.occurrence_id, \
+           head.session_index, head.move_start, head.move_end \
+         FROM semantic_heads AS head \
+         JOIN items AS item ON item.workspace_id = $1 AND item.id = head.item_id \
+         WHERE head.semantic_rank = 1 AND head.state = 'deferred' \
+           AND item.trashed_at IS NULL AND item.revision = head.item_revision \
+           AND head.move_start < $3 AND head.move_end > $2 \
+         ORDER BY head.item_id, head.item_revision, head.occurrence_id NULLS FIRST, \
+           head.session_index, head.id",
+    )
+    .bind(scope.workspace_id)
+    .bind(horizon_start)
+    .bind(horizon_end)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| SchedulePublicationError::Unavailable)?;
+
+    let mut placements = Vec::with_capacity(rows.len());
+    for row in rows {
+        let deferred_session_id: Uuid = row
+            .try_get("id")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let item_id: Uuid = row
+            .try_get("item_id")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let item_revision: i64 = row
+            .try_get("item_revision")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let occurrence_id: Option<Uuid> = row
+            .try_get("occurrence_id")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let session_index: i32 = row
+            .try_get("session_index")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let move_start: DateTime<Utc> = row
+            .try_get("move_start")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let move_end: DateTime<Utc> = row
+            .try_get("move_end")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        if move_start < horizon_start || move_end > horizon_end {
+            return Err(SchedulePublicationError::DeferredPlacementRequired);
+        }
+        let item_revision_u64 =
+            u64::try_from(item_revision).map_err(|_| SchedulePublicationError::Unavailable)?;
+
+        let matching = result
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| {
+                block
+                    .item_id
+                    .is_some_and(|candidate| candidate.0 == item_id)
+                    && block.occurrence_id.map(|candidate| candidate.0) == occurrence_id
+                    && i32::from(block.session_index) == session_index
+                    && result.source_item_revisions.get(&item_id) == Some(&item_revision_u64)
+            })
+            .collect::<Vec<_>>();
+        let [block] = matching.as_slice() else {
+            return Err(SchedulePublicationError::DeferredPlacementRequired);
+        };
+        if block.kind != ScheduleBlockKind::Pinned
+            || offset_to_chrono(block.start)? != move_start
+            || offset_to_chrono(block.end)? != move_end
+        {
+            return Err(SchedulePublicationError::DeferredPlacementRequired);
+        }
+        placements.push(RequiredDeferredPlacement {
+            deferred_session_id,
+            source_block_id: block.id,
+            item_id,
+            item_revision,
+            occurrence_id,
+            session_index,
+            move_start,
+            move_end,
+        });
+    }
+    Ok(placements)
+}
+
+async fn revision_has_deferred_placements_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    revision_id: Uuid,
+    placements: &[RequiredDeferredPlacement],
+) -> Result<bool, SchedulePublicationError> {
+    for placement in placements {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+               SELECT 1 FROM schedule_deferred_placements \
+               WHERE workspace_id = $1 AND schedule_revision_id = $2 \
+                 AND deferred_execution_session_id = $3 AND source_block_id = $4 \
+                 AND item_id = $5 AND item_revision = $6 \
+                 AND occurrence_id IS NOT DISTINCT FROM $7 \
+                 AND session_index = $8 AND move_start = $9 AND move_end = $10 \
+             )",
+        )
+        .bind(workspace_id)
+        .bind(revision_id)
+        .bind(placement.deferred_session_id)
+        .bind(placement.source_block_id)
+        .bind(placement.item_id)
+        .bind(placement.item_revision)
+        .bind(placement.occurrence_id)
+        .bind(placement.session_index)
+        .bind(placement.move_start)
+        .bind(placement.move_end)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+        if !exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+async fn insert_deferred_placements_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    revision_id: Uuid,
+    placements: &[RequiredDeferredPlacement],
+    created_at: DateTime<Utc>,
+) -> Result<(), SchedulePublicationError> {
+    for placement in placements {
+        sqlx::query(
+            "INSERT INTO schedule_deferred_placements (workspace_id, schedule_revision_id, \
+             deferred_execution_session_id, source_block_id, item_id, item_revision, occurrence_id, \
+             session_index, move_start, move_end, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(workspace_id)
+        .bind(revision_id)
+        .bind(placement.deferred_session_id)
+        .bind(placement.source_block_id)
+        .bind(placement.item_id)
+        .bind(placement.item_revision)
+        .bind(placement.occurrence_id)
+        .bind(placement.session_index)
+        .bind(placement.move_start)
+        .bind(placement.move_end)
+        .bind(created_at)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|_| SchedulePublicationError::Unavailable)?;
+    }
+    Ok(())
+}
+
 async fn bind_publication_key_tx(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -2191,7 +2404,7 @@ async fn lock_owner(
 ) -> Result<(), sqlx::Error> {
     let exists: Option<i32> = sqlx::query_scalar(
         "SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 \
-         AND removed_at IS NULL FOR UPDATE",
+         AND role = 'owner' AND removed_at IS NULL FOR UPDATE",
     )
     .bind(scope.workspace_id)
     .bind(scope.user_id)
