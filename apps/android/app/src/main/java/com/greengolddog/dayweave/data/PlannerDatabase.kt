@@ -42,11 +42,12 @@ object PlannerSnapshotFormats {
     const val JSON_V4 = "json-v4-sensitive-authoring"
     const val JSON_V5 = "json-v5-schedule-publication-journal"
     const val JSON_V6 = "json-v6-proposal-application-journal"
+    const val JSON_V7 = "json-v7-canonical-authoring"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -102,6 +103,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_6_7 = object : Migration(6, 7) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * The encrypted payload gains typed canonical authoring journals and recently-deleted rows.
+     * No plaintext columns change; the Room version is a rollback fence for the JSON contract.
+     */
+    val MIGRATION_7_8 = object : Migration(7, 8) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -148,6 +157,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_4_5,
                 PlannerDatabaseMigrations.MIGRATION_5_6,
                 PlannerDatabaseMigrations.MIGRATION_6_7,
+                PlannerDatabaseMigrations.MIGRATION_7_8,
             )
             .build()
     }

@@ -192,20 +192,63 @@ fun effectiveCanonicalSensitivity(
     items: List<CanonicalItemSnapshot>,
     itemId: String,
     pendingMutation: PendingCanonicalMutation? = null,
+    pendingAuthoringMutations: List<PendingCanonicalAuthoringMutation> = emptyList(),
 ): Boolean {
-    val byId = items.associateBy(CanonicalItemSnapshot::id)
-    val visited = mutableSetOf<String>()
-    var currentId: String? = itemId
-    var sensitive = false
-    while (currentId != null) {
-        if (!visited.add(currentId)) return true
-        val item = byId[currentId] ?: return true
-        sensitive = sensitive || item.isSensitive || (
-            pendingMutation?.itemId == item.id && pendingMutation.targetIsSensitive
-            )
-        currentId = item.parentId
+    val ownSensitivity = mutableMapOf<String, Boolean>()
+    val possibleParents = mutableMapOf<String, MutableSet<String>>()
+    fun retain(item: CanonicalItemSnapshot) {
+        ownSensitivity[item.id] = ownSensitivity[item.id] == true || item.isSensitive
+        item.parentId?.let { possibleParents.getOrPut(item.id) { mutableSetOf() }.add(it) }
     }
-    return sensitive
+    items.forEach(::retain)
+    for (mutation in pendingAuthoringMutations) {
+        if (runCatching { mutation.requireValid() }.isFailure) return true
+        mutation.baseItem?.let(::retain)
+        when (mutation.operation) {
+            CanonicalAuthoringOperation.CREATE,
+            CanonicalAuthoringOperation.REPLACE,
+            -> {
+                val draft = mutation.draft ?: return true
+                ownSensitivity[mutation.itemId] =
+                    ownSensitivity[mutation.itemId] == true || draft.isSensitive
+                draft.parentId?.let {
+                    possibleParents.getOrPut(mutation.itemId) { mutableSetOf() }.add(it)
+                }
+            }
+            CanonicalAuthoringOperation.TRASH -> Unit
+            CanonicalAuthoringOperation.RESTORE -> if (mutation.baseItem == null) {
+                // A bodyless restore has an unknown own mark and ancestor path.
+                ownSensitivity[mutation.itemId] = true
+            }
+        }
+    }
+    pendingMutation?.takeIf(PendingCanonicalMutation::targetIsSensitive)?.let {
+        ownSensitivity[it.itemId] = true
+    }
+
+    // Pending reparenting retains both old and proposed ancestor paths. It can therefore raise
+    // privacy immediately but can never declassify a confirmed item before reconciliation.
+    val colors = mutableMapOf<String, Int>()
+    val stack = mutableListOf(itemId to false)
+    while (stack.isNotEmpty()) {
+        val (currentId, exiting) = stack.removeAt(stack.lastIndex)
+        if (exiting) {
+            colors[currentId] = 2
+            continue
+        }
+        when (colors[currentId]) {
+            1 -> return true
+            2 -> continue
+        }
+        val sensitive = ownSensitivity[currentId] ?: return true
+        if (sensitive) return true
+        colors[currentId] = 1
+        stack.add(currentId to true)
+        possibleParents[currentId].orEmpty().forEach { parentId ->
+            stack.add(parentId to false)
+        }
+    }
+    return false
 }
 
 @Serializable
@@ -588,6 +631,10 @@ data class DayWeaveUiState(
     val recurrenceMoves: Map<String, RecurrenceMoveSnapshot> = emptyMap(),
     /** Last real completion instant by recurring canonical item. */
     val recurrenceCompletionAnchors: Map<String, String> = emptyMap(),
+    /** Local create/edit/delete/restore queue; submitted entries are remote uncertainty fences. */
+    val pendingCanonicalAuthoringMutations: List<PendingCanonicalAuthoringMutation> = emptyList(),
+    /** Bounded full-item/tombstone records supporting reviewable restore after deletion. */
+    val canonicalRecentlyDeleted: List<CanonicalRecentlyDeletedRecord> = emptyList(),
     val pendingCanonicalMutation: PendingCanonicalMutation? = null,
     /** Origin-bound global revision and active lease returned by `/v1/execution`. */
     val canonicalExecutionSyncOrigin: String? = null,
@@ -849,12 +896,15 @@ data class DayWeaveUiState(
  * Pending declassification never lowers the confirmed classification.
  */
 fun DayWeaveUiState.withPendingSensitivityHardened(): DayWeaveUiState {
-    val pending = pendingCanonicalMutation?.takeIf(PendingCanonicalMutation::targetIsSensitive)
-        ?: return this
     var changed = false
     val hardenedSchedule = schedule.map { block ->
         val canonicalId = block.canonicalItemId ?: return@map block
-        val mustProtect = effectiveCanonicalSensitivity(canonicalItems, canonicalId, pending)
+        val mustProtect = effectiveCanonicalSensitivity(
+            canonicalItems,
+            canonicalId,
+            pendingCanonicalMutation,
+            pendingCanonicalAuthoringMutations,
+        )
         if (!mustProtect || block.isSensitive) return@map block
         changed = true
         block.copy(isSensitive = true)

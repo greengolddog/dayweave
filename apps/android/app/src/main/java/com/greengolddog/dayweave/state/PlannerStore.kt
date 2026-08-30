@@ -8,6 +8,11 @@ import com.greengolddog.dayweave.model.ChatRole
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
+import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalItemDraft
+import com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.DerivedEnergySnapshot
 import com.greengolddog.dayweave.model.EnergyLevel
@@ -19,6 +24,7 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
@@ -33,8 +39,13 @@ import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
+import com.greengolddog.dayweave.model.requireCanonicalAuthoringShape
+import com.greengolddog.dayweave.model.nextCanonicalTrashRetentionExpiryEpochMillis
+import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.model.isApplicationReady
+import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
@@ -47,6 +58,7 @@ import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -72,6 +84,42 @@ class PlannerPersistenceReceipt internal constructor(
     suspend fun awaitDurable(): Boolean = completion.await()
 }
 
+/** The exact authoring journal generation a caller must durably acknowledge before network I/O. */
+class CanonicalAuthoringTransition internal constructor(
+    val mutation: PendingCanonicalAuthoringMutation,
+    val persistence: PlannerPersistenceReceipt,
+)
+
+fun interface CanonicalTrashCleanupCancellation {
+    fun cancel()
+}
+
+/** Injectable so retention cutoffs can be tested without sleeping or touching real credentials. */
+fun interface CanonicalTrashCleanupScheduler {
+    fun schedule(delayMillis: Long, action: () -> Unit): CanonicalTrashCleanupCancellation
+}
+
+private class CoroutineCanonicalTrashCleanupScheduler(
+    private val scope: CoroutineScope,
+) : CanonicalTrashCleanupScheduler {
+    override fun schedule(
+        delayMillis: Long,
+        action: () -> Unit,
+    ): CanonicalTrashCleanupCancellation {
+        val job = scope.launch {
+            delay(delayMillis)
+            action()
+        }
+        return CanonicalTrashCleanupCancellation(job::cancel)
+    }
+}
+
+private data class CanonicalAuthoringRefreshOverlay(
+    val items: List<CanonicalItemSnapshot>,
+    val mutations: List<PendingCanonicalAuthoringMutation>,
+    val deleted: List<CanonicalRecentlyDeletedRecord>,
+)
+
 /**
  * Owns presentation state and serializes it to an optional offline repository.
  *
@@ -84,8 +132,16 @@ class PlannerStore(
     scope: CoroutineScope? = null,
     private val onPersistenceError: (Throwable) -> Unit = {},
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
+    cleanupScheduler: CanonicalTrashCleanupScheduler? = null,
 ) {
-    private val mutableState = MutableStateFlow(initialState.withPendingSensitivityHardened())
+    private val canonicalTrashCleanupScheduler = cleanupScheduler
+        ?: scope?.let(::CoroutineCanonicalTrashCleanupScheduler)
+    private val mutableState = MutableStateFlow(
+        initialState
+            .withCanonicalTrashRetention(nowEpochMillis())
+            .withPendingSensitivityHardened()
+            .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) },
+    )
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
     private val mutableLoadState = MutableStateFlow(
         if (repository == null) PlannerLoadState.READY else PlannerLoadState.LOADING,
@@ -104,12 +160,18 @@ class PlannerStore(
     } else {
         PersistenceStatus.LOADING
     }
+    private var canonicalTrashCleanupCancellation: CanonicalTrashCleanupCancellation? = null
+    private var canonicalTrashCleanupToken = 0L
 
     init {
         if (repository != null) {
             requireNotNull(scope) { "A CoroutineScope is required when persistence is enabled" }
             scope.launch { restore(repository) }
             scope.launch { autosave(repository) }
+        } else {
+            synchronized(persistenceLock) {
+                scheduleCanonicalTrashCleanupLocked(mutableState.value)
+            }
         }
     }
 
@@ -594,30 +656,57 @@ class PlannerStore(
                         running
                     }
                 }
+            val authoringOverlay = canonicalAuthoringRefreshOverlay(
+                current = current,
+                freshItems = update.items,
+                sameBinding = sameBinding,
+            )
+            val reconciledItemsById = authoringOverlay.items.associateBy(CanonicalItemSnapshot::id)
+            val reconciledItemIds = reconciledItemsById.keys
+            val authoringSafeSchedule = orderedSchedule.filter { block ->
+                val exactCanonicalRevision = block.canonicalItemId?.let { canonicalId ->
+                    reconciledItemsById[canonicalId]?.revision == block.canonicalRevision
+                } != false
+                val exactRemoteLeasePlaceholder = authoritativeLease?.let { lease ->
+                    block.canonicalBlockKind == "remote_execution_lease" &&
+                        lease.matches(block) && block.canonicalRevision == lease.itemRevision
+                } == true
+                exactCanonicalRevision || exactRemoteLeasePlaceholder
+            }
+            val authoringFilteredSchedule = authoringSafeSchedule.size != orderedSchedule.size
+            val authoringProofInvalidated = authoringFilteredSchedule ||
+                authoringOverlay.mutations.any {
+                    it.disposition == CanonicalAuthoringDisposition.PENDING
+                }
             return current.copy(
-                canonicalItems = update.items.sortedWith(
-                    compareBy({ it.parentId.orEmpty() }, { it.siblingOrder }, { it.id }),
-                ),
+                canonicalItems = authoringOverlay.items,
+                pendingCanonicalAuthoringMutations = authoringOverlay.mutations,
+                canonicalRecentlyDeleted = authoringOverlay.deleted,
                 canonicalSyncOrigin = update.syncOrigin,
                 canonicalConfigurationId = update.configurationId,
                 canonicalDeltaCursor = update.deltaCursor,
-                schedule = orderedSchedule,
-                activeSession = restoredSession,
-                scheduleInputDigest = update.inputDigest,
+                schedule = authoringSafeSchedule,
+                activeSession = restoredSession?.takeIf { session ->
+                    authoringSafeSchedule.any { it.id == session.itemId }
+                },
+                publishedScheduleRevision = current.publishedScheduleRevision.takeUnless {
+                    authoringProofInvalidated
+                },
+                scheduleInputDigest = update.inputDigest.takeUnless { authoringProofInvalidated },
                 scheduleGeneratedAt = update.generatedAt,
                 schedulePlanningZoneId = update.planningZoneId,
                 recurrenceOutcomes = if (sameBinding) {
-                    current.recurrenceOutcomes.filterValues { it.itemId in itemsById }
+                    current.recurrenceOutcomes.filterValues { it.itemId in reconciledItemIds }
                 } else {
                     emptyMap()
                 },
                 recurrenceCompletionAnchors = if (sameBinding) {
-                    current.recurrenceCompletionAnchors.filterKeys { it in itemsById }
+                    current.recurrenceCompletionAnchors.filterKeys { it in reconciledItemIds }
                 } else {
                     emptyMap()
                 },
                 recurrenceMoves = if (sameBinding) {
-                    current.recurrenceMoves.filterValues { it.itemId in itemsById }
+                    current.recurrenceMoves.filterValues { it.itemId in reconciledItemIds }
                 } else {
                     emptyMap()
                 },
@@ -625,8 +714,10 @@ class PlannerStore(
                 // The sync manager clears this only by replaying the exact durable request.
                 pendingCanonicalMutation = current.pendingCanonicalMutation,
                 terminalExecutionOutcomes = retainedTerminalOutcomes,
-                unscheduledWork = update.unscheduledWork,
-                occurrenceSeriesItemIds = update.occurrenceSeriesItemIds,
+                unscheduledWork = update.unscheduledWork.filter { it.itemId in reconciledItemIds },
+                occurrenceSeriesItemIds = update.occurrenceSeriesItemIds.filterValues {
+                    it in reconciledItemIds
+                },
                 rejectedCanonicalItemCount = update.rejectedItemCount,
                 unscheduledCanonicalItemCount = update.unscheduledItemCount,
                 scheduleViolationMessages = update.violationMessages,
@@ -655,6 +746,9 @@ class PlannerStore(
             }
             require(current.pendingProposalApplicationMutation == null) {
                 "A proposal application must be reconciled before schedule publication"
+            }
+            require(!current.hasPendingCanonicalAuthoringOverlay()) {
+                "Pending canonical authoring must be reconciled before schedule publication"
             }
             current.canonicalSyncOrigin?.let { origin ->
                 require(
@@ -690,7 +784,11 @@ class PlannerStore(
             require(current.pendingSchedulePublication == expected) {
                 "Schedule publication changed before its response was committed"
             }
-            canonicalPlanState(current, expected.candidate).copy(
+            val accepted = canonicalPlanState(current, expected.candidate)
+            require(accepted.scheduleInputDigest == revision.inputDigest) {
+                "Published schedule no longer matches the local canonical authoring overlay"
+            }
+            accepted.copy(
                 pendingSchedulePublication = null,
                 publishedScheduleRevision = revision,
             )
@@ -763,6 +861,9 @@ class PlannerStore(
             }
             require(current.pendingExecutionCommand == null) {
                 "An execution command must be reconciled before applying a proposal"
+            }
+            require(!current.hasPendingCanonicalAuthoringOverlay()) {
+                "Canonical authoring must be reconciled before applying a proposal"
             }
             current.canonicalSyncOrigin?.let { origin ->
                 require(
@@ -1072,6 +1173,922 @@ class PlannerStore(
         requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
     }
 
+    fun canonicalAuthoringMutation(id: String): PendingCanonicalAuthoringMutation? =
+        state.value.pendingCanonicalAuthoringMutations.firstOrNull { it.id == id }
+
+    private fun MutationResult.canonicalAuthoringTransition(
+        id: String,
+    ): CanonicalAuthoringTransition = CanonicalAuthoringTransition(
+        mutation = requireNotNull(snapshot.pendingCanonicalAuthoringMutations.firstOrNull {
+            it.id == id
+        }) { "Canonical authoring mutation was removed during durable normalization" },
+        persistence = requireNotNull(receipt),
+    )
+
+    /**
+     * A composed plan can omit Inbox parents and can race a restore performed elsewhere. Retain
+     * every canonical cache row needed by the local authoring graph, while accepting a strictly
+     * newer active upsert as authoritative reconciliation of a queued restore.
+     */
+    private fun canonicalAuthoringRefreshOverlay(
+        current: DayWeaveUiState,
+        freshItems: List<CanonicalItemSnapshot>,
+        sameBinding: Boolean,
+    ): CanonicalAuthoringRefreshOverlay {
+        if (!sameBinding) {
+            require(current.pendingCanonicalAuthoringMutations.all { it.syncOrigin == null }) {
+                "Bound canonical authoring cannot cross a credential refresh"
+            }
+            return CanonicalAuthoringRefreshOverlay(
+                items = freshItems.sortedCanonicalItems(),
+                mutations = current.pendingCanonicalAuthoringMutations,
+                deleted = emptyList(),
+            )
+        }
+        val freshById = freshItems.associateBy(CanonicalItemSnapshot::id)
+        val reconciledRestoreItemIds = current.pendingCanonicalAuthoringMutations.asSequence()
+            .filter { it.operation == CanonicalAuthoringOperation.RESTORE }
+            .filter { mutation ->
+                freshById[mutation.itemId]?.revision?.let { revision ->
+                    revision > requireNotNull(mutation.expectedRevision)
+                } == true
+            }
+            .map(PendingCanonicalAuthoringMutation::itemId)
+            .toSet()
+        val mutations = current.pendingCanonicalAuthoringMutations.filterNot {
+            it.itemId in reconciledRestoreItemIds &&
+                it.operation == CanonicalAuthoringOperation.RESTORE
+        }
+        val overlayMutations = mutations.filter {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        val retainedRestoreItemIds = overlayMutations.asSequence()
+            .filter { it.operation == CanonicalAuthoringOperation.RESTORE }
+            .map(PendingCanonicalAuthoringMutation::itemId)
+            .toSet()
+        val requiredCurrentIds = mutableSetOf<String>()
+        overlayMutations.forEach { mutation ->
+            when (mutation.operation) {
+                CanonicalAuthoringOperation.REPLACE,
+                CanonicalAuthoringOperation.TRASH,
+                -> requiredCurrentIds += mutation.itemId
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.RESTORE,
+                -> Unit
+            }
+            mutation.draft?.parentId?.let(requiredCurrentIds::add)
+        }
+        val currentById = current.canonicalItems.associateBy(CanonicalItemSnapshot::id)
+        val pendingItemIds = overlayMutations.mapTo(hashSetOf()) { it.itemId }
+        var frontier = requiredCurrentIds.toList()
+        while (frontier.isNotEmpty()) {
+            val next = mutableListOf<String>()
+            frontier.forEach { itemId ->
+                currentById[itemId]?.parentId?.let { parentId ->
+                    if (parentId !in pendingItemIds && requiredCurrentIds.add(parentId)) {
+                        next += parentId
+                    }
+                }
+            }
+            frontier = next
+        }
+        val mergedItems = (
+            freshItems.filterNot {
+                it.id in retainedRestoreItemIds || it.id in requiredCurrentIds
+            } + requiredCurrentIds.mapNotNull(currentById::get)
+            ).distinctBy(CanonicalItemSnapshot::id).sortedCanonicalItems()
+        val activeIds = mergedItems.mapTo(hashSetOf()) { it.id }
+        val deleted = current.canonicalRecentlyDeleted.filterNot {
+            it.id in reconciledRestoreItemIds || it.id in activeIds
+        }
+        val overlayState = current.copy(
+            canonicalItems = mergedItems,
+            pendingCanonicalAuthoringMutations = mutations,
+            canonicalRecentlyDeleted = deleted,
+        )
+        validateCanonicalAuthoringOverlay(overlayState)
+        return CanonicalAuthoringRefreshOverlay(mergedItems, mutations, deleted)
+    }
+
+    private fun List<CanonicalItemSnapshot>.sortedCanonicalItems(): List<CanonicalItemSnapshot> =
+        sortedWith(compareBy({ it.parentId.orEmpty() }, { it.siblingOrder }, { it.id }))
+
+    fun sortedCanonicalAuthoringMutations(): List<PendingCanonicalAuthoringMutation> =
+        dependencySortedCanonicalAuthoringMutations(state.value)
+
+    fun enqueueCanonicalCreate(
+        draft: CanonicalItemDraft,
+        itemId: String = UUID.randomUUID().toString(),
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.CREATE,
+    ) { _ ->
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = draft.normalized(),
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    fun enqueueCanonicalReplace(
+        itemId: String,
+        draft: CanonicalItemDraft,
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.REPLACE,
+    ) { current ->
+        val base = current.canonicalItems.firstOrNull { it.id == itemId && it.deletedAt == null }
+            ?: throw IllegalArgumentException("Canonical item is not active")
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.REPLACE,
+            draft = draft.normalized(),
+            expectedRevision = base.revision,
+            baseItem = base,
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    fun enqueueCanonicalTrash(
+        itemId: String,
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.TRASH,
+    ) { current ->
+        val base = current.canonicalItems.firstOrNull { it.id == itemId && it.deletedAt == null }
+            ?: throw IllegalArgumentException("Canonical item is not active")
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.TRASH,
+            expectedRevision = base.revision,
+            baseItem = base,
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    fun enqueueCanonicalRestore(
+        itemId: String,
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.RESTORE,
+    ) { current ->
+        val deleted = current.canonicalRecentlyDeleted.firstOrNull { it.id == itemId }
+            ?: throw IllegalArgumentException("Recently-deleted item is unavailable")
+        val exactBase = deleted.lastKnownItem?.takeIf {
+            it.revision == deleted.revision && it.deletedAt != null
+        }
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.RESTORE,
+            expectedRevision = deleted.revision,
+            baseItem = exactBase,
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    /** Adds one reviewable local operation without claiming any server action has started. */
+    private fun enqueueCanonicalAuthoring(
+        itemId: String,
+        mutationId: String,
+        operation: CanonicalAuthoringOperation,
+        makeMutation: (DayWeaveUiState) -> PendingCanonicalAuthoringMutation,
+    ): CanonicalAuthoringTransition? {
+        requireCanonicalUuid(itemId, "canonical authoring item")
+        requireCanonicalUuid(mutationId, "canonical authoring mutation")
+        val durable = mutateDurablyWithSnapshot { current ->
+            requireCanonicalAuthoringEnqueueFence(current)
+            require(current.pendingCanonicalAuthoringMutations.size < MAX_CANONICAL_AUTHORING_QUEUE)
+            require(current.pendingCanonicalAuthoringMutations.none { it.itemId == itemId }) {
+                "This canonical item already has a queued operation"
+            }
+            val mutation = makeMutation(current)
+            require(mutation.operation == operation && mutation.id == mutationId &&
+                mutation.itemId == itemId)
+            mutation.requireValid()
+            validateCanonicalAuthoringCurrentState(current, mutation)
+            validateCanonicalAuthoringHierarchy(current, mutation)
+            current.copy(
+                pendingCanonicalAuthoringMutations =
+                    current.pendingCanonicalAuthoringMutations + mutation,
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage = "Canonical ${operation.name.lowercase()} saved locally",
+            )
+        } ?: return null
+        return durable.canonicalAuthoringTransition(mutationId)
+    }
+
+    /** Binds an unsubmitted draft to the exact active credentials immediately before first send. */
+    fun bindCanonicalAuthoringMutation(
+        id: String,
+        syncOrigin: String,
+        configurationId: String?,
+    ): CanonicalAuthoringTransition? {
+        val durable = mutateDurablyWithSnapshot { current ->
+            val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == id }
+            require(index >= 0) { "Canonical authoring mutation is unavailable" }
+            val existing = current.pendingCanonicalAuthoringMutations[index]
+            require(!existing.isSubmitted && existing.disposition == CanonicalAuthoringDisposition.PENDING)
+            require(current.canonicalSyncOrigin == syncOrigin &&
+                current.canonicalConfigurationId == configurationId) {
+                "Canonical authoring binding does not match the active cache"
+            }
+            require(existing.syncOrigin == null && existing.configurationId == null ||
+                existing.syncOrigin == syncOrigin && existing.configurationId == configurationId) {
+                "Canonical authoring mutation is already bound elsewhere"
+            }
+            val replacement = existing.copy(
+                syncOrigin = syncOrigin,
+                configurationId = configurationId,
+            ).also(PendingCanonicalAuthoringMutation::requireValid)
+            current.copy(
+                pendingCanonicalAuthoringMutations = current.pendingCanonicalAuthoringMutations
+                    .replaceAt(index, replacement),
+            )
+        } ?: return null
+        return durable.canonicalAuthoringTransition(id)
+    }
+
+    /** The returned generation must be durable before this exact request can leave the device. */
+    fun markCanonicalAuthoringSubmitted(id: String): CanonicalAuthoringTransition? {
+        val durable = mutateDurablyWithSnapshot { current ->
+            requireCanonicalAuthoringSubmissionFence(current, id)
+            val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == id }
+            require(index >= 0)
+            val existing = current.pendingCanonicalAuthoringMutations[index]
+            require(!existing.isSubmitted && existing.disposition == CanonicalAuthoringDisposition.PENDING)
+            require(canonicalAuthoringDependencies(current)[existing.id].orEmpty().isEmpty()) {
+                "A dependent canonical parent or child mutation must be confirmed first"
+            }
+            require(existing.syncOrigin == current.canonicalSyncOrigin &&
+                existing.configurationId == current.canonicalConfigurationId &&
+                existing.syncOrigin != null)
+            validateCanonicalAuthoringCurrentState(current, existing)
+            validateCanonicalAuthoringHierarchy(current, existing)
+            val replacement = existing.copy(
+                submittedAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+            ).also(PendingCanonicalAuthoringMutation::requireValid)
+            current.copy(
+                pendingCanonicalAuthoringMutations = current.pendingCanonicalAuthoringMutations
+                    .replaceAt(index, replacement),
+                scheduleMessage = "Canonical change submitted · awaiting authoritative confirmation",
+            )
+        } ?: return null
+        return durable.canonicalAuthoringTransition(id)
+    }
+
+    /** Converts one exact rejected request into a reviewable, non-retrying local record. */
+    fun markCanonicalAuthoringConflict(
+        id: String,
+        diagnostic: String,
+    ): CanonicalAuthoringTransition? {
+        val bounded = diagnostic.trim().take(PendingCanonicalAuthoringMutation.MAX_DIAGNOSTIC_CHARS)
+        require(bounded.isNotEmpty())
+        val durable = mutateDurablyWithSnapshot { current ->
+            val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == id }
+            require(index >= 0)
+            val existing = current.pendingCanonicalAuthoringMutations[index]
+            require(existing.isSubmitted && existing.disposition == CanonicalAuthoringDisposition.PENDING)
+            val replacement = existing.copy(
+                disposition = CanonicalAuthoringDisposition.CONFLICTED,
+                diagnostic = bounded,
+            ).also(PendingCanonicalAuthoringMutation::requireValid)
+            val replaced = current.pendingCanonicalAuthoringMutations
+                .replaceAt(index, replacement)
+            val reconciled = if (
+                existing.operation in setOf(
+                    CanonicalAuthoringOperation.CREATE,
+                    CanonicalAuthoringOperation.RESTORE,
+                )
+            ) {
+                conflictAuthoringDependingOnUnavailableParent(
+                    current = current,
+                    mutations = replaced,
+                    unavailableParentId = existing.itemId,
+                    diagnostic = "The queued parent change was rejected; review this draft",
+                )
+            } else {
+                replaced
+            }
+            current.copy(
+                pendingCanonicalAuthoringMutations = reconciled,
+                scheduleMessage = "Canonical change needs review",
+            )
+        } ?: return null
+        return durable.canonicalAuthoringTransition(id)
+    }
+
+    fun discardCanonicalAuthoringMutation(id: String): PlannerPersistenceReceipt? =
+        mutateDurably { current ->
+            val existing = current.pendingCanonicalAuthoringMutations.firstOrNull { it.id == id }
+                ?: throw IllegalArgumentException("Canonical authoring mutation is unavailable")
+            require(!existing.isSubmitted || existing.disposition == CanonicalAuthoringDisposition.CONFLICTED) {
+                "An unresolved submitted mutation cannot be discarded"
+            }
+            val remaining = current.pendingCanonicalAuthoringMutations.filterNot { it.id == id }
+            val candidate = current.copy(pendingCanonicalAuthoringMutations = remaining)
+            validateCanonicalAuthoringOverlay(candidate)
+            candidate
+        }
+
+    /** Installs one strictly matched mutation response and clears the same durable journal. */
+    fun applyCanonicalAuthoringResponse(
+        expected: PendingCanonicalAuthoringMutation,
+        response: CanonicalItemSnapshot,
+    ): PlannerPersistenceReceipt? {
+        expected.requireValid()
+        return mutateDurably { current ->
+            val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == expected.id }
+            require(index >= 0) { "Canonical authoring fence is unavailable" }
+            val durableExpected = current.pendingCanonicalAuthoringMutations[index]
+            require(durableExpected.isExactRetentionProjectionOf(expected)) {
+                "Canonical authoring fence changed during reconciliation"
+            }
+            require(durableExpected.isSubmitted &&
+                durableExpected.disposition == CanonicalAuthoringDisposition.PENDING)
+            require(current.canonicalSyncOrigin == durableExpected.syncOrigin &&
+                current.canonicalConfigurationId == durableExpected.configurationId) {
+                "Canonical authoring response crossed its API binding"
+            }
+            validateCanonicalAuthoringResponse(
+                expected = durableExpected,
+                response = response,
+                retainedTrashBase = current.canonicalItems.firstOrNull {
+                    it.id == durableExpected.itemId &&
+                        it.revision == durableExpected.expectedRevision
+                },
+            )
+            val withoutMutation = current.pendingCanonicalAuthoringMutations.filterNot {
+                it.id == durableExpected.id
+            }
+            val removedBlockIds = current.schedule.asSequence()
+                .filter { it.canonicalItemId == durableExpected.itemId }
+                .map(ScheduleItem::id)
+                .toSet()
+            val newerActive = current.canonicalItems.firstOrNull {
+                it.id == response.id && it.revision > response.revision
+            }
+            val newerDeleted = current.canonicalRecentlyDeleted.firstOrNull {
+                it.id == response.id && it.revision > response.revision
+            }
+            val responseIsSuperseded = newerActive != null || newerDeleted != null
+            val deletedSensitivity = if (
+                durableExpected.operation == CanonicalAuthoringOperation.TRASH
+            ) {
+                effectiveCanonicalSensitivity(
+                    current.canonicalItems,
+                    response.id,
+                    current.pendingCanonicalMutation,
+                    current.pendingCanonicalAuthoringMutations,
+                )
+            } else {
+                response.isSensitive
+            }
+            val activeItems = if (responseIsSuperseded) {
+                current.canonicalItems
+            } else when (durableExpected.operation) {
+                CanonicalAuthoringOperation.TRASH ->
+                    current.canonicalItems.filterNot { it.id == response.id }
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                CanonicalAuthoringOperation.RESTORE,
+                -> current.canonicalItems.upsertCanonical(response)
+            }
+            val deleted = if (responseIsSuperseded) {
+                current.canonicalRecentlyDeleted
+            } else when (durableExpected.operation) {
+                CanonicalAuthoringOperation.TRASH -> current.canonicalRecentlyDeleted
+                    .upsertRecentlyDeleted(
+                        response.toRecentlyDeletedRecord(deletedSensitivity),
+                    )
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                CanonicalAuthoringOperation.RESTORE,
+                -> current.canonicalRecentlyDeleted.filterNot { it.id == response.id }
+            }
+            current.copy(
+                canonicalItems = activeItems,
+                canonicalRecentlyDeleted = deleted,
+                pendingCanonicalAuthoringMutations = withoutMutation,
+                schedule = current.schedule.filterNot { it.id in removedBlockIds },
+                activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage = "Canonical ${durableExpected.operation.name.lowercase()} confirmed · recompose required",
+            )
+        }
+    }
+
+    /** Retention may erase only the recovery body; every request and conflict fence stays exact. */
+    private fun PendingCanonicalAuthoringMutation.isExactRetentionProjectionOf(
+        expected: PendingCanonicalAuthoringMutation,
+    ): Boolean = this == expected || (
+        expected.operation in setOf(
+            CanonicalAuthoringOperation.TRASH,
+            CanonicalAuthoringOperation.RESTORE,
+        ) && expected.baseItem != null && this == expected.copy(baseItem = null)
+        )
+
+    /** Retains a delta tombstone without inventing a full deleted item. */
+    fun recordCanonicalRecentlyDeleted(
+        record: CanonicalRecentlyDeletedRecord,
+    ): PlannerPersistenceReceipt? {
+        record.requireValid()
+        return mutateDurably { current ->
+            val pending = current.pendingCanonicalAuthoringMutations.firstOrNull {
+                it.itemId == record.id
+            }
+            require(pending == null || pending.operation == CanonicalAuthoringOperation.RESTORE) {
+                "A non-restore authoring operation must be reconciled before this tombstone"
+            }
+            if (pending?.expectedRevision?.let { record.revision < it } == true) {
+                return@mutateDurably current
+            }
+            val active = current.canonicalItems.firstOrNull { it.id == record.id }
+            if (active != null && active.revision > record.revision) return@mutateDurably current
+            val removedBlockIds = current.schedule.asSequence()
+                .filter { it.canonicalItemId == record.id }
+                .map(ScheduleItem::id)
+                .toSet()
+            val effectiveSensitivity = record.isSensitive || active?.let {
+                effectiveCanonicalSensitivity(
+                    current.canonicalItems,
+                    it.id,
+                    current.pendingCanonicalMutation,
+                    current.pendingCanonicalAuthoringMutations,
+                )
+            } == true
+            val retained = record.copy(
+                lastKnownItem = record.lastKnownItem ?: active?.takeIf {
+                    it.revision < record.revision
+                },
+                effectiveIsSensitive = effectiveSensitivity,
+            ).also(CanonicalRecentlyDeletedRecord::requireValid)
+            val restoreReconciledMutations = if (pending == null) {
+                current.pendingCanonicalAuthoringMutations
+            } else {
+                val replacement = when {
+                    !pending.isSubmitted -> pending.copy(
+                        expectedRevision = retained.revision,
+                        baseItem = retained.lastKnownItem?.takeIf {
+                            it.revision == retained.revision && it.deletedAt != null
+                        } ?: pending.baseItem?.takeIf { retained.revision == pending.expectedRevision },
+                    ).also(PendingCanonicalAuthoringMutation::requireValid)
+                    record.revision > requireNotNull(pending.expectedRevision) &&
+                        pending.disposition == CanonicalAuthoringDisposition.PENDING -> pending.copy(
+                            disposition = CanonicalAuthoringDisposition.CONFLICTED,
+                            diagnostic = "A newer deletion superseded the submitted restore",
+                        ).also(PendingCanonicalAuthoringMutation::requireValid)
+                    else -> pending
+                }
+                current.pendingCanonicalAuthoringMutations.map {
+                    if (it.id == replacement.id) replacement else it
+                }
+            }
+            val retainedParentRestore = restoreReconciledMutations.any {
+                it.itemId == record.id && it.operation == CanonicalAuthoringOperation.RESTORE &&
+                    it.disposition == CanonicalAuthoringDisposition.PENDING
+            }
+            val updatedMutations = if (retainedParentRestore) {
+                restoreReconciledMutations
+            } else {
+                conflictAuthoringDependingOnUnavailableParent(
+                    current = current,
+                    mutations = restoreReconciledMutations,
+                    unavailableParentId = record.id,
+                    diagnostic = "The selected parent was deleted remotely; review this draft",
+                )
+            }
+            val candidate = current.copy(
+                canonicalItems = current.canonicalItems.filterNot { it.id == record.id },
+                canonicalRecentlyDeleted = current.canonicalRecentlyDeleted
+                    .upsertRecentlyDeleted(retained),
+                pendingCanonicalAuthoringMutations = updatedMutations,
+                schedule = current.schedule.filterNot { it.id in removedBlockIds },
+                activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage = "Canonical deletion retained for restore",
+            )
+            validateCanonicalAuthoringOverlay(candidate)
+            candidate
+        }
+    }
+
+    private fun requireCanonicalAuthoringEnqueueFence(current: DayWeaveUiState) {
+        require(current.pendingSchedulePublication == null)
+        require(current.pendingProposalApplicationMutation == null)
+        require(current.pendingCanonicalMutation == null)
+        require(current.pendingExecutionCommand == null)
+        require(current.canonicalExecutionSession == null) {
+            "Canonical authoring is unavailable during an active execution lease"
+        }
+        require(current.pendingCanonicalAuthoringMutations.none {
+            it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING
+        }) { "A submitted canonical authoring change needs reconciliation" }
+    }
+
+    private fun DayWeaveUiState.hasUnresolvedCanonicalAuthoring(): Boolean =
+        pendingCanonicalAuthoringMutations.any {
+            it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+
+    private fun DayWeaveUiState.hasPendingCanonicalAuthoringOverlay(): Boolean =
+        pendingCanonicalAuthoringMutations.any {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+
+    private fun DayWeaveUiState.hasSubmittedCanonicalAuthoring(): Boolean =
+        pendingCanonicalAuthoringMutations.any(PendingCanonicalAuthoringMutation::isSubmitted)
+
+    private fun DayWeaveUiState.hasUnresolvedTerminalProjection(): Boolean = runCatching {
+        validatedTerminalExecutionOutcomes(terminalExecutionOutcomes).any {
+            it.requiresCanonicalItemProjection &&
+                it.canonicalProjectionRevision == null &&
+                it.canonicalProjectionResolution == null &&
+                (it.canonicalProjectionConflict == null ||
+                    it.canonicalProjectionRetryAuthorizedAt != null)
+        }
+    }.getOrElse { true }
+
+    private fun requireCanonicalAuthoringSubmissionFence(
+        current: DayWeaveUiState,
+        id: String,
+    ) {
+        require(current.pendingSchedulePublication == null)
+        require(current.pendingProposalApplicationMutation == null)
+        require(current.pendingCanonicalMutation == null)
+        require(current.pendingExecutionCommand == null)
+        require(current.canonicalExecutionSession == null)
+        require(!current.hasUnresolvedTerminalProjection()) {
+            "A terminal execution projection must be resolved before canonical authoring"
+        }
+        require(current.pendingCanonicalAuthoringMutations.none {
+            it.id != id && it.isSubmitted &&
+                it.disposition == CanonicalAuthoringDisposition.PENDING
+        })
+    }
+
+    private fun dependencySortedCanonicalAuthoringMutations(
+        current: DayWeaveUiState,
+    ): List<PendingCanonicalAuthoringMutation> {
+        val remaining = current.pendingCanonicalAuthoringMutations.associateBy { it.id }.toMutableMap()
+        val dependencies = canonicalAuthoringDependencies(current)
+        val result = mutableListOf<PendingCanonicalAuthoringMutation>()
+        val stableOrder = compareBy<PendingCanonicalAuthoringMutation> {
+            Instant.parse(it.createdAt)
+        }.thenBy { it.id }
+        while (remaining.isNotEmpty()) {
+            val ready = remaining.values
+                .filter { mutation -> dependencies[mutation.id].orEmpty().none(remaining::containsKey) }
+                .minWithOrNull(stableOrder)
+            requireNotNull(ready) { "Canonical authoring dependencies contain a cycle" }
+            result += ready
+            remaining.remove(ready.id)
+        }
+        return result
+    }
+
+    private fun canonicalAuthoringDependencies(
+        current: DayWeaveUiState,
+    ): Map<String, Set<String>> {
+        val mutations = current.pendingCanonicalAuthoringMutations
+        val byItem = mutations.associateBy(PendingCanonicalAuthoringMutation::itemId)
+        val activeById = current.canonicalItems.associateBy(CanonicalItemSnapshot::id)
+        return mutations.associate { mutation ->
+            val dependencies = mutableSetOf<String>()
+            val proposedParentId = when (mutation.operation) {
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                -> mutation.draft?.parentId
+                CanonicalAuthoringOperation.RESTORE -> current.canonicalRecentlyDeleted
+                    .firstOrNull { it.id == mutation.itemId }
+                    ?.parentId
+                CanonicalAuthoringOperation.TRASH -> null
+            }
+            if (mutation.operation != CanonicalAuthoringOperation.TRASH) {
+                proposedParentId?.let(byItem::get)?.takeIf {
+                    it.operation != CanonicalAuthoringOperation.TRASH
+                }?.let { dependencies += it.id }
+            } else {
+                mutations.asSequence()
+                    .filter { child ->
+                        val retainedParentId = child.baseItem?.parentId ?: activeById[child.itemId]
+                            ?.takeIf { it.revision == child.expectedRevision }
+                            ?.parentId
+                        child.id != mutation.id && retainedParentId == mutation.itemId &&
+                            child.operation in setOf(
+                                CanonicalAuthoringOperation.REPLACE,
+                                CanonicalAuthoringOperation.TRASH,
+                            )
+                    }
+                    .forEach { dependencies += it.id }
+            }
+            mutation.id to dependencies
+        }
+    }
+
+    private fun validateCanonicalAuthoringHierarchy(
+        current: DayWeaveUiState,
+        candidate: PendingCanonicalAuthoringMutation,
+    ) {
+        candidate.requireValid()
+        val allMutations = current.pendingCanonicalAuthoringMutations
+            .filterNot { it.id == candidate.id }
+            .plus(candidate)
+            .filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
+        val activeById = current.canonicalItems.associateBy(CanonicalItemSnapshot::id).toMutableMap()
+        val draftById = mutableMapOf<String, CanonicalItemDraft>()
+        val restoredStatusById = mutableMapOf<String, String>()
+        val parentById = activeById.mapValues { it.value.parentId }.toMutableMap()
+        allMutations.forEach { mutation ->
+            when (mutation.operation) {
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                -> {
+                    val draft = requireNotNull(mutation.draft)
+                    draftById[mutation.itemId] = draft
+                    parentById[mutation.itemId] = draft.parentId
+                }
+                CanonicalAuthoringOperation.TRASH -> {
+                    activeById.remove(mutation.itemId)
+                    parentById.remove(mutation.itemId)
+                }
+                CanonicalAuthoringOperation.RESTORE -> {
+                    val deleted = current.canonicalRecentlyDeleted.firstOrNull {
+                        it.id == mutation.itemId
+                    } ?: throw IllegalArgumentException("Restore record is unavailable")
+                    parentById[mutation.itemId] = deleted.parentId
+                    // A bodyless journal can only exist after a body-backed restore already
+                    // passed this validator. Retain that eligibility after the privacy cutoff;
+                    // the authoritative parent response is validated again before children send.
+                    restoredStatusById[mutation.itemId] = deleted.lastKnownItem?.status
+                        ?: mutation.baseItem?.status
+                        ?: CanonicalDraftPlacement.PLANNED.wireValue
+                }
+            }
+        }
+        if (candidate.operation == CanonicalAuthoringOperation.TRASH) {
+            require(parentById.values.none { it == candidate.itemId }) {
+                "An item with active or queued children cannot be deleted"
+            }
+        }
+        parentById.forEach { (itemId, parentId) ->
+            if (parentId == null) return@forEach
+            require(parentId in parentById) { "Canonical parent is unavailable" }
+            val parentDraft = draftById[parentId]
+            val parentStatus = parentDraft?.placement?.wireValue ?: activeById[parentId]?.status
+                ?: restoredStatusById[parentId]
+            require(parentStatus == "inbox" || parentStatus == "planned") {
+                "An executing or terminal item cannot become a parent"
+            }
+            require(itemId != parentId)
+        }
+        parentById.keys.forEach { start ->
+            val visited = mutableSetOf<String>()
+            var currentId: String? = start
+            while (currentId != null) {
+                require(visited.add(currentId)) { "Canonical hierarchy would contain a cycle" }
+                currentId = parentById[currentId]
+            }
+        }
+    }
+
+    private fun validateCanonicalAuthoringOverlay(current: DayWeaveUiState) {
+        val overlayMutations = current.pendingCanonicalAuthoringMutations.filter {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        if (overlayMutations.isNotEmpty()) {
+            overlayMutations.forEach {
+                validateCanonicalAuthoringHierarchy(current, it)
+            }
+            return
+        }
+        val parentById = current.canonicalItems.associate { it.id to it.parentId }
+        parentById.values.filterNotNull().forEach { parentId ->
+            require(parentId in parentById) { "Canonical parent is unavailable" }
+        }
+        parentById.keys.forEach { start ->
+            val visited = mutableSetOf<String>()
+            var itemId: String? = start
+            while (itemId != null) {
+                require(visited.add(itemId)) { "Canonical hierarchy contains a cycle" }
+                itemId = parentById[itemId]
+            }
+        }
+    }
+
+    /**
+     * A server tombstone wins over local draft ancestry. Keep the exact draft for explicit user
+     * recovery, but remove it from the materialized overlay by marking it conflicted. Descendant
+     * creates are closed transitively because their locally-created parent is no longer active.
+     */
+    private fun conflictAuthoringDependingOnUnavailableParent(
+        current: DayWeaveUiState,
+        mutations: List<PendingCanonicalAuthoringMutation>,
+        unavailableParentId: String,
+        diagnostic: String,
+    ): List<PendingCanonicalAuthoringMutation> {
+        val unavailableParentIds = mutableSetOf(unavailableParentId)
+        val conflictedIds = mutableSetOf<String>()
+        var changed: Boolean
+        do {
+            changed = false
+            mutations.forEach { mutation ->
+                val proposedParentId = when (mutation.operation) {
+                    CanonicalAuthoringOperation.CREATE,
+                    CanonicalAuthoringOperation.REPLACE,
+                    -> mutation.draft?.parentId
+                    CanonicalAuthoringOperation.RESTORE -> current.canonicalRecentlyDeleted
+                        .firstOrNull { it.id == mutation.itemId }
+                        ?.parentId
+                    CanonicalAuthoringOperation.TRASH -> null
+                }
+                if (mutation.disposition != CanonicalAuthoringDisposition.PENDING ||
+                    mutation.id in conflictedIds ||
+                    mutation.operation !in setOf(
+                        CanonicalAuthoringOperation.CREATE,
+                        CanonicalAuthoringOperation.REPLACE,
+                        CanonicalAuthoringOperation.RESTORE,
+                    ) || proposedParentId !in unavailableParentIds
+                ) {
+                    return@forEach
+                }
+                conflictedIds += mutation.id
+                if (mutation.operation in setOf(
+                        CanonicalAuthoringOperation.CREATE,
+                        CanonicalAuthoringOperation.RESTORE,
+                    )
+                ) {
+                    unavailableParentIds += mutation.itemId
+                }
+                changed = true
+            }
+        } while (changed)
+        if (conflictedIds.isEmpty()) return mutations
+        return mutations.map { mutation ->
+            if (mutation.id !in conflictedIds) mutation else mutation.copy(
+                disposition = CanonicalAuthoringDisposition.CONFLICTED,
+                diagnostic = diagnostic,
+            ).also(PendingCanonicalAuthoringMutation::requireValid)
+        }
+    }
+
+    private fun validateCanonicalAuthoringCurrentState(
+        current: DayWeaveUiState,
+        mutation: PendingCanonicalAuthoringMutation,
+    ) {
+        val active = current.canonicalItems.firstOrNull { it.id == mutation.itemId }
+        val deleted = current.canonicalRecentlyDeleted.firstOrNull { it.id == mutation.itemId }
+        when (mutation.operation) {
+            CanonicalAuthoringOperation.CREATE -> require(active == null && deleted == null) {
+                "Canonical create identity already exists"
+            }
+            CanonicalAuthoringOperation.REPLACE,
+            -> require(active == mutation.baseItem && deleted == null) {
+                "Canonical item changed after this draft was created"
+            }
+            CanonicalAuthoringOperation.TRASH -> require(
+                deleted == null && if (mutation.baseItem != null) {
+                    active == mutation.baseItem
+                } else {
+                    active?.revision == mutation.expectedRevision
+                },
+            ) { "Canonical item changed after this deletion was queued" }
+            CanonicalAuthoringOperation.RESTORE -> require(
+                active == null && deleted?.revision == mutation.expectedRevision,
+            ) { "Recently-deleted item changed after this restore was queued" }
+        }
+    }
+
+    private fun validateCanonicalAuthoringResponse(
+        expected: PendingCanonicalAuthoringMutation,
+        response: CanonicalItemSnapshot,
+        retainedTrashBase: CanonicalItemSnapshot? = null,
+    ) {
+        response.requireCanonicalAuthoringShape()
+        require(response.id == expected.itemId)
+        val expectedResponseRevision = when (expected.operation) {
+            CanonicalAuthoringOperation.CREATE -> 1L
+            CanonicalAuthoringOperation.REPLACE,
+            CanonicalAuthoringOperation.TRASH,
+            CanonicalAuthoringOperation.RESTORE,
+            -> Math.addExact(requireNotNull(expected.expectedRevision), 1L)
+        }
+        require(response.revision == expectedResponseRevision)
+        when (expected.operation) {
+            CanonicalAuthoringOperation.CREATE,
+            CanonicalAuthoringOperation.REPLACE,
+            -> require(requireNotNull(expected.draft).matches(response)) {
+                "Canonical authoring response does not match the exact draft"
+            }
+            CanonicalAuthoringOperation.TRASH -> {
+                require(response.deletedAt != null)
+                // Deletion requests contain only identity, expected revision, and the durable
+                // idempotency key. Keep the stronger authored-field check while the short-lived
+                // recovery body is available, but never make exact response reconciliation
+                // depend on retaining plaintext beyond the privacy boundary.
+                (expected.baseItem ?: retainedTrashBase)?.let { exactBase ->
+                    require(exactBase.id == expected.itemId &&
+                        exactBase.revision == expected.expectedRevision &&
+                        exactBase.deletedAt == null)
+                    require(response.sameAuthoredFields(exactBase))
+                }
+            }
+            CanonicalAuthoringOperation.RESTORE -> {
+                require(response.deletedAt == null)
+                expected.baseItem?.let { require(response.sameAuthoredFields(it)) }
+            }
+        }
+        if (expected.operation != CanonicalAuthoringOperation.TRASH) {
+            require(response.deletedAt == null)
+        }
+    }
+
+    private fun CanonicalItemSnapshot.sameAuthoredFields(other: CanonicalItemSnapshot): Boolean =
+        id == other.id && isSensitive == other.isSensitive && kind == other.kind &&
+            status == other.status && title == other.title && notes == other.notes &&
+            timezoneName == other.timezoneName && durationSeconds == other.durationSeconds &&
+            deadlineAt.sameInstant(other.deadlineAt) &&
+            earliestStartAt.sameInstant(other.earliestStartAt) &&
+            recurrenceJson == other.recurrenceJson &&
+            flexibleConstraintsJson == other.flexibleConstraintsJson &&
+            splitPolicyJson == other.splitPolicyJson && importance == other.importance &&
+            urgency == other.urgency && parentId == other.parentId &&
+            siblingOrder == other.siblingOrder
+
+    private fun String?.sameInstant(other: String?): Boolean = when {
+        this == null || other == null -> this == other
+        else -> Instant.parse(this) == Instant.parse(other)
+    }
+
+    private fun CanonicalItemSnapshot.toRecentlyDeletedRecord(
+        effectiveIsSensitive: Boolean,
+    ) =
+        CanonicalRecentlyDeletedRecord(
+            id = id,
+            revision = revision,
+            deletedAt = requireNotNull(deletedAt),
+            parentId = parentId,
+            lastKnownItem = this,
+            effectiveIsSensitive = effectiveIsSensitive,
+            retentionAnchorAt = minOf(
+                Instant.parse(requireNotNull(deletedAt)),
+                Instant.ofEpochMilli(nowEpochMillis()),
+            ).toString(),
+        ).also(CanonicalRecentlyDeletedRecord::requireValid)
+
+    private fun List<CanonicalItemSnapshot>.upsertCanonical(
+        item: CanonicalItemSnapshot,
+    ): List<CanonicalItemSnapshot> =
+        (filterNot { it.id == item.id } + item).sortedWith(
+            compareBy<CanonicalItemSnapshot> { it.siblingOrder }.thenBy { it.id },
+        )
+
+    private fun List<CanonicalRecentlyDeletedRecord>.upsertRecentlyDeleted(
+        record: CanonicalRecentlyDeletedRecord,
+    ): List<CanonicalRecentlyDeletedRecord> {
+        val previous = firstOrNull { it.id == record.id }
+        if (previous != null && previous.revision > record.revision) return this
+        val retained = if (
+            previous?.revision == record.revision && record.lastKnownItem == null &&
+            previous.lastKnownItem != null
+        ) {
+            record.copy(lastKnownItem = previous.lastKnownItem)
+        } else {
+            record
+        }
+        val privacyRetained = if (previous?.isSensitive == true && !retained.isSensitive) {
+            retained.copy(effectiveIsSensitive = true)
+        } else {
+            retained
+        }
+        val earliestAnchor = listOfNotNull(
+            previous?.retentionAnchorAt?.let(Instant::parse),
+            privacyRetained.retentionAnchorAt?.let(Instant::parse),
+        ).minOrNull()
+        val anchored = if (earliestAnchor == null) privacyRetained else privacyRetained.copy(
+            retentionAnchorAt = earliestAnchor.toString(),
+        )
+        return filterNot { it.id == record.id } + anchored
+    }
+
+    private fun <T> List<T>.replaceAt(index: Int, replacement: T): List<T> =
+        mapIndexed { currentIndex, value -> if (currentIndex == index) replacement else value }
+
     /** Persists the idempotency fence before a canonical mutation can leave the device. */
     fun stageCanonicalMutation(
         mutation: PendingCanonicalMutation,
@@ -1087,6 +2104,9 @@ class PlannerStore(
         }
         require(current.pendingProposalApplicationMutation == null) {
             "A proposal application already needs reconciliation"
+        }
+        require(!current.hasPendingCanonicalAuthoringOverlay()) {
+            "A canonical authoring change already needs reconciliation"
         }
         require(UUID.fromString(mutation.idempotencyKey).toString() == mutation.idempotencyKey)
         require(UUID.fromString(mutation.itemId).toString() == mutation.itemId)
@@ -1379,6 +2399,9 @@ class PlannerStore(
         require(current.pendingProposalApplicationMutation == null) {
             "A proposal application already needs reconciliation"
         }
+        require(!current.hasPendingCanonicalAuthoringOverlay()) {
+            "A canonical authoring change already needs reconciliation"
+        }
         require(UUID.fromString(command.idempotencyKey).toString() == command.idempotencyKey)
         require(UUID.fromString(command.sessionId).toString() == command.sessionId)
         require(UUID.fromString(command.itemId).toString() == command.itemId)
@@ -1431,22 +2454,12 @@ class PlannerStore(
     /** No bearer replacement may cross an unresolved or explicitly authorized server write. */
     fun hasCredentialReplacementBlocker(): Boolean {
         val current = state.value
-        val projectionBlocked = runCatching {
-            validatedTerminalExecutionOutcomes(current.terminalExecutionOutcomes).any {
-                it.requiresCanonicalItemProjection &&
-                    it.canonicalProjectionRevision == null &&
-                    it.canonicalProjectionResolution == null &&
-                    (
-                        it.canonicalProjectionConflict == null ||
-                            it.canonicalProjectionRetryAuthorizedAt != null
-                        )
-            }
-        }.getOrElse { true }
         return current.pendingCanonicalMutation != null ||
             current.pendingSchedulePublication != null ||
             current.pendingExecutionCommand != null ||
             current.pendingProposalApplicationMutation != null ||
-            projectionBlocked
+            current.hasSubmittedCanonicalAuthoring() ||
+            current.hasUnresolvedTerminalProjection()
     }
 
     /**
@@ -1863,14 +2876,31 @@ class PlannerStore(
 
     /** Locally forgets all canonical execution state before credential destruction. */
     fun abandonCanonicalConnection(): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(!current.hasSubmittedCanonicalAuthoring()) {
+            "Every submitted canonical authoring write must be explicitly resolved before disconnecting"
+        }
         val canonicalBlockIds = current.schedule.asSequence()
             .filter { it.canonicalItemId != null }
             .map(ScheduleItem::id)
             .toSet()
+        var preservedCreates = current.pendingCanonicalAuthoringMutations.filter {
+            it.operation == CanonicalAuthoringOperation.CREATE && !it.isSubmitted &&
+                it.syncOrigin == null && it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        while (true) {
+            val preservedIds = preservedCreates.mapTo(mutableSetOf()) { it.itemId }
+            val selfContained = preservedCreates.filter { mutation ->
+                mutation.draft?.parentId?.let { it in preservedIds } != false
+            }
+            if (selfContained.size == preservedCreates.size) break
+            preservedCreates = selfContained
+        }
         current.copy(
             suggestions = current.suggestions.filter { it.remoteRevision == null },
             inbox = current.inbox.filter { it.source != InboxSource.EXTERNAL_PROPOSAL },
             canonicalItems = emptyList(),
+            pendingCanonicalAuthoringMutations = preservedCreates,
+            canonicalRecentlyDeleted = emptyList(),
             canonicalSyncOrigin = null,
             canonicalConfigurationId = null,
             canonicalDeltaCursor = null,
@@ -2651,6 +3681,7 @@ class PlannerStore(
                     state.canonicalItems,
                     canonical.id,
                     state.pendingCanonicalMutation,
+                    state.pendingCanonicalAuthoringMutations,
                 )
             } ?: true,
             title = item?.title ?: "Remote focus session",
@@ -2799,10 +3830,16 @@ class PlannerStore(
 
     private fun mutateDurably(
         transform: (DayWeaveUiState) -> DayWeaveUiState,
-    ): PlannerPersistenceReceipt? {
+    ): PlannerPersistenceReceipt? = mutateDurablyWithSnapshot(transform)?.receipt
+
+    /** Returns the exact post-normalization snapshot represented by the durable receipt. */
+    private fun mutateDurablyWithSnapshot(
+        transform: (DayWeaveUiState) -> DayWeaveUiState,
+    ): MutationResult? {
         val mutation = mutateInternal(requireExactSave = true, transform) ?: return null
         if (mutation.shouldSignalWriter) saveRequests.trySend(Unit)
-        return requireNotNull(mutation.receipt)
+        requireNotNull(mutation.receipt)
+        return mutation
     }
 
     private fun mutateInternal(
@@ -2815,9 +3852,13 @@ class PlannerStore(
         ) {
             return@synchronized null
         }
-        val snapshot = transform(mutableState.value).withPendingSensitivityHardened()
+        val snapshot = transform(mutableState.value)
+            .withCanonicalTrashRetention(nowEpochMillis())
+            .withPendingSensitivityHardened()
+            .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot
         currentGeneration += 1
+        scheduleCanonicalTrashCleanupLocked(snapshot)
 
         if (persistenceStatus != PersistenceStatus.READY) {
             val receipt = if (requireExactSave) {
@@ -2828,7 +3869,11 @@ class PlannerStore(
             } else {
                 null
             }
-            return@synchronized MutationResult(receipt, shouldSignalWriter = false)
+            return@synchronized MutationResult(
+                receipt = receipt,
+                shouldSignalWriter = false,
+                snapshot = snapshot,
+            )
         }
 
         val completion = if (requireExactSave) CompletableDeferred<Boolean>() else null
@@ -2848,6 +3893,7 @@ class PlannerStore(
                 PlannerPersistenceReceipt(currentGeneration, it)
             },
             shouldSignalWriter = true,
+            snapshot = snapshot,
         )
     }
 
@@ -2861,11 +3907,15 @@ class PlannerStore(
 
         val persistedState = restored.getOrNull()
         val shouldSaveInitialState = synchronized(persistenceLock) {
-            val snapshot = (persistedState ?: initialState).withPendingSensitivityHardened()
+            val snapshot = (persistedState ?: initialState)
+                .withCanonicalTrashRetention(nowEpochMillis())
+                .withPendingSensitivityHardened()
+                .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
             mutableState.value = snapshot
             currentGeneration += 1
             persistenceStatus = PersistenceStatus.READY
-            if (persistedState == null) {
+            scheduleCanonicalTrashCleanupLocked(snapshot)
+            if (persistedState == null || snapshot != persistedState) {
                 latestNormalSaveRequest = SaveRequest(currentGeneration, snapshot)
                 true
             } else {
@@ -2908,12 +3958,35 @@ class PlannerStore(
         }
     }
 
+    private fun scheduleCanonicalTrashCleanupLocked(snapshot: DayWeaveUiState) {
+        canonicalTrashCleanupCancellation?.cancel()
+        canonicalTrashCleanupCancellation = null
+        canonicalTrashCleanupToken += 1L
+        val scheduler = canonicalTrashCleanupScheduler ?: return
+        val now = nowEpochMillis()
+        val deadline = snapshot.nextCanonicalTrashRetentionExpiryEpochMillis(now) ?: return
+        val token = canonicalTrashCleanupToken
+        val delayMillis = (deadline - now).coerceAtLeast(1L)
+        canonicalTrashCleanupCancellation = scheduler.schedule(delayMillis) {
+            val isCurrent = synchronized(persistenceLock) {
+                token == canonicalTrashCleanupToken
+            }
+            if (isCurrent) {
+                // An exact save prevents privacy cleanup from being coalesced behind routine UI IO.
+                mutateDurably { it }
+            }
+        }
+    }
+
     private fun markPersistenceFailed(
         error: Throwable,
         failedRequest: SaveRequest? = null,
     ) {
         synchronized(persistenceLock) {
             persistenceStatus = PersistenceStatus.FAILED
+            canonicalTrashCleanupCancellation?.cancel()
+            canonicalTrashCleanupCancellation = null
+            canonicalTrashCleanupToken += 1L
             failedRequest?.completion?.complete(false)
             while (exactSaveRequests.isNotEmpty()) {
                 exactSaveRequests.removeFirst().completion?.complete(false)
@@ -2927,6 +4000,7 @@ class PlannerStore(
     private data class MutationResult(
         val receipt: PlannerPersistenceReceipt?,
         val shouldSignalWriter: Boolean,
+        val snapshot: DayWeaveUiState,
     )
 
     private data class SaveRequest(
@@ -2972,6 +4046,7 @@ class PlannerStore(
         const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1
         const val PROPOSAL_APPLICATION_RECEIPT_VERSION = 1
         const val MAX_PROPOSAL_APPLICATION_COMMANDS = 100
+        const val MAX_CANONICAL_AUTHORING_QUEUE = 100
         val NIL_UUID: UUID = UUID(0L, 0L)
         const val TERMINAL_PROJECTION_ITEM_DELETED = "item_deleted"
         const val TERMINAL_PROJECTION_USER_KEPT_LATEST = "user_kept_latest_item"

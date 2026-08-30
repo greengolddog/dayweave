@@ -22,6 +22,7 @@ import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.toCanonicalDraft
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.MAX_SCHEDULE_PUBLISH_BODY_BYTES
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
@@ -271,6 +272,41 @@ class PlannerStoreTest {
         val stale = runCatching { store.commitSchedulePublication(pending, revision) }
         assertTrue(stale.isFailure)
         assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
+    fun publicationCannotCrossPendingAuthoringOrReinstallAFilteredProof() {
+        val oldItem = canonicalItem("planned", 7)
+        val store = PlannerStore(publishedCanonicalState(item = oldItem))
+        assertNotNull(
+            store.enqueueCanonicalReplace(
+                oldItem.id,
+                oldItem.toCanonicalDraft().copy(title = "Local edit"),
+            ),
+        )
+        assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.scheduleInputDigest)
+        val candidate = canonicalUpdate(
+            item = oldItem.copy(revision = 8, updatedAt = "1970-01-01T00:01:00Z"),
+            block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+            cursor = "cursor-authoring-race",
+        )
+        val pending = publication(candidate)
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            store.stageSchedulePublication(pending)
+        }
+
+        // A recovered legacy/racing journal still cannot make a filtered candidate current.
+        val recoveryStore = PlannerStore(
+            store.state.value.copy(pendingSchedulePublication = pending),
+        )
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            recoveryStore.commitSchedulePublication(pending, publishedRevision())
+        }
+        assertEquals(pending, recoveryStore.state.value.pendingSchedulePublication)
+        assertNull(recoveryStore.state.value.publishedScheduleRevision)
+        assertNull(recoveryStore.state.value.scheduleInputDigest)
     }
 
     @Test

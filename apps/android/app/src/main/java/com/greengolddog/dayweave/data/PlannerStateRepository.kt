@@ -2,8 +2,14 @@ package com.greengolddog.dayweave.data
 
 import android.content.Context
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+import com.greengolddog.dayweave.model.CanonicalTrashRetentionPolicy
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
+import com.greengolddog.dayweave.model.canonicalTrashItemBytes
+import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
+import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
@@ -49,11 +55,24 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V6 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V7 -> {
+                val decoded = decodeCurrentSnapshot(snapshot.payload)
+                if (SNAPSHOT_JSON.encodeToString(decoded) != snapshot.payload) save(decoded)
+                decoded
+            }
+            PlannerSnapshotFormats.JSON_V6 -> {
+                val migrated = decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requireCanonicalAuthoringFields = false,
+                )
+                save(migrated)
+                migrated
+            }
             PlannerSnapshotFormats.JSON_V5 -> {
                 val migrated = decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireProposalApplicationFields = false,
+                    requireCanonicalAuthoringFields = false,
                 )
                 save(migrated)
                 migrated
@@ -92,14 +111,17 @@ class RoomPlannerStateRepository(
     }
 
     override suspend fun save(state: DayWeaveUiState) {
-        validateSchedulePublicationState(state)
-        validateProposalApplicationState(state)
+        val referenceEpochMillis = nowEpochMillis()
+        val retainedState = state.withCanonicalTrashRetention(referenceEpochMillis)
+        validateSchedulePublicationState(retainedState)
+        validateProposalApplicationState(retainedState)
+        validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
-                payload = SNAPSHOT_JSON.encodeToString(state),
-                updatedAtEpochMillis = nowEpochMillis(),
-                payloadFormat = PlannerSnapshotFormats.JSON_V6,
+                payload = SNAPSHOT_JSON.encodeToString(retainedState),
+                updatedAtEpochMillis = referenceEpochMillis,
+                payloadFormat = PlannerSnapshotFormats.JSON_V7,
             ),
         )
     }
@@ -107,6 +129,7 @@ class RoomPlannerStateRepository(
     private fun decodeCurrentSnapshot(
         payload: String,
         requireProposalApplicationFields: Boolean = true,
+        requireCanonicalAuthoringFields: Boolean = true,
     ): DayWeaveUiState {
         val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         if (!root.containsKey("pendingSchedulePublication") ||
@@ -119,6 +142,13 @@ class RoomPlannerStateRepository(
                 !root.containsKey("proposalApplications"))
         ) {
             throw SerializationException("Current proposal application fields are required")
+        }
+        if (
+            requireCanonicalAuthoringFields &&
+            (!root.containsKey("pendingCanonicalAuthoringMutations") ||
+                !root.containsKey("canonicalRecentlyDeleted"))
+        ) {
+            throw SerializationException("Current canonical authoring fields are required")
         }
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
@@ -144,11 +174,14 @@ class RoomPlannerStateRepository(
             }
             else -> throw SerializationException("pendingCanonicalMutation must be an object")
         }
+        val referenceEpochMillis = nowEpochMillis()
         return SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(root)
+            .withCanonicalTrashRetention(referenceEpochMillis)
             .withPendingSensitivityHardened()
             .also {
                 validateSchedulePublicationState(it)
                 validateProposalApplicationState(it)
+                validateCanonicalAuthoringState(it, referenceEpochMillis)
             }
     }
 
@@ -179,7 +212,10 @@ class RoomPlannerStateRepository(
         }
         return SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(root)
             .withPendingSensitivityHardened()
-            .also(::validateSchedulePublicationState)
+            .also {
+                validateSchedulePublicationState(it)
+                validateCanonicalAuthoringState(it)
+            }
     }
 
     /**
@@ -231,7 +267,136 @@ class RoomPlannerStateRepository(
         }
         return LEGACY_SNAPSHOT_JSON.decodeFromJsonElement<DayWeaveUiState>(migratedRoot)
             .withPendingSensitivityHardened()
-            .also(::validateSchedulePublicationState)
+            .also {
+                validateSchedulePublicationState(it)
+                validateCanonicalAuthoringState(it)
+            }
+    }
+
+    private fun validateCanonicalAuthoringState(
+        state: DayWeaveUiState,
+        referenceEpochMillis: Long = nowEpochMillis(),
+    ) {
+        val mutations = state.pendingCanonicalAuthoringMutations
+        if (mutations.size > MAX_CANONICAL_AUTHORING_MUTATIONS ||
+            mutations.map { it.id }.distinct().size != mutations.size ||
+            mutations.map { it.itemId }.distinct().size != mutations.size) {
+            throw SerializationException("Canonical authoring queue is invalid")
+        }
+        runCatching { requireCanonicalAuthoringJournalBudget(mutations) }.getOrElse {
+            throw SerializationException("Malformed or oversized canonical authoring journal", it)
+        }
+        val unresolvedSubmitted = mutations.filter {
+            it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        val hasPendingAuthoringOverlay = mutations.any {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        if (unresolvedSubmitted.size > 1) {
+            throw SerializationException("More than one canonical authoring write is unresolved")
+        }
+        if (hasPendingAuthoringOverlay &&
+            (state.pendingCanonicalMutation != null || state.pendingExecutionCommand != null ||
+                state.pendingSchedulePublication != null ||
+                state.pendingProposalApplicationMutation != null)) {
+            throw SerializationException("Canonical authoring crosses another uncertainty fence")
+        }
+        if (hasPendingAuthoringOverlay &&
+            (state.publishedScheduleRevision != null || state.scheduleInputDigest != null)) {
+            throw SerializationException("Pending canonical authoring retains a current-plan proof")
+        }
+        mutations.filter { it.syncOrigin != null }.forEach { mutation ->
+            if (state.canonicalSyncOrigin != mutation.syncOrigin ||
+                state.canonicalConfigurationId != mutation.configurationId) {
+                throw SerializationException("Canonical authoring mutation crosses its API binding")
+            }
+        }
+
+        val deleted = state.canonicalRecentlyDeleted
+        if (deleted.size > MAX_RECENTLY_DELETED ||
+            deleted.map { it.id }.distinct().size != deleted.size) {
+            throw SerializationException("Recently-deleted canonical records are invalid")
+        }
+        deleted.forEach { record ->
+            runCatching { record.requireValid() }.getOrElse {
+                throw SerializationException("Malformed recently-deleted canonical record", it)
+            }
+            if (record.retentionAnchorAt == null) {
+                throw SerializationException("Recently-deleted canonical retention anchor is missing")
+            }
+        }
+        val retainedBodyBytes = deleted.sumOf { record ->
+            (record.lastKnownItem?.let(::canonicalTrashItemBytes) ?: 0).toLong()
+        }
+        if (deleted.any { record ->
+                record.lastKnownItem?.let(::canonicalTrashItemBytes)
+                    ?.let { it > CanonicalTrashRetentionPolicy.MAX_ITEM_BYTES } == true
+            } || retainedBodyBytes > CanonicalTrashRetentionPolicy.MAX_RETAINED_ITEM_BYTES.toLong()
+        ) {
+            throw SerializationException("Recently-deleted canonical bodies exceed retention limits")
+        }
+        if (state.canonicalItems.any { active -> deleted.any { it.id == active.id } }) {
+            throw SerializationException("An active canonical item is also recently deleted")
+        }
+        mutations.filter { it.operation == CanonicalAuthoringOperation.RESTORE }.forEach { mutation ->
+            val record = deleted.firstOrNull { it.id == mutation.itemId }
+                ?: throw SerializationException("Restore journal has no deleted record")
+            val expectedRevision = requireNotNull(mutation.expectedRevision)
+            val revisionIsValid = when {
+                !mutation.isSubmitted -> record.revision == expectedRevision
+                record.revision == expectedRevision -> true
+                record.revision > expectedRevision &&
+                    mutation.disposition == CanonicalAuthoringDisposition.CONFLICTED -> true
+                else -> false
+            }
+            if (!revisionIsValid) {
+                throw SerializationException("Restore journal revision does not match deleted state")
+            }
+            val cutoff = Instant.ofEpochMilli(referenceEpochMillis)
+                .minusSeconds(CanonicalTrashRetentionPolicy.RETENTION_SECONDS)
+            if (Instant.parse(requireNotNull(record.retentionAnchorAt)) < cutoff &&
+                mutation.baseItem != null) {
+                throw SerializationException("Expired restore journal retains a full item body")
+            }
+        }
+        val cutoff = Instant.ofEpochMilli(referenceEpochMillis)
+            .minusSeconds(CanonicalTrashRetentionPolicy.RETENTION_SECONDS)
+        mutations.filter { it.operation == CanonicalAuthoringOperation.TRASH }.forEach { mutation ->
+            if (Instant.parse(mutation.createdAt) < cutoff && mutation.baseItem != null) {
+                throw SerializationException("Expired trash journal retains a full item body")
+            }
+        }
+
+        val parentById = state.canonicalItems.associate { it.id to it.parentId }.toMutableMap()
+        mutations.filter {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }.forEach { mutation ->
+            when (mutation.operation) {
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                -> parentById[mutation.itemId] = requireNotNull(mutation.draft).parentId
+                CanonicalAuthoringOperation.TRASH -> parentById.remove(mutation.itemId)
+                CanonicalAuthoringOperation.RESTORE -> {
+                    val record = deleted.first { it.id == mutation.itemId }
+                    parentById[mutation.itemId] = record.parentId
+                }
+            }
+        }
+        parentById.values.filterNotNull().forEach { parentId ->
+            if (parentId !in parentById) {
+                throw SerializationException("Canonical authoring hierarchy has a missing parent")
+            }
+        }
+        parentById.keys.forEach { start ->
+            val visited = mutableSetOf<String>()
+            var current: String? = start
+            while (current != null) {
+                if (!visited.add(current)) {
+                    throw SerializationException("Canonical authoring hierarchy contains a cycle")
+                }
+                current = parentById[current]
+            }
+        }
     }
 
     private fun validateSchedulePublicationState(state: DayWeaveUiState) {
@@ -521,6 +686,8 @@ class RoomPlannerStateRepository(
     private companion object {
         const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1
         const val PROPOSAL_APPLICATION_RECEIPT_VERSION = 1
+        const val MAX_CANONICAL_AUTHORING_MUTATIONS = 100
+        const val MAX_RECENTLY_DELETED = CanonicalTrashRetentionPolicy.MAX_ENTRIES
         val SNAPSHOT_JSON = Json {
             encodeDefaults = true
             ignoreUnknownKeys = false

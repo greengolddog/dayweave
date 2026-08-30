@@ -41,6 +41,27 @@ Android Keystore key; they are never placed in the Room planner snapshot, WorkMa
 or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from
 backup and device transfer.
 
+## Canonical authoring recovery foundation
+
+Android has a typed, encrypted local foundation for canonical create, replace, trash, and restore
+intent. Drafts cover task, habit, routine, goal, event, and break items; recurrence, fixed event
+timing, split policy, priority, privacy, and unbounded parent/child hierarchy are validated before
+an intent can enter the journal. Each request receives a stable idempotency identity and must be
+persisted before a future network layer may send it. Submitted uncertainty, conflicts, parent/child
+submission order, refresh overlays, and schedule-proof invalidation survive process death.
+
+Recently Deleted recovery bodies and the duplicate bases held by trash/restore journals expire
+after seven days, with separate count and byte limits. A local retention anchor prevents a future
+provider timestamp from extending that window; a quiet-process timer strips expired bodies and
+durably rewrites the encrypted snapshot even when the user does nothing. Minimal bodyless restore
+metadata and request identity remain available for safe replay, while sensitivity fails closed.
+Room 7-to-8 / JSON-v6-to-v7 is a rollback fence for this encrypted payload contract; no authoring
+content or provider credential is added to a plaintext database column.
+
+This slice intentionally exposes store and persistence APIs only. The Android editor and network
+transport must consume these APIs in a later slice rather than inventing a second draft or retry
+path.
+
 ## Sensitive-item authoring
 
 Quick capture has an explicit **Sensitive** switch, and captured drafts retain that classification
