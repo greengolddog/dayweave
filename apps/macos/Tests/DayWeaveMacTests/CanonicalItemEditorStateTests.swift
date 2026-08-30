@@ -7,6 +7,32 @@ import Testing
 #if canImport(Testing)
 @Suite("Canonical item editor state")
 struct CanonicalItemEditorStateTests {
+    @Test("new drafts use the injected profile timezone while edits retain their own")
+    func testProfileTimezoneInjection() {
+        let newState = CanonicalItemEditorState(
+            itemID: Self.id(40),
+            timezoneName: "America/New_York"
+        )
+        let invalidProfileState = CanonicalItemEditorState(
+            itemID: Self.id(41),
+            timezoneName: "PST"
+        )
+        let existing = DayWeaveCanonicalItemDraft(
+            title: "Existing timezone",
+            timezoneName: "Europe/Madrid"
+        )
+        let editedState = CanonicalItemEditorState(
+            itemID: Self.id(42),
+            draft: existing,
+            timezoneName: "America/New_York"
+        )
+
+        #expect(newState.timezoneName == "America/New_York")
+        #expect(invalidProfileState.timezoneName == "UTC")
+        #expect(editedState.timezoneName == "Europe/Madrid")
+        #expect(CanonicalItemEditorState.defaultTimezoneName == "UTC")
+    }
+
     @Test("title-only capture creates an unscheduled Inbox item")
     func testTitleOnlyCapture() {
         var state = CanonicalItemEditorState(

@@ -415,7 +415,7 @@ struct LocalCompositionStoreTests {
             localProvenance: nil
         )
         let migrated = try schemaEleven.migratedToCurrentSchema()
-        #expect(migrated.schemaVersion == 12)
+        #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion)
         #expect(migrated.localScheduleCompositionProvenance == nil)
 
         let localProvenance = LocalCompositionFixture.provenance(
@@ -730,13 +730,19 @@ private enum LocalCompositionFixture {
         schedule: DayWeaveSchedulePreviewRequest
     ) -> LocalScheduleComposition {
         let item = canonicalItems[0]
-        let start = max(schedule.asOf.addingTimeInterval(3_600), schedule.horizonStart)
+        guard let placement = schedule.availability.first(where: {
+            $0.end.timeIntervalSince($0.start) >= 1_800
+        }) else {
+            preconditionFailure("The local-composition fixture needs a 30-minute availability window")
+        }
+        let start = placement.start
         let end = start.addingTimeInterval(1_800)
+        let fixedBlocks = externalBlocks(for: schedule)
         let plan = DayWeaveSchedulePreview.Plan(
             asOf: schedule.asOf,
             horizonStart: schedule.horizonStart,
             horizonEnd: schedule.horizonEnd,
-            blocks: [.init(
+            blocks: (fixedBlocks + [.init(
                 id: plannedBlockID,
                 isSensitive: false,
                 itemID: item.id,
@@ -748,7 +754,10 @@ private enum LocalCompositionFixture {
                 sessionIndex: 0,
                 kind: "planned",
                 explanations: [.init(code: "local", message: "Composed on this Mac.")]
-            )],
+            )]).sorted {
+                if $0.start != $1.start { return $0.start < $1.start }
+                return $0.id.uuidString < $1.id.uuidString
+            },
             unscheduled: [],
             decisions: [],
             violations: [],
@@ -771,6 +780,31 @@ private enum LocalCompositionFixture {
             ignoredPreviousAssignments: [],
             plan: plan
         )
+    }
+
+    static func externalBlocks(
+        for schedule: DayWeaveSchedulePreviewRequest
+    ) -> [DayWeaveSchedulePreview.Plan.Block] {
+        schedule.fixedBlocks
+            .filter { $0.end > schedule.horizonStart && $0.start < schedule.horizonEnd }
+            .map { fixed in
+                .init(
+                    id: fixed.id,
+                    isSensitive: fixed.isSensitive,
+                    itemID: nil,
+                    occurrenceID: nil,
+                    externalBlockID: fixed.id,
+                    title: fixed.title,
+                    start: fixed.start,
+                    end: fixed.end,
+                    sessionIndex: 0,
+                    kind: "external_fixed",
+                    explanations: [.init(
+                        code: fixed.source,
+                        message: "Protected by the local schedule profile."
+                    )]
+                )
+            }
     }
 
     static func renderedBlock(
@@ -800,16 +834,19 @@ private enum LocalCompositionFixture {
     }
 
     static func scheduleRequest(asOf: Date) -> DayWeaveSchedulePreviewRequest {
-        let calendar = Calendar.autoupdatingCurrent
-        let start = calendar.startOfDay(for: asOf)
+        guard let profile = try? ScheduleProfile.legacyDefault(
+            timezoneName: planningTimezone,
+            protectedFreeMinutes: 90
+        ), let expanded = try? profile.expanded(asOf: asOf) else {
+            preconditionFailure("The built-in local-composition profile must expand")
+        }
         return .init(
             asOf: asOf,
-            horizonStart: start,
-            horizonEnd: calendar.date(byAdding: .day, value: 7, to: start)
-                ?? start.addingTimeInterval(7 * 86_400),
-            timezoneName: planningTimezone,
-            availability: [],
-            fixedBlocks: [],
+            horizonStart: expanded.horizonStart,
+            horizonEnd: expanded.horizonEnd,
+            timezoneName: expanded.timezoneName,
+            availability: expanded.availability,
+            fixedBlocks: expanded.fixedBlocks,
             previousAssignments: [],
             config: .init(
                 slotGranularityMinutes: 5,
@@ -852,7 +889,7 @@ private enum LocalCompositionFixture {
             asOf: request.asOf,
             horizonStart: request.horizonStart,
             horizonEnd: request.horizonEnd,
-            blocks: [],
+            blocks: externalBlocks(for: request),
             unscheduled: [],
             decisions: [],
             violations: [],

@@ -348,6 +348,20 @@ struct CodexConversationControllerTests {
         #expect(try encoder.encode(stableTimestamp(first)) == encoder.encode(stableTimestamp(second)))
     }
 
+    @Test("planner context uses the persisted schedule profile timezone")
+    func testPlannerContextUsesProfileTimezone() throws {
+        let profile = try ScheduleProfile.legacyDefault(
+            timezoneName: "America/New_York",
+            protectedFreeMinutes: 90
+        )
+        let store = PlannerStore(
+            scheduleProfile: profile,
+            restoreFromPersistence: false
+        )
+
+        #expect(store.codexPlannerContextSnapshot().timezone == "America/New_York")
+    }
+
     @Test("oversized user messages never cross the app-server boundary")
     func testOversizedUserMessageIsRejected() {
         let store = PlannerStore(restoreFromPersistence: false)

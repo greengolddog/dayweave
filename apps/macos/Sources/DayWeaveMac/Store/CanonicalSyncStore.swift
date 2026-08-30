@@ -75,10 +75,12 @@ final class CanonicalSyncStore: ObservableObject {
     private var configurationGeneration: UInt64 = 0
     private var activeSyncID: UUID?
     private var activeSyncTask: Task<Void, Never>?
+    private var activeSyncScheduleProfile: ScheduleProfile?
     private var lastSuccessfulSyncID: UUID?
     private var lastFreshCompositionSyncID: UUID?
     private var activeLocalCompositionID: UUID?
     private var activeLocalCompositionTask: Task<LocalScheduleComposition, Error>?
+    private var activeLocalCompositionScheduleProfile: ScheduleProfile?
 
     init(
         planner: PlannerStore,
@@ -108,6 +110,9 @@ final class CanonicalSyncStore: ObservableObject {
         self.now = now
         status = .ready
         reloadConfigurationStatus()
+        planner.observeCommittedScheduleProfileChanges { [weak self] in
+            self?.scheduleProfileDidCommit()
+        }
     }
 
     var isConfigured: Bool {
@@ -175,6 +180,7 @@ final class CanonicalSyncStore: ObservableObject {
         let operationID = UUID()
         let generation = configurationGeneration
         activeLocalCompositionID = operationID
+        activeLocalCompositionScheduleProfile = planner.scheduleProfile
         isLocallyComposing = true
         localCompositionWarnings = []
         localCompositionStatus = .composing("Composing seven days on this Mac…")
@@ -189,7 +195,7 @@ final class CanonicalSyncStore: ObservableObject {
             )
 
             let priorWarningCount = warnings.count
-            let request = makePreviewRequest()
+            let request = try makePreviewRequest()
             let requestWarnings = Array(warnings.dropFirst(priorWarningCount))
             if warnings.count > priorWarningCount {
                 warnings.removeLast(warnings.count - priorWarningCount)
@@ -205,7 +211,7 @@ final class CanonicalSyncStore: ObservableObject {
                 completedOccurrenceIDs: planner.completedOccurrenceIDs,
                 recurrenceSessionOutcomes: planner.recurrenceSessionOutcomes,
                 blocks: planner.blocks,
-                protectedFreeMinutes: planner.protectedFreeMinutes,
+                scheduleProfile: planner.scheduleProfile,
                 freezeHours: planner.freezeHours,
                 timezoneName: planningTimezone
             )
@@ -287,7 +293,7 @@ final class CanonicalSyncStore: ObservableObject {
             localWarnings.append(contentsOf: composition.ignoredPreviousAssignments.map {
                 "A previous assignment for \($0.itemID.uuidString.lowercased()) was ignored on this device: \($0.reason)"
             })
-            let message = "On-device schedule · composed \(rendered.count) blocks · \(composition.plan.score.unscheduledMinutes)m unscheduled · not published"
+            let message = "On-device schedule · composed \(Self.composedBlockSummary(composition.plan.blocks)) · \(composition.plan.score.unscheduledMinutes)m unscheduled · not published"
             try planner.commitLocalScheduleComposition(
                 blocks: rendered,
                 message: message,
@@ -316,6 +322,7 @@ final class CanonicalSyncStore: ObservableObject {
         if activeLocalCompositionID == operationID {
             activeLocalCompositionTask = nil
             activeLocalCompositionID = nil
+            activeLocalCompositionScheduleProfile = nil
             isLocallyComposing = false
             planner.endCanonicalSync()
         }
@@ -364,6 +371,7 @@ final class CanonicalSyncStore: ObservableObject {
         let operationID = UUID()
         let generation = configurationGeneration
         activeSyncID = operationID
+        activeSyncScheduleProfile = planner.scheduleProfile
         isSyncing = true
         status = .syncing("Pulling canonical item revisions…")
         let task = Task<Void, Never> { @MainActor [weak self] in
@@ -432,6 +440,7 @@ final class CanonicalSyncStore: ObservableObject {
             if activeSyncID == operationID {
                 activeSyncTask = nil
                 activeSyncID = nil
+                activeSyncScheduleProfile = nil
                 isSyncing = false
                 planner.endCanonicalSync()
                 if generation != configurationGeneration {
@@ -456,12 +465,12 @@ final class CanonicalSyncStore: ObservableObject {
                     generation: generation
                 )
                 switch recovery {
-                case let .installed(revisionNumber, blockCount):
+                case let .installed(revisionNumber, blockSummary):
                     lastPreview = pending.preview
                     lastSuccessfulSyncID = operationID
                     status = .online(
                         updatedAt: now(),
-                        message: "Recovered published revision \(revisionNumber); composed \(blockCount) blocks"
+                        message: "Recovered published revision \(revisionNumber); installed \(blockSummary)"
                     )
                     return
                 case .requiresFreshComposition:
@@ -538,7 +547,7 @@ final class CanonicalSyncStore: ObservableObject {
                 updatedAt: now(),
                 message: "Synced \(planner.canonicalItems.count) items"
                     + (authored > 0 ? "; applied \(authored) Inbox edit\(authored == 1 ? "" : "s")" : "")
-                    + "; composed \(installed.blockCount) blocks"
+                    + "; composed \(installed.blockSummary)"
             )
         } catch {
             planner.flushPersistence()
@@ -628,7 +637,7 @@ final class CanonicalSyncStore: ObservableObject {
     ) async throws -> (preview: DayWeaveSchedulePreview, request: DayWeaveSchedulePreviewRequest) {
         for attempt in 1...3 {
             try ensureOperationCurrent(operationID: operationID, generation: generation)
-            let request = makePreviewRequest()
+            let request = try makePreviewRequest()
             let preview = try await client.previewSchedule(request)
             try ensureOperationCurrent(operationID: operationID, generation: generation)
             let localRevisions = Dictionary(
@@ -688,7 +697,7 @@ final class CanonicalSyncStore: ObservableObject {
         clearTransientLocalComposition()
         return .installed(
             revisionNumber: published.revision.revisionNumber,
-            blockCount: rendered.count
+            blockSummary: Self.composedBlockSummary(publication.preview.plan.blocks)
         )
     }
 
@@ -792,7 +801,10 @@ final class CanonicalSyncStore: ObservableObject {
 
             try planner.commitPendingSchedulePublication(publication, blocks: rendered)
             clearTransientLocalComposition()
-            return .init(preview: preview, blockCount: rendered.count)
+            return .init(
+                preview: preview,
+                blockSummary: Self.composedBlockSummary(preview.plan.blocks)
+            )
         }
     }
 
@@ -1868,29 +1880,11 @@ final class CanonicalSyncStore: ObservableObject {
         )
     }
 
-    private func makePreviewRequest() -> DayWeaveSchedulePreviewRequest {
-        let calendar = Calendar.autoupdatingCurrent
-        let asOf = now()
-        let start = calendar.startOfDay(for: asOf)
-        let end = calendar.date(byAdding: .day, value: 7, to: start) ?? start.addingTimeInterval(7 * 86_400)
-        let availability = (0..<7).compactMap { offset -> DayWeaveSchedulePreviewRequest.Availability? in
-            guard let day = calendar.date(byAdding: .day, value: offset, to: start),
-                  let availableStart = calendar.date(bySettingHour: 6, minute: 0, second: 0, of: day),
-                  let dayEnd = calendar.date(bySettingHour: 23, minute: 0, second: 0, of: day),
-                  let availableEnd = calendar.date(
-                      byAdding: .minute,
-                      value: -planner.protectedFreeMinutes,
-                      to: dayEnd
-                  ),
-                  availableEnd > availableStart else { return nil }
-            return .init(
-                start: max(availableStart, asOf),
-                end: availableEnd,
-                contexts: [],
-                location: nil,
-                energy: "medium"
-            )
-        }.filter { $0.end > $0.start }
+    private func makePreviewRequest() throws -> DayWeaveSchedulePreviewRequest {
+        let expandedProfile = try planner.scheduleProfile.expanded(asOf: now())
+        let asOf = expandedProfile.asOf
+        let start = expandedProfile.horizonStart
+        let end = expandedProfile.horizonEnd
         let activeItemIDs = Set(planner.canonicalItems.map(\.id))
         let activeOutcomes = planner.recurrenceSessionOutcomes.filter {
             activeItemIDs.contains($0.itemID)
@@ -1949,9 +1943,9 @@ final class CanonicalSyncStore: ObservableObject {
             asOf: asOf,
             horizonStart: start,
             horizonEnd: end,
-            timezoneName: planningTimezone,
-            availability: availability,
-            fixedBlocks: [],
+            timezoneName: expandedProfile.timezoneName,
+            availability: expandedProfile.availability,
+            fixedBlocks: expandedProfile.fixedBlocks,
             previousAssignments: previousAssignments(stabilityStart: asOf, horizonEnd: end),
             config: .init(slotGranularityMinutes: 5, stabilityWeight: 4, defaultSoftWeight: 100),
             recurrenceContext: [
@@ -2142,7 +2136,7 @@ final class CanonicalSyncStore: ObservableObject {
         updated: Int
     ) -> String {
         var parts = [
-            "Composed \(preview.plan.blocks.count) blocks",
+            "Composed \(Self.composedBlockSummary(preview.plan.blocks))",
             "\(preview.plan.score.unscheduledMinutes)m unscheduled",
         ]
         if created > 0 { parts.append("published \(created) new") }
@@ -2153,9 +2147,19 @@ final class CanonicalSyncStore: ObservableObject {
         return parts.joined(separator: " · ")
     }
 
+    private static func composedBlockSummary(
+        _ blocks: [DayWeaveSchedulePreview.Plan.Block]
+    ) -> String {
+        let fixedCount = blocks.count(where: { $0.kind == "external_fixed" })
+        let plannedCount = blocks.count - fixedCount
+        let planned = "\(plannedCount) work/calendar block\(plannedCount == 1 ? "" : "s")"
+        guard fixedCount > 0 else { return planned }
+        let fixed = "\(fixedCount) fixed-time block\(fixedCount == 1 ? "" : "s")"
+        return plannedCount > 0 ? "\(planned) + \(fixed)" : fixed
+    }
+
     private var planningTimezone: String {
-        let identifier = TimeZone.autoupdatingCurrent.identifier
-        return identifier == "GMT" ? "UTC" : identifier
+        planner.scheduleProfile.timezoneName
     }
 
     private func energyLevel(_ item: DayWeaveCanonicalItem) -> EnergyLevel {
@@ -2183,7 +2187,8 @@ final class CanonicalSyncStore: ObservableObject {
     ) throws {
         guard !Task.isCancelled,
               activeSyncID == operationID,
-              configurationGeneration == generation else {
+              configurationGeneration == generation,
+              activeSyncScheduleProfile == planner.scheduleProfile else {
             throw CanonicalSyncError.operationSuperseded
         }
         guard planner.canPersistPlan else {
@@ -2250,6 +2255,7 @@ final class CanonicalSyncStore: ObservableObject {
         guard !Task.isCancelled,
               activeLocalCompositionID == operationID,
               configurationGeneration == generation,
+              activeLocalCompositionScheduleProfile == planner.scheduleProfile,
               activeSyncID == nil,
               planner.isCanonicalSyncLocked else {
             throw LocalCompositionCoordinatorError.operationSuperseded
@@ -2286,6 +2292,16 @@ final class CanonicalSyncStore: ObservableObject {
         lastLocalCompositionScore = nil
         localCompositionWarnings = []
         localCompositionStatus = .ready
+    }
+
+    private func scheduleProfileDidCommit() {
+        // PlannerStore emits this boundary only after the encrypted CAS has
+        // committed. A failed candidate/rollback therefore preserves all
+        // transient evidence associated with the still-installed schedule.
+        lastPreview = nil
+        warnings = []
+        clearTransientLocalComposition()
+        reloadConfigurationStatus()
     }
 
     private func makeClient(reportFailure: Bool) -> DayWeaveAPIClient? {
@@ -2336,13 +2352,13 @@ final class CanonicalSyncStore: ObservableObject {
 }
 
 private enum PendingSchedulePublicationRecovery {
-    case installed(revisionNumber: UInt64, blockCount: Int)
+    case installed(revisionNumber: UInt64, blockSummary: String)
     case requiresFreshComposition
 }
 
 private struct InstalledSchedulePublication {
     let preview: DayWeaveSchedulePreview
-    let blockCount: Int
+    let blockSummary: String
 }
 
 private struct LocalCompositionMutationFence: Sendable {
@@ -2352,7 +2368,7 @@ private struct LocalCompositionMutationFence: Sendable {
     let completedOccurrenceIDs: Set<UUID>
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]
     let blocks: [ScheduleBlock]
-    let protectedFreeMinutes: Int
+    let scheduleProfile: ScheduleProfile
     let freezeHours: Int
     let timezoneName: String
 
@@ -2364,7 +2380,7 @@ private struct LocalCompositionMutationFence: Sendable {
             && completedOccurrenceIDs == planner.completedOccurrenceIDs
             && recurrenceSessionOutcomes == planner.recurrenceSessionOutcomes
             && blocks == planner.blocks
-            && protectedFreeMinutes == planner.protectedFreeMinutes
+            && scheduleProfile == planner.scheduleProfile
             && freezeHours == planner.freezeHours
             && timezoneName == currentTimezoneName
     }

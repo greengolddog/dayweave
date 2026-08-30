@@ -64,13 +64,15 @@ struct CanonicalSyncStoreTests {
 
         #expect(planner.canonicalItems.count == 1)
         #expect(planner.canonicalDeltaCursor == "cursor-0")
-        #expect(planner.blocks.count == 1)
-        #expect(planner.blocks[0].id == previewBlockID)
-        #expect(planner.blocks[0].sourceItemID == itemID)
-        #expect(planner.blocks[0].sourceItemRevision == 1)
-        #expect(planner.blocks[0].isSensitive)
+        let planned = try #require(planner.blocks.first { $0.id == previewBlockID })
+        #expect(planned.sourceItemID == itemID)
+        #expect(planned.sourceItemRevision == 1)
+        #expect(planned.isSensitive)
         #expect(planner.canonicalItems[0].isSensitive)
-        #expect(planner.blocks[0].placementReason == "Placed in the earliest matching opening.")
+        #expect(planned.placementReason == "Placed in the earliest matching opening.")
+        #expect(planner.blocks.count(where: { $0.previewKind == "external_fixed" }) == 15)
+        #expect(planner.blocks.filter { $0.previewKind == "external_fixed" }
+            .allSatisfy { $0.isSensitive })
         #expect(sync.lastPreview?.inputDigest == "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         if case .online = sync.status {} else { Issue.record("Expected online sync status") }
 
@@ -1605,7 +1607,10 @@ struct CanonicalSyncStoreTests {
 
         await run.value
 
-        #expect(planner.blocks.isEmpty)
+        #expect(!planner.blocks.isEmpty)
+        #expect(planner.blocks.allSatisfy {
+            $0.isExternalFixedBlock && $0.isSensitive
+        })
         #expect(planner.pendingSchedulePublication == nil)
         #expect(planner.canonicalPreviewFreshnessIssue == nil)
         #expect(replaySync.lastPreview?.inputDigest == Self.emptyInputDigest)
@@ -1963,7 +1968,10 @@ struct CanonicalSyncStoreTests {
         await sync.sync()
 
         #expect(planner.canonicalItems.map(\.id).sorted { $0.uuidString < $1.uuidString } == [firstID, secondID])
-        #expect(planner.blocks.allSatisfy { $0.sourceItemID != nil })
+        #expect(planner.blocks.allSatisfy {
+            $0.sourceItemID != nil || $0.isExternalFixedBlock
+        })
+        #expect(planner.blocks.contains { $0.isExternalFixedBlock })
         let createIDs = URLProtocolStub.storage.requests(for: token)
             .filter { $0.method == "POST" && $0.url.path.hasSuffix("/v1/items") }
             .compactMap { $0.jsonBody?["id"] as? String }
@@ -2117,7 +2125,7 @@ struct CanonicalSyncStoreTests {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
         let itemID = UUID(uuidString: "27400000-2222-4333-8444-200000000000")!
         let blockID = UUID(uuidString: "27400000-2222-4333-8444-200000000001")!
-        for variant in ["overlap", "score"] {
+        for variant in ["overlap", "fixed", "score"] {
             let token = "canonical-invalid-preview-\(variant)"
             let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
             let planner = PlannerStore(
@@ -2138,6 +2146,18 @@ struct CanonicalSyncStoreTests {
                 second["id"] = UUID().uuidString.lowercased()
                 second["session_index"] = 1
                 blocks.append(second)
+                plan["blocks"] = blocks
+                var score = try #require(plan["score"] as? [String: Any])
+                score["scheduled_minutes"] = 90
+                plan["score"] = score
+            } else if variant == "fixed" {
+                var blocks = try #require(plan["blocks"] as? [[String: Any]])
+                let fixed = try #require(blocks.first {
+                    $0["kind"] as? String == "external_fixed"
+                        && $0["title"] as? String == "Protected time"
+                })
+                blocks[0]["start"] = fixed["start"]
+                blocks[0]["end"] = fixed["end"]
                 plan["blocks"] = blocks
                 var score = try #require(plan["score"] as? [String: Any])
                 score["scheduled_minutes"] = 90
@@ -3040,12 +3060,18 @@ struct CanonicalSyncStoreTests {
         itemIsSensitive: Bool = false
     ) -> String {
         let asOf = Date(timeIntervalSince1970: 1_787_990_400)
-        let calendar = Calendar.autoupdatingCurrent
-        let horizonStart = calendar.startOfDay(for: asOf)
-        let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
-            ?? horizonStart.addingTimeInterval(7 * 86_400)
-        let blockStart = asOf.addingTimeInterval(3_600)
+        let expandedProfile = profileExpansion(asOf: asOf)
+        let horizonStart = expandedProfile.horizonStart
+        let horizonEnd = expandedProfile.horizonEnd
+        guard let placement = expandedProfile.availability.first(where: {
+            $0.end.timeIntervalSince($0.start) >= 2_700
+        }) else {
+            preconditionFailure("The canonical preview fixture needs a 45-minute availability window")
+        }
+        let blockStart = placement.start
         let blockEnd = blockStart.addingTimeInterval(2_700)
+        let fixedBlocks = profileFixedPreviewBlocks(from: expandedProfile)
+        let fixedSuffix = fixedBlocks.isEmpty ? "" : ",\(fixedBlocks)"
         return """
         {"input_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_item_count":1,"accepted_item_count":1,
          "source_item_revisions":{"\(itemID.uuidString.lowercased())":1},
@@ -3057,7 +3083,7 @@ struct CanonicalSyncStoreTests {
              "start":"\(wireTimestamp(blockStart))","end":"\(wireTimestamp(blockEnd))",
              "session_index":0,"kind":"planned","explanations":[
                {"code":"earliest_available","message":"Placed in the earliest matching opening."}
-             ]}],"unscheduled":[],"decisions":[],"violations":[],
+             ]}\(fixedSuffix)],"unscheduled":[],"decisions":[],"violations":[],
            "score":{"scheduled_minutes":45,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},
            "occurrences":[]}}
         """
@@ -3067,23 +3093,52 @@ struct CanonicalSyncStoreTests {
         sourceRevisions: [UUID: UInt64],
         asOf: Date = Date(timeIntervalSince1970: 1_787_990_400)
     ) -> String {
-        let calendar = Calendar.autoupdatingCurrent
-        let horizonStart = calendar.startOfDay(for: asOf)
-        let horizonEnd = calendar.date(byAdding: .day, value: 7, to: horizonStart)
-            ?? horizonStart.addingTimeInterval(7 * 86_400)
+        let expandedProfile = profileExpansion(asOf: asOf)
+        let horizonStart = expandedProfile.horizonStart
+        let horizonEnd = expandedProfile.horizonEnd
         let revisions = sourceRevisions
             .sorted { $0.key.uuidString < $1.key.uuidString }
             .map { "\"\($0.key.uuidString.lowercased())\":\($0.value)" }
             .joined(separator: ",")
+        let fixedBlocks = profileFixedPreviewBlocks(from: expandedProfile)
         return """
         {"input_digest":"\(emptyInputDigest)","source_item_count":\(sourceRevisions.count),
          "accepted_item_count":\(sourceRevisions.count),"source_item_revisions":{\(revisions)},
          "rejected_items":[],"ignored_previous_assignments":[],"plan":{
            "as_of":"\(wireTimestamp(asOf))","horizon_start":"\(wireTimestamp(horizonStart))",
-           "horizon_end":"\(wireTimestamp(horizonEnd))","blocks":[],"unscheduled":[],
+           "horizon_end":"\(wireTimestamp(horizonEnd))","blocks":[\(fixedBlocks)],"unscheduled":[],
            "decisions":[],"violations":[],"score":{"scheduled_minutes":0,
            "unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}
         """
+    }
+
+    private static func profileExpansion(asOf: Date) -> ExpandedScheduleProfile {
+        let timezoneName = ScheduleProfile.normalizedTimezoneName(
+            TimeZone.autoupdatingCurrent.identifier
+        )
+        guard let profile = try? ScheduleProfile.legacyDefault(
+            timezoneName: timezoneName,
+            protectedFreeMinutes: 90
+        ), let expanded = try? profile.expanded(asOf: asOf) else {
+            preconditionFailure("The built-in canonical preview profile must expand")
+        }
+        return expanded
+    }
+
+    private static func profileFixedPreviewBlocks(
+        from expanded: ExpandedScheduleProfile
+    ) -> String {
+        return expanded.fixedBlocks.map { fixed in
+            """
+            {"id":"\(fixed.id.uuidString.lowercased())","is_sensitive":\(fixed.isSensitive),
+             "item_id":null,"occurrence_id":null,
+             "external_block_id":"\(fixed.id.uuidString.lowercased())","title":"\(fixed.title)",
+             "start":"\(wireTimestamp(fixed.start))","end":"\(wireTimestamp(fixed.end))",
+             "session_index":0,"kind":"external_fixed","explanations":[
+               {"code":"\(fixed.source)","message":"Protected by the schedule profile."}
+             ]}
+            """
+        }.joined(separator: ",")
     }
 
     private static let emptyInputDigest =

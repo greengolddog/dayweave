@@ -10,9 +10,17 @@ struct QuickCaptureView: View {
     @State private var showsDetails = false
     @State private var saveError: String?
 
-    init(itemID: UUID = UUID(), now: Date = Date()) {
+    init(
+        itemID: UUID = UUID(),
+        now: Date = Date(),
+        profileTimezoneName: String
+    ) {
         self.itemID = itemID
-        _state = State(initialValue: CanonicalItemEditorState(itemID: itemID, now: now))
+        _state = State(initialValue: CanonicalItemEditorState(
+            itemID: itemID,
+            now: now,
+            timezoneName: profileTimezoneName
+        ))
     }
 
     var body: some View {
@@ -84,11 +92,13 @@ struct QuickCaptureView: View {
                             selection: $state.eventStart,
                             displayedComponents: [.date, .hourAndMinute]
                         )
+                        .environment(\.timeZone, editorTimeZone)
                         DatePicker(
                             "Ends",
                             selection: $state.eventEnd,
                             displayedComponents: [.date, .hourAndMinute]
                         )
+                        .environment(\.timeZone, editorTimeZone)
                     } else {
                         Toggle("Add a duration estimate", isOn: $state.hasDuration)
                         if state.hasDuration {
@@ -160,6 +170,10 @@ struct QuickCaptureView: View {
                 state.durationSeconds = UInt32(seconds)
             }
         )
+    }
+
+    private var editorTimeZone: TimeZone {
+        PlannerTimeZone.resolve(state.timezoneName)
     }
 
     private func save() {

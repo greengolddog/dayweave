@@ -112,12 +112,13 @@ struct CanonicalCapturedInboxView: View {
         .sheet(item: $editorRoute) { route in
             CanonicalItemEditorView(
                 mode: route.mode,
-                readOnlyDiagnostic: route.readOnlyDiagnostic
+                readOnlyDiagnostic: route.readOnlyDiagnostic,
+                profileTimezoneName: store.scheduleProfile.timezoneName
             )
             .environmentObject(store)
         }
         .sheet(isPresented: $isQuickCapturePresented) {
-            QuickCaptureView()
+            QuickCaptureView(profileTimezoneName: store.scheduleProfile.timezoneName)
                 .environmentObject(store)
         }
         .accessibilityIdentifier("canonical-inbox")
@@ -144,6 +145,7 @@ struct CanonicalCapturedInboxView: View {
                             .replacingOccurrences(of: " ", with: "-"),
                         isSelected: store.selectedCanonicalItemID == row.itemID,
                         canMutate: store.canMutatePlan,
+                        timezoneName: store.scheduleProfile.timezoneName,
                         select: { store.selectCanonicalItem(row.itemID) },
                         edit: { presentEditor(for: row) },
                         trash: { enqueueTrash(row.itemID) },
@@ -284,6 +286,7 @@ private struct CanonicalCapturedInboxRow: View {
     let identifierScope: String
     let isSelected: Bool
     let canMutate: Bool
+    let timezoneName: String
     let select: () -> Void
     let edit: () -> Void
     let trash: () -> Void
@@ -370,6 +373,7 @@ private struct CanonicalCapturedInboxRow: View {
         .contentShape(Rectangle())
         .onTapGesture(perform: select)
         .contextMenu { contextActions }
+        .privacySensitive(row.isSensitive)
         .accessibilityElement(children: .contain)
         .accessibilityLabel(row.accessibilitySummary)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
@@ -539,7 +543,10 @@ private struct CanonicalCapturedInboxRow: View {
     private var deadlineChip: some View {
         if let deadline = row.deadlineAt {
             CanonicalInboxChip(
-                text: deadline.formatted(date: .abbreviated, time: .shortened),
+                text: PlannerTimeZone.dateTimeLabel(
+                    deadline,
+                    timezoneName: timezoneName
+                ),
                 symbol: "flag",
                 color: .red
             )

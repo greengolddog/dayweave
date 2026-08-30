@@ -1,23 +1,93 @@
 import SwiftUI
 
+enum PlannerPresentation {
+    static func timeZone(timezoneName: String) -> TimeZone {
+        PlannerTimeZone.resolve(timezoneName)
+    }
+
+    static func calendar(timezoneName: String) -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        calendar.timeZone = timeZone(timezoneName: timezoneName)
+        calendar.firstWeekday = 2
+        calendar.minimumDaysInFirstWeek = 4
+        return calendar
+    }
+
+    static func dayInterval(
+        containing date: Date,
+        timezoneName: String
+    ) -> DateInterval? {
+        let calendar = calendar(timezoneName: timezoneName)
+        let start = calendar.startOfDay(for: date)
+        guard let end = calendar.date(byAdding: .day, value: 1, to: start),
+              end > start else { return nil }
+        return DateInterval(start: start, end: end)
+    }
+
+    static func weekDays(
+        containing date: Date,
+        timezoneName: String
+    ) -> [Date] {
+        let calendar = calendar(timezoneName: timezoneName)
+        let day = calendar.startOfDay(for: date)
+        let daysSinceMonday = (calendar.component(.weekday, from: day) + 5) % 7
+        guard let monday = calendar.date(
+            byAdding: .day,
+            value: -daysSinceMonday,
+            to: day
+        ) else { return [] }
+        return (0..<7).compactMap {
+            calendar.date(byAdding: .day, value: $0, to: monday)
+        }
+    }
+
+    static func blocks(
+        _ blocks: [ScheduleBlock],
+        intersectingDayContaining date: Date,
+        timezoneName: String
+    ) -> [ScheduleBlock] {
+        guard let interval = dayInterval(containing: date, timezoneName: timezoneName) else {
+            return []
+        }
+        return blocks.filter { $0.end > interval.start && $0.start < interval.end }
+    }
+
+    static func weekdayLabel(_ date: Date, timezoneName: String) -> String {
+        var style = Date.FormatStyle().weekday(.abbreviated)
+        style.timeZone = timeZone(timezoneName: timezoneName)
+        return date.formatted(style)
+    }
+
+    static func dayLabel(_ date: Date, timezoneName: String) -> String {
+        var style = Date.FormatStyle().day()
+        style.timeZone = timeZone(timezoneName: timezoneName)
+        return date.formatted(style)
+    }
+}
+
 struct CalendarDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
-    @State private var selectedDate = Calendar.autoupdatingCurrent.startOfDay(for: Date())
+    @State private var selectedDate = Date()
 
-    private let calendar = Calendar.autoupdatingCurrent
+    private var timezoneName: String { store.scheduleProfile.timezoneName }
+    private var calendar: Calendar {
+        PlannerPresentation.calendar(timezoneName: timezoneName)
+    }
 
     private var weekDays: [Date] {
-        let interval = calendar.dateInterval(of: .weekOfYear, for: selectedDate)
-        let start = interval?.start ?? calendar.startOfDay(for: selectedDate)
-        return (0..<7).compactMap { calendar.date(byAdding: .day, value: $0, to: start) }
+        PlannerPresentation.weekDays(
+            containing: selectedDate,
+            timezoneName: timezoneName
+        )
     }
 
     private var selectedBlocks: [ScheduleBlock] {
-        let start = calendar.startOfDay(for: selectedDate)
-        let end = calendar.date(byAdding: .day, value: 1, to: start)
-            ?? start.addingTimeInterval(86_400)
-        return store.blocks
-            .filter { $0.end > start && $0.start < end }
+        PlannerPresentation.blocks(
+            store.blocks,
+            intersectingDayContaining: selectedDate,
+            timezoneName: timezoneName
+        )
             .sorted { $0.start < $1.start }
     }
 
@@ -26,7 +96,7 @@ struct CalendarDestinationView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Calendar").font(.title2.weight(.semibold))
-                    Text("Firm blocks publish to Google after an account and writable calendar are connected.")
+                    Text("Firm DayWeave work can publish to Google. Sleep and protected-time blocks from your profile stay planning-only and never publish.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -53,9 +123,15 @@ struct CalendarDestinationView: View {
                         selectedDate = date
                     } label: {
                         VStack(spacing: 5) {
-                            Text(date.formatted(.dateTime.weekday(.abbreviated)))
+                            Text(PlannerPresentation.weekdayLabel(
+                                date,
+                                timezoneName: timezoneName
+                            ))
                                 .font(.caption)
-                            Text(date.formatted(.dateTime.day()))
+                            Text(PlannerPresentation.dayLabel(
+                                date,
+                                timezoneName: timezoneName
+                            ))
                                 .font(.headline)
                         }
                         .frame(maxWidth: .infinity)
@@ -84,7 +160,7 @@ struct CalendarDestinationView: View {
                 ScrollView {
                     LazyVStack(spacing: 10) {
                         ForEach(selectedBlocks) { block in
-                            CalendarAgendaRow(block: block)
+                            CalendarAgendaRow(block: block, timezoneName: timezoneName)
                                 .onTapGesture { store.select(block) }
                         }
                     }
@@ -93,19 +169,23 @@ struct CalendarDestinationView: View {
             }
         }
         .navigationTitle("Calendar")
+        .onChange(of: timezoneName) { _, _ in
+            selectedDate = calendar.startOfDay(for: Date())
+        }
     }
 }
 
 private struct CalendarAgendaRow: View {
     @EnvironmentObject private var store: PlannerStore
     let block: ScheduleBlock
+    let timezoneName: String
 
     var body: some View {
         HStack(spacing: 14) {
             VStack(alignment: .trailing, spacing: 3) {
-                Text(block.startTimeLabel)
+                Text(block.startTimeLabel(timezoneName: timezoneName))
                     .font(.system(.subheadline, design: .monospaced).weight(.semibold))
-                Text(block.endTimeLabel)
+                Text(block.endTimeLabel(timezoneName: timezoneName))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -123,6 +203,11 @@ private struct CalendarAgendaRow: View {
                 Text(block.project ?? block.kind.title)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if block.isExternalFixedBlock {
+                    Label("Planning-only fixed time", systemImage: "calendar.badge.exclamationmark")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
             Text(block.status.title)
@@ -135,6 +220,7 @@ private struct CalendarAgendaRow: View {
             RoundedRectangle(cornerRadius: 13)
                 .stroke(store.selectedBlockID == block.id ? Color.accentColor : .clear, lineWidth: 1)
         }
+        .privacySensitive(block.isSensitive)
     }
 }
 
@@ -142,12 +228,12 @@ struct HabitsDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
 
     private var habits: [ScheduleBlock] {
-        let calendar = Calendar.autoupdatingCurrent
-        let start = calendar.startOfDay(for: Date())
-        let end = calendar.date(byAdding: .day, value: 1, to: start)
-            ?? start.addingTimeInterval(86_400)
-        return store.blocks
-            .filter { $0.kind == .habit && $0.end > start && $0.start < end }
+        PlannerPresentation.blocks(
+            store.blocks,
+            intersectingDayContaining: Date(),
+            timezoneName: store.scheduleProfile.timezoneName
+        )
+            .filter { $0.kind == .habit }
             .sorted { $0.start < $1.start }
     }
 
@@ -165,7 +251,11 @@ struct HabitsDestinationView: View {
                 }
             } else {
                 ForEach(habits) { habit in
-                    PlanningCard(block: habit, detail: habit.notes) {
+                    PlanningCard(
+                        block: habit,
+                        detail: habit.notes,
+                        timezoneName: store.scheduleProfile.timezoneName
+                    ) {
                         Button("Complete") { store.complete(habit.id) }
                             .disabled(!store.canMutate(habit))
                         Button("Skipped") { store.skip(habit.id) }
@@ -188,7 +278,9 @@ struct ProjectsDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
 
     private var groups: [(String, [ScheduleBlock])] {
-        Dictionary(grouping: store.blocks) { $0.project ?? "Personal" }
+        Dictionary(grouping: store.blocks.filter(\.contributesToExecutionPresentation)) {
+            $0.project ?? "Personal"
+        }
             .map { ($0.key, $0.value.sorted { $0.start < $1.start }) }
             .sorted { $0.0.localizedCaseInsensitiveCompare($1.0) == .orderedAscending }
     }
@@ -216,14 +308,20 @@ struct ProjectsDestinationView: View {
                                     .foregroundStyle(block.status == .completed ? .green : block.kind.color)
                                 Text(block.title).lineLimit(1)
                                 Spacer()
-                                Text(block.timeRange).font(.caption).foregroundStyle(.secondary)
+                                Text(block.timeRange(
+                                    timezoneName: store.scheduleProfile.timezoneName
+                                ))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                             }
                         }
                         .buttonStyle(.plain)
+                        .privacySensitive(block.isSensitive)
                     }
                 }
                 .padding(16)
                 .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
+                .privacySensitive(blocks.contains(where: \ScheduleBlock.isSensitive))
             }
         }
         .navigationTitle("Projects")
@@ -245,7 +343,11 @@ struct GoalsDestinationView: View {
                 }
             } else {
                 ForEach(goals) { goal in
-                    PlanningCard(block: goal, detail: goal.notes) {
+                    PlanningCard(
+                        block: goal,
+                        detail: goal.notes,
+                        timezoneName: store.scheduleProfile.timezoneName
+                    ) {
                         Button("Open") { store.select(goal) }
                         Button("Complete") { store.complete(goal.id) }
                             .disabled(!store.canMutate(goal))
@@ -269,27 +371,38 @@ struct GoalsDestinationView: View {
 struct StatisticsDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
 
-    private var plannedMinutes: Int { store.blocks.reduce(0) { $0 + $1.durationMinutes } }
-    private var actualMinutes: Int {
-        store.blocks.filter { $0.status == .completed }.reduce(0) { $0 + ($1.actualMinutes ?? $1.durationMinutes) }
+    private var todayExecutionBlocks: [ScheduleBlock] {
+        PlannerPresentation.blocks(
+            store.blocks,
+            intersectingDayContaining: Date(),
+            timezoneName: store.scheduleProfile.timezoneName
+        )
+        .filter(\.contributesToExecutionPresentation)
     }
 
     var body: some View {
+        let blocks = todayExecutionBlocks
+        let plannedMinutes = blocks.reduce(0) { $0 + $1.durationMinutes }
+        let completedBlocks = blocks.filter { $0.status == .completed }
+        let actualMinutes = completedBlocks.reduce(0) {
+            $0 + ($1.actualMinutes ?? $1.durationMinutes)
+        }
+
         DestinationScroll(title: "Statistics", subtitle: "Today’s transparent execution summary. Historical trends appear as real data accumulates.") {
             SummaryStrip(metrics: [
                 ("\(plannedMinutes)m", "planned", "calendar"),
                 ("\(actualMinutes)m", "completed", "timer"),
-                ("\(store.completedCount)", "items done", "checkmark.circle"),
+                ("\(completedBlocks.count)", "items done", "checkmark.circle"),
             ])
 
             StatisticsSection(title: "Status") {
                 ForEach(PlannerItemStatus.allCases, id: \.self) { status in
-                    let count = store.blocks.count(where: { $0.status == status })
+                    let count = blocks.count(where: { $0.status == status })
                     if count > 0 {
                         DistributionRow(
                             label: status.title,
                             value: count,
-                            total: max(store.blocks.count, 1),
+                            total: max(blocks.count, 1),
                             color: status == .completed ? .green : .accentColor
                         )
                     }
@@ -298,7 +411,7 @@ struct StatisticsDestinationView: View {
 
             StatisticsSection(title: "Energy demand") {
                 ForEach(EnergyLevel.allCases) { energy in
-                    let minutes = store.blocks
+                    let minutes = blocks
                         .filter { $0.energy == energy }
                         .reduce(0) { $0 + $1.durationMinutes }
                     DistributionRow(
@@ -362,6 +475,7 @@ private struct PlanningCard<Actions: View>: View {
     @EnvironmentObject private var store: PlannerStore
     let block: ScheduleBlock
     let detail: String
+    let timezoneName: String
     @ViewBuilder let actions: Actions
 
     var body: some View {
@@ -373,7 +487,10 @@ private struct PlanningCard<Actions: View>: View {
                 Text(block.status.title).font(.caption).foregroundStyle(.secondary)
             }
             HStack(spacing: 12) {
-                Label(block.timeRange, systemImage: "clock")
+                Label(
+                    block.timeRange(timezoneName: timezoneName),
+                    systemImage: "clock"
+                )
                 Label("\(block.durationMinutes)m", systemImage: "timer")
                 Label(block.energy.title, systemImage: "bolt")
             }
@@ -388,6 +505,7 @@ private struct PlanningCard<Actions: View>: View {
         .padding(16)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 14))
         .onTapGesture { store.select(block) }
+        .privacySensitive(block.isSensitive)
     }
 }
 

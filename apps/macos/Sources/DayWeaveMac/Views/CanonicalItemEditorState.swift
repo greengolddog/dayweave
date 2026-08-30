@@ -131,9 +131,12 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         now: Date = Date(),
         timezoneName defaultTimezoneName: String = Self.defaultTimezoneName
     ) {
+        let newItemTimezoneName = DayWeaveCanonicalItemDraft.supportedTimeZone(
+            identifier: defaultTimezoneName
+        ) == nil ? "UTC" : defaultTimezoneName
         let source = draft ?? DayWeaveCanonicalItemDraft(
             title: "",
-            timezoneName: defaultTimezoneName
+            timezoneName: newItemTimezoneName
         )
         self.itemID = itemID
         title = source.title
@@ -190,10 +193,7 @@ struct CanonicalItemEditorState: Equatable, Sendable {
         }
     }
 
-    static var defaultTimezoneName: String {
-        let identifier = TimeZone.autoupdatingCurrent.identifier
-        return identifier == "GMT" ? "UTC" : identifier
-    }
+    static let defaultTimezoneName = "UTC"
 
     var supportsRecurrence: Bool {
         switch kind {

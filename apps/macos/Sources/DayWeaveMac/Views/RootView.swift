@@ -34,6 +34,36 @@ private func executionBlock(
     })
 }
 
+private func scheduleTimeZone(_ identifier: String) -> TimeZone {
+    PlannerTimeZone.resolve(identifier)
+}
+
+private func scheduleTimeLabel(_ date: Date, timezoneName: String) -> String {
+    var style = Date.FormatStyle()
+        .hour(.twoDigits(amPM: .omitted))
+        .minute(.twoDigits)
+        .timeZone(.iso8601(.long))
+    style.timeZone = scheduleTimeZone(timezoneName)
+    return date.formatted(style)
+}
+
+private func scheduleTimeRange(_ block: ScheduleBlock, timezoneName: String) -> String {
+    "\(scheduleTimeLabel(block.start, timezoneName: timezoneName))–\(scheduleTimeLabel(block.end, timezoneName: timezoneName))"
+}
+
+private func scheduleDateTimeLabel(_ date: Date, timezoneName: String) -> String {
+    PlannerTimeZone.dateTimeLabel(date, timezoneName: timezoneName)
+}
+
+private func scheduleDayLabel(_ date: Date, timezoneName: String) -> String {
+    var style = Date.FormatStyle()
+        .weekday(.wide)
+        .month(.wide)
+        .day()
+    style.timeZone = scheduleTimeZone(timezoneName)
+    return date.formatted(style)
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
@@ -54,7 +84,7 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
         }
         .sheet(isPresented: $store.isQuickAddPresented) {
-            QuickCaptureView()
+            QuickCaptureView(profileTimezoneName: store.scheduleProfile.timezoneName)
                 .environmentObject(store)
         }
         .onAppear {
@@ -359,7 +389,13 @@ private struct ActiveMiniPlayer: View {
                 .font(.subheadline.weight(.semibold))
                 .lineLimit(1)
             HStack {
-                Label(block.timeRange, systemImage: "timer")
+                Label(
+                    scheduleTimeRange(
+                        block,
+                        timezoneName: store.scheduleProfile.timezoneName
+                    ),
+                    systemImage: "timer"
+                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -381,6 +417,7 @@ private struct ActiveMiniPlayer: View {
         }
         .padding(12)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .privacySensitive(block.isSensitive)
     }
 }
 
@@ -730,7 +767,7 @@ private struct LocalCompositionBanner: View {
     private var provenanceSummary: String? {
         guard let provenance = store.localScheduleCompositionProvenance else { return nil }
         let sourceCount = provenance.sourceItemRevisions.count
-        return "Composed \(provenance.generatedAt.formatted(date: .abbreviated, time: .shortened)) · through \(provenance.horizonEnd.formatted(date: .abbreviated, time: .shortened)) · \(sourceCount) source revision\(sourceCount == 1 ? "" : "s") · \(provenance.timezoneName)"
+        return "Composed \(scheduleDateTimeLabel(provenance.generatedAt, timezoneName: provenance.timezoneName)) · through \(scheduleDateTimeLabel(provenance.horizonEnd, timezoneName: provenance.timezoneName)) · \(sourceCount) source revision\(sourceCount == 1 ? "" : "s") · \(provenance.timezoneName)"
     }
 
     private var statusColor: Color {
@@ -812,7 +849,10 @@ private struct TodayHeader: View {
     var body: some View {
         HStack(alignment: .top, spacing: 24) {
             VStack(alignment: .leading, spacing: 5) {
-                Text(Date.now.formatted(.dateTime.weekday(.wide).month(.wide).day()))
+                Text(scheduleDayLabel(
+                    Date.now,
+                    timezoneName: store.scheduleProfile.timezoneName
+                ))
                     .font(.title2.weight(.semibold))
                 Text(store.lastScheduleMessage)
                     .font(.subheadline)
@@ -820,14 +860,30 @@ private struct TodayHeader: View {
             }
             Spacer()
             MetricChip(
-                value: "\(store.todaysBlocks.count(where: { $0.status == .completed }))/\(store.todaysBlocks.count)",
+                value: "\(actionableTodayBlocks.count(where: { $0.status == .completed }))/\(actionableTodayBlocks.count)",
                 label: "done",
                 symbol: "checkmark"
             )
-            MetricChip(value: "\(store.protectedFreeMinutes)m", label: "protected", symbol: "shield")
+            MetricChip(
+                value: "\(protectedMinutesToday)m",
+                label: "protected today",
+                symbol: "shield"
+            )
             MetricChip(value: scheduleCoverage, label: "schedule coverage", symbol: "chart.pie")
         }
         .padding(20)
+    }
+
+    private var actionableTodayBlocks: [ScheduleBlock] {
+        store.todaysBlocks.filter { block in
+            guard !block.isHardConstraint,
+                  block.kind != .event,
+                  block.kind != .breakTime else { return false }
+            if let itemID = block.sourceItemID {
+                return store.canonicalItem(id: itemID)?.isExecutable == true
+            }
+            return block.isLocallyAuthored
+        }
     }
 
     private var scheduleCoverage: String {
@@ -836,6 +892,18 @@ private struct TodayHeader: View {
         let total = score.scheduledMinutes + score.unscheduledMinutes
         guard total > 0 else { return "100%" }
         return "\(Int((Double(score.scheduledMinutes) / Double(total) * 100).rounded()))%"
+    }
+
+    private var protectedMinutesToday: Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = scheduleTimeZone(store.scheduleProfile.timezoneName)
+        let foundationWeekday = calendar.component(.weekday, from: Date.now)
+        let isoWeekday = ((foundationWeekday + 5) % 7) + 1
+        guard let weekday = ScheduleWeekday(rawValue: isoWeekday),
+              let day = store.scheduleProfile.protectedTime.first(where: {
+                  $0.weekday == weekday
+              }), day.isEnabled else { return 0 }
+        return day.windows.reduce(0) { $0 + $1.durationMinutes }
     }
 }
 
@@ -868,7 +936,10 @@ private struct ScheduleBlockView: View {
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             VStack(alignment: .trailing, spacing: 2) {
-                Text(block.startTimeLabel)
+                Text(scheduleTimeLabel(
+                    block.start,
+                    timezoneName: store.scheduleProfile.timezoneName
+                ))
                     .font(.system(.caption, design: .monospaced).weight(.medium))
                 Text("\(block.durationMinutes)m")
                     .font(.caption2)
@@ -908,7 +979,9 @@ private struct ScheduleBlockView: View {
 
                 HStack(spacing: 12) {
                     Text(block.project ?? block.kind.title)
-                    Label(block.energy.title, systemImage: "bolt")
+                    if !isExternalFixed {
+                        Label(block.energy.title, systemImage: "bolt")
+                    }
                     if block.isFlexible {
                         Label("Flexible", systemImage: "arrow.left.and.right")
                     }
@@ -916,10 +989,11 @@ private struct ScheduleBlockView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
-                if block.sourceItemID != nil {
-                    AuthoritativeExecutionControls(block: block)
-                        .controlSize(.small)
-                } else if block.status == .active || block.status == .paused {
+                if !isExternalFixed {
+                    if block.sourceItemID != nil {
+                        AuthoritativeExecutionControls(block: block)
+                            .controlSize(.small)
+                    } else if block.status == .active || block.status == .paused {
                         HStack {
                             Button(block.status == .active ? "Pause" : "Resume") {
                                 block.status == .active ? store.pauseActive() : store.start(block.id)
@@ -931,6 +1005,7 @@ private struct ScheduleBlockView: View {
                         }
                         .controlSize(.small)
                         .disabled(!store.canMutate(block))
+                    }
                 }
             }
             .opacity(block.status == .completed ? 0.55 : 1)
@@ -946,20 +1021,30 @@ private struct ScheduleBlockView: View {
         }
         .contentShape(RoundedRectangle(cornerRadius: 14))
         .contextMenu {
-            if block.sourceItemID != nil {
-                AuthoritativeExecutionContextMenu(block: block)
-            } else {
-                Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
-                Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
-                Divider()
-                Button("Do Later") { store.doLater(block.id) }
-                    .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
-                Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
+            if !isExternalFixed {
+                if block.sourceItemID != nil {
+                    AuthoritativeExecutionContextMenu(block: block)
+                } else {
+                    Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
+                    Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
+                    Divider()
+                    Button("Do Later") { store.doLater(block.id) }
+                        .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
+                    Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
+                }
             }
         }
+        .privacySensitive(block.isSensitive)
+    }
+
+    private var isExternalFixed: Bool {
+        block.previewKind == "external_fixed"
     }
 
     private var sensitivityHelp: String {
+        if isExternalFixed {
+            return "Sensitive fixed or busy time; details stay hidden from assistant context."
+        }
         guard let itemID = block.sourceItemID else {
             return "Sensitive local capture"
         }
@@ -1496,7 +1581,12 @@ private struct CanonicalInboxInspector: View {
                         )
                         LabeledContent(
                             "Deadline",
-                            value: row.deadlineAt?.formatted(date: .abbreviated, time: .shortened)
+                            value: row.deadlineAt.map {
+                                scheduleDateTimeLabel(
+                                    $0,
+                                    timezoneName: store.scheduleProfile.timezoneName
+                                )
+                            }
                                 ?? "None"
                         )
                         LabeledContent("Hierarchy level", value: String(row.depth + 1))
@@ -1618,6 +1708,7 @@ private struct CanonicalInboxInspector: View {
                 }
                 .padding(20)
             }
+            .privacySensitive(usesSensitivePresentation(row))
             .id(row.id)
             .accessibilityElement(children: .contain)
             .accessibilityLabel(row.accessibilitySummary)
@@ -2181,17 +2272,28 @@ private struct BlockInspector: View {
                 }
 
                 InspectorSection(title: "Schedule") {
-                    LabeledContent("Time", value: block.timeRange)
+                    LabeledContent(
+                        "Time",
+                        value: scheduleTimeRange(
+                            block,
+                            timezoneName: store.scheduleProfile.timezoneName
+                        )
+                    )
                     LabeledContent("Duration", value: "\(block.durationMinutes) minutes")
-                    LabeledContent("Energy", value: block.energy.title)
-                    LabeledContent("Placement", value: block.isHardConstraint ? "Fixed in preview" : "Flexible in preview")
+                    if !isExternalFixed {
+                        LabeledContent("Energy", value: block.energy.title)
+                    }
+                    LabeledContent("Placement", value: placementDescription)
                     if let itemID = block.sourceItemID,
                        let item = store.canonicalItem(id: itemID) {
                         LabeledContent("Revision", value: String(item.revision))
                         if let deadline = item.deadlineAt {
                             LabeledContent(
                                 "Deadline",
-                                value: deadline.formatted(date: .abbreviated, time: .shortened)
+                                value: scheduleDateTimeLabel(
+                                    deadline,
+                                    timezoneName: store.scheduleProfile.timezoneName
+                                )
                             )
                         }
                         LabeledContent("Split", value: splitDescription(item.splitPolicy))
@@ -2281,24 +2383,40 @@ private struct BlockInspector: View {
                     }
                 }
 
-                if block.sourceItemID != nil {
-                    AuthoritativeExecutionControls(block: block)
-                } else {
-                    HStack {
-                        Button("Start") { store.start(block.id) }
-                            .buttonStyle(.borderedProminent)
-                        Button("Complete") { store.complete(block.id) }
-                        Menu("More") {
-                            Button("Do Later") { store.doLater(block.id) }
-                                .disabled(!block.isFlexible || block.isHardConstraint)
-                            Button("Skip") { store.skip(block.id) }
+                if !isExternalFixed {
+                    if block.sourceItemID != nil {
+                        AuthoritativeExecutionControls(block: block)
+                    } else {
+                        HStack {
+                            Button("Start") { store.start(block.id) }
+                                .buttonStyle(.borderedProminent)
+                            Button("Complete") { store.complete(block.id) }
+                            Menu("More") {
+                                Button("Do Later") { store.doLater(block.id) }
+                                    .disabled(!block.isFlexible || block.isHardConstraint)
+                                Button("Skip") { store.skip(block.id) }
+                            }
                         }
+                        .disabled(!store.canMutate(block))
                     }
-                    .disabled(!store.canMutate(block))
                 }
             }
             .padding(18)
         }
+        .privacySensitive(block.isSensitive)
+    }
+
+    private var isExternalFixed: Bool {
+        block.previewKind == "external_fixed"
+    }
+
+    private var placementDescription: String {
+        guard isExternalFixed else {
+            return block.isHardConstraint ? "Fixed in preview" : "Flexible in preview"
+        }
+        // The wire contract deliberately redacts the fixed-block source, so do
+        // not infer profile ownership from the presentation kind or title.
+        return "Profile or external fixed time"
     }
 
     private var localCaptureTitleIsValid: Bool {
@@ -3861,31 +3979,39 @@ struct MenuBarView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             if let active = focusedExecutionBlock {
-                Text(active.status == .paused ? "Paused" : "In progress")
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(active.status == .paused ? "Paused" : "In progress")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(active.title).font(.headline)
+                    Text(scheduleTimeRange(
+                        active,
+                        timezoneName: store.scheduleProfile.timezoneName
+                    ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text(active.title).font(.headline)
-                Text(active.timeRange).font(.caption).foregroundStyle(.secondary)
-                if active.sourceItemID != nil {
-                    AuthoritativeExecutionControls(
-                        block: active,
-                        includesCustomPause: false
-                    )
-                    if executionSync.expiredBreakChoiceRequired {
-                        Button("Keep paused") {
-                            _ = executionSync.keepPausedAfterExpiredBreak()
+                    if active.sourceItemID != nil {
+                        AuthoritativeExecutionControls(
+                            block: active,
+                            includesCustomPause: false
+                        )
+                        if executionSync.expiredBreakChoiceRequired {
+                            Button("Keep paused") {
+                                _ = executionSync.keepPausedAfterExpiredBreak()
+                            }
+                            .disabled(executionSync.isSyncing
+                                || store.executionState.pendingCommand != nil
+                                || !store.canMutatePlan)
                         }
-                        .disabled(executionSync.isSyncing
-                            || store.executionState.pendingCommand != nil
-                            || !store.canMutatePlan)
+                    } else {
+                        HStack {
+                            Button("Pause") { store.pauseActive() }
+                            Button("Complete") { store.complete(active.id) }
+                        }
+                        .disabled(!store.canMutate(active))
                     }
-                } else {
-                    HStack {
-                        Button("Pause") { store.pauseActive() }
-                        Button("Complete") { store.complete(active.id) }
-                    }
-                    .disabled(!store.canMutate(active))
                 }
+                .privacySensitive(active.isSensitive)
             } else {
                 ContentUnavailableView("Nothing active", systemImage: "checkmark.circle")
             }
@@ -3953,6 +4079,733 @@ struct MenuBarView: View {
     }
 }
 
+private extension ScheduleWeekday {
+    var scheduleSettingsTitle: String {
+        switch self {
+        case .monday: "Monday"
+        case .tuesday: "Tuesday"
+        case .wednesday: "Wednesday"
+        case .thursday: "Thursday"
+        case .friday: "Friday"
+        case .saturday: "Saturday"
+        case .sunday: "Sunday"
+        }
+    }
+}
+
+private enum ScheduleProfileWindowKind: Equatable {
+    case availability
+    case protectedTime
+
+    var lowercaseTitle: String {
+        switch self {
+        case .availability: "availability"
+        case .protectedTime: "protected-time"
+        }
+    }
+}
+
+private struct ScheduleProfileWindowDraft: Identifiable, Equatable {
+    let id: UUID
+    var startMinutes: Int
+    var endMinutes: Int
+
+    init(
+        id: UUID = UUID(),
+        startMinutes: Int,
+        endMinutes: Int
+    ) {
+        self.id = id
+        self.startMinutes = startMinutes
+        self.endMinutes = endMinutes
+    }
+
+    init(_ window: ScheduleLocalTimeWindow) {
+        self.init(
+            startMinutes: Int(window.start.minutesSinceMidnight),
+            endMinutes: Int(window.end.minutesSinceMidnight)
+        )
+    }
+
+    static func == (left: Self, right: Self) -> Bool {
+        left.startMinutes == right.startMinutes
+            && left.endMinutes == right.endMinutes
+    }
+}
+
+private struct ScheduleProfileDayDraft: Identifiable, Equatable {
+    let weekday: ScheduleWeekday
+    var isEnabled: Bool
+    var windows: [ScheduleProfileWindowDraft]
+
+    var id: Int { weekday.rawValue }
+
+    init(_ day: ScheduleAvailabilityDay) {
+        weekday = day.weekday
+        isEnabled = day.isEnabled
+        windows = day.windows.map(ScheduleProfileWindowDraft.init)
+    }
+
+    init(_ day: ScheduleProtectedDay) {
+        weekday = day.weekday
+        isEnabled = day.isEnabled
+        windows = day.windows.map(ScheduleProfileWindowDraft.init)
+    }
+}
+
+private struct ScheduleProfileDraft: Equatable {
+    var timezoneName: String
+    var availability: [ScheduleProfileDayDraft]
+    var sleepStartMinutes: Int
+    var sleepEndMinutes: Int
+    var protectedTime: [ScheduleProfileDayDraft]
+    var defaultEnergy: EnergyLevel
+    var contextsInput: String
+    var locationInput: String
+
+    init(_ profile: ScheduleProfile) {
+        timezoneName = profile.timezoneName
+        availability = profile.availability.map(ScheduleProfileDayDraft.init)
+        sleepStartMinutes = Int(profile.sleep.start.minutesSinceMidnight)
+        sleepEndMinutes = Int(profile.sleep.end.minutesSinceMidnight)
+        protectedTime = profile.protectedTime.map(ScheduleProfileDayDraft.init)
+        defaultEnergy = profile.defaultEnergy
+        contextsInput = profile.contexts.joined(separator: ", ")
+        locationInput = profile.location ?? ""
+    }
+
+    var normalizedContexts: [String] {
+        let values = contextsInput.split(whereSeparator: { character in
+            character == "," || character == "\n"
+        })
+        return Array(Set(values.compactMap { value -> String? in
+            let normalized = ScheduleProfile.normalizeContext(String(value))
+            return normalized.isEmpty ? nil : normalized
+        })).sorted()
+    }
+
+    var sleepDurationMinutes: Int? {
+        guard sleepStartMinutes > sleepEndMinutes else { return nil }
+        return ScheduleLocalTime.minutesPerDay - sleepStartMinutes + sleepEndMinutes
+    }
+
+    func makeProfile() throws -> ScheduleProfile {
+        let sleep = try ScheduleSleepInterval(
+            start: ScheduleLocalTime(minutesSinceMidnight: sleepStartMinutes),
+            end: ScheduleLocalTime(minutesSinceMidnight: sleepEndMinutes)
+        )
+        let validatedAvailability = try availability.map { day in
+            let windows: [ScheduleLocalTimeWindow]
+            if day.isEnabled {
+                windows = try day.windows.map(Self.validatedWindow)
+            } else {
+                windows = []
+            }
+            return try ScheduleAvailabilityDay(
+                weekday: day.weekday,
+                isEnabled: day.isEnabled,
+                windows: windows
+            )
+        }
+        let validatedProtectedTime = try protectedTime.map { day in
+            let windows: [ScheduleLocalTimeWindow]
+            if day.isEnabled {
+                windows = try day.windows.map(Self.validatedWindow)
+            } else {
+                windows = []
+            }
+            return try ScheduleProtectedDay(
+                weekday: day.weekday,
+                isEnabled: day.isEnabled,
+                windows: windows
+            )
+        }
+        return try ScheduleProfile(
+            timezoneName: ScheduleProfile.normalizedTimezoneName(timezoneName),
+            availability: validatedAvailability,
+            sleep: sleep,
+            protectedTime: validatedProtectedTime,
+            defaultEnergy: defaultEnergy,
+            contexts: normalizedContexts,
+            location: ScheduleProfile.normalizeLocation(locationInput)
+        )
+    }
+
+    func validationMessage(
+        for kind: ScheduleProfileWindowKind,
+        weekday: ScheduleWeekday
+    ) -> String? {
+        guard let targetDay = day(for: kind, weekday: weekday),
+              targetDay.isEnabled else {
+            return nil
+        }
+        guard !targetDay.windows.isEmpty else {
+            return "Add at least one \(kind.lowercaseTitle) window."
+        }
+        guard sleepStartMinutes > sleepEndMinutes else {
+            return "Set an overnight sleep interval before editing daily windows."
+        }
+        guard targetDay.windows.allSatisfy({
+            $0.startMinutes < $0.endMinutes
+                && $0.startMinutes >= sleepEndMinutes
+                && $0.endMinutes <= sleepStartMinutes
+        }) else {
+            return "Keep every window non-empty and between wake and sleep."
+        }
+        let ordered = targetDay.windows.sorted {
+            if $0.startMinutes != $1.startMinutes {
+                return $0.startMinutes < $1.startMinutes
+            }
+            return $0.endMinutes < $1.endMinutes
+        }
+        guard zip(ordered, ordered.dropFirst()).allSatisfy({
+            $0.endMinutes <= $1.startMinutes
+        }) else {
+            return "Windows on the same day cannot overlap."
+        }
+        if kind == .protectedTime {
+            let total = ordered.reduce(0) {
+                $0 + ($1.endMinutes - $1.startMinutes)
+            }
+            guard total <= ScheduleProfile.maximumProtectedFreeMinutes else {
+                return "Protect at most eight hours on one day."
+            }
+        }
+        let otherWindows = day(for: opposite(of: kind), weekday: weekday)
+            .flatMap { $0.isEnabled ? $0.windows : [] } ?? []
+        guard ordered.allSatisfy({ window in
+            otherWindows.allSatisfy { other in
+                window.endMinutes <= other.startMinutes
+                    || other.endMinutes <= window.startMinutes
+            }
+        }) else {
+            return kind == .availability
+                ? "Availability cannot overlap protected time."
+                : "Protected time cannot overlap availability."
+        }
+        return nil
+    }
+
+    func suggestedWindow(
+        for kind: ScheduleProfileWindowKind,
+        weekday: ScheduleWeekday
+    ) -> ScheduleProfileWindowDraft? {
+        guard sleepStartMinutes > sleepEndMinutes,
+              let target = day(for: kind, weekday: weekday),
+              target.windows.count < ScheduleAvailabilityDay.maximumWindows else {
+            return nil
+        }
+        let other = day(for: opposite(of: kind), weekday: weekday)
+        let occupied = (target.windows + ((other?.isEnabled == true) ? (other?.windows ?? []) : []))
+            .filter {
+                $0.startMinutes < $0.endMinutes
+                    && $0.endMinutes > sleepEndMinutes
+                    && $0.startMinutes < sleepStartMinutes
+            }
+            .map {
+                ScheduleProfileWindowDraft(
+                    startMinutes: max(sleepEndMinutes, $0.startMinutes),
+                    endMinutes: min(sleepStartMinutes, $0.endMinutes)
+                )
+            }
+            .sorted { $0.startMinutes < $1.startMinutes }
+
+        var gaps: [(start: Int, end: Int)] = []
+        var cursor = sleepEndMinutes
+        for window in occupied {
+            if cursor < window.startMinutes {
+                gaps.append((cursor, window.startMinutes))
+            }
+            cursor = max(cursor, window.endMinutes)
+        }
+        if cursor < sleepStartMinutes { gaps.append((cursor, sleepStartMinutes)) }
+
+        let preferredStart = kind == .availability ? 9 * 60 : 18 * 60
+        for gap in gaps {
+            let preferred = max(gap.start, preferredStart)
+            let start = preferred + 30 <= gap.end ? preferred : gap.start
+            let duration = min(60, gap.end - start)
+            if duration >= 30 {
+                return ScheduleProfileWindowDraft(
+                    startMinutes: start,
+                    endMinutes: start + duration
+                )
+            }
+        }
+        return nil
+    }
+
+    private static func validatedWindow(
+        _ draft: ScheduleProfileWindowDraft
+    ) throws -> ScheduleLocalTimeWindow {
+        try ScheduleLocalTimeWindow(
+            start: ScheduleLocalTime(minutesSinceMidnight: draft.startMinutes),
+            end: ScheduleLocalTime(minutesSinceMidnight: draft.endMinutes)
+        )
+    }
+
+    private func day(
+        for kind: ScheduleProfileWindowKind,
+        weekday: ScheduleWeekday
+    ) -> ScheduleProfileDayDraft? {
+        let days = kind == .availability ? availability : protectedTime
+        return days.first(where: { $0.weekday == weekday })
+    }
+
+    private func opposite(of kind: ScheduleProfileWindowKind) -> ScheduleProfileWindowKind {
+        kind == .availability ? .protectedTime : .availability
+    }
+}
+
+private struct ScheduleProfileTimeField: View {
+    let label: String
+    let accessibilityContext: String
+    @Binding var minutes: Int
+
+    init(
+        label: String,
+        accessibilityContext: String = "",
+        minutes: Binding<Int>
+    ) {
+        self.label = label
+        self.accessibilityContext = accessibilityContext
+        _minutes = minutes
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("\(accessibilityPrefix) hour", selection: hourBinding) {
+                ForEach(0..<24, id: \.self) { hour in
+                    Text(String(format: "%02d", hour)).tag(hour)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 58)
+            .accessibilityLabel("\(accessibilityPrefix) hour")
+            .accessibilityValue(String(format: "%02d", minutes / 60))
+
+            Text(":")
+                .font(.system(.body, design: .monospaced).weight(.semibold))
+
+            Picker("\(accessibilityPrefix) minute", selection: minuteBinding) {
+                ForEach(0..<60, id: \.self) { minute in
+                    Text(String(format: "%02d", minute)).tag(minute)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 58)
+            .accessibilityLabel("\(accessibilityPrefix) minute")
+            .accessibilityValue(String(format: "%02d", minutes % 60))
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var hourBinding: Binding<Int> {
+        Binding(
+            get: { minutes / 60 },
+            set: { minutes = $0 * 60 + minutes % 60 }
+        )
+    }
+
+    private var minuteBinding: Binding<Int> {
+        Binding(
+            get: { minutes % 60 },
+            set: { minutes = (minutes / 60) * 60 + $0 }
+        )
+    }
+
+    private var accessibilityPrefix: String {
+        accessibilityContext.isEmpty ? label : "\(accessibilityContext) \(label)"
+    }
+}
+
+private struct ScheduleProfileDayEditor: View {
+    let kind: ScheduleProfileWindowKind
+    @Binding var day: ScheduleProfileDayDraft
+    let suggestedWindow: ScheduleProfileWindowDraft?
+    let validationMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Toggle(day.weekday.scheduleSettingsTitle, isOn: enabledBinding)
+                    .toggleStyle(.switch)
+                    .frame(width: 150, alignment: .leading)
+                    .accessibilityIdentifier(
+                        "schedule-profile.\(kind.lowercaseTitle).\(day.weekday.rawValue).enabled"
+                    )
+                Spacer()
+                Text(day.isEnabled ? windowCountLabel : "Unavailable")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    guard let suggestedWindow else { return }
+                    day.windows.append(suggestedWindow)
+                } label: {
+                    Label("Add window", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(!day.isEnabled || suggestedWindow == nil)
+                .help(addWindowHelp)
+                .accessibilityLabel(
+                    "Add \(kind.lowercaseTitle) window on \(day.weekday.scheduleSettingsTitle)"
+                )
+            }
+
+            if day.isEnabled {
+                ForEach($day.windows) { $window in
+                    HStack(spacing: 10) {
+                        ScheduleProfileTimeField(
+                            label: "Start",
+                            accessibilityContext:
+                                "\(day.weekday.scheduleSettingsTitle) \(kind.lowercaseTitle)",
+                            minutes: $window.startMinutes
+                        )
+                        Image(systemName: "arrow.right")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                        ScheduleProfileTimeField(
+                            label: "End",
+                            accessibilityContext:
+                                "\(day.weekday.scheduleSettingsTitle) \(kind.lowercaseTitle)",
+                            minutes: $window.endMinutes
+                        )
+                        Spacer()
+                        Button(role: .destructive) {
+                            day.windows.removeAll(where: { $0.id == window.id })
+                        } label: {
+                            Image(systemName: "minus.circle")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Remove this window")
+                        .accessibilityLabel(
+                            "Remove \(kind.lowercaseTitle) window on \(day.weekday.scheduleSettingsTitle)"
+                        )
+                    }
+                    .padding(.leading, 30)
+                }
+            }
+
+            if let validationMessage {
+                Label(validationMessage, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.leading, 30)
+                    .accessibilityLabel(
+                        "\(day.weekday.scheduleSettingsTitle): \(validationMessage)"
+                    )
+            }
+        }
+        .padding(.vertical, 5)
+    }
+
+    private var enabledBinding: Binding<Bool> {
+        Binding(
+            get: { day.isEnabled },
+            set: { isEnabled in
+                day.isEnabled = isEnabled
+                if isEnabled, day.windows.isEmpty, let suggestedWindow {
+                    day.windows = [suggestedWindow]
+                }
+            }
+        )
+    }
+
+    private var windowCountLabel: String {
+        "\(day.windows.count) window\(day.windows.count == 1 ? "" : "s")"
+    }
+
+    private var addWindowHelp: String {
+        if day.windows.count >= ScheduleAvailabilityDay.maximumWindows {
+            return "This day already has the maximum of eight windows."
+        }
+        if suggestedWindow == nil {
+            return "Make at least 30 free minutes between wake and sleep first."
+        }
+        return "Add another \(kind.lowercaseTitle) window."
+    }
+}
+
+private struct ScheduleProfileSettingsEditor: View {
+    @Binding var draft: ScheduleProfileDraft
+    let isDirty: Bool
+    let canCommit: Bool
+    let validationMessage: String?
+    let blockedMessage: String?
+    let errorMessage: String?
+    let statusMessage: String?
+    let onSave: () -> Void
+    let onRevert: () -> Void
+
+    @State private var availabilityIsExpanded = true
+    @State private var protectedTimeIsExpanded = false
+
+    private static let timezoneChoices = Array(Set(
+        TimeZone.knownTimeZoneIdentifiers + ["Europe/Madrid", "UTC"]
+    ))
+    .filter { $0 != "GMT" && ScheduleProfile.isKnownIANATimezone($0) }
+    .sorted()
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Schedule profile", systemImage: "calendar.badge.clock")
+                    .font(.headline)
+                Text("DayWeave composes seven days from these local-time boundaries. Weeks are Monday-first and every time uses the 24-hour clock.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 12) {
+                    LabeledContent("Time zone") {
+                        Picker("Time zone", selection: $draft.timezoneName) {
+                            ForEach(Self.timezoneChoices, id: \.self) { timezone in
+                                Text(timezone).tag(timezone)
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(minWidth: 220, alignment: .trailing)
+                        .accessibilityLabel("Schedule profile time zone")
+                        .accessibilityIdentifier("schedule-profile.timezone")
+                    }
+                    Text("When you travel, this saved IANA zone remains authoritative until you explicitly change it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    HStack(alignment: .center, spacing: 14) {
+                        ScheduleProfileTimeField(
+                            label: "Sleep",
+                            accessibilityContext: "Overnight sleep",
+                            minutes: $draft.sleepStartMinutes
+                        )
+                        Image(systemName: "arrow.right")
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
+                        ScheduleProfileTimeField(
+                            label: "Wake",
+                            accessibilityContext: "Overnight sleep",
+                            minutes: $draft.sleepEndMinutes
+                        )
+                        Spacer()
+                        Text(sleepSummary)
+                            .font(.caption)
+                            .foregroundStyle(draft.sleepDurationMinutes == nil ? .orange : .secondary)
+                    }
+                    Text("Sleep is a hard overnight block. Its start must be later on the clock than its next-day wake time.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    Picker("Available energy", selection: $draft.defaultEnergy) {
+                        ForEach(EnergyLevel.allCases) { energy in
+                            Text(energy.title).tag(energy)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("schedule-profile.default-energy")
+                    Text("Availability windows inherit this capacity; items that require more energy are placed elsewhere.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            } label: {
+                Label("Time, sleep & energy", systemImage: "moon.stars")
+            }
+
+            GroupBox {
+                DisclosureGroup(isExpanded: $availabilityIsExpanded) {
+                    VStack(spacing: 0) {
+                        ForEach($draft.availability) { $day in
+                            ScheduleProfileDayEditor(
+                                kind: .availability,
+                                day: $day,
+                                suggestedWindow: draft.suggestedWindow(
+                                    for: .availability,
+                                    weekday: day.weekday
+                                ),
+                                validationMessage: draft.validationMessage(
+                                    for: .availability,
+                                    weekday: day.weekday
+                                )
+                            )
+                            if day.weekday != .sunday { Divider() }
+                        }
+                    }
+                    .padding(.top, 8)
+                } label: {
+                    HStack {
+                        Label("Availability", systemImage: "calendar.badge.clock")
+                        Spacer()
+                        Text(availabilitySummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            GroupBox {
+                DisclosureGroup(isExpanded: $protectedTimeIsExpanded) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Protected windows stay visible as fixed time and cannot overlap availability. Protect up to eight hours per day.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.vertical, 8)
+                        ForEach($draft.protectedTime) { $day in
+                            ScheduleProfileDayEditor(
+                                kind: .protectedTime,
+                                day: $day,
+                                suggestedWindow: draft.suggestedWindow(
+                                    for: .protectedTime,
+                                    weekday: day.weekday
+                                ),
+                                validationMessage: draft.validationMessage(
+                                    for: .protectedTime,
+                                    weekday: day.weekday
+                                )
+                            )
+                            if day.weekday != .sunday { Divider() }
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Label("Protected time", systemImage: "shield")
+                        Spacer()
+                        Text(protectedTimeSummary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            GroupBox {
+                VStack(alignment: .leading, spacing: 10) {
+                    TextField(
+                        "home, desk, errands",
+                        text: $draft.contextsInput,
+                        axis: .vertical
+                    )
+                    .lineLimit(1...3)
+                    .accessibilityLabel("Default scheduling contexts, separated by commas")
+                    .accessibilityIdentifier("schedule-profile.contexts")
+                    if !draft.normalizedContexts.isEmpty {
+                        ScrollView(.horizontal) {
+                            HStack(spacing: 6) {
+                                ForEach(draft.normalizedContexts, id: \.self) { context in
+                                    Text("#\(context)")
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(.quaternary, in: Capsule())
+                                        .accessibilityLabel("Normalized context \(context)")
+                                }
+                            }
+                        }
+                        .scrollIndicators(.hidden)
+                    }
+                    Text("Contexts are trimmed, lowercased, deduplicated, and sorted when saved (up to 16; 64 UTF-8 bytes each).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Divider()
+
+                    TextField("Optional default location", text: $draft.locationInput)
+                        .accessibilityLabel("Optional default scheduling location")
+                        .accessibilityIdentifier("schedule-profile.location")
+                    Text("Whitespace is normalized when saved. The location may use up to 256 UTF-8 bytes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+            } label: {
+                Label("Context & location", systemImage: "mappin.and.ellipse")
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                if let validationMessage {
+                    Label(validationMessage, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("schedule-profile.validation-error")
+                }
+                if let blockedMessage {
+                    Label(blockedMessage, systemImage: "lock")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let errorMessage {
+                    Label(errorMessage, systemImage: "xmark.octagon.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("schedule-profile.save-error")
+                } else if let statusMessage {
+                    Label(statusMessage, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .accessibilityIdentifier("schedule-profile.save-status")
+                }
+                Text("Saving is atomic, encrypted, and clears schedule blocks composed from the previous profile. Compose again to install a fresh plan.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Spacer()
+                Button("Revert", role: .cancel, action: onRevert)
+                    .disabled(!isDirty)
+                    .accessibilityIdentifier("schedule-profile.revert")
+                Button("Save profile", action: onSave)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!isDirty || validationMessage != nil || !canCommit)
+                    .keyboardShortcut("s", modifiers: [.command, .option])
+                    .accessibilityIdentifier("schedule-profile.save")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .privacySensitive()
+    }
+
+    private var sleepSummary: String {
+        guard let duration = draft.sleepDurationMinutes else {
+            return "Must cross midnight"
+        }
+        let hours = duration / 60
+        let minutes = duration % 60
+        return minutes == 0 ? "\(hours)h overnight" : "\(hours)h \(minutes)m overnight"
+    }
+
+    private var availabilitySummary: String {
+        let enabledDays = draft.availability.count(where: \.isEnabled)
+        let windows = draft.availability.filter(\.isEnabled).reduce(0) {
+            $0 + $1.windows.count
+        }
+        return "\(enabledDays) day\(enabledDays == 1 ? "" : "s") · \(windows) window\(windows == 1 ? "" : "s")"
+    }
+
+    private var protectedTimeSummary: String {
+        let minutes = draft.protectedTime.filter(\.isEnabled).reduce(0) { total, day in
+            total + day.windows.reduce(0) {
+                $0 + max(0, $1.endMinutes - $1.startMinutes)
+            }
+        }
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        if minutes == 0 { return "None" }
+        return remainder == 0 ? "\(hours)h / week" : "\(hours)h \(remainder)m / week"
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
@@ -3970,15 +4823,43 @@ struct SettingsView: View {
     @State private var isCanonicalResetConfirmationPresented = false
     @State private var isLocalOnlyForgetConfirmationPresented = false
     @State private var apiSettingsError: String?
+    @State private var scheduleProfileBaseline: ScheduleProfile?
+    @State private var scheduleProfileDraft: ScheduleProfileDraft?
+    @State private var scheduleProfileError: String?
+    @State private var scheduleProfileStatus: String?
 
     var body: some View {
         Form {
             Section("Scheduling") {
-                Stepper("Freeze the next \(store.freezeHours) hours", value: $store.freezeHours, in: 0...24)
-                Stepper("Protect \(store.protectedFreeMinutes) free minutes", value: $store.protectedFreeMinutes, in: 0...480, step: 15)
+                Stepper(
+                    "Freeze the next \(store.freezeHours) hours",
+                    value: $store.freezeHours,
+                    in: 0...24
+                )
+                .disabled(!store.canMutatePlan)
                 Toggle("Show completed blocks", isOn: $store.showCompleted)
+                    .disabled(!store.canMutatePlan)
+                Divider()
+                if scheduleProfileDraft != nil {
+                    ScheduleProfileSettingsEditor(
+                        draft: scheduleProfileDraftBinding,
+                        isDirty: scheduleProfileIsDirty,
+                        canCommit: scheduleProfileCanCommit,
+                        validationMessage: scheduleProfileValidationMessage,
+                        blockedMessage: scheduleProfileBlockedMessage,
+                        errorMessage: scheduleProfileError,
+                        statusMessage: scheduleProfileStatus,
+                        onSave: saveScheduleProfile,
+                        onRevert: revertScheduleProfile
+                    )
+                } else {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading the encrypted schedule profile…")
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
-            .disabled(!store.canMutatePlan)
             Section("Accounts") {
                 GoogleIntegrationSettingsView()
                 codexAccountControls
@@ -4283,9 +5164,114 @@ struct SettingsView: View {
         .onAppear {
             dayWeaveAPIBaseURL = suggestionSync.baseURLString
             durableAuth.reload()
+            loadScheduleProfileIfNeeded()
         }
         .onChange(of: dayWeaveAPIBaseURL) { _, value in
             durableAuth.reload(boundTo: try? DayWeaveAPIBaseURL(value))
+        }
+        .onChange(of: store.scheduleProfile) { _, profile in
+            persistedScheduleProfileDidChange(profile)
+        }
+    }
+
+    private var scheduleProfileDraftBinding: Binding<ScheduleProfileDraft> {
+        Binding(
+            get: {
+                scheduleProfileDraft ?? ScheduleProfileDraft(store.scheduleProfile)
+            },
+            set: { draft in
+                scheduleProfileDraft = draft
+                if scheduleProfileBaseline == store.scheduleProfile {
+                    scheduleProfileError = nil
+                }
+                scheduleProfileStatus = nil
+            }
+        )
+    }
+
+    private var scheduleProfileIsDirty: Bool {
+        guard let scheduleProfileDraft, let scheduleProfileBaseline else {
+            return false
+        }
+        guard let candidate = try? scheduleProfileDraft.makeProfile() else {
+            return true
+        }
+        return candidate != scheduleProfileBaseline
+    }
+
+    private var scheduleProfileValidationMessage: String? {
+        guard let scheduleProfileDraft else { return nil }
+        do {
+            _ = try scheduleProfileDraft.makeProfile()
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private var scheduleProfileCanCommit: Bool {
+        store.hasEncryptedPersistence && store.canMutatePlan
+    }
+
+    private var scheduleProfileBlockedMessage: String? {
+        if !store.hasEncryptedPersistence {
+            return "Configure healthy encrypted planner storage before saving this profile."
+        }
+        if !store.canPersistPlan {
+            return "Repair local encrypted persistence before saving this profile."
+        }
+        if !store.canMutatePlan {
+            return "Wait for canonical sync or on-device composition to finish before saving."
+        }
+        return nil
+    }
+
+    private func loadScheduleProfileIfNeeded() {
+        guard scheduleProfileBaseline == nil || scheduleProfileDraft == nil else {
+            return
+        }
+        installScheduleProfileDraft(store.scheduleProfile)
+    }
+
+    private func installScheduleProfileDraft(_ profile: ScheduleProfile) {
+        scheduleProfileBaseline = profile
+        scheduleProfileDraft = ScheduleProfileDraft(profile)
+        scheduleProfileError = nil
+    }
+
+    private func saveScheduleProfile() {
+        guard let scheduleProfileDraft, let scheduleProfileBaseline else { return }
+        scheduleProfileError = nil
+        scheduleProfileStatus = nil
+        do {
+            let candidate = try scheduleProfileDraft.makeProfile()
+            try store.updateScheduleProfile(
+                candidate,
+                expectedCurrentProfile: scheduleProfileBaseline
+            )
+            installScheduleProfileDraft(candidate)
+            scheduleProfileStatus = "Schedule profile saved. Compose again when you are ready."
+        } catch {
+            scheduleProfileError = error.localizedDescription
+        }
+    }
+
+    private func revertScheduleProfile() {
+        installScheduleProfileDraft(store.scheduleProfile)
+        scheduleProfileStatus = "Unsaved profile edits reverted."
+    }
+
+    private func persistedScheduleProfileDidChange(_ profile: ScheduleProfile) {
+        guard let scheduleProfileBaseline, let scheduleProfileDraft else {
+            installScheduleProfileDraft(profile)
+            return
+        }
+        guard profile != scheduleProfileBaseline else { return }
+        if (try? scheduleProfileDraft.makeProfile()) == scheduleProfileBaseline {
+            installScheduleProfileDraft(profile)
+            scheduleProfileStatus = "Reloaded a newer saved schedule profile."
+        } else {
+            scheduleProfileError = "The saved schedule profile changed while you were editing. Revert to reload it before saving."
         }
     }
 

@@ -162,7 +162,13 @@ private enum EncryptedPlannerPersistenceScenarios {
             autosaveDelay: .seconds(60)
         )
         source.destination = .goals
-        source.protectedFreeMinutes = 135
+        try source.updateScheduleProfile(
+            ScheduleProfile.legacyDefault(
+                timezoneName: source.scheduleProfile.timezoneName,
+                protectedFreeMinutes: 135
+            ),
+            expectedCurrentProfile: source.scheduleProfile
+        )
         source.freezeHours = 5
         source.showCompleted = false
         source.flushPersistence()

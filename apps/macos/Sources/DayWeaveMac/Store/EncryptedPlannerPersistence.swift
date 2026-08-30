@@ -421,10 +421,11 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// and version 10 adds canonical authoring journals, deleted-item records,
     /// and a destination-aware canonical selection. Version 11 adds the
     /// encrypted Google outbound preview/approval/enqueue recovery fence, and
-    /// version 12 adds provenance for signed on-device schedule composition.
+    /// version 12 adds provenance for signed on-device schedule composition,
+    /// and version 13 adds the encrypted, timezone-bound schedule profile.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 12
+    static let currentSchemaVersion = 13
 
     let schemaVersion: Int
     let savedAt: Date
@@ -436,6 +437,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let assistantMessages: [AssistantMessage]
     let lastScheduleMessage: String
     let protectedFreeMinutes: Int
+    /// Optional only so schemas through 12 can be decoded before migration.
+    /// Every schema-13 snapshot must contain a valid profile whose protected
+    /// duration agrees exactly with the retained compatibility field.
+    let scheduleProfile: ScheduleProfile?
     let freezeHours: Int
     let showCompleted: Bool
     let canonicalItems: [DayWeaveCanonicalItem]?
@@ -468,6 +473,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         assistantMessages: [AssistantMessage],
         lastScheduleMessage: String,
         protectedFreeMinutes: Int,
+        scheduleProfile: ScheduleProfile? = nil,
         freezeHours: Int,
         showCompleted: Bool,
         canonicalItems: [DayWeaveCanonicalItem]? = nil,
@@ -499,6 +505,17 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.assistantMessages = assistantMessages
         self.lastScheduleMessage = lastScheduleMessage
         self.protectedFreeMinutes = protectedFreeMinutes
+        if let scheduleProfile {
+            self.scheduleProfile = scheduleProfile
+        } else if schemaVersion == Self.currentSchemaVersion {
+            self.scheduleProfile = Self.legacyScheduleProfile(
+                protectedFreeMinutes: protectedFreeMinutes,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance
+            )
+        } else {
+            self.scheduleProfile = nil
+        }
         self.freezeHours = freezeHours
         self.showCompleted = showCompleted
         self.canonicalItems = canonicalItems
@@ -524,7 +541,15 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         switch schemaVersion {
         case Self.currentSchemaVersion:
-            guard executionState != nil,
+            guard let scheduleProfile,
+                  scheduleProfile.hasValidShape,
+                  scheduleProfile.protectedFreeMinutes == protectedFreeMinutes,
+                  schedulePreviewProvenance?.timezoneName == nil
+                    || schedulePreviewProvenance?.timezoneName == scheduleProfile.timezoneName,
+                  localScheduleCompositionProvenance?.timezoneName == nil
+                    || localScheduleCompositionProvenance?.timezoneName
+                        == scheduleProfile.timezoneName,
+                  executionState != nil,
                   pendingCanonicalSensitivityMutations != nil,
                   let proposalApplicationReceipts,
                   let pendingCanonicalAuthoringMutations,
@@ -558,6 +583,85 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 12:
+            // Schema 12 has no trusted schedule profile. Ignore any injected
+            // newer field and derive the exact legacy 06:00–23:00 shape from
+            // the retained protected-minute setting and proven preview zone.
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil,
+                  let proposalApplicationReceipts,
+                  let pendingCanonicalAuthoringMutations,
+                  let canonicalTrash,
+                  PlannerProposalApplicationJournalValidator.isValidState(
+                      pending: pendingProposalApplicationMutation,
+                      receipts: proposalApplicationReceipts
+                  ),
+                  PlannerCanonicalAuthoringJournalValidator.isValidState(
+                      mutations: pendingCanonicalAuthoringMutations,
+                      trash: canonicalTrash,
+                      canonicalItems: canonicalItems ?? [],
+                      tombstoneRevisions: canonicalTombstoneRevisions ?? [:],
+                      configurationIdentifier: canonicalConfigurationIdentifier
+                  ),
+                  googleOutboundRecoveryJournal?.hasValidShape != false,
+                  localScheduleCompositionProvenance?.hasValidShape != false,
+                  schedulePreviewProvenance == nil
+                    || localScheduleCompositionProvenance == nil,
+                  (localScheduleCompositionProvenance.map {
+                      $0.configurationIdentifier == canonicalConfigurationIdentifier
+                          && !blocks.contains {
+                              $0.syncOrigin == .canonicalPreview
+                                  || $0.syncOrigin == .externalPreview
+                          }
+                  } ?? true),
+                  schedulePreviewProvenance == nil
+                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
+                  localScheduleCompositionProvenance != nil
+                    || !blocks.contains(where: { $0.syncOrigin == .localComposition }),
+                  let migratedProfile = Self.legacyScheduleProfile(
+                      protectedFreeMinutes: protectedFreeMinutes,
+                      schedulePreviewProvenance: schedulePreviewProvenance,
+                      localScheduleCompositionProvenance: localScheduleCompositionProvenance
+                  ),
+                  schedulePreviewProvenance?.timezoneName == nil
+                    || schedulePreviewProvenance?.timezoneName
+                        == migratedProfile.timezoneName,
+                  localScheduleCompositionProvenance?.timezoneName == nil
+                    || localScheduleCompositionProvenance?.timezoneName
+                        == migratedProfile.timezoneName else {
+                throw .snapshotDecodingFailed
+            }
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: migratedProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 11:
             guard executionState != nil,
                   pendingCanonicalSensitivityMutations != nil,
@@ -912,6 +1016,29 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         default:
             throw .unsupportedSnapshotVersion(schemaVersion)
         }
+    }
+
+    private static func legacyScheduleProfile(
+        protectedFreeMinutes: Int,
+        schedulePreviewProvenance: SchedulePreviewProvenance?,
+        localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
+    ) -> ScheduleProfile? {
+        let current = ScheduleProfile.normalizedTimezoneName(
+            TimeZone.autoupdatingCurrent.identifier
+        )
+        let candidates = [
+            schedulePreviewProvenance?.timezoneName,
+            localScheduleCompositionProvenance?.timezoneName,
+            current,
+            "UTC",
+        ]
+        guard let timezoneName = candidates.compactMap({ $0 }).first(where: {
+            ScheduleProfile.isKnownIANATimezone($0)
+        }) else { return nil }
+        return try? ScheduleProfile.legacyDefault(
+            timezoneName: timezoneName,
+            protectedFreeMinutes: protectedFreeMinutes
+        )
     }
 }
 

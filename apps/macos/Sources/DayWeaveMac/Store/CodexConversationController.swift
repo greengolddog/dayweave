@@ -682,7 +682,7 @@ extension PlannerStore: CodexPlannerContextProviding {
 
         return CodexPlannerContextSnapshot(
             generatedAt: generatedAt,
-            timezone: TimeZone.autoupdatingCurrent.identifier,
+            timezone: scheduleProfile.timezoneName,
             scheduledBlocks: scheduledBlocks,
             privateBusySpans: privateBusySpans,
             totalScheduledBlockCount: blocks.count,

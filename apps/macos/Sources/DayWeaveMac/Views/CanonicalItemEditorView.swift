@@ -53,6 +53,7 @@ struct CanonicalItemEditorView: View {
     init(
         mode: CanonicalItemEditorMode,
         readOnlyDiagnostic: String? = nil,
+        profileTimezoneName: String,
         now: Date = Date()
     ) {
         self.mode = mode
@@ -60,7 +61,8 @@ struct CanonicalItemEditorView: View {
         _state = State(initialValue: CanonicalItemEditorState(
             itemID: mode.itemID,
             draft: mode.initialDraft,
-            now: now
+            now: now,
+            timezoneName: profileTimezoneName
         ))
     }
 
@@ -225,6 +227,7 @@ struct CanonicalItemEditorView: View {
                     selection: $state.earliestStart,
                     displayedComponents: [.date, .hourAndMinute]
                 )
+                .environment(\.timeZone, editorTimeZone)
                 .accessibilityIdentifier("canonical-editor.earliest")
             }
 
@@ -235,6 +238,7 @@ struct CanonicalItemEditorView: View {
                     selection: $state.deadline,
                     displayedComponents: [.date, .hourAndMinute]
                 )
+                .environment(\.timeZone, editorTimeZone)
                 .accessibilityIdentifier("canonical-editor.deadline")
             }
 
@@ -605,8 +609,7 @@ struct CanonicalItemEditorView: View {
     }
 
     private var editorTimeZone: TimeZone {
-        DayWeaveCanonicalItemDraft.supportedTimeZone(identifier: state.timezoneName)
-            ?? TimeZone.autoupdatingCurrent
+        PlannerTimeZone.resolve(state.timezoneName)
     }
 }
 

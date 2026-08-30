@@ -1,6 +1,26 @@
 import Foundation
 import SwiftUI
 
+enum PlannerTimeZone {
+    private static let utc = TimeZone(secondsFromGMT: 0)!
+
+    static func resolve(_ timezoneName: String) -> TimeZone {
+        DayWeaveCanonicalItemDraft.supportedTimeZone(identifier: timezoneName) ?? utc
+    }
+
+    static func dateTimeLabel(_ date: Date, timezoneName: String) -> String {
+        var style = Date.FormatStyle()
+            .year()
+            .month(.abbreviated)
+            .day()
+            .hour(.twoDigits(amPM: .omitted))
+            .minute(.twoDigits)
+            .timeZone(.iso8601(.long))
+        style.timeZone = resolve(timezoneName)
+        return date.formatted(style)
+    }
+}
+
 enum PlannerItemKind: String, Codable, CaseIterable, Identifiable, Sendable {
     case event
     case task
@@ -118,30 +138,43 @@ struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
         max(1, Int(end.timeIntervalSince(start) / 60))
     }
 
-    var timeRange: String {
-        "\(startTimeLabel)–\(endTimeLabel)"
+    func timeRange(timezoneName: String) -> String {
+        "\(startTimeLabel(timezoneName: timezoneName))–\(endTimeLabel(timezoneName: timezoneName))"
     }
 
-    var startTimeLabel: String {
-        Self.offsetTimeLabel(for: start)
+    func startTimeLabel(timezoneName: String) -> String {
+        Self.offsetTimeLabel(for: start, timezoneName: timezoneName)
     }
 
-    var endTimeLabel: String {
-        Self.offsetTimeLabel(for: end)
+    func endTimeLabel(timezoneName: String) -> String {
+        Self.offsetTimeLabel(for: end, timezoneName: timezoneName)
     }
 
     var isLocallyAuthored: Bool {
         syncOrigin == nil || syncOrigin == .local
     }
 
-    private static func offsetTimeLabel(for date: Date) -> String {
+    /// External fixed inputs constrain composition, but they are not executable
+    /// DayWeave work and must not contribute to project or execution rollups.
+    var contributesToExecutionPresentation: Bool {
+        previewKind != "external_fixed"
+    }
+
+    var isExternalFixedBlock: Bool {
+        !contributesToExecutionPresentation
+    }
+
+    private static func offsetTimeLabel(
+        for date: Date,
+        timezoneName: String
+    ) -> String {
         // The numeric offset disambiguates the repeated local hour during a
         // DST fall-back even when a zone happens to reuse an abbreviation.
         var style = Date.FormatStyle()
             .hour(.twoDigits(amPM: .omitted))
             .minute(.twoDigits)
             .timeZone(.iso8601(.long))
-        style.timeZone = .autoupdatingCurrent
+        style.timeZone = PlannerTimeZone.resolve(timezoneName)
         return date.formatted(style)
     }
 }

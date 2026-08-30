@@ -208,7 +208,9 @@ struct DayWeaveMacApp: App {
         Window("Quick Capture", id: "quick-capture") {
             Group {
                 if appLock.isContentAvailable {
-                    QuickCaptureView()
+                    QuickCaptureView(
+                        profileTimezoneName: store.scheduleProfile.timezoneName
+                    )
                         .environmentObject(store)
                 } else {
                     AppLockedView()

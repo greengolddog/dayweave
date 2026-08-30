@@ -74,6 +74,32 @@ enum PlannerLocalCompositionError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerScheduleProfileError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case invalidProfile
+    case staleBaseline
+    case mutationFenceActive
+    case recoveryInProgress
+    case activeExecution
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Healthy encrypted planner persistence is required before changing the schedule profile."
+        case .invalidProfile:
+            "The schedule profile is invalid or disagrees with its protected-time compatibility value."
+        case .staleBaseline:
+            "The schedule profile changed after this edit began. Reload it before saving."
+        case .mutationFenceActive:
+            "Wait for canonical synchronization or on-device composition to finish before changing the schedule profile."
+        case .recoveryInProgress:
+            "Recover pending schedule, proposal, Google Calendar, or status work before changing the schedule profile."
+        case .activeExecution:
+            "Finish the active cross-device execution before changing the schedule profile."
+        }
+    }
+}
+
 enum PlannerProposalApplicationJournalError: LocalizedError, Equatable, Sendable {
     case encryptedPersistenceRequired
     case invalidMutation
@@ -274,13 +300,18 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var executionState: DayWeaveExecutionDurableState {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var scheduleProfile: ScheduleProfile {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var isCanonicalSyncLocked = false
     @Published var isQuickAddPresented = false
     @Published var lastScheduleMessage: String {
         didSet { scheduleAutosave() }
     }
-    @Published var protectedFreeMinutes = 90 {
-        didSet { scheduleAutosave() }
+    /// Schema-12 compatibility value derived from the profile's common daily
+    /// terminal protected interval. It is never a second mutation source.
+    var protectedFreeMinutes: Int {
+        scheduleProfile.protectedFreeMinutes
     }
     @Published var freezeHours = 2 {
         didSet { scheduleAutosave() }
@@ -296,6 +327,7 @@ final class PlannerStore: ObservableObject {
     private let now: @Sendable () -> Date
     private var autosaveTask: Task<Void, Never>?
     private var canonicalTrashRetentionTask: Task<Void, Never>?
+    private var scheduleProfileCommitObservers: [@MainActor () -> Void] = []
     private var isCanonicalPreviewValidatedForCurrentLaunch = false
     private var persistenceRevision: PlannerPersistenceRevision = .missing
 
@@ -322,6 +354,7 @@ final class PlannerStore: ObservableObject {
         selectedCanonicalItemID: UUID? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
+        scheduleProfile: ScheduleProfile? = nil,
         previewValidatedForCurrentLaunch: Bool = false,
         lastScheduleMessage: String = "No schedule yet — add an item when you’re ready",
         persistence: EncryptedPlannerPersistence? = nil,
@@ -447,6 +480,26 @@ final class PlannerStore: ObservableObject {
         if !Self.validateExecutionState(initialExecutionState) {
             restorationError = .snapshotDecodingFailed
         }
+        let restoredProtectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes
+        let initialScheduleProfile = restoredSnapshot?.scheduleProfile
+            ?? scheduleProfile
+            ?? Self.defaultScheduleProfile(
+                protectedFreeMinutes: restoredProtectedFreeMinutes ?? 90,
+                timezoneName: initialSchedulePreviewProvenance?.timezoneName
+                    ?? initialLocalScheduleCompositionProvenance?.timezoneName
+            )
+        self.scheduleProfile = initialScheduleProfile
+        if !initialScheduleProfile.hasValidShape
+            || initialScheduleProfile.protectedFreeMinutes
+                != (restoredProtectedFreeMinutes ?? initialScheduleProfile.protectedFreeMinutes)
+            || initialSchedulePreviewProvenance.map({
+                $0.timezoneName != initialScheduleProfile.timezoneName
+            }) == true
+            || initialLocalScheduleCompositionProvenance.map({
+                $0.timezoneName != initialScheduleProfile.timezoneName
+            }) == true {
+            restorationError = .snapshotDecodingFailed
+        }
         isCanonicalPreviewValidatedForCurrentLaunch = previewValidatedForCurrentLaunch
         destination = restoredSnapshot?.destination ?? .today
         if let restoredSelection = restoredSnapshot?.selectedBlockID,
@@ -465,7 +518,6 @@ final class PlannerStore: ObservableObject {
             selectableCanonicalIDs.contains($0) ? $0 : nil
         }
         self.lastScheduleMessage = restoredSnapshot?.lastScheduleMessage ?? lastScheduleMessage
-        protectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes ?? 90
         freezeHours = restoredSnapshot?.freezeHours ?? 2
         showCompleted = restoredSnapshot?.showCompleted ?? true
         persistenceError = restorationError
@@ -546,6 +598,94 @@ final class PlannerStore: ObservableObject {
 
     var hasEncryptedPersistence: Bool {
         persistence != nil
+    }
+
+    /// Commit-only observation: unlike `$scheduleProfile`, this never fires
+    /// for an in-memory candidate that is subsequently rolled back after a
+    /// persistence/CAS failure.
+    func observeCommittedScheduleProfileChanges(
+        _ observer: @escaping @MainActor () -> Void
+    ) {
+        scheduleProfileCommitObservers.append(observer)
+    }
+
+    /// Replaces the complete value-semantic profile as one encrypted
+    /// transaction. The optional baseline lets an editor reject a stale save
+    /// without mutating either the profile or the visible schedule.
+    func updateScheduleProfile(
+        _ replacement: ScheduleProfile,
+        expectedCurrentProfile: ScheduleProfile? = nil
+    ) throws {
+        try commitScheduleProfile(
+            replacement,
+            expectedCurrentProfile: expectedCurrentProfile
+        )
+    }
+
+    private func commitScheduleProfile(
+        _ replacement: ScheduleProfile,
+        expectedCurrentProfile: ScheduleProfile?
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerScheduleProfileError.encryptedPersistenceRequired
+        }
+        guard replacement.hasValidShape else {
+            throw PlannerScheduleProfileError.invalidProfile
+        }
+        if let expectedCurrentProfile, expectedCurrentProfile != scheduleProfile {
+            throw PlannerScheduleProfileError.staleBaseline
+        }
+        guard !isCanonicalSyncLocked else {
+            throw PlannerScheduleProfileError.mutationFenceActive
+        }
+        guard pendingSchedulePublication == nil,
+              pendingProposalApplicationMutation == nil,
+              googleOutboundRecoveryJournal == nil,
+              pendingCanonicalMutations.isEmpty,
+              pendingCanonicalSensitivityMutations.isEmpty,
+              pendingCanonicalAuthoringMutations.isEmpty else {
+            throw PlannerScheduleProfileError.recoveryInProgress
+        }
+        guard executionState.activeSession == nil,
+              executionState.pendingCommand == nil,
+              !executionState.hasCredentialReplacementBlocker,
+              !blocks.contains(where: { $0.syncOrigin == .remoteExecutionLease }) else {
+            throw PlannerScheduleProfileError.activeExecution
+        }
+        guard replacement != scheduleProfile else { return }
+
+        let priorProfile = scheduleProfile
+        let priorBlocks = blocks
+        let priorSelection = selectedBlockID
+        let priorServerProvenance = schedulePreviewProvenance
+        let priorLocalProvenance = localScheduleCompositionProvenance
+        let priorMessage = lastScheduleMessage
+        let priorLaunchValidation = isCanonicalPreviewValidatedForCurrentLaunch
+
+        scheduleProfile = replacement
+        blocks.removeAll {
+            $0.syncOrigin == .canonicalPreview
+                || $0.syncOrigin == .externalPreview
+                || $0.syncOrigin == .localComposition
+        }
+        schedulePreviewProvenance = nil
+        localScheduleCompositionProvenance = nil
+        isCanonicalPreviewValidatedForCurrentLaunch = false
+        selectedBlockID = blocks.first?.id
+        lastScheduleMessage = "Schedule profile changed · compose a fresh schedule"
+
+        flushPersistence()
+        if let persistenceError {
+            scheduleProfile = priorProfile
+            blocks = priorBlocks
+            selectedBlockID = priorSelection
+            schedulePreviewProvenance = priorServerProvenance
+            localScheduleCompositionProvenance = priorLocalProvenance
+            lastScheduleMessage = priorMessage
+            isCanonicalPreviewValidatedForCurrentLaunch = priorLaunchValidation
+            throw persistenceError
+        }
+        for observer in scheduleProfileCommitObservers { observer() }
     }
 
     @discardableResult
@@ -703,11 +843,9 @@ final class PlannerStore: ObservableObject {
               currentTime.timeIntervalSince(generatedAt) <= 6 * 3_600 else {
             return "The visible schedule is older than the six-hour execution safety window. Sync or compose again."
         }
-        let currentTimezoneIdentifier = TimeZone.autoupdatingCurrent.identifier == "GMT"
-            ? "UTC"
-            : TimeZone.autoupdatingCurrent.identifier
-        guard let timezone = TimeZone(identifier: timezoneName),
-              timezoneName == currentTimezoneIdentifier else {
+        guard let timezone = DayWeaveCanonicalItemDraft.supportedTimeZone(
+            identifier: timezoneName
+        ), timezoneName == scheduleProfile.timezoneName else {
             return "The planning timezone changed. Sync or compose again before changing canonical blocks."
         }
         var calendar = Calendar(identifier: .gregorian)
@@ -857,7 +995,12 @@ final class PlannerStore: ObservableObject {
     }
 
     var todaysBlocks: [ScheduleBlock] {
-        let calendar = Calendar.autoupdatingCurrent
+        var calendar = Calendar(identifier: .gregorian)
+        if let timezone = DayWeaveCanonicalItemDraft.supportedTimeZone(
+            identifier: scheduleProfile.timezoneName
+        ) {
+            calendar.timeZone = timezone
+        }
         let start = calendar.startOfDay(for: now())
         let end = calendar.date(byAdding: .day, value: 1, to: start)
             ?? start.addingTimeInterval(86_400)
@@ -3832,6 +3975,7 @@ final class PlannerStore: ObservableObject {
             assistantMessages: assistantMessages,
             lastScheduleMessage: lastScheduleMessage,
             protectedFreeMinutes: protectedFreeMinutes,
+            scheduleProfile: scheduleProfile,
             freezeHours: freezeHours,
             showCompleted: showCompleted,
             canonicalItems: canonicalItems,
@@ -3854,6 +3998,34 @@ final class PlannerStore: ObservableObject {
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )
+    }
+
+    private static func defaultScheduleProfile(
+        protectedFreeMinutes: Int,
+        timezoneName: String? = nil
+    ) -> ScheduleProfile {
+        let currentTimezone = ScheduleProfile.normalizedTimezoneName(
+            TimeZone.autoupdatingCurrent.identifier
+        )
+        for candidate in [timezoneName, currentTimezone, "UTC"].compactMap({ $0 }) {
+            if let profile = try? ScheduleProfile.legacyDefault(
+                timezoneName: candidate,
+                protectedFreeMinutes: protectedFreeMinutes
+            ) {
+                return profile
+            }
+        }
+        // UTC and 90 minutes are compile-time contract constants accepted by
+        // the strict model. This is reached only while fail-closing a corrupt
+        // legacy value or an unsupported host timezone.
+        do {
+            return try ScheduleProfile.legacyDefault(
+                timezoneName: "UTC",
+                protectedFreeMinutes: 90
+            )
+        } catch {
+            preconditionFailure("The built-in schedule profile is invalid: \(error)")
+        }
     }
 
     private static func hierarchicallySorted(
