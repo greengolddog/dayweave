@@ -1,4 +1,4 @@
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::process::{Command, Output, Stdio};
 
 const REQUEST: &[u8] = include_bytes!("fixtures/plan-request-v1.json");
@@ -15,7 +15,11 @@ fn run(args: &[&str], input: &[u8]) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    if let Err(error) = child.stdin.take().unwrap().write_all(input) {
+        // Invalid invocations deliberately exit before reading stdin. Whether
+        // the parent finishes this tiny write first is scheduler-dependent.
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
+    }
     child.wait_with_output().unwrap()
 }
 
