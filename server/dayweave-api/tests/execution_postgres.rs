@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, Utc};
 use dayweave_api::{
     execution::{
         ExecutionCommand, ExecutionIdempotencyKey, ExecutionRepositoryError, ExecutionService,
@@ -55,10 +55,8 @@ async fn run_scenario(pool: PgPool) {
 
     let main_scope = seed_scope(&pool, "execution-owner-one", "execution-workspace-one").await;
     let other_scope = seed_scope(&pool, "execution-owner-two", "execution-workspace-two").await;
-    let base = Utc
-        .with_ymd_and_hms(2026, 8, 29, 8, 0, 0)
-        .single()
-        .expect("valid fixture time");
+    let base = postgres_now(&pool).await;
+    assert_fixture_idempotency_expiry_is_future(&pool, base).await;
     let clock = Arc::new(TestClock::new(base));
     let main_items = Arc::new(ItemService::new(
         Arc::new(PostgresItemRepository::new(pool.clone(), main_scope)),
@@ -378,6 +376,28 @@ async fn create_item(service: &ItemService, id: Uuid, title: &str, marker: u8) {
         )
         .await
         .unwrap();
+}
+
+async fn postgres_now(pool: &PgPool) -> DateTime<Utc> {
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(pool)
+        .await
+        .expect("read PostgreSQL fixture time");
+    DateTime::from_timestamp_micros(now.timestamp_micros())
+        .expect("PostgreSQL fixture time remains representable at microsecond precision")
+}
+
+async fn assert_fixture_idempotency_expiry_is_future(pool: &PgPool, base: DateTime<Utc>) {
+    let expires_at = base + Duration::hours(24);
+    let is_future: bool = sqlx::query_scalar("SELECT $1::timestamptz > clock_timestamp()")
+        .bind(expires_at)
+        .fetch_one(pool)
+        .await
+        .expect("compare fixture idempotency expiry with PostgreSQL time");
+    assert!(
+        is_future,
+        "fixture item idempotency expiry must be later than PostgreSQL creation time"
+    );
 }
 
 fn start_command(session_id: Uuid, item_id: Uuid, device_id: Uuid) -> ExecutionCommand {
