@@ -303,9 +303,20 @@ encryption, backups, and operator monitoring are ready. Approval lifetimes use
    representation.
 3. `POST .../outbound` presents the capability with the exact account,
    collection, item revision, and operation. Consumption is atomic. An exact
-   retry before expiry returns the same outbox ID; swaps or mutations fail and
-   do not consume authority. Expired capabilities are rejected, including
-   retries.
+   retry returns the same outbox ID; after successful consumption this remains
+   a receipt lookup even after expiry and cannot create another outbox row.
+   Swaps or mutations fail and do not consume authority. An expired capability
+   that was never consumed is rejected.
+
+The Mac persists each transition in its encrypted planner state before the
+corresponding request. If an approved enqueue response is lost, recovery sends
+only the saved capability and exact bound tuple. It may do so after the Mac's
+observed expiry: server time may still consume that already-approved request
+once within the clock-skew window, but after authoritative expiry the server
+can only return an already-consumed receipt or reject it without new work.
+Preview and uncertain approval-attempt stages never repeat approval
+automatically. Expired recovery can be discarded only with explicit
+confirmation after the supported five-minute clock-skew window.
 
 The reviewed intent binds workspace user, account, collection ID and revision,
 remote collection ID, collection kind, full write scope, canonical item and

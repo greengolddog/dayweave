@@ -167,9 +167,10 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
         )
     }
 
-    /// Expiration makes every possible server-minted preview or capability for
-    /// this lane unusable. The owner may then explicitly clear this exact
-    /// journal before starting a fresh intent.
+    /// Expiration prevents this authority from creating new server work. An
+    /// approved journal may still replay its exact tuple to learn whether the
+    /// server consumed it before expiry; every earlier stage remains inert.
+    /// The owner may explicitly clear this journal before starting fresh.
     func canStartFresh(at date: Date) -> Bool {
         guard Self.isFinite(date) else { return false }
         guard let expiration = authorityExpiresAt else { return false }
@@ -502,9 +503,9 @@ enum GoogleOutboundWorkflowStatus: Equatable, Sendable {
         case .enqueueing:
             "Saving the approved Google Calendar change to the durable outbox…"
         case let .expirySafetyDelay(discardAfter):
-            "The approval is no longer actionable. To tolerate device clock skew, it can be discarded after \(discardAfter.formatted(date: .omitted, time: .shortened))."
+            "This Mac's saved-authority expiry time passed. If the operation was already approved, its exact result can still be recovered safely. To tolerate device clock skew, this recovery can be discarded after \(discardAfter.formatted(date: .omitted, time: .shortened))."
         case .expired:
-            "The saved Google publication authority expired. A fresh preview is required."
+            "The saved Google publication authority expired. If it was already approved, check for an existing server acceptance. Otherwise discard it before creating a fresh preview."
         case let .recoveryRequired(message), let .failed(message):
             message
         case let .accepted(_, replayed):
@@ -671,6 +672,10 @@ final class GoogleOutboundStore: ObservableObject {
             previewID: preview.id,
             previewHash: preview.previewHash
         )
+    }
+
+    var hasApprovedRecovery: Bool {
+        hasPendingRecovery && recoveryContext?.stage == .approved
     }
 
     func setPrivacyAvailable(_ available: Bool) {
@@ -880,6 +885,7 @@ final class GoogleOutboundStore: ObservableObject {
             try persistTransition(from: attempted, to: approved)
             scheduleExpiryObservation(for: approved)
             presentedJournal = approved
+            recoveryContext = Self.context(for: approved)
             self.preview = nil
             hasPendingRecovery = true
             return try await performEnqueue(approved, using: context)
@@ -915,11 +921,16 @@ final class GoogleOutboundStore: ObservableObject {
             guard journal.isValid(now: currentDate) else {
                 throw GoogleOutboundWorkflowError.invalidRecoveryJournal
             }
-            guard !journal.canStartFresh(at: currentDate) else {
+            let authorityExpired = journal.canStartFresh(at: currentDate)
+            guard !authorityExpired || journal.stage == .approved else {
                 presentExpiredRecovery(journal)
                 return false
             }
-            scheduleExpiryObservation(for: journal)
+            if authorityExpired {
+                cancelExpiryObservation()
+            } else {
+                scheduleExpiryObservation(for: journal)
+            }
 
             if journal.stage == .approvalAttempted {
                 try requireCurrentRecoveryJournal(journal)
@@ -1010,10 +1021,6 @@ final class GoogleOutboundStore: ObservableObject {
               request.isValid else {
             throw GoogleOutboundWorkflowError.invalidRecoveryJournal
         }
-        guard !journal.canStartFresh(at: now()) else {
-            presentExpiredRecovery(journal)
-            return false
-        }
         status = .enqueueing
         let response = try await operation.transport.enqueueGoogleOutbound(
             accountID: journal.accountID,
@@ -1026,8 +1033,9 @@ final class GoogleOutboundStore: ObservableObject {
         guard try recoveryStore.loadGoogleOutboundRecoveryJournal() == journal else {
             throw GoogleOutboundWorkflowError.recoveryChanged
         }
-        // Acceptance is the only path that clears live recovery authority;
-        // expired, server-unusable authority has a separate explicit discard.
+        // Acceptance is the only non-destructive path that clears recovery.
+        // At authoritative server expiry, the exact request can only recover
+        // an outbox already created; an unconsumed capability remains closed.
         try recoveryStore.clearGoogleOutboundRecoveryJournal(journal)
         cancelExpiryObservation()
         hasPendingRecovery = false
@@ -1241,6 +1249,7 @@ final class GoogleOutboundStore: ObservableObject {
         }
         hasPendingRecovery = journal != nil
         presentedJournal = journal
+        recoveryContext = journal.map(Self.context(for:))
         if let journal, !journal.canStartFresh(at: now()) {
             scheduleExpiryObservation(for: journal)
         } else {

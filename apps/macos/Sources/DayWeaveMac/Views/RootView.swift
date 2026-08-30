@@ -215,6 +215,22 @@ private struct SidebarView: View {
                             googleReviewIsPresented = true
                         }
                         .accessibilityIdentifier("google.outbound.sidebar-review")
+                    } else if googleOutbound.hasApprovedRecovery {
+                        Button(googleOutbound.status == .expired
+                            ? "Check Calendar acceptance"
+                            : "Recover approved Calendar change") {
+                            Task {
+                                _ = await googleOutbound.recoverPendingOperation()
+                            }
+                        }
+                        .disabled(googleOutbound.status.isWorking)
+                        .accessibilityIdentifier("google.outbound.sidebar-check-acceptance")
+                        if googleOutbound.status == .expired {
+                            GoogleExpiredRecoveryDiscardButton(
+                                title: "Discard expired Calendar recovery",
+                                accessibilityIdentifier: "google.outbound.sidebar-discard"
+                            )
+                        }
                     } else if googleOutbound.status == .expired {
                         GoogleExpiredRecoveryDiscardButton(
                             title: "Discard expired Calendar recovery",
@@ -1833,6 +1849,17 @@ private struct GoogleOutboundReviewSheet: View {
                     } description: {
                         Text(googleOutbound.status.message)
                     } actions: {
+                        if googleOutbound.hasApprovedRecovery {
+                            Button(googleOutbound.status == .expired
+                                ? "Check server acceptance"
+                                : "Recover approved operation") {
+                                Task { _ = await googleOutbound.recoverPendingOperation() }
+                            }
+                            .disabled(googleOutbound.status.isWorking)
+                            .accessibilityIdentifier(
+                                "google.outbound.review-empty-check-acceptance"
+                            )
+                        }
                         if googleOutbound.status == .expired {
                             GoogleExpiredRecoveryDiscardButton(
                                 title: "Discard expired recovery",
@@ -1840,6 +1867,7 @@ private struct GoogleOutboundReviewSheet: View {
                                 onDiscard: { dismiss() }
                             )
                         } else if googleOutbound.hasPendingRecovery,
+                                  !googleOutbound.hasApprovedRecovery,
                                   !googleOutbound.status.isWaitingForSafeDiscard {
                             Button("Recover saved operation") {
                                 Task { _ = await googleOutbound.recoverPendingOperation() }

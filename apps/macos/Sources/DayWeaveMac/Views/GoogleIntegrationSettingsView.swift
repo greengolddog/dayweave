@@ -32,6 +32,18 @@ struct GoogleIntegrationSettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
+                    if outbound.hasApprovedRecovery {
+                        Button(outbound.status == .expired
+                            ? "Check Calendar acceptance"
+                            : "Recover approved Calendar change") {
+                            Task { _ = await outbound.recoverPendingOperation() }
+                        }
+                        .controlSize(.small)
+                        .disabled(outbound.status.isWorking)
+                        .accessibilityIdentifier(
+                            "google.outbound.settings-check-acceptance"
+                        )
+                    }
                     if outbound.status == .expired {
                         GoogleExpiredRecoveryDiscardButton(
                             title: "Discard expired Calendar recovery",

@@ -123,8 +123,9 @@ struct GoogleOutboundStoreTests {
         #expect(!String(reflecting: approved).contains(Self.capability))
     }
 
-    @Test("enqueue timeout retains capability and relaunch replays the exact request")
+    @Test("enqueue timeout retains capability and relaunch replays the exact request after expiry")
     func enqueueTimeoutReplaysExactly() async throws {
+        let clock = OutboundTestClock(Self.now)
         let events = OutboundEventLog()
         let recovery = TestGoogleOutboundRecoveryStore(events: events)
         let transport = TestGoogleOutboundTransport(
@@ -139,7 +140,8 @@ struct GoogleOutboundStoreTests {
         )
         var store: GoogleOutboundStore? = Self.makeStore(
             recovery: recovery,
-            transport: transport
+            transport: transport,
+            now: { clock.read() }
         )
         #expect(await Self.prepare(try #require(store)))
         let confirmation = try #require(store?.approvalConfirmation)
@@ -154,10 +156,19 @@ struct GoogleOutboundStoreTests {
         }
         let pending = try #require(recovery.value)
         #expect(pending.stage == .approved)
+        #expect(store?.hasApprovedRecovery == true)
+        #expect(store?.recoveryContext?.stage == .approved)
         #expect(recovery.cleared.isEmpty)
         store = nil
 
-        let relaunched = Self.makeStore(recovery: recovery, transport: transport)
+        clock.advance(by: 16 * 60)
+        let relaunched = Self.makeStore(
+            recovery: recovery,
+            transport: transport,
+            now: { clock.read() }
+        )
+        #expect(relaunched.status == .expired)
+        #expect(relaunched.hasApprovedRecovery)
         #expect(await relaunched.recoverPendingOperation())
         #expect(recovery.value == nil)
         let requests = await transport.enqueueCallsSnapshot()
@@ -165,6 +176,104 @@ struct GoogleOutboundStoreTests {
         #expect(requests[0] == requests[1])
         #expect(requests[0].request.approvalCapability == Self.capability)
         #expect(recovery.cleared.count == 1)
+    }
+
+    @Test("expired unconsumed approval rejection keeps exact recovery for retry or discard")
+    func expiredApprovedRejectionRetainsRecovery() async throws {
+        let clock = OutboundTestClock(Self.now)
+        clock.advance(by: 16 * 60)
+        let approved = try Self.approvedJournal()
+        let recovery = TestGoogleOutboundRecoveryStore(value: approved)
+        let transport = TestGoogleOutboundTransport(
+            configurationIdentifier: Self.configuration,
+            enqueueSteps: [
+                .failure(.api(.server(
+                    statusCode: 409,
+                    code: "google_outbound_approval_expired",
+                    message: nil,
+                    requestID: nil
+                ))),
+            ]
+        )
+        let store = Self.makeStore(
+            recovery: recovery,
+            transport: transport,
+            now: { clock.read() }
+        )
+
+        #expect(store.status == .expired)
+        #expect(store.hasApprovedRecovery)
+        #expect(!(await store.recoverPendingOperation()))
+        #expect(recovery.value == approved)
+        #expect(recovery.cleared.isEmpty)
+        #expect(store.status == .expired)
+        #expect(store.hasApprovedRecovery)
+        let calls = await transport.enqueueCallsSnapshot()
+        #expect(calls.count == 1)
+        #expect(calls[0].request == approved.enqueueRequest)
+        #expect((await transport.previewCallsSnapshot()).isEmpty)
+        #expect((await transport.approvalCallsSnapshot()).isEmpty)
+    }
+
+    @Test("expired acceptance check fences discard while its exact replay is in flight")
+    func expiredApprovedReplayFencesDiscard() async throws {
+        let clock = OutboundTestClock(Self.now)
+        clock.advance(by: 16 * 60)
+        let gate = OutboundAsyncGate()
+        let approved = try Self.approvedJournal()
+        let recovery = TestGoogleOutboundRecoveryStore(value: approved)
+        let transport = TestGoogleOutboundTransport(
+            configurationIdentifier: Self.configuration,
+            enqueueSteps: [.gated(gate, try Self.accepted(replayed: true))]
+        )
+        let store = Self.makeStore(
+            recovery: recovery,
+            transport: transport,
+            now: { clock.read() }
+        )
+        let replay = Task { @MainActor in
+            await store.recoverPendingOperation()
+        }
+        await gate.waitUntilEntered()
+
+        #expect(!store.discardExpiredRecovery())
+        #expect(recovery.value == approved)
+        #expect(recovery.cleared.isEmpty)
+
+        await gate.release()
+        #expect(await replay.value)
+        #expect(recovery.value == nil)
+        #expect(recovery.cleared == [approved])
+        #expect(store.accepted?.replayed == true)
+        #expect((await transport.enqueueCallsSnapshot()).count == 1)
+    }
+
+    @Test("expired preview and uncertain approval stages never send recovery requests")
+    func expiredEarlierStagesRemainInert() async throws {
+        let clock = OutboundTestClock(Self.now)
+        clock.advance(by: 16 * 60)
+        let previewed = try Self.previewedJournal()
+        let attempted = try previewed.recordingApprovalAttempt()
+
+        for journal in [previewed, attempted] {
+            let recovery = TestGoogleOutboundRecoveryStore(value: journal)
+            let transport = TestGoogleOutboundTransport(
+                configurationIdentifier: Self.configuration
+            )
+            let store = Self.makeStore(
+                recovery: recovery,
+                transport: transport,
+                now: { clock.read() }
+            )
+
+            #expect(store.status == .expired)
+            #expect(!store.hasApprovedRecovery)
+            #expect(!(await store.recoverPendingOperation()))
+            #expect(recovery.value == journal)
+            #expect((await transport.previewCallsSnapshot()).isEmpty)
+            #expect((await transport.approvalCallsSnapshot()).isEmpty)
+            #expect((await transport.enqueueCallsSnapshot()).isEmpty)
+        }
     }
 
     @Test("preview timeout retains exact intent and recovery replays it")

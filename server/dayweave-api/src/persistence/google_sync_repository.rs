@@ -1902,10 +1902,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         if !request_matches {
             return Err(GoogleSyncRepositoryError::ApprovalInvalid);
         }
-        let expires_at: DateTime<Utc> = approval.try_get("expires_at").map_err(internal)?;
-        if expires_at <= now {
-            return Err(GoogleSyncRepositoryError::ApprovalExpired);
-        }
+        // Consumption permanently removes enqueue authority. An exact retry is
+        // only a receipt lookup, so it remains recoverable after capability expiry.
         if approval
             .try_get::<Option<DateTime<Utc>>, _>("consumed_at")
             .map_err(internal)?
@@ -1920,6 +1918,10 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 outbox_id,
                 replayed: true,
             });
+        }
+        let expires_at: DateTime<Utc> = approval.try_get("expires_at").map_err(internal)?;
+        if expires_at <= now {
+            return Err(GoogleSyncRepositoryError::ApprovalExpired);
         }
         if approval
             .try_get::<Option<DateTime<Utc>>, _>("approved_at")
@@ -9480,12 +9482,59 @@ mod tests {
             .expect("exact immediate retry is idempotent");
         assert!(replay.replayed);
         assert_eq!(replay.outbox_id, accepted.outbox_id);
-        assert_eq!(
-            repository
-                .enqueue_outbound(enqueue, fixture.now + Duration::minutes(11))
-                .await,
-            Err(GoogleSyncRepositoryError::ApprovalExpired)
-        );
+        let post_expiry = fixture.now + Duration::minutes(11);
+        for post_expiry_swapped in [
+            OutboundEnqueueSpec {
+                account_id: Uuid::new_v4(),
+                request: request.clone(),
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    collection_id: Uuid::new_v4(),
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    item_id: Uuid::new_v4(),
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    expected_item_revision: request.expected_item_revision + 1,
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+            OutboundEnqueueSpec {
+                account_id: fixture.account_id,
+                request: crate::google_sync::OutboundRequest {
+                    operation: OutboundOperation::Delete,
+                    ..request.clone()
+                },
+                capability_hash,
+            },
+        ] {
+            assert_eq!(
+                repository
+                    .enqueue_outbound(post_expiry_swapped, post_expiry)
+                    .await,
+                Err(GoogleSyncRepositoryError::ApprovalInvalid)
+            );
+        }
+        let expired_replay = repository
+            .enqueue_outbound(enqueue, post_expiry)
+            .await
+            .expect("exact consumed retry remains a receipt after expiry");
+        assert!(expired_replay.replayed);
+        assert_eq!(expired_replay.outbox_id, accepted.outbox_id);
 
         let work = repository
             .claim_outbound(&fixture.claim, fixture.now)
