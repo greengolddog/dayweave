@@ -425,10 +425,13 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// version 13 adds the encrypted, timezone-bound schedule profile, and
     /// version 14 adds the exact successful schedule-publication proof, and
     /// version 15 adds occurrence-scoped moves plus the causal execution ->
-    /// publication recovery watermark.
+    /// publication recovery watermark, version 16 replaces local execution
+    /// move approvals with exact server-issued defer assessment evidence, and
+    /// version 17 retains the selected defer target until that target passes
+    /// while expiring only the server-issued assessment evidence.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 15
+    static let currentSchemaVersion = 17
 
     let schemaVersion: Int
     let savedAt: Date
@@ -583,7 +586,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                       recurrenceOccurrenceMoves,
                       canonicalItemIDs: Set((canonicalItems ?? []).map(\.id))
                   ),
-                  pendingExecutionDeferIntent?.hasPersistableShape != false,
+                  pendingExecutionDeferIntent?.hasValidShape != false,
                   (pendingExecutionDeferIntent.map { intent in
                       executionState.activeSession.map(intent.identity.matches) == true
                           || executionState.terminalOutcomes[intent.identity.sessionID]
@@ -637,6 +640,153 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 16:
+            // Schema 16 capped the durable user's target at 24 hours even when
+            // move_start was later. Preserve the exact target and any exact
+            // server evidence/approval, but make the target itself the sole
+            // lifetime boundary. Evidence freshness remains independently
+            // fenced by assessment.expires_at.
+            let migratedIntent: DayWeavePendingExecutionDeferIntent?
+            if let legacy = pendingExecutionDeferIntent {
+                guard legacy.version == 6, legacy.hasPersistableShape else {
+                    throw .snapshotDecodingFailed
+                }
+                migratedIntent = DayWeavePendingExecutionDeferIntent(
+                    identity: legacy.identity,
+                    focusedBlockID: legacy.focusedBlockID,
+                    sourceStart: legacy.sourceStart,
+                    sourceEnd: legacy.sourceEnd,
+                    moveStart: legacy.moveStart,
+                    approvedMoveEnd: legacy.approvedMoveEnd,
+                    approvedDeadlines: legacy.approvedDeadlines,
+                    deadlineConflictApproved: legacy.deadlineConflictApproved,
+                    approvedFixedConflicts: legacy.approvedFixedConflicts,
+                    fixedConflictApproved: legacy.fixedConflictApproved,
+                    sourceOverrideApproved: legacy.sourceOverrideApproved,
+                    assessment: legacy.assessment,
+                    approvedAssessmentDigest: legacy.approvedAssessmentDigest,
+                    createdAt: legacy.createdAt,
+                    expiresAt: legacy.moveStart
+                )
+            } else {
+                migratedIntent = nil
+            }
+            return try PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: migratedIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
+        case 15:
+            // Schema 15's execution move envelope contained only a locally
+            // interpreted risk approval. Preserve its selected target, but
+            // deliberately discard every approval while upgrading. A fresh
+            // paused-revision assessment is required before a new Defer can be
+            // staged. An already staged command remains independently fenced by
+            // its byte-for-byte execution journal.
+            let legacyIntent = pendingExecutionDeferIntent
+            let sourceBlock = legacyIntent.flatMap { legacy in
+                blocks.first { block in
+                    let identityMatches = block.sourceItemID == legacy.identity.itemID
+                        && block.sourceItemRevision == legacy.identity.itemRevision
+                        && block.occurrenceID == legacy.identity.occurrenceID
+                        && (block.sessionIndex ?? 0) == legacy.identity.sessionIndex
+                    return block.id == legacy.focusedBlockID && identityMatches
+                }
+            }
+            let migratedIntent: DayWeavePendingExecutionDeferIntent?
+            if let legacy = legacyIntent,
+               legacy.hasPersistableShape,
+               DayWeaveExecutionDeferTiming.isAligned(legacy.moveStart),
+               let source = sourceBlock {
+                migratedIntent = DayWeavePendingExecutionDeferIntent(
+                    identity: legacy.identity,
+                    focusedBlockID: legacy.focusedBlockID,
+                    sourceStart: source.start,
+                    sourceEnd: source.end,
+                    moveStart: legacy.moveStart,
+                    approvedMoveEnd: legacy.moveStart,
+                    approvedDeadlines: [],
+                    deadlineConflictApproved: false,
+                    approvedFixedConflicts: [],
+                    fixedConflictApproved: false,
+                    sourceOverrideApproved: false,
+                    assessment: nil,
+                    approvedAssessmentDigest: nil,
+                    createdAt: legacy.createdAt,
+                    expiresAt: legacy.moveStart
+                )
+            } else {
+                migratedIntent = nil
+            }
+            return try PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: migratedIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 14:
             // Schema 14 predates occurrence moves and the causal publication
             // watermark. Ignore injected newer fields, preserve its valid

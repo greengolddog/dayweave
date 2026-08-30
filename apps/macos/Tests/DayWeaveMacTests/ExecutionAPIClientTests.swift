@@ -1,4 +1,5 @@
 import Foundation
+#if canImport(Testing)
 import Testing
 @testable import DayWeaveMac
 
@@ -72,6 +73,95 @@ struct ExecutionAPIClientTests {
         #expect(deferred.moveStart == Self.date("2026-08-29T06:20:34Z"))
         #expect(deferred.moveEnd == Self.date("2026-08-29T06:50:34Z"))
         #expect(deferred.endedAt == deferred.updatedAt)
+    }
+
+    @Test("defer assessment accepts high-water replacement indices with a slow client clock")
+    func deferAssessmentContract() async throws {
+        // The server issued its five-minute evidence at roughly 05:30, while
+        // this client clock is ten minutes slow. Freshness is checked locally,
+        // but clock skew must not impose a guessed upper response bound.
+        let now = Self.date("2026-08-29T05:20:00Z")
+        let moveStart = Self.date("2026-08-29T06:20:00Z")
+        let assessmentDigest = "sha256:\(String(repeating: "d", count: 64))"
+        let environmentDigest = "sha256:\(String(repeating: "e", count: 64))"
+        let conflictID = UUID(uuidString: "50000000-0000-4000-8000-000000000005")!
+        let scheduleID = UUID(uuidString: "60000000-0000-4000-8000-000000000006")!
+        let body = Data(
+            #"""
+            {"assessment":{
+              "session_id":"\#(Self.sessionID.uuidString.lowercased())",
+              "execution_revision":4,"session_revision":2,
+              "item_id":"\#(Self.itemID.uuidString.lowercased())","item_revision":9,
+              "occurrence_id":null,"source_session_index":0,"replacement_session_index":3,
+              "source_schedule_revision_id":"\#(scheduleID.uuidString.lowercased())",
+              "source_block_id":"\#(Self.blockID.uuidString.lowercased())",
+              "actual_seconds":1234,"credited_source_seconds":1260,
+              "planned_duration_seconds":3600,"remaining_duration_seconds":2340,
+              "move_start":"2026-08-29T06:20:00Z","move_end":"2026-08-29T06:59:00Z",
+              "environment_digest":"\#(environmentDigest)",
+              "assessment_digest":"\#(assessmentDigest)","approval_required":true,
+              "violations":[{
+                "code":"immutable_overlap","item_ids":[],"occurrence_ids":[],
+                "conflicting_block_ids":["\#(conflictID.uuidString.lowercased())"],
+                "conflicting_blocks":[{
+                  "block_id":"\#(conflictID.uuidString.lowercased())","item_id":null,
+                  "occurrence_id":null,"external_block_id":null,"kind":"calendar_event",
+                  "start":"2026-08-29T06:30:00Z","end":"2026-08-29T06:45:00Z"
+                }],
+                "start":"2026-08-29T06:20:00Z","end":"2026-08-29T06:59:00Z",
+                "boundary_start":null,"boundary_end":null,
+                "message":"The placement overlaps immutable time"
+              }],
+              "expires_at":"2026-08-29T05:35:00Z"
+            }}
+            """#.utf8
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            .init(statusCode: 200, body: body)
+        )
+
+        let assessment = try await Self.client(now: { now }).assessExecutionDefer(
+            .init(
+                expectedRevision: 4,
+                sessionID: Self.sessionID,
+                moveStart: moveStart,
+                actualSeconds: 1_234
+            )
+        )
+
+        #expect(assessment.assessmentDigest == assessmentDigest)
+        #expect(assessment.replacementSessionIndex == 3)
+        #expect(assessment.approvalRequired)
+        #expect(assessment.violations.map(\.code) == [.immutableOverlap])
+        #expect(assessment.moveEnd == Self.date("2026-08-29T06:59:00Z"))
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.token).first)
+        #expect(request.method == "POST")
+        #expect(request.url.path == "/gateway/v1/execution/defer-assessments")
+        #expect((request.jsonBody?["expected_revision"] as? NSNumber)?.uint64Value == 4)
+        #expect(request.jsonBody?["session_id"] as? String == Self.sessionID.uuidString)
+        #expect((request.jsonBody?["actual_seconds"] as? NSNumber)?.uint64Value == 1_234)
+        #expect(request.jsonBody?["move_start"] as? String == "2026-08-29T06:20:00.000Z")
+    }
+
+    @Test("defer assessment rejects unknown nested fields and mismatched exact targets")
+    func deferAssessmentFailsClosed() async throws {
+        let now = Self.date("2026-08-29T05:30:00Z")
+        let response = #"{"assessment":{"future":true}}"#
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            .init(statusCode: 200, body: Data(response.utf8))
+        )
+        await Self.expectDecodingFailure {
+            try await Self.client(now: { now }).assessExecutionDefer(
+                .init(
+                    expectedRevision: 4,
+                    sessionID: Self.sessionID,
+                    moveStart: Self.date("2026-08-29T06:20:00Z"),
+                    actualSeconds: 1_234
+                )
+            )
+        }
     }
 
     @Test("commands preserve one deterministic body and idempotency key")
@@ -497,7 +587,9 @@ struct ExecutionAPIClientTests {
                 sessionID: Self.sessionID,
                 moveStart: future,
                 moveEnd: future.addingTimeInterval(1_200),
-                actualSeconds: 300
+                actualSeconds: 300,
+                assessmentDigest: "sha256:\(String(repeating: "a", count: 64))",
+                approvedAssessmentDigest: "sha256:\(String(repeating: "a", count: 64))"
             )),
         ]
         for (type, command) in commands {
@@ -507,6 +599,12 @@ struct ExecutionAPIClientTests {
             let object = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
             let encoded = try #require(object["command"] as? [String: Any])
             #expect(encoded["type"] as? String == type)
+            if type == "defer" {
+                #expect(encoded["assessment_digest"] as? String
+                    == "sha256:\(String(repeating: "a", count: 64))")
+                #expect(encoded["approved_assessment_digest"] as? String
+                    == "sha256:\(String(repeating: "a", count: 64))")
+            }
         }
 
         for invalidUntil in [Date().addingTimeInterval(-1), Date().addingTimeInterval(86_401)] {
@@ -532,6 +630,20 @@ struct ExecutionAPIClientTests {
             .deferWork(
                 sessionID: Self.sessionID,
                 moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200),
+                actualSeconds: 300
+            ),
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200),
+                actualSeconds: nil,
+                assessmentDigest: "sha256:\(String(repeating: "a", count: 64))",
+                approvedAssessmentDigest: nil
+            ),
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
                 moveEnd: future.addingTimeInterval(1_200.5),
                 actualSeconds: 300
             ),
@@ -540,6 +652,22 @@ struct ExecutionAPIClientTests {
                 moveStart: future.addingTimeInterval(0.000_000_5),
                 moveEnd: future.addingTimeInterval(1_200.000_000_5),
                 actualSeconds: 300
+            ),
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200),
+                actualSeconds: 300,
+                assessmentDigest: "sha256:\(String(repeating: "A", count: 64))",
+                approvedAssessmentDigest: nil
+            ),
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200),
+                actualSeconds: 300,
+                assessmentDigest: "sha256:\(String(repeating: "a", count: 64))",
+                approvedAssessmentDigest: "sha256:\(String(repeating: "b", count: 64))"
             ),
         ]
         for command in invalidDefers {
@@ -562,6 +690,17 @@ struct ExecutionAPIClientTests {
                 try DayWeaveExecutionWireCodec.decode(Data(persisted.utf8))
             }
         }
+        let legacyReplay = Data(
+            #"{"expected_revision":4,"command":{"type":"defer","session_id":"10000000-0000-4000-8000-000000000001","move_start":"2001-01-01T00:00:00.000000Z","move_end":"2001-01-01T00:20:00.000000Z","actual_seconds":300}}"#.utf8
+        )
+        #expect(try DayWeaveExecutionWireCodec.decode(legacyReplay).command == .deferWork(
+            sessionID: Self.sessionID,
+            moveStart: Self.date("2001-01-01T00:00:00Z"),
+            moveEnd: Self.date("2001-01-01T00:20:00Z"),
+            actualSeconds: 300,
+            assessmentDigest: nil,
+            approvedAssessmentDigest: nil
+        ))
     }
 
     private static func expectDecodingFailure<Value>(
@@ -577,11 +716,14 @@ struct ExecutionAPIClientTests {
         }
     }
 
-    private static func client() -> DayWeaveAPIClient {
+    private static func client(
+        now: @escaping @Sendable () -> Date = Date.init
+    ) -> DayWeaveAPIClient {
         DayWeaveAPIClient(
             baseURL: try! DayWeaveAPIBaseURL("https://api.example.com/gateway"),
             session: URLProtocolStub.makeSession(),
-            bearerToken: token
+            bearerToken: token,
+            now: now
         )
     }
 
@@ -672,3 +814,4 @@ struct ExecutionAPIClientTests {
         return date
     }
 }
+#endif

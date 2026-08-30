@@ -1512,6 +1512,33 @@ struct DayWeaveAPIClient: Sendable {
         return .init(sessions: envelope.sessions, nextOffset: envelope.nextOffset)
     }
 
+    func assessExecutionDefer(
+        _ request: DayWeaveDeferAssessmentRequest
+    ) async throws -> DayWeaveDeferAssessment {
+        guard request.hasValidShape,
+              request.moveStart > now(),
+              let actualSeconds = request.actualSeconds else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let envelope: DayWeaveDeferAssessmentEnvelope = try await send(
+            method: "POST",
+            pathComponents: ["v1", "execution", "defer-assessments"],
+            body: try encode(request)
+        )
+        let assessment = envelope.assessment
+        let receivedAt = now()
+        guard assessment.hasValidShape,
+              assessment.sessionID == request.sessionID,
+              assessment.executionRevision == request.expectedRevision,
+              assessment.moveStart == request.moveStart,
+              assessment.actualSeconds == actualSeconds,
+              assessment.expiresAt > receivedAt,
+              assessment.expiresAt < assessment.moveStart else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return assessment
+    }
+
     /// Produces the deterministic body that the caller must durably retain
     /// together with its idempotency key before the first network attempt.
     func encodedExecutionCommand(_ request: DayWeaveExecutionCommandRequest) throws -> Data {

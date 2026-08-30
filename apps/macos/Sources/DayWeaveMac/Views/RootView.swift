@@ -71,8 +71,18 @@ struct WillDoLaterMoveWindow: Equatable, Sendable {
 }
 
 enum WillDoLaterTiming {
+    static let executionSlotSeconds = DayWeaveExecutionDeferTiming.slotSeconds
+
     static func roundedUpToMinute(_ date: Date) -> Date {
         Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded(.up) * 60)
+    }
+
+    static func roundedUpToExecutionSlot(_ date: Date) -> Date {
+        DayWeaveExecutionDeferTiming.roundedUpToSlot(date)
+    }
+
+    static func minimumExecutionMoveStart(after referenceDate: Date) -> Date {
+        DayWeaveExecutionDeferTiming.minimumMoveStart(after: referenceDate)
     }
 
     static func tomorrowMorning(
@@ -1441,7 +1451,7 @@ struct WillDoLaterButton: View {
 
     var body: some View {
         Button(title) {
-            presenter.present(blockID: block.id, initialMoveStart: preset(hours: 1))
+            presenter.present(blockID: block.id, initialMoveStart: initialMoveStart)
         }
         .disabled(!isEligible)
         .accessibilityIdentifier(
@@ -1450,10 +1460,26 @@ struct WillDoLaterButton: View {
     }
 
     private var isEligible: Bool {
-        guard store.canMutatePlan,
-              !executionSync.isSyncing,
+        guard !executionSync.isSyncing,
               !canonicalSync.isSyncing,
-              store.executionState.pendingCommand == nil,
+              store.executionState.pendingCommand == nil else { return false }
+        if block.sourceItemID != nil,
+           block.status == .active || block.status == .paused {
+            guard canonicalSync.isConfigured,
+                  let active = executionSync.activeSession,
+                  executionSession(active, matches: block) else { return false }
+            let matchingRestoredIntent = store.pendingExecutionDeferIntent.map {
+                $0.hasValidShape
+                    && $0.focusedBlockID == block.id
+                    && $0.identity.matches(active)
+                    && $0.moveStart > Date.now
+            } == true
+            return store.canMutatePlan
+                || (matchingRestoredIntent
+                    && store.canPersistPlan
+                    && !store.isCanonicalSyncLocked)
+        }
+        guard store.canMutatePlan,
               block.isFlexible,
               !block.isHardConstraint,
               block.occurrenceID == nil
@@ -1488,10 +1514,7 @@ struct WillDoLaterButton: View {
                 && store.canonicalAuthoringMutation(itemID: itemID) == nil
                 && store.canonicalAuthoringMutation(itemID: seriesItemID) == nil
         case .active, .paused:
-            guard canonicalSync.isConfigured,
-                  let active = executionSync.activeSession else { return false }
-            return executionSession(active, matches: block)
-                && store.canonicalScheduleBlockActionabilityIssue(block) == nil
+            return false
         default:
             return false
         }
@@ -1501,14 +1524,28 @@ struct WillDoLaterButton: View {
         block.status == .scheduled ? max(Date.now, block.start) : Date.now
     }
 
+    private var initialMoveStart: Date {
+        if block.status == .active || block.status == .paused,
+           let intent = store.pendingExecutionDeferIntent,
+           intent.hasValidShape,
+           intent.focusedBlockID == block.id,
+           intent.moveStart > Date.now {
+            return intent.moveStart
+        }
+        return preset(hours: 1)
+    }
+
     private var minimumMoveStart: Date {
-        referenceDate.addingTimeInterval(60)
+        block.status == .active || block.status == .paused
+            ? WillDoLaterTiming.minimumExecutionMoveStart(after: referenceDate)
+            : referenceDate.addingTimeInterval(60)
     }
 
     private func preset(hours: Int) -> Date {
-        WillDoLaterTiming.roundedUpToMinute(
-            referenceDate.addingTimeInterval(TimeInterval(hours * 3_600))
-        )
+        let proposed = referenceDate.addingTimeInterval(TimeInterval(hours * 3_600))
+        return block.status == .active || block.status == .paused
+            ? WillDoLaterTiming.roundedUpToExecutionSlot(proposed)
+            : WillDoLaterTiming.roundedUpToMinute(proposed)
     }
 }
 
@@ -1558,20 +1595,24 @@ private struct WillDoLaterSheet: View {
                     )
                     .environment(\.timeZone, profileTimeZone)
 
-                    deadlineNotice(for: block)
-                    if let coverageIssue = exactMoveCoverageIssue(for: block) {
-                        Label(
-                            coverageIssue,
-                            systemImage: "calendar.badge.exclamationmark"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                    }
-                    if !fixedConflicts(for: block).isEmpty {
-                        overlapNotice(for: block)
-                    }
-                    if sourceRequiresOverride(block) {
-                        sourceOverrideNotice(for: block)
+                    if isExecutionMove(block) {
+                        serverDeferAssessmentNotice(for: block)
+                    } else {
+                        deadlineNotice(for: block)
+                        if let coverageIssue = exactMoveCoverageIssue(for: block) {
+                            Label(
+                                coverageIssue,
+                                systemImage: "calendar.badge.exclamationmark"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        }
+                        if !fixedConflicts(for: block).isEmpty {
+                            overlapNotice(for: block)
+                        }
+                        if sourceRequiresOverride(block) {
+                            sourceOverrideNotice(for: block)
+                        }
                     }
                     if let submissionError {
                         Label(submissionError, systemImage: "exclamationmark.triangle.fill")
@@ -1580,9 +1621,9 @@ private struct WillDoLaterSheet: View {
                     }
                     HStack {
                         Spacer()
-                        Button("Cancel") { presenter.dismiss(request.id) }
+                        Button("Cancel") { cancel() }
                             .keyboardShortcut(.cancelAction)
-                        Button("Move work") { submit(block) }
+                        Button(submitTitle(for: block)) { submit(block) }
                             .buttonStyle(.borderedProminent)
                             .keyboardShortcut(.defaultAction)
                             .disabled(!isValid(for: block) || isSubmitting)
@@ -1600,12 +1641,13 @@ private struct WillDoLaterSheet: View {
             } else {
                 VStack(spacing: 14) {
                     Text("This schedule block is no longer available.")
-                    Button("Close") { presenter.dismiss(request.id) }
+                    Button("Close") { cancel() }
                         .keyboardShortcut(.cancelAction)
                 }
                 .padding(24)
             }
         }
+        .interactiveDismissDisabled(matchingPendingIntent != nil)
     }
 
     private var block: ScheduleBlock? {
@@ -1621,13 +1663,27 @@ private struct WillDoLaterSheet: View {
     }
 
     private func minimumMoveStart(for block: ScheduleBlock) -> Date {
-        referenceDate(for: block).addingTimeInterval(60)
+        let reference = referenceDate(for: block)
+        guard isExecutionMove(block) else {
+            return reference.addingTimeInterval(60)
+        }
+        let freshAssessmentMinimum = WillDoLaterTiming.minimumExecutionMoveStart(
+            after: reference
+        )
+        if let intent = matchingPendingIntent,
+           intent.moveStart == moveStart,
+           intent.moveStart > Date.now {
+            return min(intent.moveStart, freshAssessmentMinimum)
+        }
+        return freshAssessmentMinimum
     }
 
     private func preset(hours: Int, for block: ScheduleBlock) -> Date {
-        WillDoLaterTiming.roundedUpToMinute(
-            referenceDate(for: block).addingTimeInterval(TimeInterval(hours * 3_600))
-        )
+        let proposed = referenceDate(for: block)
+            .addingTimeInterval(TimeInterval(hours * 3_600))
+        return isExecutionMove(block)
+            ? WillDoLaterTiming.roundedUpToExecutionSlot(proposed)
+            : WillDoLaterTiming.roundedUpToMinute(proposed)
     }
 
     private func tomorrowMorning(for block: ScheduleBlock) -> Date {
@@ -1821,10 +1877,17 @@ private struct WillDoLaterSheet: View {
 
     private func isValid(for block: ScheduleBlock) -> Bool {
         guard moveStart >= minimumMoveStart(for: block),
-              moveStart.timeIntervalSinceReferenceDate.isFinite,
-              block.occurrenceID == nil
-                || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true,
-              proposedWindow(for: block) != nil,
+              moveStart.timeIntervalSinceReferenceDate.isFinite else {
+            return false
+        }
+        if isExecutionMove(block) {
+            return DayWeaveExecutionDeferTiming.isAligned(moveStart)
+        }
+        guard block.occurrenceID == nil
+                || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true else {
+            return false
+        }
+        guard proposedWindow(for: block) != nil,
               exactMoveCoverageIssue(for: block) == nil else { return false }
         guard let risk = currentRisk(for: block) else { return false }
         guard let window = proposedWindow(for: block) else { return false }
@@ -1844,11 +1907,6 @@ private struct WillDoLaterSheet: View {
     private func submit(_ block: ScheduleBlock) {
         guard isValid(for: block) else { return }
         let selectedStart = moveStart
-        let reviewedWindow = proposedWindow(for: block)
-        guard let reviewedRisk = currentRisk(for: block) else { return }
-        let approvedDeadlineConflict = approvedDeadlineRisk == reviewedRisk
-        let approvedFixedConflicts = approvedOverlapRisk == reviewedRisk
-        let approvedSourceOverride = approvedSourceRisk == reviewedRisk
         submissionError = nil
         if block.sourceItemID == nil {
             store.doLater(block.id, moveStart: selectedStart)
@@ -1858,28 +1916,34 @@ private struct WillDoLaterSheet: View {
         isSubmitting = true
         Task {
             if block.status == .active || block.status == .paused {
-                guard let reviewedWindow else {
-                    submissionError = "The exact remaining-work window is no longer available."
-                    isSubmitting = false
-                    return
+                let outcome: ExecutionSyncOutcome
+                if let assessment = serverAssessment(for: block) {
+                    outcome = await executionSync.approveDeferredWork(
+                        block.id,
+                        assessmentDigest: assessment.assessmentDigest
+                    )
+                } else {
+                    outcome = await executionSync.deferWork(
+                        block.id,
+                        moveStart: selectedStart
+                    )
                 }
-                let outcome = await executionSync.deferWork(
-                    block.id,
-                    moveStart: selectedStart,
-                    approvedMoveEnd: reviewedWindow.end,
-                    deadlineIdentities: reviewedRisk.deadlines,
-                    allowDeadlineConflict: approvedDeadlineConflict,
-                    approvedFixedConflicts: reviewedRisk.fixedConflicts,
-                    allowFixedConflicts: approvedFixedConflicts,
-                    allowSourceOverride: approvedSourceOverride
-                )
                 if outcome == .success {
                     presenter.dismiss(request.id)
                     _ = await canonicalSync.syncThroughFreshComposition()
+                } else if outcome == .approvalRequired {
+                    submissionError = nil
                 } else {
                     submissionError = "The exact move was not accepted (\(String(describing: outcome))). Review the current session and try again."
                 }
             } else {
+                guard let reviewedRisk = currentRisk(for: block) else {
+                    submissionError = "The current scheduling constraints are unavailable."
+                    isSubmitting = false
+                    return
+                }
+                let approvedDeadlineConflict = approvedDeadlineRisk == reviewedRisk
+                let approvedFixedConflicts = approvedOverlapRisk == reviewedRisk
                 let succeeded = await canonicalSync.moveCanonicalWorkLater(
                     block.id,
                     earliestStart: selectedStart,
@@ -1894,6 +1958,96 @@ private struct WillDoLaterSheet: View {
                 }
             }
             isSubmitting = false
+        }
+    }
+
+    private func isExecutionMove(_ block: ScheduleBlock) -> Bool {
+        block.sourceItemID != nil && (block.status == .active || block.status == .paused)
+    }
+
+    private var matchingPendingIntent: DayWeavePendingExecutionDeferIntent? {
+        guard let intent = store.pendingExecutionDeferIntent,
+              intent.hasValidShape,
+              intent.focusedBlockID == request.blockID else { return nil }
+        return intent
+    }
+
+    private func cancel() {
+        guard let intent = matchingPendingIntent else {
+            presenter.dismiss(request.id)
+            return
+        }
+        let outcome = executionSync.cancelDeferredWork(intent)
+        if outcome == .success {
+            presenter.dismiss(request.id)
+        } else {
+            submissionError = "The move is already being sent and must be reconciled before it can be closed."
+        }
+    }
+
+    private func serverAssessment(for block: ScheduleBlock) -> DayWeaveDeferAssessment? {
+        guard isExecutionMove(block),
+              let intent = store.pendingExecutionDeferIntent,
+              intent.focusedBlockID == block.id,
+              intent.moveStart == moveStart,
+              intent.approvalIsRequired else { return nil }
+        return executionSync.pendingDeferApproval
+    }
+
+    private func submitTitle(for block: ScheduleBlock) -> String {
+        if serverAssessment(for: block) != nil {
+            return "Approve assessed conflicts and move"
+        }
+        return isExecutionMove(block) ? "Assess and move" : "Move work"
+    }
+
+    @ViewBuilder
+    private func serverDeferAssessmentNotice(for block: ScheduleBlock) -> some View {
+        if let assessment = serverAssessment(for: block) {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(
+                    "The server found \(assessment.violations.count) scheduling conflict(s). Approval applies only to this exact assessment and expires shortly.",
+                    systemImage: "checkmark.shield.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.orange)
+
+                ForEach(
+                    Array(assessment.violations.enumerated()),
+                    id: \.offset
+                ) { _, violation in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(violation.code.title)
+                            .font(.caption.weight(.semibold))
+                        Text(violation.message)
+                            .font(.caption)
+                        Text(
+                            "\(scheduleDateTimeLabel(violation.start, timezoneName: store.scheduleProfile.timezoneName)) – \(scheduleDateTimeLabel(violation.end, timezoneName: store.scheduleProfile.timezoneName))"
+                        )
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .privacySensitive(true)
+            .accessibilityIdentifier("execution.defer.assessment.\(block.id.uuidString.lowercased())")
+        } else if let intent = store.pendingExecutionDeferIntent,
+                  intent.focusedBlockID == block.id,
+                  intent.moveStart == moveStart,
+                  intent.assessment != nil {
+            Label(
+                "The prior assessment expired or changed. DayWeave will request fresh evidence; prior approval cannot carry forward.",
+                systemImage: "arrow.clockwise.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        } else {
+            Label(
+                "DayWeave will pause first, then ask the server to assess the exact remaining work against the current private schedule.",
+                systemImage: "shield.lefthalf.filled"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
         }
     }
 

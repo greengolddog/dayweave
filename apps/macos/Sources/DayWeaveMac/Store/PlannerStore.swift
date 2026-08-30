@@ -561,7 +561,7 @@ final class PlannerStore: ObservableObject {
             initialRecurrenceOccurrenceMoves,
             canonicalItemIDs: Set(initialCanonicalItems.map(\.id))
         )
-            || initialPendingExecutionDeferIntent?.hasPersistableShape == false
+            || initialPendingExecutionDeferIntent?.hasValidShape == false
             || (initialPendingExecutionDeferIntent.map { intent in
                 initialExecutionState.activeSession.map(intent.identity.matches) == true
                     || initialExecutionState.terminalOutcomes[intent.identity.sessionID]
@@ -3748,16 +3748,21 @@ final class PlannerStore: ObservableObject {
     ) throws {
         guard hasEncryptedPersistence, canPersistPlan,
               intent.hasValidShape,
-              pendingExecutionDeferIntent == nil || pendingExecutionDeferIntent == intent,
+              pendingExecutionDeferIntent == nil
+                || pendingExecutionDeferIntent?.isSameRequest(as: intent) == true,
               executionState.activeSession.map(intent.identity.matches) == true
                 || executionState.pendingCommand.map({ $0.identity == intent.identity }) == true
                 || executionState.terminalOutcomes[intent.identity.sessionID]
                     .map({ intent.identity.matches($0.session) }) == true else {
             throw PlannerExecutionStateError.invalidDurableState
         }
+        let prior = pendingExecutionDeferIntent
         pendingExecutionDeferIntent = intent
         flushPersistence()
-        if let persistenceError { throw persistenceError }
+        if let persistenceError {
+            pendingExecutionDeferIntent = prior
+            throw persistenceError
+        }
     }
 
     func clearExecutionDeferIntent(
@@ -3765,6 +3770,23 @@ final class PlannerStore: ObservableObject {
         message: String? = nil
     ) throws {
         guard pendingExecutionDeferIntent == intent else {
+            throw PlannerExecutionStateError.invalidDurableState
+        }
+        pendingExecutionDeferIntent = nil
+        if let message { lastScheduleMessage = message }
+        flushPersistence()
+        if let persistenceError {
+            pendingExecutionDeferIntent = intent
+            throw persistenceError
+        }
+    }
+
+    func cancelExecutionDeferIntent(
+        _ intent: DayWeavePendingExecutionDeferIntent,
+        message: String? = nil
+    ) throws {
+        guard executionState.pendingCommand == nil,
+              pendingExecutionDeferIntent == intent else {
             throw PlannerExecutionStateError.invalidDurableState
         }
         pendingExecutionDeferIntent = nil

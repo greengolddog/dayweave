@@ -253,6 +253,564 @@ struct DayWeaveExecutionMutation: Codable, Equatable, Sendable {
     }
 }
 
+struct DayWeaveDeferAssessmentRequest: Codable, Equatable, Sendable {
+    let expectedRevision: UInt64
+    let sessionID: UUID
+    let moveStart: Date
+    let actualSeconds: UInt64?
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case expectedRevision = "expected_revision"
+        case sessionID = "session_id"
+        case moveStart = "move_start"
+        case actualSeconds = "actual_seconds"
+    }
+
+    init(
+        expectedRevision: UInt64,
+        sessionID: UUID,
+        moveStart: Date,
+        actualSeconds: UInt64?
+    ) {
+        self.expectedRevision = expectedRevision
+        self.sessionID = sessionID
+        self.moveStart = moveStart
+        self.actualSeconds = actualSeconds
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExecutionKeyShape(
+            required: ["expected_revision", "session_id", "move_start"],
+            optional: ["actual_seconds"],
+            from: decoder
+        )
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        expectedRevision = try container.decode(UInt64.self, forKey: .expectedRevision)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        moveStart = try container.decode(Date.self, forKey: .moveStart)
+        actualSeconds = try container.decodeIfPresent(UInt64.self, forKey: .actualSeconds)
+        guard hasValidShape else {
+            throw executionDecodingError(
+                codingPath: decoder.codingPath,
+                "Defer assessment request violates the supported contract"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard hasValidShape else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Defer assessment request violates the supported contract"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(expectedRevision, forKey: .expectedRevision)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(moveStart, forKey: .moveStart)
+        try container.encodeIfPresent(actualSeconds, forKey: .actualSeconds)
+    }
+
+    var hasValidShape: Bool {
+        expectedRevision > 0
+            && expectedRevision <= UInt64(Int64.max)
+            && !sessionID.isDayWeaveNil
+            && dayWeavePostgresEpochMicroseconds(moveStart).map {
+                $0 % 300_000_000 == 0
+            } == true
+            && actualSeconds.map({ $0 <= UInt64(Int64.max) }) ?? true
+    }
+}
+
+enum DayWeaveManualPlacementViolationCode: String, Codable, CaseIterable, Sendable {
+    case outsideAvailability = "outside_availability"
+    case earliestStart = "earliest_start"
+    case latestFinish = "latest_finish"
+    case minimumNotice = "minimum_notice"
+    case allowedWeekday = "allowed_weekday"
+    case preferredDailyWindow = "preferred_daily_window"
+    case preferredAbsoluteWindow = "preferred_absolute_window"
+    case forbiddenWindow = "forbidden_window"
+    case requiredContext = "required_context"
+    case requiredLocation = "required_location"
+    case requiredCapabilities = "required_capabilities"
+    case energy
+    case dependency
+    case maximumDailyWork = "maximum_daily_work"
+    case maximumWeeklyWork = "maximum_weekly_work"
+    case bufferCompressed = "buffer_compressed"
+    case immutableOverlap = "immutable_overlap"
+
+    var title: String {
+        switch self {
+        case .outsideAvailability: "Outside availability"
+        case .earliestStart: "Before earliest start"
+        case .latestFinish: "After latest finish"
+        case .minimumNotice: "Minimum notice"
+        case .allowedWeekday: "Weekday restriction"
+        case .preferredDailyWindow: "Preferred daily window"
+        case .preferredAbsoluteWindow: "Preferred date window"
+        case .forbiddenWindow: "Forbidden time"
+        case .requiredContext: "Required context"
+        case .requiredLocation: "Required location"
+        case .requiredCapabilities: "Required capability"
+        case .energy: "Energy mismatch"
+        case .dependency: "Dependency ordering"
+        case .maximumDailyWork: "Daily capacity"
+        case .maximumWeeklyWork: "Weekly capacity"
+        case .bufferCompressed: "Protected buffer"
+        case .immutableOverlap: "Fixed-time overlap"
+        }
+    }
+}
+
+enum DayWeaveAssessedBlockKind: String, Codable, Sendable {
+    case planned
+    case pinned
+    case calendarEvent = "calendar_event"
+    case externalFixed = "external_fixed"
+}
+
+struct DayWeaveDeferConflict: Codable, Equatable, Sendable {
+    let blockID: UUID
+    let itemID: UUID?
+    let occurrenceID: UUID?
+    let externalBlockID: UUID?
+    let kind: DayWeaveAssessedBlockKind
+    let start: Date
+    let end: Date
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case blockID = "block_id"
+        case itemID = "item_id"
+        case occurrenceID = "occurrence_id"
+        case externalBlockID = "external_block_id"
+        case kind
+        case start
+        case end
+    }
+
+    init(
+        blockID: UUID,
+        itemID: UUID?,
+        occurrenceID: UUID?,
+        externalBlockID: UUID?,
+        kind: DayWeaveAssessedBlockKind,
+        start: Date,
+        end: Date
+    ) {
+        self.blockID = blockID
+        self.itemID = itemID
+        self.occurrenceID = occurrenceID
+        self.externalBlockID = externalBlockID
+        self.kind = kind
+        self.start = start
+        self.end = end
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactExecutionKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        blockID = try container.decode(UUID.self, forKey: .blockID)
+        itemID = try container.decodeIfPresent(UUID.self, forKey: .itemID)
+        occurrenceID = try container.decodeIfPresent(UUID.self, forKey: .occurrenceID)
+        externalBlockID = try container.decodeIfPresent(UUID.self, forKey: .externalBlockID)
+        kind = try container.decode(DayWeaveAssessedBlockKind.self, forKey: .kind)
+        start = try container.decode(Date.self, forKey: .start)
+        end = try container.decode(Date.self, forKey: .end)
+        guard hasValidShape else {
+            throw executionDecodingError(
+                codingPath: decoder.codingPath,
+                "Defer conflict violates the supported contract"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard hasValidShape else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Defer conflict violates the supported contract"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(blockID, forKey: .blockID)
+        try encodeExecutionNullable(itemID, forKey: .itemID, into: &container)
+        try encodeExecutionNullable(occurrenceID, forKey: .occurrenceID, into: &container)
+        try encodeExecutionNullable(externalBlockID, forKey: .externalBlockID, into: &container)
+        try container.encode(kind, forKey: .kind)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+    }
+
+    var hasValidShape: Bool {
+        !blockID.isDayWeaveNil
+            && !(itemID?.isDayWeaveNil ?? false)
+            && !(occurrenceID?.isDayWeaveNil ?? false)
+            && !(externalBlockID?.isDayWeaveNil ?? false)
+            && executionHasPostgresTimestampPrecision(start)
+            && executionHasPostgresTimestampPrecision(end)
+            && start < end
+    }
+}
+
+struct DayWeaveDeferViolation: Codable, Equatable, Sendable, Identifiable {
+    let code: DayWeaveManualPlacementViolationCode
+    let itemIDs: [UUID]
+    let occurrenceIDs: [UUID]
+    let conflictingBlockIDs: [UUID]
+    let conflictingBlocks: [DayWeaveDeferConflict]
+    let start: Date
+    let end: Date
+    let boundaryStart: Date?
+    let boundaryEnd: Date?
+    let message: String
+
+    var id: String {
+        let blockIDs = conflictingBlockIDs.map(\.uuidString).joined(separator: ",")
+        return "\(code.rawValue)|\(start.timeIntervalSince1970)|\(end.timeIntervalSince1970)|\(blockIDs)"
+    }
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case code
+        case itemIDs = "item_ids"
+        case occurrenceIDs = "occurrence_ids"
+        case conflictingBlockIDs = "conflicting_block_ids"
+        case conflictingBlocks = "conflicting_blocks"
+        case start
+        case end
+        case boundaryStart = "boundary_start"
+        case boundaryEnd = "boundary_end"
+        case message
+    }
+
+    init(
+        code: DayWeaveManualPlacementViolationCode,
+        itemIDs: [UUID],
+        occurrenceIDs: [UUID],
+        conflictingBlockIDs: [UUID],
+        conflictingBlocks: [DayWeaveDeferConflict],
+        start: Date,
+        end: Date,
+        boundaryStart: Date?,
+        boundaryEnd: Date?,
+        message: String
+    ) {
+        self.code = code
+        self.itemIDs = itemIDs
+        self.occurrenceIDs = occurrenceIDs
+        self.conflictingBlockIDs = conflictingBlockIDs
+        self.conflictingBlocks = conflictingBlocks
+        self.start = start
+        self.end = end
+        self.boundaryStart = boundaryStart
+        self.boundaryEnd = boundaryEnd
+        self.message = message
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactExecutionKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        code = try container.decode(DayWeaveManualPlacementViolationCode.self, forKey: .code)
+        itemIDs = try container.decode([UUID].self, forKey: .itemIDs)
+        occurrenceIDs = try container.decode([UUID].self, forKey: .occurrenceIDs)
+        conflictingBlockIDs = try container.decode([UUID].self, forKey: .conflictingBlockIDs)
+        conflictingBlocks = try container.decode([DayWeaveDeferConflict].self, forKey: .conflictingBlocks)
+        start = try container.decode(Date.self, forKey: .start)
+        end = try container.decode(Date.self, forKey: .end)
+        boundaryStart = try container.decodeIfPresent(Date.self, forKey: .boundaryStart)
+        boundaryEnd = try container.decodeIfPresent(Date.self, forKey: .boundaryEnd)
+        message = try container.decode(String.self, forKey: .message)
+        guard hasValidShape else {
+            throw executionDecodingError(
+                codingPath: decoder.codingPath,
+                "Defer violation violates the supported contract"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard hasValidShape else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Defer violation violates the supported contract"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(code, forKey: .code)
+        try container.encode(itemIDs, forKey: .itemIDs)
+        try container.encode(occurrenceIDs, forKey: .occurrenceIDs)
+        try container.encode(conflictingBlockIDs, forKey: .conflictingBlockIDs)
+        try container.encode(conflictingBlocks, forKey: .conflictingBlocks)
+        try container.encode(start, forKey: .start)
+        try container.encode(end, forKey: .end)
+        try encodeExecutionNullable(boundaryStart, forKey: .boundaryStart, into: &container)
+        try encodeExecutionNullable(boundaryEnd, forKey: .boundaryEnd, into: &container)
+        try container.encode(message, forKey: .message)
+    }
+
+    var hasValidShape: Bool {
+        itemIDs.count <= 10_000
+            && Set(itemIDs).count == itemIDs.count
+            && itemIDs.allSatisfy { !$0.isDayWeaveNil }
+            && occurrenceIDs.count <= 10_000
+            && Set(occurrenceIDs).count == occurrenceIDs.count
+            && occurrenceIDs.allSatisfy { !$0.isDayWeaveNil }
+            && conflictingBlockIDs.count <= 10_000
+            && Set(conflictingBlockIDs).count == conflictingBlockIDs.count
+            && conflictingBlockIDs.allSatisfy { !$0.isDayWeaveNil }
+            && conflictingBlocks.count <= 10_000
+            && conflictingBlocks.allSatisfy(\.hasValidShape)
+            && Set(conflictingBlocks.map(\.blockID)).count == conflictingBlocks.count
+            && Set(conflictingBlocks.map(\.blockID)) == Set(conflictingBlockIDs)
+            && executionHasPostgresTimestampPrecision(start)
+            && executionHasPostgresTimestampPrecision(end)
+            && start < end
+            && boundaryStart.map(executionHasPostgresTimestampPrecision) ?? true
+            && boundaryEnd.map(executionHasPostgresTimestampPrecision) ?? true
+            && !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && message.unicodeScalars.count <= 1_000
+    }
+}
+
+struct DayWeaveDeferAssessment: Codable, Equatable, Sendable {
+    static let maximumViolationCount = 10_000
+
+    let sessionID: UUID
+    let executionRevision: UInt64
+    let sessionRevision: UInt64
+    let itemID: UUID
+    let itemRevision: UInt64
+    let occurrenceID: UUID?
+    let sourceSessionIndex: UInt16
+    let replacementSessionIndex: UInt16
+    let sourceScheduleRevisionID: UUID
+    let sourceBlockID: UUID
+    let actualSeconds: UInt64
+    let creditedSourceSeconds: UInt64
+    let plannedDurationSeconds: UInt64
+    let remainingDurationSeconds: UInt64
+    let moveStart: Date
+    let moveEnd: Date
+    let environmentDigest: String
+    let assessmentDigest: String
+    let approvalRequired: Bool
+    let violations: [DayWeaveDeferViolation]
+    let expiresAt: Date
+
+    private enum CodingKeys: String, CodingKey, CaseIterable {
+        case sessionID = "session_id"
+        case executionRevision = "execution_revision"
+        case sessionRevision = "session_revision"
+        case itemID = "item_id"
+        case itemRevision = "item_revision"
+        case occurrenceID = "occurrence_id"
+        case sourceSessionIndex = "source_session_index"
+        case replacementSessionIndex = "replacement_session_index"
+        case sourceScheduleRevisionID = "source_schedule_revision_id"
+        case sourceBlockID = "source_block_id"
+        case actualSeconds = "actual_seconds"
+        case creditedSourceSeconds = "credited_source_seconds"
+        case plannedDurationSeconds = "planned_duration_seconds"
+        case remainingDurationSeconds = "remaining_duration_seconds"
+        case moveStart = "move_start"
+        case moveEnd = "move_end"
+        case environmentDigest = "environment_digest"
+        case assessmentDigest = "assessment_digest"
+        case approvalRequired = "approval_required"
+        case violations
+        case expiresAt = "expires_at"
+    }
+
+    init(
+        sessionID: UUID,
+        executionRevision: UInt64,
+        sessionRevision: UInt64,
+        itemID: UUID,
+        itemRevision: UInt64,
+        occurrenceID: UUID?,
+        sourceSessionIndex: UInt16,
+        replacementSessionIndex: UInt16,
+        sourceScheduleRevisionID: UUID,
+        sourceBlockID: UUID,
+        actualSeconds: UInt64,
+        creditedSourceSeconds: UInt64,
+        plannedDurationSeconds: UInt64,
+        remainingDurationSeconds: UInt64,
+        moveStart: Date,
+        moveEnd: Date,
+        environmentDigest: String,
+        assessmentDigest: String,
+        approvalRequired: Bool,
+        violations: [DayWeaveDeferViolation],
+        expiresAt: Date
+    ) {
+        self.sessionID = sessionID
+        self.executionRevision = executionRevision
+        self.sessionRevision = sessionRevision
+        self.itemID = itemID
+        self.itemRevision = itemRevision
+        self.occurrenceID = occurrenceID
+        self.sourceSessionIndex = sourceSessionIndex
+        self.replacementSessionIndex = replacementSessionIndex
+        self.sourceScheduleRevisionID = sourceScheduleRevisionID
+        self.sourceBlockID = sourceBlockID
+        self.actualSeconds = actualSeconds
+        self.creditedSourceSeconds = creditedSourceSeconds
+        self.plannedDurationSeconds = plannedDurationSeconds
+        self.remainingDurationSeconds = remainingDurationSeconds
+        self.moveStart = moveStart
+        self.moveEnd = moveEnd
+        self.environmentDigest = environmentDigest
+        self.assessmentDigest = assessmentDigest
+        self.approvalRequired = approvalRequired
+        self.violations = violations
+        self.expiresAt = expiresAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactExecutionKeys(CodingKeys.self, from: decoder)
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        executionRevision = try container.decode(UInt64.self, forKey: .executionRevision)
+        sessionRevision = try container.decode(UInt64.self, forKey: .sessionRevision)
+        itemID = try container.decode(UUID.self, forKey: .itemID)
+        itemRevision = try container.decode(UInt64.self, forKey: .itemRevision)
+        occurrenceID = try container.decodeIfPresent(UUID.self, forKey: .occurrenceID)
+        sourceSessionIndex = try container.decode(UInt16.self, forKey: .sourceSessionIndex)
+        replacementSessionIndex = try container.decode(UInt16.self, forKey: .replacementSessionIndex)
+        sourceScheduleRevisionID = try container.decode(UUID.self, forKey: .sourceScheduleRevisionID)
+        sourceBlockID = try container.decode(UUID.self, forKey: .sourceBlockID)
+        actualSeconds = try container.decode(UInt64.self, forKey: .actualSeconds)
+        creditedSourceSeconds = try container.decode(UInt64.self, forKey: .creditedSourceSeconds)
+        plannedDurationSeconds = try container.decode(UInt64.self, forKey: .plannedDurationSeconds)
+        remainingDurationSeconds = try container.decode(UInt64.self, forKey: .remainingDurationSeconds)
+        moveStart = try container.decode(Date.self, forKey: .moveStart)
+        moveEnd = try container.decode(Date.self, forKey: .moveEnd)
+        environmentDigest = try container.decode(String.self, forKey: .environmentDigest)
+        assessmentDigest = try container.decode(String.self, forKey: .assessmentDigest)
+        approvalRequired = try container.decode(Bool.self, forKey: .approvalRequired)
+        violations = try container.decode([DayWeaveDeferViolation].self, forKey: .violations)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+        guard hasValidShape else {
+            throw executionDecodingError(
+                codingPath: decoder.codingPath,
+                "Defer assessment violates the supported contract"
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        guard hasValidShape else {
+            throw executionEncodingError(
+                codingPath: encoder.codingPath,
+                "Defer assessment violates the supported contract"
+            )
+        }
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionID, forKey: .sessionID)
+        try container.encode(executionRevision, forKey: .executionRevision)
+        try container.encode(sessionRevision, forKey: .sessionRevision)
+        try container.encode(itemID, forKey: .itemID)
+        try container.encode(itemRevision, forKey: .itemRevision)
+        try encodeExecutionNullable(occurrenceID, forKey: .occurrenceID, into: &container)
+        try container.encode(sourceSessionIndex, forKey: .sourceSessionIndex)
+        try container.encode(replacementSessionIndex, forKey: .replacementSessionIndex)
+        try container.encode(sourceScheduleRevisionID, forKey: .sourceScheduleRevisionID)
+        try container.encode(sourceBlockID, forKey: .sourceBlockID)
+        try container.encode(actualSeconds, forKey: .actualSeconds)
+        try container.encode(creditedSourceSeconds, forKey: .creditedSourceSeconds)
+        try container.encode(plannedDurationSeconds, forKey: .plannedDurationSeconds)
+        try container.encode(remainingDurationSeconds, forKey: .remainingDurationSeconds)
+        try container.encode(moveStart, forKey: .moveStart)
+        try container.encode(moveEnd, forKey: .moveEnd)
+        try container.encode(environmentDigest, forKey: .environmentDigest)
+        try container.encode(assessmentDigest, forKey: .assessmentDigest)
+        try container.encode(approvalRequired, forKey: .approvalRequired)
+        try container.encode(violations, forKey: .violations)
+        try container.encode(expiresAt, forKey: .expiresAt)
+    }
+
+    var hasValidShape: Bool {
+        guard !sessionID.isDayWeaveNil,
+              executionRevision > 0,
+              executionRevision <= UInt64(Int64.max),
+              sessionRevision > 0,
+              sessionRevision <= executionRevision,
+              !itemID.isDayWeaveNil,
+              itemRevision > 0,
+              itemRevision <= UInt64(Int64.max),
+              !(occurrenceID?.isDayWeaveNil ?? false),
+              replacementSessionIndex > sourceSessionIndex,
+              !sourceScheduleRevisionID.isDayWeaveNil,
+              !sourceBlockID.isDayWeaveNil,
+              actualSeconds <= UInt64(Int64.max),
+              plannedDurationSeconds > 0,
+              plannedDurationSeconds <= 86_400,
+              creditedSourceSeconds <= plannedDurationSeconds,
+              remainingDurationSeconds > 0,
+              remainingDurationSeconds == plannedDurationSeconds - creditedSourceSeconds,
+              dayWeaveExactWholeSecondDelta(from: moveStart, to: moveEnd)
+                == remainingDurationSeconds,
+              dayWeavePostgresEpochMicroseconds(moveStart).map({
+                  $0 % 300_000_000 == 0
+              }) == true,
+              executionHasPostgresTimestampPrecision(moveEnd),
+              executionHasPostgresTimestampPrecision(expiresAt),
+              expiresAt < moveStart,
+              isCanonicalExecutionDigest(environmentDigest),
+              isCanonicalExecutionDigest(assessmentDigest),
+              violations.count <= Self.maximumViolationCount,
+              violations.allSatisfy(\.hasValidShape),
+              approvalRequired == !violations.isEmpty else { return false }
+        return true
+    }
+}
+
+struct DayWeaveDeferAssessmentEnvelope: Decodable, Sendable {
+    let assessment: DayWeaveDeferAssessment
+
+    private enum CodingKeys: String, CodingKey, CaseIterable { case assessment }
+
+    init(from decoder: any Decoder) throws {
+        try requireExactExecutionKeys(CodingKeys.self, from: decoder)
+        assessment = try decoder.container(keyedBy: CodingKeys.self)
+            .decode(DayWeaveDeferAssessment.self, forKey: .assessment)
+    }
+}
+
+/// The server's assessment evidence lives for five minutes. A newly selected
+/// target must leave that entire TTL plus one complete placement slot so a
+/// slow response never collapses the user's replacement window into expiry.
+enum DayWeaveExecutionDeferTiming {
+    static let slotSeconds: TimeInterval = 5 * 60
+    static let assessmentTTLSeconds: TimeInterval = 5 * 60
+    static let minimumLeadSeconds = assessmentTTLSeconds + slotSeconds
+
+    static func roundedUpToSlot(_ date: Date) -> Date {
+        Date(
+            timeIntervalSince1970: (
+                date.timeIntervalSince1970 / slotSeconds
+            ).rounded(.up) * slotSeconds
+        )
+    }
+
+    static func minimumMoveStart(after referenceDate: Date) -> Date {
+        roundedUpToSlot(referenceDate.addingTimeInterval(minimumLeadSeconds))
+    }
+
+    static func isAligned(_ date: Date) -> Bool {
+        dayWeavePostgresEpochMicroseconds(date).map {
+            $0 % 300_000_000 == 0
+        } == true
+    }
+
+    static func isValidNewMoveStart(_ moveStart: Date, now: Date) -> Bool {
+        isAligned(moveStart)
+            && moveStart >= now.addingTimeInterval(minimumLeadSeconds)
+    }
+}
+
 enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
     case start(
         sessionID: UUID,
@@ -267,7 +825,14 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
     case resume(sessionID: UUID)
     case complete(sessionID: UUID, actualSeconds: UInt64?)
     case skip(sessionID: UUID, actualSeconds: UInt64?)
-    case deferWork(sessionID: UUID, moveStart: Date, moveEnd: Date, actualSeconds: UInt64?)
+    case deferWork(
+        sessionID: UUID,
+        moveStart: Date,
+        moveEnd: Date,
+        actualSeconds: UInt64?,
+        assessmentDigest: String? = nil,
+        approvedAssessmentDigest: String? = nil
+    )
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -284,6 +849,8 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case actualSeconds = "actual_seconds"
         case moveStart = "move_start"
         case moveEnd = "move_end"
+        case assessmentDigest = "assessment_digest"
+        case approvedAssessmentDigest = "approved_assessment_digest"
     }
 
     var sessionID: UUID {
@@ -293,7 +860,7 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
              let .resume(sessionID),
              let .complete(sessionID, _),
              let .skip(sessionID, _),
-             let .deferWork(sessionID, _, _, _):
+             let .deferWork(sessionID, _, _, _, _, _):
             sessionID
         }
     }
@@ -333,7 +900,7 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case let .skip(_, actualSeconds):
             return session.status == .skipped
                 && actualSeconds.map { session.actualSeconds == $0 } ?? true
-        case let .deferWork(_, moveStart, moveEnd, actualSeconds):
+        case let .deferWork(_, moveStart, moveEnd, actualSeconds, _, _):
             return session.status == .deferred
                 && session.moveStart == moveStart
                 && session.moveEnd == moveEnd
@@ -401,7 +968,11 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case "defer":
             try requireExecutionKeyShape(
                 required: ["type", "session_id", "move_start", "move_end"],
-                optional: ["actual_seconds"],
+                optional: [
+                    "actual_seconds",
+                    "assessment_digest",
+                    "approved_assessment_digest",
+                ],
                 from: decoder
             )
             let rawMoveStart = try? container.decode(String.self, forKey: .moveStart)
@@ -428,7 +999,15 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
                 sessionID: try container.decode(UUID.self, forKey: .sessionID),
                 moveStart: try container.decode(Date.self, forKey: .moveStart),
                 moveEnd: try container.decode(Date.self, forKey: .moveEnd),
-                actualSeconds: try container.decodeIfPresent(UInt64.self, forKey: .actualSeconds)
+                actualSeconds: try container.decodeIfPresent(UInt64.self, forKey: .actualSeconds),
+                assessmentDigest: try container.decodeIfPresent(
+                    String.self,
+                    forKey: .assessmentDigest
+                ),
+                approvedAssessmentDigest: try container.decodeIfPresent(
+                    String.self,
+                    forKey: .approvedAssessmentDigest
+                )
             )
         default:
             throw executionDecodingError(
@@ -440,7 +1019,25 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
     }
 
     func encode(to encoder: any Encoder) throws {
-        try validate(codingPath: encoder.codingPath, replayingPersistedBytes: false)
+        try encode(to: encoder, replayingPersistedBytes: false)
+    }
+
+    /// Snapshot journals may contain a command accepted under an older wire
+    /// contract. Its immutable request bytes remain the replay authority, so
+    /// snapshot re-encryption must not reinterpret that historical command as
+    /// a newly authored request.
+    fileprivate func encodePersisted(to encoder: any Encoder) throws {
+        try encode(to: encoder, replayingPersistedBytes: true)
+    }
+
+    private func encode(
+        to encoder: any Encoder,
+        replayingPersistedBytes: Bool
+    ) throws {
+        try validate(
+            codingPath: encoder.codingPath,
+            replayingPersistedBytes: replayingPersistedBytes
+        )
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
         case let .start(
@@ -477,12 +1074,24 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
             try container.encode("skip", forKey: .type)
             try container.encode(sessionID, forKey: .sessionID)
             try container.encodeIfPresent(actualSeconds, forKey: .actualSeconds)
-        case let .deferWork(sessionID, moveStart, moveEnd, actualSeconds):
+        case let .deferWork(
+            sessionID,
+            moveStart,
+            moveEnd,
+            actualSeconds,
+            assessmentDigest,
+            approvedAssessmentDigest
+        ):
             try container.encode("defer", forKey: .type)
             try container.encode(sessionID, forKey: .sessionID)
             try container.encode(moveStart, forKey: .moveStart)
             try container.encode(moveEnd, forKey: .moveEnd)
             try container.encodeIfPresent(actualSeconds, forKey: .actualSeconds)
+            try container.encodeIfPresent(assessmentDigest, forKey: .assessmentDigest)
+            try container.encodeIfPresent(
+                approvedAssessmentDigest,
+                forKey: .approvedAssessmentDigest
+            )
         }
     }
 
@@ -528,8 +1137,22 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case let .complete(sessionID, actualSeconds), let .skip(sessionID, actualSeconds):
             valid = !sessionID.isDayWeaveNil
                 && actualSeconds.map { $0 <= UInt64(Int64.max) } ?? true
-        case let .deferWork(sessionID, moveStart, moveEnd, actualSeconds):
+        case let .deferWork(
+            sessionID,
+            moveStart,
+            moveEnd,
+            actualSeconds,
+            assessmentDigest,
+            approvedAssessmentDigest
+        ):
             let exactDuration = dayWeaveExactWholeSecondDelta(from: moveStart, to: moveEnd)
+            let actualIsValid = actualSeconds.map({ $0 <= UInt64(Int64.max) })
+                ?? replayingPersistedBytes
+            let assessmentIsValid = assessmentDigest.map(isCanonicalExecutionDigest)
+                ?? replayingPersistedBytes
+            let approvalIsValid = approvedAssessmentDigest.map(isCanonicalExecutionDigest) ?? true
+            let approvalMatches = approvedAssessmentDigest == nil
+                || approvedAssessmentDigest == assessmentDigest
             valid = !sessionID.isDayWeaveNil
                 && moveStart.timeIntervalSinceReferenceDate.isFinite
                 && moveEnd.timeIntervalSinceReferenceDate.isFinite
@@ -537,7 +1160,10 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
                 && executionHasPostgresTimestampPrecision(moveEnd)
                 && (replayingPersistedBytes || moveStart > Date())
                 && exactDuration.map { $0 <= 86_400 } == true
-                && actualSeconds.map { $0 <= UInt64(Int64.max) } ?? true
+                && actualIsValid
+                && assessmentIsValid
+                && approvalIsValid
+                && approvalMatches
         }
         guard valid else {
             throw EncodingError.invalidValue(
@@ -657,6 +1283,80 @@ struct DayWeavePendingExecutionCommand: Codable, Equatable, Sendable {
     let focusedBlockID: UUID
     let canonicalProjectionEligibleAtLeaseStart: Bool
     let stagedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case idempotencyKey
+        case bindingIdentifier
+        case expectedRevision
+        case identity
+        case command
+        case encodedRequest
+        case priorSession
+        case focusedBlockID
+        case canonicalProjectionEligibleAtLeaseStart
+        case stagedAt
+    }
+
+    init(
+        idempotencyKey: String,
+        bindingIdentifier: String,
+        expectedRevision: UInt64,
+        identity: DayWeaveExecutionIdentity,
+        command: DayWeaveExecutionCommand,
+        encodedRequest: Data,
+        priorSession: DayWeaveExecutionSession?,
+        focusedBlockID: UUID,
+        canonicalProjectionEligibleAtLeaseStart: Bool,
+        stagedAt: Date
+    ) {
+        self.idempotencyKey = idempotencyKey
+        self.bindingIdentifier = bindingIdentifier
+        self.expectedRevision = expectedRevision
+        self.identity = identity
+        self.command = command
+        self.encodedRequest = encodedRequest
+        self.priorSession = priorSession
+        self.focusedBlockID = focusedBlockID
+        self.canonicalProjectionEligibleAtLeaseStart = canonicalProjectionEligibleAtLeaseStart
+        self.stagedAt = stagedAt
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        idempotencyKey = try container.decode(String.self, forKey: .idempotencyKey)
+        bindingIdentifier = try container.decode(String.self, forKey: .bindingIdentifier)
+        expectedRevision = try container.decode(UInt64.self, forKey: .expectedRevision)
+        identity = try container.decode(DayWeaveExecutionIdentity.self, forKey: .identity)
+        command = try container.decode(DayWeaveExecutionCommand.self, forKey: .command)
+        encodedRequest = try container.decode(Data.self, forKey: .encodedRequest)
+        priorSession = try container.decodeIfPresent(
+            DayWeaveExecutionSession.self,
+            forKey: .priorSession
+        )
+        focusedBlockID = try container.decode(UUID.self, forKey: .focusedBlockID)
+        canonicalProjectionEligibleAtLeaseStart = try container.decode(
+            Bool.self,
+            forKey: .canonicalProjectionEligibleAtLeaseStart
+        )
+        stagedAt = try container.decode(Date.self, forKey: .stagedAt)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(idempotencyKey, forKey: .idempotencyKey)
+        try container.encode(bindingIdentifier, forKey: .bindingIdentifier)
+        try container.encode(expectedRevision, forKey: .expectedRevision)
+        try container.encode(identity, forKey: .identity)
+        try command.encodePersisted(to: container.superEncoder(forKey: .command))
+        try container.encode(encodedRequest, forKey: .encodedRequest)
+        try container.encodeIfPresent(priorSession, forKey: .priorSession)
+        try container.encode(focusedBlockID, forKey: .focusedBlockID)
+        try container.encode(
+            canonicalProjectionEligibleAtLeaseStart,
+            forKey: .canonicalProjectionEligibleAtLeaseStart
+        )
+        try container.encode(stagedAt, forKey: .stagedAt)
+    }
 }
 
 /// High-level crash-recovery intent spanning the Pause -> Defer command pair.
@@ -736,7 +1436,7 @@ struct DayWeaveMoveRiskEnvelope: Equatable, Sendable {
 }
 
 struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
-    static let currentVersion = 5
+    static let currentVersion = 7
     static let maximumConflictCount = 10_000
     static let maximumDeadlineCount = 10_000
 
@@ -754,6 +1454,13 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
     let approvedFixedConflicts: Set<DayWeaveMoveConflictIdentity>
     let fixedConflictApproved: Bool
     let sourceOverrideApproved: Bool
+    /// Server-issued, content-free evidence for this exact paused revision and
+    /// target. It is intentionally separate from the immutable command journal:
+    /// once a command is staged, replay uses its retained bytes instead.
+    let assessment: DayWeaveDeferAssessment?
+    /// Exact explicit approval for `assessment`. A replacement assessment is
+    /// always stored with this field cleared before any command can be staged.
+    let approvedAssessmentDigest: String?
     let createdAt: Date
     let expiresAt: Date
 
@@ -770,6 +1477,8 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
         case approvedFixedConflicts
         case fixedConflictApproved
         case sourceOverrideApproved
+        case assessment
+        case approvedAssessmentDigest
         case createdAt
         case expiresAt
     }
@@ -787,6 +1496,8 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
         approvedFixedConflicts: Set<DayWeaveMoveConflictIdentity>,
         fixedConflictApproved: Bool,
         sourceOverrideApproved: Bool,
+        assessment: DayWeaveDeferAssessment? = nil,
+        approvedAssessmentDigest: String? = nil,
         createdAt: Date,
         expiresAt: Date
     ) {
@@ -802,6 +1513,8 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
         self.approvedFixedConflicts = approvedFixedConflicts
         self.fixedConflictApproved = fixedConflictApproved
         self.sourceOverrideApproved = sourceOverrideApproved
+        self.assessment = assessment
+        self.approvedAssessmentDigest = approvedAssessmentDigest
         self.createdAt = createdAt
         self.expiresAt = expiresAt
     }
@@ -842,6 +1555,14 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
             Bool.self,
             forKey: .sourceOverrideApproved
         ) ?? false
+        assessment = try container.decodeIfPresent(
+            DayWeaveDeferAssessment.self,
+            forKey: .assessment
+        )
+        approvedAssessmentDigest = try container.decodeIfPresent(
+            String.self,
+            forKey: .approvedAssessmentDigest
+        )
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         expiresAt = try container.decode(Date.self, forKey: .expiresAt)
     }
@@ -851,13 +1572,15 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
               identity.plannedBlockID == focusedBlockID,
               !focusedBlockID.isDayWeaveNil,
               let moveMicros = dayWeavePostgresEpochMicroseconds(moveStart),
-              moveMicros % 1_000_000 == 0,
               createdAt.timeIntervalSinceReferenceDate.isFinite,
               expiresAt.timeIntervalSinceReferenceDate.isFinite,
-              createdAt < expiresAt,
-              expiresAt <= moveStart,
-              expiresAt <= createdAt.addingTimeInterval(86_400) else { return false }
-        if version < Self.currentVersion { return (1...4).contains(version) }
+              createdAt < expiresAt else { return false }
+        if version < Self.currentVersion {
+            return (1...6).contains(version)
+                && (version <= 5 || moveMicros % 300_000_000 == 0)
+                && expiresAt <= moveStart
+                && expiresAt <= createdAt.addingTimeInterval(86_400)
+        }
         return hasValidShape
     }
 
@@ -870,34 +1593,91 @@ struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
               dayWeaveExactWholeSecondDelta(from: sourceStart, to: sourceEnd)
                 .map({ $0 <= 86_400 }) == true,
               let moveMicros = dayWeavePostgresEpochMicroseconds(moveStart),
-              moveMicros % 1_000_000 == 0,
-              let approvedEndMicros = dayWeavePostgresEpochMicroseconds(approvedMoveEnd),
-              approvedEndMicros % 1_000_000 == 0,
-              moveStart < approvedMoveEnd,
-              dayWeaveExactWholeSecondDelta(from: moveStart, to: approvedMoveEnd)
-                .map({ $0 <= 86_400 }) == true,
-              approvedDeadlines.count <= Self.maximumDeadlineCount,
-              approvedDeadlines.allSatisfy(\.hasValidShape),
-              Set(approvedDeadlines.map(\.itemID)).count == approvedDeadlines.count,
-              deadlineConflictApproved
-                == approvedDeadlines.contains(where: {
-                    approvedMoveEnd > $0.boundary.date
-                }),
-              !deadlineConflictApproved || !approvedDeadlines.contains(where: {
-                  approvedMoveEnd > $0.boundary.date && $0.boundary.isHard
-              }),
-              approvedFixedConflicts.count <= Self.maximumConflictCount,
-              approvedFixedConflicts.allSatisfy({
-                  $0.hasValidShape && $0.id != focusedBlockID
-              }),
-              Set(approvedFixedConflicts.map(\.id)).count == approvedFixedConflicts.count,
-              fixedConflictApproved == !approvedFixedConflicts.isEmpty,
+              moveMicros % 300_000_000 == 0,
+              approvedMoveEnd == moveStart,
+              approvedDeadlines.isEmpty,
+              !deadlineConflictApproved,
+              approvedFixedConflicts.isEmpty,
+              !fixedConflictApproved,
+              !sourceOverrideApproved,
               createdAt.timeIntervalSinceReferenceDate.isFinite,
               expiresAt.timeIntervalSinceReferenceDate.isFinite,
               createdAt < expiresAt,
-              expiresAt <= moveStart,
-              expiresAt <= createdAt.addingTimeInterval(86_400) else { return false }
-        return true
+              expiresAt == moveStart else { return false }
+        guard let assessment else { return approvedAssessmentDigest == nil }
+        return assessment.hasValidShape
+            && assessment.sessionID == identity.sessionID
+            && assessment.itemID == identity.itemID
+            && assessment.itemRevision == identity.itemRevision
+            && assessment.occurrenceID == identity.occurrenceID
+            && assessment.sourceSessionIndex == identity.sessionIndex
+            && assessment.sourceBlockID == focusedBlockID
+            && assessment.moveStart == moveStart
+            && (approvedAssessmentDigest == nil
+                || (assessment.approvalRequired
+                    && approvedAssessmentDigest == assessment.assessmentDigest))
+            && (!assessment.approvalRequired || !assessment.violations.isEmpty)
+            && (assessment.approvalRequired || approvedAssessmentDigest == nil)
+    }
+
+    var approvalIsRequired: Bool {
+        assessment?.approvalRequired == true && approvedAssessmentDigest == nil
+    }
+
+    func isSameRequest(as other: Self) -> Bool {
+        version == Self.currentVersion
+            && other.version == Self.currentVersion
+            && identity == other.identity
+            && focusedBlockID == other.focusedBlockID
+            && sourceStart == other.sourceStart
+            && sourceEnd == other.sourceEnd
+            && moveStart == other.moveStart
+            && createdAt == other.createdAt
+            && expiresAt == other.expiresAt
+    }
+
+    func replacingAssessment(_ replacement: DayWeaveDeferAssessment?) -> Self {
+        Self(
+            identity: identity,
+            focusedBlockID: focusedBlockID,
+            sourceStart: sourceStart,
+            sourceEnd: sourceEnd,
+            moveStart: moveStart,
+            approvedMoveEnd: moveStart,
+            approvedDeadlines: [],
+            deadlineConflictApproved: false,
+            approvedFixedConflicts: [],
+            fixedConflictApproved: false,
+            sourceOverrideApproved: false,
+            assessment: replacement,
+            approvedAssessmentDigest: nil,
+            createdAt: createdAt,
+            expiresAt: expiresAt
+        )
+    }
+
+    func approvingAssessment(digest: String) -> Self? {
+        guard let assessment,
+              assessment.approvalRequired,
+              assessment.assessmentDigest == digest,
+              isCanonicalExecutionDigest(digest) else { return nil }
+        return Self(
+            identity: identity,
+            focusedBlockID: focusedBlockID,
+            sourceStart: sourceStart,
+            sourceEnd: sourceEnd,
+            moveStart: moveStart,
+            approvedMoveEnd: moveStart,
+            approvedDeadlines: [],
+            deadlineConflictApproved: false,
+            approvedFixedConflicts: [],
+            fixedConflictApproved: false,
+            sourceOverrideApproved: false,
+            assessment: assessment,
+            approvedAssessmentDigest: digest,
+            createdAt: createdAt,
+            expiresAt: expiresAt
+        )
     }
 }
 
@@ -1209,6 +1989,15 @@ private func validateExecutionSession(
 
 private func executionHasPostgresTimestampPrecision(_ date: Date) -> Bool {
     dayWeavePostgresEpochMicroseconds(date) != nil
+}
+
+func isCanonicalExecutionDigest(_ value: String) -> Bool {
+    let bytes = value.utf8
+    return bytes.count == 71
+        && bytes.starts(with: "sha256:".utf8)
+        && bytes.dropFirst(7).allSatisfy { byte in
+            (48...57).contains(byte) || (97...102).contains(byte)
+        }
 }
 
 /// JSONDecoder necessarily rounds RFC 3339 strings into `Date`. Inspect the

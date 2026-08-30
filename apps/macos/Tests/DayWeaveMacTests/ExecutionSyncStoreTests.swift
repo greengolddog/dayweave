@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 #if canImport(Testing)
 import Testing
 #endif
@@ -659,7 +660,7 @@ struct ExecutionSyncStoreTests {
         #expect(relaunched.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
     }
 
-    @Test("Will do later pauses first, fences exact remaining seconds, and invalidates old proof")
+    @Test("Will do later pauses first and uses only the server-assessed exact placement")
     func deferUsesPausedAuthoritativeDurationAndFreshPublicationFence() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
@@ -742,9 +743,17 @@ struct ExecutionSyncStoreTests {
         durable.presentedBlockIDs = [Self.blockID]
         var activeBlock = Self.block()
         activeBlock.status = .active
+        var locallyFixed = Self.block(id: Self.uuid(1_119))
+        locallyFixed.sourceItemID = nil
+        locallyFixed.sourceItemRevision = nil
+        locallyFixed.start = moveStart.addingTimeInterval(60)
+        locallyFixed.end = moveStart.addingTimeInterval(300)
+        locallyFixed.isFlexible = false
+        locallyFixed.isHardConstraint = true
+        locallyFixed.syncOrigin = .local
         let planner = Self.planner(
             persistence: context.persistence,
-            blocks: [activeBlock],
+            blocks: [activeBlock, locallyFixed],
             canonicalItems: [try Self.canonicalItem()],
             executionState: durable
         )
@@ -754,7 +763,11 @@ struct ExecutionSyncStoreTests {
             now: { pausedAt }
         )
 
-        #expect(await sync.deferWork(Self.blockID, moveStart: moveStart) == .success)
+        #expect(await sync.deferWork(
+            Self.blockID,
+            moveStart: moveStart,
+            latestFinish: moveStart.addingTimeInterval(60)
+        ) == .success)
         let receivedCommands = await transport.receivedCommands()
         let commands = try receivedCommands.map {
             try DayWeaveExecutionWireCodec.decode($0.body).command
@@ -772,14 +785,162 @@ struct ExecutionSyncStoreTests {
             sessionID: sessionID,
             moveStart: moveStart,
             moveEnd: moveStart.addingTimeInterval(1_500),
-            actualSeconds: 300
+            actualSeconds: 300,
+            assessmentDigest: "sha256:\(String(repeating: "d", count: 64))",
+            approvedAssessmentDigest: nil
         ))
+        let assessmentRequests = await transport.receivedAssessmentRequests()
+        #expect(assessmentRequests == [
+            .init(
+                expectedRevision: 2,
+                sessionID: sessionID,
+                moveStart: moveStart,
+                actualSeconds: 300
+            ),
+        ])
         #expect(planner.executionState.activeSession == nil)
         #expect(planner.executionState.terminalOutcomes[sessionID]?.session == deferred)
         #expect(planner.executionState.terminalOutcomes[sessionID]?.projection == .notRequired)
         #expect(planner.publishedScheduleProof == nil)
         #expect(planner.pendingCanonicalMutations.isEmpty)
         #expect(planner.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+    }
+
+    @Test("conflict approval is durable and the staged Defer replays unchanged after expiry")
+    func deferConflictApprovalAndExpiredReplayAreExact() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_146))
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        let assessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "e",
+            approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300)
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let assessmentTransport = ExecutionTransportDouble(
+            snapshots: [],
+            pages: [],
+            assessmentReplies: [.assessment(assessment)]
+        )
+
+        #expect(await Self.controller(
+            planner: planner,
+            transport: assessmentTransport
+        ).deferWork(Self.blockID, moveStart: moveStart) == .approvalRequired)
+        #expect(await assessmentTransport.receivedCommands().isEmpty)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(planner.pendingExecutionDeferIntent?.assessment == assessment)
+        #expect(planner.pendingExecutionDeferIntent?.approvedAssessmentDigest == nil)
+
+        let restored = PlannerStore(
+            persistence: context.persistence,
+            now: { Self.baseDate }
+        )
+        #expect(restored.persistenceError == nil)
+        #expect(restored.pendingExecutionDeferIntent?.assessment == assessment)
+        #expect(restored.pendingExecutionDeferIntent?.approvedAssessmentDigest == nil)
+        let pausedSnapshot = DayWeaveExecutionSnapshot(
+            revision: paused.revision,
+            activeSession: paused
+        )
+        let commandTransport = ExecutionTransportDouble(
+            snapshots: [pausedSnapshot, pausedSnapshot],
+            pages: [.init(sessions: [paused], nextOffset: nil)],
+            commandReplies: [.failure(.transport(.networkConnectionLost))]
+        )
+
+        #expect(await Self.controller(
+            planner: restored,
+            transport: commandTransport
+        ).approveDeferredWork(
+            Self.blockID,
+            assessmentDigest: assessment.assessmentDigest
+        ) == .transientNetworkFailure)
+        let lostRequest = try #require((await commandTransport.receivedCommands()).first)
+        let staged = try #require(restored.executionState.pendingCommand)
+        let stagedIntent = try #require(restored.pendingExecutionDeferIntent)
+        #expect(staged.encodedRequest == lostRequest.body)
+        #expect(restored.pendingExecutionDeferIntent?.approvedAssessmentDigest
+            == assessment.assessmentDigest)
+        #expect(try DayWeaveExecutionWireCodec.decode(lostRequest.body).command == .deferWork(
+            sessionID: paused.id,
+            moveStart: assessment.moveStart,
+            moveEnd: assessment.moveEnd,
+            actualSeconds: assessment.actualSeconds,
+            assessmentDigest: assessment.assessmentDigest,
+            approvedAssessmentDigest: assessment.assessmentDigest
+        ))
+        #expect(Self.controller(
+            planner: restored,
+            transport: commandTransport
+        ).cancelDeferredWork(stagedIntent) == .invalidLocalState)
+        #expect(restored.executionState.pendingCommand == staged)
+        #expect(restored.pendingExecutionDeferIntent == stagedIntent)
+
+        let relaunched = PlannerStore(
+            persistence: context.persistence,
+            now: { assessment.expiresAt.addingTimeInterval(1) }
+        )
+        let deferredAt = paused.updatedAt.addingTimeInterval(1)
+        let deferred = try Self.session(
+            id: paused.id,
+            status: .deferred,
+            revision: paused.revision + 1,
+            sessionIndex: paused.sessionIndex,
+            plannedBlockID: Self.blockID,
+            startedAt: paused.startedAt,
+            updatedAt: deferredAt,
+            accumulatedSeconds: paused.accumulatedSeconds,
+            actualSeconds: assessment.actualSeconds,
+            runningSince: nil,
+            pausedAt: paused.pausedAt,
+            pauseUntil: nil,
+            moveStart: assessment.moveStart,
+            moveEnd: assessment.moveEnd,
+            endedAt: deferredAt
+        )
+        let deferredSnapshot = DayWeaveExecutionSnapshot(
+            revision: paused.revision + 1,
+            activeSession: nil
+        )
+        let replayTransport = ExecutionTransportDouble(
+            snapshots: [deferredSnapshot, deferredSnapshot],
+            pages: [.init(sessions: [deferred], nextOffset: nil)],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: paused.revision + 1,
+                active: nil,
+                changed: deferred,
+                replayed: true
+            ))]
+        )
+
+        #expect(await Self.controller(
+            planner: relaunched,
+            transport: replayTransport,
+            now: { assessment.expiresAt.addingTimeInterval(1) }
+        ).refresh() == .success)
+        let replayed = try #require((await replayTransport.receivedCommands()).first)
+        #expect(replayed == lostRequest)
+        #expect(relaunched.executionState.pendingCommand == nil)
+        #expect(relaunched.pendingExecutionDeferIntent == nil)
+        #expect(relaunched.executionState.terminalOutcomes[paused.id]?.session == deferred)
     }
 
     @Test("a lost Defer response replays exact bytes after relaunch and closes the saved move")
@@ -879,6 +1040,88 @@ struct ExecutionSyncStoreTests {
         #expect(publicationAttempts == 1)
     }
 
+    @Test("approval-pending Defer can be durably canceled while keeping the lease paused")
+    func approvalPendingDeferCanBeCanceled() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_148))
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let assessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "c",
+            approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300)
+        )
+        let transport = ExecutionTransportDouble(
+            snapshots: [],
+            pages: [],
+            assessmentReplies: [.assessment(assessment)]
+        )
+        let sync = Self.controller(planner: planner, transport: transport)
+
+        #expect(await sync.deferWork(Self.blockID, moveStart: moveStart) == .approvalRequired)
+        let intent = try #require(planner.pendingExecutionDeferIntent)
+        #expect(sync.cancelDeferredWork(intent) == .success)
+        #expect(planner.pendingExecutionDeferIntent == nil)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(planner.executionState.pendingCommand == nil)
+        let restored = PlannerStore(persistence: context.persistence, now: { Self.baseDate })
+        #expect(restored.pendingExecutionDeferIntent == nil)
+        #expect(restored.executionState.activeSession == paused)
+    }
+
+    @Test("assessment network failure leaves a cancelable durable paused intent")
+    func assessmentNetworkFailureCanBeCanceled() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_149))
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let transport = ExecutionTransportDouble(
+            snapshots: [],
+            pages: [],
+            assessmentReplies: [.failure(.transport(.networkConnectionLost))]
+        )
+        let sync = Self.controller(planner: planner, transport: transport)
+
+        #expect(await sync.deferWork(Self.blockID, moveStart: moveStart)
+            == .transientNetworkFailure)
+        let intent = try #require(planner.pendingExecutionDeferIntent)
+        #expect(intent.assessment == nil)
+        #expect(sync.cancelDeferredWork(intent) == .success)
+        #expect(planner.pendingExecutionDeferIntent == nil)
+        #expect(planner.executionState.activeSession == paused)
+    }
+
     @Test("a lost Pause response retains and completes the selected move after relaunch")
     func lostPauseResponseResumesDurableMoveIntent() async throws {
         let context = try Self.persistenceContext()
@@ -930,7 +1173,7 @@ struct ExecutionSyncStoreTests {
             allowSourceOverride: true
         ) == .transientNetworkFailure)
         #expect(firstPlanner.pendingExecutionDeferIntent?.moveStart == moveStart)
-        #expect(firstPlanner.pendingExecutionDeferIntent?.sourceOverrideApproved == true)
+        #expect(firstPlanner.pendingExecutionDeferIntent?.sourceOverrideApproved == false)
         guard case .pause = firstPlanner.executionState.pendingCommand?.command else {
             Issue.record("Expected the interrupted exact Pause journal")
             return
@@ -940,7 +1183,7 @@ struct ExecutionSyncStoreTests {
             persistence: context.persistence,
             now: { pausedAt }
         )
-        #expect(restored.pendingExecutionDeferIntent?.sourceOverrideApproved == true)
+        #expect(restored.pendingExecutionDeferIntent?.sourceOverrideApproved == false)
         let pausedSnapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: paused)
         let deferredSnapshot = DayWeaveExecutionSnapshot(revision: 3, activeSession: nil)
         let replayTransport = ExecutionTransportDouble(
@@ -978,13 +1221,15 @@ struct ExecutionSyncStoreTests {
         }
         #expect(replayedCommands.last == .deferWork(
             sessionID: sessionID, moveStart: moveStart,
-            moveEnd: moveStart.addingTimeInterval(1_500), actualSeconds: 300
+            moveEnd: moveStart.addingTimeInterval(1_500), actualSeconds: 300,
+            assessmentDigest: "sha256:\(String(repeating: "d", count: 64))",
+            approvedAssessmentDigest: nil
         ))
         #expect(restored.pendingExecutionDeferIntent == nil)
         #expect(restored.executionState.terminalOutcomes[sessionID]?.session == deferred)
     }
 
-    @Test("a v5 Defer intent preserves microsecond source endpoints across relaunch")
+    @Test("a v6 Defer target preserves microsecond source endpoints across relaunch")
     func deferIntentPreservesMicrosecondSourceEndpoints() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
@@ -1007,14 +1252,14 @@ struct ExecutionSyncStoreTests {
             identity: .init(session: paused), focusedBlockID: Self.blockID,
             sourceStart: sourceStart, sourceEnd: sourceEnd,
             moveStart: moveStart,
-            approvedMoveEnd: moveStart.addingTimeInterval(1_500),
+            approvedMoveEnd: moveStart,
             approvedDeadlines: [],
             deadlineConflictApproved: false,
             approvedFixedConflicts: [],
             fixedConflictApproved: false,
             sourceOverrideApproved: false,
             createdAt: Self.baseDate,
-            expiresAt: Self.baseDate.addingTimeInterval(1_800)
+            expiresAt: moveStart
         )
         #expect(intent.hasValidShape)
         var durable = Self.emptyBoundState
@@ -1085,72 +1330,35 @@ struct ExecutionSyncStoreTests {
             sessionID: sessionID,
             moveStart: moveStart,
             moveEnd: moveStart.addingTimeInterval(1_500),
-            actualSeconds: 300
+            actualSeconds: 300,
+            assessmentDigest: "sha256:\(String(repeating: "d", count: 64))",
+            approvedAssessmentDigest: nil
         ))
         #expect(restored.pendingExecutionDeferIntent == nil)
         #expect(restored.executionState.terminalOutcomes[sessionID]?.session == deferred)
     }
 
-    @Test("active pinned work requires an explicit source-placement override before Pause")
-    func pinnedDeferRequiresSourceOverride() async throws {
-        let context = try Self.persistenceContext()
-        defer { try? FileManager.default.removeItem(at: context.directory) }
-        let sessionID = Self.uuid(1_140)
-        let active = try Self.activeSession(sessionID: sessionID)
-        var durable = Self.emptyBoundState
-        durable.revision = 1
-        durable.activeSession = active
-        durable.historyWindow = [active]
-        durable.historyWindowRevision = 1
-        durable.presentedBlockIDs = [Self.blockID]
-        var block = Self.block()
-        block.status = .active
-        block.previewKind = "pinned"
-        let planner = Self.planner(
-            persistence: context.persistence,
-            blocks: [block],
-            canonicalItems: [try Self.canonicalItem()],
-            executionState: durable
-        )
-        let transport = Self.emptyReadTransport()
-
-        #expect(await Self.controller(
-            planner: planner,
-            transport: transport
-        ).deferWork(
-            Self.blockID,
-            moveStart: Self.baseDate.addingTimeInterval(3_600)
-        ) == .invalidLocalState)
-        #expect(planner.pendingExecutionDeferIntent == nil)
-        #expect(planner.executionState.activeSession == active)
-        #expect(await transport.receivedCommands().isEmpty)
-    }
-
-    @Test("legacy saved Defer intent relaunches paused and requires fresh approval")
-    func legacyDeferIntentFailsClosedAfterRelaunch() async throws {
-        struct LegacyIntent: Encodable {
-            let version: Int
-            let identity: DayWeaveExecutionIdentity
-            let focusedBlockID: UUID
-            let moveStart: Date
-            let createdAt: Date
-            let expiresAt: Date
-        }
+    @Test("encrypted schema 15 preserves legacy Defer bytes while dropping local approval")
+    func schema15DeferApprovalMigratesFailClosed() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
         let paused = try Self.pausedSession(sessionID: Self.uuid(1_141))
         let moveStart = Self.baseDate.addingTimeInterval(3_600)
-        let encoded = try JSONEncoder().encode(LegacyIntent(
-            version: 1,
+        let legacy = DayWeavePendingExecutionDeferIntent(
+            version: 5,
             identity: .init(session: paused),
             focusedBlockID: Self.blockID,
+            sourceStart: Self.baseDate,
+            sourceEnd: Self.baseDate.addingTimeInterval(1_800),
             moveStart: moveStart,
+            approvedMoveEnd: moveStart.addingTimeInterval(1_790),
+            approvedDeadlines: [],
+            deadlineConflictApproved: true,
+            approvedFixedConflicts: [],
+            fixedConflictApproved: true,
+            sourceOverrideApproved: true,
             createdAt: Self.baseDate,
             expiresAt: Self.baseDate.addingTimeInterval(1_800)
-        ))
-        let legacy = try JSONDecoder().decode(
-            DayWeavePendingExecutionDeferIntent.self,
-            from: encoded
         )
         #expect(legacy.hasPersistableShape)
         #expect(!legacy.hasValidShape)
@@ -1160,60 +1368,182 @@ struct ExecutionSyncStoreTests {
         durable.historyWindow = [paused]
         durable.historyWindowRevision = paused.revision
         durable.presentedBlockIDs = [Self.blockID]
+        let legacyBytes = Data(
+            """
+            {"command":{"actual_seconds":300,"move_end":"\(Self.format(moveStart.addingTimeInterval(1_500)))","move_start":"\(Self.format(moveStart))","session_id":"\(paused.id.uuidString.lowercased())","type":"defer"},"expected_revision":2}
+            """.utf8
+        )
+        let legacyCommand = try DayWeaveExecutionWireCodec.decode(legacyBytes).command
+        let legacyKey = "mac-execution-schema15-defer"
+        durable.pendingCommand = DayWeavePendingExecutionCommand(
+            idempotencyKey: legacyKey,
+            bindingIdentifier: Self.binding,
+            expectedRevision: paused.revision,
+            identity: .init(session: paused),
+            command: legacyCommand,
+            encodedRequest: legacyBytes,
+            priorSession: paused,
+            focusedBlockID: Self.blockID,
+            canonicalProjectionEligibleAtLeaseStart: false,
+            stagedAt: paused.updatedAt
+        )
         var block = Self.block()
         block.status = .paused
-        let first = Self.planner(
+        block.syncOrigin = .local
+        let profile = Self.planner(
             persistence: context.persistence,
+            blocks: [],
+            executionState: Self.emptyBoundState
+        ).scheduleProfile
+        let snapshot = PlannerSnapshot(
+            schemaVersion: 15,
+            savedAt: Self.baseDate,
+            destination: nil,
+            selectedBlockID: Self.blockID,
             blocks: [block],
-            canonicalItems: [try Self.canonicalItem()],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "Legacy approved move",
+            protectedFreeMinutes: profile.protectedFreeMinutes,
+            scheduleProfile: profile,
+            freezeHours: 2,
+            showCompleted: true,
+            canonicalItems: [],
+            canonicalTombstoneRevisions: [:],
+            completedOccurrenceIDs: [],
+            pendingCanonicalMutations: [],
+            pendingCanonicalSensitivityMutations: [],
+            recurrenceSessionOutcomes: [],
+            recurrenceOccurrenceMoves: [],
             pendingExecutionDeferIntent: legacy,
+            deferredExecutionPublicationSessionIDs: [],
+            pendingPublicationDeferredSessionIDs: [],
+            proposalApplicationReceipts: [],
+            pendingCanonicalAuthoringMutations: [],
+            canonicalTrash: [],
             executionState: durable
         )
-        first.flushPersistence()
 
-        let restored = PlannerStore(persistence: context.persistence, now: { Self.baseDate })
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        encoder.outputFormatting = [.sortedKeys]
+        let plaintext = try encoder.encode(snapshot)
+        let keyData = Data((0..<32).map(UInt8.init))
+        let sealed = try AES.GCM.seal(
+            plaintext,
+            using: SymmetricKey(data: keyData),
+            authenticating: Data("DayWeave.PlannerSnapshot|1|AES.GCM.256".utf8)
+        )
+        let combined = try #require(sealed.combined)
+        let envelope: [String: Any] = [
+            "magic": "DAYWEAVE-ENCRYPTED-SNAPSHOT",
+            "formatVersion": 1,
+            "cipher": "AES.GCM.256",
+            "sealedSnapshot": combined.base64EncodedString(),
+        ]
+        try JSONSerialization.data(withJSONObject: envelope).write(
+            to: context.persistence.fileURL,
+            options: .atomic
+        )
+
+        let restored = PlannerStore(
+            persistence: context.persistence,
+            now: { moveStart.addingTimeInterval(1) }
+        )
+        let intent = try #require(restored.pendingExecutionDeferIntent)
         #expect(restored.persistenceError == nil)
-        #expect(restored.pendingExecutionDeferIntent?.version == 1)
-        #expect(!restored.canMutatePlan)
-        #expect(!restored.beginCanonicalSync())
-        let snapshot = DayWeaveExecutionSnapshot(
-            revision: paused.revision,
-            activeSession: paused
+        #expect(intent.version == DayWeavePendingExecutionDeferIntent.currentVersion)
+        #expect(intent.moveStart == moveStart)
+        #expect(intent.expiresAt == moveStart)
+        #expect(intent.assessment == nil)
+        #expect(intent.approvedAssessmentDigest == nil)
+        #expect(intent.approvedMoveEnd == moveStart)
+        #expect(intent.approvedDeadlines.isEmpty)
+        #expect(!intent.deadlineConflictApproved)
+        #expect(intent.approvedFixedConflicts.isEmpty)
+        #expect(!intent.fixedConflictApproved)
+        #expect(!intent.sourceOverrideApproved)
+        #expect(intent.hasValidShape)
+        let migratedPending = try #require(restored.executionState.pendingCommand)
+        #expect(migratedPending.idempotencyKey == legacyKey)
+        #expect(migratedPending.encodedRequest == legacyBytes)
+
+        let deferredAt = paused.updatedAt.addingTimeInterval(1)
+        let deferred = try Self.session(
+            id: paused.id,
+            status: .deferred,
+            revision: paused.revision + 1,
+            sessionIndex: paused.sessionIndex,
+            plannedBlockID: Self.blockID,
+            startedAt: paused.startedAt,
+            updatedAt: deferredAt,
+            accumulatedSeconds: paused.accumulatedSeconds,
+            actualSeconds: 300,
+            runningSince: nil,
+            pausedAt: paused.pausedAt,
+            pauseUntil: nil,
+            moveStart: moveStart,
+            moveEnd: moveStart.addingTimeInterval(1_500),
+            endedAt: deferredAt
+        )
+        let deferredSnapshot = DayWeaveExecutionSnapshot(
+            revision: deferred.revision,
+            activeSession: nil
         )
         let transport = ExecutionTransportDouble(
-            snapshots: [snapshot, snapshot],
-            pages: [.init(sessions: [paused], nextOffset: nil)]
+            snapshots: [deferredSnapshot, deferredSnapshot],
+            pages: [.init(sessions: [deferred], nextOffset: nil)],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: deferred.revision,
+                active: nil,
+                changed: deferred,
+                replayed: true
+            ))]
         )
 
         #expect(await Self.controller(
             planner: restored,
-            transport: transport
-        ).refresh() == .conflict)
+            transport: transport,
+            now: { moveStart.addingTimeInterval(1) }
+        ).refresh() == .success)
+        let replayed = try #require((await transport.receivedCommands()).first)
+        #expect(replayed.body == legacyBytes)
+        #expect(replayed.key == legacyKey)
+        #expect(restored.executionState.pendingCommand == nil)
         #expect(restored.pendingExecutionDeferIntent == nil)
-        #expect(restored.executionState.activeSession == paused)
-        #expect(await transport.receivedCommands().isEmpty)
+        #expect(restored.executionState.terminalOutcomes[paused.id]?.session == deferred)
     }
 
-    @Test("a new fixed conflict after approval clears recovery intent and leaves Pause intact")
-    func changedRiskAfterRelaunchRequiresFreshApproval() async throws {
+    @Test("a newer paused revision retains the target but cannot inherit an approved digest")
+    func newerPausedRevisionReassessesWithoutInheritedApproval() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
         let paused = try Self.pausedSession(sessionID: Self.uuid(1_142))
         let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        let priorAssessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "a",
+            approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300)
+        )
         let intent = DayWeavePendingExecutionDeferIntent(
             identity: .init(session: paused),
             focusedBlockID: Self.blockID,
             sourceStart: Self.baseDate,
             sourceEnd: Self.baseDate.addingTimeInterval(1_800),
             moveStart: moveStart,
-            approvedMoveEnd: moveStart.addingTimeInterval(1_790),
+            approvedMoveEnd: moveStart,
             approvedDeadlines: [],
             deadlineConflictApproved: false,
             approvedFixedConflicts: [],
             fixedConflictApproved: false,
             sourceOverrideApproved: false,
+            assessment: priorAssessment,
+            approvedAssessmentDigest: priorAssessment.assessmentDigest,
             createdAt: Self.baseDate,
-            expiresAt: Self.baseDate.addingTimeInterval(1_800)
+            expiresAt: moveStart
         )
         var durable = Self.emptyBoundState
         durable.revision = paused.revision
@@ -1223,38 +1553,53 @@ struct ExecutionSyncStoreTests {
         durable.presentedBlockIDs = [Self.blockID]
         var block = Self.block()
         block.status = .paused
-        var newlyFixed = Self.block(id: Self.uuid(1_143))
-        newlyFixed.sourceItemID = nil
-        newlyFixed.sourceItemRevision = nil
-        newlyFixed.start = moveStart.addingTimeInterval(60)
-        newlyFixed.end = moveStart.addingTimeInterval(300)
-        newlyFixed.isFlexible = false
-        newlyFixed.isHardConstraint = true
-        newlyFixed.syncOrigin = .local
-        let first = Self.planner(
+        let planner = Self.planner(
             persistence: context.persistence,
-            blocks: [block, newlyFixed],
+            blocks: [block],
             canonicalItems: [try Self.canonicalItem()],
             pendingExecutionDeferIntent: intent,
             executionState: durable
         )
-        first.flushPersistence()
-        let restored = PlannerStore(persistence: context.persistence, now: { Self.baseDate })
-        let snapshot = DayWeaveExecutionSnapshot(
-            revision: paused.revision,
-            activeSession: paused
+        let updatedAt = Self.baseDate.addingTimeInterval(20)
+        let newer = try Self.session(
+            id: paused.id,
+            status: .paused,
+            revision: 4,
+            sessionIndex: paused.sessionIndex,
+            plannedBlockID: Self.blockID,
+            startedAt: paused.startedAt,
+            updatedAt: updatedAt,
+            accumulatedSeconds: 20,
+            actualSeconds: nil,
+            runningSince: nil,
+            pausedAt: updatedAt,
+            pauseUntil: nil,
+            endedAt: nil
         )
+        let freshAssessment = Self.deferAssessment(
+            session: newer,
+            executionRevision: 4,
+            moveStart: moveStart,
+            digestByte: "b",
+            approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(300)
+        )
+        let snapshot = DayWeaveExecutionSnapshot(revision: 4, activeSession: newer)
         let transport = ExecutionTransportDouble(
             snapshots: [snapshot, snapshot],
-            pages: [.init(sessions: [paused], nextOffset: nil)]
+            pages: [.init(sessions: [newer], nextOffset: nil)],
+            assessmentReplies: [.assessment(freshAssessment)]
         )
 
         #expect(await Self.controller(
-            planner: restored,
+            planner: planner,
             transport: transport
-        ).refresh() == .conflict)
-        #expect(restored.pendingExecutionDeferIntent == nil)
-        #expect(restored.executionState.activeSession == paused)
+        ).refresh() == .approvalRequired)
+        let reassessed = try #require(planner.pendingExecutionDeferIntent)
+        #expect(reassessed.moveStart == moveStart)
+        #expect(reassessed.assessment == freshAssessment)
+        #expect(reassessed.approvedAssessmentDigest == nil)
+        #expect(planner.executionState.activeSession == newer)
         #expect(await transport.receivedCommands().isEmpty)
     }
 
@@ -1270,14 +1615,14 @@ struct ExecutionSyncStoreTests {
             sourceStart: Self.baseDate,
             sourceEnd: Self.baseDate.addingTimeInterval(1_800),
             moveStart: moveStart,
-            approvedMoveEnd: moveStart.addingTimeInterval(1_790),
+            approvedMoveEnd: moveStart,
             approvedDeadlines: [],
             deadlineConflictApproved: false,
             approvedFixedConflicts: [],
             fixedConflictApproved: false,
             sourceOverrideApproved: false,
             createdAt: Self.baseDate,
-            expiresAt: Self.baseDate.addingTimeInterval(1_800)
+            expiresAt: moveStart
         )
         var durable = Self.emptyBoundState
         durable.revision = paused.revision
@@ -1329,21 +1674,19 @@ struct ExecutionSyncStoreTests {
             pausedAt: pausedAt, pauseUntil: nil, endedAt: nil
         )
         let moveStart = Self.baseDate.addingTimeInterval(3_600)
-        let command = DayWeaveExecutionCommand.deferWork(
-            sessionID: sessionID,
-            moveStart: moveStart,
-            moveEnd: moveStart.addingTimeInterval(1_500),
-            actualSeconds: 300
+        let legacyBytes = Data(
+            """
+            {"command":{"actual_seconds":300,"move_end":"\(Self.format(moveStart.addingTimeInterval(1_500)))","move_start":"\(Self.format(moveStart))","session_id":"\(sessionID.uuidString.lowercased())","type":"defer"},"expected_revision":2}
+            """.utf8
         )
+        let command = try DayWeaveExecutionWireCodec.decode(legacyBytes).command
         let pending = DayWeavePendingExecutionCommand(
             idempotencyKey: "mac-execution-superseded-defer",
             bindingIdentifier: Self.binding,
             expectedRevision: 2,
             identity: .init(session: paused),
             command: command,
-            encodedRequest: try DayWeaveExecutionWireCodec.encode(.init(
-                expectedRevision: 2, command: command
-            )),
+            encodedRequest: legacyBytes,
             priorSession: paused,
             focusedBlockID: Self.blockID,
             canonicalProjectionEligibleAtLeaseStart: false,
@@ -1354,14 +1697,14 @@ struct ExecutionSyncStoreTests {
             sourceStart: Self.baseDate,
             sourceEnd: Self.baseDate.addingTimeInterval(1_800),
             moveStart: moveStart,
-            approvedMoveEnd: moveStart.addingTimeInterval(1_500),
+            approvedMoveEnd: moveStart,
             approvedDeadlines: [],
             deadlineConflictApproved: false,
             approvedFixedConflicts: [],
             fixedConflictApproved: false,
             sourceOverrideApproved: false,
             createdAt: pausedAt,
-            expiresAt: min(moveStart, pausedAt.addingTimeInterval(86_400))
+            expiresAt: moveStart
         )
         let completedAt = pausedAt.addingTimeInterval(2)
         let completed = try Self.session(
@@ -1409,8 +1752,8 @@ struct ExecutionSyncStoreTests {
         #expect(planner.deferredExecutionPublicationSessionIDs.isEmpty)
     }
 
-    @Test("an expired saved move intent clears without resuming or moving the paused lease")
-    func expiredDeferIntentLeavesExactLeasePaused() async throws {
+    @Test("an expired assessment after 24 hours preserves the target and reassesses")
+    func expiredAssessmentPreservesLongLivedTarget() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
         let sessionID = Self.uuid(1_131)
@@ -1421,21 +1764,32 @@ struct ExecutionSyncStoreTests {
             accumulatedSeconds: 20, actualSeconds: nil, runningSince: nil,
             pausedAt: pausedAt, pauseUntil: nil, endedAt: nil
         )
-        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+        let moveStart = Self.baseDate.addingTimeInterval(48 * 60 * 60)
+        let expiredAssessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "a",
+            approvalRequired: true,
+            expiresAt: Self.baseDate.addingTimeInterval(5 * 60)
+        )
         let intent = DayWeavePendingExecutionDeferIntent(
             identity: .init(session: paused), focusedBlockID: Self.blockID,
             sourceStart: Self.baseDate,
             sourceEnd: Self.baseDate.addingTimeInterval(1_800),
             moveStart: moveStart,
-            approvedMoveEnd: moveStart.addingTimeInterval(1_780),
+            approvedMoveEnd: moveStart,
             approvedDeadlines: [],
             deadlineConflictApproved: false,
             approvedFixedConflicts: [],
             fixedConflictApproved: false,
             sourceOverrideApproved: false,
+            assessment: expiredAssessment,
+            approvedAssessmentDigest: expiredAssessment.assessmentDigest,
             createdAt: Self.baseDate,
-            expiresAt: Self.baseDate.addingTimeInterval(100)
+            expiresAt: moveStart
         )
+        #expect(intent.hasValidShape)
         var durable = Self.emptyBoundState
         durable.revision = 2
         durable.activeSession = paused
@@ -1450,54 +1804,149 @@ struct ExecutionSyncStoreTests {
             pendingExecutionDeferIntent: intent, executionState: durable
         )
         let snapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: paused)
+        let observedAt = Self.baseDate.addingTimeInterval(25 * 60 * 60)
+        let freshAssessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "b",
+            approvalRequired: true,
+            expiresAt: observedAt.addingTimeInterval(5 * 60)
+        )
         let transport = ExecutionTransportDouble(
             snapshots: [snapshot, snapshot],
-            pages: [.init(sessions: [paused], nextOffset: nil)]
+            pages: [.init(sessions: [paused], nextOffset: nil)],
+            assessmentReplies: [.assessment(freshAssessment)]
         )
 
         #expect(await Self.controller(
             planner: planner,
             transport: transport,
-            now: { Self.baseDate.addingTimeInterval(200) }
-        ).refresh() == .success)
-        #expect(planner.pendingExecutionDeferIntent == nil)
+            now: { observedAt }
+        ).refresh() == .approvalRequired)
+        #expect(planner.pendingExecutionDeferIntent?.moveStart == moveStart)
+        #expect(planner.pendingExecutionDeferIntent?.expiresAt == moveStart)
+        #expect(planner.pendingExecutionDeferIntent?.assessment == freshAssessment)
+        #expect(planner.pendingExecutionDeferIntent?.approvedAssessmentDigest == nil)
         #expect(planner.executionState.activeSession == paused)
         #expect(planner.blocks.first?.status == .paused)
         #expect(await transport.receivedCommands().isEmpty)
     }
 
-    @Test("Defer preflight rejects microsecond duration and finish-after-deadline before pausing")
-    func deferPreflightRejectsUnsupportedDurationAndEndDeadline() async throws {
-        for deadlineOnly in [false, true] {
-            let context = try Self.persistenceContext()
-            defer { try? FileManager.default.removeItem(at: context.directory) }
-            let active = try Self.activeSession(sessionID: Self.uuid(deadlineOnly ? 1_124 : 1_123))
-            var block = Self.block()
-            block.status = .active
-            if !deadlineOnly { block.end.addTimeInterval(0.000_001) }
-            var durable = Self.emptyBoundState
-            durable.revision = 1
-            durable.activeSession = active
-            durable.historyWindow = [active]
-            durable.historyWindowRevision = 1
-            durable.presentedBlockIDs = [Self.blockID]
-            let planner = Self.planner(
-                persistence: context.persistence,
-                blocks: [block], canonicalItems: [try Self.canonicalItem()],
-                executionState: durable
-            )
-            let transport = Self.emptyReadTransport()
-            let moveStart = Self.baseDate.addingTimeInterval(3_600)
-            let outcome = await Self.controller(planner: planner, transport: transport).deferWork(
-                Self.blockID,
-                moveStart: moveStart,
-                latestFinish: deadlineOnly ? moveStart.addingTimeInterval(900) : nil
-            )
+    @Test("an assessment-free restored target inside the safety margin clears before Pause")
+    func restoredTargetInsideSafetyMarginClearsBeforePause() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_150))
+        let moveStart = Self.baseDate.addingTimeInterval(10 * 60)
+        let intent = Self.deferIntent(session: paused, moveStart: moveStart)
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            pendingExecutionDeferIntent: intent,
+            executionState: durable
+        )
+        let transport = Self.emptyReadTransport()
 
-            #expect(outcome == .invalidLocalState)
-            #expect(await transport.receivedCommands().isEmpty)
-            #expect(planner.pendingExecutionDeferIntent == nil)
-        }
+        #expect(await Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { Self.baseDate.addingTimeInterval(60) }
+        ).deferWork(Self.blockID, moveStart: moveStart) == .invalidLocalState)
+        #expect(planner.pendingExecutionDeferIntent == nil)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(await transport.receivedCommands().isEmpty)
+        #expect(await transport.receivedAssessmentRequests().isEmpty)
+    }
+
+    @Test("fresh bypass evidence expiring before staging clears without reassessment")
+    func freshAssessmentExpiryDuringDeferClearsTarget() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(1_151))
+        let moveStart = Self.baseDate.addingTimeInterval(10 * 60)
+        let assessment = Self.deferAssessment(
+            session: paused,
+            executionRevision: paused.revision,
+            moveStart: moveStart,
+            digestByte: "f",
+            approvalRequired: false,
+            expiresAt: Self.baseDate.addingTimeInterval(61)
+        )
+        let intent = Self.deferIntent(
+            session: paused,
+            moveStart: moveStart,
+            assessment: assessment
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = paused.revision
+        durable.activeSession = paused
+        durable.historyWindow = [paused]
+        durable.historyWindowRevision = paused.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            pendingExecutionDeferIntent: intent,
+            executionState: durable
+        )
+        let transport = Self.emptyReadTransport()
+        let clock = ExecutionSequenceClock([
+            Self.baseDate.addingTimeInterval(60),
+            Self.baseDate.addingTimeInterval(62),
+        ])
+
+        #expect(await Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { clock.now() }
+        ).deferWork(Self.blockID, moveStart: moveStart) == .invalidLocalState)
+        #expect(planner.pendingExecutionDeferIntent == nil)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(await transport.receivedCommands().isEmpty)
+        #expect(await transport.receivedAssessmentRequests().isEmpty)
+    }
+
+    @Test("Defer preflight rejects a non-whole-second source duration before pausing")
+    func deferPreflightRejectsUnsupportedDuration() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let active = try Self.activeSession(sessionID: Self.uuid(1_123))
+        var block = Self.block()
+        block.status = .active
+        block.end.addTimeInterval(0.000_001)
+        var durable = Self.emptyBoundState
+        durable.revision = 1
+        durable.activeSession = active
+        durable.historyWindow = [active]
+        durable.historyWindowRevision = 1
+        durable.presentedBlockIDs = [Self.blockID]
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block], canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let transport = Self.emptyReadTransport()
+        let moveStart = Self.baseDate.addingTimeInterval(3_600)
+
+        #expect(await Self.controller(planner: planner, transport: transport).deferWork(
+            Self.blockID,
+            moveStart: moveStart
+        ) == .invalidLocalState)
+        #expect(await transport.receivedCommands().isEmpty)
+        #expect(planner.pendingExecutionDeferIntent == nil)
         #expect(dayWeavePostgresEpochMicroseconds(
             Date(timeIntervalSince1970: Double.greatestFiniteMagnitude)
         ) == nil)
@@ -1506,42 +1955,134 @@ struct ExecutionSyncStoreTests {
         ) == nil)
     }
 
-    @Test("an exact Defer cannot target another day without a target-day schedule review")
-    func deferRejectsCrossDayTargetBeforePause() async throws {
+    @Test("new Defer targets require the assessment TTL plus one aligned safety slot")
+    func deferTargetSafetyBoundary() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
-        let sessionID = Self.uuid(1_127)
-        let active = try Self.activeSession(sessionID: sessionID)
+        let active = try Self.activeSession(sessionID: Self.uuid(1_147))
         var durable = Self.emptyBoundState
-        durable.revision = 1
+        durable.revision = active.revision
         durable.activeSession = active
         durable.historyWindow = [active]
-        durable.historyWindowRevision = 1
+        durable.historyWindowRevision = active.revision
         durable.presentedBlockIDs = [Self.blockID]
         var block = Self.block()
         block.status = .active
         let planner = Self.planner(
             persistence: context.persistence,
-            blocks: [block], canonicalItems: [try Self.canonicalItem()],
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
             executionState: durable
         )
-        let transport = Self.emptyReadTransport()
-        // This remains inside the fixture's 24-hour publication horizon, but
-        // lands on the next UTC calendar day. Exact overlap approval is not
-        // valid across that day boundary.
-        let nextDay = Self.baseDate.addingTimeInterval(18 * 3_600)
+        let activeSnapshot = DayWeaveExecutionSnapshot(
+            revision: active.revision,
+            activeSession: active
+        )
+        let transport = ExecutionTransportDouble(
+            snapshots: [activeSnapshot, activeSnapshot],
+            pages: [.init(sessions: [active], nextOffset: nil)],
+            commandReplies: [.failure(.transport(.networkConnectionLost))]
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { Self.baseDate }
+        )
 
-        #expect(await Self.controller(planner: planner, transport: transport).deferWork(
+        #expect(await sync.deferWork(
             Self.blockID,
-            moveStart: nextDay
+            moveStart: Self.baseDate.addingTimeInterval(5 * 60)
+        ) == .invalidLocalState)
+        #expect(await sync.deferWork(
+            Self.blockID,
+            moveStart: Self.baseDate.addingTimeInterval(10 * 60 + 1)
         ) == .invalidLocalState)
         #expect(await transport.receivedCommands().isEmpty)
-        #expect(planner.pendingExecutionDeferIntent == nil)
-        #expect(planner.executionState.activeSession == active)
+
+        let exactMinimum = Self.baseDate.addingTimeInterval(10 * 60)
+        #expect(await sync.deferWork(
+            Self.blockID,
+            moveStart: exactMinimum
+        ) == .transientNetworkFailure)
+        #expect(planner.pendingExecutionDeferIntent?.moveStart == exactMinimum)
+        #expect(planner.pendingExecutionDeferIntent?.expiresAt == exactMinimum)
+        #expect((await transport.receivedCommands()).count == 1)
     }
 
-    @Test("Defer rejects a custom recurrence before saving intent or pausing")
-    func deferRejectsCustomOccurrenceIdentityBeforeMutation() async throws {
+    @Test("a boundary target losing its margin during Pause never requests assessment")
+    func deferBoundaryClockAdvanceDuringPauseCancelsIntent() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sessionID = Self.uuid(1_152)
+        let active = try Self.activeSession(sessionID: sessionID)
+        let pausedAt = Self.baseDate.addingTimeInterval(1)
+        let paused = try Self.session(
+            id: sessionID,
+            status: .paused,
+            revision: 2,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate,
+            updatedAt: pausedAt,
+            accumulatedSeconds: 1,
+            actualSeconds: nil,
+            runningSince: nil,
+            pausedAt: pausedAt,
+            pauseUntil: nil,
+            endedAt: nil
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = active.revision
+        durable.activeSession = active
+        durable.historyWindow = [active]
+        durable.historyWindowRevision = active.revision
+        durable.presentedBlockIDs = [Self.blockID]
+        var block = Self.block()
+        block.status = .active
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [block],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let activeSnapshot = DayWeaveExecutionSnapshot(revision: 1, activeSession: active)
+        let pausedSnapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: paused)
+        let clock = ExecutionSequenceClock([Self.baseDate])
+        let transport = ExecutionTransportDouble(
+            snapshots: [
+                activeSnapshot, activeSnapshot,
+                pausedSnapshot, pausedSnapshot,
+            ],
+            pages: [
+                .init(sessions: [active], nextOffset: nil),
+                .init(sessions: [paused], nextOffset: nil),
+            ],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: 2,
+                active: paused,
+                changed: paused,
+                replayed: false
+            ))],
+            onCommandReceived: {
+                clock.advance(to: Self.baseDate.addingTimeInterval(1))
+            }
+        )
+        let moveStart = Self.baseDate.addingTimeInterval(10 * 60)
+
+        #expect(await Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { clock.now() }
+        ).deferWork(Self.blockID, moveStart: moveStart) == .invalidLocalState)
+        #expect(planner.pendingExecutionDeferIntent == nil)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(planner.executionState.pendingCommand == nil)
+        #expect((await transport.receivedCommands()).count == 1)
+        #expect(await transport.receivedAssessmentRequests().isEmpty)
+    }
+
+    @Test("authoritative active work defers despite stale pinned recurrence policy")
+    func deferAuthoritativePinnedOccurrenceDespiteLocalPolicy() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
         let sessionID = Self.uuid(1_126)
@@ -1563,6 +2104,9 @@ struct ExecutionSyncStoreTests {
         )
         var block = Self.block(occurrenceID: Self.occurrenceID)
         block.status = .active
+        block.isFlexible = false
+        block.isHardConstraint = true
+        block.previewKind = "pinned"
         block.recurrenceMoveSource = RecurrenceMoveSource(
             itemRevision: 1,
             identity: .custom,
@@ -1583,14 +2127,20 @@ struct ExecutionSyncStoreTests {
             canonicalItems: [try Self.canonicalItem()],
             executionState: durable
         )
-        let transport = Self.emptyReadTransport()
+        let activeSnapshot = DayWeaveExecutionSnapshot(revision: 1, activeSession: active)
+        let transport = ExecutionTransportDouble(
+            snapshots: [activeSnapshot, activeSnapshot],
+            pages: [.init(sessions: [active], nextOffset: nil)],
+            commandReplies: [.failure(.transport(.networkConnectionLost))]
+        )
 
         #expect(await Self.controller(planner: planner, transport: transport).deferWork(
             Self.blockID,
             moveStart: Self.baseDate.addingTimeInterval(3_600)
-        ) == .invalidLocalState)
-        #expect(await transport.receivedCommands().isEmpty)
-        #expect(planner.pendingExecutionDeferIntent == nil)
+        ) == .transientNetworkFailure)
+        #expect((await transport.receivedCommands()).count == 1)
+        #expect(planner.pendingExecutionDeferIntent?.moveStart
+            == Self.baseDate.addingTimeInterval(3_600))
         #expect(planner.executionState.activeSession == active)
     }
 
@@ -2548,6 +3098,95 @@ struct ExecutionSyncStoreTests {
         )
     }
 
+    private static func deferAssessment(
+        session: DayWeaveExecutionSession,
+        executionRevision: UInt64,
+        moveStart: Date,
+        digestByte: Character,
+        approvalRequired: Bool,
+        expiresAt: Date
+    ) -> DayWeaveDeferAssessment {
+        let planned: UInt64 = 1_800
+        let actual = session.accumulatedSeconds
+        let roundedMinutes = actual / 60 + (actual % 60 == 0 ? 0 : 1)
+        let credited = min(planned, roundedMinutes * 60)
+        let remaining = planned - credited
+        let conflicts: [DayWeaveDeferViolation]
+        if approvalRequired {
+            let conflictID = uuid(Int(executionRevision) + 8_000)
+            let conflict = DayWeaveDeferConflict(
+                blockID: conflictID,
+                itemID: nil,
+                occurrenceID: nil,
+                externalBlockID: nil,
+                kind: .calendarEvent,
+                start: moveStart.addingTimeInterval(60),
+                end: moveStart.addingTimeInterval(300)
+            )
+            conflicts = [DayWeaveDeferViolation(
+                code: .immutableOverlap,
+                itemIDs: [],
+                occurrenceIDs: [],
+                conflictingBlockIDs: [conflictID],
+                conflictingBlocks: [conflict],
+                start: moveStart,
+                end: moveStart.addingTimeInterval(TimeInterval(remaining)),
+                boundaryStart: nil,
+                boundaryEnd: nil,
+                message: "The exact placement overlaps immutable time"
+            )]
+        } else {
+            conflicts = []
+        }
+        return DayWeaveDeferAssessment(
+            sessionID: session.id,
+            executionRevision: executionRevision,
+            sessionRevision: session.revision,
+            itemID: session.itemID,
+            itemRevision: session.itemRevision,
+            occurrenceID: session.occurrenceID,
+            sourceSessionIndex: session.sessionIndex,
+            replacementSessionIndex: session.sessionIndex + 1,
+            sourceScheduleRevisionID: uuid(Int(executionRevision) + 9_000),
+            sourceBlockID: session.plannedBlockID ?? blockID,
+            actualSeconds: actual,
+            creditedSourceSeconds: credited,
+            plannedDurationSeconds: planned,
+            remainingDurationSeconds: remaining,
+            moveStart: moveStart,
+            moveEnd: moveStart.addingTimeInterval(TimeInterval(remaining)),
+            environmentDigest: "sha256:\(String(repeating: "c", count: 64))",
+            assessmentDigest: "sha256:\(String(repeating: digestByte, count: 64))",
+            approvalRequired: approvalRequired,
+            violations: conflicts,
+            expiresAt: expiresAt
+        )
+    }
+
+    private static func deferIntent(
+        session: DayWeaveExecutionSession,
+        moveStart: Date,
+        assessment: DayWeaveDeferAssessment? = nil
+    ) -> DayWeavePendingExecutionDeferIntent {
+        DayWeavePendingExecutionDeferIntent(
+            identity: .init(session: session),
+            focusedBlockID: blockID,
+            sourceStart: baseDate,
+            sourceEnd: baseDate.addingTimeInterval(1_800),
+            moveStart: moveStart,
+            approvedMoveEnd: moveStart,
+            approvedDeadlines: [],
+            deadlineConflictApproved: false,
+            approvedFixedConflicts: [],
+            fixedConflictApproved: false,
+            sourceOverrideApproved: false,
+            assessment: assessment,
+            approvedAssessmentDigest: nil,
+            createdAt: baseDate,
+            expiresAt: moveStart
+        )
+    }
+
     private static func session(
         id: UUID,
         status: DayWeaveExecutionStatus,
@@ -2700,9 +3339,37 @@ struct ExecutionSyncStoreTests {
     }
 }
 
+private final class ExecutionSequenceClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var dates: [Date]
+
+    init(_ dates: [Date]) {
+        precondition(!dates.isEmpty)
+        self.dates = dates
+    }
+
+    func now() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        guard dates.count > 1 else { return dates[0] }
+        return dates.removeFirst()
+    }
+
+    func advance(to date: Date) {
+        lock.lock()
+        dates = [date]
+        lock.unlock()
+    }
+}
+
 private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
     enum Reply: Sendable {
         case mutation(DayWeaveExecutionMutation)
+        case failure(DayWeaveAPIError)
+    }
+
+    enum AssessmentReply: Sendable {
+        case assessment(DayWeaveDeferAssessment)
         case failure(DayWeaveAPIError)
     }
 
@@ -2714,28 +3381,38 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
     private var snapshots: [DayWeaveExecutionSnapshot]
     private var pages: [DayWeaveExecutionHistoryPage]
     private var commandReplies: [Reply]
+    private var assessmentReplies: [AssessmentReply]
     private var offsets: [Int] = []
     private var commands: [ReceivedCommand] = []
+    private var assessmentRequests: [DayWeaveDeferAssessmentRequest] = []
     private var snapshotCount = 0
+    private var lastSnapshot: DayWeaveExecutionSnapshot?
     private let snapshotDelay: Duration?
+    private let onCommandReceived: (@Sendable () -> Void)?
 
     init(
         snapshots: [DayWeaveExecutionSnapshot],
         pages: [DayWeaveExecutionHistoryPage],
         commandReplies: [Reply] = [],
-        snapshotDelay: Duration? = nil
+        assessmentReplies: [AssessmentReply] = [],
+        snapshotDelay: Duration? = nil,
+        onCommandReceived: (@Sendable () -> Void)? = nil
     ) {
         self.snapshots = snapshots
         self.pages = pages
         self.commandReplies = commandReplies
+        self.assessmentReplies = assessmentReplies
         self.snapshotDelay = snapshotDelay
+        self.onCommandReceived = onCommandReceived
     }
 
     func executionSnapshot() async throws -> DayWeaveExecutionSnapshot {
         snapshotCount += 1
         if let snapshotDelay { try await Task.sleep(for: snapshotDelay) }
         guard !snapshots.isEmpty else { throw DayWeaveAPIError.responseDecodingFailed }
-        return snapshots.removeFirst()
+        let snapshot = snapshots.removeFirst()
+        lastSnapshot = snapshot
+        return snapshot
     }
 
     func executionHistoryPage(limit: Int, offset: Int) async throws
@@ -2753,11 +3430,66 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
         try DayWeaveExecutionWireCodec.encode(request)
     }
 
+    func assessExecutionDefer(
+        _ request: DayWeaveDeferAssessmentRequest
+    ) async throws -> DayWeaveDeferAssessment {
+        assessmentRequests.append(request)
+        if !assessmentReplies.isEmpty {
+            switch assessmentReplies.removeFirst() {
+            case let .assessment(assessment): return assessment
+            case let .failure(error): throw error
+            }
+        }
+        guard let session = lastSnapshot?.activeSession,
+              session.id == request.sessionID,
+              session.status == .paused,
+              let sourceBlockID = session.plannedBlockID,
+              session.sessionIndex < UInt16.max else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        let planned: UInt64 = 1_800
+        let actual = request.actualSeconds ?? session.accumulatedSeconds
+        let roundedMinutes = actual / 60 + (actual % 60 == 0 ? 0 : 1)
+        let credited = min(planned, roundedMinutes * 60)
+        guard credited < planned else { throw DayWeaveAPIError.responseDecodingFailed }
+        let remaining = planned - credited
+        let scheduleRevisionID = UUID(
+            uuidString: "10000000-0000-4000-8000-000000000001"
+        )!
+        return DayWeaveDeferAssessment(
+            sessionID: session.id,
+            executionRevision: request.expectedRevision,
+            sessionRevision: session.revision,
+            itemID: session.itemID,
+            itemRevision: session.itemRevision,
+            occurrenceID: session.occurrenceID,
+            sourceSessionIndex: session.sessionIndex,
+            replacementSessionIndex: session.sessionIndex + 1,
+            sourceScheduleRevisionID: scheduleRevisionID,
+            sourceBlockID: sourceBlockID,
+            actualSeconds: actual,
+            creditedSourceSeconds: credited,
+            plannedDurationSeconds: planned,
+            remainingDurationSeconds: remaining,
+            moveStart: request.moveStart,
+            moveEnd: request.moveStart.addingTimeInterval(TimeInterval(remaining)),
+            environmentDigest: "sha256:\(String(repeating: "c", count: 64))",
+            assessmentDigest: "sha256:\(String(repeating: "d", count: 64))",
+            approvalRequired: false,
+            violations: [],
+            expiresAt: min(
+                request.moveStart.addingTimeInterval(-1),
+                session.updatedAt.addingTimeInterval(5 * 60)
+            )
+        )
+    }
+
     func applyExecutionCommand(
         encodedRequest: Data,
         idempotencyKey: String
     ) async throws -> DayWeaveExecutionMutation {
         commands.append(.init(body: encodedRequest, key: idempotencyKey))
+        onCommandReceived?()
         guard !commandReplies.isEmpty else { throw DayWeaveAPIError.responseDecodingFailed }
         switch commandReplies.removeFirst() {
         case let .mutation(mutation): return mutation
@@ -2767,6 +3499,9 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
 
     func requestedOffsets() -> [Int] { offsets }
     func receivedCommands() -> [ReceivedCommand] { commands }
+    func receivedAssessmentRequests() -> [DayWeaveDeferAssessmentRequest] {
+        assessmentRequests
+    }
     func snapshotRequestCount() -> Int { snapshotCount }
 }
 #endif

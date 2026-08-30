@@ -5,6 +5,31 @@ import Testing
 
 @Suite("Will-do-later timing")
 struct WillDoLaterTimingTests {
+    @Test("execution targets retain the assessment TTL plus one full slot")
+    func executionTargetSafetyBoundary() throws {
+        let onGrid = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-30T10:00:00Z")
+        )
+        let justAfterGrid = onGrid.addingTimeInterval(1)
+
+        #expect(
+            WillDoLaterTiming.minimumExecutionMoveStart(after: onGrid)
+                == onGrid.addingTimeInterval(10 * 60)
+        )
+        #expect(
+            WillDoLaterTiming.minimumExecutionMoveStart(after: justAfterGrid)
+                == onGrid.addingTimeInterval(15 * 60)
+        )
+        #expect(!DayWeaveExecutionDeferTiming.isValidNewMoveStart(
+            onGrid.addingTimeInterval(5 * 60),
+            now: onGrid
+        ))
+        #expect(DayWeaveExecutionDeferTiming.isValidNewMoveStart(
+            onGrid.addingTimeInterval(10 * 60),
+            now: onGrid
+        ))
+    }
+
     @Test("tomorrow morning follows the profile timezone across spring DST")
     func profileTomorrowAcrossDST() throws {
         let reference = try #require(ISO8601DateFormatter().date(from: "2026-03-28T22:00:00Z"))
