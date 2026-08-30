@@ -544,6 +544,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dayweave-compose"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "dayweave-core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "dayweave-core"
 version = "0.1.0"
 dependencies = [
