@@ -168,6 +168,7 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::execution::PauseExecution,
         crate::execution::ResumeExecution,
         crate::execution::FinishExecution,
+        crate::execution::DeferExecution,
         crate::execution::ExecutionSnapshot,
         crate::execution::ExecutionMutation,
         crate::execution::http::ExecutionCommandRequest,

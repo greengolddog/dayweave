@@ -286,6 +286,142 @@ struct CanonicalSyncStoreTests {
         #expect(planner.lastScheduleMessage.contains("sync to retry"))
     }
 
+    @Test("superseded execution journals never publish canonical status writes")
+    func testSupersededExecutionJournalIsNetworkQuiet() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        for activeWinner in [false, true] {
+            let suffix = activeWinner ? "active" : "deferred"
+            let token = "canonical-superseded-execution-\(suffix)-token"
+            let itemID = UUID(
+                uuidString: activeWinner
+                    ? "22000000-2222-4333-8444-200000000010"
+                    : "22000000-2222-4333-8444-200000000011"
+            )!
+            let oldSessionID = UUID(
+                uuidString: activeWinner
+                    ? "22000000-2222-4333-8444-200000000012"
+                    : "22000000-2222-4333-8444-200000000013"
+            )!
+            let winnerSessionID = UUID(
+                uuidString: activeWinner
+                    ? "22000000-2222-4333-8444-200000000014"
+                    : "22000000-2222-4333-8444-200000000015"
+            )!
+            let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+            let block = Self.block(
+                itemID: itemID,
+                revision: 1,
+                start: now.addingTimeInterval(3_600)
+            )
+            let old = try Self.executionSession(
+                id: oldSessionID,
+                itemID: itemID,
+                plannedBlockID: block.id,
+                status: .completed,
+                startedAt: activeWinner
+                    ? now.addingTimeInterval(100) : now.addingTimeInterval(-100)
+            )
+            let winner = try Self.executionSession(
+                id: winnerSessionID,
+                itemID: itemID,
+                plannedBlockID: block.id,
+                status: activeWinner ? .active : .deferred,
+                startedAt: activeWinner
+                    ? now.addingTimeInterval(-100) : now
+            )
+            var execution = DayWeaveExecutionDurableState.empty
+            execution.deviceID = UUID(
+                uuidString: "22000000-2222-4333-8444-200000000016"
+            )!
+            execution.revision = old.revision + winner.revision
+            execution.activeSession = activeWinner ? winner : nil
+            execution.historyWindow = activeWinner ? [old, winner] : [winner, old]
+            execution.historyWindowRevision = execution.revision
+            execution.historyContinuityEstablished = true
+            execution.historyVerified = true
+            execution.terminalOutcomes[old.id] = .init(
+                session: old,
+                recordedAt: old.updatedAt,
+                projection: activeWinner ? .pending : .notRequired
+            )
+            if !activeWinner {
+                execution.terminalOutcomes[winner.id] = .init(
+                    session: winner,
+                    recordedAt: winner.updatedAt,
+                    projection: .notRequired
+                )
+            }
+            let mutation = PendingCanonicalMutation(
+                id: UUID(
+                    uuidString: activeWinner
+                        ? "22000000-2222-4333-8444-200000000017"
+                        : "22000000-2222-4333-8444-200000000018"
+                )!,
+                itemID: itemID,
+                occurrenceID: nil,
+                sessionIndex: 0,
+                desiredStatus: .completed,
+                baseRevision: 1,
+                createdAt: old.updatedAt,
+                disposition: .pending,
+                diagnostic: nil,
+                executionSessionID: old.id
+            )
+            let planner = PlannerStore(
+                blocks: [block],
+                canonicalItems: [item],
+                canonicalDeltaCursor: "superseded-\(suffix)-before",
+                pendingCanonicalMutations: [mutation],
+                canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+                executionState: execution,
+                restoreFromPersistence: false,
+                now: { now }
+            )
+            #expect(!planner.canPublishCanonicalMutation(mutation))
+            URLProtocolStub.storage.reset(key: token)
+            URLProtocolStub.storage.enqueue(
+                key: token,
+                .init(
+                    statusCode: 200,
+                    body: Data(
+                        #"{"changes":[],"next_cursor":"superseded-after","has_more":false}"#.utf8
+                    )
+                ),
+                .init(
+                    statusCode: 200,
+                    body: Data(
+                        Self.emptyPreviewObject(sourceRevisions: [itemID: 1]).utf8
+                    )
+                )
+            )
+            URLProtocolStub.storage.enqueueSchedulePublication(
+                key: token,
+                .init(
+                    statusCode: 200,
+                    body: Self.publicationResponse(
+                        inputDigest: Self.emptyInputDigest,
+                        now: now,
+                        replayed: false
+                    )
+                )
+            )
+
+            let sync = Self.makeSync(planner: planner, token: token, now: now)
+            await sync.sync()
+
+            #expect(planner.pendingCanonicalMutations == [mutation])
+            #expect(sync.warnings.contains { $0.contains("retained without another write") })
+            let requests = URLProtocolStub.storage.requests(
+                for: token,
+                includingSchedulePublication: true
+            )
+            #expect(!requests.contains {
+                $0.method == "PUT" && $0.url.path.contains("/v1/items/")
+            })
+            #expect(requests.map(\.method) == ["GET", "POST", "POST"])
+        }
+    }
+
     @Test("privacy edits are revision-guarded, stable, and safely rebase a local status edit")
     func testSensitivityEditRebasesStatusIntent() async throws {
         let token = "canonical-sensitive-edit-token"
@@ -3187,6 +3323,49 @@ struct CanonicalSyncStoreTests {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try decoder.decode(DayWeaveCanonicalItem.self, from: Data(object.utf8))
+    }
+
+    private static func executionSession(
+        id: UUID,
+        itemID: UUID,
+        plannedBlockID: UUID,
+        status: DayWeaveExecutionStatus,
+        startedAt: Date
+    ) throws -> DayWeaveExecutionSession {
+        let revision: Int = status == .active ? 1 : 2
+        let updatedAt = status == .active
+            ? startedAt : startedAt.addingTimeInterval(1)
+        var object: [String: Any] = [
+            "id": id.uuidString.lowercased(),
+            "item_id": itemID.uuidString.lowercased(),
+            "item_revision": 1,
+            "occurrence_id": NSNull(),
+            "session_index": 0,
+            "planned_block_id": plannedBlockID.uuidString.lowercased(),
+            "source_device_id": "22000000-2222-4333-8444-200000000016",
+            "status": status.rawValue,
+            "revision": revision,
+            "accumulated_seconds": status == .active ? 0 : 1,
+            "actual_seconds": status == .active ? NSNull() : 1,
+            "started_at": wireTimestamp(startedAt),
+            "running_since": status == .active ? wireTimestamp(startedAt) : NSNull(),
+            "paused_at": NSNull(),
+            "pause_until": NSNull(),
+            "pause_reason": NSNull(),
+            "ended_at": status == .active ? NSNull() : wireTimestamp(updatedAt),
+            "created_at": wireTimestamp(startedAt),
+            "updated_at": wireTimestamp(updatedAt),
+        ]
+        if status == .deferred {
+            object["move_start"] = wireTimestamp(updatedAt.addingTimeInterval(3_600))
+            object["move_end"] = wireTimestamp(updatedAt.addingTimeInterval(5_400))
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(
+            DayWeaveExecutionSession.self,
+            from: JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        )
     }
 
     private static func block(

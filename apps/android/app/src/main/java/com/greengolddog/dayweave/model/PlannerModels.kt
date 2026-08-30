@@ -314,6 +314,9 @@ data class CanonicalExecutionSessionSnapshot(
     val pauseUntil: String? = null,
     val pauseReason: String? = null,
     val endedAt: String? = null,
+    /** Exact future placement requested when a server-owned session closes as deferred. */
+    val moveStart: String? = null,
+    val moveEnd: String? = null,
     val createdAt: String,
     val updatedAt: String,
     /**
@@ -327,11 +330,11 @@ data class CanonicalExecutionSessionSnapshot(
 )
 
 /**
- * Durable terminal execution fact retained independently from a composed schedule.
+ * Durable closed execution fact retained independently from a composed schedule.
  *
  * A schedule preview is allowed to move or replace blocks, but it cannot erase a server-confirmed
- * completion/skip. One-shot, indivisible leaves additionally project their terminal status through
- * the canonical item replacement fence; recurring and split work remains scoped to this exact
+ * closure. One-shot, indivisible leaves additionally project a completion/skip through the
+ * canonical item replacement fence; deferred, recurring, and split work remain scoped to the exact
  * occurrence/session identity.
  */
 @Serializable
@@ -649,7 +652,7 @@ data class DayWeaveUiState(
     val canonicalExecutionHistoryContinuityEstablished: Boolean = false,
     /** False fences every canonical start until bounded history continuity is proven. */
     val canonicalExecutionHistoryVerified: Boolean = false,
-    /** Bounded ledger preventing a confirmed execution outcome from being recomposed away. */
+    /** Lifetime ledger preventing a confirmed closed execution from being recomposed away. */
     val terminalExecutionOutcomes: Map<String, TerminalExecutionOutcomeSnapshot> = emptyMap(),
     val pendingExecutionCommand: PendingExecutionCommand? = null,
     /** Random device identity generated once and retained only inside encrypted planner state. */
@@ -889,6 +892,33 @@ data class DayWeaveUiState(
         )
     }
 }
+
+/** Fail-closed newest-session test shared by projection and conflict entry points. */
+internal fun DayWeaveUiState.isNewestExecutionForProjection(
+    session: CanonicalExecutionSessionSnapshot,
+): Boolean = runCatching {
+    val active = canonicalExecutionSession?.takeIf { candidate ->
+        candidate.hasSameExecutionProjectionKey(session)
+    }
+    if (active != null) return@runCatching active.id == session.id
+    val newest = terminalExecutionOutcomes.values.asSequence()
+        .map(TerminalExecutionOutcomeSnapshot::session)
+        .filter { candidate -> candidate.hasSameExecutionProjectionKey(session) }
+        .maxWithOrNull(
+            compareBy<CanonicalExecutionSessionSnapshot> {
+                Instant.parse(it.updatedAt)
+            }.thenBy { it.id },
+        )
+    newest?.id == session.id
+}.getOrDefault(false)
+
+private fun CanonicalExecutionSessionSnapshot.hasSameExecutionProjectionKey(
+    other: CanonicalExecutionSessionSnapshot,
+): Boolean =
+    itemId == other.itemId &&
+        itemRevision == other.itemRevision &&
+        occurrenceId == other.occurrenceId &&
+        sessionIndex == other.sessionIndex
 
 /**
  * A durable pending promotion may already have committed remotely. Its target and descendants

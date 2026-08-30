@@ -36,6 +36,8 @@ data class RemoteExecutionSession(
     @SerialName("pause_until") val pauseUntil: String?,
     @SerialName("pause_reason") val pauseReason: String?,
     @SerialName("ended_at") val endedAt: String?,
+    @SerialName("move_start") val moveStart: String? = null,
+    @SerialName("move_end") val moveEnd: String? = null,
     @SerialName("created_at") val createdAt: String,
     @SerialName("updated_at") val updatedAt: String,
 )

@@ -5,8 +5,11 @@ enum DayWeaveExecutionStatus: String, Codable, Equatable, Sendable {
     case paused
     case completed
     case skipped
+    case deferred
 
     var isOpen: Bool { self == .active || self == .paused }
+
+    var isCanonicalTerminal: Bool { self == .completed || self == .skipped }
 }
 
 /// One immutable identity and its server-authoritative timer state.
@@ -31,6 +34,8 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
     let pausedAt: Date?
     let pauseUntil: Date?
     let pauseReason: String?
+    let moveStart: Date?
+    let moveEnd: Date?
     let endedAt: Date?
     let createdAt: Date
     let updatedAt: Date
@@ -52,13 +57,23 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
         case pausedAt = "paused_at"
         case pauseUntil = "pause_until"
         case pauseReason = "pause_reason"
+        case moveStart = "move_start"
+        case moveEnd = "move_end"
         case endedAt = "ended_at"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
 
     init(from decoder: any Decoder) throws {
-        try requireExactExecutionKeys(CodingKeys.self, from: decoder)
+        let optionalMoveKeys = Set([
+            CodingKeys.moveStart.stringValue,
+            CodingKeys.moveEnd.stringValue,
+        ])
+        try requireExecutionKeyShape(
+            required: Set(CodingKeys.allCases.map(\.stringValue)).subtracting(optionalMoveKeys),
+            optional: optionalMoveKeys,
+            from: decoder
+        )
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         itemID = try container.decode(UUID.self, forKey: .itemID)
@@ -76,6 +91,8 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
         pausedAt = try container.decodeIfPresent(Date.self, forKey: .pausedAt)
         pauseUntil = try container.decodeIfPresent(Date.self, forKey: .pauseUntil)
         pauseReason = try container.decodeIfPresent(String.self, forKey: .pauseReason)
+        moveStart = try container.decodeIfPresent(Date.self, forKey: .moveStart)
+        moveEnd = try container.decodeIfPresent(Date.self, forKey: .moveEnd)
         endedAt = try container.decodeIfPresent(Date.self, forKey: .endedAt)
         createdAt = try container.decode(Date.self, forKey: .createdAt)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
@@ -101,6 +118,8 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
         try encodeExecutionNullable(pausedAt, forKey: .pausedAt, into: &container)
         try encodeExecutionNullable(pauseUntil, forKey: .pauseUntil, into: &container)
         try encodeExecutionNullable(pauseReason, forKey: .pauseReason, into: &container)
+        try container.encodeIfPresent(moveStart, forKey: .moveStart)
+        try container.encodeIfPresent(moveEnd, forKey: .moveEnd)
         try encodeExecutionNullable(endedAt, forKey: .endedAt, into: &container)
         try container.encode(createdAt, forKey: .createdAt)
         try container.encode(updatedAt, forKey: .updatedAt)
@@ -812,6 +831,13 @@ private func validateExecutionSession(
             && session.accumulatedSeconds == 0
             && session.runningSince == session.startedAt
             && session.updatedAt == session.startedAt)
+    let deferredMoveIsValid = if let start = session.moveStart, let end = session.moveEnd {
+        start > session.updatedAt
+            && end > start
+            && end <= start.addingTimeInterval(86_400)
+    } else {
+        false
+    }
     let statusStateIsValid: Bool
     switch session.status {
     case .active:
@@ -819,6 +845,8 @@ private func validateExecutionSession(
             && session.pausedAt == nil
             && session.pauseUntil == nil
             && session.pauseReason == nil
+            && session.moveStart == nil
+            && session.moveEnd == nil
             && session.actualSeconds == nil
             && session.endedAt == nil
     case .paused:
@@ -828,14 +856,28 @@ private func validateExecutionSession(
             && session.pauseUntil.map {
                 $0 <= session.updatedAt.addingTimeInterval(86_400)
             } ?? true
+            && session.moveStart == nil
+            && session.moveEnd == nil
             && session.actualSeconds == nil
             && session.endedAt == nil
     case .completed, .skipped:
         statusStateIsValid = session.runningSince == nil
             && session.pauseUntil == nil
             && session.pauseReason == nil
+            && session.moveStart == nil
+            && session.moveEnd == nil
             && session.actualSeconds != nil
             && session.endedAt == session.updatedAt
+            && (session.pausedAt.map {
+                $0 >= session.startedAt && $0 <= session.updatedAt
+            } ?? true)
+    case .deferred:
+        statusStateIsValid = session.runningSince == nil
+            && session.pauseUntil == nil
+            && session.pauseReason == nil
+            && session.actualSeconds != nil
+            && session.endedAt == session.updatedAt
+            && deferredMoveIsValid
             && (session.pausedAt.map {
                 $0 >= session.startedAt && $0 <= session.updatedAt
             } ?? true)

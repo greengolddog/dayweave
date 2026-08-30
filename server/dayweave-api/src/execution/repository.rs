@@ -97,6 +97,7 @@ pub struct InMemoryExecutionRepository {
 struct MemoryState {
     revision: u64,
     active_session_id: Option<Uuid>,
+    protocol_updated_at: Option<DateTime<Utc>>,
     sessions: HashMap<Uuid, ExecutionSession>,
     idempotency: HashMap<[u8; 32], MemoryIdempotency>,
 }
@@ -163,6 +164,8 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             });
         }
 
+        let transition_at = next_protocol_time(now, guard.protocol_updated_at)?;
+
         let mut next = guard.clone();
         let changed_session = if let ExecutionCommand::Start(input) = &command {
             if next.active_session_id.is_some() {
@@ -171,7 +174,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             if next.sessions.contains_key(&input.session_id) {
                 return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
             }
-            let session = ExecutionSession::start(input, now);
+            let session = ExecutionSession::start_with_protocol_time(input, transition_at, now);
             next.active_session_id = Some(session.id);
             next.sessions.insert(session.id, session.clone());
             session
@@ -189,7 +192,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
                 .get(&active_id)
                 .cloned()
                 .ok_or(ExecutionRepositoryError::Internal)?;
-            let updated = current.apply(&command, now)?;
+            let updated = current.apply_with_protocol_time(&command, transition_at, now)?;
             if updated.status.is_open() {
                 next.active_session_id = Some(updated.id);
             } else {
@@ -202,6 +205,7 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .revision
             .checked_add(1)
             .ok_or(ExecutionRepositoryError::Internal)?;
+        next.protocol_updated_at = Some(transition_at);
         let mutation = ExecutionMutation {
             revision: next.revision,
             active_session: next
@@ -236,6 +240,22 @@ impl ExecutionRepository for InMemoryExecutionRepository {
                 .then_with(|| right.id.cmp(&left.id))
         });
         Ok(sessions.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+pub(crate) fn next_protocol_time(
+    now: DateTime<Utc>,
+    previous: Option<DateTime<Utc>>,
+) -> Result<DateTime<Utc>, ExecutionRepositoryError> {
+    let Some(previous) = previous else {
+        return Ok(now);
+    };
+    if now > previous {
+        Ok(now)
+    } else {
+        previous
+            .checked_add_signed(chrono::Duration::microseconds(1))
+            .ok_or(ExecutionRepositoryError::Internal)
     }
 }
 

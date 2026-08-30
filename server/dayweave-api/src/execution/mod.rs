@@ -4,9 +4,10 @@ mod repository;
 mod service;
 
 pub use domain::{
-    ExecutionCommand, ExecutionDomainError, ExecutionSession, ExecutionStatus, FinishExecution,
-    PauseExecution, ResumeExecution, StartExecution,
+    DeferExecution, ExecutionCommand, ExecutionDomainError, ExecutionSession, ExecutionStatus,
+    FinishExecution, PauseExecution, ResumeExecution, StartExecution,
 };
+pub(crate) use repository::next_protocol_time;
 pub use repository::{
     ExecutionIdempotency, ExecutionMutation, ExecutionRepository, ExecutionRepositoryError,
     ExecutionSnapshot, InMemoryExecutionRepository,

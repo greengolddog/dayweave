@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
 import com.greengolddog.dayweave.sync.SuggestionSyncState
@@ -376,9 +377,12 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
         dayWeaveApplication.launchCanonicalAction {
             val current = plannerStore.state.value
+            val outcome = current.terminalExecutionOutcomes[sessionId]
             if (
                 current.pendingCanonicalMutation != null ||
-                current.terminalExecutionOutcomes[sessionId]?.canonicalProjectionConflict == null
+                outcome?.session?.status !in setOf("completed", "skipped") ||
+                outcome?.let { current.isNewestExecutionForProjection(it.session) } != true ||
+                outcome?.canonicalProjectionConflict == null
             ) {
                 return@launchCanonicalAction
             }
@@ -393,6 +397,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             val outcome = current.terminalExecutionOutcomes[sessionId]
             if (
                 current.pendingCanonicalMutation != null ||
+                outcome?.session?.status !in setOf("completed", "skipped") ||
+                outcome?.let { current.isNewestExecutionForProjection(it.session) } != true ||
                 outcome?.canonicalProjectionConflict == null ||
                 outcome.canonicalProjectionRetryAuthorizedAt != null
             ) {

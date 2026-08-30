@@ -6,9 +6,9 @@ use std::{
 use chrono::{DateTime, Duration, Utc};
 use dayweave_api::{
     execution::{
-        ExecutionCommand, ExecutionIdempotencyKey, ExecutionRepositoryError, ExecutionService,
-        ExecutionServiceError, ExecutionStatus, FinishExecution, PauseExecution, ResumeExecution,
-        StartExecution,
+        DeferExecution, ExecutionCommand, ExecutionDomainError, ExecutionIdempotencyKey,
+        ExecutionRepositoryError, ExecutionService, ExecutionServiceError, ExecutionStatus,
+        FinishExecution, PauseExecution, ResumeExecution, StartExecution,
     },
     items::{
         IdempotencyKey as ItemIdempotencyKey, ItemKind, ItemService, ItemStatus, NewItem,
@@ -43,6 +43,160 @@ async fn postgres_execution_is_transactional_cross_device_and_recoverable() {
     // Keep cleanup outside the scenario task so assertion panics cannot leak its schema.
     test_database.destroy().await;
     scenario.expect("PostgreSQL execution scenario task succeeds");
+}
+
+#[tokio::test]
+async fn execution_defer_upgrade_repairs_the_legacy_workspace_clock() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL execution upgrade test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let scenario = tokio::spawn(run_legacy_clock_upgrade(test_database.pool.clone())).await;
+
+    test_database.destroy().await;
+    scenario.expect("PostgreSQL execution upgrade scenario task succeeds");
+}
+
+#[allow(clippy::too_many_lines)] // Keeps the exact legacy schema, rows, migration, and first commands together.
+async fn run_legacy_clock_upgrade(pool: PgPool) {
+    for migration in [
+        include_str!("../migrations/0001_identity_and_items.sql"),
+        include_str!("../migrations/0002_schedule_sync_and_audit.sql"),
+        include_str!("../migrations/0003_proposals_mcp_idempotency_outbox.sql"),
+        include_str!("../migrations/0004_item_delta_sync.sql"),
+        include_str!("../migrations/0005_execution_sessions.sql"),
+        include_str!("../migrations/0006_google_oauth.sql"),
+        include_str!("../migrations/0007_google_sync.sql"),
+        include_str!("../migrations/0008_credential_auth_foundation.sql"),
+        include_str!("../migrations/0009_sensitive_items.sql"),
+        include_str!("../migrations/0010_auth_runtime.sql"),
+        include_str!("../migrations/0011_google_outbound_safety.sql"),
+        include_str!("../migrations/0012_schedule_publication.sql"),
+        include_str!("../migrations/0013_schedule_seal_and_mcp_submission.sql"),
+        include_str!("../migrations/0014_google_calendar_projection.sql"),
+        include_str!("../migrations/0015_transactional_proposal_applications.sql"),
+        include_str!("../migrations/0016_mcp_simulation_evidence.sql"),
+        include_str!("../migrations/0017_google_refresh_generations.sql"),
+    ] {
+        pool.execute(migration)
+            .await
+            .expect("pre-defer migration applies");
+    }
+
+    let scope = seed_scope(
+        &pool,
+        "execution-upgrade-owner",
+        "execution-upgrade-workspace",
+    )
+    .await;
+    let latest = postgres_now(&pool).await;
+    let clock = Arc::new(TestClock::new(latest));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Legacy clock task", 40).await;
+    let older_session = Uuid::from_u128(4_000);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, occurrence_id, \
+         session_index, planned_block_id, source_device_id, state, revision, accumulated_seconds, \
+         actual_seconds, started_at, running_since, paused_at, pause_until, pause_reason, ended_at, \
+         created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, NULL, $4, 'completed', 2, 10, \
+         10, $5, NULL, NULL, NULL, NULL, $6, $5, $6)",
+    )
+    .bind(older_session)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(Uuid::new_v4())
+    .bind(latest - Duration::seconds(10))
+    .bind(latest)
+    .execute(&pool)
+    .await
+    .expect("legacy terminal session");
+    let legacy_active_session = Uuid::from_u128(3_500);
+    let legacy_active_start = latest - Duration::days(1);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, occurrence_id, \
+         session_index, planned_block_id, source_device_id, state, revision, accumulated_seconds, \
+         actual_seconds, started_at, running_since, paused_at, pause_until, pause_reason, ended_at, \
+         created_at, updated_at) VALUES ($1, $2, $3, 1, NULL, 0, NULL, $4, 'active', 1, 0, \
+         NULL, $5, $5, NULL, NULL, NULL, NULL, $5, $5)",
+    )
+    .bind(legacy_active_session)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(Uuid::new_v4())
+    .bind(legacy_active_start)
+    .execute(&pool)
+    .await
+    .expect("legacy active session after clock rollback");
+    sqlx::query(
+        "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
+         VALUES ($1, 3, $2, $3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(legacy_active_session)
+    .bind(legacy_active_start)
+    .execute(&pool)
+    .await
+    .expect("legacy lagging workspace clock");
+
+    pool.execute(include_str!("../migrations/0018_execution_defer.sql"))
+        .await
+        .expect("execution defer migration applies");
+    let repaired: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM execution_state WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(&pool)
+            .await
+            .expect("repaired workspace clock");
+    assert_eq!(repaired, latest);
+
+    clock.set(legacy_active_start + Duration::seconds(10));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items,
+        clock.clone(),
+    );
+    let deferred = execution
+        .command(
+            3,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: legacy_active_session,
+                move_start: latest + Duration::hours(1),
+                move_end: latest + Duration::hours(2),
+                actual_seconds: None,
+            }),
+            execution_idempotency("execution-upgrade-defer-001", 41),
+        )
+        .await
+        .expect("post-upgrade legacy defer");
+    assert_eq!(deferred.changed_session.accumulated_seconds, 10);
+    assert_eq!(
+        deferred.changed_session.updated_at,
+        latest + Duration::microseconds(1)
+    );
+
+    let newer_session = Uuid::from_u128(3_000);
+    let started = execution
+        .command(
+            4,
+            start_command(newer_session, item_id, Uuid::new_v4()),
+            execution_idempotency("execution-upgrade-start-001", 42),
+        )
+        .await
+        .expect("post-upgrade start");
+    assert_eq!(
+        started.changed_session.updated_at,
+        latest + Duration::microseconds(2)
+    );
+    let history = execution.history(10).await.expect("post-upgrade history");
+    assert_eq!(history.len(), 3);
+    assert_eq!(history[0].id, newer_session);
+    assert_eq!(history[1].id, legacy_active_session);
+    assert_eq!(history[2].id, older_session);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -314,6 +468,222 @@ async fn run_scenario(pool: PgPool) {
             execution_idempotency_count(&pool, main_scope, failed_key).await,
             0,
             "failed mutation leaked idempotency reservation for {failed_key}"
+        );
+    }
+
+    assert_postgres_defer_transitions(&pool).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_postgres_defer_transitions(pool: &PgPool) {
+    const INVALID_KEY: &str = "execution-defer-invalid-001";
+    const STALE_DEFER_KEY: &str = "execution-defer-stale-001";
+    const DEFER_KEY: &str = "execution-defer-active-001";
+
+    let scope = seed_scope(pool, "execution-defer-owner", "execution-defer-workspace").await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    );
+    let first_item = Uuid::new_v4();
+    let second_item = Uuid::new_v4();
+    create_item(&items, first_item, "Defer active task", 31).await;
+    create_item(&items, second_item, "Defer paused task", 32).await;
+
+    let first_session = Uuid::from_u128(2_000);
+    execution
+        .command(
+            0,
+            start_command(first_session, first_item, Uuid::new_v4()),
+            execution_idempotency("execution-defer-first-start-001", 33),
+        )
+        .await
+        .unwrap();
+    clock.set(base + Duration::seconds(45));
+
+    let invalid = execution
+        .command(
+            1,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: first_session,
+                move_start: clock.now(),
+                move_end: clock.now() + Duration::minutes(30),
+                actual_seconds: None,
+            }),
+            execution_idempotency(INVALID_KEY, 34),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        invalid,
+        ExecutionServiceError::Domain(ExecutionDomainError::InvalidDefer)
+    ));
+
+    let first_move_start = clock.now() + Duration::hours(1);
+    let first_move_end = first_move_start + Duration::hours(1);
+    let defer_active = ExecutionCommand::Defer(DeferExecution {
+        session_id: first_session,
+        move_start: first_move_start,
+        move_end: first_move_end,
+        actual_seconds: None,
+    });
+    let stale = execution
+        .command(
+            0,
+            defer_active.clone(),
+            execution_idempotency(STALE_DEFER_KEY, 35),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale,
+        ExecutionServiceError::Repository(ExecutionRepositoryError::RevisionConflict {
+            expected: 0,
+            actual: 1
+        })
+    ));
+
+    let deferred = execution
+        .command(
+            1,
+            defer_active.clone(),
+            execution_idempotency(DEFER_KEY, 36),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deferred.revision, 2);
+    assert!(deferred.active_session.is_none());
+    assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
+    assert_eq!(deferred.changed_session.accumulated_seconds, 45);
+    assert_eq!(deferred.changed_session.actual_seconds, Some(45));
+    assert_eq!(deferred.changed_session.move_start, Some(first_move_start));
+    assert_eq!(deferred.changed_session.move_end, Some(first_move_end));
+    assert_eq!(open_session_count(pool, scope).await, 0);
+
+    clock.set(first_move_end + Duration::seconds(1));
+    let replay = execution
+        .command(1, defer_active, execution_idempotency(DEFER_KEY, 36))
+        .await
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.revision, 2);
+    assert_eq!(replay.changed_session, deferred.changed_session);
+
+    // A later session keeps causal order even if the host clock rolls backward and its UUID sorts
+    // before the older terminal row.
+    let rollback_start = base - Duration::days(30);
+    clock.set(rollback_start);
+    let second_session = Uuid::from_u128(1_000);
+    let started_second = execution
+        .command(
+            2,
+            start_command(second_session, second_item, Uuid::new_v4()),
+            execution_idempotency("execution-defer-second-start-001", 37),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        started_second.changed_session.updated_at,
+        deferred.changed_session.updated_at + Duration::microseconds(1)
+    );
+    clock.set(rollback_start + Duration::seconds(20));
+    execution
+        .command(
+            3,
+            ExecutionCommand::Pause(PauseExecution {
+                session_id: second_session,
+                duration_seconds: None,
+                pause_until: None,
+                reason: Some("Waiting to move".to_owned()),
+            }),
+            execution_idempotency("execution-defer-second-pause-001", 38),
+        )
+        .await
+        .unwrap();
+    clock.set(clock.now() + Duration::minutes(10));
+    let second_move_start = clock.now() + Duration::days(30);
+    let second_move_end = second_move_start + Duration::hours(24);
+    let deferred_paused = execution
+        .command(
+            4,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: second_session,
+                move_start: second_move_start,
+                move_end: second_move_end,
+                actual_seconds: Some(7),
+            }),
+            execution_idempotency("execution-defer-paused-001", 39),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deferred_paused.revision, 5);
+    assert!(deferred_paused.active_session.is_none());
+    assert_eq!(
+        deferred_paused.changed_session.status,
+        ExecutionStatus::Deferred
+    );
+    assert_eq!(deferred_paused.changed_session.accumulated_seconds, 20);
+    assert_eq!(deferred_paused.changed_session.actual_seconds, Some(7));
+    assert_eq!(
+        deferred_paused.changed_session.move_start,
+        Some(second_move_start)
+    );
+    assert_eq!(
+        deferred_paused.changed_session.move_end,
+        Some(second_move_end)
+    );
+    assert_eq!(open_session_count(pool, scope).await, 0);
+
+    let history = execution.history(10).await.unwrap();
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0].id, second_session);
+    assert_eq!(history[1].id, first_session);
+    assert!(history.iter().all(|session| {
+        session.status == ExecutionStatus::Deferred
+            && session.move_start.is_some()
+            && session.move_end.is_some()
+    }));
+    let deferred_outbox_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox_messages WHERE workspace_id = $1 \
+         AND event_type = 'execution.deferred'",
+    )
+    .bind(scope.workspace_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(deferred_outbox_count, 2);
+    assert_execution_side_effects(pool, scope, 5).await;
+    for failed_key in [INVALID_KEY, STALE_DEFER_KEY] {
+        assert_eq!(
+            execution_idempotency_count(pool, scope, failed_key).await,
+            0,
+            "failed defer leaked idempotency reservation for {failed_key}"
+        );
+    }
+
+    for invalid_update in [
+        "UPDATE execution_sessions SET move_end = NULL WHERE workspace_id = $1 AND id = $2",
+        "UPDATE execution_sessions SET ended_at = updated_at - interval '1 second' \
+         WHERE workspace_id = $1 AND id = $2",
+        "UPDATE execution_sessions SET move_start = ended_at WHERE workspace_id = $1 AND id = $2",
+        "UPDATE execution_sessions SET move_end = move_start + interval '24 hours 1 second' \
+         WHERE workspace_id = $1 AND id = $2",
+    ] {
+        assert!(
+            sqlx::query(invalid_update)
+                .bind(scope.workspace_id)
+                .bind(first_session)
+                .execute(pool)
+                .await
+                .is_err(),
+            "database must reject malformed durable defer windows"
         );
     }
 }

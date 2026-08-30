@@ -14,6 +14,7 @@ import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -1646,7 +1647,10 @@ class CanonicalSyncManager(
         val origin = configuration.baseUrl.toString()
         val unresolved = current.terminalExecutionOutcomes.values
             .filter {
-                it.syncOrigin == origin && it.requiresCanonicalItemProjection &&
+                it.syncOrigin == origin &&
+                    it.session.status in TERMINAL_CANONICAL_STATUSES &&
+                    current.isNewestExecutionForProjection(it.session) &&
+                    it.requiresCanonicalItemProjection &&
                     it.canonicalProjectionRevision == null &&
                     it.canonicalProjectionResolution == null
             }

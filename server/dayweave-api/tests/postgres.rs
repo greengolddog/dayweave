@@ -29,7 +29,9 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ]
     );
 
     let schema = [
@@ -50,6 +52,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0015_transactional_proposal_applications.sql"),
         include_str!("../migrations/0016_mcp_simulation_evidence.sql"),
         include_str!("../migrations/0017_google_refresh_generations.sql"),
+        include_str!("../migrations/0018_execution_defer.sql"),
     ]
     .join("\n");
     for table in [
@@ -99,6 +102,14 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     ] {
         assert!(schema.contains(&format!("CREATE TABLE {table}")), "{table}");
     }
+    assert!(schema.contains("ADD COLUMN move_start timestamptz"));
+    assert!(schema.contains("ADD COLUMN move_end timestamptz"));
+    assert!(schema.contains("ADD COLUMN observed_running_since timestamptz"));
+    assert!(schema.contains("'deferred'"));
+    assert!(schema.contains("ended_at = updated_at"));
+    assert!(schema.contains("move_start > ended_at"));
+    assert!(schema.contains("UPDATE execution_state AS state"));
+    assert!(schema.contains("max(updated_at) AS updated_at"));
     assert!(schema.contains("timestamptz"));
     assert!(!schema.contains("timestamp without time zone"));
     assert!(schema.contains("trashed_at"));

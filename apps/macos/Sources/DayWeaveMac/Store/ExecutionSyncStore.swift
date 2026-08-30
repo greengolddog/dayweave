@@ -696,12 +696,13 @@ final class ExecutionSyncStore: ObservableObject {
             if let existing = next.terminalOutcomes[session.id] {
                 outcomes[session.id] = existing
             } else {
-                let eligible = next.leaseProjectionEligibility[session.id]
-                    ?? next.pendingCommand.flatMap {
-                        $0.identity.sessionID == session.id
-                            ? $0.canonicalProjectionEligibleAtLeaseStart : nil
-                    }
-                    ?? false
+                let eligible = session.status.isCanonicalTerminal
+                    && (next.leaseProjectionEligibility[session.id]
+                        ?? next.pendingCommand.flatMap {
+                            $0.identity.sessionID == session.id
+                                ? $0.canonicalProjectionEligibleAtLeaseStart : nil
+                        }
+                        ?? false)
                 outcomes[session.id] = .init(
                     session: session,
                     recordedAt: now(),
@@ -799,23 +800,24 @@ final class ExecutionSyncStore: ObservableObject {
               DayWeaveExecutionIdentity(session: prior) == pending.identity,
               changed.revision == prior.revision + 1,
               changed.startedAt == prior.startedAt,
-              changed.createdAt == prior.createdAt else { return false }
-        let elapsed = executionElapsedSeconds(prior, at: changed.updatedAt)
+              changed.createdAt == prior.createdAt,
+              changed.updatedAt >= prior.updatedAt,
+              accumulatedTransitionIsValid(prior: prior, changed: changed) else { return false }
         switch pending.command {
         case let .pause(_, duration, absolute, reason):
             let expectedUntil = duration.map {
                 changed.updatedAt.addingTimeInterval(TimeInterval($0))
             } ?? absolute
-            return changed.accumulatedSeconds == elapsed
-                && changed.pausedAt == (prior.pausedAt ?? changed.updatedAt)
+            return changed.pausedAt == (prior.pausedAt ?? changed.updatedAt)
                 && changed.pauseUntil == expectedUntil
                 && changed.pauseReason == (reason ?? prior.pauseReason)
         case .resume:
             return prior.status == .paused
                 && changed.accumulatedSeconds == prior.accumulatedSeconds
         case let .complete(_, corrected), let .skip(_, corrected):
-            return changed.accumulatedSeconds == elapsed
-                && changed.actualSeconds == (corrected ?? elapsed)
+            let actualIsValid = corrected.map { changed.actualSeconds == $0 }
+                ?? (changed.actualSeconds == changed.accumulatedSeconds)
+            return actualIsValid
                 && changed.pausedAt == (prior.pausedAt
                     ?? (prior.status == .paused ? changed.updatedAt : nil))
         case .start:
@@ -823,18 +825,18 @@ final class ExecutionSyncStore: ObservableObject {
         }
     }
 
-    private func executionElapsedSeconds(
-        _ session: DayWeaveExecutionSession,
-        at date: Date
-    ) -> UInt64 {
-        let running: UInt64
-        if let since = session.runningSince {
-            running = UInt64(max(0, floor(date.timeIntervalSince(since))))
-        } else {
-            running = 0
-        }
-        let total = session.accumulatedSeconds.addingReportingOverflow(running)
-        return total.overflow ? UInt64(Int64.max) : min(total.partialValue, UInt64(Int64.max))
+    private func accumulatedTransitionIsValid(
+        prior: DayWeaveExecutionSession,
+        changed: DayWeaveExecutionSession
+    ) -> Bool {
+        guard changed.accumulatedSeconds >= prior.accumulatedSeconds else { return false }
+        // A paused session has no private running anchor, so its accumulated
+        // value is exactly stable. For an active session, public running_since
+        // is the causal protocol clock and may be ahead of the server's private
+        // observed timer anchor after wall-clock rollback; only monotonicity is
+        // externally provable in that case.
+        return prior.runningSince != nil
+            || changed.accumulatedSeconds == prior.accumulatedSeconds
     }
 
     private func requireActiveSession(

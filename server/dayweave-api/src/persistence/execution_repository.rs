@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::execution::{
     ExecutionCommand, ExecutionIdempotency, ExecutionMutation, ExecutionRepository,
     ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot, ExecutionStatus,
+    next_protocol_time,
 };
 
 use super::DatabaseScope;
@@ -14,17 +15,19 @@ use super::DatabaseScope;
 const IDEMPOTENCY_NAMESPACE: &str = "execution.command";
 const HISTORY_SELECT: &str = "SELECT id, item_id, item_revision, occurrence_id, session_index, \
     planned_block_id, source_device_id, state, revision, accumulated_seconds, actual_seconds, \
-    started_at, running_since, paused_at, pause_until, pause_reason, ended_at, created_at, updated_at \
+    started_at, running_since, observed_running_since, paused_at, pause_until, pause_reason, \
+    move_start, move_end, ended_at, created_at, updated_at \
     FROM execution_sessions WHERE workspace_id = $1 \
     ORDER BY updated_at DESC, id DESC LIMIT $2 OFFSET $3";
 const SESSION_BY_ID: &str = "SELECT id, item_id, item_revision, occurrence_id, session_index, \
     planned_block_id, source_device_id, state, revision, accumulated_seconds, actual_seconds, \
-    started_at, running_since, paused_at, pause_until, pause_reason, ended_at, created_at, updated_at \
+    started_at, running_since, observed_running_since, paused_at, pause_until, pause_reason, \
+    move_start, move_end, ended_at, created_at, updated_at \
     FROM execution_sessions WHERE workspace_id = $1 AND id = $2";
 const SESSION_BY_ID_FOR_UPDATE: &str = "SELECT id, item_id, item_revision, occurrence_id, \
     session_index, planned_block_id, source_device_id, state, revision, accumulated_seconds, \
-    actual_seconds, started_at, running_since, paused_at, pause_until, pause_reason, ended_at, \
-    created_at, updated_at FROM execution_sessions \
+    actual_seconds, started_at, running_since, observed_running_since, paused_at, pause_until, \
+    pause_reason, move_start, move_end, ended_at, created_at, updated_at FROM execution_sessions \
     WHERE workspace_id = $1 AND id = $2 FOR UPDATE";
 
 #[derive(Clone, Debug)]
@@ -107,7 +110,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
         ensure_state_transaction(&mut transaction, self.scope.workspace_id, now).await?;
         let state = sqlx::query(
-            "SELECT revision, active_session_id FROM execution_state \
+            "SELECT revision, active_session_id, updated_at FROM execution_state \
              WHERE workspace_id = $1 FOR UPDATE",
         )
         .bind(self.scope.workspace_id)
@@ -124,12 +127,16 @@ impl ExecutionRepository for PostgresExecutionRepository {
         }
         let active_session_id: Option<Uuid> =
             state.try_get("active_session_id").map_err(internal)?;
+        let protocol_updated_at: DateTime<Utc> = state.try_get("updated_at").map_err(internal)?;
+        let transition_at =
+            next_protocol_time(now, (current_revision > 0).then_some(protocol_updated_at))?;
 
         let changed_session = apply_command_transaction(
             &mut transaction,
             self.scope.workspace_id,
             active_session_id,
             &command,
+            transition_at,
             now,
         )
         .await?;
@@ -149,7 +156,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(self.scope.workspace_id)
         .bind(revision_i64)
         .bind(next_active_id)
-        .bind(now)
+        .bind(transition_at)
         .bind(revision_to_i64(current_revision)?)
         .execute(&mut *transaction)
         .await
@@ -202,7 +209,8 @@ async fn apply_command_transaction(
     workspace_id: Uuid,
     active_session_id: Option<Uuid>,
     command: &ExecutionCommand,
-    now: DateTime<Utc>,
+    transition_at: DateTime<Utc>,
+    observed_at: DateTime<Utc>,
 ) -> Result<ExecutionSession, ExecutionRepositoryError> {
     if let ExecutionCommand::Start(input) = command {
         if active_session_id.is_some() {
@@ -219,7 +227,7 @@ async fn apply_command_transaction(
         if session_exists(transaction, input.session_id).await? {
             return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
         }
-        let session = ExecutionSession::start(input, now);
+        let session = ExecutionSession::start_with_protocol_time(input, transition_at, observed_at);
         insert_session(transaction, workspace_id, &session).await?;
         return Ok(session);
     }
@@ -229,7 +237,7 @@ async fn apply_command_transaction(
         return Err(ExecutionRepositoryError::SessionNotFound(requested_id));
     }
     let current = fetch_session_transaction(transaction, workspace_id, requested_id).await?;
-    let updated = current.apply(command, now)?;
+    let updated = current.apply_with_protocol_time(command, transition_at, observed_at)?;
     update_session(transaction, workspace_id, &updated).await?;
     Ok(updated)
 }
@@ -441,9 +449,10 @@ async fn insert_session(
     sqlx::query(
         "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, occurrence_id, \
          session_index, planned_block_id, source_device_id, state, revision, accumulated_seconds, \
-         actual_seconds, started_at, running_since, paused_at, pause_until, pause_reason, ended_at, \
-         created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
-         $13, $14, $15, $16, $17, $18, $19, $20)",
+         actual_seconds, started_at, running_since, observed_running_since, paused_at, pause_until, \
+         pause_reason, move_start, move_end, ended_at, created_at, updated_at) VALUES ($1, $2, $3, \
+         $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
+         $22, $23)",
     )
     .bind(session.id)
     .bind(workspace_id)
@@ -459,9 +468,12 @@ async fn insert_session(
     .bind(session.actual_seconds.map(seconds_to_i64).transpose()?)
     .bind(session.started_at)
     .bind(session.running_since)
+    .bind(session.observed_running_since)
     .bind(session.paused_at)
     .bind(session.pause_until)
     .bind(&session.pause_reason)
+    .bind(session.move_start)
+    .bind(session.move_end)
     .bind(session.ended_at)
     .bind(session.created_at)
     .bind(session.updated_at)
@@ -478,9 +490,9 @@ async fn update_session(
 ) -> Result<(), ExecutionRepositoryError> {
     let updated = sqlx::query(
         "UPDATE execution_sessions SET state = $3, revision = $4, accumulated_seconds = $5, \
-         actual_seconds = $6, running_since = $7, paused_at = $8, pause_until = $9, \
-         pause_reason = $10, ended_at = $11, updated_at = $12 \
-         WHERE workspace_id = $1 AND id = $2 AND revision = $13",
+         actual_seconds = $6, running_since = $7, observed_running_since = $8, paused_at = $9, \
+         pause_until = $10, pause_reason = $11, move_start = $12, move_end = $13, ended_at = $14, \
+         updated_at = $15 WHERE workspace_id = $1 AND id = $2 AND revision = $16",
     )
     .bind(workspace_id)
     .bind(session.id)
@@ -489,9 +501,12 @@ async fn update_session(
     .bind(seconds_to_i64(session.accumulated_seconds)?)
     .bind(session.actual_seconds.map(seconds_to_i64).transpose()?)
     .bind(session.running_since)
+    .bind(session.observed_running_since)
     .bind(session.paused_at)
     .bind(session.pause_until)
     .bind(&session.pause_reason)
+    .bind(session.move_start)
+    .bind(session.move_end)
     .bind(session.ended_at)
     .bind(session.updated_at)
     .bind(revision_to_i64(session.revision - 1)?)
@@ -560,9 +575,12 @@ fn session_from_row(row: &PgRow) -> Result<ExecutionSession, ExecutionRepository
             .transpose()?,
         started_at: row.try_get("started_at").map_err(internal)?,
         running_since: row.try_get("running_since").map_err(internal)?,
+        observed_running_since: row.try_get("observed_running_since").map_err(internal)?,
         paused_at: row.try_get("paused_at").map_err(internal)?,
         pause_until: row.try_get("pause_until").map_err(internal)?,
         pause_reason: row.try_get("pause_reason").map_err(internal)?,
+        move_start: row.try_get("move_start").map_err(internal)?,
+        move_end: row.try_get("move_end").map_err(internal)?,
         ended_at: row.try_get("ended_at").map_err(internal)?,
         created_at: row.try_get("created_at").map_err(internal)?,
         updated_at: row.try_get("updated_at").map_err(internal)?,
@@ -581,6 +599,7 @@ async fn record_outbox(
         ExecutionCommand::Resume(_) => "execution.resumed",
         ExecutionCommand::Complete(_) => "execution.completed",
         ExecutionCommand::Skip(_) => "execution.skipped",
+        ExecutionCommand::Defer(_) => "execution.deferred",
     };
     let payload = serde_json::to_value(mutation).map_err(|_| ExecutionRepositoryError::Internal)?;
     sqlx::query(
@@ -610,6 +629,7 @@ const fn status_name(status: ExecutionStatus) -> &'static str {
         ExecutionStatus::Paused => "paused",
         ExecutionStatus::Completed => "completed",
         ExecutionStatus::Skipped => "skipped",
+        ExecutionStatus::Deferred => "deferred",
     }
 }
 
@@ -619,6 +639,7 @@ fn parse_status(value: &str) -> Result<ExecutionStatus, ExecutionRepositoryError
         "paused" => Ok(ExecutionStatus::Paused),
         "completed" => Ok(ExecutionStatus::Completed),
         "skipped" => Ok(ExecutionStatus::Skipped),
+        "deferred" => Ok(ExecutionStatus::Deferred),
         _ => Err(ExecutionRepositoryError::Internal),
     }
 }

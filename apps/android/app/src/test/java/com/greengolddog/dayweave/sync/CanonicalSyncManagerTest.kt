@@ -1494,6 +1494,59 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun newerDeferredClosurePreventsAutomaticProjectionOfOlderTerminalOutcome() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem(split = false))),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        recordTerminalExecution(plannerStore, "completed")
+        val olderCompleted = plannerStore.state.value.terminalExecutionOutcomes
+            .getValue(EXECUTION_ID).session
+        val newerDeferred = olderCompleted.copy(
+            id = "88888888-8888-4888-8888-888888888888",
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 180,
+            actualSeconds = 180,
+            endedAt = "2026-09-01T07:03:00Z",
+            moveStart = "2026-09-01T08:00:00Z",
+            moveEnd = "2026-09-01T09:00:00Z",
+            updatedAt = "2026-09-01T07:03:00Z",
+            canonicalProjectionEligibleAtLeaseStart = null,
+        )
+        requireNotNull(
+            plannerStore.reconcileCanonicalExecution(
+                syncOrigin = "https://api.example.test/",
+                configurationId = "connection-1",
+                revision = 4,
+                activeSession = null,
+                changedSession = newerDeferred,
+                message = "Newer defer",
+            ),
+        )
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+        transport.previewResult = preview()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertTrue(transport.replacementRequests.isEmpty())
+        assertEquals(null, plannerStore.state.value.pendingCanonicalMutation)
+        assertEquals("planned", plannerStore.state.value.canonicalItems.single().status)
+        assertEquals(ItemStatus.SCHEDULED, plannerStore.state.value.schedule.single().status)
+        assertTrue(
+            plannerStore.state.value.terminalExecutionOutcomes.getValue(EXECUTION_ID)
+                .requiresCanonicalItemProjection,
+        )
+    }
+
+    @Test
     fun lostTerminalProjectionResponseReplaysExactCanonicalFenceAfterRestart() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {

@@ -24,6 +24,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.ui.components.ActiveItemActions
 import com.greengolddog.dayweave.ui.components.EnergySignalCard
 import com.greengolddog.dayweave.ui.components.MetricCard
@@ -105,7 +106,9 @@ fun TodayScreen(
         }
 
         val terminalConflict = state.terminalExecutionOutcomes.values.firstOrNull {
-            it.canonicalProjectionConflict != null
+            it.session.status in setOf("completed", "skipped") &&
+                state.isNewestExecutionForProjection(it.session) &&
+                it.canonicalProjectionConflict != null
         }
         if (terminalConflict != null) {
             val canonicalWritePending = state.pendingCanonicalMutation != null
@@ -322,14 +325,19 @@ fun TodayScreen(
                     outcome.session.itemRevision == item.canonicalRevision &&
                     outcome.session.occurrenceId == item.occurrenceId &&
                     outcome.session.sessionIndex == item.sessionIndex
-                val exactTerminalApplies = exactIdentity &&
-                    outcome.canonicalProjectionResolution != "user_kept_latest_item"
+                val exactClosedApplies = exactIdentity && (
+                    outcome.session.status == "deferred" ||
+                        outcome.session.status in setOf("completed", "skipped") &&
+                        outcome.canonicalProjectionResolution != "user_kept_latest_item"
+                    )
                 val unresolvedParentProjection =
+                    outcome.session.status in setOf("completed", "skipped") &&
+                    state.isNewestExecutionForProjection(outcome.session) &&
                     outcome.requiresCanonicalItemProjection &&
                         outcome.canonicalProjectionRevision == null &&
                         outcome.canonicalProjectionResolution == null &&
                         outcome.session.itemId == item.canonicalItemId
-                sameOrigin && (exactTerminalApplies || unresolvedParentProjection)
+                sameOrigin && (exactClosedApplies || unresolvedParentProjection)
             } || item.canonicalItemId != null && (
                 !state.canonicalExecutionHistoryVerified ||
                     state.canonicalExecutionSyncOrigin != state.canonicalSyncOrigin ||

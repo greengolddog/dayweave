@@ -45,12 +45,14 @@ import com.greengolddog.dayweave.model.nextCanonicalTrashRetentionExpiryEpochMil
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.model.isApplicationReady
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
 import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.util.ArrayDeque
@@ -543,16 +545,16 @@ class PlannerStore(
                         current.terminalExecutionOutcomes.isEmpty(),
                 ) { "Credential replacement must quarantine canonical state before composition" }
             }
-            val retainedTerminalOutcomes = if (sameBinding) {
-                retainedTerminalExecutionOutcomes(
-                    validatedTerminalExecutionOutcomes(current.terminalExecutionOutcomes)
+            val retainedClosedOutcomes = if (sameBinding) {
+                retainedClosedExecutionOutcomes(
+                    validatedClosedExecutionOutcomes(current.terminalExecutionOutcomes)
                         .filter { it.syncOrigin == update.syncOrigin }
                         .associateBy { it.session.id },
                 )
             } else {
                 emptyMap()
             }
-            val terminalOutcomesNewestFirst = retainedTerminalOutcomes.values.sortedWith(
+            val closedOutcomesNewestFirst = retainedClosedOutcomes.values.sortedWith(
                 compareByDescending<TerminalExecutionOutcomeSnapshot> {
                     Instant.parse(it.session.updatedAt)
                 }.thenByDescending { it.session.id },
@@ -560,11 +562,12 @@ class PlannerStore(
             val authoritativeLease = current.canonicalExecutionSession
                 ?.takeIf { sameBinding && it.status in OPEN_EXECUTION_STATUSES }
             val freshSchedule = update.schedule.map { block ->
-                val newestTerminal = terminalOutcomesNewestFirst.firstOrNull { outcome ->
+                val newestClosed = closedOutcomesNewestFirst.firstOrNull { outcome ->
                     outcome.session.matchesProjectionLineage(block)
                 }
-                val terminal = newestTerminal?.takeIf { outcome ->
-                    !outcome.userKeptLatestItem() &&
+                val terminal = newestClosed?.takeIf { outcome ->
+                    outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                        !outcome.userKeptLatestItem() &&
                         (outcome.session.matches(block) || outcome.canSafelyOverlayRebased(
                         block = block,
                         itemsById = itemsById,
@@ -713,7 +716,7 @@ class PlannerStore(
                 // A plan read alone cannot prove that a timed-out write will not commit later.
                 // The sync manager clears this only by replaying the exact durable request.
                 pendingCanonicalMutation = current.pendingCanonicalMutation,
-                terminalExecutionOutcomes = retainedTerminalOutcomes,
+                terminalExecutionOutcomes = retainedClosedOutcomes,
                 unscheduledWork = update.unscheduledWork.filter { it.itemId in reconciledItemIds },
                 occurrenceSeriesItemIds = update.occurrenceSeriesItemIds.filterValues {
                     it in reconciledItemIds
@@ -1922,8 +1925,10 @@ class PlannerStore(
         pendingCanonicalAuthoringMutations.any(PendingCanonicalAuthoringMutation::isSubmitted)
 
     private fun DayWeaveUiState.hasUnresolvedTerminalProjection(): Boolean = runCatching {
-        validatedTerminalExecutionOutcomes(terminalExecutionOutcomes).any {
-            it.requiresCanonicalItemProjection &&
+        validatedClosedExecutionOutcomes(terminalExecutionOutcomes).any {
+            it.session.status in TERMINAL_EXECUTION_STATUSES &&
+                isNewestExecutionForProjection(it.session) &&
+                it.requiresCanonicalItemProjection &&
                 it.canonicalProjectionRevision == null &&
                 it.canonicalProjectionResolution == null &&
                 (it.canonicalProjectionConflict == null ||
@@ -2340,9 +2345,11 @@ class PlannerStore(
             require(UUID.fromString(sessionId).toString() == sessionId)
             val outcome = current.terminalExecutionOutcomes[sessionId]
                 ?: throw IllegalArgumentException("Terminal execution outcome is unavailable")
-            validateTerminalExecutionOutcome(outcome)
+            validateClosedExecutionOutcome(outcome)
             require(
-                outcome.requiresCanonicalItemProjection &&
+                outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                    current.isNewestExecutionForProjection(outcome.session) &&
+                    outcome.requiresCanonicalItemProjection &&
                     outcome.isProjectionWriteAuthorized() &&
                     outcome.syncOrigin == mutation.syncOrigin &&
                     outcome.session.itemId == mutation.itemId &&
@@ -2458,7 +2465,7 @@ class PlannerStore(
             }
         }
 
-    /** A confirmed terminal row or unresolved parent projection is a durable start fence. */
+    /** A confirmed closed row or unresolved parent projection is a durable start fence. */
     fun isCanonicalExecutionStartBlocked(blockId: String): Boolean {
         val current = state.value
         val block = current.schedule.firstOrNull { it.id == blockId } ?: return true
@@ -2471,14 +2478,20 @@ class PlannerStore(
         ) {
             return true
         }
-        val validated = validatedTerminalExecutionOutcomes(current.terminalExecutionOutcomes)
+        val validated = runCatching {
+            validatedClosedExecutionOutcomes(current.terminalExecutionOutcomes)
+        }.getOrElse { return true }
         if (validated.isEmpty()) return false
         val outcomes = validated
             .filter { it.syncOrigin == origin }
-        return outcomes.any {
-            !it.userKeptLatestItem() && it.session.matches(block)
+        return outcomes.any { outcome ->
+            outcome.session.status == "deferred" && outcome.session.matches(block) ||
+                outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                !outcome.userKeptLatestItem() && outcome.session.matches(block)
         } || outcomes.any { outcome ->
-            outcome.isProjectionUnresolved() &&
+            outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                current.isNewestExecutionForProjection(outcome.session) &&
+                outcome.isProjectionUnresolved() &&
                 outcome.session.itemId == itemId
         }
     }
@@ -2534,6 +2547,9 @@ class PlannerStore(
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
         require(conflict.isNotBlank() && conflict.length <= MAX_TERMINAL_PROJECTION_CONFLICT_CHARS)
         val outcome = requireTerminalProjection(current, sessionId)
+        require(current.isNewestExecutionForProjection(outcome.session)) {
+            "A newer execution session supersedes this terminal projection"
+        }
         current.copy(
             terminalExecutionOutcomes = current.terminalExecutionOutcomes + (
                 sessionId to outcome.copy(
@@ -2556,6 +2572,9 @@ class PlannerStore(
         }
         val outcome = requireTerminalProjection(current, sessionId)
         require(outcome.canonicalProjectionConflict != null)
+        require(current.isNewestExecutionForProjection(outcome.session)) {
+            "A newer execution session supersedes this terminal projection"
+        }
         val authorizedAt = Instant.ofEpochMilli(nowEpochMillis()).toString()
         current.copy(
             terminalExecutionOutcomes = current.terminalExecutionOutcomes + (
@@ -2577,6 +2596,9 @@ class PlannerStore(
         }
         val outcome = requireTerminalProjection(current, sessionId)
         require(outcome.canonicalProjectionConflict != null)
+        require(current.isNewestExecutionForProjection(outcome.session)) {
+            "A newer execution session supersedes this terminal projection"
+        }
         current.copy(
             terminalExecutionOutcomes = current.terminalExecutionOutcomes + (
                 sessionId to outcome.copy(
@@ -2757,7 +2779,7 @@ class PlannerStore(
                         remote.accumulatedSeconds >= prior.accumulatedSeconds,
                 ) { "Execution history rewrote immutable time or regressed accumulated work" }
                 require(
-                    if (prior.status in TERMINAL_EXECUTION_STATUSES) {
+                    if (prior.status in CLOSED_EXECUTION_STATUSES) {
                         remote.hasSameRemoteSemantics(prior)
                     } else {
                         remote.revision > prior.revision ||
@@ -2826,6 +2848,7 @@ class PlannerStore(
         changedSession: CanonicalExecutionSessionSnapshot? = null,
         clearPendingIdempotencyKey: String? = null,
         message: String,
+        changedSessionControlsPresentation: Boolean = true,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
         require(syncOrigin.isNotBlank() && revision >= 0)
         validateExecutionSession(activeSession, mustBeOpen = true)
@@ -2949,41 +2972,80 @@ class PlannerStore(
         var recurrenceOutcomes = current.recurrenceOutcomes
         var recurrenceMoves = current.recurrenceMoves
         var completionAnchors = current.recurrenceCompletionAnchors
-        var terminalExecutionOutcomes = if (sameBinding) {
-            validatedTerminalExecutionOutcomes(current.terminalExecutionOutcomes)
+        var closedExecutionOutcomes = if (sameBinding) {
+            validatedClosedExecutionOutcomes(current.terminalExecutionOutcomes)
                 .filter { it.syncOrigin == syncOrigin }
                 .associateBy { it.session.id }
         } else {
             emptyMap()
         }
-        if (authoritativeChangedSession?.status in TERMINAL_EXECUTION_STATUSES) {
+        if (authoritativeChangedSession?.status in CLOSED_EXECUTION_STATUSES) {
             val changed = requireNotNull(authoritativeChangedSession)
+            val isCanonicalTerminal = changed.status in TERMINAL_EXECUTION_STATUSES
             val focused = matchingBlock(changed, schedule)
-            val existingOutcome = terminalExecutionOutcomes[changed.id]
+            val existingOutcome = closedExecutionOutcomes[changed.id]
             existingOutcome?.let { existing ->
                 require(existing.session.hasSameRemoteSemantics(changed)) {
-                    "A confirmed terminal execution row was mutated by the server"
+                    "A confirmed closed execution row was mutated by the server"
                 }
             }
-            val immutableTerminalSession = existingOutcome?.session ?: changed
+            val immutableClosedSession = existingOutcome?.session ?: changed
             val outcome = TerminalExecutionOutcomeSnapshot(
                 syncOrigin = syncOrigin,
-                session = immutableTerminalSession,
-                requiresCanonicalItemProjection =
+                session = immutableClosedSession,
+                requiresCanonicalItemProjection = isCanonicalTerminal && (
                     existingOutcome?.requiresCanonicalItemProjection == true ||
-                        immutableTerminalSession.canonicalProjectionEligibleAtLeaseStart == true,
-                canonicalProjectionRevision = existingOutcome?.canonicalProjectionRevision,
-                canonicalProjectionResolution = existingOutcome?.canonicalProjectionResolution,
-                canonicalProjectionConflict = existingOutcome?.canonicalProjectionConflict,
-                canonicalProjectionRetryAuthorizedAt =
-                    existingOutcome?.canonicalProjectionRetryAuthorizedAt,
+                        immutableClosedSession.canonicalProjectionEligibleAtLeaseStart == true
+                    ),
+                canonicalProjectionRevision = existingOutcome
+                    ?.canonicalProjectionRevision?.takeIf { isCanonicalTerminal },
+                canonicalProjectionResolution = existingOutcome
+                    ?.canonicalProjectionResolution?.takeIf { isCanonicalTerminal },
+                canonicalProjectionConflict = existingOutcome
+                    ?.canonicalProjectionConflict?.takeIf { isCanonicalTerminal },
+                canonicalProjectionRetryAuthorizedAt = existingOutcome
+                    ?.canonicalProjectionRetryAuthorizedAt?.takeIf { isCanonicalTerminal },
                 recordedAt = existingOutcome?.recordedAt ?:
-                    immutableTerminalSession.endedAt ?: immutableTerminalSession.updatedAt,
+                    immutableClosedSession.endedAt ?: immutableClosedSession.updatedAt,
             )
-            terminalExecutionOutcomes = retainedTerminalExecutionOutcomes(
-                terminalExecutionOutcomes + (changed.id to outcome),
+            closedExecutionOutcomes = retainedClosedExecutionOutcomes(
+                closedExecutionOutcomes + (changed.id to outcome),
             )
-            if (focused != null && !outcome.userKeptLatestItem()) {
+            if (changed.status == "deferred") {
+                focused?.let { deferredBlock ->
+                    schedule = schedule.map { block ->
+                        if (block.id == deferredBlock.id) {
+                            block.copy(status = ItemStatus.SCHEDULED, actualMinutes = null)
+                        } else {
+                            block
+                        }
+                    }
+                }
+                changed.occurrenceId?.let { occurrenceId ->
+                    val staleOutcome = recurrenceOutcomes[occurrenceId]
+                    recurrenceOutcomes = recurrenceOutcomes - occurrenceId
+                    val owner = current.occurrenceSeriesItemIds[occurrenceId]
+                    if (
+                        owner != null && staleOutcome?.status == ItemStatus.COMPLETED &&
+                        completionAnchors[owner] == staleOutcome.resolvedAt
+                    ) {
+                        val previousCompletion = recurrenceOutcomes.values.asSequence()
+                            .filter {
+                                it.itemId == owner && it.status == ItemStatus.COMPLETED
+                            }
+                            .maxByOrNull { Instant.parse(it.resolvedAt) }
+                        completionAnchors = if (previousCompletion == null) {
+                            completionAnchors - owner
+                        } else {
+                            completionAnchors + (owner to previousCompletion.resolvedAt)
+                        }
+                    }
+                }
+            }
+            if (
+                isCanonicalTerminal && changedSessionControlsPresentation && focused != null &&
+                !outcome.userKeptLatestItem()
+            ) {
                 val displayStatus = changed.terminalDisplayStatus()
                 schedule = schedule.map { block ->
                     if (block.id == focused.id) {
@@ -3063,7 +3125,7 @@ class PlannerStore(
             canonicalExecutionConfigurationId = configurationId,
             canonicalExecutionRevision = revision,
             canonicalExecutionSession = authoritativeActiveSession,
-            terminalExecutionOutcomes = terminalExecutionOutcomes,
+            terminalExecutionOutcomes = closedExecutionOutcomes,
             pendingExecutionCommand = if (clearPendingIdempotencyKey != null) {
                 null
             } else {
@@ -3196,9 +3258,10 @@ class PlannerStore(
         val projectedExecutionMinutes = pendingMutation?.terminalExecutionSessionId?.let { sessionId ->
             val outcome = current.terminalExecutionOutcomes[sessionId]
                 ?: throw IllegalArgumentException("Terminal execution projection is unavailable")
-            validateTerminalExecutionOutcome(outcome)
+            validateClosedExecutionOutcome(outcome)
             require(
-                outcome.session.itemId == item.id && outcome.session.status == item.status,
+                outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                    outcome.session.itemId == item.id && outcome.session.status == item.status,
             ) { "Terminal execution projection does not match the canonical response" }
             requireNotNull(outcome.session.actualMinutes()) {
                 "Terminal execution duration is unavailable"
@@ -3236,9 +3299,10 @@ class PlannerStore(
         val terminalExecutionOutcomes = pendingMutation?.terminalExecutionSessionId?.let { sessionId ->
             val outcome = current.terminalExecutionOutcomes[sessionId]
                 ?: throw IllegalArgumentException("Terminal execution projection is unavailable")
-            validateTerminalExecutionOutcome(outcome)
+            validateClosedExecutionOutcome(outcome)
             require(
-                outcome.requiresCanonicalItemProjection &&
+                outcome.session.status in TERMINAL_EXECUTION_STATUSES &&
+                    outcome.requiresCanonicalItemProjection &&
                     outcome.isProjectionWriteAuthorized() &&
                     outcome.session.itemId == item.id &&
                     outcome.session.itemRevision <= pendingMutation.expectedRevision &&
@@ -3657,6 +3721,8 @@ class PlannerStore(
         val pausedAt = session.pausedAt?.let(Instant::parse)
         val pauseUntil = session.pauseUntil?.let(Instant::parse)
         val endedAt = session.endedAt?.let(Instant::parse)
+        val moveStart = session.moveStart?.let(Instant::parse)
+        val moveEnd = session.moveEnd?.let(Instant::parse)
         val createdAt = Instant.parse(session.createdAt)
         val updatedAt = Instant.parse(session.updatedAt)
         require(createdAt == startedAt && updatedAt >= createdAt)
@@ -3674,27 +3740,39 @@ class PlannerStore(
         when (session.status) {
             "active" -> require(
                 runningSince == updatedAt && pausedAt == null && pauseUntil == null &&
-                    session.pauseReason == null && endedAt == null && session.actualSeconds == null,
+                    session.pauseReason == null && endedAt == null &&
+                    session.actualSeconds == null && moveStart == null && moveEnd == null,
             )
             "paused" -> require(
                 runningSince == null && pausedAt != null && pausedAt >= startedAt &&
                     pausedAt <= updatedAt &&
                     (pauseUntil == null || pauseUntil > updatedAt &&
                         pauseUntil <= updatedAt.plusSeconds(MAX_EXECUTION_PAUSE_SECONDS.toLong())) &&
-                    endedAt == null && session.actualSeconds == null,
+                    endedAt == null && session.actualSeconds == null &&
+                    moveStart == null && moveEnd == null,
             )
-            else -> require(
+            "completed", "skipped" -> require(
                 runningSince == null && pauseUntil == null && session.pauseReason == null &&
                     session.actualSeconds != null && endedAt == updatedAt &&
-                    (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt),
+                    (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
+                    moveStart == null && moveEnd == null,
+            )
+            "deferred" -> require(
+                runningSince == null && pauseUntil == null && session.pauseReason == null &&
+                    session.actualSeconds != null && endedAt == updatedAt &&
+                    (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
+                    moveStart != null && moveStart > endedAt &&
+                    moveEnd != null && moveEnd > moveStart &&
+                    Duration.between(moveStart, moveEnd) <=
+                    Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()),
             )
         }
     }
 
-    private fun validateTerminalExecutionOutcome(outcome: TerminalExecutionOutcomeSnapshot) {
+    private fun validateClosedExecutionOutcome(outcome: TerminalExecutionOutcomeSnapshot) {
         require(outcome.syncOrigin.isNotBlank())
         validateExecutionSession(outcome.session, mustBeOpen = false)
-        require(outcome.session.status in TERMINAL_EXECUTION_STATUSES)
+        require(outcome.session.status in CLOSED_EXECUTION_STATUSES)
         Instant.parse(outcome.recordedAt)
         require(
             listOfNotNull(
@@ -3737,14 +3815,19 @@ class PlannerStore(
                     outcome.canonicalProjectionRetryAuthorizedAt == null
             )
         }
+        if (outcome.session.status == "deferred") {
+            require(!outcome.requiresCanonicalItemProjection) {
+                "Deferred execution cannot project a canonical terminal state"
+            }
+        }
     }
 
-    private fun validatedTerminalExecutionOutcomes(
+    private fun validatedClosedExecutionOutcomes(
         outcomes: Map<String, TerminalExecutionOutcomeSnapshot>,
     ): List<TerminalExecutionOutcomeSnapshot> {
         return outcomes.map { (sessionId, outcome) ->
             require(sessionId == outcome.session.id)
-            validateTerminalExecutionOutcome(outcome)
+            validateClosedExecutionOutcome(outcome)
             outcome
         }
     }
@@ -3772,7 +3855,8 @@ class PlannerStore(
             block.sessionIndex == sessionIndex
 
     private fun TerminalExecutionOutcomeSnapshot.isProjectionUnresolved(): Boolean =
-        requiresCanonicalItemProjection &&
+        session.status in TERMINAL_EXECUTION_STATUSES &&
+            requiresCanonicalItemProjection &&
             canonicalProjectionRevision == null &&
             canonicalProjectionResolution == null
 
@@ -3794,7 +3878,10 @@ class PlannerStore(
         require(UUID.fromString(sessionId).toString() == sessionId)
         val outcome = state.terminalExecutionOutcomes[sessionId]
             ?: throw IllegalArgumentException("Terminal execution outcome is unavailable")
-        validateTerminalExecutionOutcome(outcome)
+        validateClosedExecutionOutcome(outcome)
+        require(outcome.session.status in TERMINAL_EXECUTION_STATUSES) {
+            "Execution closure does not have a canonical terminal projection"
+        }
         require(outcome.isProjectionUnresolved()) {
             "Terminal execution projection is already resolved"
         }
@@ -3808,6 +3895,7 @@ class PlannerStore(
         unscheduledWork: List<UnscheduledWorkSnapshot>,
     ): Boolean {
         if (
+            session.status !in TERMINAL_EXECUTION_STATUSES ||
             !isProjectionUnresolved() || session.occurrenceId != null ||
             block.canonicalItemId != session.itemId || block.occurrenceId != null ||
             block.sessionIndex != session.sessionIndex || block.isSplittable
@@ -3939,19 +4027,19 @@ class PlannerStore(
     }
 
     /**
-     * Keeps every immutable terminal fact for the lifetime of this credential binding.
+     * Keeps every immutable closed fact for the lifetime of this credential binding.
      *
      * Server history is paged and plans can reintroduce an old split/session identity years later;
      * dropping a resolved row would therefore resurrect completed work. The encrypted Room snapshot
      * is the compact durable ledger, not a presentation cache, so it intentionally has no age/count
      * eviction policy.
      */
-    private fun retainedTerminalExecutionOutcomes(
+    private fun retainedClosedExecutionOutcomes(
         outcomes: Map<String, TerminalExecutionOutcomeSnapshot>,
     ): Map<String, TerminalExecutionOutcomeSnapshot> {
         outcomes.forEach { (sessionId, outcome) ->
             require(sessionId == outcome.session.id)
-            validateTerminalExecutionOutcome(outcome)
+            validateClosedExecutionOutcome(outcome)
         }
         return outcomes.toMap()
     }
@@ -4251,12 +4339,14 @@ class PlannerStore(
         val OPEN_DISPLAY_STATUSES = setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
         val OPEN_EXECUTION_STATUSES = setOf("active", "paused")
         val TERMINAL_EXECUTION_STATUSES = setOf("completed", "skipped")
+        val CLOSED_EXECUTION_STATUSES = TERMINAL_EXECUTION_STATUSES + "deferred"
         val TERMINAL_CANONICAL_STATUSES = setOf("completed", "skipped")
-        val ALL_EXECUTION_STATUSES = OPEN_EXECUTION_STATUSES + TERMINAL_EXECUTION_STATUSES
+        val ALL_EXECUTION_STATUSES = OPEN_EXECUTION_STATUSES + CLOSED_EXECUTION_STATUSES
         val EXECUTION_COMMAND_TYPES = setOf("start", "pause", "resume", "complete", "skip")
         const val MAX_PENDING_EXECUTION_REQUEST_CHARS = 64 * 1024
         const val MAX_EXECUTION_HISTORY_WINDOW = 100
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60
+        const val MAX_DEFER_MOVE_WINDOW_SECONDS = 24 * 60 * 60
         const val MAX_TERMINAL_PROJECTION_CONFLICT_CHARS = 500
         const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
         const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1

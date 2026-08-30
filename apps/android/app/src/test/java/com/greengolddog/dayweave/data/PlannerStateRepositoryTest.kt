@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.data
 
+import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.DayWeaveUiState
@@ -13,6 +14,7 @@ import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
+import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
@@ -87,6 +89,60 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.inbox.single().isSensitive)
         assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
+    }
+
+    @Test
+    fun deferredExecutionHistorySurvivesEncryptedSnapshotRoundTrip() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 17 }
+        val deferred = CanonicalExecutionSessionSnapshot(
+            id = "44444444-4444-4444-8444-444444444444",
+            itemId = "11111111-1111-4111-8111-111111111111",
+            itemRevision = 7,
+            sessionIndex = 0,
+            plannedBlockId = "22222222-2222-4222-8222-222222222222",
+            sourceDeviceId = "33333333-3333-4333-8333-333333333333",
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 135,
+            actualSeconds = 135,
+            startedAt = "2026-09-01T06:45:00Z",
+            endedAt = "2026-09-01T07:00:00Z",
+            moveStart = "2026-09-01T08:00:00Z",
+            moveEnd = "2026-09-01T09:00:00Z",
+            createdAt = "2026-09-01T06:45:00Z",
+            updatedAt = "2026-09-01T07:00:00Z",
+        )
+        val state = DayWeaveUiState(
+            canonicalExecutionSyncOrigin = "https://api.example.test/",
+            canonicalExecutionRevision = 2,
+            canonicalExecutionHistoryWindow = listOf(deferred),
+            canonicalExecutionHistoryWindowRevision = 2,
+            canonicalExecutionHistoryContinuityEstablished = true,
+            canonicalExecutionHistoryVerified = true,
+            terminalExecutionOutcomes = mapOf(
+                deferred.id to TerminalExecutionOutcomeSnapshot(
+                    syncOrigin = "https://api.example.test/",
+                    session = deferred,
+                    requiresCanonicalItemProjection = false,
+                    recordedAt = requireNotNull(deferred.endedAt),
+                ),
+            ),
+        )
+
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(listOf(deferred), restored.canonicalExecutionHistoryWindow)
+        assertEquals(2L, restored.canonicalExecutionHistoryWindowRevision)
+        assertTrue(restored.canonicalExecutionHistoryVerified)
+        val retained = restored.terminalExecutionOutcomes.getValue(deferred.id)
+        assertEquals(deferred, retained.session)
+        assertFalse(retained.requiresCanonicalItemProjection)
+        assertEquals(deferred.endedAt, retained.recordedAt)
+        assertEquals(PlannerSnapshotFormats.JSON_V7, dao.snapshot?.payloadFormat)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
 
     @Test

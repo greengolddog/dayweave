@@ -22,6 +22,7 @@ import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.MAX_SCHEDULE_PUBLISH_BODY_BYTES
@@ -482,6 +483,99 @@ class PlannerStoreTest {
 
         assertPublishedPlanInvalidated(store)
         assertTrue(occurrenceId in store.state.value.recurrenceOutcomes)
+    }
+
+    @Test
+    fun remoteDeferredSessionRemainsHistoryOnlyAndNeverProjectsAnOutcome() {
+        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
+        val store = PlannerStore(
+            publishedCanonicalState(item, block).copy(
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            ),
+        )
+        val running = executionSession("active", 1).copy(occurrenceId = occurrenceId)
+        assertNotNull(
+            store.reconcileCanonicalExecution(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revision = 1,
+                activeSession = running,
+                message = "Recurring session active",
+            ),
+        )
+        val deferred = running.copy(
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            moveStart = "1970-01-01T02:00:00Z",
+            moveEnd = "1970-01-01T03:00:00Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+
+        assertNotNull(
+            store.reconcileCanonicalExecution(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revision = 2,
+                activeSession = null,
+                changedSession = deferred,
+                message = "Recurring session deferred",
+            ),
+        )
+        assertNotNull(
+            store.recordCanonicalExecutionHistoryWindow(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revision = 2,
+                history = listOf(deferred.copy(canonicalProjectionEligibleAtLeaseStart = null)),
+                continuityVerified = true,
+                message = "Deferred history retained",
+            ),
+        )
+
+        val state = store.state.value
+        assertNull(state.canonicalExecutionSession)
+        assertEquals(ItemStatus.SCHEDULED, state.schedule.single().status)
+        assertEquals("planned", state.canonicalItems.single().status)
+        val deferredOutcome = state.terminalExecutionOutcomes.getValue(deferred.id)
+        assertEquals(deferred, deferredOutcome.session)
+        assertFalse(deferredOutcome.requiresCanonicalItemProjection)
+        assertNull(deferredOutcome.canonicalProjectionRevision)
+        assertNull(deferredOutcome.canonicalProjectionResolution)
+        assertNull(deferredOutcome.canonicalProjectionConflict)
+        assertNull(deferredOutcome.canonicalProjectionRetryAuthorizedAt)
+        assertTrue(state.recurrenceOutcomes.isEmpty())
+        assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+        assertEquals("deferred", state.canonicalExecutionHistoryWindow.single().status)
+        assertEquals(deferred.moveStart, state.canonicalExecutionHistoryWindow.single().moveStart)
+        assertEquals(deferred.moveEnd, state.canonicalExecutionHistoryWindow.single().moveEnd)
+        assertTrue(store.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
+        assertNotNull(state.publishedScheduleRevision)
+
+        val restarted = PlannerStore(state)
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
+        assertEquals(deferredOutcome, restarted.state.value.terminalExecutionOutcomes[deferred.id])
+
+        val recomposedBlockId = "77777777-7777-4777-8777-777777777777"
+        val restartedAfterRecompose = PlannerStore(
+            state.copy(
+                schedule = state.schedule.map { scheduled ->
+                    scheduled.copy(id = recomposedBlockId)
+                },
+            ),
+        )
+        assertTrue(restartedAfterRecompose.isCanonicalExecutionStartBlocked(recomposedBlockId))
+        assertEquals(
+            deferredOutcome,
+            restartedAfterRecompose.state.value.terminalExecutionOutcomes[deferred.id],
+        )
     }
 
     @Test
@@ -1159,7 +1253,228 @@ class PlannerStoreTest {
     }
 
     @Test
-    fun compositionKeepsANewerOpenLeaseAboveOlderTerminalHistory() {
+    fun newerDeferredClosureSuppressesOlderTerminalPresentationAndRecurrenceProjection() {
+        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val item = canonicalItem(status = "planned", revision = 7).copy(
+            recurrenceJson = "{\"frequency\":\"daily\"}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, revision = 7).copy(
+            occurrenceId = occurrenceId,
+        )
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(item),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+                schedule = listOf(block),
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            ),
+        )
+        val olderCompleted = executionSession(status = "active", revision = 1).copy(
+            id = "33333333-3333-4333-8333-333333333333",
+            occurrenceId = occurrenceId,
+            status = "completed",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+        val newerDeferred = executionSession(status = "active", revision = 1).copy(
+            occurrenceId = occurrenceId,
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 90,
+            actualSeconds = 90,
+            runningSince = null,
+            endedAt = "1970-01-01T01:02:00Z",
+            moveStart = "1970-01-01T02:00:00Z",
+            moveEnd = "1970-01-01T03:00:00Z",
+            updatedAt = "1970-01-01T01:02:00Z",
+        )
+
+        requireNotNull(
+            store.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                2,
+                null,
+                olderCompleted,
+                message = "Older completion",
+            ),
+        )
+        assertEquals(ItemStatus.COMPLETED, store.state.value.schedule.single().status)
+        assertEquals(ItemStatus.COMPLETED, store.state.value.recurrenceOutcomes[occurrenceId]?.status)
+        assertEquals(
+            olderCompleted.endedAt,
+            store.state.value.recurrenceCompletionAnchors[CANONICAL_ITEM_ID],
+        )
+
+        requireNotNull(
+            store.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                4,
+                null,
+                newerDeferred,
+                message = "Newer defer",
+            ),
+        )
+        assertEquals(ItemStatus.SCHEDULED, store.state.value.schedule.single().status)
+        assertTrue(store.state.value.recurrenceOutcomes.isEmpty())
+        assertTrue(store.state.value.recurrenceCompletionAnchors.isEmpty())
+
+        requireNotNull(
+            store.replaceCanonicalPlan(
+                canonicalUpdate(
+                    item,
+                    block.copy(id = "77777777-7777-4777-8777-777777777777"),
+                    "cursor-1",
+                ),
+            ),
+        )
+
+        val state = store.state.value
+        assertEquals(ItemStatus.SCHEDULED, state.schedule.single().status)
+        assertTrue(state.recurrenceOutcomes.isEmpty())
+        assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+        assertEquals(2, state.terminalExecutionOutcomes.size)
+        val deferredOutcome = state.terminalExecutionOutcomes.getValue(newerDeferred.id)
+        assertFalse(deferredOutcome.requiresCanonicalItemProjection)
+        assertNull(deferredOutcome.canonicalProjectionRevision)
+        assertNull(deferredOutcome.canonicalProjectionResolution)
+        assertNull(deferredOutcome.canonicalProjectionConflict)
+        assertNull(deferredOutcome.canonicalProjectionRetryAuthorizedAt)
+    }
+
+    @Test
+    fun newerDeferredClosureSuppressesNewProjectionButPreservesExistingMutationUncertainty() {
+        val initial = DayWeaveUiState(
+            canonicalItems = listOf(canonicalItem(status = "planned", revision = 7)),
+            canonicalSyncOrigin = CANONICAL_ORIGIN,
+            canonicalConfigurationId = "connection-1",
+            canonicalDeltaCursor = "cursor-0",
+            schedule = listOf(canonicalBlock(ItemStatus.SCHEDULED, revision = 7)),
+        )
+        val baseStore = PlannerStore(initial)
+        val running = executionSession(
+            status = "active",
+            revision = 1,
+            projectionEligible = true,
+        )
+        requireNotNull(
+            baseStore.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                1,
+                running,
+                message = "Older session active",
+            ),
+        )
+        val olderCompleted = running.copy(
+            status = "completed",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+        requireNotNull(
+            baseStore.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                2,
+                null,
+                olderCompleted,
+                message = "Older completion",
+            ),
+        )
+        val beforeDeferred = baseStore.state.value
+        assertTrue(
+            beforeDeferred.terminalExecutionOutcomes.getValue(olderCompleted.id)
+                .requiresCanonicalItemProjection,
+        )
+        val matchingPending = canonicalMutation(
+            targetStatus = "completed",
+            displayStatus = ItemStatus.COMPLETED,
+            terminalExecutionSessionId = olderCompleted.id,
+        )
+        val newerDeferred = executionSession(status = "active", revision = 1).copy(
+            id = "33333333-3333-4333-8333-333333333333",
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 90,
+            actualSeconds = 90,
+            runningSince = null,
+            endedAt = "1970-01-01T01:02:00Z",
+            moveStart = "1970-01-01T02:00:00Z",
+            moveEnd = "1970-01-01T03:00:00Z",
+            updatedAt = "1970-01-01T01:02:00Z",
+        )
+
+        val unstagedStore = PlannerStore(beforeDeferred)
+        requireNotNull(
+            unstagedStore.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                4,
+                null,
+                newerDeferred,
+                message = "Newer defer",
+            ),
+        )
+        assertFalse(
+            unstagedStore.state.value.isNewestExecutionForProjection(olderCompleted),
+        )
+        assertTrue(
+            unstagedStore.state.value.isNewestExecutionForProjection(newerDeferred),
+        )
+        assertFalse(unstagedStore.hasCredentialReplacementBlocker())
+        assertTrue(
+            runCatching { unstagedStore.stageCanonicalMutation(matchingPending) }.isFailure,
+        )
+
+        val matchingPendingStore = PlannerStore(beforeDeferred)
+        requireNotNull(matchingPendingStore.stageCanonicalMutation(matchingPending))
+        requireNotNull(
+            matchingPendingStore.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                4,
+                null,
+                newerDeferred,
+                message = "Newer defer",
+            ),
+        )
+        // Staging precedes network I/O, so the exact journal may already be in flight and cannot
+        // be discarded by a read-only execution refresh. It remains fenced for reconciliation.
+        assertEquals(matchingPending, matchingPendingStore.state.value.pendingCanonicalMutation)
+        assertEquals(ItemStatus.SCHEDULED, matchingPendingStore.state.value.schedule.single().status)
+
+        val unrelatedPending = canonicalMutation(
+            targetStatus = "planned",
+            displayStatus = ItemStatus.SCHEDULED,
+        )
+        val unrelatedPendingStore = PlannerStore(beforeDeferred)
+        requireNotNull(unrelatedPendingStore.stageCanonicalMutation(unrelatedPending))
+        requireNotNull(
+            unrelatedPendingStore.reconcileCanonicalExecution(
+                CANONICAL_ORIGIN,
+                "connection-1",
+                4,
+                null,
+                newerDeferred,
+                message = "Newer defer",
+            ),
+        )
+        assertEquals(unrelatedPending, unrelatedPendingStore.state.value.pendingCanonicalMutation)
+    }
+
+    @Test
+    fun authoritativeOpenLeaseWinsProjectionDespiteOlderTimestampAndId() {
         val store = PlannerStore(
             DayWeaveUiState(
                 canonicalItems = listOf(canonicalItem(status = "planned", revision = 7)),
@@ -1180,10 +1495,11 @@ class PlannerStoreTest {
             updatedAt = "1970-01-01T01:01:00Z",
         )
         val active = executionSession(status = "active", revision = 1).copy(
-            startedAt = "1970-01-01T01:02:00Z",
-            runningSince = "1970-01-01T01:02:00Z",
-            createdAt = "1970-01-01T01:02:00Z",
-            updatedAt = "1970-01-01T01:02:00Z",
+            id = "22222222-2222-4222-8222-222222222221",
+            startedAt = "1970-01-01T00:59:00Z",
+            runningSince = "1970-01-01T00:59:00Z",
+            createdAt = "1970-01-01T00:59:00Z",
+            updatedAt = "1970-01-01T00:59:00Z",
         )
         requireNotNull(
             store.reconcileCanonicalExecution(
@@ -1216,7 +1532,9 @@ class PlannerStoreTest {
         )
 
         assertEquals(ItemStatus.ACTIVE, store.state.value.schedule.single().status)
-        assertEquals(EXECUTION_ID, store.state.value.activeSession?.canonicalExecutionSessionId)
+        assertEquals(active.id, store.state.value.activeSession?.canonicalExecutionSessionId)
+        assertFalse(store.state.value.isNewestExecutionForProjection(terminal))
+        assertTrue(store.state.value.isNewestExecutionForProjection(active))
     }
 
     @Test

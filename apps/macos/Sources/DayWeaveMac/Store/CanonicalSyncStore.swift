@@ -1764,6 +1764,12 @@ final class CanonicalSyncStore: ObservableObject {
                 warnings.append("“\(item.title)” has split-session or conflicted status intent retained for review.")
                 continue
             }
+            guard planner.canPublishCanonicalMutation(mutation) else {
+                warnings.append(
+                    "“\(item.title)” has a superseded execution status journal retained without another write."
+                )
+                continue
+            }
             guard mutation.baseRevision == item.revision else {
                 planner.markCanonicalMutationConflicted(
                     itemID: itemID,

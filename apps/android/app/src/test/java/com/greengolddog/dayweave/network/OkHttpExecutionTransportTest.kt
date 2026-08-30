@@ -35,6 +35,8 @@ class OkHttpExecutionTransportTest {
         assertEquals(4L, snapshot.revision)
         assertEquals(SESSION_ID, snapshot.activeSession?.id)
         assertEquals("paused", snapshot.activeSession?.status)
+        assertEquals(null, snapshot.activeSession?.moveStart)
+        assertEquals(null, snapshot.activeSession?.moveEnd)
         val request = server.takeRequest()
         assertEquals("GET", request.method)
         assertEquals("/tenant/v1/execution", request.url.encodedPath)
@@ -91,6 +93,22 @@ class OkHttpExecutionTransportTest {
             runBlocking { transport.history(configuration(), limit = 100, offset = 0) }
         }
         Unit
+    }
+
+    @Test
+    fun historyDecodesConditionalDeferredMoveWindow() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                """{"sessions":[${deferredSessionJson()}],"next_offset":null}""",
+            ),
+        )
+
+        val deferred = transport.history(configuration()).sessions.single()
+
+        assertEquals("deferred", deferred.status)
+        assertEquals(135L, deferred.actualSeconds)
+        assertEquals("2026-09-01T08:00:00Z", deferred.moveStart)
+        assertEquals("2026-09-01T09:00:00Z", deferred.moveEnd)
     }
 
     @Test
@@ -181,6 +199,32 @@ class OkHttpExecutionTransportTest {
           "ended_at":null,
           "created_at":"2026-09-01T06:45:00Z",
           "updated_at":"2026-09-01T06:50:00Z"
+        }
+    """.trimIndent()
+
+    private fun deferredSessionJson(): String = """
+        {
+          "id":"$SESSION_ID",
+          "item_id":"11111111-1111-4111-8111-111111111111",
+          "item_revision":7,
+          "occurrence_id":null,
+          "session_index":0,
+          "planned_block_id":"22222222-2222-4222-8222-222222222222",
+          "source_device_id":"33333333-3333-4333-8333-333333333333",
+          "status":"deferred",
+          "revision":2,
+          "accumulated_seconds":135,
+          "actual_seconds":135,
+          "started_at":"2026-09-01T06:45:00Z",
+          "running_since":null,
+          "paused_at":null,
+          "pause_until":null,
+          "pause_reason":null,
+          "ended_at":"2026-09-01T07:00:00Z",
+          "move_start":"2026-09-01T08:00:00Z",
+          "move_end":"2026-09-01T09:00:00Z",
+          "created_at":"2026-09-01T06:45:00Z",
+          "updated_at":"2026-09-01T07:00:00Z"
         }
     """.trimIndent()
 

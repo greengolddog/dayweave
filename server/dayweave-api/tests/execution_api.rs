@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header},
 };
+use chrono::{Duration as ChronoDuration, Utc};
 use dayweave_api::{
     AppState,
     auth::StaticTokenAuthenticator,
@@ -349,6 +350,31 @@ async fn execution_rejects_malformed_breaks_and_unknown_fields() {
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
+    let exact_now = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    let nanosecond_pause = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                0,
+                json!({
+                    "type": "pause",
+                    "session_id": Uuid::new_v4(),
+                    "duration_seconds": null,
+                    "pause_until": exact_now
+                        + ChronoDuration::minutes(1)
+                        + ChronoDuration::nanoseconds(1),
+                    "reason": null
+                }),
+            )),
+            true,
+            Some("execution-nanosecond-break-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(nanosecond_pause.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
     let unknown = app
         .clone()
         .oneshot(request(
@@ -368,4 +394,198 @@ async fn execution_rejects_malformed_breaks_and_unknown_fields() {
         .await
         .unwrap();
     assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers response compatibility and replay as one public contract.
+async fn execution_defer_is_terminal_exact_and_replayable_over_http() {
+    let app = test_app();
+    let item_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(item(item_id)),
+            true,
+            Some("execution-defer-create-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let started = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                0,
+                json!({
+                    "type": "start",
+                    "session_id": session_id,
+                    "item_id": item_id,
+                    "item_revision": 1,
+                    "occurrence_id": null,
+                    "session_index": 0,
+                    "planned_block_id": null,
+                    "device_id": Uuid::new_v4()
+                }),
+            )),
+            true,
+            Some("execution-defer-start-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+    let started = body_json(started).await;
+    assert!(
+        started["mutation"]["changed_session"]
+            .get("move_start")
+            .is_none()
+    );
+    assert!(
+        started["mutation"]["changed_session"]
+            .get("move_end")
+            .is_none()
+    );
+
+    let exact_now = chrono::DateTime::from_timestamp_micros(Utc::now().timestamp_micros()).unwrap();
+    let move_start = exact_now + ChronoDuration::days(30) + ChronoDuration::microseconds(1);
+    let move_end = move_start + ChronoDuration::hours(24);
+    let defer = command(
+        1,
+        json!({
+            "type": "defer",
+            "session_id": session_id,
+            "move_start": move_start,
+            "move_end": move_end
+        }),
+    );
+    let deferred = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(defer.clone()),
+            true,
+            Some("execution-defer-command-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deferred.status(), StatusCode::OK);
+    assert_eq!(deferred.headers()["idempotency-replayed"], "false");
+    let deferred = body_json(deferred).await;
+    assert_eq!(deferred["mutation"]["revision"], 2);
+    assert!(deferred["mutation"]["active_session"].is_null());
+    assert_eq!(
+        deferred["mutation"]["changed_session"]["status"],
+        "deferred"
+    );
+    assert_eq!(
+        deferred["mutation"]["changed_session"]["move_start"],
+        serde_json::to_value(move_start).unwrap()
+    );
+    assert_eq!(
+        deferred["mutation"]["changed_session"]["move_end"],
+        serde_json::to_value(move_end).unwrap()
+    );
+    assert_eq!(
+        deferred["mutation"]["changed_session"]["ended_at"],
+        deferred["mutation"]["changed_session"]["updated_at"]
+    );
+
+    let replay = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(defer),
+            true,
+            Some("execution-defer-command-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+}
+
+#[tokio::test]
+async fn execution_defer_rejects_invalid_windows_missing_fields_and_unknown_fields() {
+    let app = test_app();
+    let now = Utc::now();
+    let exact_now = chrono::DateTime::from_timestamp_micros(now.timestamp_micros()).unwrap();
+    let invalid_windows = [
+        (
+            now - ChronoDuration::seconds(1),
+            now + ChronoDuration::minutes(1),
+        ),
+        (
+            now + ChronoDuration::minutes(1),
+            now + ChronoDuration::minutes(1),
+        ),
+        (
+            now + ChronoDuration::days(30),
+            now + ChronoDuration::days(31) + ChronoDuration::seconds(1),
+        ),
+        (
+            exact_now + ChronoDuration::days(30) + ChronoDuration::nanoseconds(1),
+            exact_now + ChronoDuration::days(30) + ChronoDuration::hours(1),
+        ),
+    ];
+    for (index, (move_start, move_end)) in invalid_windows.into_iter().enumerate() {
+        let invalid = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(command(
+                    0,
+                    json!({
+                        "type": "defer",
+                        "session_id": Uuid::new_v4(),
+                        "move_start": move_start,
+                        "move_end": move_end
+                    }),
+                )),
+                true,
+                Some(&format!("execution-invalid-defer-{index:03}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let future_start = now + ChronoDuration::hours(1);
+    for (index, malformed) in [
+        json!({
+            "type": "defer",
+            "session_id": Uuid::new_v4(),
+            "move_start": future_start
+        }),
+        json!({
+            "type": "defer",
+            "session_id": Uuid::new_v4(),
+            "move_start": future_start,
+            "move_end": future_start + ChronoDuration::minutes(30),
+            "surprise": true
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let malformed = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/execution/commands",
+                Some(command(0, malformed)),
+                true,
+                Some(&format!("execution-malformed-defer-{index:03}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    }
 }

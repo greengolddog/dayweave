@@ -1389,7 +1389,9 @@ private struct CanonicalConflictRecoveryControls: View {
                         }
                     }
                     .buttonStyle(.link)
-                    .disabled(!store.canMutatePlan)
+                    .disabled(
+                        !store.canKeepLatestCanonicalItem(forExecutionSession: sessionID)
+                    )
                 }
             }
             if let errorMessage {

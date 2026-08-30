@@ -53,6 +53,27 @@ struct ExecutionAPIClientTests {
         #expect(requests.allSatisfy { $0.headers["Authorization"] == "Bearer \(Self.token)" })
     }
 
+    @Test("deferred history decodes its exact move without changing older session shape")
+    func deferredHistoryContract() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"sessions":[\#(Self.session(status: "deferred", revision: 2))],"next_offset":null}"#.utf8
+                )
+            )
+        )
+
+        let history = try await Self.client().executionHistory(limit: 1)
+        let deferred = try #require(history.first)
+        #expect(deferred.status == .deferred)
+        #expect(deferred.actualSeconds == 1_234)
+        #expect(deferred.moveStart == Self.date("2026-08-29T06:20:34Z"))
+        #expect(deferred.moveEnd == Self.date("2026-08-29T06:50:34Z"))
+        #expect(deferred.endedAt == deferred.updatedAt)
+    }
+
     @Test("commands preserve one deterministic body and idempotency key")
     func deterministicCommandBodiesAndReplay() async throws {
         URLProtocolStub.storage.enqueue(
@@ -172,6 +193,16 @@ struct ExecutionAPIClientTests {
         let future = Self.session(status: "active", revision: 1)
             .dropLast()
             + #","future_lease":true}"#
+        let incompleteDeferred = Self.session(status: "deferred", revision: 2)
+            .replacingOccurrences(
+                of: #""move_end":"2026-08-29T06:50:34Z","#,
+                with: ""
+            )
+        let forgedCompletedMove = Self.session(status: "completed", revision: 2)
+            .replacingOccurrences(
+                of: #""ended_at":"#,
+                with: #""move_start":"2026-08-29T06:20:34Z","move_end":"2026-08-29T06:50:34Z","ended_at":"#
+            )
         let futureBody = Data(
             #"{"execution":{"revision":1,"active_session":\#(future)}}"#.utf8
         )
@@ -189,6 +220,14 @@ struct ExecutionAPIClientTests {
             .init(
                 statusCode: 200,
                 body: Data(#"{"execution":{"revision":18446744073709551615,"active_session":null}}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"sessions":[\#(incompleteDeferred)],"next_offset":null}"#.utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(#"{"sessions":[\#(forgedCompletedMove)],"next_offset":null}"#.utf8)
             )
         )
         let client = Self.client()
@@ -196,6 +235,8 @@ struct ExecutionAPIClientTests {
         await Self.expectDecodingFailure { try await client.executionSnapshot() }
         await Self.expectDecodingFailure { try await client.executionSnapshot() }
         await Self.expectDecodingFailure { try await client.executionSnapshot() }
+        await Self.expectDecodingFailure { try await client.executionHistory(limit: 1) }
+        await Self.expectDecodingFailure { try await client.executionHistory(limit: 1) }
     }
 
     @Test("invalid history limits fail before transport")
@@ -480,8 +521,8 @@ struct ExecutionAPIClientTests {
         }
     }
 
-    private static func expectDecodingFailure(
-        _ operation: () async throws -> DayWeaveExecutionSnapshot
+    private static func expectDecodingFailure<Value>(
+        _ operation: () async throws -> Value
     ) async {
         do {
             _ = try await operation()
@@ -550,7 +591,11 @@ struct ExecutionAPIClientTests {
     ) -> String {
         let isActive = status == "active"
         let isPaused = status == "paused"
-        let isTerminal = status == "completed" || status == "skipped"
+        let isDeferred = status == "deferred"
+        let isTerminal = status == "completed" || status == "skipped" || isDeferred
+        let moveFields = isDeferred
+            ? "\"move_start\":\"2026-08-29T06:20:34Z\",\n          \"move_end\":\"2026-08-29T06:50:34Z\","
+            : ""
         return """
         {
           "id":"\(id.uuidString.lowercased())",
@@ -569,10 +614,18 @@ struct ExecutionAPIClientTests {
           "paused_at":\(isPaused ? "\"2026-08-29T05:20:34Z\"" : "null"),
           "pause_until":\(isPaused ? "\"2026-08-29T05:35:34Z\"" : "null"),
           "pause_reason":\(isPaused ? "\"Tea\"" : "null"),
+          \(moveFields)
           "ended_at":\(isTerminal ? "\"2026-08-29T05:20:34Z\"" : "null"),
           "created_at":"2026-08-29T05:00:00Z",
           "updated_at":"2026-08-29T05:20:34Z"
         }
         """
+    }
+
+    private static func date(_ value: String) -> Date {
+        guard let date = ISO8601DateFormatter().date(from: value) else {
+            preconditionFailure("Invalid execution test date")
+        }
+        return date
     }
 }

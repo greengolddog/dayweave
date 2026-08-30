@@ -8,6 +8,7 @@ import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.health.EnergySignalManager
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthBindingFence
 import com.greengolddog.dayweave.network.ApiBindingOperationGate
 import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
@@ -247,6 +248,8 @@ class DayWeaveApplication : Application() {
                 val state = plannerStore.state.value
                 state.terminalExecutionOutcomes.values.any { outcome ->
                     outcome.syncOrigin == state.canonicalSyncOrigin &&
+                        outcome.session.status in CANONICAL_TERMINAL_EXECUTION_STATUSES &&
+                        state.isNewestExecutionForProjection(outcome.session) &&
                         outcome.requiresCanonicalItemProjection &&
                         outcome.canonicalProjectionRevision == null &&
                         outcome.canonicalProjectionResolution == null &&
@@ -262,6 +265,7 @@ class DayWeaveApplication : Application() {
 
     private companion object {
         const val LOG_TAG = "DayWeavePersistence"
+        val CANONICAL_TERMINAL_EXECUTION_STATUSES = setOf("completed", "skipped")
     }
 }
 

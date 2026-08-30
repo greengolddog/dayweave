@@ -17,6 +17,9 @@ struct ExecutionSyncStoreTests {
     nonisolated private static let deviceID = UUID(
         uuidString: "40000000-0000-4000-8000-000000000004"
     )!
+    nonisolated private static let occurrenceID = UUID(
+        uuidString: "50000000-0000-4000-8000-000000000005"
+    )!
     nonisolated private static let binding = "execution-test-binding-a"
     nonisolated private static let canonicalConfiguration = "https://api.example.test"
     nonisolated private static let baseDate = Date(timeIntervalSince1970: 1_800_000_000)
@@ -333,6 +336,161 @@ struct ExecutionSyncStoreTests {
         #expect(planner.executionState.pendingCommand == command)
     }
 
+    @Test("a protocol-ahead public clock does not inflate or reject observed elapsed work")
+    func protocolAheadMutationAcceptsServerObservedElapsedTime() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sessionID = Self.uuid(1_001)
+        let protocolStart = Self.baseDate.addingTimeInterval(3_600)
+        let prior = try Self.session(
+            id: sessionID,
+            status: .active,
+            revision: 1,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: protocolStart,
+            updatedAt: protocolStart,
+            accumulatedSeconds: 0,
+            actualSeconds: nil,
+            runningSince: protocolStart,
+            pausedAt: nil,
+            pauseUntil: nil,
+            endedAt: nil
+        )
+        let changedAt = protocolStart.addingTimeInterval(1)
+        let changed = try Self.session(
+            id: sessionID,
+            status: .completed,
+            revision: 2,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: protocolStart,
+            updatedAt: changedAt,
+            accumulatedSeconds: 10,
+            actualSeconds: 10,
+            runningSince: nil,
+            pausedAt: nil,
+            pauseUntil: nil,
+            endedAt: changedAt
+        )
+        let command = DayWeaveExecutionCommand.complete(
+            sessionID: sessionID,
+            actualSeconds: nil
+        )
+        let request = DayWeaveExecutionCommandRequest(
+            expectedRevision: 1,
+            command: command
+        )
+        let pending = DayWeavePendingExecutionCommand(
+            idempotencyKey: "mac-execution-protocol-ahead-complete",
+            bindingIdentifier: Self.binding,
+            expectedRevision: 1,
+            identity: .init(session: prior),
+            command: command,
+            encodedRequest: try DayWeaveExecutionWireCodec.encode(request),
+            priorSession: prior,
+            focusedBlockID: Self.blockID,
+            canonicalProjectionEligibleAtLeaseStart: true,
+            stagedAt: Self.baseDate
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = 1
+        durable.activeSession = prior
+        durable.historyWindow = [prior]
+        durable.historyWindowRevision = 1
+        durable.pendingCommand = pending
+        let snapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [changed], nextOffset: nil)],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: 2,
+                active: nil,
+                changed: changed,
+                replayed: false
+            ))]
+        )
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+
+        #expect(await Self.controller(planner: planner, transport: transport).refresh() == .success)
+        #expect(planner.executionState.pendingCommand == nil)
+        #expect(planner.executionState.historyVerified)
+        #expect(planner.executionState.terminalOutcomes[sessionID]?.session == changed)
+        #expect(planner.pendingCanonicalMutations.first?.executionSessionID == sessionID)
+    }
+
+    @Test("a corrected terminal duration must match the exact command")
+    func correctedTerminalDurationMismatchRetainsFence() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sessionID = Self.uuid(1_002)
+        let prior = try Self.activeSession(sessionID: sessionID)
+        let changedAt = Self.baseDate.addingTimeInterval(1)
+        let changed = try Self.session(
+            id: sessionID,
+            status: .completed,
+            revision: 2,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate,
+            updatedAt: changedAt,
+            accumulatedSeconds: 1,
+            actualSeconds: 8,
+            runningSince: nil,
+            pausedAt: nil,
+            pauseUntil: nil,
+            endedAt: changedAt
+        )
+        let command = DayWeaveExecutionCommand.complete(
+            sessionID: sessionID,
+            actualSeconds: 7
+        )
+        let pending = DayWeavePendingExecutionCommand(
+            idempotencyKey: "mac-execution-corrected-duration",
+            bindingIdentifier: Self.binding,
+            expectedRevision: 1,
+            identity: .init(session: prior),
+            command: command,
+            encodedRequest: try DayWeaveExecutionWireCodec.encode(.init(
+                expectedRevision: 1,
+                command: command
+            )),
+            priorSession: prior,
+            focusedBlockID: Self.blockID,
+            canonicalProjectionEligibleAtLeaseStart: true,
+            stagedAt: Self.baseDate
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = 1
+        durable.activeSession = prior
+        durable.historyWindow = [prior]
+        durable.historyWindowRevision = 1
+        durable.pendingCommand = pending
+        let transport = ExecutionTransportDouble(
+            snapshots: [],
+            pages: [],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: 2,
+                active: nil,
+                changed: changed,
+                replayed: false
+            ))]
+        )
+        let planner = Self.planner(
+            persistence: context.persistence,
+            executionState: durable
+        )
+
+        #expect(await Self.controller(planner: planner, transport: transport).refresh()
+            == .protocolFailure)
+        #expect(planner.executionState.pendingCommand == pending)
+    }
+
     @Test("split-session completion changes only its exact block and never projects the parent")
     func splitSessionPresentationIsScoped() async throws {
         let context = try Self.persistenceContext()
@@ -360,6 +518,248 @@ struct ExecutionSyncStoreTests {
         #expect(planner.blocks.first(where: { $0.id == first.id })?.status == .completed)
         #expect(planner.blocks.first(where: { $0.id == second.id })?.status == .scheduled)
         #expect(planner.pendingCanonicalMutations.isEmpty)
+    }
+
+    @Test("deferred history is retained without becoming completion or skip")
+    func deferredHistoryIsTerminalButNonProjecting() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let deferred = try Self.deferredSession(
+            sessionID: Self.uuid(55),
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate
+        )
+        let snapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [deferred], nextOffset: nil)]
+        )
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [Self.block()],
+            canonicalItems: [try Self.canonicalItem()]
+        )
+
+        #expect(await Self.controller(planner: planner, transport: transport).refresh() == .success)
+        #expect(planner.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+        #expect(planner.pendingCanonicalMutations.isEmpty)
+        #expect(planner.recurrenceSessionOutcomes.isEmpty)
+        #expect(planner.executionState.terminalOutcomes[deferred.id]?.session == deferred)
+        #expect(planner.executionState.terminalOutcomes[deferred.id]?.projection == .notRequired)
+
+        planner.flushPersistence()
+        let relaunched = PlannerStore.live(persistence: context.persistence)
+        #expect(relaunched.persistenceError == nil)
+        #expect(relaunched.executionState.terminalOutcomes[deferred.id]?.session == deferred)
+        #expect(relaunched.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+    }
+
+    @Test("a newer deferred session suppresses a projection but preserves its uncertainty journal")
+    func newerDeferredSuppressesProjectionAndPreservesJournalAcrossRelaunch() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let older = try Self.terminalSession(
+            sessionID: Self.uuid(56),
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate
+        )
+        let deferred = try Self.deferredSession(
+            sessionID: Self.uuid(57),
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate.addingTimeInterval(100)
+        )
+        var state = Self.emptyBoundState
+        state.revision = older.revision
+        state.historyWindow = [older]
+        state.historyWindowRevision = older.revision
+        state.terminalOutcomes[older.id] = .init(
+            session: older,
+            recordedAt: older.updatedAt,
+            projection: .pending
+        )
+        state.presentedBlockIDs = [Self.blockID]
+        let linkedMutation = PendingCanonicalMutation(
+            id: Self.uuid(58),
+            itemID: Self.itemID,
+            occurrenceID: nil,
+            sessionIndex: 0,
+            desiredStatus: .completed,
+            baseRevision: older.itemRevision,
+            createdAt: older.updatedAt,
+            disposition: .pending,
+            diagnostic: nil,
+            executionSessionID: older.id
+        )
+        var completedBlock = Self.block()
+        completedBlock.status = .completed
+        completedBlock.actualMinutes = 1
+        let seeded = Self.planner(
+            persistence: context.persistence,
+            blocks: [completedBlock],
+            canonicalItems: [try Self.canonicalItem()],
+            pendingCanonicalMutations: [linkedMutation],
+            executionState: state
+        )
+        seeded.flushPersistence()
+
+        let firstLaunch = PlannerStore.live(persistence: context.persistence)
+        #expect(firstLaunch.pendingCanonicalMutations == [linkedMutation])
+        let snapshot = DayWeaveExecutionSnapshot(revision: 4, activeSession: nil)
+        let firstTransport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [deferred, older], nextOffset: nil)]
+        )
+        #expect(
+            await Self.controller(planner: firstLaunch, transport: firstTransport).refresh()
+                == .success
+        )
+        #expect(firstLaunch.pendingCanonicalMutations == [linkedMutation])
+        #expect(firstLaunch.executionState.terminalOutcomes[older.id]?.projection == .notRequired)
+        #expect(firstLaunch.executionState.terminalOutcomes[deferred.id]?.projection == .notRequired)
+        #expect(firstLaunch.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+        firstLaunch.capturePendingCanonicalMutations()
+        #expect(firstLaunch.pendingCanonicalMutations == [linkedMutation])
+        let conflictDiagnostic = "The exact status write was rejected as stale."
+        firstLaunch.markCanonicalMutationConflicted(
+            itemID: Self.itemID,
+            diagnostic: conflictDiagnostic
+        )
+        var conflictedMutation = linkedMutation
+        conflictedMutation.disposition = .conflicted
+        conflictedMutation.diagnostic = conflictDiagnostic
+        #expect(firstLaunch.pendingCanonicalMutations == [conflictedMutation])
+        #expect(firstLaunch.executionState.terminalOutcomes[older.id]?.projection == .notRequired)
+        #expect(!firstLaunch.canRetryCanonicalMutation(conflictedMutation))
+        #expect(!firstLaunch.canKeepLatestCanonicalItem(forExecutionSession: older.id))
+
+        var recomposedBlock = Self.block()
+        recomposedBlock.syncOrigin = .localComposition
+        let compositionNow = Date()
+        let provenance = LocalScheduleCompositionProvenance(
+            configurationIdentifier: Self.canonicalConfiguration,
+            localInputFingerprint: "local-sha256:\(String(repeating: "a", count: 64))",
+            generatedAt: compositionNow,
+            asOf: compositionNow,
+            horizonStart: compositionNow.addingTimeInterval(-60),
+            horizonEnd: compositionNow.addingTimeInterval(7 * 24 * 60 * 60),
+            timezoneName: "Europe/Madrid",
+            sourceItemRevisions: [Self.itemID: 1]
+        )
+        #expect(firstLaunch.beginCanonicalSync())
+        try firstLaunch.commitLocalScheduleComposition(
+            blocks: [recomposedBlock],
+            message: "Recomposed after deferred history",
+            provenance: provenance
+        )
+        firstLaunch.endCanonicalSync()
+        #expect(firstLaunch.pendingCanonicalMutations == [conflictedMutation])
+        #expect(firstLaunch.canonicalPreviewFreshnessIssue == nil)
+        #expect(!firstLaunch.canRetryCanonicalMutation(conflictedMutation))
+        #expect(firstLaunch.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+
+        firstLaunch.flushPersistence()
+        let secondLaunch = PlannerStore.live(persistence: context.persistence)
+        #expect(secondLaunch.persistenceError == nil)
+        #expect(secondLaunch.pendingCanonicalMutations == [conflictedMutation])
+        #expect(secondLaunch.executionState.terminalOutcomes[older.id]?.projection == .notRequired)
+        let secondTransport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [deferred, older], nextOffset: nil)]
+        )
+        #expect(
+            await Self.controller(planner: secondLaunch, transport: secondTransport).refresh()
+                == .success
+        )
+        #expect(secondLaunch.pendingCanonicalMutations == [conflictedMutation])
+        #expect(!secondLaunch.canRetryCanonicalMutation(conflictedMutation))
+        #expect(!secondLaunch.canKeepLatestCanonicalItem(forExecutionSession: older.id))
+        #expect(secondLaunch.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+    }
+
+    @Test("a newer deferred recurrence session removes stale outcome and completion anchor")
+    func newerDeferredRemovesRecurrenceAnchorAcrossRelaunch() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let older = try Self.terminalSession(
+            sessionID: Self.uuid(59),
+            sessionIndex: 0,
+            occurrenceID: Self.occurrenceID,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate
+        )
+        let deferred = try Self.deferredSession(
+            sessionID: Self.uuid(60),
+            sessionIndex: 0,
+            occurrenceID: Self.occurrenceID,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate.addingTimeInterval(100)
+        )
+        var state = Self.emptyBoundState
+        state.revision = older.revision
+        state.historyWindow = [older]
+        state.historyWindowRevision = older.revision
+        state.terminalOutcomes[older.id] = .init(
+            session: older,
+            recordedAt: older.updatedAt,
+            projection: .notRequired
+        )
+        state.presentedBlockIDs = [Self.blockID]
+        let recurrenceOutcome = RecurrenceSessionOutcome(
+            itemID: Self.itemID,
+            occurrenceID: Self.occurrenceID,
+            sessionIndex: 0,
+            disposition: .completed,
+            occurredAt: older.endedAt ?? older.updatedAt,
+            occurrenceFullyScheduled: true
+        )
+        var completedBlock = Self.block(occurrenceID: Self.occurrenceID)
+        completedBlock.status = .completed
+        completedBlock.actualMinutes = 1
+        let seeded = Self.planner(
+            persistence: context.persistence,
+            blocks: [completedBlock],
+            canonicalItems: [try Self.canonicalItem()],
+            completedOccurrenceIDs: [Self.occurrenceID],
+            recurrenceSessionOutcomes: [recurrenceOutcome],
+            executionState: state
+        )
+        seeded.flushPersistence()
+
+        let firstLaunch = PlannerStore.live(persistence: context.persistence)
+        #expect(firstLaunch.recurrenceCompletionAnchors()[Self.itemID] == recurrenceOutcome.occurredAt)
+        let snapshot = DayWeaveExecutionSnapshot(revision: 4, activeSession: nil)
+        let firstTransport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [deferred, older], nextOffset: nil)]
+        )
+        #expect(
+            await Self.controller(planner: firstLaunch, transport: firstTransport).refresh()
+                == .success
+        )
+        #expect(firstLaunch.recurrenceSessionOutcomes.isEmpty)
+        #expect(firstLaunch.recurrenceCompletionAnchors().isEmpty)
+        #expect(!firstLaunch.completedOccurrenceIDs.contains(Self.occurrenceID))
+        #expect(firstLaunch.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
+
+        firstLaunch.flushPersistence()
+        let secondLaunch = PlannerStore.live(persistence: context.persistence)
+        #expect(secondLaunch.persistenceError == nil)
+        #expect(secondLaunch.recurrenceSessionOutcomes.isEmpty)
+        #expect(secondLaunch.recurrenceCompletionAnchors().isEmpty)
+        let secondTransport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [deferred, older], nextOffset: nil)]
+        )
+        #expect(
+            await Self.controller(planner: secondLaunch, transport: secondTransport).refresh()
+                == .success
+        )
+        #expect(secondLaunch.recurrenceSessionOutcomes.isEmpty)
+        #expect(secondLaunch.recurrenceCompletionAnchors().isEmpty)
+        #expect(secondLaunch.blocks.first(where: { $0.id == Self.blockID })?.status == .scheduled)
     }
 
     @Test("eligible terminal outcomes enter the existing approval-safe canonical mutation path")
@@ -400,8 +800,8 @@ struct ExecutionSyncStoreTests {
         #expect(relaunched.pendingCanonicalMutations.first?.executionSessionID == terminal.id)
     }
 
-    @Test("a newer open lease overrides an older terminal presentation on the same target")
-    func newerActiveLeaseWinsPresentation() async throws {
+    @Test("the authoritative open lease overrides a later-dated terminal on the same target")
+    func authoritativeActiveLeaseWinsDespiteOlderTimestamp() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
         let terminal = try Self.terminalSession(
@@ -412,22 +812,26 @@ struct ExecutionSyncStoreTests {
         )
         let active = try Self.activeSession(
             sessionID: Self.uuid(71),
-            startedAt: Self.baseDate.addingTimeInterval(100)
+            startedAt: Self.baseDate.addingTimeInterval(-100)
         )
         let snapshot = DayWeaveExecutionSnapshot(revision: 3, activeSession: active)
         let transport = ExecutionTransportDouble(
             snapshots: [snapshot, snapshot],
-            pages: [.init(sessions: [active, terminal], nextOffset: nil)]
+            pages: [.init(sessions: [terminal, active], nextOffset: nil)]
         )
+        var state = Self.emptyBoundState
+        state.leaseProjectionEligibility[terminal.id] = true
         let planner = Self.planner(
             persistence: context.persistence,
             blocks: [Self.block()],
-            canonicalItems: [try Self.canonicalItem()]
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: state
         )
 
         #expect(await Self.controller(planner: planner, transport: transport).refresh() == .success)
         #expect(planner.blocks.first(where: { $0.id == Self.blockID })?.status == .active)
-        #expect(planner.executionState.terminalOutcomes[terminal.id] != nil)
+        #expect(planner.executionState.terminalOutcomes[terminal.id]?.projection == .notRequired)
+        #expect(planner.pendingCanonicalMutations.isEmpty)
     }
 
     @Test("an expired timed break remains paused until an explicit local choice")
@@ -575,11 +979,17 @@ struct ExecutionSyncStoreTests {
         persistence: EncryptedPlannerPersistence,
         blocks: [ScheduleBlock] = [],
         canonicalItems: [DayWeaveCanonicalItem] = [],
+        completedOccurrenceIDs: Set<UUID> = [],
+        pendingCanonicalMutations: [PendingCanonicalMutation] = [],
+        recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
         executionState: DayWeaveExecutionDurableState = emptyBoundState
     ) -> PlannerStore {
         PlannerStore(
             blocks: blocks,
             canonicalItems: canonicalItems,
+            completedOccurrenceIDs: completedOccurrenceIDs,
+            pendingCanonicalMutations: pendingCanonicalMutations,
+            recurrenceSessionOutcomes: recurrenceSessionOutcomes,
             canonicalConfigurationIdentifier: canonicalConfiguration,
             executionState: executionState,
             previewValidatedForCurrentLaunch: true,
@@ -610,7 +1020,8 @@ struct ExecutionSyncStoreTests {
 
     private static func block(
         id: UUID = blockID,
-        sessionIndex: UInt16 = 0
+        sessionIndex: UInt16 = 0,
+        occurrenceID: UUID? = nil
     ) -> ScheduleBlock {
         ScheduleBlock(
             id: id,
@@ -627,7 +1038,7 @@ struct ExecutionSyncStoreTests {
             actualMinutes: nil,
             sourceItemID: itemID,
             sourceItemRevision: 1,
-            occurrenceID: nil,
+            occurrenceID: occurrenceID,
             sessionIndex: sessionIndex,
             syncOrigin: .canonicalPreview,
             placementReason: nil,
@@ -678,6 +1089,7 @@ struct ExecutionSyncStoreTests {
     private static func terminalSession(
         sessionID: UUID,
         sessionIndex: UInt16,
+        occurrenceID: UUID? = nil,
         plannedBlockID: UUID? = nil,
         startedAt: Date
     ) throws -> DayWeaveExecutionSession {
@@ -686,6 +1098,7 @@ struct ExecutionSyncStoreTests {
             status: .completed,
             revision: 2,
             sessionIndex: sessionIndex,
+            occurrenceID: occurrenceID,
             plannedBlockID: plannedBlockID,
             startedAt: startedAt,
             updatedAt: startedAt.addingTimeInterval(1),
@@ -695,6 +1108,34 @@ struct ExecutionSyncStoreTests {
             pausedAt: nil,
             pauseUntil: nil,
             endedAt: startedAt.addingTimeInterval(1)
+        )
+    }
+
+    private static func deferredSession(
+        sessionID: UUID,
+        sessionIndex: UInt16,
+        occurrenceID: UUID? = nil,
+        plannedBlockID: UUID?,
+        startedAt: Date
+    ) throws -> DayWeaveExecutionSession {
+        let updatedAt = startedAt.addingTimeInterval(1)
+        return try session(
+            id: sessionID,
+            status: .deferred,
+            revision: 2,
+            sessionIndex: sessionIndex,
+            occurrenceID: occurrenceID,
+            plannedBlockID: plannedBlockID,
+            startedAt: startedAt,
+            updatedAt: updatedAt,
+            accumulatedSeconds: 1,
+            actualSeconds: 1,
+            runningSince: nil,
+            pausedAt: nil,
+            pauseUntil: nil,
+            moveStart: updatedAt.addingTimeInterval(3_600),
+            moveEnd: updatedAt.addingTimeInterval(5_400),
+            endedAt: updatedAt
         )
     }
 
@@ -722,6 +1163,7 @@ struct ExecutionSyncStoreTests {
         status: DayWeaveExecutionStatus,
         revision: UInt64,
         sessionIndex: UInt16,
+        occurrenceID: UUID? = nil,
         plannedBlockID: UUID?,
         startedAt: Date,
         updatedAt: Date,
@@ -730,13 +1172,15 @@ struct ExecutionSyncStoreTests {
         runningSince: Date?,
         pausedAt: Date?,
         pauseUntil: Date?,
+        moveStart: Date? = nil,
+        moveEnd: Date? = nil,
         endedAt: Date?
     ) throws -> DayWeaveExecutionSession {
         let object: [String: Any] = [
             "id": id.uuidString.lowercased(),
             "item_id": itemID.uuidString.lowercased(),
             "item_revision": 1,
-            "occurrence_id": NSNull(),
+            "occurrence_id": occurrenceID?.uuidString.lowercased() ?? NSNull(),
             "session_index": Int(sessionIndex),
             "planned_block_id": plannedBlockID?.uuidString.lowercased() ?? NSNull(),
             "source_device_id": deviceID.uuidString.lowercased(),
@@ -749,6 +1193,8 @@ struct ExecutionSyncStoreTests {
             "paused_at": pausedAt.map(format) ?? NSNull(),
             "pause_until": pauseUntil.map(format) ?? NSNull(),
             "pause_reason": NSNull(),
+            "move_start": moveStart.map(format) ?? NSNull(),
+            "move_end": moveEnd.map(format) ?? NSNull(),
             "ended_at": endedAt.map(format) ?? NSNull(),
             "created_at": format(startedAt),
             "updated_at": format(updatedAt),
@@ -795,6 +1241,8 @@ struct ExecutionSyncStoreTests {
             "paused_at": session.pausedAt.map(format) ?? NSNull(),
             "pause_until": session.pauseUntil.map(format) ?? NSNull(),
             "pause_reason": session.pauseReason ?? NSNull(),
+            "move_start": session.moveStart.map(format) ?? NSNull(),
+            "move_end": session.moveEnd.map(format) ?? NSNull(),
             "ended_at": session.endedAt.map(format) ?? NSNull(),
             "created_at": format(session.createdAt),
             "updated_at": format(session.updatedAt),

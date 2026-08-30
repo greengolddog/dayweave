@@ -1,10 +1,13 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::scheduling::has_postgres_timestamp_precision;
+
 pub const MAX_PAUSE_SECONDS: u32 = 24 * 60 * 60;
+pub const MAX_DEFER_SECONDS: u32 = 24 * 60 * 60;
 pub const MAX_ACTUAL_SECONDS: u64 = i64::MAX as u64;
 const MAX_REASON_CHARS: usize = 500;
 
@@ -15,6 +18,7 @@ pub enum ExecutionStatus {
     Paused,
     Completed,
     Skipped,
+    Deferred,
 }
 
 impl ExecutionStatus {
@@ -24,7 +28,7 @@ impl ExecutionStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionSession {
     pub id: Uuid,
@@ -40,16 +44,112 @@ pub struct ExecutionSession {
     pub actual_seconds: Option<u64>,
     pub started_at: DateTime<Utc>,
     pub running_since: Option<DateTime<Utc>>,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) observed_running_since: Option<DateTime<Utc>>,
     pub paused_at: Option<DateTime<Utc>>,
     pub pause_until: Option<DateTime<Utc>>,
     pub pause_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_start: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub move_end: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionSessionWire {
+    id: Uuid,
+    item_id: Uuid,
+    item_revision: u64,
+    occurrence_id: Option<Uuid>,
+    session_index: u16,
+    planned_block_id: Option<Uuid>,
+    source_device_id: Uuid,
+    status: ExecutionStatus,
+    revision: u64,
+    accumulated_seconds: u64,
+    actual_seconds: Option<u64>,
+    started_at: DateTime<Utc>,
+    running_since: Option<DateTime<Utc>>,
+    paused_at: Option<DateTime<Utc>>,
+    pause_until: Option<DateTime<Utc>>,
+    pause_reason: Option<String>,
+    move_start: Option<DateTime<Utc>>,
+    move_end: Option<DateTime<Utc>>,
+    ended_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl TryFrom<ExecutionSessionWire> for ExecutionSession {
+    type Error = ExecutionDomainError;
+
+    fn try_from(wire: ExecutionSessionWire) -> Result<Self, Self::Error> {
+        match (wire.status, wire.move_start, wire.move_end) {
+            (ExecutionStatus::Deferred, Some(start), Some(end))
+                if wire.ended_at == Some(wire.updated_at)
+                    && start > wire.updated_at
+                    && start < end
+                    && has_postgres_timestamp_precision(start)
+                    && has_postgres_timestamp_precision(end)
+                    && end.signed_duration_since(start)
+                        <= chrono::Duration::seconds(i64::from(MAX_DEFER_SECONDS)) => {}
+            (ExecutionStatus::Deferred, _, _) => return Err(ExecutionDomainError::InvalidDefer),
+            (_, None, None) => {}
+            (_, _, _) => return Err(ExecutionDomainError::InvalidDefer),
+        }
+        Ok(Self {
+            id: wire.id,
+            item_id: wire.item_id,
+            item_revision: wire.item_revision,
+            occurrence_id: wire.occurrence_id,
+            session_index: wire.session_index,
+            planned_block_id: wire.planned_block_id,
+            source_device_id: wire.source_device_id,
+            status: wire.status,
+            revision: wire.revision,
+            accumulated_seconds: wire.accumulated_seconds,
+            actual_seconds: wire.actual_seconds,
+            started_at: wire.started_at,
+            running_since: wire.running_since,
+            observed_running_since: wire.running_since,
+            paused_at: wire.paused_at,
+            pause_until: wire.pause_until,
+            pause_reason: wire.pause_reason,
+            move_start: wire.move_start,
+            move_end: wire.move_end,
+            ended_at: wire.ended_at,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for ExecutionSession {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExecutionSessionWire::deserialize(deserializer)?;
+        Self::try_from(wire).map_err(serde::de::Error::custom)
+    }
+}
+
 impl ExecutionSession {
+    #[cfg(test)]
     pub(crate) fn start(input: &StartExecution, now: DateTime<Utc>) -> Self {
+        Self::start_with_protocol_time(input, now, now)
+    }
+
+    pub(crate) fn start_with_protocol_time(
+        input: &StartExecution,
+        transition_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> Self {
         Self {
             id: input.session_id,
             item_id: input.item_id,
@@ -62,48 +162,69 @@ impl ExecutionSession {
             revision: 1,
             accumulated_seconds: 0,
             actual_seconds: None,
-            started_at: now,
-            running_since: Some(now),
+            started_at: transition_at,
+            running_since: Some(transition_at),
+            observed_running_since: Some(observed_at),
             paused_at: None,
             pause_until: None,
             pause_reason: None,
+            move_start: None,
+            move_end: None,
             ended_at: None,
-            created_at: now,
-            updated_at: now,
+            created_at: transition_at,
+            updated_at: transition_at,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply(
         &self,
         command: &ExecutionCommand,
         now: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
-        // Wall clocks can move backwards. Session time is a persisted protocol clock: keeping it
-        // monotonic preserves elapsed accounting, newest-first pagination, and client continuity.
         let transition_at = now.max(self.updated_at);
+        self.apply_with_protocol_time(command, transition_at, transition_at)
+    }
+
+    pub(crate) fn apply_with_protocol_time(
+        &self,
+        command: &ExecutionCommand,
+        transition_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
+    ) -> Result<Self, ExecutionDomainError> {
+        // The persisted workspace protocol clock can run ahead after wall-clock rollback. Keep it
+        // causal for history ordering without charging that synthetic gap to the running timer.
+        if transition_at < self.updated_at || transition_at < observed_at {
+            return Err(ExecutionDomainError::InvalidTransition);
+        }
+        let elapsed_at = observed_at;
         match command {
             ExecutionCommand::Start(_) => Err(ExecutionDomainError::InvalidTransition),
-            ExecutionCommand::Pause(input) => self.pause(input, transition_at),
-            ExecutionCommand::Resume(input) => self.resume(input, transition_at),
+            ExecutionCommand::Pause(input) => self.pause(input, transition_at, elapsed_at),
+            ExecutionCommand::Resume(input) => self.resume(input, transition_at, observed_at),
             ExecutionCommand::Complete(input) => self.finish(
                 input.session_id,
                 input.actual_seconds,
                 ExecutionStatus::Completed,
                 transition_at,
+                elapsed_at,
             ),
             ExecutionCommand::Skip(input) => self.finish(
                 input.session_id,
                 input.actual_seconds,
                 ExecutionStatus::Skipped,
                 transition_at,
+                elapsed_at,
             ),
+            ExecutionCommand::Defer(input) => self.defer(input, transition_at, elapsed_at),
         }
     }
 
     fn pause(
         &self,
         input: &PauseExecution,
-        now: DateTime<Utc>,
+        transition_at: DateTime<Utc>,
+        elapsed_at: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
         if self.id != input.session_id || !self.status.is_open() {
             return Err(ExecutionDomainError::InvalidTransition);
@@ -111,11 +232,15 @@ impl ExecutionSession {
         validate_reason(input.reason.as_deref())?;
         let pause_until = match (input.duration_seconds, input.pause_until) {
             (Some(seconds), None) if (1..=MAX_PAUSE_SECONDS).contains(&seconds) => {
-                Some(now + chrono::Duration::seconds(i64::from(seconds)))
+                Some(transition_at + chrono::Duration::seconds(i64::from(seconds)))
             }
             (None, Some(until)) => {
-                let maximum = now + chrono::Duration::seconds(i64::from(MAX_PAUSE_SECONDS));
-                if until <= now || until > maximum {
+                let maximum =
+                    transition_at + chrono::Duration::seconds(i64::from(MAX_PAUSE_SECONDS));
+                if !has_postgres_timestamp_precision(until)
+                    || until <= transition_at
+                    || until > maximum
+                {
                     return Err(ExecutionDomainError::InvalidPause);
                 }
                 Some(until)
@@ -125,16 +250,17 @@ impl ExecutionSession {
                 return Err(ExecutionDomainError::InvalidPause);
             }
         };
-        let accumulated_seconds = self.elapsed_seconds(now)?;
+        let accumulated_seconds = self.elapsed_seconds(elapsed_at)?;
         Ok(Self {
             status: ExecutionStatus::Paused,
             revision: next_revision(self.revision)?,
             accumulated_seconds,
             running_since: None,
-            paused_at: self.paused_at.or(Some(now)),
+            observed_running_since: None,
+            paused_at: self.paused_at.or(Some(transition_at)),
             pause_until,
             pause_reason: input.reason.clone().or_else(|| self.pause_reason.clone()),
-            updated_at: now,
+            updated_at: transition_at,
             ..self.clone()
         })
     }
@@ -142,7 +268,8 @@ impl ExecutionSession {
     fn resume(
         &self,
         input: &ResumeExecution,
-        now: DateTime<Utc>,
+        transition_at: DateTime<Utc>,
+        observed_at: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
         if self.id != input.session_id || self.status != ExecutionStatus::Paused {
             return Err(ExecutionDomainError::InvalidTransition);
@@ -150,11 +277,12 @@ impl ExecutionSession {
         Ok(Self {
             status: ExecutionStatus::Active,
             revision: next_revision(self.revision)?,
-            running_since: Some(now),
+            running_since: Some(transition_at),
+            observed_running_since: Some(observed_at),
             paused_at: None,
             pause_until: None,
             pause_reason: None,
-            updated_at: now,
+            updated_at: transition_at,
             ..self.clone()
         })
     }
@@ -164,12 +292,13 @@ impl ExecutionSession {
         session_id: Uuid,
         corrected_actual_seconds: Option<u64>,
         status: ExecutionStatus,
-        now: DateTime<Utc>,
+        transition_at: DateTime<Utc>,
+        elapsed_at: DateTime<Utc>,
     ) -> Result<Self, ExecutionDomainError> {
         if self.id != session_id || !self.status.is_open() || status.is_open() {
             return Err(ExecutionDomainError::InvalidTransition);
         }
-        let elapsed = self.elapsed_seconds(now)?;
+        let elapsed = self.elapsed_seconds(elapsed_at)?;
         let actual_seconds = corrected_actual_seconds.unwrap_or(elapsed);
         if actual_seconds > MAX_ACTUAL_SECONDS {
             return Err(ExecutionDomainError::InvalidActualDuration);
@@ -180,19 +309,39 @@ impl ExecutionSession {
             accumulated_seconds: elapsed,
             actual_seconds: Some(actual_seconds),
             running_since: None,
+            observed_running_since: None,
             paused_at: self
                 .paused_at
-                .or((self.status == ExecutionStatus::Paused).then_some(now)),
+                .or((self.status == ExecutionStatus::Paused).then_some(transition_at)),
             pause_until: None,
             pause_reason: None,
-            ended_at: Some(now),
-            updated_at: now,
+            ended_at: Some(transition_at),
+            updated_at: transition_at,
             ..self.clone()
         })
     }
 
+    fn defer(
+        &self,
+        input: &DeferExecution,
+        transition_at: DateTime<Utc>,
+        elapsed_at: DateTime<Utc>,
+    ) -> Result<Self, ExecutionDomainError> {
+        validate_defer(input, transition_at)?;
+        let mut deferred = self.finish(
+            input.session_id,
+            input.actual_seconds,
+            ExecutionStatus::Deferred,
+            transition_at,
+            elapsed_at,
+        )?;
+        deferred.move_start = Some(input.move_start);
+        deferred.move_end = Some(input.move_end);
+        Ok(deferred)
+    }
+
     fn elapsed_seconds(&self, now: DateTime<Utc>) -> Result<u64, ExecutionDomainError> {
-        let running = self.running_since.map_or(Ok(0), |started| {
+        let running = self.observed_running_since.map_or(Ok(0), |started| {
             let seconds = now.signed_duration_since(started).num_seconds().max(0);
             u64::try_from(seconds).map_err(|_| ExecutionDomainError::DurationOverflow)
         })?;
@@ -213,6 +362,7 @@ pub enum ExecutionCommand {
     Resume(ResumeExecution),
     Complete(FinishExecution),
     Skip(FinishExecution),
+    Defer(DeferExecution),
 }
 
 impl ExecutionCommand {
@@ -223,6 +373,7 @@ impl ExecutionCommand {
             Self::Pause(input) => input.session_id,
             Self::Resume(input) => input.session_id,
             Self::Complete(input) | Self::Skip(input) => input.session_id,
+            Self::Defer(input) => input.session_id,
         }
     }
 
@@ -235,7 +386,8 @@ impl ExecutionCommand {
                 match (input.duration_seconds, input.pause_until) {
                     (Some(seconds), None) if (1..=MAX_PAUSE_SECONDS).contains(&seconds) => Ok(()),
                     (None, Some(until))
-                        if until > now
+                        if has_postgres_timestamp_precision(until)
+                            && until > now
                             && until
                                 <= now
                                     + chrono::Duration::seconds(i64::from(MAX_PAUSE_SECONDS)) =>
@@ -258,6 +410,7 @@ impl ExecutionCommand {
                     Ok(())
                 }
             }
+            Self::Defer(input) => validate_defer(input, now),
         }
     }
 }
@@ -310,6 +463,15 @@ pub struct FinishExecution {
     pub actual_seconds: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeferExecution {
+    pub session_id: Uuid,
+    pub move_start: DateTime<Utc>,
+    pub move_end: DateTime<Utc>,
+    pub actual_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ExecutionDomainError {
     #[error("execution identifiers must not be nil")]
@@ -322,6 +484,10 @@ pub enum ExecutionDomainError {
     InvalidPauseReason,
     #[error("actual duration is outside the supported range")]
     InvalidActualDuration,
+    #[error(
+        "deferred move window must use microsecond precision, start in the future, and span no more than 24 hours"
+    )]
+    InvalidDefer,
     #[error("execution command does not match the active session state")]
     InvalidTransition,
     #[error("execution revision or duration exceeded the supported range")]
@@ -336,6 +502,26 @@ fn validate_reason(reason: Option<&str>) -> Result<(), ExecutionDomainError> {
     } else {
         Ok(())
     }
+}
+
+fn validate_defer(input: &DeferExecution, now: DateTime<Utc>) -> Result<(), ExecutionDomainError> {
+    reject_nil(input.session_id)?;
+    if input
+        .actual_seconds
+        .is_some_and(|seconds| seconds > MAX_ACTUAL_SECONDS)
+    {
+        return Err(ExecutionDomainError::InvalidActualDuration);
+    }
+    let duration = input.move_end.signed_duration_since(input.move_start);
+    if !has_postgres_timestamp_precision(input.move_start)
+        || !has_postgres_timestamp_precision(input.move_end)
+        || input.move_start <= now
+        || input.move_end <= input.move_start
+        || duration > chrono::Duration::seconds(i64::from(MAX_DEFER_SECONDS))
+    {
+        return Err(ExecutionDomainError::InvalidDefer);
+    }
+    Ok(())
 }
 
 fn reject_nil(id: Uuid) -> Result<(), ExecutionDomainError> {
@@ -453,6 +639,70 @@ mod tests {
     }
 
     #[test]
+    fn workspace_protocol_clock_does_not_inflate_elapsed_work() {
+        let observed_start = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let protocol_start = observed_start + chrono::Duration::hours(1);
+        let session =
+            ExecutionSession::start_with_protocol_time(&start(), protocol_start, observed_start);
+        let observed_finish = observed_start + chrono::Duration::seconds(10);
+        let causal_transition = protocol_start + chrono::Duration::microseconds(1);
+        let completed = session
+            .apply_with_protocol_time(
+                &ExecutionCommand::Complete(FinishExecution {
+                    session_id: session.id,
+                    actual_seconds: None,
+                }),
+                causal_transition,
+                observed_finish,
+            )
+            .unwrap();
+
+        assert_eq!(completed.updated_at, causal_transition);
+        assert_eq!(completed.ended_at, Some(causal_transition));
+        assert_eq!(completed.accumulated_seconds, 10);
+        assert_eq!(completed.actual_seconds, Some(10));
+
+        let session = ExecutionSession::start(&start(), observed_start);
+        let paused = session
+            .apply_with_protocol_time(
+                &ExecutionCommand::Pause(PauseExecution {
+                    session_id: session.id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: None,
+                }),
+                protocol_start,
+                observed_start + chrono::Duration::seconds(10),
+            )
+            .unwrap();
+        let resumed = paused
+            .apply_with_protocol_time(
+                &ExecutionCommand::Resume(ResumeExecution {
+                    session_id: session.id,
+                }),
+                protocol_start + chrono::Duration::microseconds(1),
+                observed_start + chrono::Duration::seconds(20),
+            )
+            .unwrap();
+        let completed = resumed
+            .apply_with_protocol_time(
+                &ExecutionCommand::Complete(FinishExecution {
+                    session_id: session.id,
+                    actual_seconds: None,
+                }),
+                protocol_start + chrono::Duration::microseconds(2),
+                observed_start + chrono::Duration::seconds(25),
+            )
+            .unwrap();
+        assert_eq!(completed.accumulated_seconds, 15);
+        assert_eq!(completed.actual_seconds, Some(15));
+
+        let wire = serde_json::to_value(&resumed).unwrap();
+        assert!(wire.get("observed_running_since").is_none());
+        assert_eq!(wire["running_since"], serde_json::json!(resumed.updated_at));
+    }
+
+    #[test]
     fn pause_rejects_conflicting_duration_and_until() {
         let now = Utc::now();
         let command = ExecutionCommand::Pause(PauseExecution {
@@ -463,6 +713,40 @@ mod tests {
         });
         assert_eq!(
             command.validate(now),
+            Err(ExecutionDomainError::InvalidPause)
+        );
+    }
+
+    #[test]
+    fn absolute_pause_requires_postgres_microsecond_precision() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let session = ExecutionSession::start(&start(), now);
+        let exact = ExecutionCommand::Pause(PauseExecution {
+            session_id: session.id,
+            duration_seconds: None,
+            pause_until: Some(now + chrono::Duration::microseconds(1)),
+            reason: None,
+        });
+        assert_eq!(exact.validate(now), Ok(()));
+        assert_eq!(
+            session.apply(&exact, now).unwrap().pause_until,
+            Some(now + chrono::Duration::microseconds(1))
+        );
+
+        let nanosecond = ExecutionCommand::Pause(PauseExecution {
+            session_id: session.id,
+            duration_seconds: None,
+            pause_until: Some(
+                now + chrono::Duration::minutes(1) + chrono::Duration::nanoseconds(1),
+            ),
+            reason: None,
+        });
+        assert_eq!(
+            nanosecond.validate(now),
+            Err(ExecutionDomainError::InvalidPause)
+        );
+        assert_eq!(
+            session.apply(&nanosecond, now),
             Err(ExecutionDomainError::InvalidPause)
         );
     }
@@ -500,6 +784,216 @@ mod tests {
             extended.pause_until,
             Some(t0 + chrono::Duration::seconds(690))
         );
+    }
+
+    #[test]
+    fn defer_is_terminal_from_active_and_paused_with_elapsed_semantics() {
+        let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let move_start = t0 + chrono::Duration::hours(2);
+        let move_end = move_start + chrono::Duration::minutes(45);
+        let session = ExecutionSession::start(&start(), t0);
+        let deferred = session
+            .apply(
+                &ExecutionCommand::Defer(DeferExecution {
+                    session_id: session.id,
+                    move_start,
+                    move_end,
+                    actual_seconds: None,
+                }),
+                t0 + chrono::Duration::seconds(90),
+            )
+            .unwrap();
+
+        assert_eq!(deferred.status, ExecutionStatus::Deferred);
+        assert!(!deferred.status.is_open());
+        assert_eq!(deferred.accumulated_seconds, 90);
+        assert_eq!(deferred.actual_seconds, Some(90));
+        assert_eq!(deferred.move_start, Some(move_start));
+        assert_eq!(deferred.move_end, Some(move_end));
+        assert_eq!(deferred.ended_at, Some(t0 + chrono::Duration::seconds(90)));
+        assert!(deferred.running_since.is_none());
+
+        let session = ExecutionSession::start(&start(), t0);
+        let paused = session
+            .apply(
+                &ExecutionCommand::Pause(PauseExecution {
+                    session_id: session.id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: Some("Waiting".to_owned()),
+                }),
+                t0 + chrono::Duration::seconds(30),
+            )
+            .unwrap();
+        let deferred = paused
+            .apply(
+                &ExecutionCommand::Defer(DeferExecution {
+                    session_id: session.id,
+                    move_start,
+                    move_end,
+                    actual_seconds: Some(12),
+                }),
+                t0 + chrono::Duration::minutes(10),
+            )
+            .unwrap();
+
+        assert_eq!(deferred.status, ExecutionStatus::Deferred);
+        assert_eq!(deferred.accumulated_seconds, 30);
+        assert_eq!(deferred.actual_seconds, Some(12));
+        assert_eq!(deferred.paused_at, Some(t0 + chrono::Duration::seconds(30)));
+        assert!(deferred.pause_until.is_none());
+        assert!(deferred.pause_reason.is_none());
+        assert_eq!(deferred.move_start, Some(move_start));
+        assert_eq!(deferred.move_end, Some(move_end));
+    }
+
+    #[test]
+    fn defer_requires_an_exact_future_window_inside_twenty_four_hours() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let session_id = Uuid::from_u128(1);
+        let valid = ExecutionCommand::Defer(DeferExecution {
+            session_id,
+            move_start: now + chrono::Duration::days(30),
+            move_end: now + chrono::Duration::days(31),
+            actual_seconds: None,
+        });
+        assert_eq!(valid.validate(now), Ok(()));
+
+        let nanosecond = ExecutionCommand::Defer(DeferExecution {
+            session_id,
+            move_start: now + chrono::Duration::minutes(1) + chrono::Duration::nanoseconds(1),
+            move_end: now + chrono::Duration::minutes(2),
+            actual_seconds: None,
+        });
+        assert_eq!(
+            nanosecond.validate(now),
+            Err(ExecutionDomainError::InvalidDefer)
+        );
+
+        for command in [
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: now,
+                move_end: now + chrono::Duration::minutes(1),
+                actual_seconds: None,
+            }),
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: now + chrono::Duration::minutes(1),
+                move_end: now + chrono::Duration::minutes(1),
+                actual_seconds: None,
+            }),
+            ExecutionCommand::Defer(DeferExecution {
+                session_id,
+                move_start: now + chrono::Duration::days(30),
+                move_end: now + chrono::Duration::days(31) + chrono::Duration::seconds(1),
+                actual_seconds: None,
+            }),
+        ] {
+            assert_eq!(
+                command.validate(now),
+                Err(ExecutionDomainError::InvalidDefer)
+            );
+        }
+
+        let invalid_actual = ExecutionCommand::Defer(DeferExecution {
+            session_id,
+            move_start: now + chrono::Duration::minutes(1),
+            move_end: now + chrono::Duration::minutes(2),
+            actual_seconds: Some(MAX_ACTUAL_SECONDS + 1),
+        });
+        assert_eq!(
+            invalid_actual.validate(now),
+            Err(ExecutionDomainError::InvalidActualDuration)
+        );
+    }
+
+    #[test]
+    fn defer_revalidates_against_the_persisted_monotonic_clock() {
+        let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let session = ExecutionSession::start(&start(), t0);
+        let paused = session
+            .apply(
+                &ExecutionCommand::Pause(PauseExecution {
+                    session_id: session.id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: None,
+                }),
+                t0 + chrono::Duration::hours(2),
+            )
+            .unwrap();
+        let command = ExecutionCommand::Defer(DeferExecution {
+            session_id: session.id,
+            move_start: t0 + chrono::Duration::minutes(90),
+            move_end: t0 + chrono::Duration::hours(3),
+            actual_seconds: None,
+        });
+
+        assert_eq!(command.validate(t0 + chrono::Duration::hours(1)), Ok(()));
+        assert_eq!(
+            paused.apply(&command, t0 + chrono::Duration::hours(1)),
+            Err(ExecutionDomainError::InvalidDefer)
+        );
+    }
+
+    #[test]
+    fn session_wire_shape_omits_legacy_move_fields_and_rejects_partial_pairs() {
+        let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let session = ExecutionSession::start(&start(), t0);
+        let legacy_shape = serde_json::to_value(&session).unwrap();
+        assert!(legacy_shape.get("move_start").is_none());
+        assert!(legacy_shape.get("move_end").is_none());
+        assert_eq!(
+            serde_json::from_value::<ExecutionSession>(legacy_shape.clone()).unwrap(),
+            session
+        );
+
+        let mut partial = legacy_shape.clone();
+        partial["move_start"] = serde_json::json!(t0 + chrono::Duration::hours(1));
+        assert!(serde_json::from_value::<ExecutionSession>(partial).is_err());
+
+        let deferred = session
+            .apply(
+                &ExecutionCommand::Defer(DeferExecution {
+                    session_id: session.id,
+                    move_start: t0 + chrono::Duration::hours(1),
+                    move_end: t0 + chrono::Duration::hours(2),
+                    actual_seconds: None,
+                }),
+                t0 + chrono::Duration::minutes(1),
+            )
+            .unwrap();
+        let deferred_shape = serde_json::to_value(&deferred).unwrap();
+        assert!(deferred_shape.get("move_start").is_some());
+        assert!(deferred_shape.get("move_end").is_some());
+        assert_eq!(
+            serde_json::from_value::<ExecutionSession>(deferred_shape.clone()).unwrap(),
+            deferred
+        );
+
+        let mut partial_deferred = deferred_shape.clone();
+        partial_deferred.as_object_mut().unwrap().remove("move_end");
+        assert!(serde_json::from_value::<ExecutionSession>(partial_deferred).is_err());
+
+        let mut mismatched_terminal_time = deferred_shape.clone();
+        mismatched_terminal_time["ended_at"] =
+            serde_json::json!(deferred.updated_at - chrono::Duration::seconds(1));
+        assert!(serde_json::from_value::<ExecutionSession>(mismatched_terminal_time).is_err());
+
+        let mut nanosecond_deferred = deferred_shape.clone();
+        nanosecond_deferred["move_start"] =
+            serde_json::json!(deferred.move_start.unwrap() + chrono::Duration::nanoseconds(1));
+        assert!(serde_json::from_value::<ExecutionSession>(nanosecond_deferred).is_err());
+
+        let mut stale_deferred = deferred_shape;
+        stale_deferred["move_start"] = stale_deferred["updated_at"].clone();
+        assert!(serde_json::from_value::<ExecutionSession>(stale_deferred).is_err());
+
+        let mut nonterminal_with_move = legacy_shape;
+        nonterminal_with_move["move_start"] = serde_json::json!(t0 + chrono::Duration::hours(1));
+        nonterminal_with_move["move_end"] = serde_json::json!(t0 + chrono::Duration::hours(2));
+        assert!(serde_json::from_value::<ExecutionSession>(nonterminal_with_move).is_err());
     }
 
     #[test]

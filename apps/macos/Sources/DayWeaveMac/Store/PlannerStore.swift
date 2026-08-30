@@ -2540,7 +2540,12 @@ final class PlannerStore: ObservableObject {
         let selectedSourceID = selectedBlock?.sourceItemID
         let pendingLocalBlocks = blocks.filter { $0.isLocallyAuthored && $0.sourceItemID == nil }
         var mutationBySession: [CanonicalSessionKey: PendingCanonicalMutation] = [:]
-        for mutation in pendingCanonicalMutations {
+        let executionWinners = currentExecutionProjectionWinners()
+        for mutation in pendingCanonicalMutations
+            where canonicalMutationAffectsSchedulePresentation(
+                mutation,
+                executionWinners: executionWinners
+            ) {
             let key = CanonicalSessionKey(
                 itemID: mutation.itemID,
                 occurrenceID: mutation.occurrenceID,
@@ -2596,6 +2601,60 @@ final class PlannerStore: ObservableObject {
         applyExecutionPresentation(to: &presentedExecutionState)
         executionState = presentedExecutionState
         lastScheduleMessage = message
+    }
+
+    private func canonicalMutationAffectsSchedulePresentation(
+        _ mutation: PendingCanonicalMutation
+    ) -> Bool {
+        canonicalMutationAffectsSchedulePresentation(
+            mutation,
+            executionWinners: currentExecutionProjectionWinners()
+        )
+    }
+
+    private func canonicalMutationAffectsSchedulePresentation(
+        _ mutation: PendingCanonicalMutation,
+        executionWinners: [ExecutionProjectionKey: DayWeaveExecutionSession]
+    ) -> Bool {
+        guard let sessionID = mutation.executionSessionID,
+              let outcome = executionState.terminalOutcomes[sessionID],
+              executionProjectionWinner(
+                  for: sessionID,
+                  executionWinners: executionWinners
+              )?.id == sessionID else {
+            return mutation.executionSessionID == nil
+        }
+        switch outcome.projection {
+        case .pending, .conflicted, .retryAuthorized:
+            return true
+        case .notRequired, .applied, .keptLatest:
+            return false
+        }
+    }
+
+    private func executionProjectionWinner(
+        for sessionID: UUID
+    ) -> DayWeaveExecutionSession? {
+        executionProjectionWinner(
+            for: sessionID,
+            executionWinners: currentExecutionProjectionWinners()
+        )
+    }
+
+    private func executionProjectionWinner(
+        for sessionID: UUID,
+        executionWinners: [ExecutionProjectionKey: DayWeaveExecutionSession]
+    ) -> DayWeaveExecutionSession? {
+        guard let linked = executionState.terminalOutcomes[sessionID]?.session else { return nil }
+        return executionWinners[Self.executionProjectionKey(for: linked)]
+    }
+
+    private func currentExecutionProjectionWinners()
+        -> [ExecutionProjectionKey: DayWeaveExecutionSession] {
+        Self.newestExecutionSessionsByProjectionKey(
+            terminalSessions: executionState.terminalOutcomes.values.map(\.session),
+            activeSession: executionState.activeSession
+        )
     }
 
     func canonicalItem(id: UUID) -> DayWeaveCanonicalItem? {
@@ -3014,7 +3073,9 @@ final class PlannerStore: ObservableObject {
         guard canPersistPlan else { return }
         let itemByID = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
         let authoringItemIDs = Set(pendingCanonicalAuthoringMutations.map(\.itemID))
-        pendingCanonicalMutations.removeAll { authoringItemIDs.contains($0.itemID) }
+        pendingCanonicalMutations.removeAll {
+            $0.executionSessionID == nil && authoringItemIDs.contains($0.itemID)
+        }
         var existingKeys = Set(pendingCanonicalMutations.map {
             CanonicalSessionKey(
                 itemID: $0.itemID,
@@ -3059,7 +3120,7 @@ final class PlannerStore: ObservableObject {
         }
         if !keysToRemove.isEmpty {
             pendingCanonicalMutations.removeAll {
-                keysToRemove.contains(.init(
+                $0.executionSessionID == nil && keysToRemove.contains(.init(
                     itemID: $0.itemID,
                     occurrenceID: $0.occurrenceID,
                     sessionIndex: $0.sessionIndex ?? 0
@@ -3074,13 +3135,22 @@ final class PlannerStore: ObservableObject {
         diagnostic: String
     ) {
         guard canPersistPlan else { return }
+        let executionWinners = currentExecutionProjectionWinners()
         for index in pendingCanonicalMutations.indices
             where pendingCanonicalMutations[index].itemID == itemID {
             pendingCanonicalMutations[index].disposition = .conflicted
             pendingCanonicalMutations[index].diagnostic = diagnostic
             if let sessionID = pendingCanonicalMutations[index].executionSessionID,
                var outcome = executionState.terminalOutcomes[sessionID] {
-                outcome.projection = .conflicted(diagnostic)
+                switch outcome.projection {
+                case .pending, .conflicted, .retryAuthorized:
+                    outcome.projection = executionProjectionWinner(
+                        for: sessionID,
+                        executionWinners: executionWinners
+                    )?.id == sessionID ? .conflicted(diagnostic) : .notRequired
+                case .notRequired, .applied, .keptLatest:
+                    break
+                }
                 executionState.terminalOutcomes[sessionID] = outcome
             }
         }
@@ -3119,6 +3189,7 @@ final class PlannerStore: ObservableObject {
         guard canMutatePlan,
               canonicalPreviewFreshnessIssue == nil,
               mutation.disposition == .conflicted,
+              canonicalMutationAffectsSchedulePresentation(mutation),
               mutation.occurrenceID == nil,
               let item = canonicalItem(id: mutation.itemID),
               item.recurrence == nil,
@@ -3129,6 +3200,15 @@ final class PlannerStore: ObservableObject {
             $0.sourceItemID == mutation.itemID && $0.occurrenceID == nil
         }
         return matchingBlocks.count == 1 && matchingBlocks[0].occurrenceFullyScheduled
+    }
+
+    /// Execution-linked status intent is also a durable uncertainty journal.
+    /// It may be replayed only while its originating terminal session remains
+    /// the current actionable winner for that exact projection key. Generic
+    /// user-authored status mutations are unaffected by execution history.
+    func canPublishCanonicalMutation(_ mutation: PendingCanonicalMutation) -> Bool {
+        guard mutation.executionSessionID != nil else { return true }
+        return canonicalMutationAffectsSchedulePresentation(mutation)
     }
 
     func retryConflictedCanonicalMutation(_ mutationID: UUID) {
@@ -3264,7 +3344,8 @@ final class PlannerStore: ObservableObject {
     }
 
     func keepLatestCanonicalItem(forExecutionSession sessionID: UUID) throws {
-        guard var outcome = executionState.terminalOutcomes[sessionID] else {
+        guard canKeepLatestCanonicalItem(forExecutionSession: sessionID),
+              var outcome = executionState.terminalOutcomes[sessionID] else {
             throw PlannerExecutionStateError.invalidDurableState
         }
         switch outcome.projection {
@@ -3281,6 +3362,21 @@ final class PlannerStore: ObservableObject {
             message: "Kept the latest canonical item; the execution outcome remains in history",
             reconcilePresentation: true
         )
+    }
+
+    func canKeepLatestCanonicalItem(forExecutionSession sessionID: UUID) -> Bool {
+        guard canMutatePlan,
+              executionProjectionWinner(for: sessionID)?.id == sessionID,
+              pendingCanonicalMutations.contains(where: {
+                  $0.executionSessionID == sessionID
+              }),
+              let outcome = executionState.terminalOutcomes[sessionID] else { return false }
+        switch outcome.projection {
+        case .pending, .conflicted, .retryAuthorized:
+            return true
+        case .notRequired, .applied, .keptLatest:
+            return false
+        }
     }
 
     private func quarantineCredentialBoundState(preservingDeviceID: Bool) {
@@ -3363,24 +3459,21 @@ final class PlannerStore: ObservableObject {
         }
         state.presentedBlockIDs = []
 
-        let allSessions = state.terminalOutcomes.values.map(\.session)
-            + (state.activeSession.map { [$0] } ?? [])
-        let newest = allSessions.sorted(by: Self.executionNewestFirst).reduce(
-            into: [ExecutionProjectionKey: DayWeaveExecutionSession]()
-        ) { result, session in
-            let key = ExecutionProjectionKey(
-                itemID: session.itemID,
-                itemRevision: session.itemRevision,
-                occurrenceID: session.occurrenceID,
-                sessionIndex: session.sessionIndex
-            )
-            if result[key] == nil { result[key] = session }
-        }
+        let newest = Self.newestExecutionSessionsByProjectionKey(
+            terminalSessions: state.terminalOutcomes.values.map(\.session),
+            activeSession: state.activeSession
+        )
+
+        suppressCanonicalEffectsSupersededByNonCanonicalSession(
+            state: &state,
+            newest: newest
+        )
 
         for outcome in state.terminalOutcomes.values.sorted(by: {
             Self.executionNewestFirst($0.session, $1.session)
         }) {
             let session = outcome.session
+            guard session.status.isCanonicalTerminal else { continue }
             let key = ExecutionProjectionKey(
                 itemID: session.itemID,
                 itemRevision: session.itemRevision,
@@ -3450,6 +3543,55 @@ final class PlannerStore: ObservableObject {
         }
     }
 
+    private func suppressCanonicalEffectsSupersededByNonCanonicalSession(
+        state: inout DayWeaveExecutionDurableState,
+        newest: [ExecutionProjectionKey: DayWeaveExecutionSession]
+    ) {
+        var supersededRecurrenceKeys = Set<CanonicalSessionKey>()
+        for (sessionID, storedOutcome) in state.terminalOutcomes {
+            let session = storedOutcome.session
+            guard session.status.isCanonicalTerminal else { continue }
+            let key = ExecutionProjectionKey(
+                itemID: session.itemID,
+                itemRevision: session.itemRevision,
+                occurrenceID: session.occurrenceID,
+                sessionIndex: session.sessionIndex
+            )
+            guard let winner = newest[key],
+                  winner.id != sessionID,
+                  !winner.status.isCanonicalTerminal else { continue }
+            if let occurrenceID = session.occurrenceID {
+                supersededRecurrenceKeys.insert(.init(
+                    itemID: session.itemID,
+                    occurrenceID: occurrenceID,
+                    sessionIndex: session.sessionIndex
+                ))
+            }
+            switch storedOutcome.projection {
+            case .pending, .conflicted, .retryAuthorized:
+                var outcome = storedOutcome
+                outcome.projection = .notRequired
+                state.terminalOutcomes[sessionID] = outcome
+            case .notRequired, .applied, .keptLatest:
+                break
+            }
+        }
+        // A linked canonical mutation is also the idempotency journal for a
+        // request that may already have reached the server. A newer execution
+        // session cannot prove otherwise, so only authoritative canonical
+        // refresh may clear that mutation.
+        guard !supersededRecurrenceKeys.isEmpty else { return }
+        let supersededOccurrenceIDs = Set(supersededRecurrenceKeys.compactMap(\.occurrenceID))
+        recurrenceSessionOutcomes.removeAll { outcome in
+            supersededRecurrenceKeys.contains(.init(
+                itemID: outcome.itemID,
+                occurrenceID: outcome.occurrenceID,
+                sessionIndex: outcome.sessionIndex
+            ))
+        }
+        completedOccurrenceIDs.subtract(supersededOccurrenceIDs)
+    }
+
     private func reconcileExecutionCanonicalProjections(
         state: inout DayWeaveExecutionDurableState
     ) {
@@ -3457,6 +3599,7 @@ final class PlannerStore: ObservableObject {
             $0.uuidString.lowercased() < $1.uuidString.lowercased()
         }) {
             guard var outcome = state.terminalOutcomes[sessionID] else { continue }
+            guard outcome.session.status.isCanonicalTerminal else { continue }
             let desired: PlannerItemStatus = outcome.session.status == .completed
                 ? .completed : .skipped
             if let item = canonicalItem(id: outcome.session.itemID),
@@ -3540,6 +3683,7 @@ final class PlannerStore: ObservableObject {
         for block: ScheduleBlock,
         session: DayWeaveExecutionSession
     ) {
+        guard session.status.isCanonicalTerminal else { return }
         guard let itemID = block.sourceItemID,
               let occurrenceID = block.occurrenceID else { return }
         let sessionIndex = block.sessionIndex ?? 0
@@ -3575,6 +3719,37 @@ final class PlannerStore: ObservableObject {
     ) -> Bool {
         if left.updatedAt != right.updatedAt { return left.updatedAt > right.updatedAt }
         return left.id.uuidString.lowercased() > right.id.uuidString.lowercased()
+    }
+
+    private static func newestExecutionSessionsByProjectionKey(
+        terminalSessions: [DayWeaveExecutionSession],
+        activeSession: DayWeaveExecutionSession?
+    ) -> [ExecutionProjectionKey: DayWeaveExecutionSession] {
+        var newest: [ExecutionProjectionKey: DayWeaveExecutionSession] = [:]
+        for session in terminalSessions {
+            let key = executionProjectionKey(for: session)
+            if let current = newest[key], !executionNewestFirst(session, current) {
+                continue
+            }
+            newest[key] = session
+        }
+        if let activeSession {
+            // The snapshot's one open lease is authoritative even when legacy
+            // timestamps across separate sessions are not monotonic.
+            newest[executionProjectionKey(for: activeSession)] = activeSession
+        }
+        return newest
+    }
+
+    private static func executionProjectionKey(
+        for session: DayWeaveExecutionSession
+    ) -> ExecutionProjectionKey {
+        ExecutionProjectionKey(
+            itemID: session.itemID,
+            itemRevision: session.itemRevision,
+            occurrenceID: session.occurrenceID,
+            sessionIndex: session.sessionIndex
+        )
     }
 
     private static func roundedExecutionMinutes(_ seconds: UInt64) -> Int {
@@ -3615,6 +3790,8 @@ final class PlannerStore: ObservableObject {
             guard sessionID == outcome.session.id,
                   !outcome.session.status.isOpen,
                   outcome.session.revision <= state.revision else { return false }
+            if outcome.session.status == .deferred,
+               outcome.projection != .notRequired { return false }
             if case let .applied(revision) = outcome.projection,
                revision <= outcome.session.itemRevision { return false }
         }

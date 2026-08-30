@@ -20,6 +20,7 @@ import com.greengolddog.dayweave.network.RemoteExecutionSnapshot
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
 import java.io.IOException
+import java.time.Duration
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
@@ -427,6 +428,92 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
+    fun protocolAheadPrivateElapsedAnchorAcceptsPauseAndCompleteResponses() = runBlocking {
+        val publicStartedAt = Instant.parse("2026-09-01T06:59:59.900Z")
+        val publicChangedAt = Instant.parse("2026-09-01T07:00:04.100Z")
+        assertEquals(4L, Duration.between(publicStartedAt, publicChangedAt).seconds)
+
+        listOf("pause", "complete").forEach { requestedTransition ->
+            val store = plannerStore()
+            lateinit var serverSession: RemoteExecutionSession
+            var globalRevision = 0L
+            val transport = FakeExecutionTransport().apply {
+                snapshotResult = RemoteExecutionSnapshot(0, null)
+                commandHandler = { _, body ->
+                    val command = Json.parseToJsonElement(body).jsonObject
+                        .getValue("command").jsonObject
+                    val type = command.getValue("type").jsonPrimitive.content
+                    globalRevision += 1
+                    serverSession = when (type) {
+                        "start" -> activeSession(
+                            sessionId = command.getValue("session_id").jsonPrimitive.content,
+                            deviceId = command.getValue("device_id").jsonPrimitive.content,
+                        ).copy(
+                            startedAt = publicStartedAt.toString(),
+                            runningSince = publicStartedAt.toString(),
+                            createdAt = publicStartedAt.toString(),
+                            updatedAt = publicStartedAt.toString(),
+                        )
+                        "pause" -> {
+                            assertEquals("pause", requestedTransition)
+                            serverSession.copy(
+                                status = "paused",
+                                revision = 2,
+                                accumulatedSeconds = 5,
+                                runningSince = null,
+                                pausedAt = publicChangedAt.toString(),
+                                updatedAt = publicChangedAt.toString(),
+                            )
+                        }
+                        "complete" -> {
+                            assertEquals("complete", requestedTransition)
+                            serverSession.copy(
+                                status = "completed",
+                                revision = 2,
+                                accumulatedSeconds = 5,
+                                actualSeconds = 5,
+                                runningSince = null,
+                                endedAt = publicChangedAt.toString(),
+                                updatedAt = publicChangedAt.toString(),
+                            )
+                        }
+                        else -> error("Unexpected command: $type")
+                    }
+                    val active = serverSession.takeIf { it.status in setOf("active", "paused") }
+                    snapshotResult = RemoteExecutionSnapshot(globalRevision, active)
+                    RemoteExecutionMutation(
+                        revision = globalRevision,
+                        activeSession = active,
+                        changedSession = serverSession,
+                        replayed = false,
+                    )
+                }
+            }
+            val manager = manager(store, transport)
+
+            assertEquals(ExecutionSyncOutcome.SUCCESS, manager.start(BLOCK_ID))
+            assertNull(store.state.value.pendingExecutionCommand)
+            val transitionOutcome = if (requestedTransition == "pause") {
+                manager.pause(BLOCK_ID)
+            } else {
+                manager.complete(BLOCK_ID)
+            }
+
+            assertEquals(ExecutionSyncOutcome.SUCCESS, transitionOutcome)
+            assertNull(store.state.value.pendingExecutionCommand)
+            if (requestedTransition == "pause") {
+                assertEquals(5L, store.state.value.canonicalExecutionSession?.accumulatedSeconds)
+                assertTrue(requireNotNull(store.state.value.activeSession).isPaused)
+            } else {
+                val closed = store.state.value.terminalExecutionOutcomes.getValue(SESSION_ID).session
+                assertEquals(5L, closed.accumulatedSeconds)
+                assertEquals(5L, closed.actualSeconds)
+                assertEquals(ItemStatus.COMPLETED, store.state.value.schedule.single().status)
+            }
+        }
+    }
+
+    @Test
     fun absolutePauseEndIsSentWithoutACompetingDuration() = runBlocking {
         val store = plannerStore()
         val running = activeSession(sessionId = SESSION_ID)
@@ -458,6 +545,22 @@ class ExecutionSyncManagerTest {
             manager.pause(BLOCK_ID, pauseUntil = until),
         )
         assertEquals(until.toEpochMilli(), store.state.value.activeSession?.pauseUntilEpochMillis)
+    }
+
+    @Test
+    fun canonicalDeferProducerRemainsDisabledInCompatibilityFoundation() = runBlocking {
+        val store = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(ExecutionSyncOutcome.INVALID_LOCAL_STATE, manager.doLater(BLOCK_ID))
+        assertEquals(SESSION_ID, store.state.value.canonicalExecutionSession?.id)
+        assertTrue(transport.commandBodies.isEmpty())
     }
 
     @Test
@@ -1108,6 +1211,242 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
+    fun deferredRemoteClosureIsRetainedWithoutAnyTerminalOrRecurrenceProjection() = runBlocking {
+        val canonicalItem = CanonicalItemSnapshot(
+            id = ITEM_ID,
+            kind = "habit",
+            status = "planned",
+            title = "Practice",
+            timezoneName = "Europe/Madrid",
+            durationSeconds = 1_800,
+            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+            flexibleConstraintsJson = "{}",
+            splitPolicyJson = "{\"type\":\"indivisible\"}",
+            importance = 50,
+            urgency = 50,
+            siblingOrder = 0,
+            isExecutable = true,
+            revision = 7,
+            createdAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        val block = scheduleItem(BLOCK_ID, 0).copy(
+            kind = ItemKind.HABIT,
+            occurrenceId = OCCURRENCE_ID,
+        )
+        val store = PlannerStore(
+            initialState = DayWeaveUiState(
+                schedule = listOf(block),
+                canonicalItems = listOf(canonicalItem),
+                canonicalSyncOrigin = "https://api.example.test/",
+                occurrenceSeriesItemIds = mapOf(OCCURRENCE_ID to ITEM_ID),
+            ),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val running = activeSession(SESSION_ID).copy(occurrenceId = OCCURRENCE_ID)
+        val deferred = running.copy(
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 135,
+            actualSeconds = 135,
+            runningSince = null,
+            endedAt = NOW.toString(),
+            moveStart = NOW.plusSeconds(3_600).toString(),
+            moveEnd = NOW.plusSeconds(7_200).toString(),
+            updatedAt = NOW.toString(),
+        )
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+        }
+        val manager = manager(store, transport)
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        assertEquals(SESSION_ID, store.state.value.canonicalExecutionSession?.id)
+
+        transport.snapshotResult = RemoteExecutionSnapshot(2, null)
+        transport.historyResult = listOf(deferred)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        val state = store.state.value
+        assertNull(state.canonicalExecutionSession)
+        assertNull(state.activeSession)
+        assertEquals(ItemStatus.SCHEDULED, state.schedule.single().status)
+        assertEquals("planned", state.canonicalItems.single().status)
+        val deferredOutcome = state.terminalExecutionOutcomes.getValue(deferred.id)
+        assertEquals(deferred.toSnapshot(), deferredOutcome.session)
+        assertFalse(deferredOutcome.requiresCanonicalItemProjection)
+        assertNull(deferredOutcome.canonicalProjectionRevision)
+        assertNull(deferredOutcome.canonicalProjectionResolution)
+        assertNull(deferredOutcome.canonicalProjectionConflict)
+        assertNull(deferredOutcome.canonicalProjectionRetryAuthorizedAt)
+        assertTrue(state.recurrenceOutcomes.isEmpty())
+        assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+        assertEquals(deferred.toSnapshot(), state.canonicalExecutionHistoryWindow.single())
+        assertEquals(2L, state.canonicalExecutionHistoryWindowRevision)
+        assertTrue(state.canonicalExecutionHistoryVerified)
+        assertTrue(store.isCanonicalExecutionStartBlocked(BLOCK_ID))
+        assertTrue(transport.commandBodies.isEmpty())
+
+        val restarted = PlannerStore(state)
+        val retained = restarted.state.value.canonicalExecutionHistoryWindow.single()
+        assertEquals("deferred", retained.status)
+        assertEquals(135L, retained.actualSeconds)
+        assertEquals(deferred.moveStart, retained.moveStart)
+        assertEquals(deferred.moveEnd, retained.moveEnd)
+        assertEquals(deferredOutcome, restarted.state.value.terminalExecutionOutcomes[deferred.id])
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(BLOCK_ID))
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(restarted, transport).refresh())
+        assertEquals(deferredOutcome, restarted.state.value.terminalExecutionOutcomes[deferred.id])
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(BLOCK_ID))
+    }
+
+    @Test
+    fun coldRefreshLetsNewerDeferredClosureShadowOlderTerminalPresentation() = runBlocking {
+        val olderCompleted = activeSession(OTHER_SESSION_ID, OTHER_DEVICE_ID).copy(
+            status = "completed",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            startedAt = NOW.minusSeconds(120).toString(),
+            runningSince = null,
+            endedAt = NOW.minusSeconds(60).toString(),
+            createdAt = NOW.minusSeconds(120).toString(),
+            updatedAt = NOW.minusSeconds(60).toString(),
+        )
+        val newerDeferred = activeSession(SESSION_ID).copy(
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 90,
+            actualSeconds = 90,
+            runningSince = null,
+            endedAt = NOW.toString(),
+            moveStart = NOW.plusSeconds(3_600).toString(),
+            moveEnd = NOW.plusSeconds(7_200).toString(),
+            updatedAt = NOW.toString(),
+        )
+        val store = plannerStore()
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(4, null)
+            historyResult = listOf(newerDeferred, olderCompleted)
+        }
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(store, transport).refresh())
+
+        val state = store.state.value
+        assertEquals(ItemStatus.SCHEDULED, state.schedule.single().status)
+        assertNull(state.schedule.single().actualMinutes)
+        assertEquals(
+            setOf(newerDeferred.id, olderCompleted.id),
+            state.terminalExecutionOutcomes.keys,
+        )
+        assertFalse(
+            state.terminalExecutionOutcomes.getValue(newerDeferred.id)
+                .requiresCanonicalItemProjection,
+        )
+        assertTrue(state.recurrenceOutcomes.isEmpty())
+        assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+        assertTrue(store.isCanonicalExecutionStartBlocked(BLOCK_ID))
+    }
+
+    @Test
+    fun authoritativeLegacyClockActiveLeaseSuppressesNewerTimestampTerminalRecurrence() =
+        runBlocking {
+            val block = scheduleItem(BLOCK_ID, 0).copy(
+                kind = ItemKind.HABIT,
+                occurrenceId = OCCURRENCE_ID,
+            )
+            val store = PlannerStore(
+                initialState = DayWeaveUiState(
+                    schedule = listOf(block),
+                    canonicalSyncOrigin = "https://api.example.test/",
+                    occurrenceSeriesItemIds = mapOf(OCCURRENCE_ID to ITEM_ID),
+                ),
+                nowEpochMillis = { NOW.toEpochMilli() },
+            )
+            val oldTerminalWithLaterClock = activeSession(
+                OTHER_SESSION_ID,
+                OTHER_DEVICE_ID,
+            ).copy(
+                occurrenceId = OCCURRENCE_ID,
+                status = "completed",
+                revision = 2,
+                accumulatedSeconds = 60,
+                actualSeconds = 60,
+                runningSince = null,
+                endedAt = NOW.plusSeconds(3_600).toString(),
+                updatedAt = NOW.plusSeconds(3_600).toString(),
+            )
+            val authoritativeActiveWithEarlierClock = activeSession(SESSION_ID).copy(
+                occurrenceId = OCCURRENCE_ID,
+                startedAt = NOW.minusSeconds(3_600).toString(),
+                runningSince = NOW.minusSeconds(3_600).toString(),
+                createdAt = NOW.minusSeconds(3_600).toString(),
+                updatedAt = NOW.minusSeconds(3_600).toString(),
+            )
+            val transport = FakeExecutionTransport().apply {
+                snapshotResult = RemoteExecutionSnapshot(3, authoritativeActiveWithEarlierClock)
+                historyResult = listOf(
+                    oldTerminalWithLaterClock,
+                    authoritativeActiveWithEarlierClock,
+                )
+            }
+
+            assertEquals(ExecutionSyncOutcome.SUCCESS, manager(store, transport).refresh())
+
+            val state = store.state.value
+            assertEquals(SESSION_ID, state.canonicalExecutionSession?.id)
+            assertEquals(ItemStatus.ACTIVE, state.schedule.single().status)
+            assertEquals(SESSION_ID, state.activeSession?.canonicalExecutionSessionId)
+            assertTrue(state.recurrenceOutcomes.isEmpty())
+            assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+            assertTrue(state.terminalExecutionOutcomes.containsKey(OTHER_SESSION_ID))
+        }
+
+    @Test
+    fun malformedDeferredWindowsAndMoveFieldsOnOtherStatusesFailClosed() = runBlocking {
+        val valid = activeSession(SESSION_ID).copy(
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 30,
+            actualSeconds = 30,
+            runningSince = null,
+            endedAt = NOW.toString(),
+            moveStart = NOW.plusSeconds(60).toString(),
+            moveEnd = NOW.plusSeconds(120).toString(),
+            updatedAt = NOW.toString(),
+        )
+        val invalidRows = listOf(
+            valid.copy(actualSeconds = null),
+            valid.copy(endedAt = null),
+            valid.copy(moveStart = null),
+            valid.copy(moveEnd = null),
+            valid.copy(moveStart = NOW.toString()),
+            valid.copy(moveEnd = valid.moveStart),
+            valid.copy(moveEnd = NOW.plusSeconds(60 + 24 * 60 * 60 + 1L).toString()),
+            valid.copy(status = "completed"),
+        )
+
+        invalidRows.forEachIndexed { index, invalid ->
+            val store = plannerStore()
+            val transport = FakeExecutionTransport().apply {
+                snapshotResult = RemoteExecutionSnapshot(2, null)
+                historyResult = listOf(invalid)
+            }
+
+            assertEquals(
+                "invalid fixture $index",
+                ExecutionSyncOutcome.PROTOCOL_FAILURE,
+                manager(store, transport).refresh(),
+            )
+            assertTrue(store.state.value.canonicalExecutionHistoryWindow.isEmpty())
+            assertTrue(store.state.value.terminalExecutionOutcomes.isEmpty())
+            assertNull(store.state.value.canonicalExecutionSession)
+        }
+    }
+
+    @Test
     fun nullToNullPollStillReconcilesEveryUnseenTerminalSession() = runBlocking {
         val store = plannerStore()
         val transport = FakeExecutionTransport().apply {
@@ -1327,6 +1666,74 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
+    fun deferredLifetimeFenceSurvivesHistoryWindowEvictionAndRestartRefresh() = runBlocking {
+        val deferredId = UUID(0L, 9_999L).toString()
+        val completeHistory = (0..100).map { index ->
+            val endedAt = NOW.minusSeconds(index.toLong())
+            val base = activeSession(UUID(0L, index.toLong() + 5_000L).toString()).copy(
+                itemId = OTHER_ITEM_ID,
+                plannedBlockId = null,
+                status = "completed",
+                revision = 2,
+                accumulatedSeconds = index.toLong(),
+                actualSeconds = index.toLong(),
+                startedAt = endedAt.minusSeconds(120).toString(),
+                runningSince = null,
+                endedAt = endedAt.toString(),
+                createdAt = endedAt.minusSeconds(120).toString(),
+                updatedAt = endedAt.toString(),
+            )
+            if (index == 100) {
+                base.copy(
+                    id = deferredId,
+                    itemId = ITEM_ID,
+                    plannedBlockId = BLOCK_ID,
+                    status = "deferred",
+                    moveStart = endedAt.plusSeconds(60).toString(),
+                    moveEnd = endedAt.plusSeconds(3_660).toString(),
+                )
+            } else {
+                base
+            }
+        }
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(202, null)
+            historyPageHandler = { limit, offset ->
+                val start = offset.toInt()
+                val end = minOf(start + limit, completeHistory.size)
+                RemoteExecutionHistoryPage(
+                    sessions = completeHistory.subList(start, end),
+                    nextOffset = end.toLong().takeIf { end < completeHistory.size },
+                )
+            }
+        }
+        val store = plannerStore()
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(store, transport).refresh())
+        val state = store.state.value
+        assertEquals(100, state.canonicalExecutionHistoryWindow.size)
+        assertTrue(state.canonicalExecutionHistoryWindow.none { it.id == deferredId })
+        assertEquals(101, state.terminalExecutionOutcomes.size)
+        assertEquals(
+            "deferred",
+            state.terminalExecutionOutcomes.getValue(deferredId).session.status,
+        )
+        assertTrue(store.isCanonicalExecutionStartBlocked(BLOCK_ID))
+
+        val restarted = PlannerStore(state)
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(BLOCK_ID))
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(restarted, transport).refresh())
+        assertTrue(
+            restarted.state.value.canonicalExecutionHistoryWindow.none { it.id == deferredId },
+        )
+        assertEquals(
+            "deferred",
+            restarted.state.value.terminalExecutionOutcomes.getValue(deferredId).session.status,
+        )
+        assertTrue(restarted.isCanonicalExecutionStartBlocked(BLOCK_ID))
+    }
+
+    @Test
     fun provenHundredRowHistoryRollsForwardWithoutLifetimeDeadlock() = runBlocking {
         val completeWindow = (0 until 100).map { index ->
             activeSession(UUID(0L, index.toLong() + 1_000L).toString()).copy(
@@ -1504,6 +1911,8 @@ class ExecutionSyncManagerTest {
         pauseUntil = pauseUntil,
         pauseReason = pauseReason,
         endedAt = endedAt,
+        moveStart = moveStart,
+        moveEnd = moveEnd,
         createdAt = createdAt,
         updatedAt = updatedAt,
     )
@@ -1550,6 +1959,7 @@ class ExecutionSyncManagerTest {
         const val SESSION_ID = "44444444-4444-4444-8444-444444444444"
         const val DEVICE_ID = "55555555-5555-4555-8555-555555555555"
         const val OTHER_SESSION_ID = "66666666-6666-4666-8666-666666666666"
+        const val OCCURRENCE_ID = "77777777-7777-4777-8777-777777777777"
         const val OTHER_DEVICE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     }
 }

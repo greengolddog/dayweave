@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::{
     items::{ItemService, ItemServiceError, ItemStatus},
     proposals::Clock,
+    scheduling::truncate_to_postgres_timestamp_precision,
 };
 
 use super::{
@@ -80,7 +81,7 @@ impl ExecutionService {
         if expected_revision > i64::MAX as u64 {
             return Err(ExecutionServiceError::InvalidRevision);
         }
-        let now = self.clock.now();
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
         let ttl = chrono::Duration::from_std(IDEMPOTENCY_TTL)
             .map_err(|_| ExecutionServiceError::Internal)?;
         let idempotency = ExecutionIdempotency {
@@ -221,7 +222,8 @@ mod tests {
 
     use super::*;
     use crate::execution::{
-        FinishExecution, InMemoryExecutionRepository, PauseExecution, StartExecution,
+        DeferExecution, ExecutionStatus, FinishExecution, InMemoryExecutionRepository,
+        PauseExecution, StartExecution,
     };
 
     #[derive(Debug)]
@@ -381,6 +383,266 @@ mod tests {
         let replay = service.command(1, pause, idempotency(6)).await.unwrap();
         assert!(replay.replayed);
         assert_eq!(replay.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn execution_protocol_clock_is_microsecond_exact_across_return_and_history() {
+        let (service, clock, item_id) = fixture().await;
+        let t0 = clock.now();
+        clock.set(t0 + chrono::Duration::nanoseconds(999));
+        let session_id = Uuid::from_u128(34);
+        let started = service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(33),
+                }),
+                idempotency(16),
+            )
+            .await
+            .unwrap();
+        assert_eq!(started.changed_session.started_at, t0);
+        assert_eq!(started.changed_session.running_since, Some(t0));
+        assert_eq!(started.changed_session.created_at, t0);
+        assert_eq!(started.changed_session.updated_at, t0);
+
+        clock.set(t0 + chrono::Duration::seconds(5) + chrono::Duration::nanoseconds(999));
+        let finished = service
+            .command(
+                1,
+                ExecutionCommand::Complete(FinishExecution {
+                    session_id,
+                    actual_seconds: None,
+                }),
+                idempotency(17),
+            )
+            .await
+            .unwrap();
+        let terminal_at = t0 + chrono::Duration::seconds(5);
+        assert_eq!(finished.changed_session.ended_at, Some(terminal_at));
+        assert_eq!(finished.changed_session.updated_at, terminal_at);
+        assert_eq!(finished.changed_session.accumulated_seconds, 5);
+
+        let history = service.history(1).await.unwrap();
+        assert_eq!(history, vec![finished.changed_session]);
+        for instant in [
+            history[0].started_at,
+            history[0].ended_at.unwrap(),
+            history[0].updated_at,
+        ] {
+            assert!(instant.timestamp_subsec_nanos().is_multiple_of(1_000));
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_protocol_clock_is_strictly_monotonic_across_sessions() {
+        let (service, clock, item_id) = fixture().await;
+        let t0 = clock.now();
+        let older_id = Uuid::from_u128(200);
+        service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: older_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(201),
+                }),
+                idempotency(18),
+            )
+            .await
+            .unwrap();
+        clock.set(t0 + chrono::Duration::seconds(10));
+        let older = service
+            .command(
+                1,
+                ExecutionCommand::Complete(FinishExecution {
+                    session_id: older_id,
+                    actual_seconds: None,
+                }),
+                idempotency(19),
+            )
+            .await
+            .unwrap()
+            .changed_session;
+
+        // The later session deliberately has the lower UUID and observes a rolled-back clock.
+        // Its persisted protocol instants, rather than the UUID tie-breaker, must establish cause.
+        clock.set(t0 - chrono::Duration::hours(1));
+        let newer_id = Uuid::from_u128(1);
+        let newer = service
+            .command(
+                2,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: newer_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(201),
+                }),
+                idempotency(20),
+            )
+            .await
+            .unwrap()
+            .changed_session;
+        assert_eq!(
+            newer.updated_at,
+            older.updated_at + chrono::Duration::microseconds(1)
+        );
+
+        let deferred = service
+            .command(
+                3,
+                ExecutionCommand::Defer(DeferExecution {
+                    session_id: newer_id,
+                    move_start: t0 + chrono::Duration::hours(1),
+                    move_end: t0 + chrono::Duration::hours(2),
+                    actual_seconds: None,
+                }),
+                idempotency(21),
+            )
+            .await
+            .unwrap()
+            .changed_session;
+        assert_eq!(
+            deferred.updated_at,
+            newer.updated_at + chrono::Duration::microseconds(1)
+        );
+
+        let history = service.history(2).await.unwrap();
+        assert_eq!(history, vec![deferred, older]);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keeps both legal source states and replay in one atomic-flow test.
+    async fn defer_closes_active_and_paused_sessions_atomically_and_replays() {
+        let (service, clock, item_id) = fixture().await;
+        let first_id = Uuid::from_u128(35);
+        service
+            .command(
+                0,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: first_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 0,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(36),
+                }),
+                idempotency(10),
+            )
+            .await
+            .unwrap();
+
+        clock.set(clock.now() + chrono::Duration::seconds(30));
+        let first_move_start = clock.now() + chrono::Duration::hours(2);
+        let first_move_end = first_move_start + chrono::Duration::hours(1);
+        let defer_active = ExecutionCommand::Defer(DeferExecution {
+            session_id: first_id,
+            move_start: first_move_start,
+            move_end: first_move_end,
+            actual_seconds: None,
+        });
+        let stale = service
+            .command(0, defer_active.clone(), idempotency(11))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            ExecutionServiceError::Repository(ExecutionRepositoryError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
+        assert_eq!(service.snapshot().await.unwrap().revision, 1);
+
+        let deferred = service
+            .command(1, defer_active.clone(), idempotency(12))
+            .await
+            .unwrap();
+        assert_eq!(deferred.revision, 2);
+        assert!(deferred.active_session.is_none());
+        assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
+        assert_eq!(deferred.changed_session.accumulated_seconds, 30);
+        assert_eq!(deferred.changed_session.actual_seconds, Some(30));
+        assert_eq!(deferred.changed_session.move_start, Some(first_move_start));
+        assert_eq!(deferred.changed_session.move_end, Some(first_move_end));
+
+        clock.set(first_move_end + chrono::Duration::seconds(1));
+        let replay = service
+            .command(1, defer_active, idempotency(12))
+            .await
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.revision, 2);
+        assert_eq!(replay.changed_session, deferred.changed_session);
+
+        let second_id = Uuid::from_u128(37);
+        service
+            .command(
+                2,
+                ExecutionCommand::Start(StartExecution {
+                    session_id: second_id,
+                    item_id,
+                    item_revision: 1,
+                    occurrence_id: None,
+                    session_index: 1,
+                    planned_block_id: None,
+                    device_id: Uuid::from_u128(36),
+                }),
+                idempotency(13),
+            )
+            .await
+            .unwrap();
+        clock.set(clock.now() + chrono::Duration::seconds(20));
+        service
+            .command(
+                3,
+                ExecutionCommand::Pause(PauseExecution {
+                    session_id: second_id,
+                    duration_seconds: None,
+                    pause_until: None,
+                    reason: Some("Interrupted".to_owned()),
+                }),
+                idempotency(14),
+            )
+            .await
+            .unwrap();
+        clock.set(clock.now() + chrono::Duration::minutes(10));
+        let second_move_start = clock.now() + chrono::Duration::days(30);
+        let second_move_end = second_move_start + chrono::Duration::minutes(45);
+        let deferred = service
+            .command(
+                4,
+                ExecutionCommand::Defer(DeferExecution {
+                    session_id: second_id,
+                    move_start: second_move_start,
+                    move_end: second_move_end,
+                    actual_seconds: Some(7),
+                }),
+                idempotency(15),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deferred.revision, 5);
+        assert!(deferred.active_session.is_none());
+        assert_eq!(deferred.changed_session.status, ExecutionStatus::Deferred);
+        assert_eq!(deferred.changed_session.accumulated_seconds, 20);
+        assert_eq!(deferred.changed_session.actual_seconds, Some(7));
+        assert_eq!(deferred.changed_session.move_start, Some(second_move_start));
+        assert_eq!(deferred.changed_session.move_end, Some(second_move_end));
     }
 
     #[tokio::test]

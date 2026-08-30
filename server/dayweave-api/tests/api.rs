@@ -168,6 +168,38 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
             "OpenAPI must declare the {schema} schema"
         );
     }
+    for schema in [
+        "DeferExecution",
+        "ExecutionCommand",
+        "ExecutionSession",
+        "ExecutionStatus",
+    ] {
+        assert!(
+            document["components"]["schemas"][schema].is_object(),
+            "OpenAPI must declare the {schema} schema"
+        );
+    }
+    let defer_required = document["components"]["schemas"]["DeferExecution"]["required"]
+        .as_array()
+        .expect("defer required fields");
+    for field in ["session_id", "move_start", "move_end"] {
+        assert!(
+            defer_required.iter().any(|required| required == field),
+            "OpenAPI must require defer {field}"
+        );
+    }
+    assert!(
+        !defer_required
+            .iter()
+            .any(|required| required == "actual_seconds")
+    );
+    assert!(
+        document["components"]["schemas"]["ExecutionStatus"]["enum"]
+            .as_array()
+            .expect("execution status values")
+            .iter()
+            .any(|status| status == "deferred")
+    );
     for path in [
         "/v1/suggestions/application-previews/{id}/apply",
         "/v1/suggestions/applications/{id}/undo",

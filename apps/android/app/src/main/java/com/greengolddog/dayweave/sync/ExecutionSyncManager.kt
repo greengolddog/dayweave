@@ -207,7 +207,7 @@ class ExecutionSyncManager(
         actualSeconds: Long? = null,
     ): ExecutionSyncOutcome = finish(blockId, "skip", actualSeconds)
 
-    /** The execution API has no atomic "release and defer" command yet. */
+    /** Compatibility phase: consume remote defers before this client is allowed to produce one. */
     suspend fun doLater(blockId: String): ExecutionSyncOutcome = withReadyStore {
         operationMutex.withLock {
             val state = plannerStore.state.value
@@ -215,8 +215,8 @@ class ExecutionSyncManager(
                 return@withLock ExecutionSyncOutcome.INVALID_LOCAL_STATE
             }
             updateError(
-                "Will do later is unavailable while a canonical execution lease is open. " +
-                    "Complete or skip this session first.",
+                "Will do later is not enabled on this client yet. " +
+                    "Complete or skip this session for now.",
             )
             ExecutionSyncOutcome.INVALID_LOCAL_STATE
         }
@@ -417,7 +417,8 @@ class ExecutionSyncManager(
         if (changed == null && !activeMatches && !completeAbsenceProven) {
             throw UnresolvedPendingCommandException()
         }
-        reconcileTerminalHistoryRows(
+        val newestPresentableTerminalIds = stable.newestPresentableTerminalIds()
+        reconcileClosedHistoryRows(
             configuration = configuration,
             stable = stable,
             excludedSessionId = changed?.id,
@@ -431,6 +432,8 @@ class ExecutionSyncManager(
             changedSession = changed?.toSnapshot(),
             clearPendingIdempotencyKey = pending.idempotencyKey,
             message = message,
+            changedSessionControlsPresentation =
+                changed != null && changed.id in newestPresentableTerminalIds,
         )
         if (receipt == null || !receipt.awaitDurable()) throw LocalExecutionStorageException()
         persistHistoryWindow(
@@ -450,7 +453,7 @@ class ExecutionSyncManager(
     ): RemoteExecutionSnapshot {
         val stable = readStableHistory(configuration, initialSnapshot)
         val continuityVerified = validateHistoryAgainstDurableState(configuration, stable)
-        reconcileTerminalHistoryRows(configuration, stable, excludedSessionId = null, message)
+        reconcileClosedHistoryRows(configuration, stable, excludedSessionId = null, message)
         val receipt = plannerStore.reconcileCanonicalExecution(
             syncOrigin = configuration.baseUrl.toString(),
             configurationId = configuration.configurationId,
@@ -464,30 +467,28 @@ class ExecutionSyncManager(
         return stable.snapshot
     }
 
-    private suspend fun reconcileTerminalHistoryRows(
+    private suspend fun reconcileClosedHistoryRows(
         configuration: AuthenticatedApiConfiguration,
         stable: StableExecutionRead,
         excludedSessionId: String?,
         message: String,
     ) {
-        // History is newest first. Only a target's newest session may control its presentation;
-        // older terminal facts still belong in the immutable ledger, but a later open session must
-        // not make an old completion/skip fight the authoritative active snapshot on every poll.
-        val newestPresentableTerminalIds = stable.history.asSequence()
-            .distinctBy { it.projectionTarget() }
-            .filter { it.status in TERMINAL_STATUSES }
-            .map { it.id }
-            .toSet()
+        // History is newest first. All closed facts belong in the immutable lifetime ledger, but
+        // only a target's newest session may control completion/skip presentation. A later open or
+        // deferred session must not let an older terminal fact fight the authoritative state.
+        val newestPresentableTerminalIds = stable.newestPresentableTerminalIds()
         stable.history.asReversed()
-            .filter { it.status in TERMINAL_STATUSES && it.id != excludedSessionId }
-            .forEach { terminal ->
-                val alreadyDurable = plannerStore.state.value.terminalExecutionOutcomes[terminal.id]
+            .filter { it.status in CLOSED_STATUSES && it.id != excludedSessionId }
+            .forEach { closed ->
+                val isCanonicalTerminal = closed.status in TERMINAL_STATUSES
+                val alreadyDurable = plannerStore.state.value.terminalExecutionOutcomes[closed.id]
                     ?.let { outcome ->
                         outcome.syncOrigin == configuration.baseUrl.toString() &&
-                            terminal.hasSameRemoteSemantics(outcome.session) &&
+                            closed.hasSameRemoteSemantics(outcome.session) &&
                             (
-                                terminal.id !in newestPresentableTerminalIds ||
-                                    terminalPresentationIsConverged(terminal)
+                                !isCanonicalTerminal ||
+                                    closed.id !in newestPresentableTerminalIds ||
+                                    terminalPresentationIsConverged(closed)
                             )
                     } == true
                 if (alreadyDurable) return@forEach
@@ -496,8 +497,10 @@ class ExecutionSyncManager(
                     configurationId = configuration.configurationId,
                     revision = stable.snapshot.revision,
                     activeSession = stable.snapshot.activeSession?.toSnapshot(),
-                    changedSession = terminal.toSnapshot(),
+                    changedSession = closed.toSnapshot(),
                     message = message,
+                    changedSessionControlsPresentation =
+                        closed.id in newestPresentableTerminalIds,
                 )
                 if (receipt == null || !receipt.awaitDurable()) {
                     throw LocalExecutionStorageException()
@@ -505,7 +508,18 @@ class ExecutionSyncManager(
             }
     }
 
+    private fun StableExecutionRead.newestPresentableTerminalIds(): Set<String> {
+        val authoritativeActiveTarget = snapshot.activeSession?.projectionTarget()
+        return history.asSequence()
+            .filter { session -> session.projectionTarget() != authoritativeActiveTarget }
+            .distinctBy { it.projectionTarget() }
+            .filter { it.status in TERMINAL_STATUSES }
+            .map { it.id }
+            .toSet()
+    }
+
     private fun terminalPresentationIsConverged(terminal: RemoteExecutionSession): Boolean {
+        if (terminal.status !in TERMINAL_STATUSES) return false
         val current = plannerStore.state.value
         val outcome = current.terminalExecutionOutcomes[terminal.id] ?: return false
         if (outcome.canonicalProjectionResolution == "user_kept_latest_item") return true
@@ -753,7 +767,7 @@ class ExecutionSyncManager(
                 ) {
                     throw InvalidExecutionProtocolException()
                 }
-                if (prior.status in TERMINAL_STATUSES) {
+                if (prior.status in CLOSED_STATUSES) {
                     if (!remote.hasSameRemoteSemantics(prior)) {
                         throw InvalidExecutionProtocolException()
                     }
@@ -767,7 +781,7 @@ class ExecutionSyncManager(
             current.terminalExecutionOutcomes[remote.id]?.let { outcome ->
                 if (
                     outcome.syncOrigin != configuration.baseUrl.toString() ||
-                    remote.status !in TERMINAL_STATUSES ||
+                    remote.status !in CLOSED_STATUSES ||
                     !remote.hasSameRemoteSemantics(outcome.session)
                 ) {
                     throw InvalidExecutionProtocolException()
@@ -805,23 +819,23 @@ class ExecutionSyncManager(
             if (priorWindow.any { it.id !in historyById }) {
                 throw InvalidExecutionProtocolException()
             }
-            val missingTerminal = current.terminalExecutionOutcomes.values.any { outcome ->
+            val missingClosed = current.terminalExecutionOutcomes.values.any { outcome ->
                 outcome.syncOrigin == configuration.baseUrl.toString() &&
                     outcome.session.id !in historyById
             }
-            if (missingTerminal) throw InvalidExecutionProtocolException()
+            if (missingClosed) throw InvalidExecutionProtocolException()
         }
         current.canonicalExecutionSession?.let { cached ->
             val stillActive = stable.snapshot.activeSession
                 ?.hasSameImmutableIdentity(cached.immutableIdentity()) == true
             if (!stillActive) {
-                val terminalMatches = stable.history.filter {
-                    it.status in TERMINAL_STATUSES &&
+                val closedMatches = stable.history.filter {
+                    it.status in CLOSED_STATUSES &&
                         it.hasSameImmutableIdentity(cached.immutableIdentity())
                 }
                 if (
-                    terminalMatches.size > 1 ||
-                    continuityVerified && terminalMatches.size != 1
+                    closedMatches.size > 1 ||
+                    continuityVerified && closedMatches.size != 1
                 ) {
                     throw UnresolvedRemoteTransitionException()
                 }
@@ -1050,16 +1064,23 @@ class ExecutionSyncManager(
         validateSession(prior)
         val nextSessionRevision = runCatching { Math.addExact(prior.revision, 1L) }
             .getOrElse { throw InvalidExecutionProtocolException(it) }
+        val changedAt = Instant.parse(changed.updatedAt)
+        val priorUpdatedAt = Instant.parse(prior.updatedAt)
         if (
             !prior.hasSameImmutableIdentity(pending.immutableIdentity()) ||
             !changed.hasSameImmutableIdentity(prior.immutableIdentity()) ||
             changed.revision != nextSessionRevision ||
-            changed.startedAt != prior.startedAt || changed.createdAt != prior.createdAt
+            changed.startedAt != prior.startedAt || changed.createdAt != prior.createdAt ||
+            changed.accumulatedSeconds < prior.accumulatedSeconds || changedAt < priorUpdatedAt
         ) {
             throw InvalidExecutionProtocolException()
         }
-        val changedAt = Instant.parse(changed.updatedAt)
-        val expectedElapsed = elapsedSeconds(prior, changedAt)
+        // The server measures a running interval from a private monotonic anchor. Public protocol
+        // instants can be ahead of that anchor after wall-clock repair (and can differ at
+        // sub-second precision), so they cannot safely reproduce accumulated_seconds. A paused
+        // lease has no running interval and therefore retains its exact prior accumulation.
+        val accumulatedMatchesClosedAnchor = prior.status != "paused" ||
+            changed.accumulatedSeconds == prior.accumulatedSeconds
         when (pending.commandType) {
             "pause" -> {
                 if (prior.status !in OPEN_STATUSES) throw InvalidExecutionProtocolException()
@@ -1069,7 +1090,7 @@ class ExecutionSyncManager(
                 val expectedReason = command["reason"]?.jsonPrimitive?.content ?: prior.pauseReason
                 val expectedPausedAt = prior.pausedAt?.let(Instant::parse) ?: changedAt
                 if (
-                    changed.accumulatedSeconds != expectedElapsed ||
+                    !accumulatedMatchesClosedAnchor ||
                     changed.pausedAt?.let(Instant::parse) != expectedPausedAt ||
                     changed.pauseUntil?.let(Instant::parse) != expectedUntil ||
                     changed.pauseReason != expectedReason
@@ -1087,29 +1108,17 @@ class ExecutionSyncManager(
             "complete", "skip" -> {
                 if (prior.status !in OPEN_STATUSES) throw InvalidExecutionProtocolException()
                 val corrected = command["actual_seconds"]?.jsonPrimitive?.long
-                val expectedActual = corrected ?: expectedElapsed
                 val expectedPausedAt = prior.pausedAt?.let(Instant::parse)
                     ?: if (prior.status == "paused") changedAt else null
                 if (
-                    changed.accumulatedSeconds != expectedElapsed ||
-                    changed.actualSeconds != expectedActual ||
+                    !accumulatedMatchesClosedAnchor ||
+                    changed.actualSeconds != (corrected ?: changed.accumulatedSeconds) ||
                     changed.pausedAt?.let(Instant::parse) != expectedPausedAt
                 ) {
                     throw InvalidExecutionProtocolException()
                 }
             }
             else -> throw InvalidExecutionProtocolException()
-        }
-    }
-
-    private fun elapsedSeconds(session: RemoteExecutionSession, at: Instant): Long {
-        val runningSeconds = session.runningSince?.let { raw ->
-            Duration.between(Instant.parse(raw), at).seconds.coerceAtLeast(0L)
-        } ?: 0L
-        return try {
-            Math.addExact(session.accumulatedSeconds, runningSeconds)
-        } catch (_: ArithmeticException) {
-            Long.MAX_VALUE
         }
     }
 
@@ -1149,6 +1158,8 @@ class ExecutionSyncManager(
             val pausedAt = session.pausedAt?.let(Instant::parse)
             val pauseUntil = session.pauseUntil?.let(Instant::parse)
             val endedAt = session.endedAt?.let(Instant::parse)
+            val moveStart = session.moveStart?.let(Instant::parse)
+            val moveEnd = session.moveEnd?.let(Instant::parse)
             val createdAt = Instant.parse(session.createdAt)
             val updatedAt = Instant.parse(session.updatedAt)
             require(createdAt == startedAt && updatedAt >= createdAt)
@@ -1167,19 +1178,31 @@ class ExecutionSyncManager(
                 "active" -> require(
                     runningSince == updatedAt && pausedAt == null && pauseUntil == null &&
                         session.pauseReason == null &&
-                        endedAt == null && session.actualSeconds == null,
+                        endedAt == null && session.actualSeconds == null &&
+                        moveStart == null && moveEnd == null,
                 )
                 "paused" -> require(
                     runningSince == null && pausedAt != null && pausedAt >= startedAt &&
                         pausedAt <= updatedAt &&
                         (pauseUntil == null || pauseUntil > updatedAt &&
                             pauseUntil <= updatedAt.plusSeconds(MAX_PAUSE_SECONDS.toLong())) &&
-                        endedAt == null && session.actualSeconds == null,
+                        endedAt == null && session.actualSeconds == null &&
+                        moveStart == null && moveEnd == null,
                 )
-                else -> require(
+                "completed", "skipped" -> require(
                     runningSince == null && pauseUntil == null && session.pauseReason == null &&
                         session.actualSeconds != null && endedAt == updatedAt &&
-                        (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt),
+                        (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
+                        moveStart == null && moveEnd == null,
+                )
+                "deferred" -> require(
+                    runningSince == null && pauseUntil == null && session.pauseReason == null &&
+                        session.actualSeconds != null && endedAt == updatedAt &&
+                        (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
+                        moveStart != null && moveStart > endedAt &&
+                        moveEnd != null && moveEnd > moveStart &&
+                        Duration.between(moveStart, moveEnd) <=
+                        Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()),
                 )
             }
         } catch (error: Exception) {
@@ -1205,6 +1228,8 @@ class ExecutionSyncManager(
         pauseUntil = pauseUntil,
         pauseReason = pauseReason,
         endedAt = endedAt,
+        moveStart = moveStart,
+        moveEnd = moveEnd,
         createdAt = createdAt,
         updatedAt = updatedAt,
     )
@@ -1227,6 +1252,8 @@ class ExecutionSyncManager(
         pauseUntil = pauseUntil,
         pauseReason = pauseReason,
         endedAt = endedAt,
+        moveStart = moveStart,
+        moveEnd = moveEnd,
         createdAt = createdAt,
         updatedAt = updatedAt,
     )
@@ -1264,7 +1291,7 @@ class ExecutionSyncManager(
     private fun RemoteExecutionSession.hasSameImmutableIdentity(identity: ExecutionIdentity): Boolean =
         immutableIdentity() == identity
 
-    /** Every server-owned field must remain byte-for-byte semantic once a terminal row is cached. */
+    /** Every server-owned field must remain byte-for-byte semantic once a closed row is cached. */
     private fun RemoteExecutionSession.hasSameRemoteSemantics(
         snapshot: CanonicalExecutionSessionSnapshot,
     ): Boolean = this == snapshot.toRemoteSession()
@@ -1551,6 +1578,7 @@ class ExecutionSyncManager(
 
     private companion object {
         const val MAX_PAUSE_SECONDS = 24 * 60 * 60
+        const val MAX_DEFER_MOVE_WINDOW_SECONDS = 24 * 60 * 60
         const val MAX_PENDING_REQUEST_CHARS = 64 * 1024
         const val MAX_HISTORY_SESSIONS = 100
         const val MAX_BOOTSTRAP_HISTORY_PAGES = 1_000
@@ -1558,6 +1586,7 @@ class ExecutionSyncManager(
         val NIL_UUID: UUID = UUID(0L, 0L)
         val OPEN_STATUSES = setOf("active", "paused")
         val TERMINAL_STATUSES = setOf("completed", "skipped")
-        val ALL_STATUSES = OPEN_STATUSES + TERMINAL_STATUSES
+        val CLOSED_STATUSES = TERMINAL_STATUSES + "deferred"
+        val ALL_STATUSES = OPEN_STATUSES + CLOSED_STATUSES
     }
 }
