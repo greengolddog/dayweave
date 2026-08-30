@@ -188,6 +188,15 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["201"].is_null());
     assert!(document["paths"]["/v1/schedule/preview"]["post"]["responses"]["413"].is_object());
     assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["413"].is_object());
+    let discover = &document["paths"]["/v1/integrations/google/accounts/{account_id}/collections/discover"]
+        ["post"];
+    assert!(discover["requestBody"].is_null());
+    let refresh =
+        &document["paths"]["/v1/integrations/google/accounts/{account_id}/sync/refresh"]["post"];
+    assert_eq!(
+        refresh["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/GoogleSyncRefreshRequest"
+    );
     assert!(
         document["components"]["schemas"]["ComposeScheduleResult"]["properties"]
             .get("source_item_sensitivity")

@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use super::{
     CalendarProjectionBatch, CalendarProjectionResult, DiscoveredCollection, GoogleCalendarPolicy,
-    GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRole,
-    GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec, OutboundDispatchPermit,
-    OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
+    GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRefreshAccepted,
+    GoogleSyncRole, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
+    OutboundDispatchPermit, OutboundEnqueueSpec, OutboundPreviewSpec, OutboundResult, OutboundWork,
     RemoteCalendarSeriesChange, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
     SyncFailureKind,
 };
@@ -70,8 +70,9 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
     async fn request_refresh(
         &self,
         account_id: Uuid,
+        request_id: Uuid,
         now: DateTime<Utc>,
-    ) -> Result<(), GoogleSyncRepositoryError>;
+    ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncRepositoryError>;
 
     /// Invalidates every selected Calendar projection before discovery or any
     /// provider read. A failed/partial refresh can therefore never leave stale

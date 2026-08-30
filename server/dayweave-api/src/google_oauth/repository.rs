@@ -1327,13 +1327,26 @@ impl GoogleOAuthRepository for InMemoryGoogleOAuthRepository {
         }
         cleanup_sessions(&mut state, now, exchange_stale_before);
         ensure_no_open_authorization(&state)?;
-        let retry = matches!(
+        let idempotency_retry = matches!(
             replayed,
             Some(MemoryReplay::DisconnectPending { account_id: replay_id }) if replay_id == account_id
         );
-        if replayed.is_some() && !retry {
+        if replayed.is_some() && !idempotency_retry {
             return Err(GoogleOAuthRepositoryError::IdempotencyConflict);
         }
+        let matching_disconnect_fence = state.revocation_fence.is_some_and(|fence| {
+            fence.kind == MemoryRevocationKind::Disconnect && fence.owner_id == account_id
+        });
+        // A failed provider revocation deliberately retains its account operation
+        // hash and scope fence beyond the ordinary idempotency TTL. Reconstruct
+        // only that exact key/account operation; the fence still rejects every
+        // other absent key.
+        let recovered_expired_retry = replayed.is_none()
+            && matching_disconnect_fence
+            && state.accounts.get(&account_id).is_some_and(|account| {
+                account.disconnect_operation_hash == Some(idempotency.key_hash)
+            });
+        let retry = idempotency_retry || recovered_expired_retry;
         if state.revocation_fence.is_some_and(|fence| {
             !retry || fence.kind != MemoryRevocationKind::Disconnect || fence.owner_id != account_id
         }) {
@@ -1379,7 +1392,7 @@ impl GoogleOAuthRepository for InMemoryGoogleOAuthRepository {
             account.disconnect_operation_hash = Some(idempotency.key_hash);
             (credentials, account.value.clone())
         };
-        if !retry {
+        if !idempotency_retry {
             remember(
                 &mut state,
                 &idempotency,

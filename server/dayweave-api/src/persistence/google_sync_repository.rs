@@ -19,12 +19,13 @@ use crate::{
     google_sync::{
         CalendarProjectionBatch, CalendarProjectionResult, CalendarProjectionState,
         DiscoveredCollection, GoogleCalendarPolicy, GoogleCollectionKind, GoogleEventDisposition,
-        GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRepository,
-        GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncRunState, GoogleSyncRunStatus,
-        ImportOutcome, OutboundApprovalSpec, OutboundDispatchPermit, OutboundEnqueueSpec,
-        OutboundOperation, OutboundPreviewSpec, OutboundResult, OutboundWork, OutboxCounts,
-        RemoteCalendarSeriesChange, RemoteItemChange, StoredCursor, SyncClaim, SyncCounts,
-        SyncFailureKind, outbound_intent_hash, outbound_preview_hash,
+        GoogleOutboundAccepted, GoogleOutboundPreview, GoogleSyncCollection,
+        GoogleSyncRefreshAccepted, GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole,
+        GoogleSyncRunState, GoogleSyncRunStatus, ImportOutcome, OutboundApprovalSpec,
+        OutboundDispatchPermit, OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec,
+        OutboundResult, OutboundWork, OutboxCounts, RemoteCalendarSeriesChange, RemoteItemChange,
+        StoredCursor, SyncClaim, SyncCounts, SyncFailureKind, outbound_intent_hash,
+        outbound_preview_hash,
     },
     items::{Item, ItemStatus, ItemTombstone, NewItem, ReplaceItem, SplitPolicy},
 };
@@ -659,7 +660,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
             sqlx::query(
                 "UPDATE google_sync_runs SET requested_at = $4, next_attempt_at = \
-                 LEAST(next_attempt_at, $4), updated_at = $4, revision = revision + 1 \
+                 LEAST(next_attempt_at, $4), refresh_generation = refresh_generation + 1, \
+                 updated_at = $4, revision = revision + 1 \
                  WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
             )
             .bind(self.scope.workspace_id)
@@ -736,24 +738,68 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
     async fn request_refresh(
         &self,
         account_id: Uuid,
+        request_id: Uuid,
         now: DateTime<Utc>,
-    ) -> Result<(), GoogleSyncRepositoryError> {
+    ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         self.ensure_account(&mut transaction, account_id, true)
             .await?;
         ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
-        sqlx::query(
-            "UPDATE google_sync_runs SET requested_at = $4, \
-             next_attempt_at = CASE WHEN state = 'running' THEN next_attempt_at \
-                                    ELSE LEAST(next_attempt_at, $4) END, \
-             state = CASE WHEN state IN ('failed', 'reauthorization_required') THEN 'idle' ELSE state END, \
-             last_error_code = CASE WHEN state IN ('failed', 'reauthorization_required') THEN NULL ELSE last_error_code END, \
-             revision = revision + 1, updated_at = $4 \
-             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        if let Some(existing) = sqlx::query(
+            "SELECT refresh_generation, requested_at FROM google_sync_refresh_requests \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND request_id = $4",
         )
         .bind(self.scope.workspace_id)
         .bind(self.scope.user_id)
         .bind(account_id)
+        .bind(request_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(internal)?
+        {
+            let accepted = GoogleSyncRefreshAccepted {
+                account_id,
+                request_id,
+                refresh_generation: i64_to_u64(
+                    existing.try_get("refresh_generation").map_err(internal)?,
+                )?,
+                requested_at: existing.try_get("requested_at").map_err(internal)?,
+            };
+            transaction.commit().await.map_err(internal)?;
+            return Ok(accepted);
+        }
+        let row = sqlx::query(
+            "UPDATE google_sync_runs SET requested_at = $4, \
+             next_attempt_at = CASE WHEN state = 'running' THEN next_attempt_at \
+                                    ELSE LEAST(next_attempt_at, $4) END, \
+             started_at = CASE WHEN state = 'running' THEN started_at ELSE NULL END, \
+             completed_at = CASE WHEN state = 'running' THEN completed_at ELSE NULL END, \
+             refresh_generation = refresh_generation + 1, \
+             state = CASE WHEN state IN ('failed', 'reauthorization_required') THEN 'idle' ELSE state END, \
+             last_error_code = CASE WHEN state IN ('failed', 'reauthorization_required') THEN NULL ELSE last_error_code END, \
+             revision = revision + 1, updated_at = $4 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+             RETURNING refresh_generation",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        let refresh_generation = i64_to_u64(row.try_get("refresh_generation").map_err(internal)?)?;
+        sqlx::query(
+            "INSERT INTO google_sync_refresh_requests \
+             (workspace_id, user_id, provider_account_id, request_id, refresh_generation, \
+              requested_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $6)",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(request_id)
+        .bind(u64_to_i64(refresh_generation)?)
         .bind(now)
         .execute(&mut *transaction)
         .await
@@ -771,7 +817,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .await
         .map_err(internal)?;
         transaction.commit().await.map_err(internal)?;
-        Ok(())
+        Ok(GoogleSyncRefreshAccepted {
+            account_id,
+            request_id,
+            refresh_generation,
+            requested_at: now,
+        })
     }
 
     async fn begin_calendar_projection_refresh(
@@ -865,7 +916,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                ORDER BY run.next_attempt_at, run.provider_account_id \
                FOR UPDATE OF account, run SKIP LOCKED LIMIT 1) \
              UPDATE google_sync_runs run SET state = 'running', claim_id = $4, lease_until = $5, \
-               claim_generation = claim_generation + 1, started_at = $3, updated_at = $3, \
+               claim_generation = claim_generation + 1, \
+               claimed_refresh_generation = refresh_generation, started_at = $3, \
+               completed_at = NULL, updated_at = $3, \
                revision = revision + 1 \
              FROM candidate WHERE run.workspace_id = $1 \
                AND run.provider_account_id = candidate.provider_account_id \
@@ -943,8 +996,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         .await?;
         let updated = sqlx::query(
             "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
-             completed_at = $5, next_attempt_at = CASE WHEN requested_at > started_at THEN $5 ELSE $6 END, \
-             requested_at = NULL, consecutive_failures = 0, last_error_code = NULL, last_error_at = NULL, \
+             completed_at = $5, completed_refresh_generation = claimed_refresh_generation, \
+             next_attempt_at = CASE WHEN refresh_generation > claimed_refresh_generation \
+                                    THEN $5 ELSE $6 END, \
+             requested_at = CASE WHEN refresh_generation > claimed_refresh_generation \
+                                 THEN requested_at ELSE NULL END, \
+             consecutive_failures = 0, last_error_code = NULL, last_error_at = NULL, \
              imported_count = $7, updated_count = $8, deleted_count = $9, conflict_count = $10, \
              rejected_count = $11, revision = revision + 1, updated_at = $5 \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
@@ -1034,7 +1091,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         let row = sqlx::query(
             "SELECT provider_account_id, state, requested_at, started_at, completed_at, \
              next_attempt_at, consecutive_failures, last_error_code, last_error_at, imported_count, \
-             updated_count, deleted_count, conflict_count, rejected_count, revision \
+             updated_count, deleted_count, conflict_count, rejected_count, refresh_generation, \
+             claimed_refresh_generation, completed_refresh_generation, revision \
              FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
              AND provider_account_id = $3",
         )
@@ -2148,7 +2206,8 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
         sqlx::query(
             "UPDATE google_sync_runs SET requested_at = $4, next_attempt_at = LEAST(next_attempt_at, $4), \
-             revision = revision + 1, updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
+             refresh_generation = refresh_generation + 1, revision = revision + 1, \
+             updated_at = $4 WHERE workspace_id = $1 AND user_id = $2 \
              AND provider_account_id = $3",
         )
         .bind(self.scope.workspace_id)
@@ -6238,6 +6297,15 @@ fn run_from_row(row: &PgRow) -> Result<GoogleSyncRunStatus, GoogleSyncRepository
         deleted_count: i64_to_u64(row.try_get("deleted_count").map_err(internal)?)?,
         conflict_count: i64_to_u64(row.try_get("conflict_count").map_err(internal)?)?,
         rejected_count: i64_to_u64(row.try_get("rejected_count").map_err(internal)?)?,
+        refresh_generation: i64_to_u64(row.try_get("refresh_generation").map_err(internal)?)?,
+        claimed_refresh_generation: i64_to_u64(
+            row.try_get("claimed_refresh_generation")
+                .map_err(internal)?,
+        )?,
+        completed_refresh_generation: i64_to_u64(
+            row.try_get("completed_refresh_generation")
+                .map_err(internal)?,
+        )?,
         revision: i64_to_u64(row.try_get("revision").map_err(internal)?)?,
     })
 }
@@ -6527,7 +6595,7 @@ mod tests {
             .await
             .expect("writable owner calendar");
         repository
-            .request_refresh(account_id, now)
+            .request_refresh(account_id, Uuid::new_v4(), now)
             .await
             .expect("refresh requested");
         let claim = repository
@@ -9716,6 +9784,200 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_refresh_clears_stale_non_running_completion_timestamps() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; refresh timestamp reset test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let retry_at = fixture.now + Duration::minutes(1);
+        let stale_started_at = retry_at + Duration::minutes(1);
+        let stale_completed_at = retry_at + Duration::minutes(2);
+        sqlx::query(
+            "UPDATE google_sync_runs SET state = 'idle', claim_id = NULL, lease_until = NULL, \
+             started_at = $4, completed_at = $5, next_attempt_at = $5 \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.account_id)
+        .bind(stale_started_at)
+        .bind(stale_completed_at)
+        .execute(&fixture.database.pool)
+        .await
+        .expect("stale completed run fixture");
+
+        fixture
+            .repository
+            .request_refresh(fixture.account_id, Uuid::new_v4(), retry_at)
+            .await
+            .expect("refresh accepted");
+
+        let refreshed = sqlx::query(
+            "SELECT state, requested_at, started_at, completed_at FROM google_sync_runs \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.account_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("refreshed run");
+        assert_eq!(refreshed.get::<String, _>("state"), "idle");
+        assert_eq!(
+            refreshed.get::<Option<DateTime<Utc>>, _>("requested_at"),
+            Some(retry_at)
+        );
+        assert_eq!(
+            refreshed.get::<Option<DateTime<Utc>>, _>("started_at"),
+            None
+        );
+        assert_eq!(
+            refreshed.get::<Option<DateTime<Utc>>, _>("completed_at"),
+            None
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keeps the complete causal lifecycle in one regression.
+    async fn postgres_refresh_generation_is_exact_and_clock_independent() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; refresh generation test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let initial = fixture
+            .repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("initial status")
+            .expect("running fixture status");
+        assert_eq!(initial.state, GoogleSyncRunState::Running);
+        assert_eq!(
+            initial.claimed_refresh_generation,
+            initial.refresh_generation
+        );
+
+        let request_id = Uuid::new_v4();
+        let skewed_request_time = fixture.now - Duration::hours(1);
+        let accepted = fixture
+            .repository
+            .request_refresh(fixture.account_id, request_id, skewed_request_time)
+            .await
+            .expect("clock-skewed refresh accepted");
+        assert_eq!(accepted.request_id, request_id);
+        assert_eq!(accepted.refresh_generation, initial.refresh_generation + 1);
+        let replay = fixture
+            .repository
+            .request_refresh(
+                fixture.account_id,
+                request_id,
+                fixture.now + Duration::hours(4),
+            )
+            .await
+            .expect("exact refresh replay");
+        assert_eq!(replay, accepted);
+
+        let during_run = fixture
+            .repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("during-run status")
+            .expect("during-run row");
+        assert_eq!(during_run.refresh_generation, accepted.refresh_generation);
+        assert_eq!(
+            during_run.claimed_refresh_generation,
+            initial.claimed_refresh_generation
+        );
+
+        let first_completed_at = fixture.now + Duration::seconds(1);
+        fixture
+            .repository
+            .complete_claim(
+                &fixture.claim,
+                &SyncCounts::default(),
+                first_completed_at,
+                fixture.now + Duration::hours(1),
+            )
+            .await
+            .expect("first claim completes");
+        let after_first = fixture
+            .repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("first completion status")
+            .expect("first completion row");
+        assert_eq!(after_first.state, GoogleSyncRunState::Idle);
+        assert_eq!(after_first.next_attempt_at, first_completed_at);
+        assert_eq!(
+            after_first.completed_refresh_generation,
+            initial.claimed_refresh_generation
+        );
+        assert!(
+            after_first.completed_refresh_generation < accepted.refresh_generation,
+            "the pre-request run must not satisfy the accepted refresh"
+        );
+
+        let follow_up = fixture
+            .repository
+            .claim_due(
+                first_completed_at,
+                first_completed_at + Duration::minutes(10),
+            )
+            .await
+            .expect("follow-up claim query")
+            .expect("follow-up claim");
+        let follow_up_running = fixture
+            .repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("follow-up status")
+            .expect("follow-up row");
+        assert_eq!(
+            follow_up_running.claimed_refresh_generation,
+            accepted.refresh_generation
+        );
+        assert_eq!(follow_up_running.completed_at, None);
+
+        fixture
+            .repository
+            .complete_claim(
+                &follow_up,
+                &SyncCounts::default(),
+                first_completed_at + Duration::seconds(1),
+                fixture.now + Duration::hours(1),
+            )
+            .await
+            .expect("follow-up completes");
+        let completed = fixture
+            .repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("final status")
+            .expect("final row");
+        assert_eq!(
+            completed.completed_refresh_generation,
+            accepted.refresh_generation
+        );
+
+        let request_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM google_sync_refresh_requests \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND request_id = $4",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.account_id)
+        .bind(request_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("refresh request count");
+        assert_eq!(request_count, 1);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
     async fn postgres_full_snapshot_sweep_waits_for_canonical_item_lock() {
         let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
             eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; snapshot lock test skipped");
@@ -10505,7 +10767,7 @@ mod tests {
             .expect("writable owner calendar");
 
         repository
-            .request_refresh(account_id, now)
+            .request_refresh(account_id, Uuid::new_v4(), now)
             .await
             .expect("manual refresh durable");
         let claim = repository
@@ -11189,7 +11451,7 @@ mod tests {
             Some("provider_temporary")
         );
         repository
-            .request_refresh(account_id, now + Duration::minutes(2))
+            .request_refresh(account_id, Uuid::new_v4(), now + Duration::minutes(2))
             .await
             .expect("manual refresh advances retained delivery");
         let work = repository

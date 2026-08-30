@@ -516,6 +516,9 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     /// Exact authenticated item-mutation evidence that this request made no
     /// change. Callers may still reconcile independently observed semantics.
     case trustedCanonicalMutationNoEffect(conflictCode: String)
+    /// Exact authenticated Google disconnect evidence that the optimistic
+    /// revision check failed before this request could claim or revoke data.
+    case trustedGoogleDisconnectNoEffect
     case server(statusCode: Int, code: String?, message: String?, requestID: String?)
     case responseDecodingFailed
 }
@@ -555,6 +558,8 @@ extension DayWeaveAPIError: LocalizedError {
             return "The matching canonical item request is still in progress."
         case .trustedCanonicalMutationNoEffect:
             return "The authenticated server proved that the canonical item request had no effect."
+        case .trustedGoogleDisconnectNoEffect:
+            return "The authenticated server proved that the exact Google disconnect request had no effect."
         case let .server(statusCode, code, message, requestID):
             let safeCode = DayWeaveDiagnosticSanitizer.code(code, secrets: [])
             let safeMessage = DayWeaveDiagnosticSanitizer.text(
@@ -710,6 +715,22 @@ struct DayWeaveAPIClient: Sendable {
         }
     }
 
+    private struct ConfigureGoogleCollectionRequest: Encodable {
+        let expectedRevision: UInt64
+        let selected: Bool
+        let visible: Bool
+        let syncRole: GoogleSyncRole
+        let calendarPolicy: GoogleCalendarPolicy
+
+        private enum CodingKeys: String, CodingKey {
+            case expectedRevision = "expected_revision"
+            case selected
+            case visible
+            case syncRole = "sync_role"
+            case calendarPolicy = "calendar_policy"
+        }
+    }
+
     private struct DecisionRequest: Encodable {
         let expectedRevision: UInt64
         let note: String?
@@ -717,6 +738,14 @@ struct DayWeaveAPIClient: Sendable {
         private enum CodingKeys: String, CodingKey {
             case expectedRevision = "expected_revision"
             case note
+        }
+    }
+
+    private struct GoogleSyncRefreshRequest: Encodable {
+        let requestID: UUID
+
+        private enum CodingKeys: String, CodingKey {
+            case requestID = "request_id"
         }
     }
 
@@ -765,6 +794,296 @@ struct DayWeaveAPIClient: Sendable {
         expectedBindingIdentifier = binding
         configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
     }
+
+    func googleAccounts() async throws -> GoogleAccountsSnapshot {
+        try await send(
+            method: "GET",
+            pathComponents: ["v1", "integrations", "google", "accounts"],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+    }
+
+    func startGoogleOAuth(
+        _ request: GoogleOAuthStartRequest,
+        idempotencyKey: String
+    ) async throws -> GoogleOAuthAuthorization {
+        guard request.isValid, Self.isValidGoogleIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        return try await send(
+            method: "POST",
+            pathComponents: ["v1", "integrations", "google", "oauth", "start"],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(request),
+            requiredStatusCode: 201,
+            requiresDurableAuthorization: true
+        )
+    }
+
+    func pauseGoogleAccount(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> GoogleAccount {
+        try validateGoogleAccountMutationRequest(
+            id: id,
+            expectedRevision: expectedRevision,
+            idempotencyKey: idempotencyKey
+        )
+        let account: GoogleAccount = try await send(
+            method: "POST",
+            pathComponents: [
+                "v1", "integrations", "google", "accounts", id.uuidString.lowercased(), "pause",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(RevisionRequest(expectedRevision: expectedRevision)),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        return try validateGoogleAccountMutationResponse(
+            account,
+            id: id,
+            expectedRevision: expectedRevision,
+            expectedStatus: .paused,
+            expectedSyncEnabled: false
+        )
+    }
+
+    func resumeGoogleAccount(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> GoogleAccount {
+        try validateGoogleAccountMutationRequest(
+            id: id,
+            expectedRevision: expectedRevision,
+            idempotencyKey: idempotencyKey
+        )
+        let account: GoogleAccount = try await send(
+            method: "POST",
+            pathComponents: [
+                "v1", "integrations", "google", "accounts", id.uuidString.lowercased(), "resume",
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(RevisionRequest(expectedRevision: expectedRevision)),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        return try validateGoogleAccountMutationResponse(
+            account,
+            id: id,
+            expectedRevision: expectedRevision,
+            expectedStatus: .active,
+            expectedSyncEnabled: true
+        )
+    }
+
+    func disconnectGoogleAccount(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> GoogleAccount {
+        try validateGoogleAccountMutationRequest(
+            id: id,
+            expectedRevision: expectedRevision,
+            idempotencyKey: idempotencyKey
+        )
+        guard expectedRevision <= UInt64(Int64.max) - 2 else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let account: GoogleAccount = try await send(
+            method: "DELETE",
+            pathComponents: [
+                "v1", "integrations", "google", "accounts", id.uuidString.lowercased(),
+            ],
+            queryItems: [
+                URLQueryItem(name: "expected_revision", value: String(expectedRevision)),
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        return try validateGoogleAccountMutationResponse(
+            account,
+            id: id,
+            expectedRevision: expectedRevision,
+            expectedStatus: .revoked,
+            expectedSyncEnabled: false,
+            minimumRevisionIncrement: 2,
+            requiresExactNextRevision: false
+        )
+    }
+
+    func googleCollections(accountID: UUID) async throws -> [GoogleSyncCollection] {
+        try validateGoogleIdentity(accountID)
+        let snapshot: GoogleCollectionsSnapshot = try await send(
+            method: "GET",
+            pathComponents: googleAccountPath(accountID) + ["collections"],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        return try validateGoogleCollections(snapshot.collections, accountID: accountID)
+    }
+
+    func discoverGoogleCollections(accountID: UUID) async throws -> [GoogleSyncCollection] {
+        try validateGoogleIdentity(accountID)
+        let snapshot: GoogleCollectionsSnapshot = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + ["collections", "discover"],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        return try validateGoogleCollections(snapshot.collections, accountID: accountID)
+    }
+
+    func configureGoogleCollection(
+        accountID: UUID,
+        collectionID: UUID,
+        expectedRevision: UInt64,
+        selected: Bool,
+        visible: Bool,
+        role: GoogleSyncRole,
+        calendarPolicy: GoogleCalendarPolicy
+    ) async throws -> GoogleSyncCollection {
+        try validateGoogleIdentity(accountID)
+        try validateGoogleIdentity(collectionID)
+        guard expectedRevision > 0,
+              expectedRevision < UInt64(Int64.max),
+              role != .writable,
+              calendarPolicy.isReadOnlySafe else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let snapshot: GoogleCollectionSnapshot = try await send(
+            method: "PUT",
+            pathComponents: googleAccountPath(accountID) + [
+                "collections", collectionID.uuidString.lowercased(),
+            ],
+            body: try encode(ConfigureGoogleCollectionRequest(
+                expectedRevision: expectedRevision,
+                selected: selected,
+                visible: visible,
+                syncRole: role,
+                calendarPolicy: calendarPolicy
+            )),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        let collection = snapshot.collection
+        guard collection.accountID == accountID,
+              collection.id == collectionID,
+              collection.revision == expectedRevision + 1,
+              collection.selected == selected,
+              collection.visible == visible,
+              collection.syncRole == role,
+              collection.calendarPolicy == calendarPolicy,
+              role != .blocking || collection.kind == .calendar else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return collection
+    }
+
+    func googleSyncStatus(accountID: UUID) async throws -> GoogleSyncStatus {
+        try validateGoogleIdentity(accountID)
+        let snapshot: GoogleSyncStatusSnapshot = try await send(
+            method: "GET",
+            pathComponents: googleAccountPath(accountID) + ["sync"],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        guard snapshot.sync.run.map({ $0.accountID == accountID }) ?? true else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return snapshot.sync
+    }
+
+    func requestGoogleSyncRefresh(
+        accountID: UUID,
+        requestID: UUID
+    ) async throws -> GoogleSyncRefreshAccepted {
+        try validateGoogleIdentity(accountID)
+        try validateGoogleIdentity(requestID)
+        let snapshot: GoogleSyncRefreshSnapshot = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + ["sync", "refresh"],
+            body: try encode(GoogleSyncRefreshRequest(requestID: requestID)),
+            requiredStatusCode: 202,
+            requiresDurableAuthorization: true
+        )
+        guard snapshot.refresh.accountID == accountID,
+              snapshot.refresh.requestID == requestID else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return snapshot.refresh
+    }
+
+    private func googleAccountPath(_ accountID: UUID) -> [String] {
+        [
+            "v1", "integrations", "google", "accounts", accountID.uuidString.lowercased(),
+        ]
+    }
+
+    private func validateGoogleIdentity(_ id: UUID) throws {
+        guard id != Self.googleZeroUUID else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
+    private func validateGoogleAccountMutationRequest(
+        id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) throws {
+        try validateGoogleIdentity(id)
+        guard expectedRevision > 0,
+              expectedRevision < UInt64(Int64.max),
+              Self.isValidGoogleIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
+    private func validateGoogleAccountMutationResponse(
+        _ account: GoogleAccount,
+        id: UUID,
+        expectedRevision: UInt64,
+        expectedStatus: GoogleAccountStatus,
+        expectedSyncEnabled: Bool,
+        minimumRevisionIncrement: UInt64 = 1,
+        requiresExactNextRevision: Bool = true
+    ) throws -> GoogleAccount {
+        guard account.id == id,
+              account.revision >= expectedRevision + minimumRevisionIncrement,
+              !requiresExactNextRevision || account.revision == expectedRevision + 1,
+              account.status == expectedStatus,
+              account.syncEnabled == expectedSyncEnabled else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return account
+    }
+
+    private func validateGoogleCollections(
+        _ collections: [GoogleSyncCollection],
+        accountID: UUID
+    ) throws -> [GoogleSyncCollection] {
+        guard collections.allSatisfy({ $0.accountID == accountID }) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return collections
+    }
+
+    private static func isValidGoogleIdempotencyKey(_ value: String) -> Bool {
+        (8...128).contains(value.utf8.count)
+            && value.utf8.allSatisfy { byte in
+                (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122)
+                    || (byte >= 48 && byte <= 57)
+                    || [45, 46, 95].contains(byte)
+            }
+    }
+
+    private static let googleZeroUUID = UUID(
+        uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+    )
 
     func listSuggestions(
         status: DayWeaveProposalStatus? = .pending,
@@ -1383,7 +1702,8 @@ struct DayWeaveAPIClient: Sendable {
         queryItems: [URLQueryItem] = [],
         headers: [String: String] = [:],
         body: Data? = nil,
-        requiredStatusCode: Int? = nil
+        requiredStatusCode: Int? = nil,
+        requiresDurableAuthorization: Bool = false
     ) async throws -> Response {
         if let body, body.count > Self.maximumRequestBytes {
             throw DayWeaveAPIError.requestEncodingFailed
@@ -1433,6 +1753,9 @@ struct DayWeaveAPIClient: Sendable {
         guard initialAuthorization.bindingIdentifier == expectedBindingIdentifier else {
             throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
         }
+        guard !requiresDurableAuthorization || initialAuthorization.isDurable else {
+            throw DayWeaveAPIError.durableAuthentication(.enrollmentRequired)
+        }
 
         var tokensToRedact = [initialAuthorization.bearerToken]
         var replayedAuthorization: DurableAuthorization?
@@ -1460,6 +1783,9 @@ struct DayWeaveAPIClient: Sendable {
             guard recovered.bindingIdentifier == initialAuthorization.bindingIdentifier,
                   recovered.bindingIdentifier == expectedBindingIdentifier else {
                 throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+            }
+            guard !requiresDurableAuthorization || recovered.isDurable else {
+                throw DayWeaveAPIError.durableAuthentication(.enrollmentRequired)
             }
             tokensToRedact.append(recovered.bearerToken)
             replayedAuthorization = recovered
@@ -1518,6 +1844,18 @@ struct DayWeaveAPIClient: Sendable {
             if let trusted = Self.trustedCanonicalMutationError(
                 method: method,
                 pathComponents: pathComponents,
+                statusCode: httpResponse.statusCode,
+                contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                body: data
+            ) {
+                throw trusted
+            }
+            if let trusted = Self.trustedGoogleDisconnectError(
+                method: method,
+                pathComponents: pathComponents,
+                queryItems: queryItems,
                 statusCode: httpResponse.statusCode,
                 contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
                 cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
@@ -1635,6 +1973,47 @@ struct DayWeaveAPIClient: Sendable {
             return nil
         }
         return .trustedCanonicalMutationNoEffect(conflictCode: conflictCode)
+    }
+
+    private static func trustedGoogleDisconnectError(
+        method: String,
+        pathComponents: [String],
+        queryItems: [URLQueryItem],
+        statusCode: Int,
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> DayWeaveAPIError? {
+        guard method == "DELETE",
+              pathComponents.count == 5,
+              pathComponents[0...3] == ["v1", "integrations", "google", "accounts"],
+              UUID(uuidString: pathComponents[4]) != nil,
+              queryItems.count == 1,
+              queryItems[0].name == "expected_revision",
+              let requestedRevision = UInt64(queryItems[0].value ?? ""),
+              requestedRevision > 0,
+              statusCode == 409,
+              body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              cacheControl?.lowercased() == "no-store, max-age=0",
+              pragma?.lowercased() == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              Set(error.keys) == ["code", "message", "details"],
+              error["code"] as? String == "conflict",
+              error["message"] as? String == "Google account changed on another device",
+              let details = error["details"] as? [String: Any],
+              Set(details.keys) == ["expected_revision", "actual_revision"],
+              isStrictPositiveJSONInteger(details["expected_revision"]),
+              isStrictPositiveJSONInteger(details["actual_revision"]),
+              (details["expected_revision"] as? NSNumber)?.uint64Value
+                == requestedRevision,
+              let actualRevision = (details["actual_revision"] as? NSNumber)?.uint64Value,
+              actualRevision != requestedRevision else { return nil }
+        return .trustedGoogleDisconnectNoEffect
     }
 
     private static func isStrictPositiveJSONInteger(_ value: Any?) -> Bool {
@@ -1923,6 +2302,168 @@ struct DayWeaveAPIClient: Sendable {
         binding: String
     ) -> String {
         "\(baseURL.canonicalConfigurationIdentifier)|auth=\(binding)"
+    }
+}
+
+/// Foundation's JSON object decoders collapse duplicate member names before a
+/// keyed container can inspect them. Destructive trust promotion therefore
+/// performs a small duplicate-aware grammar pass over the exact wire bytes
+/// before using `JSONSerialization` for typed envelope checks.
+private struct StrictJSONObjectKeyScanner {
+    private static let maximumDepth = 64
+
+    private let bytes: [UInt8]
+    private var index = 0
+
+    private init(_ data: Data) {
+        bytes = Array(data)
+    }
+
+    static func hasUniqueKeys(in data: Data) -> Bool {
+        var scanner = Self(data)
+        scanner.skipWhitespace()
+        guard scanner.parseValue(depth: 0) else { return false }
+        scanner.skipWhitespace()
+        return scanner.index == scanner.bytes.count
+    }
+
+    private mutating func parseValue(depth: Int) -> Bool {
+        guard depth <= Self.maximumDepth, index < bytes.count else { return false }
+        switch bytes[index] {
+        case 0x7B:
+            return parseObject(depth: depth)
+        case 0x5B:
+            return parseArray(depth: depth)
+        case 0x22:
+            return parseString() != nil
+        case 0x74:
+            return consumeLiteral([0x74, 0x72, 0x75, 0x65])
+        case 0x66:
+            return consumeLiteral([0x66, 0x61, 0x6C, 0x73, 0x65])
+        case 0x6E:
+            return consumeLiteral([0x6E, 0x75, 0x6C, 0x6C])
+        case 0x2D, 0x30...0x39:
+            return parseNumber()
+        default:
+            return false
+        }
+    }
+
+    private mutating func parseObject(depth: Int) -> Bool {
+        index += 1
+        skipWhitespace()
+        if consume(0x7D) { return true }
+        var keys = Set<String>()
+        while true {
+            guard index < bytes.count, bytes[index] == 0x22,
+                  let key = parseString(), keys.insert(key).inserted else { return false }
+            skipWhitespace()
+            guard consume(0x3A) else { return false }
+            skipWhitespace()
+            guard parseValue(depth: depth + 1) else { return false }
+            skipWhitespace()
+            if consume(0x7D) { return true }
+            guard consume(0x2C) else { return false }
+            skipWhitespace()
+        }
+    }
+
+    private mutating func parseArray(depth: Int) -> Bool {
+        index += 1
+        skipWhitespace()
+        if consume(0x5D) { return true }
+        while true {
+            guard parseValue(depth: depth + 1) else { return false }
+            skipWhitespace()
+            if consume(0x5D) { return true }
+            guard consume(0x2C) else { return false }
+            skipWhitespace()
+        }
+    }
+
+    private mutating func parseString() -> String? {
+        guard consume(0x22) else { return nil }
+        let start = index - 1
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == 0x22 {
+                index += 1
+                return try? JSONDecoder().decode(
+                    String.self,
+                    from: Data(bytes[start..<index])
+                )
+            }
+            if byte < 0x20 { return nil }
+            if byte == 0x5C {
+                index += 1
+                guard index < bytes.count else { return nil }
+                let escape = bytes[index]
+                if escape == 0x75 {
+                    guard index + 4 < bytes.count,
+                          bytes[(index + 1)...(index + 4)].allSatisfy(Self.isHexDigit) else {
+                        return nil
+                    }
+                    index += 5
+                    continue
+                }
+                guard [0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74].contains(escape) else {
+                    return nil
+                }
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private mutating func parseNumber() -> Bool {
+        _ = consume(0x2D)
+        guard index < bytes.count else { return false }
+        if consume(0x30) {
+            if index < bytes.count, Self.isDigit(bytes[index]) { return false }
+        } else {
+            guard index < bytes.count, (0x31...0x39).contains(bytes[index]) else { return false }
+            repeat { index += 1 } while index < bytes.count && Self.isDigit(bytes[index])
+        }
+        if consume(0x2E) {
+            guard index < bytes.count, Self.isDigit(bytes[index]) else { return false }
+            repeat { index += 1 } while index < bytes.count && Self.isDigit(bytes[index])
+        }
+        if index < bytes.count, bytes[index] == 0x65 || bytes[index] == 0x45 {
+            index += 1
+            if index < bytes.count, bytes[index] == 0x2B || bytes[index] == 0x2D {
+                index += 1
+            }
+            guard index < bytes.count, Self.isDigit(bytes[index]) else { return false }
+            repeat { index += 1 } while index < bytes.count && Self.isDigit(bytes[index])
+        }
+        return true
+    }
+
+    private mutating func consumeLiteral(_ literal: [UInt8]) -> Bool {
+        guard index + literal.count <= bytes.count,
+              Array(bytes[index..<(index + literal.count)]) == literal else { return false }
+        index += literal.count
+        return true
+    }
+
+    private mutating func consume(_ byte: UInt8) -> Bool {
+        guard index < bytes.count, bytes[index] == byte else { return false }
+        index += 1
+        return true
+    }
+
+    private mutating func skipWhitespace() {
+        while index < bytes.count, [0x20, 0x09, 0x0A, 0x0D].contains(bytes[index]) {
+            index += 1
+        }
+    }
+
+    private static func isDigit(_ byte: UInt8) -> Bool {
+        (0x30...0x39).contains(byte)
+    }
+
+    private static func isHexDigit(_ byte: UInt8) -> Bool {
+        isDigit(byte) || (0x41...0x46).contains(byte) || (0x61...0x66).contains(byte)
     }
 }
 

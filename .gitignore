@@ -48,3 +48,5 @@ deploy/terraform/**/local.auto.tfvars.json
 deploy/terraform/**/crash*.log
 coverage/
 dist/
+__pycache__/
+*.py[cod]

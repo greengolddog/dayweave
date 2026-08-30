@@ -76,6 +76,67 @@ All routes below require the normal DayWeave bearer token. Provider access and
 refresh tokens never leave the server and must never appear in logs or API
 responses.
 
+#### macOS read-only owner flow
+
+The native Mac client exposes the safe import subset after durable DayWeave
+device enrollment is active:
+
+1. Open **Settings → Accounts → Google** and choose **Connect Calendar & Tasks**.
+   The client explicitly sends `"services":[]`; by server contract this requests
+   Calendar read-only and Tasks read-only together. No Google client secret,
+   provider token, callback code, or callback state belongs on the Mac.
+2. Choose **Open Google**, complete consent in the external browser, then leave
+   DayWeave unlocked while it checks the account or choose **Check connection**.
+   Browser launch is not considered success. The protected accounts endpoint is
+   authoritative account inventory, but it cannot bind a change to one exact
+   browser attempt, so the client keeps that attempt's recovery journal until
+   expiry. The authorization URL is never persisted.
+3. Choose **Discover sources** for an active account. Select Calendar sources as
+   reference-only or blocking and select Task lists as reference-only. This
+   client can display a pre-existing writable Calendar policy only so the owner
+   can explicitly downgrade it; outgoing writable roles, blocking Task lists,
+   and every publication flag are rejected locally.
+4. Choose **Refresh import**. The returned `202` is only durable queue
+   acceptance. DayWeave polls sync status and pulls/recomposes canonical items
+   only after the accepted monotonic refresh generation is completed by an idle
+   run. Its non-secret completion marker has
+   no time-based expiry and is deleted only after fresh canonical composition
+   reports success. Backoff or a still-running import can be checked later
+   without replaying the mutation. If acceptance was never proved, the UI may
+   safely replay the exact persisted request UUID; the server returns its
+   original generation without queuing duplicate work. A terminal failed
+   run—or a reauthorization-required run after
+   authorization is repaired—can also be retried: before transport, the client
+   replaces the marker with a new durable request UUID. Completion uses only
+   monotonic generations, so API/client/worker clock skew cannot falsely prove
+   the retry completed. If sync status requires reauthorization while the
+   provider account still appears active, the Reauthorize action remains
+   available and preserves the pending completion marker.
+
+OAuth start keeps only a non-secret, expiring request/idempotency journal for an
+exact lost-response retry. Disconnect separately retains its exact account,
+revision, and idempotency identity until authoritative revocation; it never
+ages that identity out while the server's revocation fence exists, and it is
+cleared only after a verified fresh canonical composition removes retired
+imports. An exact, endpoint-bound revision-conflict response proves a stale
+disconnect had no effect. The client retires that obsolete request identity
+only after an authoritative read still shows a usable account; if the account
+is absent or revoked, it retains the marker through verified canonical
+composition. App lock,
+sleep, and inactivity cancel work and redact all in-memory Google labels and
+browser authority. Destructive or cross-base DayWeave credential replacement
+is blocked while recovery exists; a same-API-base authentication repair may
+rebind recovery only after the protected account identity is visible. If the
+old session is no longer recoverable and the protected account is absent, the
+app offers a destructive, explicitly confirmed abandonment of only that
+orphaned local marker. Cleanup revocation fences and operator-recovery state
+block new connect and reauthorization attempts before an OAuth request is
+persisted. Resetting unreadable disconnect/import recovery first requires a
+verified fresh composition. Tests use injected transports and synthetic
+identities; they never open a browser or contact Google.
+
+#### Server/operator API sequence
+
 1. Complete `/v1/integrations/google/oauth/start` and its browser callback.
    Start read-only unless a write feature is already enabled.
 2. `POST /v1/integrations/google/accounts/{account_id}/collections/discover`.
@@ -107,10 +168,14 @@ responses.
    atomically downgrades DayWeave's role to `read_only`, invalidates its cursor,
    and conflicts any unpublished outbound work for that collection, including a
    delivery claim that was already in progress.
-4. `POST .../sync/refresh` durably requests a run and returns `202`; periodic
+4. `POST .../sync/refresh` accepts a persist-before-send `request_id`, durably
+   increments a monotonic refresh generation, and returns both in `202`;
+   replaying the same ID returns its original acceptance without duplicate work.
+   Periodic
    reconciliation also runs every 15 minutes. `GET .../sync` reports the run,
-   retry time, stable redacted run/outbound error codes, import conflicts, and
-   outbound queue counts. Rate limiting and transient provider failures enter
+   retry time, accepted/claimed/completed refresh generations, stable redacted
+   run/outbound error codes, import conflicts, and outbound queue counts. Rate
+   limiting and transient provider failures enter
    bounded backoff. A manual refresh advances backoff work for an explicit
    retry; after reauthorization, call it to resume retained outbound work.
    Invalid authorization and terminal durable failures make `/ready` false.

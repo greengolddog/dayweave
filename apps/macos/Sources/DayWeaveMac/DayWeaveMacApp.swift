@@ -35,6 +35,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var proposalApplications: ProposalApplicationStore
     @StateObject private var canonicalSync: CanonicalSyncStore
     @StateObject private var executionSync: ExecutionSyncStore
+    @StateObject private var googleIntegration: GoogleIntegrationStore
     @StateObject private var serviceCoordinator: DayWeaveServiceCoordinator
     @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
@@ -72,6 +73,13 @@ struct DayWeaveMacApp: App {
             authCoordinator: authCoordinator
         )
         _executionSync = StateObject(wrappedValue: executionSync)
+        let googleIntegration = GoogleIntegrationStore(
+            authCoordinator: authCoordinator
+        )
+        googleIntegration.installImportCompletionVerifier {
+            await canonicalSync.syncThroughFreshComposition()
+        }
+        _googleIntegration = StateObject(wrappedValue: googleIntegration)
         _serviceCoordinator = StateObject(wrappedValue: DayWeaveServiceCoordinator(
             proposalApplications: proposalApplications,
             executionSync: executionSync,
@@ -97,6 +105,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(proposalApplications)
                 .environmentObject(canonicalSync)
                 .environmentObject(executionSync)
+                .environmentObject(googleIntegration)
                 .environmentObject(serviceCoordinator)
                 .environmentObject(durableAuth)
                 .environmentObject(appLock)
@@ -267,6 +276,7 @@ struct DayWeaveMacApp: App {
                         .environmentObject(proposalApplications)
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
+                        .environmentObject(googleIntegration)
                         .environmentObject(durableAuth)
                 } else {
                     AppLockedView()
@@ -283,11 +293,13 @@ struct DayWeaveMacApp: App {
     private func activateServices() {
         guard appLock.isContentAvailable else { return }
         codex.startIfNeeded()
+        googleIntegration.activate()
         serviceCoordinator.activate()
     }
 
     private func deactivateServices() {
         serviceCoordinator.deactivate()
+        googleIntegration.suspendForPrivacyBoundary()
         codexConversation.suspendForPrivacyBoundary()
         proposalApplications.suspendForPrivacyBoundary()
     }

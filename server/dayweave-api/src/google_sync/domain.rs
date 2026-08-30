@@ -169,6 +169,14 @@ pub struct GoogleSyncRunStatus {
     pub deleted_count: u64,
     pub conflict_count: u64,
     pub rejected_count: u64,
+    /// Monotonic generation of every durable refresh signal accepted for this
+    /// account. This is a causal fence; timestamps are presentation metadata.
+    pub refresh_generation: u64,
+    /// Refresh generation captured by the currently running or most recently
+    /// claimed worker run.
+    pub claimed_refresh_generation: u64,
+    /// Highest refresh generation incorporated by a successful worker run.
+    pub completed_refresh_generation: u64,
     pub revision: u64,
 }
 
@@ -482,6 +490,8 @@ pub struct GoogleSyncStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct GoogleSyncRefreshAccepted {
     pub account_id: Uuid,
+    pub request_id: Uuid,
+    pub refresh_generation: u64,
     pub requested_at: DateTime<Utc>,
 }
 

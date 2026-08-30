@@ -64,7 +64,7 @@ generated tuple before its first consume request.
 
 A crash, timeout, cancellation, or lost response retains the exact pending
 request. Restart recovery uses the journaled target and bytes, never a newly
-entered same-origin base path and never a replacement tuple. Older pending
+entered API base and never a replacement tuple. Older pending
 records without a complete request fence are quarantined instead of being
 retargeted. Access refresh follows the same persist-before-send rule for a
 material-distinct next pair. Proactive refresh and a strictly validated API 401
@@ -94,6 +94,71 @@ the same origin therefore quarantines stale work instead of sending it under a
 new identity. Legacy raw-token records have no trustworthy origin and require
 explicit re-entry. Credentials are device-only and are never added to the
 Codable planner snapshot or application diagnostics.
+
+## Google Calendar and Tasks
+
+**Settings → Accounts → Google** connects through the configured DayWeave API.
+The Mac sends an explicit empty `services` array, which the server defines as
+Calendar read-only plus Tasks read-only. Google access and refresh credentials,
+the OAuth callback code, and callback state remain server-only. The app accepts
+only a short-lived `https://accounts.google.com/o/oauth2/v2/auth` page, consumes
+that in-memory capability before asking macOS to open it, and never saves the
+URL or exposes it through SwiftUI or diagnostics.
+
+Before OAuth start, DayWeave saves a non-secret exact-retry journal containing
+the request, idempotency key, DayWeave authentication binding, baseline account
+revisions, and expiry with a synchronized read-back before transport. A timeout
+or lost response can therefore replay the same request rather than creating
+another authorization session. The URL itself is memory-only. Because the
+accounts endpoint cannot identify one particular browser attempt, an account
+change is candidate evidence only; the exact journal remains recoverable until
+it expires. Lock, sleep, inactivity, or API credential replacement cancels the
+active operation, clears account/source labels and pending browser authority,
+and rejects late results. Unlocking reloads them only under the current durable
+DayWeave session; legacy static bearers are not used by the live Google client.
+
+Connected accounts expose discovery, pause/resume, reauthorization, and an
+explicitly confirmed disconnect. Calendars can be imported as visible reference
+data or complete blocking constraints. Task lists are reference-only in this
+slice. Existing server-side writable Calendar policies remain representable so
+the owner can explicitly downgrade them to read-only; this client never sends a
+writable role, blocking Task-list role, or provider-publication policy.
+Collection changes use optimistic revisions; a lost response or conflict is
+reconciled with an authoritative GET before the app permits another conclusion.
+Disconnect persists its exact account, revision, and idempotency key before the
+request and retains them without a time-based expiry until an authoritative
+snapshot proves revocation. A same-API-base DayWeave authentication repair may
+rebind that record after account identity is proved, while destructive or
+cross-base credential replacement stays blocked. Proven revocation keeps the
+record as a completion fence until a fresh canonical pull and composition
+succeeds. A strict endpoint-bound revision conflict can instead prove that an
+obsolete disconnect request made no change, but the record is retired only
+after an authoritative account read. If the account is already absent or
+revoked, that same record remains the crash-safe canonical-composition fence.
+If repaired authentication cannot
+prove an absent account from the previous session, Settings offers an explicit
+warning and confirmation before abandoning only that orphaned local marker.
+
+**Refresh import** durably queues provider reconciliation and polls its status.
+It does not treat HTTP `202` as completed work. The Mac persists a non-secret
+request UUID before transport; replaying that UUID returns the same server
+timestamp and monotonic refresh generation without queuing duplicate work.
+Only an idle run whose completed generation covers the accepted generation
+triggers canonical planner sync and a new composition. This proof is independent
+of Mac/API/worker clock skew. The completion marker survives restart and has no
+time-based expiry; it is removed only after fresh canonical pull/composition
+reports success. If a response is lost, the owner can safely replay the exact
+coalescing read-only request from that recovery slot. Terminal failed runs, and
+authorization-required runs after authorization repair, advance to a new
+persist-before-send request UUID and generation so an older run cannot clear the
+marker. If the worker reports authorization-required before the account record
+does, **Reauthorize** remains available without dropping that marker. Backoff,
+reauthorization, conflicts,
+offline state, and still-queued work remain visible without displaying provider
+IDs, scopes, tokens, or raw error codes. Server cleanup fences block new OAuth
+starts before a local request journal is created. Google outbound publication is deliberately absent from this
+read-only macOS slice; the server's separately approved outbound flow remains a
+future client surface.
 
 The unified Inbox separates **Items** from **Suggestions**. Items are canonical,
 encrypted local drafts: Quick Capture needs only a title, while the detailed

@@ -622,14 +622,17 @@ impl GoogleSyncService {
     pub(crate) async fn request_refresh(
         &self,
         account_id: Uuid,
+        request_id: Uuid,
     ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncServiceError> {
+        if request_id.is_nil() {
+            return Err(GoogleSyncServiceError::InvalidRequest);
+        }
         self.oauth.account_for_sync(account_id).await?;
         let now = self.clock.now();
-        self.repository.request_refresh(account_id, now).await?;
-        Ok(GoogleSyncRefreshAccepted {
-            account_id,
-            requested_at: now,
-        })
+        Ok(self
+            .repository
+            .request_refresh(account_id, request_id, now)
+            .await?)
     }
 
     pub(crate) async fn status(

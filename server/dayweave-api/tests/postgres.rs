@@ -29,7 +29,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     let versions: Vec<_> = MIGRATOR.iter().map(|migration| migration.version).collect();
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 
     let schema = [
@@ -49,6 +49,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0014_google_calendar_projection.sql"),
         include_str!("../migrations/0015_transactional_proposal_applications.sql"),
         include_str!("../migrations/0016_mcp_simulation_evidence.sql"),
+        include_str!("../migrations/0017_google_refresh_generations.sql"),
     ]
     .join("\n");
     for table in [
@@ -87,6 +88,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "google_calendar_projection_rejections",
         "google_outbound_previews",
         "google_provider_identity_roots",
+        "google_sync_refresh_requests",
         "proposal_apply_previews",
         "proposal_apply_preview_members",
         "proposal_applications",
@@ -1692,6 +1694,130 @@ fn google_session(
         created_at: now,
         expires_at: now + ChronoDuration::minutes(10),
     }
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)]
+async fn postgres_expired_disconnect_idempotency_recovers_only_the_same_key() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+    let scope = seed_scope(pool).await;
+    let repository = PostgresGoogleOAuthRepository::new(pool.clone(), scope);
+    let now = Utc::now();
+    let account_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO provider_accounts (id, workspace_id, user_id, provider, \
+         external_account_id, display_label, encrypted_credentials, credential_key_version, \
+         status, sync_enabled, is_default) VALUES ($1, $2, $3, 'google', \
+         'expired-disconnect-user', 'expired-disconnect@example.test', $4, 1, \
+         'active', true, true)",
+    )
+    .bind(account_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(vec![73_u8; 64])
+    .execute(pool)
+    .await
+    .expect("seed disconnect account");
+
+    let original_key = google_idempotency("google.account.disconnect", 71, 81, now);
+    let first_claim_id = Uuid::new_v4();
+    let first = repository
+        .claim_disconnect(
+            account_id,
+            1,
+            first_claim_id,
+            now,
+            now - ChronoDuration::minutes(2),
+            now - ChronoDuration::minutes(2),
+            original_key,
+        )
+        .await
+        .expect("initial disconnect claimed");
+    let DisconnectMutation::Execute(first) = first else {
+        panic!("initial disconnect must execute");
+    };
+    repository
+        .fail_disconnect(account_id, first_claim_id, first.credential_generation, now)
+        .await
+        .expect("failed revocation retains its exact fence");
+
+    let recovery_now = now + ChronoDuration::days(1) + ChronoDuration::seconds(1);
+    let different_key = google_idempotency("google.account.disconnect", 72, 81, recovery_now);
+    assert!(matches!(
+        repository
+            .claim_disconnect(
+                account_id,
+                1,
+                Uuid::new_v4(),
+                recovery_now,
+                recovery_now - ChronoDuration::minutes(2),
+                recovery_now - ChronoDuration::minutes(2),
+                different_key.clone(),
+            )
+            .await,
+        Err(GoogleOAuthRepositoryError::RevocationInProgress)
+    ));
+    let different_key_recorded: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE workspace_id = $1 \
+         AND namespace = $2 AND key_hash = $3)",
+    )
+    .bind(scope.workspace_id)
+    .bind(different_key.namespace)
+    .bind(different_key.key_hash.as_slice())
+    .fetch_one(pool)
+    .await
+    .expect("different-key lookup");
+    assert!(!different_key_recorded);
+
+    let recovered_key = google_idempotency("google.account.disconnect", 71, 81, recovery_now);
+    let retry_claim_id = Uuid::new_v4();
+    let recovered = repository
+        .claim_disconnect(
+            account_id,
+            1,
+            retry_claim_id,
+            recovery_now,
+            recovery_now - ChronoDuration::minutes(2),
+            recovery_now - ChronoDuration::minutes(2),
+            recovered_key.clone(),
+        )
+        .await
+        .expect("same key reconstructs the expired retry record");
+    let DisconnectMutation::Execute(recovered) = recovered else {
+        panic!("recovered disconnect must execute");
+    };
+    let reconstructed: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE workspace_id = $1 \
+         AND namespace = $2 AND key_hash = $3 AND state = 'in_progress' \
+         AND resource_type = 'google_disconnect' AND resource_id = $4)",
+    )
+    .bind(scope.workspace_id)
+    .bind(recovered_key.namespace)
+    .bind(recovered_key.key_hash.as_slice())
+    .bind(account_id)
+    .fetch_one(pool)
+    .await
+    .expect("reconstructed idempotency lookup");
+    assert!(reconstructed);
+
+    let revoked = repository
+        .complete_disconnect(
+            account_id,
+            retry_claim_id,
+            recovered.credential_generation,
+            recovery_now,
+            recovered_key,
+        )
+        .await
+        .expect("recovered disconnect completes");
+    assert_eq!(revoked.account.status, GoogleAccountStatus::Revoked);
+
+    test_database.destroy().await;
 }
 
 #[tokio::test]

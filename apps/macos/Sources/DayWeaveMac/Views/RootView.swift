@@ -164,6 +164,7 @@ private struct SidebarView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var googleIntegration: GoogleIntegrationStore
 
     var body: some View {
         List(selection: $store.destination) {
@@ -191,8 +192,13 @@ private struct SidebarView: View {
                         .foregroundStyle(.secondary)
                 }
                 .help(persistenceHelp)
-                Label("Google Calendar · not connected", systemImage: "circle.dashed")
-                    .foregroundStyle(.secondary)
+                Label {
+                    Text(googleIntegration.sidebarMessage).lineLimit(2)
+                } icon: {
+                    Image(systemName: googleIntegration.sidebarSymbol)
+                }
+                .font(.caption)
+                .foregroundStyle(googleIntegration.status.isFailure ? .red : .secondary)
                 Label {
                     Text(canonicalSync.status.message).lineLimit(2)
                 } icon: {
@@ -3182,6 +3188,7 @@ struct SettingsView: View {
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var googleIntegration: GoogleIntegrationStore
     @EnvironmentObject private var durableAuth: DurableAuthSettingsModel
     @EnvironmentObject private var appLock: AppLockController
     @EnvironmentObject private var appearance: AppearanceController
@@ -3201,7 +3208,7 @@ struct SettingsView: View {
             }
             .disabled(!store.canMutatePlan)
             Section("Accounts") {
-                LabeledContent("Google", value: "Not connected")
+                GoogleIntegrationSettingsView()
                 codexAccountControls
             }
             Section("Appearance") {
@@ -3312,6 +3319,7 @@ struct SettingsView: View {
                             || canonicalSync.isSyncing
                             || !store.canMutatePlan
                             || executionSync.credentialReplacementIsBlocked
+                            || googleAuthenticationUpdateIsBlocked
                     )
                     Text("Directly consumes an already-minted code; it is never sent as a legacy bearer.")
                         .font(.caption)
@@ -3336,7 +3344,8 @@ struct SettingsView: View {
                                 && !dayWeaveBearerToken.isEmpty)
                             || !store.canMutatePlan
                             || (apiCredentialReplacementRequired
-                                && executionSync.credentialReplacementIsBlocked)
+                                && (executionSync.credentialReplacementIsBlocked
+                                    || googleAuthenticationUpdateIsBlocked))
                     )
 
                     if durableAuth.presentation.canForget || suggestionSync.tokenConfigured {
@@ -3352,6 +3361,7 @@ struct SettingsView: View {
                                     || durableAuth.isBusy
                                     || !store.canMutatePlan
                                     || executionSync.credentialReplacementIsBlocked
+                                    || googleCredentialTransitionIsBlocked
                             )
                         }
                         Button("Forget only on this Mac…", role: .destructive) {
@@ -3365,6 +3375,7 @@ struct SettingsView: View {
                                 || durableAuth.isBusy
                                 || !store.canMutatePlan
                                 || executionSync.credentialReplacementIsBlocked
+                                || googleCredentialTransitionIsBlocked
                         )
                     }
                 }
@@ -3401,6 +3412,7 @@ struct SettingsView: View {
                             || canonicalSync.isSyncing
                             || !store.canMutatePlan
                             || executionSync.credentialReplacementIsBlocked
+                            || googleAuthenticationUpdateIsBlocked
                     )
                 }
                 if durableAuth.isBusy {
@@ -3518,6 +3530,55 @@ struct SettingsView: View {
                 != current.canonicalConfigurationIdentifier
     }
 
+    private var googleCredentialTransitionIsBlocked: Bool {
+        googleIntegration.isBusy
+            || googleIntegration.credentialTransitionInProgress
+            || googleIntegration.hasPendingRecovery
+    }
+
+    private var googleAuthenticationUpdateIsBlocked: Bool {
+        guard googleCredentialTransitionIsBlocked else { return false }
+        guard !googleIntegration.isBusy,
+              !googleIntegration.credentialTransitionInProgress,
+              durableAuthenticationNeedsRepair,
+              let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL) else {
+            return true
+        }
+        return !googleIntegration.canRepairAuthentication(boundTo: baseURL)
+    }
+
+    private var durableAuthenticationNeedsRepair: Bool {
+        switch durableAuth.presentation.phase {
+        case .active:
+            false
+        case .notConfigured, .legacy, .enrollmentCreationPending, .enrollmentPending,
+             .refreshPending, .reauthenticationRequired, .incompatible:
+            true
+        }
+    }
+
+    private func allowGoogleCredentialTransition(allowSameAPIBaseRepair: Bool = false) -> Bool {
+        if allowSameAPIBaseRepair,
+           durableAuthenticationNeedsRepair,
+           let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL),
+           googleIntegration.canRepairAuthentication(boundTo: baseURL) {
+            guard googleIntegration.beginCredentialRepairTransition(boundTo: baseURL) else {
+                apiSettingsError = "DayWeave could not reserve Google recovery while repairing authentication."
+                return false
+            }
+            return true
+        }
+        guard !googleCredentialTransitionIsBlocked else {
+            apiSettingsError = "Finish or authoritatively reconcile the pending Google operation before replacing DayWeave authentication."
+            return false
+        }
+        guard googleIntegration.beginCredentialTransition() else {
+            apiSettingsError = "DayWeave could not reserve the Google connection while authentication changes."
+            return false
+        }
+        return true
+    }
+
     private var appLockEnabledBinding: Binding<Bool> {
         Binding(
             get: { appLock.preferences.isEnabled },
@@ -3556,6 +3617,9 @@ struct SettingsView: View {
 
     private func saveAPISettings() {
         apiSettingsError = nil
+        let reservedGoogleTransition = apiCredentialReplacementRequired
+        if reservedGoogleTransition,
+           !allowGoogleCredentialTransition(allowSameAPIBaseRepair: true) { return }
         do {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
@@ -3566,6 +3630,11 @@ struct SettingsView: View {
             let bootstrap = dayWeaveBearerToken
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             Task { @MainActor in
+                defer {
+                    if reservedGoogleTransition {
+                        googleIntegration.endCredentialTransition()
+                    }
+                }
                 if !bootstrap.isEmpty {
                     let saved: Bool
                     if durableAuth.presentation.canReenroll {
@@ -3595,64 +3664,78 @@ struct SettingsView: View {
                 dayWeaveAPIBaseURL = suggestionSync.baseURLString
                 suggestionSync.durableAuthenticationDidChange()
                 guard replacementRequired || !bootstrap.isEmpty else { return }
+                googleIntegration.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {
+            if reservedGoogleTransition {
+                googleIntegration.endCredentialTransition()
+            }
             apiSettingsError = error.localizedDescription
         }
     }
 
     private func revokeAndRemoveAuthentication() {
         apiSettingsError = nil
+        guard allowGoogleCredentialTransition() else { return }
         do {
             try executionSync.prepareForCredentialReplacement()
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             Task { @MainActor in
+                defer { googleIntegration.endCredentialTransition() }
                 guard await durableAuth.revokeAndForget(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
                 }
                 suggestionSync.durableAuthenticationDidChange()
+                googleIntegration.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
             }
         } catch {
+            googleIntegration.endCredentialTransition()
             apiSettingsError = error.localizedDescription
         }
     }
 
     private func forgetAuthenticationLocally() {
         apiSettingsError = nil
+        guard allowGoogleCredentialTransition() else { return }
         do {
             try executionSync.prepareForCredentialReplacement()
             let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             Task { @MainActor in
+                defer { googleIntegration.endCredentialTransition() }
                 guard await durableAuth.forgetLocally(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
                 }
                 suggestionSync.durableAuthenticationDidChange()
+                googleIntegration.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
                 dayWeaveEnrollmentCode = ""
             }
         } catch {
+            googleIntegration.endCredentialTransition()
             apiSettingsError = error.localizedDescription
         }
     }
 
     private func consumeOneTimeEnrollmentCode() {
         apiSettingsError = nil
+        guard allowGoogleCredentialTransition(allowSameAPIBaseRepair: true) else { return }
         do {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
             try executionSync.prepareForCredentialReplacement()
             let code = dayWeaveEnrollmentCode
             Task { @MainActor in
+                defer { googleIntegration.endCredentialTransition() }
                 guard await durableAuth.consumeEnrollmentCode(baseURL: baseURL, code: code) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -3667,22 +3750,26 @@ struct SettingsView: View {
                 }
                 dayWeaveAPIBaseURL = suggestionSync.baseURLString
                 suggestionSync.durableAuthenticationDidChange()
+                googleIntegration.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {
+            googleIntegration.endCredentialTransition()
             apiSettingsError = error.localizedDescription
         }
     }
 
     private func upgradeDurableAuthentication() {
         apiSettingsError = nil
+        guard allowGoogleCredentialTransition(allowSameAPIBaseRepair: true) else { return }
         do {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
             try executionSync.prepareForCredentialReplacement()
             Task { @MainActor in
+                defer { googleIntegration.endCredentialTransition() }
                 guard await durableAuth.enroll(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -3696,11 +3783,13 @@ struct SettingsView: View {
                 }
                 dayWeaveAPIBaseURL = suggestionSync.baseURLString
                 suggestionSync.durableAuthenticationDidChange()
+                googleIntegration.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {
+            googleIntegration.endCredentialTransition()
             apiSettingsError = error.localizedDescription
         }
     }

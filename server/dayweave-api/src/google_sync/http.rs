@@ -96,6 +96,12 @@ pub struct GoogleSyncRefreshResponse {
     pub refresh: GoogleSyncRefreshAccepted,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleSyncRefreshRequest {
+    pub request_id: Uuid,
+}
+
 // Deliberately not `Debug`: the body contains a one-time bearer capability.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -268,6 +274,7 @@ pub(crate) async fn sync_status(
     tag = "google_sync",
     security(("bearer_token" = [])),
     params(("account_id" = Uuid, Path, description = "Connected Google account")),
+    request_body = GoogleSyncRefreshRequest,
     responses(
         (status = 202, description = "Durable manual reconciliation request accepted", body = GoogleSyncRefreshResponse),
         (status = 401, description = "Missing or invalid DayWeave token", body = crate::error::ErrorEnvelope),
@@ -279,9 +286,13 @@ pub(crate) async fn sync_status(
 pub(crate) async fn manual_refresh(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
+    request: Result<Json<GoogleSyncRefreshRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let request = request
+        .map_err(|error| ApiError::from_json_rejection(&error))?
+        .0;
     let refresh = configured_service(&state)?
-        .request_refresh(account_id)
+        .request_refresh(account_id, request.request_id)
         .await
         .map_err(map_service_error)?;
     Ok((

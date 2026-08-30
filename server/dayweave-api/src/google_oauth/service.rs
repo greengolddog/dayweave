@@ -3005,6 +3005,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_disconnect_idempotency_recovers_only_the_same_key() {
+        let (service, repository, transport, clock) = fixture([Some("refresh-one")]);
+        let started = service
+            .begin(begin_input(), idempotency("expired-disconnect-start"))
+            .await
+            .expect("authorization starts");
+        let account = service
+            .callback(
+                &FakeTransport::state_from_url(&started.authorization_url),
+                "code-one",
+            )
+            .await
+            .expect("account connects");
+
+        transport.0.lock().expect("transport lock").fail_next_revoke = true;
+        assert!(
+            service
+                .disconnect(
+                    account.id,
+                    account.revision,
+                    idempotency("expired-disconnect-operation"),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            repository
+                .account()
+                .await
+                .expect("repository")
+                .expect("failed account retained")
+                .account
+                .status,
+            GoogleAccountStatus::RevocationFailed
+        );
+
+        clock.advance(MUTATION_IDEMPOTENCY_TTL + TimeDelta::seconds(1));
+        assert!(matches!(
+            service
+                .disconnect(
+                    account.id,
+                    account.revision,
+                    idempotency("expired-disconnect-different"),
+                )
+                .await,
+            Err(GoogleOAuthServiceError::Repository(
+                GoogleOAuthRepositoryError::RevocationInProgress
+            ))
+        ));
+        assert_eq!(
+            transport.0.lock().expect("transport lock").revoked_tokens,
+            vec!["refresh-one"]
+        );
+
+        let revoked = service
+            .disconnect(
+                account.id,
+                account.revision,
+                idempotency("expired-disconnect-operation"),
+            )
+            .await
+            .expect("same key reconstructs the expired retry record");
+        assert_eq!(revoked.account.status, GoogleAccountStatus::Revoked);
+        assert_eq!(
+            transport.0.lock().expect("transport lock").revoked_tokens,
+            vec!["refresh-one", "refresh-one"]
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_refresh_is_retained_for_eventual_full_revocation() {
         let (service, _, transport, _) = fixture([Some("refresh-one"), Some("refresh-two")]);
         let first = service

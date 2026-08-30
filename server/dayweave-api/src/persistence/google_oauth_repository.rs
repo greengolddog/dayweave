@@ -1764,12 +1764,12 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
             transaction.commit().await.map_err(internal)?;
             return Ok(DisconnectMutation::Replay(account));
         }
-        let retry = match idempotency_state {
+        let idempotency_retry = match &idempotency_state {
             IdempotencyState::Absent => false,
             IdempotencyState::InProgress {
                 resource_type,
                 resource_id: Some(id),
-            } if resource_type.as_deref() == Some(DISCONNECT_RESOURCE) && id == account_id => true,
+            } if resource_type.as_deref() == Some(DISCONNECT_RESOURCE) && *id == account_id => true,
             IdempotencyState::InProgress { .. } | IdempotencyState::Completed { .. } => {
                 return Err(GoogleOAuthRepositoryError::IdempotencyConflict);
             }
@@ -1790,13 +1790,6 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         let existing_owner: Option<Uuid> = scope_state
             .try_get("revocation_owner_id")
             .map_err(internal)?;
-        if existing_kind.is_some()
-            && (!retry
-                || existing_kind.as_deref() != Some("disconnect")
-                || existing_owner != Some(account_id))
-        {
-            return Err(GoogleOAuthRepositoryError::RevocationInProgress);
-        }
         let credential_generation = generation_from_i64(
             scope_state
                 .try_get("credential_generation")
@@ -1823,6 +1816,19 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
             .transpose()?;
         let claimed_at: Option<DateTime<Utc>> =
             row.try_get("disconnect_claimed_at").map_err(internal)?;
+        let matching_disconnect_fence =
+            existing_kind.as_deref() == Some("disconnect") && existing_owner == Some(account_id);
+        // The durable disconnect operation hash and scope fence intentionally
+        // outlive the ordinary idempotency row after provider revocation fails.
+        // Recreate only that exact key/account operation; a different absent key
+        // remains blocked by the fence below.
+        let recovered_expired_retry = matches!(idempotency_state, IdempotencyState::Absent)
+            && matching_disconnect_fence
+            && current_operation == Some(idempotency.key_hash);
+        let retry = idempotency_retry || recovered_expired_retry;
+        if existing_kind.is_some() && (!retry || !matching_disconnect_fence) {
+            return Err(GoogleOAuthRepositoryError::RevocationInProgress);
+        }
         if retry {
             if current_operation != Some(idempotency.key_hash) {
                 return Err(GoogleOAuthRepositoryError::IdempotencyConflict);
@@ -1911,7 +1917,7 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         .execute(&mut *transaction)
         .await
         .map_err(internal)?;
-        if !retry {
+        if !idempotency_retry {
             insert_idempotency(
                 &mut transaction,
                 self.scope,

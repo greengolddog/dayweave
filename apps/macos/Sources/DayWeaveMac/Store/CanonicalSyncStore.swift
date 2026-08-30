@@ -51,6 +51,8 @@ final class CanonicalSyncStore: ObservableObject {
     private var configurationGeneration: UInt64 = 0
     private var activeSyncID: UUID?
     private var activeSyncTask: Task<Void, Never>?
+    private var lastSuccessfulSyncID: UUID?
+    private var lastFreshCompositionSyncID: UUID?
 
     init(
         planner: PlannerStore,
@@ -113,7 +115,11 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     func sync() async {
-        guard await waitForCanonicalMutationFence() else { return }
+        _ = await syncReportingSuccess()
+    }
+
+    private func syncReportingSuccess() async -> Bool {
+        guard await waitForCanonicalMutationFence() else { return false }
         // Invalidate before reading configuration or Keychain state. An
         // out-of-process change must not leave an old preview actionable just
         // because client construction fails.
@@ -122,7 +128,7 @@ final class CanonicalSyncStore: ObservableObject {
         warnings = []
         guard let client = makeClient(reportFailure: true) else {
             planner.endCanonicalSync()
-            return
+            return false
         }
         if let pending = planner.pendingSchedulePublication,
            pending.configurationIdentifier != client.configurationIdentifier {
@@ -130,7 +136,7 @@ final class CanonicalSyncStore: ObservableObject {
             status = .failed(
                 "The exact schedule publication belongs to another API URL or credential session. Restore that original configuration and authentication, then sync to recover it; it was not discarded."
             )
-            return
+            return false
         }
         do {
             try planner.prepareCanonicalSync(
@@ -139,7 +145,7 @@ final class CanonicalSyncStore: ObservableObject {
         } catch {
             planner.endCanonicalSync()
             status = .failed(error.localizedDescription)
-            return
+            return false
         }
 
         let operationID = UUID()
@@ -157,6 +163,20 @@ final class CanonicalSyncStore: ObservableObject {
         }
         activeSyncTask = task
         await task.value
+        return lastSuccessfulSyncID == operationID
+    }
+
+    /// Import completion must survive an unrelated pending publication
+    /// recovery. A recovered old receipt is successful work, but it does not
+    /// prove that newly imported canonical items were pulled and recomposed.
+    @discardableResult
+    func syncThroughFreshComposition() async -> Bool {
+        for _ in 0..<2 {
+            guard await syncReportingSuccess(),
+                  let successfulID = lastSuccessfulSyncID else { return false }
+            if lastFreshCompositionSyncID == successfulID { return true }
+        }
+        return false
     }
 
     /// A proposal completion must not lose its required pull/recomposition just
@@ -225,6 +245,7 @@ final class CanonicalSyncStore: ObservableObject {
                 switch recovery {
                 case let .installed(revisionNumber, blockCount):
                     lastPreview = pending.preview
+                    lastSuccessfulSyncID = operationID
                     status = .online(
                         updatedAt: now(),
                         message: "Recovered published revision \(revisionNumber); composed \(blockCount) blocks"
@@ -298,6 +319,8 @@ final class CanonicalSyncStore: ObservableObject {
                 retryBudget: freshPublicationRetryBudget
             )
             lastPreview = installed.preview
+            lastSuccessfulSyncID = operationID
+            lastFreshCompositionSyncID = operationID
             status = .online(
                 updatedAt: now(),
                 message: "Synced \(planner.canonicalItems.count) items"
