@@ -524,16 +524,17 @@ assert_owned_safe_directory "$account_home" 'the current account home'
 
 readonly canonical_cargo_root="${account_home}/.cargo"
 readonly canonical_registry_cache="${canonical_cargo_root}/registry/cache"
-readonly rustup_home="${account_home}/.rustup"
-readonly rustup_command="${canonical_cargo_root}/bin/rustup"
-readonly pinned_toolchain_root="${rustup_home}/toolchains/1.95.0-aarch64-apple-darwin"
+readonly canonical_rustup_root="${account_home}/.rustup"
+readonly pinned_toolchain_root="${canonical_rustup_root}/toolchains/1.95.0-aarch64-apple-darwin"
 readonly expected_rustc_command="${pinned_toolchain_root}/bin/rustc"
 readonly expected_cargo_command="${pinned_toolchain_root}/bin/cargo"
+readonly expected_target_libdir="${pinned_toolchain_root}/lib/rustlib/${target_triple}/lib"
 assert_owned_safe_directory "$canonical_cargo_root" 'the canonical Cargo directory'
 assert_owned_safe_directory \
-  "${canonical_cargo_root}/bin" 'the canonical Cargo binary directory'
-assert_owned_safe_directory "$rustup_home" 'the canonical Rustup directory'
-assert_regular_single_link_file "$rustup_command" 'the canonical rustup executable' yes yes
+  "$canonical_rustup_root" 'the canonical Rustup directory'
+assert_owned_safe_directory "$pinned_toolchain_root" 'the pinned Rust toolchain'
+assert_owned_safe_directory \
+  "${pinned_toolchain_root}/bin" 'the pinned Rust toolchain binary directory'
 for root_cargo_control_file in /.cargo/config /.cargo/config.toml; do
   if test -e "$root_cargo_control_file" || test -L "$root_cargo_control_file"; then
     fail 'Cargo configuration at the filesystem root is not permitted'
@@ -548,46 +549,47 @@ rust_environment=(
   "CARGO_HOME=${private_cargo_home}"
   "HOME=${private_home_directory}"
   'PATH=/usr/bin:/bin:/usr/sbin:/sbin'
-  "RUSTUP_HOME=${rustup_home}"
-  'RUSTUP_TOOLCHAIN=1.95.0'
   "TMPDIR=${private_temporary_directory}"
 )
 readonly rust_environment
 
-rustc_command="$(
-  cd /
-  "${rust_environment[@]}" "$rustup_command" which rustc
-)" || fail 'the pinned rustc executable could not be located'
-cargo_command="$(
-  cd /
-  "${rust_environment[@]}" "$rustup_command" which cargo
-)" || fail 'the pinned cargo executable could not be located'
+rustc_command="$expected_rustc_command"
+cargo_command="$expected_cargo_command"
 readonly rustc_command cargo_command
-test "$rustc_command" = "$expected_rustc_command" \
-  || fail 'rustup resolved rustc outside the pinned standard toolchain'
-test "$cargo_command" = "$expected_cargo_command" \
-  || fail 'rustup resolved cargo outside the pinned standard toolchain'
 assert_regular_single_link_file \
   "$rustc_command" 'the pinned rustc executable' yes yes
 assert_regular_single_link_file \
   "$cargo_command" 'the pinned cargo executable' yes yes
 
-rustc_version="$("${rust_environment[@]}" "$rustc_command" --version)" \
+rustc_version="$(
+  cd /
+  "${rust_environment[@]}" "$rustc_command" --version
+)" \
   || fail 'rustc version could not be determined'
 readonly rustc_version
 case "$rustc_version" in
   'rustc 1.95.0 '*) ;;
   *) fail 'rustc must match the repository pin at 1.95.0' ;;
 esac
-installed_targets="$(
+cargo_version="$(
   cd /
-  "${rust_environment[@]}" "$rustup_command" target list --installed
-)" || fail 'installed Rust targets could not be determined'
-readonly installed_targets
-case $'\n'"$installed_targets"$'\n' in
-  *$'\n'"$target_triple"$'\n'*) ;;
-  *) fail "the ${target_triple} Rust target is not installed" ;;
+  "${rust_environment[@]}" "$cargo_command" --version
+)" || fail 'Cargo version could not be determined'
+readonly cargo_version
+case "$cargo_version" in
+  'cargo 1.95.0 '*) ;;
+  *) fail 'Cargo must match the repository pin at 1.95.0' ;;
 esac
+target_libdir="$(
+  cd /
+  "${rust_environment[@]}" \
+    "$rustc_command" --print target-libdir --target "$target_triple"
+)" || fail 'the pinned target library directory could not be located'
+readonly target_libdir
+test "$target_libdir" = "$expected_target_libdir" \
+  || fail 'rustc resolved target libraries outside the pinned standard toolchain'
+assert_owned_safe_directory \
+  "$target_libdir" 'the pinned Rust target library directory'
 
 (
   cd /
