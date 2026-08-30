@@ -283,7 +283,7 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **OPS-003** The VM shall run isolated containers/services for API/MCP, worker, PostgreSQL, and HTTPS ingress/tunnel.
 - **OPS-004** PostgreSQL shall not be publicly reachable. Administrative access shall use the private deployment path/tunnel.
 - **OPS-005** Health checks, structured content-free logs, metrics, and correlation IDs shall cover every service.
-- **OPS-006** Infrastructure configuration and deployment shall be reproducible from the private repository, with secrets supplied by CI/project secret stores.
+- **OPS-006** Infrastructure configuration and deployment shall be reproducible from the public repository, with secrets supplied only by CI/project secret stores and never committed.
 - **OPS-007** CI/CD shall support development, beta, and stable channels with migration checks, rollback information, artifact hashes, and provenance.
 - **OPS-008** macOS shall provide a private update feed; Android shall provide signed APK download and update metadata. Stable signing keys shall be held outside Git.
 - **OPS-009** Bundle/package identifiers shall derive from `com.greengolddog.dayweave`.
