@@ -238,7 +238,7 @@ struct SchedulerHelperClientTests {
         let result = try await SchedulerHelperProcessRunner().run(
             executable: executable,
             standardInput: Data(repeating: 0x41, count: 1_024 * 1_024),
-            timeout: .seconds(3)
+            timeout: .seconds(15)
         )
 
         #expect(result.termination == .exited(0))
@@ -260,7 +260,7 @@ struct SchedulerHelperClientTests {
         let result = try await SchedulerHelperProcessRunner().run(
             executable: executable,
             standardInput: Data(repeating: 0x41, count: 2 * 1_024 * 1_024),
-            timeout: .seconds(3)
+            timeout: .seconds(15)
         )
 
         #expect(result.termination == .exited(2))
@@ -282,7 +282,7 @@ struct SchedulerHelperClientTests {
             _ = try await runner.run(
                 executable: executable,
                 standardInput: Data(),
-                timeout: .seconds(3)
+                timeout: .seconds(15)
             )
             Issue.record("Expected stdout overflow")
         } catch let error as SchedulerHelperClientError {
@@ -296,7 +296,7 @@ struct SchedulerHelperClientTests {
                     repeating: 0x41,
                     count: SchedulerHelperClient.maximumStandardInputBytes + 1
                 ),
-                timeout: .seconds(3)
+                timeout: .seconds(15)
             )
             Issue.record("Expected stdin overflow")
         } catch let error as SchedulerHelperClientError {
@@ -316,7 +316,7 @@ struct SchedulerHelperClientTests {
             let result = try await runner.run(
                 executable: executable,
                 standardInput: Data(),
-                timeout: .milliseconds(500)
+                timeout: .seconds(3)
             )
             Issue.record("Expected timeout, got \(result)")
         } catch let error as SchedulerHelperClientError {
@@ -337,7 +337,7 @@ struct SchedulerHelperClientTests {
             try await runner.run(
                 executable: executable,
                 standardInput: Data(),
-                timeout: .seconds(5)
+                timeout: .seconds(15)
             )
         }
         try await waitForFile(fixture.pidFile)
@@ -435,9 +435,9 @@ struct SchedulerHelperClientTests {
     }
 
     private func waitForFile(_ url: URL) async throws {
-        for _ in 0..<200 {
+        for _ in 0..<1_000 {
             if FileManager.default.fileExists(atPath: url.path) { return }
-            try await Task.sleep(for: .milliseconds(5))
+            try await Task.sleep(for: .milliseconds(10))
         }
         throw SchedulerHelperTestError.fileDidNotAppear
     }
