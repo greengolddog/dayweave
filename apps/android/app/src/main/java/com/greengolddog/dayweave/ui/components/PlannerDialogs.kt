@@ -32,6 +32,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -48,19 +49,25 @@ import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonPrimitive
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun QuickCaptureSheet(
     onDismiss: () -> Unit,
-    onCapture: (String, ItemKind, Boolean) -> Boolean,
+    onCapture: suspend (String, ItemKind, Boolean) -> Boolean,
+    onContinueWithDetails: (String, ItemKind, Boolean) -> Unit,
 ) {
     var title by remember { mutableStateOf("") }
     var kind by remember { mutableStateOf(ItemKind.TASK) }
     var isSensitive by remember { mutableStateOf(false) }
+    var isSaving by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    val requiresDetails = kind == ItemKind.HABIT || kind == ItemKind.EVENT
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    ModalBottomSheet(onDismissRequest = { if (!isSaving) onDismiss() }) {
         Column(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -90,6 +97,9 @@ fun QuickCaptureSheet(
                     FilterChip(
                         selected = option == kind,
                         onClick = { kind = option },
+                        modifier = Modifier.testTag(
+                            "quick_capture_kind_${option.name.lowercase()}",
+                        ),
                         label = { Text(option.label) },
                     )
                 }
@@ -112,12 +122,53 @@ fun QuickCaptureSheet(
                     modifier = Modifier.testTag("quick_capture_sensitive_toggle"),
                 )
             }
+            if (requiresDetails) {
+                Text(
+                    if (kind == ItemKind.HABIT) {
+                        "Habits need an explicit recurrence before they can be queued."
+                    } else {
+                        "Events need exact start and end instants; DayWeave will not invent them."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            saveError?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.testTag("quick_capture_diagnostic"),
+                )
+            }
             Button(
-                onClick = { if (onCapture(title, kind, isSensitive)) onDismiss() },
-                enabled = title.isNotBlank(),
+                onClick = {
+                    if (requiresDetails) {
+                        onContinueWithDetails(title, kind, isSensitive)
+                        onDismiss()
+                    } else {
+                        isSaving = true
+                        saveError = null
+                        coroutineScope.launch {
+                            if (onCapture(title, kind, isSensitive)) {
+                                onDismiss()
+                            } else {
+                                saveError = "The capture could not be saved to the encrypted journal."
+                            }
+                            isSaving = false
+                        }
+                    }
+                },
+                enabled = title.isNotBlank() && !isSaving,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text("Add to Inbox")
+                Text(
+                    when {
+                        isSaving -> "Saving…"
+                        requiresDetails -> "Continue to details"
+                        else -> "Add to Inbox"
+                    },
+                )
             }
         }
     }

@@ -1,7 +1,10 @@
 package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
+import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
+import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
@@ -12,6 +15,8 @@ import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.CanonicalPlannerTransport
+import com.greengolddog.dayweave.network.CanonicalItemRevisionRequest
+import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.PlannerApiException
 import com.greengolddog.dayweave.network.RemoteCanonicalItem
@@ -2318,6 +2323,386 @@ class CanonicalSyncManagerTest {
         assertEquals("cursor-1", plannerStore.state.value.canonicalDeltaCursor)
     }
 
+    @Test
+    fun queuedCreateIsDurablySubmittedBeforeSendAndReconcilesExactResponse() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val mutationId = "99999999-9999-4999-8999-999999999999"
+        val queued = requireNotNull(
+            plannerStore.enqueueCanonicalCreate(authoredDraft(), TASK_ID, mutationId),
+        )
+        assertTrue(queued.persistence.awaitDurable())
+        val created = authoredRemote(TASK_ID, revision = 1)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "authoring-empty", false)
+            pages["authoring-empty"] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = created)),
+                "authoring-created",
+                false,
+            )
+            queuedPreviews += itemsPreview(emptyList())
+            queuedPreviews += itemsPreview(listOf(created))
+            createHandler = { idempotencyKey, request ->
+                val durable = requireNotNull(plannerStore.canonicalAuthoringMutation(mutationId))
+                assertTrue(durable.isSubmitted)
+                assertEquals("https://api.example.test/", durable.syncOrigin)
+                assertEquals("connection-1", durable.configurationId)
+                assertEquals(durable.idempotencyKey, idempotencyKey)
+                assertEquals(TASK_ID, request.id)
+                created
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+
+        assertTrue(plannerStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(created.id, plannerStore.state.value.canonicalItems.single().id)
+        assertEquals(1, transport.createRequests.size)
+        assertEquals("planned", transport.createRequests.single().second.status)
+        assertNotNull(plannerStore.state.value.publishedScheduleRevision)
+    }
+
+    @Test
+    fun authoringSubmissionPersistenceFailurePreventsEveryNetworkSend() = runBlocking {
+        val mutationId = "99999999-9999-4999-8999-999999999998"
+        val seed = PlannerStore(DayWeaveUiState())
+        requireNotNull(seed.enqueueCanonicalCreate(authoredDraft(), TASK_ID, mutationId))
+        var durable = seed.state.value
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = durable
+
+            override suspend fun save(state: DayWeaveUiState) {
+                if (state.pendingCanonicalAuthoringMutations.any { it.isSubmitted }) {
+                    throw IOException("synthetic authoring submission persistence failure")
+                }
+                durable = state
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val plannerStore = PlannerStore(DayWeaveUiState(), repository, scope)
+            withTimeout(3_000) { plannerStore.loadState.first { it == PlannerLoadState.READY } }
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(emptyList(), "authoring-empty", false)
+                previewResult = itemsPreview(emptyList())
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE,
+                manager(plannerStore, transport).refreshAndCompose(),
+            )
+
+            assertTrue(transport.createRequests.isEmpty())
+            assertTrue(transport.authoringOperationIds.isEmpty())
+            val durableMutation = durable.pendingCanonicalAuthoringMutations.single()
+            assertFalse(durableMutation.isSubmitted)
+            assertEquals("https://api.example.test/", durableMutation.syncOrigin)
+            assertEquals(PlannerLoadState.PERSISTENCE_FAILED, plannerStore.loadState.value)
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun parentCreateIsSentBeforeLexicallyEarlierChildMutation() = runBlocking {
+        val parentId = "88888888-8888-4888-8888-888888888888"
+        val childId = "99999999-9999-4999-8999-999999999999"
+        val parentMutationId = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        val childMutationId = "00000000-0000-4000-8000-000000000001"
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        requireNotNull(
+            plannerStore.enqueueCanonicalCreate(
+                authoredDraft(title = "Parent"),
+                parentId,
+                parentMutationId,
+            ),
+        )
+        requireNotNull(
+            plannerStore.enqueueCanonicalCreate(
+                authoredDraft(title = "Child").copy(parentId = parentId),
+                childId,
+                childMutationId,
+            ),
+        )
+        val parentCreated = authoredRemote(parentId, revision = 1, title = "Parent")
+        val childCreated = authoredRemote(
+            childId,
+            revision = 1,
+            title = "Child",
+            parentId = parentId,
+        )
+        val parentRefreshed = parentCreated.copy(
+            revision = 2,
+            isExecutable = false,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "authoring-empty", false)
+            pages["authoring-empty"] = RemoteItemDeltaPage(
+                listOf(
+                    RemoteItemDeltaChange(type = "upsert", item = parentRefreshed),
+                    RemoteItemDeltaChange(type = "upsert", item = childCreated),
+                ),
+                "authoring-tree",
+                false,
+            )
+            queuedPreviews += itemsPreview(emptyList())
+            queuedPreviews += itemsPreview(listOf(parentRefreshed, childCreated))
+            createHandler = { _, request ->
+                when (request.id) {
+                    parentId -> parentCreated
+                    childId -> childCreated
+                    else -> error("unexpected create")
+                }
+            }
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+
+        assertEquals(listOf(parentId, childId), transport.authoringOperationIds)
+        assertTrue(plannerStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(2L, plannerStore.state.value.canonicalItems.first { it.id == parentId }.revision)
+    }
+
+    @Test
+    fun childTrashRefreshesAndRebasesQueuedParentTrashBeforeItsFirstSend() = runBlocking {
+        val parentId = "88888888-8888-4888-8888-888888888888"
+        val childId = "99999999-9999-4999-8999-999999999999"
+        val parent = authoredRemote(
+            id = parentId,
+            revision = 1,
+            title = "Parent",
+            isExecutable = false,
+        )
+        val child = authoredRemote(
+            id = childId,
+            revision = 1,
+            title = "Child",
+            parentId = parentId,
+        )
+        val parentRefreshed = parent.copy(
+            revision = 2,
+            isExecutable = true,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        val childDeleted = child.copy(
+            revision = 2,
+            isExecutable = false,
+            updatedAt = "2026-09-01T07:01:00Z",
+            deletedAt = "2026-09-01T07:01:00Z",
+        )
+        val parentDeleted = parentRefreshed.copy(
+            revision = 3,
+            isExecutable = false,
+            updatedAt = "2026-09-01T07:02:00Z",
+            deletedAt = "2026-09-01T07:02:00Z",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            queuedPages[null] = ArrayDeque(
+                listOf(
+                    RemoteItemDeltaPage(
+                        listOf(
+                            RemoteItemDeltaChange(type = "upsert", item = parent),
+                            RemoteItemDeltaChange(type = "upsert", item = child),
+                        ),
+                        "hierarchy-cursor-1",
+                        false,
+                    ),
+                    RemoteItemDeltaPage(
+                        listOf(RemoteItemDeltaChange(type = "upsert", item = parentRefreshed)),
+                        "hierarchy-cursor-3",
+                        false,
+                    ),
+                ),
+            )
+            pages["hierarchy-cursor-1"] = RemoteItemDeltaPage(
+                emptyList(),
+                "hierarchy-cursor-2",
+                false,
+            )
+            pages["hierarchy-cursor-3"] = RemoteItemDeltaPage(
+                listOf(
+                    RemoteItemDeltaChange(
+                        type = "tombstone",
+                        tombstone = RemoteItemTombstone(
+                            id = parentId,
+                            revision = 3,
+                            deletedAt = "2026-09-01T07:02:00Z",
+                        ),
+                    ),
+                ),
+                "hierarchy-cursor-4",
+                false,
+            )
+            queuedPreviews += itemsPreview(listOf(parent, child))
+            queuedPreviews += itemsPreview(listOf(parent, child))
+            queuedPreviews += itemsPreview(listOf(parentRefreshed))
+            queuedPreviews += itemsPreview(emptyList())
+            trashHandler = { request ->
+                when (request.id) {
+                    childId -> {
+                        assertEquals(1L, request.expectedRevision)
+                        childDeleted
+                    }
+                    parentId -> {
+                        assertEquals(2L, request.expectedRevision)
+                        parentDeleted
+                    }
+                    else -> error("unexpected trash request")
+                }
+            }
+        }
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        requireNotNull(
+            plannerStore.enqueueCanonicalTrash(
+                childId,
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            ),
+        ).persistence.awaitDurable()
+        requireNotNull(
+            plannerStore.enqueueCanonicalTrash(
+                parentId,
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ),
+        ).persistence.awaitDurable()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertEquals(listOf(childId, parentId), transport.authoringOperationIds)
+        assertEquals(listOf(1L, 2L), transport.trashRequests.map { it.expectedRevision })
+        assertTrue(plannerStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+    }
+
+    @Test
+    fun trustedServerRejectionBecomesDurableVisibleConflictAndRebuildsCanonicalCache() =
+        runBlocking {
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = preview()
+            }
+            val manager = manager(plannerStore, transport)
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+            val mutationId = "99999999-9999-4999-8999-999999999997"
+            requireNotNull(
+                plannerStore.enqueueCanonicalReplace(
+                    TASK_ID,
+                    authoredDraft(title = "Retained local edit"),
+                    mutationId,
+                ),
+            )
+            transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+            transport.replacementError = PlannerApiException.CanonicalMutationRejected()
+            transport.queuedPreviews += preview()
+            transport.queuedPreviews += preview()
+
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+            val conflict = requireNotNull(plannerStore.canonicalAuthoringMutation(mutationId))
+            assertTrue(conflict.isSubmitted)
+            assertEquals(CanonicalAuthoringDisposition.CONFLICTED, conflict.disposition)
+            assertTrue(requireNotNull(conflict.diagnostic).contains("Review"))
+            assertEquals(7L, plannerStore.state.value.canonicalItems.single().revision)
+            assertEquals("cursor-1", plannerStore.state.value.canonicalDeltaCursor)
+            assertNotNull(plannerStore.state.value.publishedScheduleRevision)
+        }
+
+    @Test
+    fun queuedTrashAndRestoreReconcileDeletedAndActiveResponses() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        val trashMutationId = "99999999-9999-4999-8999-999999999996"
+        requireNotNull(
+            plannerStore.enqueueCanonicalTrash(TASK_ID, trashMutationId),
+        ).persistence.awaitDurable()
+        val deleted = remoteItem().copy(
+            revision = 8,
+            updatedAt = "2026-09-01T07:05:00Z",
+            deletedAt = "2026-09-01T07:05:00Z",
+        )
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+        transport.pages["cursor-2"] = RemoteItemDeltaPage(
+            listOf(
+                RemoteItemDeltaChange(
+                    type = "tombstone",
+                    tombstone = RemoteItemTombstone(
+                        id = TASK_ID,
+                        revision = 8,
+                        deletedAt = "2026-09-01T07:05:00Z",
+                    ),
+                ),
+            ),
+            "cursor-3",
+            false,
+        )
+        transport.queuedPreviews += preview()
+        transport.queuedPreviews += itemsPreview(emptyList())
+        transport.trashHandler = { request ->
+            val durable = requireNotNull(plannerStore.canonicalAuthoringMutation(trashMutationId))
+            assertTrue(durable.isSubmitted)
+            assertEquals(durable.idempotencyKey, request.idempotencyKey)
+            assertEquals(7L, request.expectedRevision)
+            deleted
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertEquals(8L, plannerStore.state.value.canonicalRecentlyDeleted.single().revision)
+        assertEquals(1, transport.trashRequests.size)
+
+        val restoreMutationId = "99999999-9999-4999-8999-999999999995"
+        requireNotNull(
+            plannerStore.enqueueCanonicalRestore(TASK_ID, restoreMutationId),
+        ).persistence.awaitDurable()
+        val restored = remoteItem().copy(
+            revision = 9,
+            updatedAt = "2026-09-01T07:06:00Z",
+        )
+        transport.pages["cursor-3"] = RemoteItemDeltaPage(emptyList(), "cursor-4", false)
+        transport.pages["cursor-4"] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = restored)),
+            "cursor-5",
+            false,
+        )
+        transport.queuedPreviews += itemsPreview(emptyList())
+        transport.queuedPreviews += scheduledPreview(restored)
+        transport.restoreHandler = { request ->
+            val durable = requireNotNull(plannerStore.canonicalAuthoringMutation(restoreMutationId))
+            assertTrue(durable.isSubmitted)
+            assertEquals(durable.idempotencyKey, request.idempotencyKey)
+            assertEquals(8L, request.request.expectedRevision)
+            restored
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        assertEquals(9L, plannerStore.state.value.canonicalItems.single().revision)
+        assertTrue(plannerStore.state.value.canonicalRecentlyDeleted.isEmpty())
+        assertTrue(plannerStore.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+        assertEquals(1, transport.restoreRequests.size)
+    }
+
     private fun manager(
         plannerStore: PlannerStore,
         transport: FakeCanonicalTransport,
@@ -2474,6 +2859,54 @@ class CanonicalSyncManagerTest {
         createdAt = "2026-08-29T09:00:00Z",
         updatedAt = "2026-08-29T10:00:00Z",
     )
+
+    private fun authoredDraft(
+        title: String = "Compose Android timeline",
+    ) = CanonicalItemDraft(
+        placement = CanonicalDraftPlacement.PLANNED,
+        title = title,
+        notes = null,
+        timezoneName = "Europe/Madrid",
+        durationSeconds = 3_600,
+        deadlineAt = "2026-09-01T12:00:00Z",
+        importance = 80,
+        urgency = 60,
+    )
+
+    private fun authoredRemote(
+        id: String,
+        revision: Long,
+        title: String = "Compose Android timeline",
+        parentId: String? = null,
+        isExecutable: Boolean = true,
+    ) = RemoteCanonicalItem(
+        id = id,
+        isSensitive = false,
+        kind = "task",
+        status = "planned",
+        title = title,
+        notes = null,
+        timezoneName = "Europe/Madrid",
+        durationSeconds = 3_600,
+        deadlineAt = "2026-09-01T12:00:00Z",
+        flexibleConstraints = buildJsonObject { },
+        splitPolicy = buildJsonObject { put("type", "indivisible") },
+        importance = 80,
+        urgency = 60,
+        parentId = parentId,
+        siblingOrder = 0,
+        isExecutable = isExecutable,
+        revision = revision,
+        createdAt = "2026-09-01T07:00:00Z",
+        updatedAt = "2026-09-01T07:00:00Z",
+    )
+
+    private fun itemsPreview(items: List<RemoteCanonicalItem>): RemoteSchedulePreview =
+        emptyPreview().copy(
+            sourceItemCount = items.size,
+            sourceItemRevisions = items.associate { it.id to it.revision },
+            acceptedItemCount = items.size,
+        )
 
     private fun preview(isSensitive: Boolean = false) = RemoteSchedulePreview(
         inputDigest = "sha256:${"a".repeat(64)}",
@@ -2635,6 +3068,32 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         idempotencyKey: String,
         request: ReplaceCanonicalItemRequest,
     ) -> RemoteCanonicalItem)? = null
+    val authoringOperationIds = mutableListOf<String>()
+    val createRequests = mutableListOf<Pair<String, CreateCanonicalItemRequest>>()
+    var createResult: RemoteCanonicalItem? = null
+    var createError: Throwable? = null
+    var createHandler: (suspend (
+        idempotencyKey: String,
+        request: CreateCanonicalItemRequest,
+    ) -> RemoteCanonicalItem)? = null
+    data class TrashRequest(
+        val id: String,
+        val idempotencyKey: String,
+        val expectedRevision: Long,
+    )
+    val trashRequests = mutableListOf<TrashRequest>()
+    var trashResult: RemoteCanonicalItem? = null
+    var trashError: Throwable? = null
+    var trashHandler: (suspend (TrashRequest) -> RemoteCanonicalItem)? = null
+    data class RestoreRequest(
+        val id: String,
+        val idempotencyKey: String,
+        val request: CanonicalItemRevisionRequest,
+    )
+    val restoreRequests = mutableListOf<RestoreRequest>()
+    var restoreResult: RemoteCanonicalItem? = null
+    var restoreError: Throwable? = null
+    var restoreHandler: (suspend (RestoreRequest) -> RemoteCanonicalItem)? = null
 
     override suspend fun itemDelta(
         configuration: AuthenticatedApiConfiguration,
@@ -2685,12 +3144,25 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         )
     }
 
+    override suspend fun createItem(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        request: CreateCanonicalItemRequest,
+    ): RemoteCanonicalItem {
+        authoringOperationIds += request.id
+        createRequests += idempotencyKey to request
+        createHandler?.let { return it(idempotencyKey, request) }
+        createError?.let { throw it }
+        return requireNotNull(createResult)
+    }
+
     override suspend fun replaceItem(
         configuration: AuthenticatedApiConfiguration,
         id: String,
         idempotencyKey: String,
         request: ReplaceCanonicalItemRequest,
     ): RemoteCanonicalItem {
+        authoringOperationIds += id
         replacementId = id
         replacementIdempotencyKey = idempotencyKey
         replacementIdempotencyKeys += idempotencyKey
@@ -2699,6 +3171,34 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         replacementHandler?.let { return it(id, idempotencyKey, request) }
         replacementError?.let { throw it }
         return requireNotNull(replacementResult)
+    }
+
+    override suspend fun trashItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        expectedRevision: Long,
+    ): RemoteCanonicalItem {
+        authoringOperationIds += id
+        val request = TrashRequest(id, idempotencyKey, expectedRevision)
+        trashRequests += request
+        trashHandler?.let { return it(request) }
+        trashError?.let { throw it }
+        return requireNotNull(trashResult)
+    }
+
+    override suspend fun restoreItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        request: CanonicalItemRevisionRequest,
+    ): RemoteCanonicalItem {
+        authoringOperationIds += id
+        val recorded = RestoreRequest(id, idempotencyKey, request)
+        restoreRequests += recorded
+        restoreHandler?.let { return it(recorded) }
+        restoreError?.let { throw it }
+        return requireNotNull(restoreResult)
     }
 
     private companion object {

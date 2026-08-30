@@ -4,6 +4,7 @@ import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
@@ -15,6 +16,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
+import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.canonicalTrashItemBytes
@@ -78,6 +80,172 @@ class CanonicalAuthoringStoreTest {
         } finally {
             scope.cancel()
         }
+    }
+
+    @Test
+    fun unsentDraftCanBeEditedWithoutChangingItsRequestIdentity() {
+        val store = PlannerStore(boundState(), nowEpochMillis = { NOW_MILLIS })
+        val queued = requireNotNull(
+            store.enqueueCanonicalCreate(taskDraft(), ITEM_ID, MUTATION_ID),
+        ).mutation
+        val bound = requireNotNull(
+            store.bindCanonicalAuthoringMutation(MUTATION_ID, ORIGIN, CONFIGURATION_ID),
+        ).mutation
+        assertEquals(queued.idempotencyKey, bound.idempotencyKey)
+
+        val updated = requireNotNull(
+            store.updateCanonicalAuthoringDraft(
+                MUTATION_ID,
+                taskDraft().copy(title = "Edited before the first send"),
+            ),
+        ).mutation
+
+        assertEquals(queued.id, updated.id)
+        assertEquals(queued.itemId, updated.itemId)
+        assertEquals(queued.idempotencyKey, updated.idempotencyKey)
+        assertEquals(queued.createdAt, updated.createdAt)
+        assertEquals("Edited before the first send", updated.draft?.title)
+        assertNull(updated.syncOrigin)
+        assertNull(updated.configurationId)
+        assertFalse(updated.isSubmitted)
+        assertEquals(updated, store.state.value.pendingCanonicalAuthoringMutations.single())
+    }
+
+    @Test
+    fun conflictedDraftCopiesToDetachedSensitiveInboxWithoutDestroyingOriginal() {
+        val parent = canonicalItem(PARENT_ID).copy(isSensitive = true)
+        val store = PlannerStore(boundState(parent), nowEpochMillis = { NOW_MILLIS })
+        val queued = requireNotNull(
+            store.enqueueCanonicalCreate(
+                taskDraft().copy(isSensitive = false, parentId = PARENT_ID),
+                ITEM_ID,
+                MUTATION_ID,
+            ),
+        ).mutation
+        val submitted = submit(store, queued)
+        val conflicted = requireNotNull(
+            store.markCanonicalAuthoringConflict(
+                submitted.id,
+                "Server rejected the retained contract",
+            ),
+        ).mutation
+        val copyItemId = "12121212-1212-4212-8212-121212121212"
+        val copyMutationId = "34343434-3434-4434-8434-343434343434"
+
+        val copy = requireNotNull(
+            store.duplicateConflictedCanonicalDraft(
+                conflicted.id,
+                copyItemId,
+                copyMutationId,
+            ),
+        ).mutation
+
+        assertEquals(
+            conflicted,
+            store.state.value.pendingCanonicalAuthoringMutations.first { it.id == conflicted.id },
+        )
+        assertTrue(conflicted.isSubmitted)
+        assertEquals(CanonicalAuthoringDisposition.CONFLICTED, conflicted.disposition)
+        assertEquals(copyItemId, copy.itemId)
+        assertEquals(copyMutationId, copy.id)
+        assertFalse(copy.isSubmitted)
+        assertNull(copy.syncOrigin)
+        assertEquals(CanonicalDraftPlacement.INBOX, copy.draft?.placement)
+        assertTrue(copy.draft?.isSensitive == true)
+        assertNull(copy.draft?.parentId)
+        assertEquals(0L, copy.draft?.siblingOrder)
+        assertEquals(2, store.state.value.pendingCanonicalAuthoringMutations.size)
+    }
+
+    @Test
+    fun detachedInboxCaptureDoesNotBlockPausingAnActiveExecutionLease() {
+        val active = canonicalItem(ITEM_ID)
+        val blockId = "56565656-5656-4656-8656-565656565656"
+        val executionId = "78787878-7878-4878-8878-787878787878"
+        val deviceId = "90909090-9090-4090-8090-909090909090"
+        val running = CanonicalExecutionSessionSnapshot(
+            id = executionId,
+            itemId = active.id,
+            itemRevision = active.revision,
+            sessionIndex = 0,
+            plannedBlockId = blockId,
+            sourceDeviceId = deviceId,
+            status = "active",
+            revision = 1,
+            accumulatedSeconds = 0,
+            startedAt = NOW,
+            runningSince = NOW,
+            createdAt = NOW,
+            updatedAt = NOW,
+        )
+        val block = ScheduleItem(
+            id = blockId,
+            title = active.title,
+            kind = ItemKind.TASK,
+            startMinute = 600,
+            durationMinutes = 60,
+            status = ItemStatus.ACTIVE,
+            canonicalItemId = active.id,
+            canonicalRevision = active.revision,
+        )
+        val store = PlannerStore(
+            boundState(active).copy(
+                schedule = listOf(block),
+                canonicalExecutionSyncOrigin = ORIGIN,
+                canonicalExecutionConfigurationId = CONFIGURATION_ID,
+                canonicalExecutionRevision = 1,
+                canonicalExecutionSession = running,
+                executionDeviceId = deviceId,
+            ),
+            nowEpochMillis = { NOW_MILLIS },
+        )
+        val captureItemId = "abababab-abab-4bab-8bab-abababababab"
+        val captureMutationId = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"
+
+        val capture = requireNotNull(
+            store.enqueueCanonicalCreate(
+                taskDraft().copy(
+                    placement = CanonicalDraftPlacement.INBOX,
+                    parentId = null,
+                ),
+                captureItemId,
+                captureMutationId,
+            ),
+        ).mutation
+        assertFalse(capture.isSubmitted)
+        assertThrows(IllegalArgumentException::class.java) {
+            store.enqueueCanonicalCreate(
+                taskDraft(),
+                "dededede-dede-4ede-8ede-dededededede",
+                "efefefef-efef-4fef-8fef-efefefefefef",
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            store.enqueueCanonicalReplace(active.id, active.toCanonicalDraft())
+        }
+
+        val staged = store.stageExecutionCommand(
+            PendingExecutionCommand(
+                idempotencyKey = "10101010-1010-4010-8010-101010101010",
+                syncOrigin = ORIGIN,
+                configurationId = CONFIGURATION_ID,
+                expectedRevision = 1,
+                sessionId = executionId,
+                itemId = active.id,
+                itemRevision = active.revision,
+                sessionIndex = 0,
+                plannedBlockId = blockId,
+                sourceDeviceId = deviceId,
+                commandType = "pause",
+                requestJson = "{}",
+                focusedBlockId = blockId,
+                startedAt = NOW,
+            ),
+        )
+
+        assertNotNull(staged)
+        assertEquals("pause", store.state.value.pendingExecutionCommand?.commandType)
+        assertEquals(capture, store.state.value.pendingCanonicalAuthoringMutations.single())
     }
 
     @Test
@@ -166,6 +334,73 @@ class CanonicalAuthoringStoreTest {
         assertNotNull(store.discardCanonicalAuthoringMutation(MUTATION_ID))
         assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
         assertFalse(store.hasCredentialReplacementBlocker())
+    }
+
+    @Test
+    fun credentialReplacementBlocksEveryAuthoringJournalThatCannotSurviveAbandonment() {
+        val localParentId = stableUuid("replacement-safe-local-parent")
+        val localChildId = stableUuid("replacement-safe-local-child")
+        val safe = PlannerStore(boundState(), nowEpochMillis = { NOW_MILLIS })
+        requireNotNull(
+            safe.enqueueCanonicalCreate(
+                taskDraft().copy(title = "Local parent"),
+                localParentId,
+                stableUuid("replacement-safe-parent-mutation"),
+            ),
+        )
+        requireNotNull(
+            safe.enqueueCanonicalCreate(
+                taskDraft().copy(title = "Local child", parentId = localParentId),
+                localChildId,
+                stableUuid("replacement-safe-child-mutation"),
+            ),
+        )
+        assertFalse(safe.hasCredentialReplacementBlocker())
+
+        val remoteParent = canonicalItem(PARENT_ID)
+        val remoteDependent = PlannerStore(
+            boundState(remoteParent),
+            nowEpochMillis = { NOW_MILLIS },
+        )
+        requireNotNull(
+            remoteDependent.enqueueCanonicalCreate(
+                taskDraft().copy(title = "Remote-dependent child", parentId = PARENT_ID),
+                localChildId,
+                stableUuid("replacement-remote-dependent-mutation"),
+            ),
+        )
+        assertTrue(remoteDependent.hasCredentialReplacementBlocker())
+
+        val boundBeforeSubmit = PlannerStore(boundState(), nowEpochMillis = { NOW_MILLIS })
+        val boundMutationId = stableUuid("replacement-bound-before-submit")
+        requireNotNull(
+            boundBeforeSubmit.enqueueCanonicalCreate(
+                taskDraft(),
+                ITEM_ID,
+                boundMutationId,
+            ),
+        )
+        requireNotNull(
+            boundBeforeSubmit.bindCanonicalAuthoringMutation(
+                boundMutationId,
+                ORIGIN,
+                CONFIGURATION_ID,
+            ),
+        )
+        assertTrue(boundBeforeSubmit.hasCredentialReplacementBlocker())
+
+        val replacement = PlannerStore(
+            boundState(canonicalItem(ITEM_ID)),
+            nowEpochMillis = { NOW_MILLIS },
+        )
+        requireNotNull(
+            replacement.enqueueCanonicalReplace(
+                ITEM_ID,
+                taskDraft().copy(title = "Unsent replacement"),
+                MUTATION_ID,
+            ),
+        )
+        assertTrue(replacement.hasCredentialReplacementBlocker())
     }
 
     @Test

@@ -62,6 +62,10 @@ import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
 import com.greengolddog.dayweave.ui.components.ProposalReviewDialog
 import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
+import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorMode
+import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
+import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorSheet
+import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
 import com.greengolddog.dayweave.ui.screens.CalendarScreen
@@ -224,11 +228,19 @@ private fun DayWeaveRoot(
             !proposalApplicationState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
             state.pendingProposalApplicationMutation == null
+    val canonicalAuthoringActionsEnabled = canonicalExecutionActionsEnabled &&
+        state.canonicalExecutionSession == null &&
+        state.pendingSchedulePublication == null &&
+        state.pendingCanonicalAuthoringMutations.none {
+            it.isSubmitted &&
+                it.disposition == com.greengolddog.dayweave.model.CanonicalAuthoringDisposition.PENDING
+        }
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
     var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
     var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
+    var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
 
     LaunchedEffect(lifecycleOwner, viewModel) {
@@ -366,6 +378,22 @@ private fun DayWeaveRoot(
                 syncState = suggestionSyncState,
                 onRefresh = viewModel::refreshSuggestions,
                 onConfigureConnection = { showApiConnection = true },
+                canonicalActionsEnabled = canonicalAuthoringActionsEnabled,
+                canonicalRetryEnabled = canonicalExecutionActionsEnabled,
+                onNewCanonicalItem = {
+                    canonicalEditorRoute = CanonicalItemEditorRoute.create()
+                },
+                onOpenCanonicalEditor = { canonicalEditorRoute = it },
+                onTrashCanonicalItem = { itemId ->
+                    viewModel.trashCanonicalItem(itemId, confirmed = true)
+                },
+                onRestoreCanonicalItem = viewModel::restoreCanonicalItem,
+                onDiscardCanonicalMutation = viewModel::discardCanonicalAuthoringMutation,
+                onCopyCanonicalConflict = viewModel::copyConflictedCanonicalDraft,
+                onReviewLegacyDraft = { draft ->
+                    canonicalEditorRoute = CanonicalItemEditorRoute.fromInbox(draft)
+                },
+                onRetryCanonicalAuthoring = viewModel::retryCanonicalAuthoring,
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.ASSISTANT -> AssistantScreen(
@@ -438,6 +466,37 @@ private fun DayWeaveRoot(
         QuickCaptureSheet(
             onDismiss = { showQuickCapture = false },
             onCapture = viewModel::quickCapture,
+            onContinueWithDetails = { title, kind, isSensitive ->
+                canonicalEditorRoute = CanonicalItemEditorRoute.create(
+                    title = title,
+                    kind = kind,
+                    isSensitive = isSensitive,
+                )
+            },
+        )
+    }
+
+    canonicalEditorRoute?.let { route ->
+        CanonicalItemEditorSheet(
+            route = route,
+            parentOptions = canonicalParentOptions(state, route.itemId),
+            onDismiss = { canonicalEditorRoute = null },
+            onSave = { draft ->
+                val saved = when (route.mode) {
+                    CanonicalItemEditorMode.CREATE -> route.sourceInboxId?.let { inboxId ->
+                        viewModel.convertInboxDraft(inboxId, route.itemId, draft)
+                    } ?: viewModel.createCanonicalItem(route.itemId, draft)
+                    CanonicalItemEditorMode.REPLACE ->
+                        viewModel.replaceCanonicalItem(route.itemId, draft)
+                    CanonicalItemEditorMode.UPDATE_PENDING ->
+                        viewModel.updatePendingCanonicalItem(
+                            mutationId = requireNotNull(route.mutationId),
+                            draft = draft,
+                        )
+                }
+                if (saved) canonicalEditorRoute = null
+                saved
+            },
         )
     }
 
@@ -498,19 +557,7 @@ private fun DayWeaveRoot(
     if (showApiConnection) {
         ApiConnectionDialog(
             authState = deviceAuthState,
-            credentialReplacementBlocked = state.pendingSchedulePublication != null ||
-                state.pendingProposalApplicationMutation != null ||
-                state.pendingCanonicalMutation != null ||
-                state.pendingExecutionCommand != null ||
-                state.terminalExecutionOutcomes.values.any {
-                    it.requiresCanonicalItemProjection &&
-                        it.canonicalProjectionRevision == null &&
-                        it.canonicalProjectionResolution == null &&
-                        (
-                            it.canonicalProjectionConflict == null ||
-                                it.canonicalProjectionRetryAuthorizedAt != null
-                            )
-            },
+            credentialReplacementBlocked = viewModel.hasCredentialReplacementBlocker(),
             onDismiss = { showApiConnection = false },
             onUpgradeWithBootstrap = viewModel::upgradeDeviceAuthentication,
             onConsumeEnrollmentCode = viewModel::consumeDeviceEnrollmentCode,

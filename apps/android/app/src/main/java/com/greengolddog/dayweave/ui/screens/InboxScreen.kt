@@ -17,7 +17,6 @@ import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.GppGood
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.KeyOff
-import androidx.compose.material.icons.outlined.PrivacyTip
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material3.Button
@@ -54,13 +53,15 @@ import com.greengolddog.dayweave.sync.ProposalApplicationPhase
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
+import com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringList
+import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 
 @Composable
-fun InboxScreen(
+internal fun InboxScreen(
     state: DayWeaveUiState,
     onApprove: (String) -> Unit,
     onReject: (String) -> Unit,
@@ -72,6 +73,16 @@ fun InboxScreen(
     syncState: SuggestionSyncState,
     onRefresh: () -> Unit,
     onConfigureConnection: () -> Unit,
+    canonicalActionsEnabled: Boolean,
+    canonicalRetryEnabled: Boolean,
+    onNewCanonicalItem: () -> Unit,
+    onOpenCanonicalEditor: (CanonicalItemEditorRoute) -> Unit,
+    onTrashCanonicalItem: suspend (String) -> Boolean,
+    onRestoreCanonicalItem: suspend (String) -> Boolean,
+    onDiscardCanonicalMutation: suspend (String) -> Boolean,
+    onCopyCanonicalConflict: suspend (String) -> Boolean,
+    onReviewLegacyDraft: (InboxItem) -> Unit,
+    onRetryCanonicalAuthoring: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var tab by remember { mutableIntStateOf(0) }
@@ -105,7 +116,7 @@ fun InboxScreen(
             Tab(
                 selected = tab == 0,
                 onClick = { tab = 0 },
-                text = { Text("Captured (${state.inbox.size})") },
+                text = { Text("Items") },
             )
             Tab(
                 selected = tab == 1,
@@ -119,7 +130,20 @@ fun InboxScreen(
         }
 
         if (tab == 0) {
-            CapturedList(state.inbox, Modifier.weight(1f))
+            CanonicalAuthoringList(
+                state = state,
+                actionsEnabled = canonicalActionsEnabled,
+                retryEnabled = canonicalRetryEnabled,
+                onNewDetailed = onNewCanonicalItem,
+                onOpenEditor = onOpenCanonicalEditor,
+                onTrashConfirmed = onTrashCanonicalItem,
+                onRestore = onRestoreCanonicalItem,
+                onDiscard = onDiscardCanonicalMutation,
+                onCopyConflict = onCopyCanonicalConflict,
+                onReviewLegacy = onReviewLegacyDraft,
+                onRetry = onRetryCanonicalAuthoring,
+                modifier = Modifier.weight(1f),
+            )
         } else {
             SuggestionList(
                 suggestions = state.suggestions,
@@ -137,62 +161,6 @@ fun InboxScreen(
                 onConfigureConnection = onConfigureConnection,
                 modifier = Modifier.weight(1f),
             )
-        }
-    }
-}
-
-@Composable
-private fun CapturedList(items: List<InboxItem>, modifier: Modifier = Modifier) {
-    LazyColumn(
-        modifier = modifier,
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        if (items.isEmpty()) {
-            item { EmptyInbox("Nothing needs clarification.") }
-        }
-        items(items, key = { it.id }) { item ->
-            Card {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(14.dp),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.Top,
-                ) {
-                    Icon(Icons.Outlined.Inbox, contentDescription = null)
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(item.title, style = MaterialTheme.typography.titleMedium)
-                        Text(item.source.label, style = MaterialTheme.typography.labelMedium)
-                        if (item.detail.isNotEmpty()) {
-                            Text(
-                                item.detail,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    if (item.requiresReview) {
-                        Column(horizontalAlignment = Alignment.End) {
-                            if (item.isSensitive) {
-                                Icon(
-                                    Icons.Outlined.PrivacyTip,
-                                    contentDescription = "Sensitive draft",
-                                    tint = MaterialTheme.colorScheme.tertiary,
-                                )
-                                Text(
-                                    "SENSITIVE",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.tertiary,
-                                )
-                            }
-                            Text(
-                                "REVIEW",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 }

@@ -1252,10 +1252,14 @@ class PlannerStore(
             }
             frontier = next
         }
+        val overlayByItem = overlayMutations.associateBy(PendingCanonicalAuthoringMutation::itemId)
         val mergedItems = (
             freshItems.filterNot {
                 it.id in retainedRestoreItemIds || it.id in requiredCurrentIds
-            } + requiredCurrentIds.mapNotNull(currentById::get)
+            } + requiredCurrentIds.mapNotNull { itemId ->
+                val mutationBase = overlayByItem[itemId]?.baseItem
+                freshById[itemId]?.takeIf { it == mutationBase } ?: currentById[itemId]
+            }
             ).distinctBy(CanonicalItemSnapshot::id).sortedCanonicalItems()
         val activeIds = mergedItems.mapTo(hashSetOf()) { it.id }
         val deleted = current.canonicalRecentlyDeleted.filterNot {
@@ -1276,6 +1280,63 @@ class PlannerStore(
     fun sortedCanonicalAuthoringMutations(): List<PendingCanonicalAuthoringMutation> =
         dependencySortedCanonicalAuthoringMutations(state.value)
 
+    /**
+     * Rebases only unsent replace/trash requests when an authoritative refresh proves that the
+     * server changed derived hierarchy metadata, but no user-authored field. Child mutations
+     * increment parent revisions, so this fence is required before an offline parent batch sends.
+     */
+    fun rebaseUnsubmittedCanonicalAuthoringBases(
+        authoritativeItems: List<CanonicalItemSnapshot>,
+    ): PlannerPersistenceReceipt? {
+        authoritativeItems.forEach(CanonicalItemSnapshot::requireCanonicalAuthoringShape)
+        val authoritativeById = authoritativeItems.associateBy(CanonicalItemSnapshot::id)
+        require(authoritativeById.size == authoritativeItems.size) {
+            "Authoritative canonical item ids must be unique"
+        }
+        return mutateDurably { current ->
+            var changed = false
+            val mutations = current.pendingCanonicalAuthoringMutations.map { mutation ->
+                if (
+                    mutation.isSubmitted ||
+                    mutation.disposition != CanonicalAuthoringDisposition.PENDING ||
+                    mutation.operation !in setOf(
+                        CanonicalAuthoringOperation.REPLACE,
+                        CanonicalAuthoringOperation.TRASH,
+                    )
+                ) {
+                    return@map mutation
+                }
+                val base = mutation.baseItem ?: return@map mutation
+                val authoritative = authoritativeById[mutation.itemId] ?: return@map mutation
+                val expectedRevision = requireNotNull(mutation.expectedRevision)
+                if (
+                    authoritative.revision <= expectedRevision ||
+                    !authoritative.sameAuthoredFields(base)
+                ) {
+                    return@map mutation
+                }
+                changed = true
+                mutation.copy(
+                    expectedRevision = authoritative.revision,
+                    baseItem = authoritative,
+                    syncOrigin = null,
+                    configurationId = null,
+                ).also(PendingCanonicalAuthoringMutation::requireValid)
+            }
+            if (!changed) {
+                current
+            } else {
+                current.copy(
+                    pendingCanonicalAuthoringMutations = mutations,
+                    publishedScheduleRevision = null,
+                    scheduleInputDigest = null,
+                    scheduleMessage =
+                        "Queued hierarchy changes rebased to authoritative parent revisions",
+                )
+            }
+        }
+    }
+
     fun enqueueCanonicalCreate(
         draft: CanonicalItemDraft,
         itemId: String = UUID.randomUUID().toString(),
@@ -1290,6 +1351,31 @@ class PlannerStore(
             itemId = itemId,
             operation = CanonicalAuthoringOperation.CREATE,
             draft = draft.normalized(),
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    /** Atomically converts one legacy/proposal review draft into canonical local intent. */
+    fun enqueueCanonicalCreateFromInbox(
+        inboxId: String,
+        draft: CanonicalItemDraft,
+        itemId: String = UUID.randomUUID().toString(),
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.CREATE,
+        consumeInboxId = inboxId,
+    ) { current ->
+        val source = current.inbox.firstOrNull { it.id == inboxId }
+            ?: throw IllegalArgumentException("Inbox review draft is unavailable")
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = draft.copy(
+                isSensitive = draft.isSensitive || source.isSensitive,
+            ).normalized(),
             createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
         )
     }
@@ -1359,18 +1445,115 @@ class PlannerStore(
         )
     }
 
+    /** Replaces an unsent create/replace body without changing its durable request identity. */
+    fun updateCanonicalAuthoringDraft(
+        id: String,
+        draft: CanonicalItemDraft,
+    ): CanonicalAuthoringTransition? {
+        val durable = mutateDurablyWithSnapshot { current ->
+            requireCanonicalAuthoringEnqueueFence(
+                current,
+                allowDetachedInboxCapture = true,
+            )
+            val index = current.pendingCanonicalAuthoringMutations.indexOfFirst { it.id == id }
+            require(index >= 0) { "Canonical authoring mutation is unavailable" }
+            val existing = current.pendingCanonicalAuthoringMutations[index]
+            require(
+                !existing.isSubmitted &&
+                    existing.disposition == CanonicalAuthoringDisposition.PENDING &&
+                    existing.operation in setOf(
+                        CanonicalAuthoringOperation.CREATE,
+                        CanonicalAuthoringOperation.REPLACE,
+                    ),
+            ) { "Only an unsent create or replacement draft can be edited" }
+            val replacement = existing.copy(
+                draft = draft.normalized(),
+                // A crash can leave a persistently bound request before its submission
+                // generation. Editing is safe only because no network byte left; make the
+                // next sync bind the changed body again under the active credentials.
+                syncOrigin = null,
+                configurationId = null,
+            ).also(PendingCanonicalAuthoringMutation::requireValid)
+            if (current.canonicalExecutionSession != null) {
+                require(replacement.isDetachedInboxCapture()) {
+                    "Only a detached Inbox capture is editable during active execution"
+                }
+            }
+            validateCanonicalAuthoringCurrentState(current, replacement)
+            validateCanonicalAuthoringHierarchy(current, replacement)
+            current.copy(
+                pendingCanonicalAuthoringMutations = current.pendingCanonicalAuthoringMutations
+                    .replaceAt(index, replacement),
+                publishedScheduleRevision = null,
+                scheduleInputDigest = null,
+                scheduleMessage = "Canonical draft updated locally",
+            )
+        } ?: return null
+        return durable.canonicalAuthoringTransition(id)
+    }
+
+    /**
+     * Copies a submitted conflict into a detached, editable Inbox identity while retaining the
+     * original recovery record. Inherited sensitivity is promoted before ancestry is removed.
+     */
+    fun duplicateConflictedCanonicalDraft(
+        id: String,
+        newItemId: String = UUID.randomUUID().toString(),
+        newMutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = newItemId,
+        mutationId = newMutationId,
+        operation = CanonicalAuthoringOperation.CREATE,
+    ) { current ->
+        val source = current.pendingCanonicalAuthoringMutations.firstOrNull { it.id == id }
+            ?: throw IllegalArgumentException("Canonical authoring conflict is unavailable")
+        require(
+            source.disposition == CanonicalAuthoringDisposition.CONFLICTED &&
+                source.operation in setOf(
+                    CanonicalAuthoringOperation.CREATE,
+                    CanonicalAuthoringOperation.REPLACE,
+                ),
+        ) { "Only a conflicted create or replacement can be copied" }
+        val sourceDraft = requireNotNull(source.draft)
+        val mustRemainSensitive = effectiveCanonicalSensitivity(
+            current.canonicalItems,
+            source.itemId,
+            current.pendingCanonicalMutation,
+            current.pendingCanonicalAuthoringMutations,
+        )
+        PendingCanonicalAuthoringMutation(
+            id = newMutationId,
+            itemId = newItemId,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = sourceDraft.copy(
+                placement = CanonicalDraftPlacement.INBOX,
+                isSensitive = sourceDraft.isSensitive || mustRemainSensitive,
+                parentId = null,
+                siblingOrder = 0,
+            ).normalized(),
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
     /** Adds one reviewable local operation without claiming any server action has started. */
     private fun enqueueCanonicalAuthoring(
         itemId: String,
         mutationId: String,
         operation: CanonicalAuthoringOperation,
+        consumeInboxId: String? = null,
         makeMutation: (DayWeaveUiState) -> PendingCanonicalAuthoringMutation,
     ): CanonicalAuthoringTransition? {
         requireCanonicalUuid(itemId, "canonical authoring item")
         requireCanonicalUuid(mutationId, "canonical authoring mutation")
         val durable = mutateDurablyWithSnapshot { current ->
-            requireCanonicalAuthoringEnqueueFence(current)
+            requireCanonicalAuthoringEnqueueFence(
+                current,
+                allowDetachedInboxCapture = operation == CanonicalAuthoringOperation.CREATE,
+            )
             require(current.pendingCanonicalAuthoringMutations.size < MAX_CANONICAL_AUTHORING_QUEUE)
+            require(current.pendingCanonicalAuthoringMutations.none { it.id == mutationId }) {
+                "This canonical authoring request identity already exists"
+            }
             require(current.pendingCanonicalAuthoringMutations.none { it.itemId == itemId }) {
                 "This canonical item already has a queued operation"
             }
@@ -1378,9 +1561,20 @@ class PlannerStore(
             require(mutation.operation == operation && mutation.id == mutationId &&
                 mutation.itemId == itemId)
             mutation.requireValid()
+            if (current.canonicalExecutionSession != null) {
+                require(mutation.isDetachedInboxCapture()) {
+                    "Only a detached Inbox capture is available during active execution"
+                }
+            }
             validateCanonicalAuthoringCurrentState(current, mutation)
             validateCanonicalAuthoringHierarchy(current, mutation)
             current.copy(
+                inbox = if (consumeInboxId == null) {
+                    current.inbox
+                } else {
+                    require(current.inbox.any { it.id == consumeInboxId })
+                    current.inbox.filterNot { it.id == consumeInboxId }
+                },
                 pendingCanonicalAuthoringMutations =
                     current.pendingCanonicalAuthoringMutations + mutation,
                 publishedScheduleRevision = null,
@@ -1688,13 +1882,16 @@ class PlannerStore(
         }
     }
 
-    private fun requireCanonicalAuthoringEnqueueFence(current: DayWeaveUiState) {
+    private fun requireCanonicalAuthoringEnqueueFence(
+        current: DayWeaveUiState,
+        allowDetachedInboxCapture: Boolean = false,
+    ) {
         require(current.pendingSchedulePublication == null)
         require(current.pendingProposalApplicationMutation == null)
         require(current.pendingCanonicalMutation == null)
         require(current.pendingExecutionCommand == null)
-        require(current.canonicalExecutionSession == null) {
-            "Canonical authoring is unavailable during an active execution lease"
+        require(allowDetachedInboxCapture || current.canonicalExecutionSession == null) {
+            "Schedule-affecting authoring is unavailable during an active execution lease"
         }
         require(current.pendingCanonicalAuthoringMutations.none {
             it.isSubmitted && it.disposition == CanonicalAuthoringDisposition.PENDING
@@ -1710,6 +1907,16 @@ class PlannerStore(
         pendingCanonicalAuthoringMutations.any {
             it.disposition == CanonicalAuthoringDisposition.PENDING
         }
+
+    private fun DayWeaveUiState.hasExecutionBlockingCanonicalAuthoringOverlay(): Boolean =
+        pendingCanonicalAuthoringMutations.any {
+            it.disposition == CanonicalAuthoringDisposition.PENDING &&
+                !it.isDetachedInboxCapture()
+        }
+
+    private fun PendingCanonicalAuthoringMutation.isDetachedInboxCapture(): Boolean =
+        !isSubmitted && operation == CanonicalAuthoringOperation.CREATE &&
+            draft?.placement == CanonicalDraftPlacement.INBOX && draft.parentId == null
 
     private fun DayWeaveUiState.hasSubmittedCanonicalAuthoring(): Boolean =
         pendingCanonicalAuthoringMutations.any(PendingCanonicalAuthoringMutation::isSubmitted)
@@ -2105,7 +2312,7 @@ class PlannerStore(
         require(current.pendingProposalApplicationMutation == null) {
             "A proposal application already needs reconciliation"
         }
-        require(!current.hasPendingCanonicalAuthoringOverlay()) {
+        require(!current.hasExecutionBlockingCanonicalAuthoringOverlay()) {
             "A canonical authoring change already needs reconciliation"
         }
         require(UUID.fromString(mutation.idempotencyKey).toString() == mutation.idempotencyKey)
@@ -2399,7 +2606,7 @@ class PlannerStore(
         require(current.pendingProposalApplicationMutation == null) {
             "A proposal application already needs reconciliation"
         }
-        require(!current.hasPendingCanonicalAuthoringOverlay()) {
+        require(!current.hasExecutionBlockingCanonicalAuthoringOverlay()) {
             "A canonical authoring change already needs reconciliation"
         }
         require(UUID.fromString(command.idempotencyKey).toString() == command.idempotencyKey)
@@ -2454,11 +2661,15 @@ class PlannerStore(
     /** No bearer replacement may cross an unresolved or explicitly authorized server write. */
     fun hasCredentialReplacementBlocker(): Boolean {
         val current = state.value
+        val preservableAuthoringIds = current.preservableUnboundCanonicalCreates()
+            .mapTo(hashSetOf(), PendingCanonicalAuthoringMutation::id)
         return current.pendingCanonicalMutation != null ||
             current.pendingSchedulePublication != null ||
             current.pendingExecutionCommand != null ||
             current.pendingProposalApplicationMutation != null ||
-            current.hasSubmittedCanonicalAuthoring() ||
+            current.pendingCanonicalAuthoringMutations.any {
+                it.id !in preservableAuthoringIds
+            } ||
             current.hasUnresolvedTerminalProjection()
     }
 
@@ -2883,18 +3094,7 @@ class PlannerStore(
             .filter { it.canonicalItemId != null }
             .map(ScheduleItem::id)
             .toSet()
-        var preservedCreates = current.pendingCanonicalAuthoringMutations.filter {
-            it.operation == CanonicalAuthoringOperation.CREATE && !it.isSubmitted &&
-                it.syncOrigin == null && it.disposition == CanonicalAuthoringDisposition.PENDING
-        }
-        while (true) {
-            val preservedIds = preservedCreates.mapTo(mutableSetOf()) { it.itemId }
-            val selfContained = preservedCreates.filter { mutation ->
-                mutation.draft?.parentId?.let { it in preservedIds } != false
-            }
-            if (selfContained.size == preservedCreates.size) break
-            preservedCreates = selfContained
-        }
+        val preservedCreates = current.preservableUnboundCanonicalCreates()
         current.copy(
             suggestions = current.suggestions.filter { it.remoteRevision == null },
             inbox = current.inbox.filter { it.source != InboxSource.EXTERNAL_PROPOSAL },
@@ -2937,6 +3137,22 @@ class PlannerStore(
             scheduleMessage =
                 "API connection forgotten locally · any in-flight server action has unknown outcome",
         )
+    }
+
+    /** Captures with no server dependency can safely survive a change of remote identity. */
+    private fun DayWeaveUiState.preservableUnboundCanonicalCreates(): List<PendingCanonicalAuthoringMutation> {
+        var preservedCreates = pendingCanonicalAuthoringMutations.filter {
+            it.operation == CanonicalAuthoringOperation.CREATE && !it.isSubmitted &&
+                it.syncOrigin == null && it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        while (true) {
+            val preservedIds = preservedCreates.mapTo(mutableSetOf()) { it.itemId }
+            val selfContained = preservedCreates.filter { mutation ->
+                mutation.draft?.parentId?.let { it in preservedIds } != false
+            }
+            if (selfContained.size == preservedCreates.size) return preservedCreates
+            preservedCreates = selfContained
+        }
     }
 
     /** Durably reconciles one optimistic server mutation without inventing a new schedule. */

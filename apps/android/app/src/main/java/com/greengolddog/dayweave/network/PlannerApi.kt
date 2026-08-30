@@ -20,6 +20,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -99,10 +100,37 @@ data class CanonicalItemReplacement(
     @SerialName("sibling_order") val siblingOrder: Long,
 )
 
+/** Flat `/v1/items` create body; the server does not accept a nested `item` object here. */
+@Serializable
+data class CreateCanonicalItemRequest(
+    val id: String,
+    @SerialName("is_sensitive") val isSensitive: Boolean,
+    val kind: String,
+    val status: String,
+    val title: String,
+    val notes: String? = null,
+    @SerialName("timezone_name") val timezoneName: String,
+    @SerialName("duration_seconds") val durationSeconds: Long? = null,
+    @SerialName("deadline_at") val deadlineAt: String? = null,
+    @SerialName("earliest_start_at") val earliestStartAt: String? = null,
+    val recurrence: JsonElement? = null,
+    @SerialName("flexible_constraints") val flexibleConstraints: JsonObject,
+    @SerialName("split_policy") val splitPolicy: JsonObject,
+    val importance: Int,
+    val urgency: Int,
+    @SerialName("parent_id") val parentId: String? = null,
+    @SerialName("sibling_order") val siblingOrder: Long,
+)
+
 @Serializable
 data class ReplaceCanonicalItemRequest(
     @SerialName("expected_revision") val expectedRevision: Long,
     val item: CanonicalItemReplacement,
+)
+
+@Serializable
+data class CanonicalItemRevisionRequest(
+    @SerialName("expected_revision") val expectedRevision: Long,
 )
 
 @Serializable
@@ -324,6 +352,16 @@ sealed class PlannerApiException(message: String, cause: Throwable? = null) :
 
     class Conflict : PlannerApiException("The canonical item changed on the server")
 
+    /** A trusted canonical 409 proving that the exact request made no server-side change. */
+    class CanonicalMutationRejected : PlannerApiException(
+        "The canonical item mutation was deterministically rejected",
+    )
+
+    /** A trusted canonical 409 that is still ambiguous and must retain its exact retry journal. */
+    class CanonicalMutationInProgress : PlannerApiException(
+        "The matching canonical item mutation is still in progress",
+    )
+
     class SchedulePublicationStale : PlannerApiException(
         "The validated schedule preview became stale before publication",
     )
@@ -358,11 +396,31 @@ interface CanonicalPlannerTransport {
         request: SchedulePublishHttpRequest,
     ): RemoteSchedulePublishResponse
 
+    suspend fun createItem(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        request: CreateCanonicalItemRequest,
+    ): RemoteCanonicalItem
+
     suspend fun replaceItem(
         configuration: AuthenticatedApiConfiguration,
         id: String,
         idempotencyKey: String,
         request: ReplaceCanonicalItemRequest,
+    ): RemoteCanonicalItem
+
+    suspend fun trashItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        expectedRevision: Long,
+    ): RemoteCanonicalItem
+
+    suspend fun restoreItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        request: CanonicalItemRevisionRequest,
     ): RemoteCanonicalItem
 }
 
@@ -412,12 +470,31 @@ class OkHttpCanonicalPlannerTransport(
         return executePublication(httpRequest)
     }
 
+    override suspend fun createItem(
+        configuration: AuthenticatedApiConfiguration,
+        idempotencyKey: String,
+        request: CreateCanonicalItemRequest,
+    ): RemoteCanonicalItem {
+        requireCanonicalItemMutationIdentity(request.id, idempotencyKey)
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/items")
+            .build()
+        val body = json.encodeToString(request).toRequestBody(JSON_MEDIA_TYPE)
+        val httpRequest = requestBuilder(configuration, url.toString())
+            .header("Idempotency-Key", idempotencyKey)
+            .post(body)
+            .build()
+        return execute<CanonicalItemEnvelope>(httpRequest, expectedStatusCode = 201).item
+    }
+
     override suspend fun replaceItem(
         configuration: AuthenticatedApiConfiguration,
         id: String,
         idempotencyKey: String,
         request: ReplaceCanonicalItemRequest,
     ): RemoteCanonicalItem {
+        requireCanonicalItemMutationIdentity(id, idempotencyKey)
+        requireCanonicalItemRevision(request.expectedRevision)
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/items")
             .addPathSegment(id)
@@ -426,6 +503,47 @@ class OkHttpCanonicalPlannerTransport(
         val httpRequest = requestBuilder(configuration, url.toString())
             .header("Idempotency-Key", idempotencyKey)
             .put(body)
+            .build()
+        return execute<CanonicalItemEnvelope>(httpRequest).item
+    }
+
+    override suspend fun trashItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        expectedRevision: Long,
+    ): RemoteCanonicalItem {
+        requireCanonicalItemMutationIdentity(id, idempotencyKey)
+        requireCanonicalItemRevision(expectedRevision)
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/items")
+            .addPathSegment(id)
+            .addQueryParameter("expected_revision", expectedRevision.toString())
+            .build()
+        val httpRequest = requestBuilder(configuration, url.toString())
+            .header("Idempotency-Key", idempotencyKey)
+            .delete()
+            .build()
+        return execute<CanonicalItemEnvelope>(httpRequest).item
+    }
+
+    override suspend fun restoreItem(
+        configuration: AuthenticatedApiConfiguration,
+        id: String,
+        idempotencyKey: String,
+        request: CanonicalItemRevisionRequest,
+    ): RemoteCanonicalItem {
+        requireCanonicalItemMutationIdentity(id, idempotencyKey)
+        requireCanonicalItemRevision(request.expectedRevision)
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/items")
+            .addPathSegment(id)
+            .addPathSegment("restore")
+            .build()
+        val body = json.encodeToString(request).toRequestBody(JSON_MEDIA_TYPE)
+        val httpRequest = requestBuilder(configuration, url.toString())
+            .header("Idempotency-Key", idempotencyKey)
+            .post(body)
             .build()
         return execute<CanonicalItemEnvelope>(httpRequest).item
     }
@@ -439,12 +557,19 @@ class OkHttpCanonicalPlannerTransport(
         .header("Accept", "application/json")
         .header("Authorization", "Bearer ${configuration.bearerToken}")
 
-    private suspend inline fun <reified T> execute(request: Request): T {
+    private suspend inline fun <reified T> execute(
+        request: Request,
+        expectedStatusCode: Int = 200,
+    ): T {
         val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
             ?: throw PlannerApiException.InvalidResponse()
         val response = configuration.executeAuthenticated(client, request)
         response.use {
-            if (response.code != 200) throw response.toPlannerApiException()
+            if (response.code != expectedStatusCode) throw response.toPlannerApiException()
+            val mediaType = response.header("Content-Type")?.toMediaTypeOrNull()
+            if (mediaType?.type != "application" || mediaType.subtype != "json") {
+                throw PlannerApiException.InvalidResponse()
+            }
             val responseText = response.body.charStream().use { reader ->
                 reader.readBoundedPlannerText()
             }
@@ -512,9 +637,135 @@ class OkHttpCanonicalPlannerTransport(
 
     private fun Response.toPlannerApiException(): PlannerApiException = when (code) {
         401 -> PlannerApiException.Authentication()
-        409 -> PlannerApiException.Conflict()
+        404 -> strictCanonicalMutationNotFound() ?: PlannerApiException.Http(code)
+        409 -> strictCanonicalMutationConflict() ?: PlannerApiException.Conflict()
         400, 422 -> PlannerApiException.Validation(code)
         else -> PlannerApiException.Http(code)
+    }
+
+    /** A trusted item-route 404 proves that a replace/trash/restore request changed nothing. */
+    private fun Response.strictCanonicalMutationNotFound(): PlannerApiException? {
+        val endpoint = canonicalMutationEndpoint()?.takeUnless {
+            it == CanonicalMutationEndpoint.CREATE
+        } ?: return null
+        val mediaType = header("Content-Type")?.toMediaTypeOrNull() ?: return null
+        if (mediaType.type != "application" || mediaType.subtype != "json") return null
+        if (header("Cache-Control")?.lowercase() != "no-store, max-age=0") return null
+        if (header("Pragma")?.lowercase() != "no-cache") return null
+        val responseText = runCatching {
+            body.charStream().use { reader ->
+                reader.readBoundedPlannerText(MAX_ERROR_RESPONSE_CHARS)
+            }
+        }.getOrNull() ?: return null
+        val root = runCatching { json.parseToJsonElement(responseText).jsonObject }
+            .getOrNull() ?: return null
+        if (root.keys != setOf("error")) return null
+        val error = runCatching { root.getValue("error").jsonObject }.getOrNull() ?: return null
+        return if (
+            error.keys == setOf("code", "message") &&
+            error["code"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull == "not_found" &&
+            error["message"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull ==
+            "item was not found"
+        ) {
+            PlannerApiException.CanonicalMutationRejected()
+        } else {
+            null
+        }
+    }
+
+    /**
+     * Trust only the exact authenticated server envelopes whose outcome is unambiguous.
+     * A generic or future 409 remains replayable because it may represent an in-flight request.
+     */
+    private fun Response.strictCanonicalMutationConflict(): PlannerApiException? {
+        val endpoint = canonicalMutationEndpoint() ?: return null
+        val mediaType = header("Content-Type")?.toMediaTypeOrNull() ?: return null
+        if (mediaType.type != "application" || mediaType.subtype != "json") return null
+        if (header("Cache-Control")?.lowercase() != "no-store, max-age=0") return null
+        if (header("Pragma")?.lowercase() != "no-cache") return null
+        val responseText = runCatching {
+            body.charStream().use { reader ->
+                reader.readBoundedPlannerText(MAX_ERROR_RESPONSE_CHARS)
+            }
+        }.getOrNull() ?: return null
+        val root = runCatching { json.parseToJsonElement(responseText).jsonObject }
+            .getOrNull() ?: return null
+        if (root.keys != setOf("error")) return null
+        val error = runCatching { root.getValue("error").jsonObject }.getOrNull() ?: return null
+        val code = error["code"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull
+            ?: return null
+        val message = error["message"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull
+            ?: return null
+        if (code != "conflict" || message.isBlank() || message.length > MAX_ERROR_MESSAGE_CHARS) {
+            return null
+        }
+        if (
+            error.keys == setOf("code", "message") &&
+            message == "matching idempotent request is still in progress"
+        ) {
+            return PlannerApiException.CanonicalMutationInProgress()
+        }
+        if (
+            endpoint != CanonicalMutationEndpoint.CREATE &&
+            error.keys == setOf("code", "message", "details") &&
+            message == "item was changed by another request"
+        ) {
+            val details = runCatching { error.getValue("details").jsonObject }.getOrNull()
+                ?: return null
+            if (
+                details.keys == setOf("expected_revision", "actual_revision") &&
+                details.values.all { value ->
+                    value.jsonPrimitive.takeUnless { it.isString }?.longOrNull?.let { it > 0 } == true
+                }
+            ) {
+                return PlannerApiException.CanonicalMutationRejected()
+            }
+            return null
+        }
+        if (error.keys != setOf("code", "message")) return null
+        val common = setOf("Idempotency-Key was already used for different content")
+        val endpointSpecific = when (endpoint) {
+            CanonicalMutationEndpoint.CREATE -> setOf(
+                "item already exists",
+                "item cannot be its own parent",
+                "item hierarchy would contain a cycle",
+                "an executing or terminal item cannot become a parent",
+            )
+            CanonicalMutationEndpoint.REPLACE -> setOf(
+                "item cannot be its own parent",
+                "item hierarchy would contain a cycle",
+                "an executing or terminal item cannot become a parent",
+                "only leaf items can enter an executable state",
+            )
+            CanonicalMutationEndpoint.TRASH -> setOf(
+                "an item with active children cannot be deleted",
+            )
+            CanonicalMutationEndpoint.RESTORE -> setOf(
+                "deleted item's parent must be restored first",
+                "only leaf items can enter an executable state",
+            )
+        }
+        return if (message in common || message in endpointSpecific) {
+            PlannerApiException.CanonicalMutationRejected()
+        } else {
+            null
+        }
+    }
+
+    private fun Response.canonicalMutationEndpoint(): CanonicalMutationEndpoint? {
+        val segments = request.url.pathSegments
+        val v1Index = segments.indexOfLast { it == "v1" }
+        if (v1Index < 0 || segments.getOrNull(v1Index + 1) != "items") return null
+        val suffix = segments.drop(v1Index)
+        return when {
+            request.method == "POST" && suffix == listOf("v1", "items") ->
+                CanonicalMutationEndpoint.CREATE
+            request.method == "PUT" && suffix.size == 3 -> CanonicalMutationEndpoint.REPLACE
+            request.method == "DELETE" && suffix.size == 3 -> CanonicalMutationEndpoint.TRASH
+            request.method == "POST" && suffix.size == 4 && suffix.last() == "restore" ->
+                CanonicalMutationEndpoint.RESTORE
+            else -> null
+        }
     }
 
     companion object {
@@ -524,7 +775,25 @@ class OkHttpCanonicalPlannerTransport(
         private const val MAX_ERROR_RESPONSE_CHARS = 8 * 1024
         private const val MAX_ERROR_MESSAGE_CHARS = 500
         private const val SCHEDULE_PUBLICATION_STALE_CODE = "schedule_publication_stale"
+        private val CANONICAL_ITEM_IDEMPOTENCY_KEY = Regex("^[A-Za-z0-9._:-]{8,128}$")
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        private enum class CanonicalMutationEndpoint {
+            CREATE,
+            REPLACE,
+            TRASH,
+            RESTORE,
+        }
+
+        private fun requireCanonicalItemMutationIdentity(id: String, idempotencyKey: String) {
+            val parsed = runCatching { UUID.fromString(id) }.getOrNull()
+            require(parsed != null && parsed != UUID(0L, 0L) && parsed.toString() == id)
+            require(CANONICAL_ITEM_IDEMPOTENCY_KEY.matches(idempotencyKey))
+        }
+
+        private fun requireCanonicalItemRevision(expectedRevision: Long) {
+            require(expectedRevision in 1 until Long.MAX_VALUE)
+        }
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)

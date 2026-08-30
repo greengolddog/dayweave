@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.greengolddog.dayweave.DayWeaveApplication
 import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.AppDestination
+import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
@@ -19,6 +20,7 @@ import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -35,6 +37,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
     private val energySignalManager = dayWeaveApplication.energySignalManager
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
+    private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
@@ -142,8 +145,45 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             localAction = plannerStore::doActiveLater,
         )
     }
-    fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean): Boolean =
-        plannerStore.quickCapture(title, kind, isSensitive)
+    suspend fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean): Boolean =
+        canonicalAuthoringAction {
+            canonicalAuthoringController.quickCapture(title, kind, isSensitive)
+        }
+
+    suspend fun createCanonicalItem(itemId: String, draft: CanonicalItemDraft): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.create(draft, itemId) }
+
+    suspend fun convertInboxDraft(
+        inboxId: String,
+        itemId: String,
+        draft: CanonicalItemDraft,
+    ): Boolean = canonicalAuthoringAction {
+        canonicalAuthoringController.convertInboxDraft(inboxId, itemId, draft)
+    }
+
+    suspend fun replaceCanonicalItem(itemId: String, draft: CanonicalItemDraft): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.replace(itemId, draft) }
+
+    suspend fun updatePendingCanonicalItem(mutationId: String, draft: CanonicalItemDraft): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.updatePending(mutationId, draft) }
+
+    suspend fun trashCanonicalItem(itemId: String, confirmed: Boolean): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.trash(itemId, confirmed) }
+
+    suspend fun restoreCanonicalItem(itemId: String): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.restore(itemId) }
+
+    suspend fun discardCanonicalAuthoringMutation(mutationId: String): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.discard(mutationId) }
+
+    suspend fun copyConflictedCanonicalDraft(mutationId: String): Boolean =
+        canonicalAuthoringAction { canonicalAuthoringController.copyConflict(mutationId) }
+
+    /** Reconciles an interrupted submitted journal; conflicted journals remain review-only. */
+    fun retryCanonicalAuthoring() = recompose()
+
+    fun hasCredentialReplacementBlocker(): Boolean =
+        plannerStore.hasCredentialReplacementBlocker()
 
     fun setCanonicalItemSensitive(itemId: String, expectedRevision: Long, isSensitive: Boolean) {
         if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
@@ -387,6 +427,35 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
             proposalApplicationManager.state.value.isBusy ||
             plannerStore.state.value.pendingProposalApplicationMutation != null
+
+    private suspend inline fun canonicalAuthoringAction(
+        crossinline action: suspend () -> Boolean,
+    ): Boolean {
+        if (isCanonicalBusy()) return false
+        return try {
+            persistCanonicalAuthoringThenScheduleSync(
+                persist = { action() },
+                scheduleSync = {
+                    dayWeaveApplication.launchCanonicalAction {
+                        dayWeaveApplication.refreshCanonicalState()
+                    }
+                },
+            )
+        } catch (error: RuntimeException) {
+            if (error is CancellationException) throw error
+            false
+        }
+    }
+}
+
+/** Local durability is success; synchronization is best-effort and remains manually retryable. */
+internal suspend fun persistCanonicalAuthoringThenScheduleSync(
+    persist: suspend () -> Boolean,
+    scheduleSync: () -> Unit,
+): Boolean {
+    val persisted = persist()
+    if (persisted) scheduleSync()
+    return persisted
 }
 
 /** Terminal execution success immediately enters the application projection/recompose sequence. */

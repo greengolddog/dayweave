@@ -1,11 +1,15 @@
 package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
+import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
+import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
@@ -15,7 +19,9 @@ import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.CanonicalItemReplacement
+import com.greengolddog.dayweave.network.CanonicalItemRevisionRequest
 import com.greengolddog.dayweave.network.CanonicalPlannerTransport
+import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.PlannerApiException
 import com.greengolddog.dayweave.network.PreviousScheduleAssignmentRequest
@@ -315,10 +321,11 @@ class CanonicalSyncManager(
         configuration: AuthenticatedApiConfiguration,
         instant: Instant,
         planningZone: ZoneId,
+        forceCanonicalRebuild: Boolean = false,
     ): AcceptedCanonicalPreview {
         val planningDate = instant.atZone(planningZone).toLocalDate()
         for (attempt in 1..MAX_SNAPSHOT_ATTEMPTS) {
-            val canonical = loadDelta(configuration)
+            val canonical = loadDelta(configuration, forceCanonicalRebuild)
             val request = previewRequest(
                 instant,
                 planningZone,
@@ -373,10 +380,16 @@ class CanonicalSyncManager(
                 if (pendingResolution != PendingMutationResolution.SUPERSEDED) {
                     projectPendingTerminalExecution(configuration)
                 }
+                val authoring = publishPendingCanonicalAuthoringMutations(
+                    configuration = configuration,
+                    instant = instant,
+                    planningZone = planningZone,
+                )
                 val loaded = loadConsistentPlan(
                     configuration = configuration,
                     instant = instant,
                     planningZone = planningZone,
+                    forceCanonicalRebuild = authoring.conflictedCount > 0,
                 )
                 var message = loaded.update.message
                 if (pendingResolution == PendingMutationResolution.SUPERSEDED) {
@@ -385,9 +398,33 @@ class CanonicalSyncManager(
                 if (recoveredStaleOrReplayCount > 0) {
                     message += " A stale or replayed publication was safely recomposed."
                 }
+                if (authoring.appliedCount > 0) {
+                    message += " Published ${authoring.appliedCount} saved canonical " +
+                        "change${if (authoring.appliedCount == 1) "" else "s"}."
+                }
+                if (authoring.conflictedCount > 0) {
+                    message += " ${authoring.conflictedCount} saved canonical " +
+                        "change${if (authoring.conflictedCount == 1) " needs" else "s need"} " +
+                        "conflict review."
+                }
+                if (authoring.deferredCount > 0) {
+                    message += " ${authoring.deferredCount} dependent canonical " +
+                        "change${if (authoring.deferredCount == 1) " remains" else "s remain"} " +
+                        "queued behind conflict review."
+                }
+                val accepted = loaded.copy(update = loaded.update.copy(message = message))
+                if (plannerStore.state.value.pendingCanonicalAuthoringMutations.any {
+                        it.disposition == CanonicalAuthoringDisposition.PENDING
+                    }
+                ) {
+                    // A dependency can remain queued behind a conflicted parent. Persist the fresh
+                    // canonical view, but never publish a schedule that omits its local overlay.
+                    persistCanonicalAuthoringPreflight(configuration, accepted.update)
+                    return accepted.update
+                }
                 return publishAcceptedSchedule(
                     configuration,
-                    loaded.copy(update = loaded.update.copy(message = message)),
+                    accepted,
                 )
             } catch (_: ReplayedSchedulePublicationNeedsFreshSnapshotException) {
                 recoveredStaleOrReplayCount += 1
@@ -410,6 +447,309 @@ class CanonicalSyncManager(
                 throw SchedulePublicationRecoveryExhaustedException()
             }
         }
+    }
+
+    /**
+     * Installs a fresh, unpublished canonical view before sending queued authoring operations.
+     * This both establishes the exact credential binding for first-sync drafts and gives submitted
+     * requests one authoritative cache observation before their immutable idempotent replay.
+     */
+    private suspend fun publishPendingCanonicalAuthoringMutations(
+        configuration: AuthenticatedApiConfiguration,
+        instant: Instant,
+        planningZone: ZoneId,
+    ): CanonicalAuthoringPushSummary {
+        if (plannerStore.state.value.pendingCanonicalAuthoringMutations.none {
+                it.disposition == CanonicalAuthoringDisposition.PENDING
+            }
+        ) {
+            return CanonicalAuthoringPushSummary()
+        }
+        val preflight = loadConsistentPlan(configuration, instant, planningZone)
+        rebaseCanonicalAuthoringPreflight(configuration, preflight.update.items)
+        persistCanonicalAuthoringPreflight(configuration, preflight.update)
+
+        // A crash can leave one submitted request beside older unsubmitted siblings. Reconcile
+        // that ambiguous request first; the store's topological order remains intact because a
+        // submitted request cannot retain an unresolved dependency.
+        val ordered = plannerStore.sortedCanonicalAuthoringMutations()
+            .filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
+            .let { mutations ->
+                mutations.filter(PendingCanonicalAuthoringMutation::isSubmitted) +
+                    mutations.filterNot(PendingCanonicalAuthoringMutation::isSubmitted)
+            }
+        var appliedCount = 0
+        var conflictedCount = 0
+        for (original in ordered) {
+            var mutation = plannerStore.canonicalAuthoringMutation(original.id)
+                ?.takeIf { it.disposition == CanonicalAuthoringDisposition.PENDING }
+                ?: continue
+            if (mutation.isSubmitted) {
+                when (reconcileCanonicalAuthoringFromCache(configuration, mutation)) {
+                    CanonicalAuthoringCacheResolution.APPLIED -> {
+                        appliedCount += 1
+                        continue
+                    }
+                    CanonicalAuthoringCacheResolution.CONFLICTED -> {
+                        conflictedCount += 1
+                        break
+                    }
+                    CanonicalAuthoringCacheResolution.NO_EVIDENCE -> Unit
+                }
+            } else {
+                if (mutation.syncOrigin == null) {
+                    val bound = plannerStore.bindCanonicalAuthoringMutation(
+                        id = mutation.id,
+                        syncOrigin = configuration.baseUrl.toString(),
+                        configurationId = configuration.configurationId,
+                    ) ?: throw LocalPlannerStorageException()
+                    if (!bound.persistence.awaitDurable()) throw LocalPlannerStorageException()
+                    mutation = bound.mutation
+                }
+                ensureConfigurationCurrent(configuration)
+                val submitted = try {
+                    plannerStore.markCanonicalAuthoringSubmitted(mutation.id)
+                } catch (_: IllegalArgumentException) {
+                    return CanonicalAuthoringPushSummary(
+                        appliedCount = appliedCount,
+                        conflictedCount = conflictedCount,
+                        deferredCount = ordered.count { queued ->
+                            plannerStore.canonicalAuthoringMutation(queued.id)
+                                ?.disposition == CanonicalAuthoringDisposition.PENDING
+                        },
+                    )
+                } ?: throw LocalPlannerStorageException()
+                if (!submitted.persistence.awaitDurable()) throw LocalPlannerStorageException()
+                mutation = submitted.mutation
+            }
+            ensureConfigurationCurrent(configuration)
+            try {
+                val remote = sendCanonicalAuthoringMutation(configuration, mutation)
+                ensureConfigurationCurrent(configuration)
+                val response = mapCanonicalItem(
+                    remote,
+                    requireActive = mutation.operation != CanonicalAuthoringOperation.TRASH,
+                )
+                val receipt = try {
+                    plannerStore.applyCanonicalAuthoringResponse(mutation, response)
+                } catch (error: IllegalArgumentException) {
+                    throw CanonicalAuthoringResponseException(error)
+                } ?: throw LocalPlannerStorageException()
+                if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+                appliedCount += 1
+                if (hasQueuedMutationForAffectedParent(mutation, response)) {
+                    val refreshed = loadConsistentPlan(
+                        configuration = configuration,
+                        instant = instant,
+                        planningZone = planningZone,
+                        forceCanonicalRebuild = true,
+                    )
+                    rebaseCanonicalAuthoringPreflight(configuration, refreshed.update.items)
+                    persistCanonicalAuthoringPreflight(configuration, refreshed.update)
+                }
+            } catch (error: PlannerApiException.CanonicalMutationRejected) {
+                ensureConfigurationCurrent(configuration)
+                persistCanonicalAuthoringConflict(
+                    mutation,
+                    "The server rejected this saved canonical hierarchy or revision. " +
+                        "Review the retained change before copying or discarding it.",
+                )
+                conflictedCount += 1
+                break
+            } catch (error: PlannerApiException.Validation) {
+                ensureConfigurationCurrent(configuration)
+                persistCanonicalAuthoringConflict(
+                    mutation,
+                    "The server rejected this saved canonical item contract (HTTP " +
+                        "${error.statusCode}). Review the retained change before copying or " +
+                        "discarding it.",
+                )
+                conflictedCount += 1
+                break
+            }
+        }
+        val deferredCount = plannerStore.state.value.pendingCanonicalAuthoringMutations.count {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        }
+        return CanonicalAuthoringPushSummary(appliedCount, conflictedCount, deferredCount)
+    }
+
+    private suspend fun persistCanonicalAuthoringPreflight(
+        configuration: AuthenticatedApiConfiguration,
+        update: CanonicalPlanUpdate,
+    ) {
+        ensureConfigurationCurrent(configuration)
+        val receipt = try {
+            plannerStore.replaceCanonicalPlan(update)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalConfigurationChangedException()
+        } ?: throw LocalPlannerStorageException()
+        if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+        ensureConfigurationCurrent(configuration)
+    }
+
+    private suspend fun rebaseCanonicalAuthoringPreflight(
+        configuration: AuthenticatedApiConfiguration,
+        authoritativeItems: List<CanonicalItemSnapshot>,
+    ) {
+        ensureConfigurationCurrent(configuration)
+        val receipt = try {
+            plannerStore.rebaseUnsubmittedCanonicalAuthoringBases(authoritativeItems)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalAuthoringResponseException(error)
+        } ?: throw LocalPlannerStorageException()
+        if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+        ensureConfigurationCurrent(configuration)
+    }
+
+    private fun hasQueuedMutationForAffectedParent(
+        mutation: PendingCanonicalAuthoringMutation,
+        response: CanonicalItemSnapshot,
+    ): Boolean {
+        val affectedParentIds = setOfNotNull(
+            mutation.baseItem?.parentId,
+            mutation.draft?.parentId,
+            response.parentId,
+        )
+        if (affectedParentIds.isEmpty()) return false
+        return plannerStore.state.value.pendingCanonicalAuthoringMutations.any { queued ->
+            queued.disposition == CanonicalAuthoringDisposition.PENDING &&
+                !queued.isSubmitted && queued.itemId in affectedParentIds
+        }
+    }
+
+    private suspend fun reconcileCanonicalAuthoringFromCache(
+        configuration: AuthenticatedApiConfiguration,
+        mutation: PendingCanonicalAuthoringMutation,
+    ): CanonicalAuthoringCacheResolution {
+        val state = plannerStore.state.value
+        val candidate = when (mutation.operation) {
+            CanonicalAuthoringOperation.CREATE -> state.canonicalItems.firstOrNull {
+                it.id == mutation.itemId
+            }
+            CanonicalAuthoringOperation.REPLACE,
+            CanonicalAuthoringOperation.RESTORE,
+            -> state.canonicalItems.firstOrNull {
+                it.id == mutation.itemId &&
+                    it.revision > requireNotNull(mutation.expectedRevision)
+            }
+            CanonicalAuthoringOperation.TRASH -> state.canonicalRecentlyDeleted.firstOrNull {
+                it.id == mutation.itemId &&
+                    it.revision > requireNotNull(mutation.expectedRevision)
+            }?.lastKnownItem?.takeIf { it.deletedAt != null }
+        } ?: return CanonicalAuthoringCacheResolution.NO_EVIDENCE
+        ensureConfigurationCurrent(configuration)
+        val receipt = try {
+            plannerStore.applyCanonicalAuthoringResponse(mutation, candidate)
+        } catch (_: IllegalArgumentException) {
+            persistCanonicalAuthoringConflict(
+                mutation,
+                "The canonical item now has different content or revision state. Review the " +
+                    "retained local change before copying or discarding it.",
+            )
+            return CanonicalAuthoringCacheResolution.CONFLICTED
+        } ?: throw LocalPlannerStorageException()
+        if (!receipt.awaitDurable()) throw LocalPlannerStorageException()
+        return CanonicalAuthoringCacheResolution.APPLIED
+    }
+
+    private suspend fun persistCanonicalAuthoringConflict(
+        mutation: PendingCanonicalAuthoringMutation,
+        diagnostic: String,
+    ) {
+        val receipt = try {
+            plannerStore.markCanonicalAuthoringConflict(mutation.id, diagnostic)
+        } catch (error: IllegalArgumentException) {
+            throw CanonicalConfigurationChangedException()
+        } ?: throw LocalPlannerStorageException()
+        if (!receipt.persistence.awaitDurable()) throw LocalPlannerStorageException()
+    }
+
+    private suspend fun sendCanonicalAuthoringMutation(
+        configuration: AuthenticatedApiConfiguration,
+        mutation: PendingCanonicalAuthoringMutation,
+    ): RemoteCanonicalItem = when (mutation.operation) {
+        CanonicalAuthoringOperation.CREATE -> transport.createItem(
+            configuration = configuration,
+            idempotencyKey = mutation.idempotencyKey,
+            request = requireNotNull(mutation.draft).toCreateCanonicalItemRequest(mutation.itemId),
+        )
+        CanonicalAuthoringOperation.REPLACE -> transport.replaceItem(
+            configuration = configuration,
+            id = mutation.itemId,
+            idempotencyKey = mutation.idempotencyKey,
+            request = ReplaceCanonicalItemRequest(
+                expectedRevision = requireNotNull(mutation.expectedRevision),
+                item = requireNotNull(mutation.draft).toCanonicalItemReplacement(mutation.itemId),
+            ),
+        )
+        CanonicalAuthoringOperation.TRASH -> transport.trashItem(
+            configuration = configuration,
+            id = mutation.itemId,
+            idempotencyKey = mutation.idempotencyKey,
+            expectedRevision = requireNotNull(mutation.expectedRevision),
+        )
+        CanonicalAuthoringOperation.RESTORE -> transport.restoreItem(
+            configuration = configuration,
+            id = mutation.itemId,
+            idempotencyKey = mutation.idempotencyKey,
+            request = CanonicalItemRevisionRequest(
+                expectedRevision = requireNotNull(mutation.expectedRevision),
+            ),
+        )
+    }
+
+    private fun CanonicalItemDraft.toCanonicalItemReplacement(
+        itemId: String,
+    ): CanonicalItemReplacement {
+        val value = normalized().also { it.requireValid(itemId) }
+        return CanonicalItemReplacement(
+            isSensitive = value.isSensitive,
+            kind = value.kind.name.lowercase(),
+            status = value.placement.wireValue,
+            title = value.title,
+            notes = value.notes,
+            timezoneName = value.timezoneName,
+            durationSeconds = value.durationSeconds,
+            deadlineAt = value.deadlineAt,
+            earliestStartAt = value.earliestStartAt,
+            recurrence = value.recurrence?.toCanonicalJson(),
+            flexibleConstraints = value.constraints.toCanonicalJson(
+                value.eventTiming,
+                value.durationSeconds,
+                value.timezoneName,
+            ),
+            splitPolicy = value.split.toCanonicalJson(value.durationSeconds),
+            importance = value.importance,
+            urgency = value.urgency,
+            parentId = value.parentId,
+            siblingOrder = value.siblingOrder,
+        )
+    }
+
+    private fun CanonicalItemDraft.toCreateCanonicalItemRequest(
+        itemId: String,
+    ): CreateCanonicalItemRequest {
+        val fields = toCanonicalItemReplacement(itemId)
+        return CreateCanonicalItemRequest(
+            id = itemId,
+            isSensitive = fields.isSensitive,
+            kind = fields.kind,
+            status = fields.status,
+            title = fields.title,
+            notes = fields.notes,
+            timezoneName = fields.timezoneName,
+            durationSeconds = fields.durationSeconds,
+            deadlineAt = fields.deadlineAt,
+            earliestStartAt = fields.earliestStartAt,
+            recurrence = fields.recurrence,
+            flexibleConstraints = fields.flexibleConstraints,
+            splitPolicy = fields.splitPolicy,
+            importance = fields.importance,
+            urgency = fields.urgency,
+            parentId = fields.parentId,
+            siblingOrder = fields.siblingOrder,
+        )
     }
 
     private suspend fun publishAcceptedSchedule(
@@ -1714,11 +2054,14 @@ class CanonicalSyncManager(
 
     private suspend fun loadDelta(
         configuration: AuthenticatedApiConfiguration,
+        forceCanonicalRebuild: Boolean = false,
     ): CanonicalDeltaSnapshot {
         val cached = plannerStore.state.value
         val sameBinding = cached.canonicalSyncOrigin == configuration.baseUrl.toString() &&
             cached.canonicalConfigurationId == configuration.configurationId
-        val firstCursor = cached.canonicalDeltaCursor.takeIf { sameBinding }
+        val firstCursor = cached.canonicalDeltaCursor.takeIf {
+            sameBinding && !forceCanonicalRebuild
+        }
         val initialItems = if (firstCursor == null) {
             emptyList()
         } else {
@@ -2569,6 +2912,8 @@ class CanonicalSyncManager(
         val configurationId = configuration.configurationId
         val hasCanonicalCache = current.canonicalSyncOrigin != null ||
             current.canonicalDeltaCursor != null || current.canonicalItems.isNotEmpty() ||
+            current.canonicalRecentlyDeleted.isNotEmpty() ||
+            current.pendingCanonicalAuthoringMutations.isNotEmpty() ||
             current.pendingCanonicalMutation != null ||
             current.publishedScheduleRevision != null
         val pendingPublicationMismatch = current.pendingSchedulePublication?.let { pending ->
@@ -2628,6 +2973,16 @@ class CanonicalSyncManager(
                 "This item changed on another client. Recompose to load its latest revision.",
                 CanonicalRefreshOutcome.STALE_REVISION,
             )
+            is PlannerApiException.CanonicalMutationInProgress -> Triple(
+                CanonicalSyncPhase.OFFLINE,
+                "The saved canonical change is still being committed. Its exact retry was kept.",
+                CanonicalRefreshOutcome.RETRYABLE_SERVER_FAILURE,
+            )
+            is PlannerApiException.CanonicalMutationRejected -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "The saved canonical change needs conflict review.",
+                CanonicalRefreshOutcome.STALE_REVISION,
+            )
             is PlannerApiException.Validation -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "The server rejected the canonical plan input (HTTP ${error.statusCode}).",
@@ -2637,6 +2992,7 @@ class CanonicalSyncManager(
             is RemotePlannerMappingException,
             is RemoteSnapshotChangedException,
             is SchedulePublicationContractException,
+            is CanonicalAuthoringResponseException,
             -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "The server planner contract is incompatible with this DayWeave build.",
@@ -2737,6 +3093,12 @@ class CanonicalSyncManager(
         val update: CanonicalPlanUpdate,
     )
 
+    private data class CanonicalAuthoringPushSummary(
+        val appliedCount: Int = 0,
+        val conflictedCount: Int = 0,
+        val deferredCount: Int = 0,
+    )
+
     private data class ParentTerminalResolution(
         val wireStatus: String,
         val displayStatus: ItemStatus,
@@ -2746,6 +3108,12 @@ class CanonicalSyncManager(
         NONE,
         APPLIED,
         SUPERSEDED,
+    }
+
+    private enum class CanonicalAuthoringCacheResolution {
+        NO_EVIDENCE,
+        APPLIED,
+        CONFLICTED,
     }
 
     private enum class TerminalProjectionResult {
@@ -2770,6 +3138,9 @@ class CanonicalSyncManager(
 
     private class SchedulePublicationContractException(cause: Throwable? = null) :
         IllegalArgumentException("Invalid schedule publication contract", cause)
+
+    private class CanonicalAuthoringResponseException(cause: Throwable? = null) :
+        IllegalArgumentException("Invalid canonical authoring response", cause)
 
     private class ReplayedSchedulePublicationNeedsFreshSnapshotException :
         IllegalStateException("Replayed schedule publication requires a fresh snapshot")
@@ -2915,7 +3286,10 @@ class CanonicalSyncManager(
             )
         }
 
-        private fun mapCanonicalItem(remote: RemoteCanonicalItem): CanonicalItemSnapshot {
+        private fun mapCanonicalItem(
+            remote: RemoteCanonicalItem,
+            requireActive: Boolean = true,
+        ): CanonicalItemSnapshot {
             validateUuid(remote.id)
             remote.parentId?.let(::validateUuid)
             val recurrenceJson = remote.recurrence?.toString()
@@ -2934,7 +3308,7 @@ class CanonicalSyncManager(
                 } == true ||
                 constraintsJson.toByteArray(Charsets.UTF_8).size > MAX_CONSTRAINT_BYTES ||
                 splitPolicyJson.length > 1_024 ||
-                remote.revision <= 0 || remote.deletedAt != null ||
+                remote.revision <= 0 || requireActive && remote.deletedAt != null ||
                 remote.importance !in 0..100 || remote.urgency !in 0..100 ||
                 remote.siblingOrder !in 0..1_000_000 ||
                 remote.durationSeconds?.let { it <= 0 || it > 366L * 24L * 60L * 60L } == true
@@ -2951,6 +3325,7 @@ class CanonicalSyncManager(
             val created = parseTimestamp(remote.createdAt)
             val updated = parseTimestamp(remote.updatedAt)
             remote.completedAt?.let(::parseTimestamp)
+            remote.deletedAt?.let(::parseTimestamp)
             if (
                 earliest != null && deadline != null && earliest >= deadline ||
                 created > updated

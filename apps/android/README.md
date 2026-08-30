@@ -1,6 +1,6 @@
 # DayWeave for Android
 
-Native Jetpack Compose client for `com.greengolddog.dayweave`. The current foundation includes the Today timeline, five-destination navigation, quick capture, active-session controls, assistant chat, and an authenticated proposal-only Suggestions Inbox.
+Native Jetpack Compose client for `com.greengolddog.dayweave`. The current client includes the Today timeline, five-destination navigation, canonical quick capture and detailed item authoring, active-session controls, assistant chat, and an authenticated Suggestions Inbox.
 
 Planner state, including the last server proposal cache, is stored offline in a Room database encrypted by SQLCipher. A random 256-bit database passphrase is AES-GCM wrapped by a non-exportable Android Keystore key; plaintext key material is never written to storage. Startup restores the last atomic snapshot, blocks edits until restore finishes, and autosaves subsequent intents through one serialized writer.
 
@@ -41,26 +41,38 @@ Android Keystore key; they are never placed in the Room planner snapshot, WorkMa
 or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from
 backup and device transfer.
 
-## Canonical authoring recovery foundation
+## Canonical authoring and recovery
 
-Android has a typed, encrypted local foundation for canonical create, replace, trash, and restore
-intent. Drafts cover task, habit, routine, goal, event, and break items; recurrence, fixed event
-timing, split policy, priority, privacy, and unbounded parent/child hierarchy are validated before
-an intent can enter the journal. Each request receives a stable idempotency identity and must be
-persisted before a future network layer may send it. Submitted uncertainty, conflicts, parent/child
-submission order, refresh overlays, and schedule-proof invalidation survive process death.
+Android has a typed, encrypted, offline-first path for canonical create, replace, trash, and restore
+intent. Quick capture writes title-only tasks, routines, goals, and breaks directly to Inbox after
+durable local persistence. Habits and events continue into the detailed editor so recurrence and
+exact timing are never guessed. The editor covers task, habit, routine, goal, event, and break
+items; recurrence, fixed event timing, split policy, priority, energy and spacing constraints,
+privacy, and unbounded parent/child hierarchy are validated before an intent can enter the journal.
+
+Inbox separates canonical Inbox, Planned, conflicts, and Recently Deleted while retaining older
+local review drafts. Accepted assistant/proposal drafts and older captures have a **Review as
+item** path that carries their title, context, and sensitivity into the typed editor; successful
+conversion atomically removes the review draft in the same encrypted generation that creates its
+canonical journal. Queued creates and replacements remain editable before submission; deletion
+requires confirmation; conflicts can be retained, discarded, or copied to a fresh standalone
+Inbox identity. Each network request receives a stable idempotency identity and is persisted before
+its first byte can leave the device. A successful local save schedules best-effort background sync
+without making network availability part of local success, and **Retry sync** remains explicit.
+Sync pulls an authoritative preflight snapshot, submits parent/child operations in dependency
+order, rebases unsent parent revisions after proven child-only hierarchy side effects, and accepts
+only an exact response matching the durable draft and expected revision. Ambiguous responses retain
+their byte-equivalent retry, whereas trusted deterministic conflicts—including an exact server
+not-found response after remote deletion—become visible review records. Submitted uncertainty,
+refresh overlays, and schedule-proof invalidation survive process death.
 
 Recently Deleted recovery bodies and the duplicate bases held by trash/restore journals expire
-after seven days, with separate count and byte limits. A local retention anchor prevents a future
+after 30 days, with separate count and byte limits. A local retention anchor prevents a future
 provider timestamp from extending that window; a quiet-process timer strips expired bodies and
 durably rewrites the encrypted snapshot even when the user does nothing. Minimal bodyless restore
 metadata and request identity remain available for safe replay, while sensitivity fails closed.
 Room 7-to-8 / JSON-v6-to-v7 is a rollback fence for this encrypted payload contract; no authoring
 content or provider credential is added to a plaintext database column.
-
-This slice intentionally exposes store and persistence APIs only. The Android editor and network
-transport must consume these APIs in a later slice rather than inventing a second draft or retry
-path.
 
 ## Sensitive-item authoring
 

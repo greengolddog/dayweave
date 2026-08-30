@@ -338,6 +338,175 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun createUsesFlatBodyIdempotencyHeaderAndExact201Status() = runBlocking {
+        server.enqueue(
+            MockResponse.Builder()
+                .code(201)
+                .addHeader("Content-Type", "application/json")
+                .body("""{"item":${itemJson()}}""")
+                .build(),
+        )
+        val request = createRequest()
+
+        val item = transport.createItem(
+            configuration(),
+            "android-item-33333333-3333-4333-8333-333333333333",
+            request,
+        )
+
+        assertEquals(TASK_ID, item.id)
+        val recorded = server.takeRequest()
+        assertEquals("POST", recorded.method)
+        assertEquals("/tenant/v1/items", recorded.url.encodedPath)
+        assertEquals(null, recorded.url.encodedQuery)
+        assertEquals(
+            "android-item-33333333-3333-4333-8333-333333333333",
+            recorded.headers["Idempotency-Key"],
+        )
+        val body = Json.parseToJsonElement(requireNotNull(recorded.body).utf8()) as JsonObject
+        assertEquals(TASK_ID, body["id"]?.jsonPrimitive?.content)
+        assertEquals("true", body["is_sensitive"]?.jsonPrimitive?.content)
+        assertEquals("planned", body["status"]?.jsonPrimitive?.content)
+        assertFalse("item" in body)
+
+        server.enqueue(jsonResponse("""{"item":${itemJson()}}"""))
+        val wrongStatus = assertThrows(PlannerApiException.Http::class.java) {
+            runBlocking {
+                transport.createItem(
+                    configuration(),
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    request,
+                )
+            }
+        }
+        assertEquals(200, wrongStatus.statusCode)
+    }
+
+    @Test
+    fun trashAndRestoreUseExactRevisionContracts() = runBlocking {
+        val trashed = itemJson()
+            .replace("\"revision\":7", "\"revision\":8")
+            .replace("\"deleted_at\":null", "\"deleted_at\":\"2026-09-01T07:05:00Z\"")
+        val restored = itemJson()
+            .replace("\"revision\":7", "\"revision\":9")
+            .replace(
+                "\"updated_at\":\"2026-08-29T10:00:00Z\"",
+                "\"updated_at\":\"2026-09-01T07:06:00Z\"",
+            )
+        server.enqueue(jsonResponse("""{"item":$trashed}"""))
+        server.enqueue(jsonResponse("""{"item":$restored}"""))
+        val key = "android-item-33333333-3333-4333-8333-333333333333"
+
+        assertEquals(8L, transport.trashItem(configuration(), TASK_ID, key, 7).revision)
+        assertEquals(
+            9L,
+            transport.restoreItem(
+                configuration(),
+                TASK_ID,
+                key,
+                CanonicalItemRevisionRequest(8),
+            ).revision,
+        )
+
+        val deletion = server.takeRequest()
+        assertEquals("DELETE", deletion.method)
+        assertEquals("/tenant/v1/items/$TASK_ID", deletion.url.encodedPath)
+        assertEquals("expected_revision=7", deletion.url.encodedQuery)
+        assertEquals(key, deletion.headers["Idempotency-Key"])
+        assertEquals(0L, deletion.bodySize)
+        val restoration = server.takeRequest()
+        assertEquals("POST", restoration.method)
+        assertEquals("/tenant/v1/items/$TASK_ID/restore", restoration.url.encodedPath)
+        assertEquals(null, restoration.url.encodedQuery)
+        assertEquals(key, restoration.headers["Idempotency-Key"])
+        val body = Json.parseToJsonElement(requireNotNull(restoration.body).utf8()) as JsonObject
+        assertEquals(setOf("expected_revision"), body.keys)
+        assertEquals(8L, body["expected_revision"]?.jsonPrimitive?.content?.toLong())
+    }
+
+    @Test
+    fun canonicalConflictTrustRequiresExactServerEnvelopeAndNoStoreHeaders() {
+        val noEffect = """{"error":{"code":"conflict","message":"an item with active children cannot be deleted"}}"""
+        server.enqueue(trustedConflict(noEffect))
+        assertThrows(PlannerApiException.CanonicalMutationRejected::class.java) {
+            runBlocking {
+                transport.trashItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    7,
+                )
+            }
+        }
+
+        server.enqueue(
+            trustedConflict(
+                """{"error":{"code":"conflict","message":"matching idempotent request is still in progress"}}""",
+            ),
+        )
+        assertThrows(PlannerApiException.CanonicalMutationInProgress::class.java) {
+            runBlocking {
+                transport.trashItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    7,
+                )
+            }
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(409)
+                .addHeader("Content-Type", "application/json")
+                .body(noEffect)
+                .build(),
+        )
+        assertThrows(PlannerApiException.Conflict::class.java) {
+            runBlocking {
+                transport.trashItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    7,
+                )
+            }
+        }
+
+        val missing = """{"error":{"code":"not_found","message":"item was not found"}}"""
+        server.enqueue(trustedError(404, missing))
+        assertThrows(PlannerApiException.CanonicalMutationRejected::class.java) {
+            runBlocking {
+                transport.replaceItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    ReplaceCanonicalItemRequest(7, createRequest().toReplacement()),
+                )
+            }
+        }
+
+        server.enqueue(
+            MockResponse.Builder()
+                .code(404)
+                .addHeader("Content-Type", "application/json")
+                .body(missing)
+                .build(),
+        )
+        val untrusted = assertThrows(PlannerApiException.Http::class.java) {
+            runBlocking {
+                transport.trashItem(
+                    configuration(),
+                    TASK_ID,
+                    "android-item-33333333-3333-4333-8333-333333333333",
+                    7,
+                )
+            }
+        }
+        assertEquals(404, untrusted.statusCode)
+    }
+
+    @Test
     fun missingCurrentSensitivityFieldFailsClosed() {
         val current = Json.parseToJsonElement(itemJson()) as JsonObject
         val missing = JsonObject(current - "is_sensitive").toString()
@@ -376,6 +545,58 @@ class OkHttpCanonicalPlannerTransportTest {
         .addHeader("Content-Type", "application/json")
         .body(body)
         .build()
+
+    private fun trustedConflict(body: String): MockResponse = MockResponse.Builder()
+        .code(409)
+        .addHeader("Content-Type", "application/json; charset=utf-8")
+        .addHeader("Cache-Control", "no-store, max-age=0")
+        .addHeader("Pragma", "no-cache")
+        .body(body)
+        .build()
+
+    private fun trustedError(status: Int, body: String): MockResponse = MockResponse.Builder()
+        .code(status)
+        .addHeader("Content-Type", "application/json; charset=utf-8")
+        .addHeader("Cache-Control", "no-store, max-age=0")
+        .addHeader("Pragma", "no-cache")
+        .body(body)
+        .build()
+
+    private fun createRequest() = CreateCanonicalItemRequest(
+        id = TASK_ID,
+        isSensitive = true,
+        kind = "task",
+        status = "planned",
+        title = "Compose Android timeline",
+        notes = "Server-owned canonical task",
+        timezoneName = "Europe/Madrid",
+        durationSeconds = 3_600,
+        deadlineAt = "2026-09-01T12:00:00Z",
+        flexibleConstraints = buildJsonObject { put("energy", "deep") },
+        splitPolicy = buildJsonObject { put("type", "indivisible") },
+        importance = 80,
+        urgency = 60,
+        siblingOrder = 0,
+    )
+
+    private fun CreateCanonicalItemRequest.toReplacement() = CanonicalItemReplacement(
+        isSensitive = isSensitive,
+        kind = kind,
+        status = status,
+        title = title,
+        notes = notes,
+        timezoneName = timezoneName,
+        durationSeconds = durationSeconds,
+        deadlineAt = deadlineAt,
+        earliestStartAt = earliestStartAt,
+        recurrence = recurrence,
+        flexibleConstraints = flexibleConstraints,
+        splitPolicy = splitPolicy,
+        importance = importance,
+        urgency = urgency,
+        parentId = parentId,
+        siblingOrder = siblingOrder,
+    )
 
     private fun itemJson(): String = """
         {

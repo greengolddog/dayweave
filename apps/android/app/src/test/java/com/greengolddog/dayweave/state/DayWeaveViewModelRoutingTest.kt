@@ -67,6 +67,35 @@ class DayWeaveViewModelRoutingTest {
         assertEquals(false, refreshed)
     }
 
+    @Test
+    fun durableCanonicalAuthoringSchedulesBackgroundSyncWithoutChangingLocalSuccess() = runBlocking {
+        val calls = mutableListOf<String>()
+
+        val saved = persistCanonicalAuthoringThenScheduleSync(
+            persist = {
+                calls += "persist"
+                true
+            },
+            scheduleSync = { calls += "sync" },
+        )
+
+        assertEquals(true, saved)
+        assertEquals(listOf("persist", "sync"), calls)
+    }
+
+    @Test
+    fun failedCanonicalAuthoringDoesNotStartSync() = runBlocking {
+        var syncScheduled = false
+
+        val saved = persistCanonicalAuthoringThenScheduleSync(
+            persist = { false },
+            scheduleSync = { syncScheduled = true },
+        )
+
+        assertEquals(false, saved)
+        assertEquals(false, syncScheduled)
+    }
+
     private fun block(id: String, canonicalItemId: String?) = ScheduleItem(
         id = id,
         title = id,
