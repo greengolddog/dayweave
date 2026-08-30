@@ -97,10 +97,15 @@ Codable planner snapshot or application diagnostics.
 
 The Inbox fetches pending proposals and supports refresh, edit, accept, and
 reject with the proposal's optimistic `expected_revision`. Remote proposals
-remain a separate, in-memory review feed. Accepting one records the decision at
-the API and intentionally does **not** create or mutate a schedule block. Local
-suggestions and all local planning remain available when the API is absent or
-offline, with the last request state shown in the Inbox.
+remain a separate, in-memory review feed. Accepting an ordinary advisory
+proposal records the decision at the API and intentionally does **not** create
+or mutate a schedule block. A supported
+`dayweave.proposal-change-set/1` proposal instead exposes a complete exact-diff
+review, explicit content-bound approval, transactional apply receipt, and
+bounded undo. Its exact non-secret mutation request is persisted before send
+and recovered before canonical or execution synchronization may continue.
+Local suggestions and all local planning remain available when the API is
+absent or offline, with the last request state shown in the Inbox.
 
 The same authenticated configuration powers canonical planner sync. A sync:
 
@@ -238,7 +243,10 @@ Keychain. Coverage includes contract decoding, authenticated request shape,
 revision-guarded actions, structured errors, origin-bound credential lifecycle,
 interrupted configuration updates, legacy-token refusal, configuration separation,
 offline behavior, restore-failure mutation gating, and the invariant that a
-remote approval leaves the schedule unchanged. Canonical coverage adds stale
+legacy remote approval leaves the schedule unchanged. Transactional proposal
+coverage separately exercises exact preview approval, encrypted apply/undo
+journals, lost-result recovery, content-free receipts, shared mutation fences,
+and canonical reconciliation. Canonical coverage adds stale
 cursor and multipage recovery, tombstones, credential snapshots, exact integer
 JSON, fail-closed replacement, conflict retention, recurrence correction and
 rollup, conservative pinning, transitive hierarchy order, encrypted schema

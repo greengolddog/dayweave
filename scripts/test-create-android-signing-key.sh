@@ -89,3 +89,4 @@ if [[ -e "${lexical_candidate}" || -L "${lexical_candidate}" ]]; then
 fi
 
 echo "Android signing containment regression: PASS"
+"${repo_root}/scripts/test-build-android-signing-boundary.sh"

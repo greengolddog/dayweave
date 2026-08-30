@@ -82,7 +82,7 @@ export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
 ./gradlew testDebugUnitTest lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
 ```
 
-The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signed minified release is produced with `scripts/build-android-apk.sh`, using the private external signing properties created by `scripts/create-android-signing-key.sh`. The generator rejects lexical or symlink-resolved destinations inside the repository and its Git metadata before invoking any private-key tool.
+The debug APK is written to `app/build/outputs/apk/debug/app-debug.apk`. A signed minified release is produced with `scripts/build-android-apk.sh`, using the private external signing properties created by `scripts/create-android-signing-key.sh`. The generator rejects lexical or symlink-resolved destinations inside the repository and its Git metadata before invoking any private-key tool. The build entry point independently applies that same boundary to both the properties file and its Java-properties-decoded `storeFile`, and requires each input to be a regular, single-link, non-symlink file with mode `0600` before Gradle can run.
 
 The supported floor is Android 9 / API 28, so the direct-download release APK intentionally uses APK Signature Scheme v3 only. Gradle disables v1, v2, and the uncopied v4 sidecar; the release script runs verbose `apksigner` verification before copying `dist/android/DayWeave-release.apk`. Release acceptance requires v3 `true`, v1/v2 `false`, and exactly one signer in that output.
 
@@ -197,7 +197,20 @@ For the device smoke test, start an API 35 emulator or connect the Pixel with US
 
 ## Safety boundary
 
-Accepting a ChatGPT, Codex, or in-app assistant proposal first records the revision-aware API decision and then creates a reviewable Inbox draft. It never mutates the schedule. On the next refresh, any accepted server proposal is reconciled idempotently into a draft, so an interrupted client response cannot bypass review or lose the accepted proposal locally.
+Accepting an ordinary advisory ChatGPT, Codex, or in-app assistant proposal
+first records the revision-aware API decision and then creates a reviewable
+Inbox draft. It never mutates the schedule. On the next refresh, any such
+accepted server proposal is reconciled idempotently into a draft, so an
+interrupted client response cannot bypass review or lose the accepted proposal
+locally.
+
+A supported `dayweave.proposal-change-set/1` proposal uses a separate fail-closed
+path: Android validates and displays every exact direct and implicit changed
+value, binds explicit approval to the proposal revision plus preview ID/hash,
+persists the exact non-secret apply or undo request before network I/O, and
+stores only a content-free receipt. Unknown reserved schema versions cannot use
+legacy acceptance. An uncertain result blocks canonical/execution mutation
+until authoritative lookup or exact idempotent replay resolves it.
 
 A refresh or proposal mutation reports success only after the exact replaced/reconciled planner generation has completed its encrypted Room save. That acknowledgement is limited to server sync; ordinary UI intents remain non-blocking and are serialized by the same writer.
 

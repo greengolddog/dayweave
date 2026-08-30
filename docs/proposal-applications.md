@@ -1,6 +1,6 @@
 # Transactional AI proposal applications
 
-Status: implemented PostgreSQL contract
+Status: implemented PostgreSQL and native-client contract
 Schema: `dayweave.proposal-change-set/1`
 
 DayWeave treats AI output as a proposal, never as authority to mutate canonical
@@ -169,6 +169,61 @@ timestamps. Canonical revisions and audit timestamps advance rather than
 rewinding history. The item changes, derived parent refreshes, fences, audit,
 outbox, idempotency receipt, and `applied` to `undone` transition commit
 together.
+
+## Native review and recovery contract
+
+The macOS and Android clients expose the same single-proposal review workflow.
+They accept ordinary advisory suggestions only as editable Inbox drafts. A
+payload in the reserved `dayweave.proposal-change-set/*` namespace cannot use
+that legacy path: version 1 must pass the transactional workflow, and an
+unknown reserved version remains visible but fails closed until the client is
+updated.
+
+Each client independently validates the complete preview response and derives
+the material changed-field set from every before/after pair. Approval displays
+the exact values of all twenty material fields for direct changes and implicit
+hierarchy changes, together with identifiable before/after item snapshots,
+risks, and conflicts. Sensitive values are concealed until the user explicitly
+reveals them for that review. Reviews remain memory-only and are invalidated on
+expiry, authenticated configuration changes, and app privacy boundaries.
+
+The approval value is bound to the proposal ID and expected revision plus the
+preview ID and review hash. A Boolean confirmation, an approval from another
+window or screen, or an approval retained after a newer review is not
+sufficient. Conflicted or expired previews cannot be applied; the clients offer
+an explicit regeneration path.
+
+Before the first apply or undo byte leaves the device, the client durably saves
+the following non-secret recovery evidence inside its encrypted planner store:
+
+- the authenticated API origin and opaque configuration identifier;
+- the proposal/application revision and ordered command IDs;
+- the preview ID and review hash for apply, or application ID and revision for
+  undo;
+- one idempotency key; and
+- the exact validated URL, headers, body bytes, and body digest.
+
+Authorization credentials are never copied into that journal. If the journal
+cannot be persisted, nothing is sent. Canonical synchronization, execution
+commands, schedule publication, another proposal mutation, and credential
+replacement share the same mutation fence while an outcome is uncertain.
+
+Recovery first queries the authoritative application receipt by proposal or
+application ID. Only an exact match commits the local content-free receipt. If
+the server proves that no application exists, the client may replay the exact
+saved body with the same idempotency key. Generic HTTP failures, malformed or
+version-skewed responses, and `already_applied` never discard uncertainty.
+Only a strictly validated, operation-specific conflict that proves no mutation
+could have happened may clear the journal. A successful apply or undo then
+refreshes canonical items and the composed schedule. Interrupted foreground
+startup recovery resumes the execution-refresh, canonical-sync, and polling
+sequence before normal synchronization continues.
+
+Durable local receipts contain identifiers, revisions, status, command and
+affected-item IDs, and timestamps, but no proposal or item content. They are
+configuration-bound and preserve the server's bounded undo deadline. Reset,
+sign-out, app-lock, and configuration flows cannot silently rebind an uncertain
+request or expose a cached sensitive review.
 
 ## Provider-managed boundary
 

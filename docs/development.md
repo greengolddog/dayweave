@@ -17,7 +17,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 swift build --package-path apps/macos
-swift test --package-path apps/macos
+./scripts/test-macos.sh -Xswiftc -warnings-as-errors
 apps/android/gradlew --project-dir apps/android test lint assembleDebug
 python3 -B scripts/test-repository-credential-scanner.py
 python3 -B scripts/scan-repository-credentials.py all
@@ -44,8 +44,21 @@ scripts/build-macos-app.sh
 open dist/macos/DayWeave.app
 ```
 
-The output uses an ad-hoc signature because no Apple Developer membership is in
-scope. Do not mistake that for notarization.
+The script verifies the pinned Codex runtime and final signatures, then writes
+both `dist/macos/DayWeave.app` and an integrity-tested
+`dist/macos/DayWeave-macOS.zip` with a SHA-256 checksum. Both outputs are
+ignored by Git.
+
+The outer app uses an ad-hoc signature because no Apple Developer membership is
+in scope. It is suitable for a trusted build made and launched by the same Mac
+user, but it is neither notarized nor a stable automatic-update identity. Keep
+the app owned by the launching user; a `sudo` copy can make the embedded Codex
+runtime fail its owner check. If macOS quarantines a transferred ZIP or app,
+first verify its checksum and source, then use **Control-click → Open** (or
+**System Settings → Privacy & Security → Open Anyway**) for that exact copy.
+Do not broadly remove quarantine metadata. Back up planner data before replacing
+an ad-hoc build because Keychain continuity across changing ad-hoc identities is
+not yet a release guarantee.
 
 Create the private Android release key once, outside the repository, then build
 the signed direct-install APK with:
@@ -63,7 +76,12 @@ APK signature, and writes the ignored artifact to
 `dist/android/DayWeave-release.apk`. Signing material and generated binaries
 must never be committed. The generator rejects both lexically in-worktree paths
 and external paths that resolve through a symlink into the worktree or its Git
-metadata before it invokes OpenSSL or `keytool`.
+metadata before it invokes OpenSSL or `keytool`. The build script repeats this
+check before Gradle for its properties file and the referenced keystore,
+including linked-worktree Git and common directories; both inputs must remain
+regular, single-link, non-symlink files with mode `0600`. The signing
+containment regression uses only synthetic temporary files and refuses the
+unsafe paths before any Gradle or signing command can run.
 
 ## Local API
 

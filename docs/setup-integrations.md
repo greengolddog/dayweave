@@ -365,7 +365,12 @@ command, file-change, and approval requests are denied. A reply may include a
 strict bounded change-proposal envelope, but DayWeave can only route valid entries
 to the local Suggestions Inbox through an app-owned router. The conversation
 controller never mutates `PlannerStore` directly, and accepting a proposal
-currently records the review decision without changing the schedule.
+from this session-local embedded-Codex route currently records the review
+decision without changing the schedule. Separately, a server-backed
+`dayweave.proposal-change-set/1` suggestion can be simulated, reviewed field by
+field, explicitly approved, applied atomically, and undone through the native
+device workflow documented in
+[proposal-applications.md](proposal-applications.md).
 Chat requires a signed-in ChatGPT account and network access; there is no offline
 model fallback.
 

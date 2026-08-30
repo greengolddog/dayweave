@@ -6,6 +6,7 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 package_dir="${repo_root}/apps/macos"
 output_root="${repo_root}/dist/macos"
 app_dir="${output_root}/DayWeave.app"
+archive_path="${output_root}/DayWeave-macOS.zip"
 runtime_version="0.150.1"
 runtime_source="/opt/homebrew/Caskroom/codex/${runtime_version}/bin/codex"
 runtime_contract="${repo_root}/vendor/codex-app-server/${runtime_version}"
@@ -67,4 +68,11 @@ if [[ -e "${previous_app}" || -L "${previous_app}" ]]; then
     rm -rf -- "${previous_app}"
 fi
 
+archive_candidate="${build_root}/DayWeave-macOS.zip"
+ditto -c -k --sequesterRsrc --keepParent "${app_dir}" "${archive_candidate}"
+unzip -tq "${archive_candidate}"
+mv -f "${archive_candidate}" "${archive_path}"
+
 echo "Built ${app_dir}"
+shasum -a 256 "${archive_path}"
+echo "Built and verified ${archive_path}"

@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "${script_dir}/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "${script_dir}/.." && pwd -P)"
 android_dir="${repo_root}/apps/android"
 output_dir="${repo_root}/dist/android"
 output_apk="${output_dir}/DayWeave-release.apk"
@@ -11,15 +11,17 @@ config_base="${XDG_CONFIG_HOME:-${HOME:?HOME is required}/.config}"
 default_properties="${config_base}/dayweave/android-signing/release-signing.properties"
 signing_properties="${DAYWEAVE_ANDROID_SIGNING_PROPERTIES:-${default_properties}}"
 
-if [[ ! -f "${signing_properties}" || -L "${signing_properties}" ]]; then
-  echo "Signing properties must be a regular, non-symlink file: ${signing_properties}" >&2
-  echo "Run scripts/create-android-signing-key.sh once if no private key exists." >&2
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required." >&2
   exit 1
 fi
-if [[ "$(stat -f '%Lp' "${signing_properties}")" != "600" ]]; then
-  echo "Signing properties must have mode 0600." >&2
-  exit 1
+if [[ "${signing_properties}" != /* ]]; then
+  signing_properties="${PWD}/${signing_properties}"
 fi
+python3 "${script_dir}/check-android-signing-boundary.py" \
+  --repo-root "${repo_root}" \
+  --properties "${signing_properties}" \
+  --keystore-base "${android_dir}/app"
 
 android_sdk_root="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 if [[ -z "${android_sdk_root}" || ! -d "${android_sdk_root}/build-tools" ]]; then
