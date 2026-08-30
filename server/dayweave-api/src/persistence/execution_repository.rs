@@ -217,7 +217,7 @@ async fn apply_command_transaction(
             return Err(ExecutionRepositoryError::ActiveSessionConflict);
         }
         lock_workspace_items(transaction, workspace_id).await?;
-        validate_start_item(
+        let execution_epoch = validate_start_item(
             transaction,
             workspace_id,
             input.item_id,
@@ -227,9 +227,9 @@ async fn apply_command_transaction(
         if session_exists(transaction, input.session_id).await? {
             return Err(ExecutionRepositoryError::DuplicateSession(input.session_id));
         }
-        validate_start_schedule(transaction, workspace_id, active_session_id, input).await?;
+        validate_start_schedule(transaction, workspace_id, execution_epoch, input).await?;
         let session = ExecutionSession::start_with_protocol_time(input, transition_at, observed_at);
-        insert_session(transaction, workspace_id, &session).await?;
+        insert_session(transaction, workspace_id, execution_epoch, &session).await?;
         return Ok(session);
     }
 
@@ -240,76 +240,87 @@ async fn apply_command_transaction(
     let current = fetch_session_transaction(transaction, workspace_id, requested_id).await?;
     let updated = current.apply_with_protocol_time(command, transition_at, observed_at)?;
     update_session(transaction, workspace_id, &updated).await?;
+    if matches!(command, ExecutionCommand::Defer(_)) {
+        insert_defer_replacement_claim(transaction, workspace_id, &updated).await?;
+    }
     Ok(updated)
 }
 
 async fn validate_start_schedule(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
-    active_session_id: Option<Uuid>,
+    execution_epoch: i64,
     input: &crate::execution::StartExecution,
 ) -> Result<(), ExecutionRepositoryError> {
-    let head = sqlx::query(
-        "SELECT id, state, move_start, move_end FROM execution_sessions \
-         WHERE workspace_id = $1 AND item_id = $2 AND item_revision = $3 \
-         AND occurrence_id IS NOT DISTINCT FROM $4 AND session_index = $5 \
-         ORDER BY CASE WHEN id = $6 THEN 1 ELSE 0 END DESC, updated_at DESC, id DESC \
-         LIMIT 1 FOR SHARE",
+    let physical = sqlx::query(
+        "SELECT reservation_kind, source_deferred_session_id \
+         FROM execution_physical_indices WHERE workspace_id = $1 AND item_id = $2 \
+         AND occurrence_id IS NOT DISTINCT FROM $3 AND session_index = $4 FOR SHARE",
     )
     .bind(workspace_id)
     .bind(input.item_id)
-    .bind(revision_to_i64(input.item_revision)?)
     .bind(input.occurrence_id)
     .bind(i32::from(input.session_index))
-    .bind(active_session_id)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(internal)?;
-    let Some(head) = head else {
-        // Legacy first execution of a semantic slot does not need a schedule attestation.
+    let Some(physical) = physical else {
+        // Passive compatibility is restricted to a genuinely unused physical
+        // index. The Start trigger reserves it before the transaction commits.
         return Ok(());
     };
-    let state: String = head.try_get("state").map_err(internal)?;
-    if matches!(state.as_str(), "active" | "paused") {
-        return Err(ExecutionRepositoryError::ActiveSessionConflict);
-    }
-    if matches!(state.as_str(), "completed" | "skipped") {
+    let reservation_kind: String = physical.try_get("reservation_kind").map_err(internal)?;
+    let source_deferred_session_id: Option<Uuid> = physical
+        .try_get("source_deferred_session_id")
+        .map_err(internal)?;
+    if reservation_kind != "defer_replacement" || source_deferred_session_id.is_none() {
         return Err(ExecutionRepositoryError::ScheduleStale);
     }
-    if state != "deferred" {
-        return Err(ExecutionRepositoryError::Internal);
-    }
-
     let Some(planned_block_id) = input.planned_block_id else {
         return Err(ExecutionRepositoryError::ScheduleStale);
     };
-    let deferred_execution_session_id: Uuid = head.try_get("id").map_err(internal)?;
-    let move_start: DateTime<Utc> = head.try_get("move_start").map_err(internal)?;
-    let move_end: DateTime<Utc> = head.try_get("move_end").map_err(internal)?;
+    let source_deferred_session_id =
+        source_deferred_session_id.ok_or(ExecutionRepositoryError::Internal)?;
     let attested: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM schedule_deferred_placements AS placement \
-         JOIN schedule_revisions AS revision \
-           ON revision.workspace_id = placement.workspace_id \
-          AND revision.id = placement.schedule_revision_id \
-         WHERE placement.workspace_id = $1 \
-           AND placement.deferred_execution_session_id = $2 \
-           AND placement.source_block_id = $3 \
-           AND placement.item_id = $4 \
-           AND placement.item_revision = $5 \
-           AND placement.occurrence_id IS NOT DISTINCT FROM $6 \
-           AND placement.session_index = $7 \
-           AND placement.move_start = $8 AND placement.move_end = $9 \
-           AND revision.state IN ('published', 'superseded'))",
+        "SELECT EXISTS ( \
+           SELECT 1 FROM execution_defer_replacement_claims AS claim \
+           JOIN schedule_defer_replacement_placements AS placement \
+             ON placement.workspace_id = claim.workspace_id \
+            AND placement.source_deferred_session_id = claim.source_deferred_session_id \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = placement.workspace_id \
+            AND revision.id = placement.schedule_revision_id \
+           JOIN schedule_blocks AS block \
+             ON block.workspace_id = placement.workspace_id \
+            AND block.schedule_revision_id = placement.schedule_revision_id \
+            AND block.source_block_id = placement.source_block_id \
+           WHERE claim.workspace_id = $1 AND claim.source_deferred_session_id = $2 \
+             AND claim.actionable AND claim.item_id = $3 AND claim.execution_epoch = $4 \
+             AND claim.occurrence_id IS NOT DISTINCT FROM $5 \
+             AND claim.replacement_session_index = $6 \
+             AND placement.source_block_id = $7 AND placement.item_id = $3 \
+             AND placement.item_revision = $8 AND placement.execution_epoch = $4 \
+             AND placement.occurrence_id IS NOT DISTINCT FROM $5 \
+             AND placement.replacement_session_index = $6 \
+             AND placement.remaining_duration_seconds = claim.remaining_duration_seconds \
+             AND placement.move_start = claim.move_start AND placement.move_end = claim.move_end \
+             AND revision.state = 'published' AND block.item_id = $3 \
+             AND block.starts_at = claim.move_start AND block.ends_at = claim.move_end \
+             AND EXTRACT(EPOCH FROM (block.ends_at - block.starts_at)) \
+                   = claim.remaining_duration_seconds::numeric \
+             AND NOT EXISTS (SELECT 1 FROM execution_defer_replacement_consumptions AS consumed \
+               WHERE consumed.workspace_id = claim.workspace_id \
+                 AND consumed.source_deferred_session_id = claim.source_deferred_session_id) \
+         )",
     )
     .bind(workspace_id)
-    .bind(deferred_execution_session_id)
-    .bind(planned_block_id)
+    .bind(source_deferred_session_id)
     .bind(input.item_id)
-    .bind(revision_to_i64(input.item_revision)?)
+    .bind(execution_epoch)
     .bind(input.occurrence_id)
     .bind(i32::from(input.session_index))
-    .bind(move_start)
-    .bind(move_end)
+    .bind(planned_block_id)
+    .bind(revision_to_i64(input.item_revision)?)
     .fetch_one(&mut **transaction)
     .await
     .map_err(internal)?;
@@ -471,9 +482,10 @@ async fn validate_start_item(
     workspace_id: Uuid,
     item_id: Uuid,
     expected_revision: u64,
-) -> Result<(), ExecutionRepositoryError> {
+) -> Result<i64, ExecutionRepositoryError> {
     let row = sqlx::query(
-        "SELECT revision, status, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        "SELECT revision, execution_epoch, status, trashed_at FROM items \
+         WHERE workspace_id = $1 AND id = $2",
     )
     .bind(workspace_id)
     .bind(item_id)
@@ -482,6 +494,10 @@ async fn validate_start_item(
     .map_err(internal)?
     .ok_or(ExecutionRepositoryError::ItemNotExecutable)?;
     let revision = positive_revision(row.try_get("revision").map_err(internal)?)?;
+    let execution_epoch: i64 = row.try_get("execution_epoch").map_err(internal)?;
+    if execution_epoch <= 0 {
+        return Err(ExecutionRepositoryError::Internal);
+    }
     if revision != expected_revision {
         return Err(ExecutionRepositoryError::ItemRevisionConflict);
     }
@@ -504,8 +520,171 @@ async fn validate_start_item(
     {
         Err(ExecutionRepositoryError::ItemNotExecutable)
     } else {
-        Ok(())
+        Ok(execution_epoch)
     }
+}
+
+async fn insert_defer_replacement_claim(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    session: &ExecutionSession,
+) -> Result<(), ExecutionRepositoryError> {
+    let evidence = sqlx::query(
+        "SELECT session.execution_epoch, origin.planned_duration_seconds \
+         FROM execution_sessions AS session \
+         LEFT JOIN execution_session_schedule_origins AS origin \
+           ON origin.workspace_id = session.workspace_id \
+          AND origin.execution_session_id = session.id \
+         WHERE session.workspace_id = $1 AND session.id = $2",
+    )
+    .bind(workspace_id)
+    .bind(session.id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let execution_epoch: i64 = evidence.try_get("execution_epoch").map_err(internal)?;
+    if execution_epoch <= 0 {
+        return Err(ExecutionRepositoryError::Internal);
+    }
+    let origin_duration: Option<i64> = evidence
+        .try_get("planned_duration_seconds")
+        .map_err(internal)?;
+    let move_start = session
+        .move_start
+        .ok_or(ExecutionRepositoryError::Internal)?;
+    let move_end = session.move_end.ok_or(ExecutionRepositoryError::Internal)?;
+    let move_duration = exact_window_seconds(move_start, move_end)?;
+    let actual_seconds = seconds_to_i64(
+        session
+            .actual_seconds
+            .ok_or(ExecutionRepositoryError::Internal)?,
+    )?;
+    let (planned_duration, duration_source, consumed_by_source) =
+        if let Some(planned_duration) = origin_duration {
+            if planned_duration <= 0 {
+                return Err(ExecutionRepositoryError::Internal);
+            }
+            (
+                planned_duration,
+                "published_origin",
+                actual_seconds.min(planned_duration),
+            )
+        } else {
+            (move_duration, "legacy_move_window", 0)
+        };
+    let remaining_duration = planned_duration
+        .checked_sub(consumed_by_source)
+        .ok_or(ExecutionRepositoryError::Internal)?;
+    if origin_duration.is_some() && (remaining_duration <= 0 || remaining_duration != move_duration)
+    {
+        return Err(ExecutionRepositoryError::DeferDurationConflict);
+    }
+
+    let replacement_session_index = next_replacement_session_index(
+        transaction,
+        workspace_id,
+        session.item_id,
+        session.occurrence_id,
+    )
+    .await?;
+
+    let inserted = sqlx::query(
+        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
+         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
+         occurrence_id, source_session_index, replacement_session_index, \
+         planned_duration_seconds, planned_duration_source, actionable, consumed_before_seconds, \
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, 0, $11, $12, $13, $14, $15)",
+    )
+    .bind(workspace_id)
+    .bind(session.id)
+    .bind(session.item_id)
+    .bind(revision_to_i64(session.item_revision)?)
+    .bind(execution_epoch)
+    .bind(session.occurrence_id)
+    .bind(i32::from(session.session_index))
+    .bind(replacement_session_index)
+    .bind(planned_duration)
+    .bind(duration_source)
+    .bind(consumed_by_source)
+    .bind(remaining_duration)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(session.updated_at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .rows_affected();
+    if inserted == 1 {
+        Ok(())
+    } else {
+        Err(ExecutionRepositoryError::Internal)
+    }
+}
+
+async fn next_replacement_session_index(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+) -> Result<i32, ExecutionRepositoryError> {
+    let high_water: i32 = sqlx::query_scalar(
+        "WITH current_published_block_indices AS ( \
+           SELECT CASE \
+             WHEN block.constraint_snapshot ->> 'session_index' ~ '^[0-9]+$' \
+              AND (block.constraint_snapshot ->> 'session_index')::numeric \
+                    BETWEEN 0 AND 65535 \
+             THEN (block.constraint_snapshot ->> 'session_index')::integer \
+           END AS session_index \
+           FROM schedule_blocks AS block \
+           JOIN schedule_revisions AS revision \
+             ON revision.workspace_id = block.workspace_id \
+            AND revision.id = block.schedule_revision_id \
+           WHERE revision.workspace_id = $1 AND revision.state = 'published' \
+             AND block.item_id = $2 \
+             AND block.constraint_snapshot ->> 'occurrence_id' \
+                 IS NOT DISTINCT FROM $3::uuid::text \
+         ) \
+         SELECT GREATEST( \
+           COALESCE((SELECT MAX(session_index) FROM execution_physical_indices \
+                     WHERE workspace_id = $1 AND item_id = $2 \
+                       AND occurrence_id IS NOT DISTINCT FROM $3), -1), \
+           COALESCE((SELECT MAX(session_index) \
+                     FROM current_published_block_indices), -1) \
+         )",
+    )
+    .bind(workspace_id)
+    .bind(item_id)
+    .bind(occurrence_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    if high_water >= i32::from(u16::MAX) {
+        return Err(ExecutionRepositoryError::IndexExhausted);
+    }
+    high_water
+        .checked_add(1)
+        .ok_or(ExecutionRepositoryError::IndexExhausted)
+}
+
+fn exact_window_seconds(
+    move_start: DateTime<Utc>,
+    move_end: DateTime<Utc>,
+) -> Result<i64, ExecutionRepositoryError> {
+    let microseconds = move_end
+        .signed_duration_since(move_start)
+        .num_microseconds()
+        .ok_or(ExecutionRepositoryError::Internal)?;
+    if microseconds <= 0 {
+        return Err(ExecutionRepositoryError::Internal);
+    }
+    if microseconds % 1_000_000 != 0 {
+        return Err(ExecutionRepositoryError::DeferDurationConflict);
+    }
+    microseconds
+        .checked_div(1_000_000)
+        .filter(|seconds| *seconds > 0)
+        .ok_or(ExecutionRepositoryError::Internal)
 }
 
 async fn session_exists(
@@ -522,20 +701,22 @@ async fn session_exists(
 async fn insert_session(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
+    execution_epoch: i64,
     session: &ExecutionSession,
 ) -> Result<(), ExecutionRepositoryError> {
     sqlx::query(
-        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, occurrence_id, \
-         session_index, planned_block_id, source_device_id, state, revision, accumulated_seconds, \
-         actual_seconds, started_at, running_since, observed_running_since, paused_at, pause_until, \
-         pause_reason, move_start, move_end, ended_at, created_at, updated_at) VALUES ($1, $2, $3, \
-         $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
-         $22, $23)",
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         execution_epoch, occurrence_id, session_index, planned_block_id, source_device_id, state, \
+         revision, accumulated_seconds, actual_seconds, started_at, running_since, \
+         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+         $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
     )
     .bind(session.id)
     .bind(workspace_id)
     .bind(session.item_id)
     .bind(revision_to_i64(session.item_revision)?)
+    .bind(execution_epoch)
     .bind(session.occurrence_id)
     .bind(i32::from(session.session_index))
     .bind(session.planned_block_id)

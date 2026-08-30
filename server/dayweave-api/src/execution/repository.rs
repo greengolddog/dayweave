@@ -57,6 +57,10 @@ pub enum ExecutionRepositoryError {
     ItemNotExecutable,
     #[error("execution start is not attested by the deferred schedule placement")]
     ScheduleStale,
+    #[error("execution replacement session index space is exhausted")]
+    IndexExhausted,
+    #[error("deferred move window does not match the unfinished planned duration")]
+    DeferDurationConflict,
     #[error("idempotency key was used for different execution content")]
     IdempotencyConflict,
     #[error(transparent)]

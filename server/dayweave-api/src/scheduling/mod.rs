@@ -6,7 +6,7 @@ mod postgres;
 mod projection;
 mod proposal_bridge;
 
-pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/2";
+pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/3";
 
 /// `PostgreSQL` `timestamptz` stores microseconds. Query boundaries must already
 /// use that precision so a read cannot silently change meaning when bound.

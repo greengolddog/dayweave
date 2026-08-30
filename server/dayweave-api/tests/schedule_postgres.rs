@@ -15,11 +15,17 @@ use dayweave_api::{
         CredentialKind, CredentialRepository, DEVICE_CLIENT_CONTRACT_VERSION, DeviceClientKind,
         DeviceEnrollmentSpec, GeneratedCredential,
     },
+    execution::{
+        DeferExecution, ExecutionCommand, ExecutionIdempotencyKey, ExecutionService, StartExecution,
+    },
     http::router,
     items::{
         IdempotencyKey, Item, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
     },
-    persistence::{DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresItemRepository},
+    persistence::{
+        DatabaseScope, MIGRATOR, PostgresCredentialRepository, PostgresExecutionRepository,
+        PostgresItemRepository,
+    },
     proposals::{
         InMemoryProposalRepository, Proposal, ProposalChangeSet, ProposalCommand, ProposalKind,
         ProposalRepository, ProposalService, ProposalSource, SystemClock,
@@ -39,7 +45,7 @@ use http_body_util::BodyExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{
-    AssertSqlSafe, ConnectOptions, Executor, PgPool, Postgres, Transaction,
+    AssertSqlSafe, ConnectOptions, Executor, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use tower::ServiceExt as _;
@@ -69,8 +75,10 @@ type DeferredBindingRow = (
     Uuid,
     Uuid,
     i64,
+    i64,
     Option<Uuid>,
     i32,
+    i64,
     chrono::DateTime<Utc>,
     chrono::DateTime<Utc>,
 );
@@ -342,10 +350,10 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         Err(SchedulePublicationError::IdempotencyConflict)
     ));
 
-    // A fresh key for identical exact content binds to the current revision
-    // without revision churn.
+    // Publication changes the private current-revision evidence. A preview
+    // captured before that seal cannot be rebound under a fresh key.
     let fresh_key = Uuid::new_v4();
-    let deduplicated = schedules
+    let stale_previous_publication = schedules
         .publish(
             &access,
             PublishScheduleSpec {
@@ -357,10 +365,11 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 published_at: Utc::now(),
             },
         )
-        .await
-        .unwrap();
-    assert!(!deduplicated.replayed);
-    assert_eq!(deduplicated.revision.revision, first_revision);
+        .await;
+    assert!(matches!(
+        stale_previous_publication,
+        Err(SchedulePublicationError::StaleComposition)
+    ));
     let revision_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1")
             .bind(scope.workspace_id)
@@ -1151,13 +1160,16 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         test_database.pool.clone(),
         scope,
     ));
+    let exact_preview = compose_canonical_schedule(&items, &schedules, compose_request())
+        .await
+        .unwrap();
     let exact_key = Uuid::new_v4();
     let exact_spec = PublishScheduleSpec {
         idempotency_key: exact_key,
         request_hash: [91; 32],
-        input_digest: digest_bytes(&next_preview.input_digest),
+        input_digest: digest_bytes(&exact_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
-        result: next_preview.clone(),
+        result: exact_preview,
         published_at: Utc::now(),
     };
     let (exact_left, exact_right) = publish_concurrently_after_lock_barrier(
@@ -1177,13 +1189,16 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     );
     assert_eq!(exact_left.revision.id, exact_right.revision.id);
 
+    let conflict_preview = compose_canonical_schedule(&items, &schedules, compose_request())
+        .await
+        .unwrap();
     let conflicting_key = Uuid::new_v4();
     let conflict_left = PublishScheduleSpec {
         idempotency_key: conflicting_key,
         request_hash: [92; 32],
-        input_digest: digest_bytes(&next_preview.input_digest),
+        input_digest: digest_bytes(&conflict_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
-        result: next_preview.clone(),
+        result: conflict_preview,
         published_at: Utc::now(),
     };
     let mut conflict_right = conflict_left.clone();
@@ -1207,12 +1222,15 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
             | (Err(SchedulePublicationError::IdempotencyConflict), Ok(_))
     ));
 
+    let same_content_preview = compose_canonical_schedule(&items, &schedules, compose_request())
+        .await
+        .unwrap();
     let same_content_left = PublishScheduleSpec {
         idempotency_key: Uuid::new_v4(),
         request_hash: [94; 32],
-        input_digest: digest_bytes(&next_preview.input_digest),
+        input_digest: digest_bytes(&same_content_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
-        result: next_preview.clone(),
+        result: same_content_preview,
         published_at: Utc::now(),
     };
     let mut same_content_right = same_content_left.clone();
@@ -1227,13 +1245,15 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         same_content_right,
     )
     .await;
-    let same_content_left = same_content_left.unwrap();
-    let same_content_right = same_content_right.unwrap();
-    assert!(!same_content_left.replayed && !same_content_right.replayed);
     assert_eq!(
-        same_content_left.revision.id,
-        same_content_right.revision.id
+        usize::from(same_content_left.is_ok()) + usize::from(same_content_right.is_ok()),
+        1
     );
+    assert!(matches!(
+        (same_content_left, same_content_right),
+        (Ok(_), Err(SchedulePublicationError::StaleComposition))
+            | (Err(SchedulePublicationError::StaleComposition), Ok(_))
+    ));
 
     let different_left_result = compose_canonical_schedule(&items, &schedules, compose_request())
         .await
@@ -1270,9 +1290,15 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         different_right,
     )
     .await;
-    let different_left = different_left.unwrap();
-    let different_right = different_right.unwrap();
-    assert_ne!(different_left.revision.id, different_right.revision.id);
+    assert_eq!(
+        usize::from(different_left.is_ok()) + usize::from(different_right.is_ok()),
+        1
+    );
+    assert!(matches!(
+        (different_left, different_right),
+        (Ok(_), Err(SchedulePublicationError::StaleComposition))
+            | (Err(SchedulePublicationError::StaleComposition), Ok(_))
+    ));
 
     // Caller clocks can be inverted relative to serialization order. The
     // transaction captures/clamps publication time after its locks, so even a
@@ -2073,6 +2099,14 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         test_database.pool.clone(),
         scope,
     ));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        items.clone(),
+        Arc::new(SystemClock),
+    );
     let access = owner_access(scope, "auth0|deferred-publication-owner");
     let item_id = Uuid::new_v4();
     items
@@ -2090,13 +2124,13 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         .unwrap();
     let item = items.get(item_id).await.unwrap();
     let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
-    let move_end: chrono::DateTime<Utc> = "2026-09-01T12:00:00Z".parse().unwrap();
+    let move_end: chrono::DateTime<Utc> = "2026-09-01T11:40:00Z".parse().unwrap();
 
     let exact_request = deferred_compose_request(item_id, item.revision, move_start, move_end);
-    let exact_preview = compose_canonical_schedule(&items, &schedules, exact_request.clone())
+    let pre_defer_preview = compose_canonical_schedule(&items, &schedules, exact_request.clone())
         .await
         .unwrap();
-    let exact_blocks = exact_preview
+    let pre_defer_blocks = pre_defer_preview
         .plan
         .blocks
         .iter()
@@ -2106,23 +2140,23 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 .is_some_and(|candidate| candidate.0 == item_id)
         })
         .collect::<Vec<_>>();
-    let [exact_block] = exact_blocks.as_slice() else {
-        panic!("the pinned fixture must emit exactly one semantic block");
+    let [pre_defer_block] = pre_defer_blocks.as_slice() else {
+        panic!("the pre-defer fixture must emit exactly one semantic block");
     };
     assert_eq!(
-        serde_json::to_value(exact_block.kind).unwrap(),
-        json!("pinned")
+        serde_json::to_value(pre_defer_block.kind).unwrap(),
+        json!("planned")
     );
-    assert_eq!(exact_block.session_index, 0);
-    let source_block_id = exact_block.id;
+    assert_eq!(pre_defer_block.session_index, 0);
+    let original_block_id = pre_defer_block.id;
 
     // The same content is a normal revision before any defer exists.
     let pre_defer_spec = PublishScheduleSpec {
         idempotency_key: Uuid::new_v4(),
         request_hash: [141; 32],
-        input_digest: digest_bytes(&exact_preview.input_digest),
+        input_digest: digest_bytes(&pre_defer_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
-        result: exact_preview.clone(),
+        result: pre_defer_preview.clone(),
         published_at: Utc::now(),
     };
     let pre_defer = schedules
@@ -2135,18 +2169,67 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         0
     );
 
-    let deferred_session_id = insert_deferred_session(
-        &test_database.pool,
-        scope,
-        item_id,
-        item.revision,
-        0,
-        "2026-09-01T06:30:00Z".parse().unwrap(),
-        move_start,
-        move_end,
-    )
-    .await;
-    ensure_inactive_execution_state(&test_database.pool, scope).await;
+    let deferred_session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id: deferred_session_id,
+                item_id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(original_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("schedule-v20-source-start", 141),
+        )
+        .await
+        .expect("start the exact published source block");
+    execution
+        .command(
+            1,
+            ExecutionCommand::Defer(DeferExecution {
+                session_id: deferred_session_id,
+                move_start,
+                move_end,
+                actual_seconds: Some(20 * 60),
+            }),
+            execution_idempotency("schedule-v20-source-defer", 142),
+        )
+        .await
+        .expect("defer with an exact forty-minute remainder");
+
+    let exact_preview = compose_canonical_schedule(&items, &schedules, exact_request.clone())
+        .await
+        .expect("compose the authoritative fresh-index replacement");
+    let exact_blocks = exact_preview
+        .plan
+        .blocks
+        .iter()
+        .filter(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .collect::<Vec<_>>();
+    let [exact_block] = exact_blocks.as_slice() else {
+        panic!("the replacement fixture must emit exactly one semantic block");
+    };
+    assert_eq!(
+        serde_json::to_value(exact_block.kind).unwrap(),
+        json!("pinned")
+    );
+    assert_eq!(exact_block.session_index, 1);
+    assert_eq!(
+        exact_block.start.unix_timestamp_nanos(),
+        i128::from(move_start.timestamp_micros()) * 1_000
+    );
+    assert_eq!(
+        exact_block.end.unix_timestamp_nanos(),
+        i128::from(move_end.timestamp_micros()) * 1_000
+    );
+    let source_block_id = exact_block.id;
 
     // An old exact receipt wins before fresh defer guards, even though that
     // historical revision predates the binding protocol.
@@ -2157,11 +2240,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
     assert!(replay.replayed);
     assert_eq!(replay.revision.id, pre_defer.revision.id);
 
-    let mut omission_request = exact_request.clone();
-    omission_request.previous_assignments.clear();
-    let omission = compose_canonical_schedule(&items, &schedules, omission_request)
-        .await
-        .unwrap();
+    let omission = pre_defer_preview.clone();
     let before_stale = publication_attestation_counts(&test_database.pool, scope).await;
     assert!(matches!(
         schedules
@@ -2177,7 +2256,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 },
             )
             .await,
-        Err(SchedulePublicationError::DeferredPlacementRequired)
+        Err(SchedulePublicationError::StaleComposition)
     ));
     assert_eq!(
         publication_attestation_counts(&test_database.pool, scope).await,
@@ -2201,7 +2280,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
             "CREATE FUNCTION fail_test_deferred_binding() RETURNS trigger LANGUAGE plpgsql AS $$ \
              BEGIN RAISE EXCEPTION 'synthetic deferred binding failure'; END $$; \
              CREATE TRIGGER fail_test_deferred_binding BEFORE INSERT \
-             ON schedule_deferred_placements FOR EACH ROW \
+             ON schedule_defer_replacement_placements FOR EACH ROW \
              EXECUTE FUNCTION fail_test_deferred_binding();",
         )
         .await
@@ -2226,7 +2305,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
     test_database
         .pool
         .execute(
-            "DROP TRIGGER fail_test_deferred_binding ON schedule_deferred_placements; \
+            "DROP TRIGGER fail_test_deferred_binding ON schedule_defer_replacement_placements; \
              DROP FUNCTION fail_test_deferred_binding();",
         )
         .await
@@ -2234,13 +2313,17 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
 
     // Although its content hash equals revision 1, the first successful
     // post-defer seal must create revision 2 to carry immutable evidence.
-    let post_defer = schedules.publish(&access, post_defer_spec).await.unwrap();
+    let post_defer = schedules
+        .publish(&access, post_defer_spec.clone())
+        .await
+        .unwrap();
     assert_eq!(post_defer.revision.revision_number, 2);
     assert_ne!(post_defer.revision.id, pre_defer.revision.id);
     let binding: DeferredBindingRow = sqlx::query_as(
-        "SELECT deferred_execution_session_id, source_block_id, item_id, item_revision, \
-             occurrence_id, session_index, move_start, move_end \
-             FROM schedule_deferred_placements \
+        "SELECT source_deferred_session_id, source_block_id, item_id, item_revision, \
+             execution_epoch, occurrence_id, replacement_session_index, \
+             remaining_duration_seconds, move_start, move_end \
+             FROM schedule_defer_replacement_placements \
              WHERE workspace_id = $1 AND schedule_revision_id = $2",
     )
     .bind(scope.workspace_id)
@@ -2255,30 +2338,21 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
             source_block_id,
             item_id,
             i64::try_from(item.revision).unwrap(),
+            1,
             None,
-            0,
+            1,
+            40 * 60,
             move_start,
             move_end,
         )
     );
 
-    // Once the current revision contains every exact binding, identical
-    // content can use the existing same-content shortcut.
+    // Exact retries remain durable even after the claim-aware revision seals.
     let same_content = schedules
-        .publish(
-            &access,
-            PublishScheduleSpec {
-                idempotency_key: Uuid::new_v4(),
-                request_hash: [144; 32],
-                input_digest: digest_bytes(&exact_preview.input_digest),
-                timezone_name: "Europe/Madrid".to_owned(),
-                result: exact_preview,
-                published_at: Utc::now(),
-            },
-        )
+        .publish(&access, post_defer_spec.clone())
         .await
         .unwrap();
-    assert!(!same_content.replayed);
+    assert!(same_content.replayed);
     assert_eq!(same_content.revision.id, post_defer.revision.id);
     assert_eq!(
         deferred_binding_count(&test_database.pool, scope, post_defer.revision.id).await,
@@ -2331,7 +2405,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 },
             )
             .await,
-        Err(SchedulePublicationError::DeferredPlacementRequired)
+        Err(SchedulePublicationError::StaleComposition)
     ));
     assert_eq!(
         publication_attestation_counts(&test_database.pool, scope).await,
@@ -2355,6 +2429,111 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         .unwrap();
     assert!(historical_replay.replayed);
     assert_eq!(historical_replay.revision.id, pre_defer.revision.id);
+
+    // Recompose from the disjoint head, seal the claim again, and consume it
+    // through the normal execution repository. This joins Defer, scheduler
+    // publication, exact Start origin, and one-shot consumption end to end.
+    let restart_preview = compose_canonical_schedule(&items, &schedules, exact_request)
+        .await
+        .expect("recompose the still-live replacement after a disjoint head");
+    let restart_block = restart_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .expect("recomposed replacement block");
+    assert_eq!(restart_block.session_index, 1);
+    let restart_block_id = restart_block.id;
+    schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [149; 32],
+                input_digest: digest_bytes(&restart_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: restart_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("publish the recomposed replacement");
+    let replacement_session_id = Uuid::new_v4();
+    execution
+        .command(
+            2,
+            ExecutionCommand::Start(StartExecution {
+                session_id: replacement_session_id,
+                item_id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: Some(restart_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("schedule-v20-replacement-start", 149),
+        )
+        .await
+        .expect("consume the exact current replacement placement");
+    let consumed_source: Uuid = sqlx::query_scalar(
+        "SELECT source_deferred_session_id FROM execution_defer_replacement_consumptions \
+         WHERE workspace_id = $1 AND replacement_execution_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(replacement_session_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .expect("load one-shot replacement consumption");
+    assert_eq!(consumed_source, deferred_session_id);
+    let active_replacement_preview = compose_canonical_schedule(
+        &items,
+        &schedules,
+        deferred_compose_request(item_id, item.revision, move_start, move_end),
+    )
+    .await
+    .expect("compose the consumed replacement as an in-flight reservation");
+    let active_replacement = active_replacement_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .expect("active replacement block");
+    assert_eq!(active_replacement.session_index, 1);
+    assert_eq!(
+        serde_json::to_value(active_replacement.kind).unwrap(),
+        json!("pinned")
+    );
+    let active_replacement_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [150; 32],
+                input_digest: digest_bytes(&active_replacement_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: active_replacement_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("republish the exact active replacement reservation");
+    assert_eq!(
+        deferred_binding_count(
+            &test_database.pool,
+            scope,
+            active_replacement_publication.revision.id
+        )
+        .await,
+        0
+    );
 
     // Scope claims alone cannot replay an owner's durable receipt after a role
     // downgrade or removal. Both the HTTP preflight adapter and publication
@@ -2456,90 +2635,88 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         .await
         .unwrap();
     let item = items.get(item_id).await.unwrap();
-    let active_session_id = insert_active_session(
-        &test_database.pool,
-        scope,
-        item_id,
-        item.revision,
-        0,
-        "2026-09-01T06:20:00Z".parse().unwrap(),
-    )
-    .await;
-    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
-    let move_end: chrono::DateTime<Utc> = "2026-09-01T12:00:00Z".parse().unwrap();
-    insert_deferred_session(
-        &test_database.pool,
-        scope,
-        item_id,
-        item.revision,
-        0,
-        "2026-09-01T06:30:00Z".parse().unwrap(),
-        move_start,
-        move_end,
-    )
-    .await;
-    sqlx::query(
-        "UPDATE execution_state SET revision = 1, active_session_id = $2, updated_at = $3 \
-         WHERE workspace_id = $1",
-    )
-    .bind(scope.workspace_id)
-    .bind(active_session_id)
-    .bind(
-        "2026-09-01T06:20:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap(),
-    )
-    .execute(&test_database.pool)
-    .await
-    .unwrap();
-
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        items.clone(),
+        Arc::new(SystemClock),
+    );
     let mut request = compose_request();
     request.fixed_blocks.clear();
-    let omission = compose_canonical_schedule(&items, &schedules, request)
+    let initial_preview = compose_canonical_schedule(&items, &schedules, request.clone())
         .await
-        .unwrap();
-    let publication = schedules
+        .expect("compose the initial executable schedule");
+    let initial_block = initial_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .expect("initial item block");
+    assert_eq!(initial_block.session_index, 0);
+    let initial_block_id = initial_block.id;
+    schedules
         .publish(
             &access,
             PublishScheduleSpec {
                 idempotency_key: Uuid::new_v4(),
                 request_hash: [146; 32],
-                input_digest: digest_bytes(&omission.input_digest),
+                input_digest: digest_bytes(&initial_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
-                result: omission.clone(),
+                result: initial_preview,
                 published_at: Utc::now(),
             },
         )
         .await
-        .expect("authoritative active session supersedes newer defer history");
+        .expect("publish the source schedule");
+    let active_session_id = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id: active_session_id,
+                item_id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: Some(initial_block_id),
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("schedule-v20-race-start", 146),
+        )
+        .await
+        .expect("start the exact current block");
+    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
+    let move_end: chrono::DateTime<Utc> = "2026-09-01T11:40:00Z".parse().unwrap();
+    let active_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("compose with the exact in-flight reservation");
+    let active_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [147; 32],
+                input_digest: digest_bytes(&active_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: active_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("republish the exact active reservation");
     assert_eq!(
-        deferred_binding_count(&test_database.pool, scope, publication.revision.id).await,
+        deferred_binding_count(&test_database.pool, scope, active_publication.revision.id).await,
         0
     );
-
-    // Close the active row so a new defer can become the semantic head.
-    let completed_at: chrono::DateTime<Utc> = "2026-09-01T06:40:00Z".parse().unwrap();
-    sqlx::query(
-        "UPDATE execution_sessions SET state = 'completed', revision = revision + 1, \
-         accumulated_seconds = 1200, actual_seconds = 1200, running_since = NULL, \
-         observed_running_since = NULL, ended_at = $3, updated_at = $3 \
-         WHERE workspace_id = $1 AND id = $2",
-    )
-    .bind(scope.workspace_id)
-    .bind(active_session_id)
-    .bind(completed_at)
-    .execute(&test_database.pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "UPDATE execution_state SET revision = revision + 1, active_session_id = NULL, \
-         updated_at = $2 WHERE workspace_id = $1",
-    )
-    .bind(scope.workspace_id)
-    .bind(completed_at)
-    .execute(&test_database.pool)
-    .await
-    .unwrap();
+    let race_preview = compose_canonical_schedule(&items, &schedules, request.clone())
+        .await
+        .expect("refresh the active evidence before the defer race");
 
     let before_race = publication_attestation_counts(&test_database.pool, scope).await;
     let mut blocker = test_database.pool.begin().await.unwrap();
@@ -2560,10 +2737,10 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
                 &race_access,
                 PublishScheduleSpec {
                     idempotency_key: Uuid::new_v4(),
-                    request_hash: [147; 32],
-                    input_digest: digest_bytes(&omission.input_digest),
+                    request_hash: [148; 32],
+                    input_digest: digest_bytes(&race_preview.input_digest),
                     timezone_name: "Europe/Madrid".to_owned(),
-                    result: omission,
+                    result: race_preview,
                     published_at: Utc::now(),
                 },
             )
@@ -2582,17 +2759,48 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         canonical_lock_available,
         "publication must wait before canonical item space"
     );
-    insert_deferred_session_tx(
-        &mut blocker,
-        scope,
-        item_id,
-        item.revision,
-        0,
-        "2026-09-01T06:50:00Z".parse().unwrap(),
-        move_start,
-        move_end,
+    let deferred_at: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE execution_sessions SET state = 'deferred', revision = revision + 1, \
+         accumulated_seconds = 1200, actual_seconds = 1200, running_since = NULL, \
+         observed_running_since = NULL, move_start = $3, move_end = $4, \
+         ended_at = clock_timestamp(), updated_at = clock_timestamp() \
+         WHERE workspace_id = $1 AND id = $2 RETURNING updated_at",
     )
-    .await;
+    .bind(scope.workspace_id)
+    .bind(active_session_id)
+    .bind(move_start)
+    .bind(move_end)
+    .fetch_one(&mut *blocker)
+    .await
+    .expect("defer the source while publication waits");
+    sqlx::query(
+        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
+         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
+         occurrence_id, source_session_index, replacement_session_index, \
+         planned_duration_seconds, planned_duration_source, actionable, consumed_before_seconds, \
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, $4, 1, NULL, 0, 1, 3600, 'published_origin', true, 0, 1200, \
+         2400, $5, $6, $7)",
+    )
+    .bind(scope.workspace_id)
+    .bind(active_session_id)
+    .bind(item_id)
+    .bind(i64::try_from(item.revision).unwrap())
+    .bind(move_start)
+    .bind(move_end)
+    .bind(deferred_at)
+    .execute(&mut *blocker)
+    .await
+    .expect("reserve the exact fresh replacement index");
+    sqlx::query(
+        "UPDATE execution_state SET revision = revision + 1, active_session_id = NULL, \
+         updated_at = $2 WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(deferred_at)
+    .execute(&mut *blocker)
+    .await
+    .expect("close the execution lease");
     blocker.commit().await.unwrap();
     let result = tokio::time::timeout(StdDuration::from_secs(10), publish)
         .await
@@ -2600,11 +2808,336 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         .unwrap();
     assert!(matches!(
         result,
-        Err(SchedulePublicationError::DeferredPlacementRequired)
+        Err(SchedulePublicationError::StaleComposition)
     ));
     assert_eq!(
         publication_attestation_counts(&test_database.pool, scope).await,
         before_race
+    );
+
+    let claim_preview = compose_canonical_schedule(&items, &schedules, request)
+        .await
+        .expect("recompose the fresh replacement claim");
+    let replacement = claim_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .expect("replacement block");
+    assert_eq!(replacement.session_index, 1);
+    assert_eq!(
+        serde_json::to_value(replacement.kind).unwrap(),
+        json!("pinned")
+    );
+    let publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [150; 32],
+                input_digest: digest_bytes(&claim_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: claim_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("publish the exact replacement claim");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, publication.revision.id).await,
+        1
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Exercises all three dynamic claim-retirement paths in one isolated workspace.
+async fn non_executable_claims_retire_without_blocking_publication() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; claim liveness test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
+    let nonleaf_item = Uuid::new_v4();
+    let terminal_item = Uuid::new_v4();
+    let trashed_item = Uuid::new_v4();
+    for (item_id, title, marker) in [
+        (nonleaf_item, "Claim becomes non-leaf", 201),
+        (terminal_item, "Claim becomes completed", 202),
+        (trashed_item, "Claim becomes trashed", 203),
+    ] {
+        items
+            .create(
+                task(item_id, title, false, None, json!({})),
+                idempotency(marker),
+            )
+            .await
+            .expect("create claim liveness item");
+    }
+    let terminal_at: chrono::DateTime<Utc> = "2026-08-31T06:00:00Z".parse().unwrap();
+    insert_live_legacy_claim(
+        &test_database.pool,
+        scope,
+        nonleaf_item,
+        terminal_at,
+        "2026-09-01T11:00:00Z".parse().unwrap(),
+    )
+    .await;
+    insert_live_legacy_claim(
+        &test_database.pool,
+        scope,
+        terminal_item,
+        terminal_at + chrono::Duration::seconds(1),
+        "2026-09-01T12:00:00Z".parse().unwrap(),
+    )
+    .await;
+    insert_live_legacy_claim(
+        &test_database.pool,
+        scope,
+        trashed_item,
+        terminal_at + chrono::Duration::seconds(2),
+        "2026-09-01T13:00:00Z".parse().unwrap(),
+    )
+    .await;
+    sqlx::query(
+        "UPDATE execution_state SET revision = 1, active_session_id = NULL, updated_at = $2 \
+         WHERE workspace_id = $1",
+    )
+    .bind(scope.workspace_id)
+    .bind(terminal_at + chrono::Duration::seconds(3))
+    .execute(&test_database.pool)
+    .await
+    .expect("advance claim liveness execution clock");
+
+    let child_id = Uuid::new_v4();
+    items
+        .create(
+            task(
+                child_id,
+                "Executable child control",
+                false,
+                Some(nonleaf_item),
+                json!({}),
+            ),
+            idempotency(204),
+        )
+        .await
+        .expect("turn the claimed item into a non-leaf");
+    sqlx::query(
+        "UPDATE items SET status = 'completed', revision = revision + 1, \
+         updated_at = clock_timestamp() WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(terminal_item)
+    .execute(&test_database.pool)
+    .await
+    .expect("make a claimed item terminal");
+    items
+        .trash(trashed_item, 1, idempotency(205))
+        .await
+        .expect("trash a claimed item");
+
+    let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
+    let access = owner_access(scope, "auth0|claim-liveness-owner");
+    let mut request = compose_request();
+    request.fixed_blocks.clear();
+    let preview = compose_canonical_schedule(&items, &schedules, request)
+        .await
+        .expect("retired claims do not remain planning reservations");
+    assert!(preview.plan.blocks.iter().any(|block| {
+        block
+            .item_id
+            .is_some_and(|candidate| candidate.0 == child_id)
+    }));
+    assert!(preview.plan.blocks.iter().all(|block| {
+        block.item_id.is_none_or(|candidate| {
+            ![nonleaf_item, terminal_item, trashed_item].contains(&candidate.0)
+        })
+    }));
+    let publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [205; 32],
+                input_digest: digest_bytes(&preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("retired claims do not block the revision seal");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, publication.revision.id).await,
+        0
+    );
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
+#[allow(clippy::too_many_lines)] // Rehearses the passive-claim migration through a real compose and seal.
+async fn migrated_passive_replacement_index_is_never_reallocated() {
+    let database_url = std::env::var("DAYWEAVE_TEST_DATABASE_URL")
+        .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
+    let test_database = TestDatabase::create(&database_url).await;
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 20) {
+        test_database
+            .pool
+            .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-ledger migration applies");
+    }
+    let scope = seed_scope(&test_database.pool).await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
+    let item_id = Uuid::new_v4();
+    items
+        .create(
+            task(
+                item_id,
+                "Never reuse a passive migrated index",
+                false,
+                None,
+                json!({}),
+            ),
+            idempotency(209),
+        )
+        .await
+        .expect("create migration fixture item");
+    let source_session_id = Uuid::new_v4();
+    let started_at: chrono::DateTime<Utc> = "2026-08-31T06:00:00Z".parse().unwrap();
+    let deferred_at: chrono::DateTime<Utc> = "2026-08-31T06:20:00Z".parse().unwrap();
+    let completed_at: chrono::DateTime<Utc> = "2026-08-31T06:30:00Z".parse().unwrap();
+    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
+    let move_end: chrono::DateTime<Utc> = "2026-09-01T11:30:00Z".parse().unwrap();
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, observed_running_since, \
+         paused_at, pause_until, pause_reason, move_start, move_end, ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, 1, NULL, 9, NULL, $4, 'deferred', 1, 1200, 1200, $5, NULL, \
+         NULL, NULL, NULL, NULL, $6, $7, $8, $5, $8)",
+    )
+    .bind(source_session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(deferred_at)
+    .execute(&test_database.pool)
+    .await
+    .expect("insert historical defer");
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, observed_running_since, \
+         paused_at, pause_until, pause_reason, move_start, move_end, ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, 1, NULL, 9, NULL, $4, 'completed', 1, 1800, 1800, $5, NULL, \
+         NULL, NULL, NULL, NULL, NULL, NULL, $6, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(completed_at)
+    .execute(&test_database.pool)
+    .await
+    .expect("insert the later completed semantic head");
+    sqlx::query(
+        "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
+         VALUES ($1, 2, NULL, $2)",
+    )
+    .bind(scope.workspace_id)
+    .bind(completed_at)
+    .execute(&test_database.pool)
+    .await
+    .expect("seed the legacy execution clock");
+
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20)
+        .expect("execution ledger migration is embedded");
+    test_database
+        .pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect("execution ledger migration applies");
+    let (replacement_index, actionable): (i32, bool) = sqlx::query_as(
+        "SELECT replacement_session_index, actionable \
+         FROM execution_defer_replacement_claims \
+         WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(source_session_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .expect("load migrated passive claim");
+    assert_eq!(replacement_index, 10);
+    assert!(!actionable);
+
+    let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
+    let access = owner_access(scope, "auth0|passive-index-owner");
+    let mut request = compose_request();
+    request.fixed_blocks.clear();
+    let preview = compose_canonical_schedule(&items, &schedules, request)
+        .await
+        .expect("compose above every passive physical index");
+    let block = preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .item_id
+                .is_some_and(|candidate| candidate.0 == item_id)
+        })
+        .expect("migrated item remains schedulable");
+    assert_eq!(block.session_index, 11);
+    let publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [209; 32],
+                input_digest: digest_bytes(&preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                result: preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("publish without colliding with passive physical history");
+    assert_eq!(
+        deferred_binding_count(&test_database.pool, scope, publication.revision.id).await,
+        0
     );
 
     test_database.destroy().await;
@@ -2768,6 +3301,13 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
         ))
         .await
         .expect("deferred placement migration applies");
+    test_database
+        .pool
+        .execute(include_str!(
+            "../migrations/0020_execution_progress_ledger.sql"
+        ))
+        .await
+        .expect("execution progress ledger migration applies");
 
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
@@ -3443,142 +3983,59 @@ fn deferred_compose_request(
     request
 }
 
-async fn insert_active_session(
+async fn insert_live_legacy_claim(
     pool: &PgPool,
     scope: DatabaseScope,
     item_id: Uuid,
-    item_revision: u64,
-    session_index: i32,
-    updated_at: chrono::DateTime<Utc>,
+    terminal_at: chrono::DateTime<Utc>,
+    move_start: chrono::DateTime<Utc>,
 ) -> Uuid {
-    let session_id = Uuid::new_v4();
-    let started_at = updated_at - chrono::Duration::minutes(20);
+    let source_session_id = Uuid::new_v4();
+    let move_end = move_start + chrono::Duration::minutes(30);
+    let started_at = terminal_at - chrono::Duration::seconds(5);
+    let mut transaction = pool.begin().await.expect("begin raw legacy claim");
     sqlx::query(
         "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
-         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
-         accumulated_seconds, actual_seconds, started_at, running_since, \
+         execution_epoch, occurrence_id, session_index, planned_block_id, source_device_id, state, \
+         revision, accumulated_seconds, actual_seconds, started_at, running_since, \
          observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
-         ended_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, 'active', 1, 0, NULL, $7, $7, $7, \
-         NULL, NULL, NULL, NULL, NULL, NULL, $7, $8)",
+         ended_at, created_at, updated_at) VALUES ($1, $2, $3, 1, 1, NULL, 0, NULL, $4, \
+         'deferred', 1, 0, 0, $5, NULL, NULL, NULL, NULL, NULL, $6, $7, $8, $5, $8)",
     )
-    .bind(session_id)
+    .bind(source_session_id)
     .bind(scope.workspace_id)
     .bind(item_id)
-    .bind(i64::try_from(item_revision).unwrap())
-    .bind(session_index)
-    .bind(Uuid::new_v4())
-    .bind(started_at)
-    .bind(updated_at)
-    .execute(pool)
-    .await
-    .unwrap();
-    session_id
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_deferred_session(
-    pool: &PgPool,
-    scope: DatabaseScope,
-    item_id: Uuid,
-    item_revision: u64,
-    session_index: i32,
-    ended_at: chrono::DateTime<Utc>,
-    move_start: chrono::DateTime<Utc>,
-    move_end: chrono::DateTime<Utc>,
-) -> Uuid {
-    insert_deferred_session_with(
-        pool,
-        scope,
-        item_id,
-        item_revision,
-        session_index,
-        ended_at,
-        move_start,
-        move_end,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_deferred_session_tx(
-    transaction: &mut Transaction<'_, Postgres>,
-    scope: DatabaseScope,
-    item_id: Uuid,
-    item_revision: u64,
-    session_index: i32,
-    ended_at: chrono::DateTime<Utc>,
-    move_start: chrono::DateTime<Utc>,
-    move_end: chrono::DateTime<Utc>,
-) -> Uuid {
-    insert_deferred_session_with(
-        &mut **transaction,
-        scope,
-        item_id,
-        item_revision,
-        session_index,
-        ended_at,
-        move_start,
-        move_end,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn insert_deferred_session_with<'e, E>(
-    executor: E,
-    scope: DatabaseScope,
-    item_id: Uuid,
-    item_revision: u64,
-    session_index: i32,
-    ended_at: chrono::DateTime<Utc>,
-    move_start: chrono::DateTime<Utc>,
-    move_end: chrono::DateTime<Utc>,
-) -> Uuid
-where
-    E: Executor<'e, Database = Postgres>,
-{
-    let session_id = Uuid::new_v4();
-    let started_at = ended_at - chrono::Duration::minutes(20);
-    sqlx::query(
-        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
-         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
-         accumulated_seconds, actual_seconds, started_at, running_since, \
-         observed_running_since, paused_at, pause_until, pause_reason, move_start, move_end, \
-         ended_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, NULL, $5, NULL, $6, 'deferred', 1, 1200, 1200, $7, NULL, \
-         NULL, NULL, NULL, NULL, $8, $9, $10, $7, $10)",
-    )
-    .bind(session_id)
-    .bind(scope.workspace_id)
-    .bind(item_id)
-    .bind(i64::try_from(item_revision).unwrap())
-    .bind(session_index)
     .bind(Uuid::new_v4())
     .bind(started_at)
     .bind(move_start)
     .bind(move_end)
-    .bind(ended_at)
-    .execute(executor)
+    .bind(terminal_at)
+    .execute(&mut *transaction)
     .await
-    .unwrap();
-    session_id
-}
-
-async fn ensure_inactive_execution_state(pool: &PgPool, scope: DatabaseScope) {
+    .expect("insert raw deferred source");
     sqlx::query(
-        "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
-         VALUES ($1, 1, NULL, $2) ON CONFLICT (workspace_id) DO NOTHING",
+        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
+         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
+         occurrence_id, source_session_index, replacement_session_index, \
+         planned_duration_seconds, planned_duration_source, actionable, consumed_before_seconds, \
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, 1, 1, NULL, 0, 1, 1800, 'legacy_move_window', true, 0, 0, \
+         1800, $4, $5, $6)",
     )
     .bind(scope.workspace_id)
-    .bind(
-        "2026-09-01T06:30:00Z"
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap(),
-    )
-    .execute(pool)
+    .bind(source_session_id)
+    .bind(item_id)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(terminal_at)
+    .execute(&mut *transaction)
     .await
-    .unwrap();
+    .expect("insert exact live legacy claim");
+    transaction
+        .commit()
+        .await
+        .expect("commit deferred source and claim together");
+    source_session_id
 }
 
 fn goal(id: Uuid, title: &str, sensitive: bool, parent_id: Option<Uuid>) -> NewItem {
@@ -3634,6 +4091,13 @@ fn task(
 fn idempotency(marker: u8) -> IdempotencyKey {
     IdempotencyKey {
         key: format!("schedule-postgres-{marker:03}"),
+        fingerprint: [marker; 32],
+    }
+}
+
+fn execution_idempotency(key: &str, marker: u8) -> ExecutionIdempotencyKey {
+    ExecutionIdempotencyKey {
+        key: key.to_owned(),
         fingerprint: [marker; 32],
     }
 }
@@ -3784,6 +4248,13 @@ async fn wait_for_blocked_queries(pool: &PgPool, blocker_pid: i32, minimum: i64)
     })
     .await
     .expect("competing PostgreSQL query reached the intended lock");
+}
+
+fn postgres_error_code(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
 }
 
 async fn publish_concurrently_after_lock_barrier(
@@ -4259,7 +4730,7 @@ async fn publication_attestation_counts(
            (SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1), \
            (SELECT COUNT(*) FROM schedule_blocks WHERE workspace_id = $1), \
            (SELECT COUNT(*) FROM schedule_revision_details WHERE workspace_id = $1), \
-           (SELECT COUNT(*) FROM schedule_deferred_placements WHERE workspace_id = $1), \
+           (SELECT COUNT(*) FROM schedule_defer_replacement_placements WHERE workspace_id = $1), \
            (SELECT COUNT(*) FROM schedule_publication_requests WHERE workspace_id = $1), \
            (SELECT COUNT(*) FROM audit_operations WHERE workspace_id = $1 \
              AND operation_type = 'schedule.published')",
@@ -4272,7 +4743,7 @@ async fn publication_attestation_counts(
 
 async fn deferred_binding_count(pool: &PgPool, scope: DatabaseScope, revision_id: Uuid) -> i64 {
     sqlx::query_scalar(
-        "SELECT COUNT(*) FROM schedule_deferred_placements \
+        "SELECT COUNT(*) FROM schedule_defer_replacement_placements \
          WHERE workspace_id = $1 AND schedule_revision_id = $2",
     )
     .bind(scope.workspace_id)
@@ -4399,10 +4870,6 @@ async fn assert_content_insert_seal_race(pool: &PgPool, scope: DatabaseScope) {
 
     let source_block_id = Uuid::new_v4();
     let mut content = pool.begin().await.unwrap();
-    let content_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *content)
-        .await
-        .unwrap();
     sqlx::query(
         "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, schedule_revision_id, \
          block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal) \
@@ -4430,8 +4897,7 @@ async fn assert_content_insert_seal_race(pool: &PgPool, scope: DatabaseScope) {
         .bind(current_id)
         .bind(published_at)
         .execute(&mut *transaction)
-        .await
-        .unwrap();
+        .await?;
         sqlx::query(
             "UPDATE schedule_revisions SET state = 'published', published_at = $3 \
              WHERE workspace_id = $1 AND id = $2 AND state = 'draft'",
@@ -4440,13 +4906,39 @@ async fn assert_content_insert_seal_race(pool: &PgPool, scope: DatabaseScope) {
         .bind(draft_id)
         .bind(published_at)
         .execute(&mut *transaction)
-        .await
-        .unwrap();
-        transaction.commit().await.unwrap();
+        .await?;
+        transaction.commit().await
     });
-    wait_for_blocked_queries(pool, content_pid, 1).await;
+    let seal_error = seal
+        .await
+        .expect("raw seal task completes")
+        .expect_err("raw seal fails fast behind the execution-state lock");
+    assert_eq!(postgres_error_code(&seal_error).as_deref(), Some("55P03"));
     content.commit().await.unwrap();
-    seal.await.unwrap();
+
+    let mut retry = pool.begin().await.unwrap();
+    let published_at = Utc::now();
+    sqlx::query(
+        "UPDATE schedule_revisions SET state = 'superseded', superseded_at = $3 \
+         WHERE workspace_id = $1 AND id = $2 AND state = 'published'",
+    )
+    .bind(scope.workspace_id)
+    .bind(current_id)
+    .bind(published_at)
+    .execute(&mut *retry)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE schedule_revisions SET state = 'published', published_at = $3 \
+         WHERE workspace_id = $1 AND id = $2 AND state = 'draft'",
+    )
+    .bind(scope.workspace_id)
+    .bind(draft_id)
+    .bind(published_at)
+    .execute(&mut *retry)
+    .await
+    .unwrap();
+    retry.commit().await.unwrap();
 
     let included: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM schedule_blocks WHERE workspace_id = $1 \

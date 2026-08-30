@@ -74,6 +74,20 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn execution_index_exhausted(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "execution_index_exhausted", message)
+    }
+
+    #[must_use]
+    pub(crate) fn execution_defer_duration_conflict(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "execution_defer_duration_conflict",
+            message,
+        )
+    }
+
+    #[must_use]
     pub(crate) fn schedule_publication_idempotency_conflict(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::CONFLICT,

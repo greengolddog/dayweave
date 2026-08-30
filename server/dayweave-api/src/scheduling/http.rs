@@ -189,15 +189,25 @@ fn map_compose_error(error: &ComposeScheduleError) -> ApiError {
         ComposeScheduleError::CalendarProjectionUnavailable => {
             ApiError::unavailable("Google Calendar projection evidence is temporarily unavailable")
         }
+        ComposeScheduleError::ExecutionEvidenceChanged => ApiError::unavailable(
+            "Execution or published schedule evidence changed during preview; retry",
+        ),
+        ComposeScheduleError::ExecutionEvidenceUnavailable => {
+            ApiError::unavailable("Execution planning evidence is temporarily unavailable")
+        }
         _ if error.is_client_error() => ApiError::validation(error.to_string()),
         _ => ApiError::internal(),
     }
 }
 
 fn map_publish_compose_error(error: &ComposeScheduleError) -> ApiError {
-    if matches!(error, ComposeScheduleError::CalendarProjectionIncomplete) {
+    if matches!(
+        error,
+        ComposeScheduleError::CalendarProjectionIncomplete
+            | ComposeScheduleError::ExecutionEvidenceChanged
+    ) {
         return ApiError::schedule_publication_stale(
-            "Google Calendar data changed after preview; preview again before publishing",
+            "Schedule inputs changed after preview; preview again before publishing",
         );
     }
     map_compose_error(error)

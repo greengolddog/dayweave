@@ -19,7 +19,7 @@ use dayweave_api::{
 };
 use serde_json::json;
 use sqlx::{
-    AssertSqlSafe, ConnectOptions, Executor, PgPool,
+    AssertSqlSafe, ConnectOptions, Executor, PgPool, Postgres,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use uuid::Uuid;
@@ -31,7 +31,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ]
     );
 
@@ -55,6 +55,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0017_google_refresh_generations.sql"),
         include_str!("../migrations/0018_execution_defer.sql"),
         include_str!("../migrations/0019_schedule_deferred_placements.sql"),
+        include_str!("../migrations/0020_execution_progress_ledger.sql"),
     ]
     .join("\n");
     for table in [
@@ -83,6 +84,11 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         "execution_sessions",
         "execution_state",
         "schedule_deferred_placements",
+        "execution_session_schedule_origins",
+        "execution_defer_replacement_claims",
+        "execution_defer_replacement_consumptions",
+        "execution_physical_indices",
+        "schedule_defer_replacement_placements",
         "google_oauth_sessions",
         "google_oauth_cleanup_tokens",
         "google_oauth_scope_state",
@@ -117,6 +123,10 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("deferred_execution_session_id"));
     assert!(schema.contains("guard_schedule_deferred_placement"));
     assert!(schema.contains("guard_execution_session_semantic_start"));
+    assert!(schema.contains("ADD COLUMN execution_epoch bigint NOT NULL DEFAULT 1"));
+    assert!(schema.contains("execution_defer_replacement_claims_physical_index_uq"));
+    assert!(schema.contains("NULLS NOT DISTINCT"));
+    assert!(schema.contains("protect_execution_defer_claim_source"));
     assert!(schema.contains("FOR UPDATE"));
     assert!(schema.contains("revision.state IN ('published', 'superseded')"));
     assert!(schema.contains("timestamptz"));
@@ -133,6 +143,386 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // The upgrade fixture and its raw-SQL backstops must share one isolated schema.
+async fn execution_progress_ledger_migration_backfills_partitioned_fresh_claims() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; execution ledger migration test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 20) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-ledger migration applies");
+    }
+    let scope = seed_scope(pool).await;
+    let first_item = Uuid::new_v4();
+    let second_item = Uuid::new_v4();
+    let historical_item = Uuid::new_v4();
+    let published_high_water_item = Uuid::new_v4();
+    let base = Utc::now();
+    for (item_id, title) in [
+        (first_item, "First legacy defer"),
+        (second_item, "Second legacy defer"),
+        (historical_item, "Historical completed defer"),
+        (published_high_water_item, "Published split high-water"),
+    ] {
+        sqlx::query(
+            "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+             timezone_name, duration_seconds, revision, created_at, updated_at) \
+             VALUES ($1, $2, $3, 'task', 'planned', $4, 'UTC', 3600, 1, $5, $5)",
+        )
+        .bind(item_id)
+        .bind(scope.workspace_id)
+        .bind(scope.user_id)
+        .bind(title)
+        .bind(base)
+        .execute(pool)
+        .await
+        .expect("seed pre-ledger item");
+    }
+    let first_defer = Uuid::new_v4();
+    let later_first_defer = Uuid::new_v4();
+    let second_defer = Uuid::new_v4();
+    insert_pre_v20_deferred_session(
+        pool,
+        scope,
+        first_defer,
+        first_item,
+        2,
+        base,
+        base + ChronoDuration::hours(1),
+    )
+    .await;
+    let historical_defer = Uuid::new_v4();
+    insert_pre_v20_deferred_session(
+        pool,
+        scope,
+        historical_defer,
+        historical_item,
+        9,
+        base + ChronoDuration::seconds(2),
+        base + ChronoDuration::hours(3),
+    )
+    .await;
+    insert_pre_v20_completed_session(
+        pool,
+        scope,
+        Uuid::new_v4(),
+        historical_item,
+        9,
+        base + ChronoDuration::seconds(3),
+    )
+    .await;
+
+    let schedule_revision_id = Uuid::new_v4();
+    let schedule_block_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO schedule_revisions (id, workspace_id, revision_number, state, \
+         horizon_start, horizon_end, timezone_name, solver_version, input_digest, \
+         created_by_user_id, created_at) VALUES ($1, $2, 1, 'draft', $3, $4, 'UTC', \
+         'execution-ledger-migration-test', $5, $6, $7)",
+    )
+    .bind(schedule_revision_id)
+    .bind(scope.workspace_id)
+    .bind(base)
+    .bind(base + ChronoDuration::days(1))
+    .bind(vec![20_u8; 32])
+    .bind(scope.user_id)
+    .bind(base)
+    .execute(pool)
+    .await
+    .expect("seed pre-v20 current schedule draft");
+    sqlx::query(
+        "INSERT INTO schedule_revision_details (workspace_id, user_id, schedule_revision_id, \
+         result_snapshot, created_at) VALUES ($1, $2, $3, '{}'::jsonb, $4)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(schedule_revision_id)
+    .bind(base)
+    .execute(pool)
+    .await
+    .expect("seed pre-v20 current schedule details");
+    sqlx::query(
+        "INSERT INTO schedule_blocks (id, source_block_id, workspace_id, schedule_revision_id, \
+         item_id, block_kind, title_snapshot, starts_at, ends_at, timezone_name, ordinal, \
+         is_fixed, constraint_snapshot, created_at) VALUES ($1, $2, $3, $4, $5, 'planned', \
+         'Published high-water', $6, $7, 'UTC', 0, false, $8, $9)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(schedule_block_id)
+    .bind(scope.workspace_id)
+    .bind(schedule_revision_id)
+    .bind(published_high_water_item)
+    .bind(base + ChronoDuration::hours(4))
+    .bind(base + ChronoDuration::hours(5))
+    .bind(json!({"occurrence_id": null, "session_index": 8}))
+    .bind(base)
+    .execute(pool)
+    .await
+    .expect("seed pre-v20 current schedule high-water block");
+    sqlx::query(
+        "UPDATE schedule_revisions SET state = 'published', published_at = $3 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(schedule_revision_id)
+    .bind(base)
+    .execute(pool)
+    .await
+    .expect("publish pre-v20 high-water schedule");
+    insert_pre_v20_deferred_session(
+        pool,
+        scope,
+        later_first_defer,
+        first_item,
+        5,
+        base + ChronoDuration::seconds(1),
+        base + ChronoDuration::hours(2),
+    )
+    .await;
+    insert_pre_v20_deferred_session(
+        pool,
+        scope,
+        second_defer,
+        second_item,
+        2,
+        base,
+        base + ChronoDuration::hours(1),
+    )
+    .await;
+
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20)
+        .expect("execution ledger migration is embedded");
+    pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect("execution ledger migration applies");
+
+    let claims: Vec<(Uuid, i32, String, i64, bool)> = sqlx::query_as(
+        "SELECT source_deferred_session_id, replacement_session_index, \
+         planned_duration_source, planned_duration_seconds, actionable \
+         FROM execution_defer_replacement_claims WHERE workspace_id = $1 \
+         ORDER BY source_deferred_session_id",
+    )
+    .bind(scope.workspace_id)
+    .fetch_all(pool)
+    .await
+    .expect("load backfilled claims");
+    assert_eq!(claims.len(), 4);
+    let replacement_for = |session_id| {
+        claims
+            .iter()
+            .find(|(source, _, _, _, _)| *source == session_id)
+            .expect("backfilled source claim")
+    };
+    assert_eq!(replacement_for(first_defer).1, 6);
+    assert_eq!(replacement_for(later_first_defer).1, 7);
+    assert_eq!(replacement_for(second_defer).1, 3);
+    assert_eq!(replacement_for(historical_defer).1, 10);
+    assert!(replacement_for(first_defer).4);
+    assert!(replacement_for(later_first_defer).4);
+    assert!(replacement_for(second_defer).4);
+    assert!(!replacement_for(historical_defer).4);
+    assert!(claims.iter().all(|(_, _, source, duration, _)| {
+        source == "legacy_move_window" && *duration == 30 * 60
+    }));
+    let epochs: Vec<i64> = sqlx::query_scalar(
+        "SELECT execution_epoch FROM execution_sessions WHERE workspace_id = $1 ORDER BY id",
+    )
+    .bind(scope.workspace_id)
+    .fetch_all(pool)
+    .await
+    .expect("load backfilled execution epochs");
+    assert_eq!(epochs, vec![1, 1, 1, 1, 1]);
+    let historical_registry_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_physical_indices WHERE workspace_id = $1 \
+         AND item_id = $2 AND occurrence_id IS NULL AND session_index = 9",
+    )
+    .bind(scope.workspace_id)
+    .bind(historical_item)
+    .fetch_one(pool)
+    .await
+    .expect("load deduplicated historical physical index");
+    assert_eq!(historical_registry_rows, 1);
+
+    let immutable_source = sqlx::query(
+        "UPDATE execution_sessions SET actual_seconds = actual_seconds + 1 \
+         WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_defer)
+    .execute(pool)
+    .await
+    .expect_err("claimed source cannot drift");
+    assert!(
+        immutable_source
+            .to_string()
+            .contains("claimed deferred execution sessions are immutable")
+    );
+    let immutable_claim = sqlx::query(
+        "UPDATE execution_defer_replacement_claims SET created_at = created_at \
+         WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_defer)
+    .execute(pool)
+    .await
+    .expect_err("replacement claim is immutable");
+    assert!(
+        immutable_claim
+            .to_string()
+            .contains("execution defer replacement claims are immutable")
+    );
+
+    let unclaimed_session = Uuid::new_v4();
+    let mut unclaimed = pool.begin().await.expect("begin unclaimed raw defer");
+    insert_pre_v20_deferred_session(
+        &mut *unclaimed,
+        scope,
+        unclaimed_session,
+        first_item,
+        100,
+        base + ChronoDuration::seconds(4),
+        base + ChronoDuration::hours(4),
+    )
+    .await;
+    let unclaimed_error = unclaimed
+        .commit()
+        .await
+        .expect_err("raw deferred session cannot commit without a replacement claim");
+    assert!(
+        unclaimed_error
+            .to_string()
+            .contains("deferred execution session lacks its replacement claim")
+    );
+    let unclaimed_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_sessions WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(unclaimed_session)
+    .fetch_one(pool)
+    .await
+    .expect("count rolled-back raw defer");
+    assert_eq!(unclaimed_rows, 0);
+
+    let bypass_source = Uuid::new_v4();
+    let bypass_terminal_at = base + ChronoDuration::seconds(2);
+    let bypass_move_start = base + ChronoDuration::hours(3);
+    let mut bypass = pool.begin().await.expect("begin raw claim bypass");
+    insert_pre_v20_deferred_session(
+        &mut *bypass,
+        scope,
+        bypass_source,
+        published_high_water_item,
+        0,
+        bypass_terminal_at,
+        bypass_move_start,
+    )
+    .await;
+    let stale_replacement = sqlx::query(
+        "INSERT INTO execution_defer_replacement_claims (workspace_id, \
+         source_deferred_session_id, item_id, source_item_revision, execution_epoch, \
+         occurrence_id, source_session_index, replacement_session_index, \
+         planned_duration_seconds, planned_duration_source, consumed_before_seconds, \
+         consumed_by_source_seconds, remaining_duration_seconds, move_start, move_end, created_at) \
+         VALUES ($1, $2, $3, 1, 1, NULL, 0, 8, 1800, 'legacy_move_window', 0, 0, \
+         1800, $4, $5, $6)",
+    )
+    .bind(scope.workspace_id)
+    .bind(bypass_source)
+    .bind(published_high_water_item)
+    .bind(bypass_move_start)
+    .bind(bypass_move_start + ChronoDuration::minutes(30))
+    .bind(bypass_terminal_at)
+    .execute(&mut *bypass)
+    .await
+    .expect_err("direct claim cannot reuse historical physical index");
+    assert!(
+        stale_replacement
+            .to_string()
+            .contains("execution defer replacement index is not fresh")
+    );
+    bypass.rollback().await.expect("roll back raw claim bypass");
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn execution_progress_ledger_migration_fails_closed_at_maximum_index() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; execution ledger overflow test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 20) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-ledger migration applies");
+    }
+    let scope = seed_scope(pool).await;
+    let item_id = Uuid::new_v4();
+    let base = Utc::now();
+    sqlx::query(
+        "INSERT INTO items (id, workspace_id, created_by_user_id, kind, status, title, \
+         timezone_name, duration_seconds, revision, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'task', 'planned', 'Exhausted legacy defer', 'UTC', \
+         3600, 1, $4, $4)",
+    )
+    .bind(item_id)
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(base)
+    .execute(pool)
+    .await
+    .expect("seed overflow item");
+    insert_pre_v20_deferred_session(
+        pool,
+        scope,
+        Uuid::new_v4(),
+        item_id,
+        i32::from(u16::MAX),
+        base,
+        base + ChronoDuration::hours(1),
+    )
+    .await;
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20)
+        .expect("execution ledger migration is embedded");
+    let error = pool
+        .execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+        .await
+        .expect_err("replacement index overflow aborts migration");
+    assert!(
+        error
+            .to_string()
+            .contains("replacement session index space is exhausted during migration")
+    );
+    let ledger_table: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('execution_defer_replacement_claims')::text")
+            .fetch_one(pool)
+            .await
+            .expect("inspect failed migration rollback");
+    assert!(ledger_table.is_none());
+    let epoch_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'execution_sessions' \
+           AND column_name = 'execution_epoch')",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("inspect failed epoch-column rollback");
+    assert!(!epoch_column_exists);
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
 #[ignore = "requires DAYWEAVE_TEST_DATABASE_URL; run with --include-ignored"]
 #[allow(clippy::too_many_lines)]
 async fn deferred_placement_migration_seals_exact_restart_evidence() {
@@ -140,7 +530,11 @@ async fn deferred_placement_migration_seals_exact_restart_evidence() {
         .expect("DAYWEAVE_TEST_DATABASE_URL is required for this ignored integration test");
     let test_database = TestDatabase::create(&database_url).await;
     let pool = &test_database.pool;
-    MIGRATOR.run(pool).await.expect("migrations apply");
+    for migration in MIGRATOR.iter().filter(|migration| migration.version < 20) {
+        pool.execute(AssertSqlSafe(migration.sql.as_str().to_owned()))
+            .await
+            .expect("pre-ledger migration applies");
+    }
 
     let scope = seed_scope(pool).await;
     let item_id = Uuid::new_v4();
@@ -530,6 +924,39 @@ async fn deferred_placement_migration_seals_exact_restart_evidence() {
             .to_string()
             .contains("completed or skipped execution semantics cannot be restarted")
     );
+
+    let ledger_migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 20)
+        .expect("execution ledger migration is embedded");
+    pool.execute(AssertSqlSafe(ledger_migration.sql.as_str().to_owned()))
+        .await
+        .expect("v19 restart history upgrades to the v20 ledger");
+    let (replacement_session_index, actionable): (i32, bool) = sqlx::query_as(
+        "SELECT replacement_session_index, actionable \
+         FROM execution_defer_replacement_claims \
+         WHERE workspace_id = $1 AND source_deferred_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_session_id)
+    .fetch_one(pool)
+    .await
+    .expect("inspect migrated legacy defer claim");
+    assert_eq!(replacement_session_index, 1);
+    assert!(
+        !actionable,
+        "completed v19 restart retires its migrated claim"
+    );
+    let retained_v19_binding: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM schedule_deferred_placements \
+         WHERE workspace_id = $1 AND deferred_execution_session_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(first_session_id)
+    .fetch_one(pool)
+    .await
+    .expect("inspect retained v19 placement evidence");
+    assert_eq!(retained_v19_binding, 1);
 
     test_database.destroy().await;
 }
@@ -3730,6 +4157,70 @@ fn postgres_error_code(error: &sqlx::Error) -> Option<String> {
         .as_database_error()
         .and_then(sqlx::error::DatabaseError::code)
         .map(std::borrow::Cow::into_owned)
+}
+
+async fn insert_pre_v20_deferred_session<'e, E>(
+    executor: E,
+    scope: DatabaseScope,
+    session_id: Uuid,
+    item_id: Uuid,
+    session_index: i32,
+    terminal_at: chrono::DateTime<Utc>,
+    move_start: chrono::DateTime<Utc>,
+) where
+    E: Executor<'e, Database = Postgres>,
+{
+    let move_end = move_start + ChronoDuration::minutes(30);
+    let started_at = terminal_at - ChronoDuration::seconds(5);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, observed_running_since, \
+         paused_at, pause_until, pause_reason, move_start, move_end, ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, 1, NULL, $4, NULL, $5, 'deferred', 1, 5, 5, $6, NULL, NULL, \
+         NULL, NULL, NULL, $7, $8, $9, $6, $9)",
+    )
+    .bind(session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(session_index)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(move_start)
+    .bind(move_end)
+    .bind(terminal_at)
+    .execute(executor)
+    .await
+    .expect("seed pre-v20 deferred session");
+}
+
+async fn insert_pre_v20_completed_session(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    session_id: Uuid,
+    item_id: Uuid,
+    session_index: i32,
+    terminal_at: chrono::DateTime<Utc>,
+) {
+    let started_at = terminal_at - ChronoDuration::seconds(5);
+    sqlx::query(
+        "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+         occurrence_id, session_index, planned_block_id, source_device_id, state, revision, \
+         accumulated_seconds, actual_seconds, started_at, running_since, observed_running_since, \
+         paused_at, pause_until, pause_reason, move_start, move_end, ended_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, 1, NULL, $4, NULL, $5, 'completed', 1, 5, 5, $6, NULL, NULL, \
+         NULL, NULL, NULL, NULL, NULL, $7, $6, $7)",
+    )
+    .bind(session_id)
+    .bind(scope.workspace_id)
+    .bind(item_id)
+    .bind(session_index)
+    .bind(Uuid::new_v4())
+    .bind(started_at)
+    .bind(terminal_at)
+    .execute(pool)
+    .await
+    .expect("seed pre-v20 completed session");
 }
 
 struct TestDatabase {

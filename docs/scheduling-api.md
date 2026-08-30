@@ -1,10 +1,10 @@
 # Scheduling preview and publication contract
 
 `POST /v1/schedule/preview` composes the active canonical item graph without
-writing items, schedule blocks, or provider state. It requires the ordinary
-DayWeave bearer token. The same canonical revisions, request, scheduler schema,
-and required Calendar projection stamps produce the same `input_digest` and
-plan.
+writing items, schedule blocks, execution state, or provider state. It requires
+the ordinary DayWeave bearer token. The same canonical revisions, request,
+scheduler schema, required Calendar projection stamps, execution progress, and
+current published assignments produce the same `input_digest` and plan.
 
 The preview and publication routes each have a 16 MiB request-body ceiling.
 Other API routes retain the service-wide 1 MiB ceiling. A body over its route
@@ -33,6 +33,18 @@ version, so a preview cached across a solver/schema upgrade cannot acknowledge
 and install different blocks. Effective sensitivity evidence is retained
 internally for publication/redaction; it is deliberately not exposed as a
 whole-item map in the preview JSON or OpenAPI schema.
+
+Execution progress and stability inputs are server-authoritative. Preview reads
+the execution ledger and the current published revision's assignments in one
+repeatable-read snapshot on both sides of the canonical-item and Calendar
+reads. Caller-supplied `previous_assignments` are only advisory: an exact match
+to current published evidence is accepted, every other entry is reported in
+`ignored_previous_assignments`, and the solver always receives the complete
+server copy. The private execution snapshot includes credited duration,
+completed or skipped work units, every permanently used physical session index,
+and exact active, paused, or deferred reservations. It is bound into the digest
+and durable publication snapshot but is not exposed in the public preview
+schema.
 
 An active canonical item with `status: "inbox"`, and every descendant below an
 Inbox ancestor, remains accepted and included in `source_item_revisions` and the
@@ -95,43 +107,59 @@ receipt and its original `published_at`; changed content under the same key is
 For a new key, the server recomposes from canonical items and compares the
 result with `expected_input_digest`. Inside the publication transaction it
 serializes against item mutations and rechecks the complete active-item
-revision set. It also share-locks every Calendar collection row, reconstructs
-the required projection stamps, and rejects a changed generation, configuration,
-coverage window, or newly enabled blocking source as
+revision set. It also locks the workspace execution ledger, rechecks both
+execution progress and the current published assignment set, share-locks every
+Calendar collection row, reconstructs the required projection stamps, and
+rejects a changed generation, configuration, coverage window, newly enabled
+blocking source, execution transition, or intervening publication as
 `409 schedule_publication_stale`. It then inserts a draft header, blocks, and
 exactly one detail; supersedes the old current revision; seals the draft as
-published; and writes
-the receipt and audit row, all in one transaction. Content insertion is allowed
-only while the parent is draft, and blocks/details become immutable after the
-seal. A fresh key whose solver-versioned publication content is identical to the
-current revision binds to that existing revision without revision churn.
+published; and writes the receipt and audit row, all in one transaction.
+Content insertion is allowed only while the parent is draft, and blocks/details
+become immutable after the seal. A fresh key whose solver-versioned publication
+content and private v3 evidence are identical to the current revision binds to
+that existing revision without revision churn.
 An expected-digest mismatch or canonical item change during the transaction is
 `409 schedule_publication_stale`. That stable code proves no publication was
 committed and tells the client to discard the journal and recompose; generic,
 transport, unavailable, and idempotency-conflict failures remain ambiguous and
 must retain the exact journal for operator recovery or retry.
 
-A deferred execution session adds one more publication fence. If its requested
-move window overlaps the candidate horizon, a fresh publication must contain
-exactly one `pinned` block for the same item revision, occurrence, and session
-index, at the exact requested start and end. Omitting, clipping, duplicating, or
-changing that block returns the same detail-free
-`409 schedule_publication_stale` and commits no draft, receipt, binding, or
-audit row. A disjoint horizon has no such obligation. Successful publication
-stores an immutable binding between the deferred session and block before the
-revision is sealed. A same-content revision created before that evidence
-existed is not reused; after a binding exists, normal same-content reuse is
-allowed. The evidence remains valid if the revision is later superseded.
+A deferred execution session permanently closes its physical session index and
+atomically claims a strictly higher, previously unused replacement index. For
+an attested Start, the remaining duration is derived from its published origin
+minus already credited execution; legacy sources use their requested move
+window as the only duration evidence. Move windows must be positive, no longer
+than 24 hours, and exactly equal to a positive whole-second remainder. A
+fractional or otherwise mismatched window returns the detail-free
+`409 execution_defer_duration_conflict`. Index exhaustion returns the
+detail-free `409 execution_index_exhausted`. Raw database writes cannot
+commit a deferred session without the matching immutable claim.
 
-Starting the same semantic execution slot after a defer requires the bound
-block ID from a published or superseded revision. A missing, draft-only,
-mismatched, or unattested block returns the detail-free
-`409 execution_schedule_stale`; completed and skipped slots cannot be
-resurrected. Exact successful command retries still return their historical
-idempotency response before these fresh-state checks. The first execution of a
-semantic slot remains compatible with records created before attestation, but
-there is no binding backfill. The in-memory fallback cannot prove publication
-and therefore fails closed after any terminal history for that slot.
+If a live, current-epoch claim overlaps the candidate horizon, a fresh
+publication must contain exactly one `pinned` block for the current item
+revision, occurrence, fresh replacement index, remaining duration, and exact
+requested start and end. Omitting, clipping, duplicating, or changing that block
+returns `409 schedule_publication_stale` and commits no draft, receipt, binding,
+or audit row. A disjoint horizon has no block obligation, but its reserved index
+still remains unavailable to the solver. Claims for completed, skipped,
+cancelled, trashed, non-leaf, or obsolete-epoch items are not actionable; their
+physical indices remain historical and can never be reused. Successful
+publication stores immutable replacement-placement evidence before the revision
+is sealed. A revision created before the required v20 evidence is not reused.
+
+Starting a claimed replacement requires that fresh index and the exact bound
+block ID from the current published revision. A missing, superseded, draft-only,
+mismatched, already consumed, or unattested placement returns the detail-free
+`409 execution_schedule_stale`; the successful Start atomically records both
+its immutable schedule origin and one-shot claim consumption. Exact successful
+command retries still return their historical idempotency response before these
+fresh-state checks. Ordinary first Starts also record an origin when their
+planned block is an exact `planned` or `pinned` block in the current published
+revision. Active and paused work is carried into later plans as the same exact
+pinned origin; all other used indices remain closed. The in-memory fallback
+cannot prove durable publication or claim consumption and therefore fails
+closed when that proof is required.
 
 Both first publication and exact idempotent replay return `200`; `replayed` is
 the sole distinction:
@@ -218,7 +246,7 @@ must be positive and no longer than 90 days.
 
 Production publication, immutable reads, transactional MCP proposal submission,
 execution defer, and attested restart require migrations through
-`0019_schedule_deferred_placements.sql`. Deploy the migrated server before
+`0020_execution_progress_ledger.sql`. Deploy the migrated server before
 enabling clients that produce deferred restart commands.
 
 An upgrade from migrations 1–11 safely seals any legacy published revision but

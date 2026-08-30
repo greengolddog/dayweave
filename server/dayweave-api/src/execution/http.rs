@@ -97,7 +97,7 @@ pub(crate) async fn get_execution(
         (status = 400, description = "Malformed command JSON", body = crate::error::ErrorEnvelope),
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
         (status = 404, description = "Item or session not found", body = crate::error::ErrorEnvelope),
-        (status = 409, description = "Stale revision, active lease, or idempotency conflict", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale revision, active lease, exhausted index space, or idempotency conflict", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid execution command", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -220,6 +220,16 @@ fn map_execution_error(error: ExecutionServiceError) -> ApiError {
                 "the execution slot is not startable from the current published schedule",
             )
         }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::IndexExhausted) => {
+            ApiError::execution_index_exhausted(
+                "no additional execution session index can be allocated",
+            )
+        }
+        ExecutionServiceError::Repository(ExecutionRepositoryError::DeferDurationConflict) => {
+            ApiError::execution_defer_duration_conflict(
+                "the deferred move window must exactly match the unfinished planned duration",
+            )
+        }
         ExecutionServiceError::InvalidIdempotencyKey => {
             ApiError::validation("Idempotency-Key must be 8-128 URL-safe ASCII characters")
         }
@@ -244,5 +254,42 @@ fn map_domain_error(error: &ExecutionDomainError) -> ApiError {
             ApiError::conflict("command does not match the active execution state")
         }
         _ => ApiError::validation(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn index_exhaustion_is_a_stable_detail_free_conflict() {
+        let response = map_execution_error(ExecutionServiceError::Repository(
+            ExecutionRepositoryError::IndexExhausted,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error envelope");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("decode error envelope");
+        assert_eq!(body["error"]["code"], "execution_index_exhausted");
+        assert!(body["error"].get("details").is_none());
+    }
+
+    #[tokio::test]
+    async fn defer_duration_conflict_is_stable_and_detail_free() {
+        let response = map_execution_error(ExecutionServiceError::Repository(
+            ExecutionRepositoryError::DeferDurationConflict,
+        ))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read error envelope");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("decode error envelope");
+        assert_eq!(body["error"]["code"], "execution_defer_duration_conflict");
+        assert!(body["error"].get("details").is_none());
     }
 }

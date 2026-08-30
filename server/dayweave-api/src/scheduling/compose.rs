@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, fmt::Write as _, ops::Deref};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    ops::Deref,
+};
 
 use dayweave_compose::{
     CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
@@ -6,7 +10,10 @@ use dayweave_compose::{
     PrepareScheduleError, PreparedSchedule, RejectedScheduleItem, prepare_canonical_schedule,
     validate_schedule_request,
 };
-use dayweave_core::{ItemId, OccurrenceId, PlanRequest, ScheduleError, SchedulePlan, Scheduler};
+use dayweave_core::{
+    ExecutionPlanningContext, ItemId, OccurrenceId, PlanRequest, ScheduleError, SchedulePlan,
+    Scheduler,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -20,7 +27,10 @@ use crate::items::{
 };
 
 use super::{
-    CalendarProjectionFenceError, CalendarProjectionStamp, postgres::PostgresSchedulingRepository,
+    CalendarProjectionFenceError, CalendarProjectionStamp,
+    postgres::{
+        AuthoritativePlanningEvidence, ExecutionPlanningEvidenceError, PostgresSchedulingRepository,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -46,6 +56,12 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    /// Full private execution and current-publication fence used by the
+    /// scheduler. Publication compares it under the execution lock and stores
+    /// it only inside the private durable snapshot.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) planning_evidence: AuthoritativePlanningEvidence,
     /// Canonical items accepted by this scheduler schema. This includes Inbox
     /// subtrees and retained nonblocking calendar context even though neither
     /// emits a work item or schedule block.
@@ -239,6 +255,10 @@ pub enum ComposeScheduleError {
     CalendarProjectionIncomplete,
     #[error("Google Calendar projection evidence is temporarily unavailable")]
     CalendarProjectionUnavailable,
+    #[error("execution or published-assignment evidence changed during preview")]
+    ExecutionEvidenceChanged,
+    #[error("execution planning evidence is temporarily unavailable")]
+    ExecutionEvidenceUnavailable,
 }
 
 impl ComposeScheduleError {
@@ -286,9 +306,16 @@ pub(crate) async fn compose_canonical_schedule_unfenced(
 async fn compose_canonical_schedule_inner(
     service: &ItemService,
     projection: Option<&PostgresSchedulingRepository>,
-    request: ComposeScheduleRequest,
+    mut request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     validate_schedule_request(&request).map_err(map_prepare_error)?;
+    let planning_before = match projection {
+        Some(projection) => projection
+            .authoritative_planning_evidence()
+            .await
+            .map_err(map_execution_evidence_error)?,
+        None => AuthoritativePlanningEvidence::default(),
+    };
     let projection_before = match projection {
         Some(projection) => projection
             .calendar_projection_stamps(request.horizon_start, request.horizon_end)
@@ -316,11 +343,25 @@ async fn compose_canonical_schedule_inner(
     if projection_before != projection_after {
         return Err(ComposeScheduleError::CalendarProjectionIncomplete);
     }
+    let planning_after = match projection {
+        Some(projection) => projection
+            .authoritative_planning_evidence()
+            .await
+            .map_err(map_execution_evidence_error)?,
+        None => AuthoritativePlanningEvidence::default(),
+    };
+    if planning_before != planning_after {
+        return Err(ComposeScheduleError::ExecutionEvidenceChanged);
+    }
+    let untrusted_assignments =
+        replace_with_authoritative_assignments(&mut request, &planning_before)?;
     compose_items_with_projection_for_schema(
         items,
         request,
         super::SCHEDULER_PUBLICATION_SCHEMA,
         projection_before,
+        planning_before,
+        untrusted_assignments,
     )
 }
 
@@ -335,6 +376,12 @@ const fn map_projection_fence_error(error: CalendarProjectionFenceError) -> Comp
     }
 }
 
+const fn map_execution_evidence_error(
+    _error: ExecutionPlanningEvidenceError,
+) -> ComposeScheduleError {
+    ComposeScheduleError::ExecutionEvidenceUnavailable
+}
+
 #[cfg(test)]
 fn compose_items(
     source_items: Vec<Item>,
@@ -346,14 +393,22 @@ fn compose_items(
 #[cfg(test)]
 fn compose_items_for_schema(
     source_items: Vec<Item>,
-    request: ComposeScheduleRequest,
+    mut request: ComposeScheduleRequest,
     scheduler_publication_schema: &str,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    let planning_evidence = AuthoritativePlanningEvidence {
+        execution: ExecutionPlanningContext::default(),
+        published_revision_id: None,
+        previous_assignments: request.previous_assignments.clone(),
+    };
+    let ignored = replace_with_authoritative_assignments(&mut request, &planning_evidence)?;
     compose_items_with_projection_for_schema(
         source_items,
         request,
         scheduler_publication_schema,
         Vec::new(),
+        planning_evidence,
+        ignored,
     )
 }
 
@@ -362,6 +417,8 @@ fn compose_items_with_projection_for_schema(
     request: ComposeScheduleRequest,
     scheduler_publication_schema: &str,
     calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    planning_evidence: AuthoritativePlanningEvidence,
+    untrusted_assignments: Vec<IgnoredPreviousAssignment>,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     if !calendar_projection_stamps.is_empty()
         && request
@@ -380,6 +437,8 @@ fn compose_items_with_projection_for_schema(
         prepared,
         scheduler_publication_schema,
         calendar_projection_stamps,
+        planning_evidence,
+        untrusted_assignments,
     )
 }
 
@@ -387,6 +446,8 @@ fn compose_prepared_for_schema(
     prepared: PreparedSchedule,
     scheduler_publication_schema: &str,
     calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+    planning_evidence: AuthoritativePlanningEvidence,
+    untrusted_assignments: Vec<IgnoredPreviousAssignment>,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
     let PreparedSchedule {
         timezone_name,
@@ -395,23 +456,26 @@ fn compose_prepared_for_schema(
         effective_sensitivity,
         accepted_item_count,
         rejected_items,
-        ignored_previous_assignments,
+        mut ignored_previous_assignments,
         plan_request,
     } = prepared;
+    ignored_previous_assignments.extend(untrusted_assignments);
     let input_digest = request_digest(
         scheduler_publication_schema,
         &timezone_name,
         &source_item_revisions,
         &calendar_projection_stamps,
+        &planning_evidence.execution,
         &plan_request,
     )?;
-    let plan = Scheduler.plan(&plan_request)?;
+    let plan = Scheduler.plan_with_execution(&plan_request, &planning_evidence.execution)?;
     let result = ComposeScheduleResult {
         input_digest,
         source_item_count,
         source_item_revisions,
         source_item_sensitivity: effective_sensitivity,
         calendar_projection_stamps,
+        planning_evidence,
         accepted_item_count,
         rejected_items,
         ignored_previous_assignments,
@@ -492,6 +556,44 @@ fn map_prepare_error(error: PrepareScheduleError) -> ComposeScheduleError {
     }
 }
 
+fn replace_with_authoritative_assignments(
+    request: &mut ComposeScheduleRequest,
+    evidence: &AuthoritativePlanningEvidence,
+) -> Result<Vec<IgnoredPreviousAssignment>, ComposeScheduleError> {
+    let requested = std::mem::take(&mut request.previous_assignments);
+    let mut requested_identities = BTreeSet::new();
+    let trusted_by_identity: BTreeMap<_, _> = evidence
+        .previous_assignments
+        .iter()
+        .map(|assignment| ((assignment.item_id, assignment.occurrence_id), assignment))
+        .collect();
+    let mut ignored = Vec::new();
+    for assignment in requested {
+        let identity = (assignment.item_id, assignment.occurrence_id);
+        if !requested_identities.insert(identity) {
+            return Err(ComposeScheduleError::InvalidRequest(format!(
+                "duplicate previous assignment for item {} and occurrence",
+                assignment.item_id
+            )));
+        }
+        if trusted_by_identity.get(&identity).copied() == Some(&assignment) {
+            continue;
+        }
+        ignored.push(IgnoredPreviousAssignment {
+            item_id: assignment.item_id,
+            requested_revision: assignment.item_revision,
+            current_revision: trusted_by_identity
+                .get(&identity)
+                .map(|trusted| trusted.item_revision),
+            reason: "not an exact current published assignment".to_owned(),
+        });
+    }
+    request
+        .previous_assignments
+        .clone_from(&evidence.previous_assignments);
+    Ok(ignored)
+}
+
 fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.format(&Rfc3339)
 }
@@ -501,6 +603,7 @@ fn request_digest(
     timezone_name: &str,
     source_item_revisions: &BTreeMap<Uuid, u64>,
     calendar_projection_stamps: &[CalendarProjectionStamp],
+    execution: &ExecutionPlanningContext,
     request: &PlanRequest,
 ) -> Result<String, ComposeScheduleError> {
     #[derive(Serialize)]
@@ -509,6 +612,7 @@ fn request_digest(
         timezone_name: &'a str,
         source_item_revisions: &'a BTreeMap<Uuid, u64>,
         calendar_projection_stamps: &'a [CalendarProjectionStamp],
+        execution: &'a ExecutionPlanningContext,
         request: &'a PlanRequest,
     }
 
@@ -517,6 +621,7 @@ fn request_digest(
         timezone_name,
         source_item_revisions,
         calendar_projection_stamps,
+        execution,
         request,
     })
     .map_err(|_| ComposeScheduleError::Encoding)?;
@@ -605,17 +710,17 @@ mod tests {
 
     #[test]
     fn composes_canonical_item_and_is_digest_stable() {
-        const LEGACY_DIGEST: &str =
-            "sha256:45da53ed109c08d0ac9a442b722f0f10ebb3ca813bf346fa10f79a4ccff53def";
-        const LEGACY_RESPONSE: &str = r#"{"input_digest":"sha256:45da53ed109c08d0ac9a442b722f0f10ebb3ca813bf346fa10f79a4ccff53def","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
+        const V3_DIGEST: &str =
+            "sha256:78c2926e7b139818ec7250be97f8033314358a43d7781fe5f475f4e019ade8f6";
+        const V3_RESPONSE: &str = r#"{"input_digest":"sha256:78c2926e7b139818ec7250be97f8033314358a43d7781fe5f475f4e019ade8f6","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
         let item = canonical_item(Uuid::from_u128(1));
         let first = compose_items(vec![item.clone()], preview_request()).unwrap();
         let second = compose_items(vec![item], preview_request()).unwrap();
         assert_eq!(first.input_digest, second.input_digest);
-        assert_eq!(first.input_digest, LEGACY_DIGEST);
+        assert_eq!(first.input_digest, V3_DIGEST);
         assert_eq!(
             serde_json::to_string(&first).expect("migrated response encoding"),
-            LEGACY_RESPONSE
+            V3_RESPONSE
         );
         assert_eq!(first.accepted_item_count, 1);
         assert_eq!(
@@ -920,6 +1025,8 @@ mod tests {
             preview_request(),
             super::super::SCHEDULER_PUBLICATION_SCHEMA,
             vec![stamp.clone()],
+            AuthoritativePlanningEvidence::default(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -945,6 +1052,8 @@ mod tests {
                 duplicate,
                 super::super::SCHEDULER_PUBLICATION_SCHEMA,
                 vec![stamp],
+                AuthoritativePlanningEvidence::default(),
+                Vec::new(),
             ),
             Err(ComposeScheduleError::InvalidRequest(_))
         ));

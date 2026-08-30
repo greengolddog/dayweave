@@ -7,7 +7,10 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Duration, Utc};
-use dayweave_core::{ExplanationCode, ScheduleBlockKind};
+use dayweave_core::{
+    ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
+    ExecutionWorkUnit, ExplanationCode, ItemId, OccurrenceId, ScheduleBlockKind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -29,10 +32,10 @@ use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp, ComposeScheduleResult, ConflictQuery,
     ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary, PlacementAlternative,
     PlacementExplanation, PlacementReason, PlanOperationKind, PlanningSimulationPort,
-    ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
-    ProposalSubmissionSpec, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess, ScheduleBlockView,
-    ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort, ScheduleView,
-    SchedulingPortError, SimulatedBlockMove, SimulationConsumption, SimulationIssue,
+    PreviousAssignmentInput, PreviousBlockInput, ProposalSubmissionError, ProposalSubmissionPort,
+    ProposalSubmissionResult, ProposalSubmissionSpec, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess,
+    ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
+    ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationConsumption, SimulationIssue,
     SimulationProposalEvidence, SimulationRequest, SimulationResult,
     has_postgres_timestamp_precision, materialize_proposal,
     proposal_bridge::{
@@ -77,14 +80,34 @@ pub struct PublishScheduleSpec {
     pub published_at: DateTime<Utc>,
 }
 
+/// Private, server-authoritative inputs that are fenced around preview reads
+/// and compared again while publication owns the workspace execution lock.
+/// None of this evidence is exposed by the public preview response.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub(crate) struct AuthoritativePlanningEvidence {
+    pub(crate) execution: ExecutionPlanningContext,
+    pub(crate) published_revision_id: Option<Uuid>,
+    pub(crate) previous_assignments: Vec<PreviousAssignmentInput>,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub(crate) enum ExecutionPlanningEvidenceError {
+    #[error("execution planning evidence is unavailable")]
+    Unavailable,
+    #[error("execution planning evidence is internally inconsistent")]
+    Inconsistent,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RequiredDeferredPlacement {
-    deferred_session_id: Uuid,
+struct RequiredDeferReplacementPlacement {
+    source_deferred_session_id: Uuid,
     source_block_id: Uuid,
     item_id: Uuid,
     item_revision: i64,
+    execution_epoch: i64,
     occurrence_id: Option<Uuid>,
-    session_index: i32,
+    replacement_session_index: i32,
+    remaining_duration_seconds: i64,
     move_start: DateTime<Utc>,
     move_end: DateTime<Utc>,
 }
@@ -125,6 +148,30 @@ impl PostgresSchedulingRepository {
     #[must_use]
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self { pool, scope }
+    }
+
+    /// Reads execution progress and current immutable assignment evidence from
+    /// one repeatable-read snapshot. Preview takes this snapshot on both sides
+    /// of its canonical item and Calendar projection reads.
+    pub(crate) async fn authoritative_planning_evidence(
+        &self,
+    ) -> Result<AuthoritativePlanningEvidence, ExecutionPlanningEvidenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        let evidence =
+            authoritative_planning_evidence_tx(&mut transaction, self.scope.workspace_id).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+        Ok(evidence)
     }
 
     /// Removes consumed or expired hidden simulation evidence.
@@ -402,13 +449,21 @@ impl PostgresSchedulingRepository {
             return Ok(replayed);
         }
 
+        let current_planning_evidence =
+            authoritative_planning_evidence_tx(&mut transaction, self.scope.workspace_id)
+                .await
+                .map_err(|_| SchedulePublicationError::Unavailable)?;
+        if current_planning_evidence != spec.result.planning_evidence {
+            return Err(SchedulePublicationError::StaleComposition);
+        }
+
         assert_current_item_snapshot(
             &mut transaction,
             self.scope,
             &spec.result.source_item_revisions,
         )
         .await?;
-        let deferred_placements = required_deferred_placements_tx(
+        let defer_replacement_placements = required_defer_replacement_placements_tx(
             &mut transaction,
             self.scope,
             horizon_start,
@@ -467,11 +522,11 @@ impl PostgresSchedulingRepository {
                 .try_get("publication_hash")
                 .map_err(|_| SchedulePublicationError::Unavailable)?;
             if stored_publication_hash.as_deref() == Some(publication_hash.as_slice())
-                && revision_has_deferred_placements_tx(
+                && revision_has_defer_replacement_placements_tx(
                     &mut transaction,
                     self.scope.workspace_id,
                     parent_id.ok_or(SchedulePublicationError::Unavailable)?,
-                    &deferred_placements,
+                    &defer_replacement_placements,
                 )
                 .await?
             {
@@ -568,11 +623,11 @@ impl PostgresSchedulingRepository {
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         }
 
-        insert_deferred_placements_tx(
+        insert_defer_replacement_placements_tx(
             &mut transaction,
             self.scope.workspace_id,
             revision_id,
-            &deferred_placements,
+            &defer_replacement_placements,
             published_at,
         )
         .await?;
@@ -1810,9 +1865,10 @@ fn durable_snapshot(
         })
         .collect::<Result<Vec<_>, SchedulePublicationError>>()?;
     let snapshot = json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "scheduler_publication_schema": SCHEDULER_PUBLICATION_SCHEMA,
         "compose": result,
+        "execution_planning": &result.planning_evidence,
         "evidence": {
             "source_item_sensitivity": result.source_item_sensitivity,
             "calendar_projection_stamps": result.calendar_projection_stamps,
@@ -1829,6 +1885,488 @@ fn durable_snapshot(
         return Err(SchedulePublicationError::InvalidPayload);
     }
     Ok(snapshot)
+}
+
+#[derive(Default)]
+struct WorkUnitEvidence {
+    progress_epoch: u64,
+    credited_seconds: u64,
+    skipped: bool,
+    used_session_indices: BTreeSet<u16>,
+    reservations: Vec<ExecutionReservation>,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentExecutionItem {
+    progress_epoch: u64,
+    trashed: bool,
+}
+
+#[allow(clippy::too_many_lines)] // One ordered snapshot assembly keeps every execution invariant under the same transaction.
+async fn authoritative_planning_evidence_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<AuthoritativePlanningEvidence, ExecutionPlanningEvidenceError> {
+    let revision = sqlx::query_scalar::<_, i64>(
+        "SELECT revision FROM execution_state WHERE workspace_id = $1",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?
+    .unwrap_or(0);
+    let snapshot_revision =
+        u64::try_from(revision).map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+
+    let item_rows = sqlx::query(
+        "SELECT id, execution_epoch, trashed_at IS NOT NULL AS trashed \
+         FROM items WHERE workspace_id = $1 ORDER BY id",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+    let mut current_items = BTreeMap::new();
+    for row in item_rows {
+        let item_id: Uuid = row
+            .try_get("id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let execution_epoch: i64 = row
+            .try_get("execution_epoch")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let trashed: bool = row
+            .try_get("trashed")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let execution_epoch = u64::try_from(execution_epoch)
+            .ok()
+            .filter(|epoch| *epoch > 0)
+            .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+        current_items.insert(
+            item_id,
+            CurrentExecutionItem {
+                progress_epoch: execution_epoch,
+                trashed,
+            },
+        );
+    }
+
+    let session_rows = sqlx::query(
+        "SELECT session.id, session.item_id, session.execution_epoch, session.occurrence_id, \
+           session.session_index, session.state, session.actual_seconds, \
+           session.planned_block_id, origin.execution_session_id AS origin_id, \
+           origin.item_id AS origin_item_id, origin.execution_epoch AS origin_execution_epoch, \
+           origin.occurrence_id AS origin_occurrence_id, \
+           origin.session_index AS origin_session_index, \
+           origin.source_block_id AS origin_source_block_id, \
+           block.starts_at AS origin_starts_at, block.ends_at AS origin_ends_at \
+         FROM execution_sessions AS session \
+         LEFT JOIN execution_session_schedule_origins AS origin \
+           ON origin.workspace_id = session.workspace_id \
+          AND origin.execution_session_id = session.id \
+         LEFT JOIN schedule_blocks AS block \
+           ON block.workspace_id = origin.workspace_id \
+          AND block.schedule_revision_id = origin.schedule_revision_id \
+          AND block.source_block_id = origin.source_block_id \
+         WHERE session.workspace_id = $1 \
+         ORDER BY session.item_id, session.occurrence_id NULLS FIRST, \
+           session.session_index, session.updated_at, session.id",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+
+    let mut work_units: BTreeMap<(Uuid, Option<Uuid>), WorkUnitEvidence> = BTreeMap::new();
+    for row in session_rows {
+        let session_id: Uuid = row
+            .try_get("id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let item_id: Uuid = row
+            .try_get("item_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let occurrence_id: Option<Uuid> = row
+            .try_get("occurrence_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let state: String = row
+            .try_get("state")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let Some(current_item) = current_items.get(&item_id).copied() else {
+            if matches!(state.as_str(), "active" | "paused") {
+                return Err(ExecutionPlanningEvidenceError::Inconsistent);
+            }
+            continue;
+        };
+        if current_item.trashed {
+            if matches!(state.as_str(), "active" | "paused") {
+                return Err(ExecutionPlanningEvidenceError::Inconsistent);
+            }
+            continue;
+        }
+        let current_epoch = current_item.progress_epoch;
+        let session_epoch = positive_u64_from_row(&row, "execution_epoch")?;
+        let session_index = session_index_from_row(&row, "session_index")?;
+        let unit = work_units.entry((item_id, occurrence_id)).or_default();
+        if unit.progress_epoch == 0 {
+            unit.progress_epoch = current_epoch;
+        } else if unit.progress_epoch != current_epoch {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+        unit.used_session_indices.insert(session_index);
+
+        let origin_id: Option<Uuid> = row
+            .try_get("origin_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let has_exact_origin = if origin_id == Some(session_id) {
+            let origin_item_id: Option<Uuid> = row
+                .try_get("origin_item_id")
+                .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+            let origin_epoch: Option<i64> = row
+                .try_get("origin_execution_epoch")
+                .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+            let origin_occurrence: Option<Uuid> = row
+                .try_get("origin_occurrence_id")
+                .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+            let origin_index: Option<i32> = row
+                .try_get("origin_session_index")
+                .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+            origin_item_id == Some(item_id)
+                && origin_epoch.and_then(|epoch| u64::try_from(epoch).ok()) == Some(session_epoch)
+                && origin_occurrence == occurrence_id
+                && origin_index.and_then(|index| u16::try_from(index).ok()) == Some(session_index)
+        } else {
+            false
+        };
+
+        if session_epoch == current_epoch && has_exact_origin {
+            match state.as_str() {
+                "completed" | "deferred" => {
+                    let actual_seconds: i64 = row
+                        .try_get::<Option<i64>, _>("actual_seconds")
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+                        .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+                    let actual_seconds = u64::try_from(actual_seconds)
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+                    unit.credited_seconds = unit
+                        .credited_seconds
+                        .checked_add(actual_seconds)
+                        .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+                }
+                "skipped" => unit.skipped = true,
+                "active" | "paused" => {
+                    let planned_block_id: Option<Uuid> = row
+                        .try_get("planned_block_id")
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+                    let origin_source_block_id: Option<Uuid> = row
+                        .try_get("origin_source_block_id")
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+                    if planned_block_id.is_none() || planned_block_id != origin_source_block_id {
+                        return Err(ExecutionPlanningEvidenceError::Inconsistent);
+                    }
+                    let starts_at: DateTime<Utc> = row
+                        .try_get::<Option<DateTime<Utc>>, _>("origin_starts_at")
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+                        .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+                    let ends_at: DateTime<Utc> = row
+                        .try_get::<Option<DateTime<Utc>>, _>("origin_ends_at")
+                        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+                        .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+                    unit.reservations.push(ExecutionReservation {
+                        session_index,
+                        start: chrono_to_offset(starts_at)?,
+                        end: chrono_to_offset(ends_at)?,
+                        kind: ExecutionReservationKind::InFlight,
+                    });
+                }
+                _ => {}
+            }
+        } else if matches!(state.as_str(), "active" | "paused") {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+    }
+
+    // Every physical index remains unavailable forever, including fresh
+    // indices allocated for claims that later became passive. Live claim
+    // indices are removed below and represented as exact reservations instead.
+    let physical_rows = sqlx::query(
+        "SELECT physical.item_id, physical.occurrence_id, physical.session_index \
+         FROM execution_physical_indices AS physical \
+         JOIN items AS item ON item.workspace_id = physical.workspace_id \
+          AND item.id = physical.item_id \
+         WHERE physical.workspace_id = $1 AND item.trashed_at IS NULL \
+         ORDER BY physical.item_id, physical.occurrence_id NULLS FIRST, \
+           physical.session_index",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+    for row in physical_rows {
+        let item_id: Uuid = row
+            .try_get("item_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let occurrence_id: Option<Uuid> = row
+            .try_get("occurrence_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let session_index = session_index_from_row(&row, "session_index")?;
+        let current_epoch = current_items
+            .get(&item_id)
+            .map(|item| item.progress_epoch)
+            .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+        let unit = work_units.entry((item_id, occurrence_id)).or_default();
+        if unit.progress_epoch == 0 {
+            unit.progress_epoch = current_epoch;
+        } else if unit.progress_epoch != current_epoch {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+        unit.used_session_indices.insert(session_index);
+    }
+
+    let claim_rows = sqlx::query(
+        "SELECT claim.item_id, claim.execution_epoch, claim.occurrence_id, \
+           claim.source_session_index, claim.replacement_session_index, \
+           claim.move_start, claim.move_end \
+         FROM execution_defer_replacement_claims AS claim \
+         JOIN items AS item ON item.workspace_id = claim.workspace_id \
+          AND item.id = claim.item_id \
+         LEFT JOIN execution_defer_replacement_consumptions AS consumption \
+           ON consumption.workspace_id = claim.workspace_id \
+          AND consumption.source_deferred_session_id = claim.source_deferred_session_id \
+         WHERE claim.workspace_id = $1 AND claim.actionable \
+           AND consumption.source_deferred_session_id IS NULL \
+           AND item.trashed_at IS NULL \
+           AND item.execution_epoch = claim.execution_epoch \
+           AND item.status NOT IN ('completed', 'skipped', 'cancelled') \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM item_hierarchy AS edge \
+               JOIN items AS child ON child.workspace_id = edge.workspace_id \
+                AND child.id = edge.child_item_id \
+               WHERE edge.workspace_id = item.workspace_id \
+                 AND edge.parent_item_id = item.id \
+                 AND child.trashed_at IS NULL \
+           ) \
+         ORDER BY claim.item_id, claim.occurrence_id NULLS FIRST, \
+           claim.replacement_session_index, claim.source_deferred_session_id",
+    )
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+    for row in claim_rows {
+        let item_id: Uuid = row
+            .try_get("item_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let occurrence_id: Option<Uuid> = row
+            .try_get("occurrence_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let current_epoch = current_items
+            .get(&item_id)
+            .map(|item| item.progress_epoch)
+            .ok_or(ExecutionPlanningEvidenceError::Inconsistent)?;
+        if positive_u64_from_row(&row, "execution_epoch")? != current_epoch {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+        let source_session_index = session_index_from_row(&row, "source_session_index")?;
+        let replacement_session_index = session_index_from_row(&row, "replacement_session_index")?;
+        let move_start: DateTime<Utc> = row
+            .try_get("move_start")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let move_end: DateTime<Utc> = row
+            .try_get("move_end")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let unit = work_units.entry((item_id, occurrence_id)).or_default();
+        if unit.progress_epoch == 0 {
+            unit.progress_epoch = current_epoch;
+        }
+        if !unit.used_session_indices.remove(&replacement_session_index)
+            || !unit.used_session_indices.contains(&source_session_index)
+        {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+        unit.reservations.push(ExecutionReservation {
+            session_index: replacement_session_index,
+            start: chrono_to_offset(move_start)?,
+            end: chrono_to_offset(move_end)?,
+            kind: ExecutionReservationKind::DeferredReplacement {
+                source_session_index,
+            },
+        });
+    }
+
+    let work_units = work_units
+        .into_iter()
+        .map(|((item_id, occurrence_id), mut unit)| {
+            unit.reservations.sort_by(|left, right| {
+                left.session_index
+                    .cmp(&right.session_index)
+                    .then(left.start.cmp(&right.start))
+                    .then(left.end.cmp(&right.end))
+            });
+            ExecutionWorkUnit {
+                item_id: ItemId(item_id),
+                occurrence_id: occurrence_id.map(OccurrenceId),
+                progress_epoch: unit.progress_epoch,
+                credited_seconds: unit.credited_seconds,
+                disposition: unit.skipped.then_some(ExecutionDisposition::Skipped),
+                used_session_indices: unit.used_session_indices.into_iter().collect(),
+                reservations: unit.reservations,
+            }
+        })
+        .collect::<Vec<_>>();
+    if snapshot_revision == 0 && !work_units.is_empty() {
+        return Err(ExecutionPlanningEvidenceError::Inconsistent);
+    }
+    let execution = ExecutionPlanningContext {
+        snapshot_revision,
+        work_units,
+    };
+    let (published_revision_id, previous_assignments) =
+        current_published_assignments_tx(transaction, workspace_id).await?;
+    Ok(AuthoritativePlanningEvidence {
+        execution,
+        published_revision_id,
+        previous_assignments,
+    })
+}
+
+type PublishedAssignmentAccumulator = (u64, bool, Vec<PreviousBlockInput>);
+
+#[allow(clippy::too_many_lines)] // Parsing and grouping the private snapshot together keeps malformed legacy rows fail-closed.
+async fn current_published_assignments_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(Option<Uuid>, Vec<PreviousAssignmentInput>), ExecutionPlanningEvidenceError> {
+    let published_revision_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM schedule_revisions WHERE workspace_id = $1 AND state = 'published'",
+    )
+    .bind(workspace_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+    let Some(revision_id) = published_revision_id else {
+        return Ok((None, Vec::new()));
+    };
+    let rows = sqlx::query(
+        "SELECT block.item_id, block.block_kind, block.starts_at, block.ends_at, \
+           block.source_block_id, block.constraint_snapshot ->> 'source_block_id' \
+             AS evidence_source_block_id, \
+           block.constraint_snapshot ->> 'occurrence_id' AS occurrence_id, \
+           block.constraint_snapshot ->> 'session_index' AS session_index, \
+           detail.result_snapshot -> 'compose' -> 'source_item_revisions' \
+             ->> block.item_id::text AS item_revision \
+         FROM schedule_blocks AS block \
+         JOIN schedule_revision_details AS detail \
+           ON detail.workspace_id = block.workspace_id \
+          AND detail.schedule_revision_id = block.schedule_revision_id \
+         WHERE block.workspace_id = $1 AND block.schedule_revision_id = $2 \
+           AND block.item_id IS NOT NULL \
+           AND block.block_kind IN ('planned', 'pinned') \
+         ORDER BY block.item_id, block.constraint_snapshot ->> 'occurrence_id' NULLS FIRST, \
+           block.starts_at, block.ends_at, block.source_block_id",
+    )
+    .bind(workspace_id)
+    .bind(revision_id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| ExecutionPlanningEvidenceError::Unavailable)?;
+
+    let mut grouped: BTreeMap<(Uuid, Option<Uuid>), PublishedAssignmentAccumulator> =
+        BTreeMap::new();
+    for row in rows {
+        let item_id: Uuid = row
+            .try_get("item_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let source_block_id: Uuid = row
+            .try_get("source_block_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let evidence_source_block_id: Option<String> = row
+            .try_get("evidence_source_block_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        if evidence_source_block_id.as_deref() != Some(source_block_id.to_string().as_str()) {
+            continue;
+        }
+        let occurrence_id = row
+            .try_get::<Option<String>, _>("occurrence_id")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+            .map(|value| Uuid::parse_str(&value))
+            .transpose()
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let session_index = row
+            .try_get::<Option<String>, _>("session_index")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+            .and_then(|value| value.parse::<u16>().ok());
+        let item_revision = row
+            .try_get::<Option<String>, _>("item_revision")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|revision| *revision > 0);
+        let (Some(session_index), Some(item_revision)) = (session_index, item_revision) else {
+            continue;
+        };
+        let starts_at: DateTime<Utc> = row
+            .try_get("starts_at")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let ends_at: DateTime<Utc> = row
+            .try_get("ends_at")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let block_kind: String = row
+            .try_get("block_kind")
+            .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+        let entry = grouped
+            .entry((item_id, occurrence_id))
+            .or_insert_with(|| (item_revision, true, Vec::new()));
+        if entry.0 != item_revision {
+            return Err(ExecutionPlanningEvidenceError::Inconsistent);
+        }
+        entry.1 &= block_kind == "pinned";
+        entry.2.push(PreviousBlockInput {
+            start: starts_at,
+            end: ends_at,
+            session_index,
+        });
+    }
+    let previous_assignments = grouped
+        .into_iter()
+        .map(
+            |((item_id, occurrence_id), (item_revision, pinned, blocks))| PreviousAssignmentInput {
+                item_id,
+                item_revision,
+                occurrence_id,
+                blocks,
+                pinned,
+            },
+        )
+        .collect();
+    Ok((Some(revision_id), previous_assignments))
+}
+
+fn positive_u64_from_row(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<u64, ExecutionPlanningEvidenceError> {
+    let value: i64 = row
+        .try_get(column)
+        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+    u64::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or(ExecutionPlanningEvidenceError::Inconsistent)
+}
+
+fn session_index_from_row(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<u16, ExecutionPlanningEvidenceError> {
+    let value: i32 = row
+        .try_get(column)
+        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)?;
+    u16::try_from(value).map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)
+}
+
+fn chrono_to_offset(
+    value: DateTime<Utc>,
+) -> Result<time::OffsetDateTime, ExecutionPlanningEvidenceError> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(value.timestamp_micros()) * 1_000)
+        .map_err(|_| ExecutionPlanningEvidenceError::Inconsistent)
 }
 
 pub(super) fn validate_publishable_compose_result(
@@ -1913,6 +2451,67 @@ fn validate_publication_result(
             return Err(SchedulePublicationError::InvalidPayload);
         }
     }
+    validate_execution_block_identities(result)?;
+    Ok(())
+}
+
+fn validate_execution_block_identities(
+    result: &ComposeScheduleResult,
+) -> Result<(), SchedulePublicationError> {
+    let mut output_identities = BTreeSet::new();
+    for block in &result.plan.blocks {
+        let Some(item_id) = block.item_id else {
+            continue;
+        };
+        if !output_identities.insert((item_id, block.occurrence_id, block.session_index)) {
+            return Err(SchedulePublicationError::InvalidPayload);
+        }
+    }
+    for unit in &result.planning_evidence.execution.work_units {
+        let used: BTreeSet<_> = unit.used_session_indices.iter().copied().collect();
+        for block in result.plan.blocks.iter().filter(|block| {
+            block.item_id == Some(unit.item_id) && block.occurrence_id == unit.occurrence_id
+        }) {
+            let reservation = unit
+                .reservations
+                .iter()
+                .find(|reservation| reservation.session_index == block.session_index);
+            if used.contains(&block.session_index)
+                && !reservation.is_some_and(|reservation| {
+                    matches!(reservation.kind, ExecutionReservationKind::InFlight)
+                })
+            {
+                return Err(SchedulePublicationError::InvalidPayload);
+            }
+            if let Some(reservation) = reservation
+                && (block.kind != ScheduleBlockKind::Pinned
+                    || block.start != reservation.start
+                    || block.end != reservation.end)
+            {
+                return Err(SchedulePublicationError::InvalidPayload);
+            }
+        }
+        for reservation in &unit.reservations {
+            let overlaps_horizon = reservation.start < result.plan.horizon_end
+                && reservation.end > result.plan.horizon_start;
+            let matches = result
+                .plan
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.item_id == Some(unit.item_id)
+                        && block.occurrence_id == unit.occurrence_id
+                        && block.session_index == reservation.session_index
+                        && block.kind == ScheduleBlockKind::Pinned
+                        && block.start == reservation.start
+                        && block.end == reservation.end
+                })
+                .count();
+            if (overlaps_horizon && matches != 1) || (!overlaps_horizon && matches != 0) {
+                return Err(SchedulePublicationError::InvalidPayload);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1926,6 +2525,7 @@ pub(crate) fn publication_content_hash(
         scheduler_publication_schema: &'static str,
         timezone_name: &'a str,
         result: &'a ComposeScheduleResult,
+        execution_planning: &'a ExecutionPlanningContext,
         source_item_sensitivity: &'a BTreeMap<Uuid, bool>,
         calendar_projection_stamps: &'a [CalendarProjectionStamp],
     }
@@ -1934,6 +2534,7 @@ pub(crate) fn publication_content_hash(
         scheduler_publication_schema: SCHEDULER_PUBLICATION_SCHEMA,
         timezone_name,
         result,
+        execution_planning: &result.planning_evidence.execution,
         source_item_sensitivity: &result.source_item_sensitivity,
         calendar_projection_stamps: &result.calendar_projection_stamps,
     })
@@ -1941,43 +2542,44 @@ pub(crate) fn publication_content_hash(
     Ok(Sha256::digest(bytes).into())
 }
 
-/// Selects the authoritative execution head for every semantic work session,
-/// then turns each current-revision defer that touches this horizon into an
-/// exact publication obligation.
-///
-/// The window/state filters intentionally live outside the ranking CTE. A
-/// newer active lease for the same semantic identity supersedes an older defer
-/// even when the active row has an earlier protocol timestamp.
-async fn required_deferred_placements_tx(
+/// Turns each live, current-epoch replacement claim touching the horizon into
+/// one exact fresh-index publication obligation. Disjoint claims remain in the
+/// execution context as high-water reservations but do not create blocks.
+#[allow(clippy::too_many_lines)] // Keep claim decoding and its exact block-attestation checks adjacent.
+async fn required_defer_replacement_placements_tx(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
     horizon_start: DateTime<Utc>,
     horizon_end: DateTime<Utc>,
     result: &ComposeScheduleResult,
-) -> Result<Vec<RequiredDeferredPlacement>, SchedulePublicationError> {
+) -> Result<Vec<RequiredDeferReplacementPlacement>, SchedulePublicationError> {
     let rows = sqlx::query(
-        "WITH semantic_heads AS MATERIALIZED ( \
-           SELECT session.id, session.item_id, session.item_revision, session.occurrence_id, \
-             session.session_index, session.state, session.move_start, session.move_end, \
-             ROW_NUMBER() OVER ( \
-               PARTITION BY session.item_id, session.item_revision, session.occurrence_id, \
-                 session.session_index \
-               ORDER BY CASE WHEN session.id = execution_state.active_session_id \
-                 THEN 1 ELSE 0 END DESC, session.updated_at DESC, session.id DESC \
-             ) AS semantic_rank \
-           FROM execution_sessions AS session \
-           JOIN execution_state ON execution_state.workspace_id = session.workspace_id \
-           WHERE session.workspace_id = $1 \
-         ) \
-         SELECT head.id, head.item_id, head.item_revision, head.occurrence_id, \
-           head.session_index, head.move_start, head.move_end \
-         FROM semantic_heads AS head \
-         JOIN items AS item ON item.workspace_id = $1 AND item.id = head.item_id \
-         WHERE head.semantic_rank = 1 AND head.state = 'deferred' \
-           AND item.trashed_at IS NULL AND item.revision = head.item_revision \
-           AND head.move_start < $3 AND head.move_end > $2 \
-         ORDER BY head.item_id, head.item_revision, head.occurrence_id NULLS FIRST, \
-           head.session_index, head.id",
+        "SELECT claim.source_deferred_session_id, claim.item_id, \
+           item.revision AS item_revision, claim.execution_epoch, claim.occurrence_id, \
+           claim.replacement_session_index, claim.remaining_duration_seconds, \
+           claim.move_start, claim.move_end \
+         FROM execution_defer_replacement_claims AS claim \
+         JOIN items AS item ON item.workspace_id = claim.workspace_id \
+          AND item.id = claim.item_id \
+         LEFT JOIN execution_defer_replacement_consumptions AS consumption \
+           ON consumption.workspace_id = claim.workspace_id \
+          AND consumption.source_deferred_session_id = claim.source_deferred_session_id \
+         WHERE claim.workspace_id = $1 AND claim.actionable \
+           AND consumption.source_deferred_session_id IS NULL \
+           AND item.trashed_at IS NULL \
+           AND item.execution_epoch = claim.execution_epoch \
+           AND item.status NOT IN ('completed', 'skipped', 'cancelled') \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM item_hierarchy AS edge \
+               JOIN items AS child ON child.workspace_id = edge.workspace_id \
+                AND child.id = edge.child_item_id \
+               WHERE edge.workspace_id = item.workspace_id \
+                 AND edge.parent_item_id = item.id \
+                 AND child.trashed_at IS NULL \
+           ) \
+           AND claim.move_start < $3 AND claim.move_end > $2 \
+         ORDER BY claim.item_id, claim.occurrence_id NULLS FIRST, \
+           claim.replacement_session_index, claim.source_deferred_session_id",
     )
     .bind(scope.workspace_id)
     .bind(horizon_start)
@@ -1988,8 +2590,8 @@ async fn required_deferred_placements_tx(
 
     let mut placements = Vec::with_capacity(rows.len());
     for row in rows {
-        let deferred_session_id: Uuid = row
-            .try_get("id")
+        let source_deferred_session_id: Uuid = row
+            .try_get("source_deferred_session_id")
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         let item_id: Uuid = row
             .try_get("item_id")
@@ -1997,11 +2599,17 @@ async fn required_deferred_placements_tx(
         let item_revision: i64 = row
             .try_get("item_revision")
             .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let execution_epoch: i64 = row
+            .try_get("execution_epoch")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
         let occurrence_id: Option<Uuid> = row
             .try_get("occurrence_id")
             .map_err(|_| SchedulePublicationError::Unavailable)?;
-        let session_index: i32 = row
-            .try_get("session_index")
+        let replacement_session_index: i32 = row
+            .try_get("replacement_session_index")
+            .map_err(|_| SchedulePublicationError::Unavailable)?;
+        let remaining_duration_seconds: i64 = row
+            .try_get("remaining_duration_seconds")
             .map_err(|_| SchedulePublicationError::Unavailable)?;
         let move_start: DateTime<Utc> = row
             .try_get("move_start")
@@ -2024,7 +2632,7 @@ async fn required_deferred_placements_tx(
                     .item_id
                     .is_some_and(|candidate| candidate.0 == item_id)
                     && block.occurrence_id.map(|candidate| candidate.0) == occurrence_id
-                    && i32::from(block.session_index) == session_index
+                    && i32::from(block.session_index) == replacement_session_index
                     && result.source_item_revisions.get(&item_id) == Some(&item_revision_u64)
             })
             .collect::<Vec<_>>();
@@ -2034,16 +2642,19 @@ async fn required_deferred_placements_tx(
         if block.kind != ScheduleBlockKind::Pinned
             || offset_to_chrono(block.start)? != move_start
             || offset_to_chrono(block.end)? != move_end
+            || exact_duration_seconds(move_start, move_end)? != remaining_duration_seconds
         {
             return Err(SchedulePublicationError::DeferredPlacementRequired);
         }
-        placements.push(RequiredDeferredPlacement {
-            deferred_session_id,
+        placements.push(RequiredDeferReplacementPlacement {
+            source_deferred_session_id,
             source_block_id: block.id,
             item_id,
             item_revision,
+            execution_epoch,
             occurrence_id,
-            session_index,
+            replacement_session_index,
+            remaining_duration_seconds,
             move_start,
             move_end,
         });
@@ -2051,31 +2662,36 @@ async fn required_deferred_placements_tx(
     Ok(placements)
 }
 
-async fn revision_has_deferred_placements_tx(
+async fn revision_has_defer_replacement_placements_tx(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     revision_id: Uuid,
-    placements: &[RequiredDeferredPlacement],
+    placements: &[RequiredDeferReplacementPlacement],
 ) -> Result<bool, SchedulePublicationError> {
     for placement in placements {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS ( \
-               SELECT 1 FROM schedule_deferred_placements \
+               SELECT 1 FROM schedule_defer_replacement_placements \
                WHERE workspace_id = $1 AND schedule_revision_id = $2 \
-                 AND deferred_execution_session_id = $3 AND source_block_id = $4 \
+                 AND source_deferred_session_id = $3 AND source_block_id = $4 \
                  AND item_id = $5 AND item_revision = $6 \
-                 AND occurrence_id IS NOT DISTINCT FROM $7 \
-                 AND session_index = $8 AND move_start = $9 AND move_end = $10 \
+                 AND execution_epoch = $7 \
+                 AND occurrence_id IS NOT DISTINCT FROM $8 \
+                 AND replacement_session_index = $9 \
+                 AND remaining_duration_seconds = $10 \
+                 AND move_start = $11 AND move_end = $12 \
              )",
         )
         .bind(workspace_id)
         .bind(revision_id)
-        .bind(placement.deferred_session_id)
+        .bind(placement.source_deferred_session_id)
         .bind(placement.source_block_id)
         .bind(placement.item_id)
         .bind(placement.item_revision)
+        .bind(placement.execution_epoch)
         .bind(placement.occurrence_id)
-        .bind(placement.session_index)
+        .bind(placement.replacement_session_index)
+        .bind(placement.remaining_duration_seconds)
         .bind(placement.move_start)
         .bind(placement.move_end)
         .fetch_one(&mut **transaction)
@@ -2088,28 +2704,31 @@ async fn revision_has_deferred_placements_tx(
     Ok(true)
 }
 
-async fn insert_deferred_placements_tx(
+async fn insert_defer_replacement_placements_tx(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     revision_id: Uuid,
-    placements: &[RequiredDeferredPlacement],
+    placements: &[RequiredDeferReplacementPlacement],
     created_at: DateTime<Utc>,
 ) -> Result<(), SchedulePublicationError> {
     for placement in placements {
         sqlx::query(
-            "INSERT INTO schedule_deferred_placements (workspace_id, schedule_revision_id, \
-             deferred_execution_session_id, source_block_id, item_id, item_revision, occurrence_id, \
-             session_index, move_start, move_end, created_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO schedule_defer_replacement_placements (workspace_id, \
+             schedule_revision_id, source_deferred_session_id, source_block_id, item_id, \
+             item_revision, execution_epoch, occurrence_id, replacement_session_index, \
+             remaining_duration_seconds, move_start, move_end, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(workspace_id)
         .bind(revision_id)
-        .bind(placement.deferred_session_id)
+        .bind(placement.source_deferred_session_id)
         .bind(placement.source_block_id)
         .bind(placement.item_id)
         .bind(placement.item_revision)
+        .bind(placement.execution_epoch)
         .bind(placement.occurrence_id)
-        .bind(placement.session_index)
+        .bind(placement.replacement_session_index)
+        .bind(placement.remaining_duration_seconds)
         .bind(placement.move_start)
         .bind(placement.move_end)
         .bind(created_at)
@@ -3241,6 +3860,24 @@ fn offset_to_chrono(
     value: time::OffsetDateTime,
 ) -> Result<DateTime<Utc>, SchedulePublicationError> {
     DateTime::from_timestamp(value.unix_timestamp(), value.nanosecond())
+        .ok_or(SchedulePublicationError::InvalidPayload)
+}
+
+fn exact_duration_seconds(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<i64, SchedulePublicationError> {
+    let microseconds = end
+        .signed_duration_since(start)
+        .num_microseconds()
+        .filter(|value| *value > 0)
+        .ok_or(SchedulePublicationError::InvalidPayload)?;
+    if microseconds % 1_000_000 != 0 {
+        return Err(SchedulePublicationError::InvalidPayload);
+    }
+    microseconds
+        .checked_div(1_000_000)
+        .filter(|value| *value > 0)
         .ok_or(SchedulePublicationError::InvalidPayload)
 }
 
