@@ -1134,7 +1134,11 @@ async fn calendar_projection_upgrade_retires_legacy_items_and_resets_only_calend
     .fetch_one(pool)
     .await
     .expect("already-trashed control item");
-    assert_eq!(already_trashed, (1, Some(already_trashed_at)));
+    assert_eq!(already_trashed.0, 1);
+    assert_eq!(
+        already_trashed.1.map(|value| value.timestamp_micros()),
+        Some(already_trashed_at.timestamp_micros())
+    );
 
     let retirement_audits: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_operations WHERE workspace_id = $1 \

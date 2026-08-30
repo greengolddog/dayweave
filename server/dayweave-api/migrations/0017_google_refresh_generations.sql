@@ -9,9 +9,9 @@ ALTER TABLE google_sync_runs
         CHECK (claimed_refresh_generation >= 0),
     ADD COLUMN completed_refresh_generation bigint NOT NULL DEFAULT 0
         CHECK (completed_refresh_generation >= 0),
-    ADD CONSTRAINT google_sync_runs_claimed_refresh_generation_check
+    ADD CONSTRAINT google_sync_runs_claimed_not_ahead_of_refresh_check
         CHECK (claimed_refresh_generation <= refresh_generation),
-    ADD CONSTRAINT google_sync_runs_completed_refresh_generation_check
+    ADD CONSTRAINT google_sync_runs_completed_not_ahead_of_claimed_check
         CHECK (completed_refresh_generation <= claimed_refresh_generation);
 
 -- A durable request identity makes a response-loss retry exact. Replaying the

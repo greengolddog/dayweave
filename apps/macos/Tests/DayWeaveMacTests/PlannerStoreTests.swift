@@ -557,6 +557,7 @@ final class PlannerStoreTests: XCTestCase {
         let parent = try authoringItem(id: parentID, revision: 1, deleted: false)
         let store = PlannerStore(
             canonicalItems: [parent],
+            canonicalConfigurationIdentifier: authoringConfigurationIdentifier,
             persistence: context.persistence,
             restoreFromPersistence: false
         )
