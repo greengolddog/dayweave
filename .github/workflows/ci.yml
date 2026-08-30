@@ -55,6 +55,8 @@ jobs:
           --package dayweave-scheduler-helper
           --all-targets --all-features
           --target aarch64-apple-darwin
+      - name: Test scheduler helper build isolation
+        run: scripts/tests/test-build-macos-scheduler-helper-security.sh
       - name: Verify the dormant arm64 scheduler helper
         run: scripts/build-macos-scheduler-helper.sh
       - name: Install the runtime verified by the app bundle gate
