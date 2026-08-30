@@ -23,10 +23,12 @@ pub(crate) fn truncate_to_postgres_timestamp_precision(
 
 pub(crate) use compose::compose_canonical_schedule_unfenced;
 pub use compose::{
-    AvailabilityInput, ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult,
-    EnergyInput, FixedBlockInput, FixedBlockSourceInput, IgnoredPreviousAssignment,
-    PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem, Rfc3339SchedulePlan,
-    SchedulerConfigInput, compose_canonical_schedule,
+    ComposeScheduleError, ComposeScheduleResult, Rfc3339SchedulePlan, compose_canonical_schedule,
+};
+pub use dayweave_compose::{
+    AvailabilityInput, ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
+    IgnoredPreviousAssignment, PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem,
+    SchedulerConfigInput,
 };
 pub use memory::{
     InMemoryScheduleQueryPort, InMemorySimulationPort, simulation_request_digest,

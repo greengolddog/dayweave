@@ -1,26 +1,17 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
-    fmt::Write as _,
-    ops::Deref,
-};
+use std::{collections::BTreeMap, fmt::Write as _, ops::Deref};
 
-use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, Offset as _, TimeZone as _, Utc};
-use chrono_tz::Tz;
-use dayweave_core::{
-    AllocationRange, AvailabilityWindow, BreakCategory, BreakSpec, CalendarEventSpec,
-    DailyTimeWindow, DurationEstimate, EnergyLevel, FixedBlock, FixedBlockSource, GoalMeasure,
-    GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
-    PreviousAssignment, PreviousBlock, Priority, Qualified, QuantityTarget, Recurrence,
-    RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurringTaskSpec,
-    RoutineSpec, ScheduleError, SchedulePlan, Scheduler, SchedulerConfig, SchedulingConstraints,
-    SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus, ZonedDayBoundary,
+use dayweave_compose::{
+    CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
+    ComposeScheduleRequest, FixedBlockSourceInput, IgnoredPreviousAssignment, MAX_CANONICAL_ITEMS,
+    PrepareScheduleError, PreparedSchedule, RejectedScheduleItem, prepare_canonical_schedule,
+    validate_schedule_request,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use dayweave_core::{ItemId, OccurrenceId, PlanRequest, ScheduleError, SchedulePlan, Scheduler};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use time::{OffsetDateTime, UtcOffset};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -31,117 +22,6 @@ use crate::items::{
 use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp, postgres::PostgresSchedulingRepository,
 };
-
-const MAX_CANONICAL_ITEMS: usize = 10_000;
-const MAX_AVAILABILITY_WINDOWS: usize = 10_000;
-const MAX_FIXED_BLOCKS: usize = 10_000;
-const MAX_PREVIOUS_ASSIGNMENTS: usize = 10_000;
-const MAX_PREVIOUS_BLOCKS: usize = 50_000;
-const MAX_RECURRENCE_CONTEXT_ENTRIES: usize = 10_000;
-const MAX_HORIZON_DAYS: i64 = 90;
-const MAX_CALENDAR_DAYS: usize = 92;
-const MAX_WEIGHT: u32 = 1_000_000;
-const MAX_PERSISTED_BLOCK_TITLE_CHARACTERS: usize = 500;
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ComposeScheduleRequest {
-    pub as_of: DateTime<Utc>,
-    pub horizon_start: DateTime<Utc>,
-    pub horizon_end: DateTime<Utc>,
-    pub timezone_name: String,
-    #[serde(default)]
-    pub availability: Vec<AvailabilityInput>,
-    #[serde(default)]
-    pub fixed_blocks: Vec<FixedBlockInput>,
-    #[serde(default)]
-    pub previous_assignments: Vec<PreviousAssignmentInput>,
-    #[serde(default)]
-    pub config: SchedulerConfigInput,
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub recurrence_context: RecurrenceContext,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct AvailabilityInput {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    #[serde(default)]
-    pub contexts: BTreeSet<String>,
-    pub location: Option<String>,
-    #[serde(default)]
-    pub energy: EnergyInput,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum EnergyInput {
-    Low,
-    #[default]
-    Medium,
-    Deep,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct FixedBlockInput {
-    pub id: Uuid,
-    pub is_sensitive: bool,
-    pub title: String,
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    pub source: FixedBlockSourceInput,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum FixedBlockSourceInput {
-    GoogleCalendar,
-    Sleep,
-    ProtectedTime,
-    Travel,
-    Manual,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PreviousAssignmentInput {
-    pub item_id: Uuid,
-    pub item_revision: u64,
-    pub occurrence_id: Option<Uuid>,
-    #[serde(default)]
-    pub blocks: Vec<PreviousBlockInput>,
-    #[serde(default)]
-    pub pinned: bool,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct PreviousBlockInput {
-    pub start: DateTime<Utc>,
-    pub end: DateTime<Utc>,
-    pub session_index: u16,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, ToSchema)]
-#[serde(default, deny_unknown_fields)]
-pub struct SchedulerConfigInput {
-    pub slot_granularity_minutes: u32,
-    pub stability_weight: u32,
-    pub default_soft_weight: u32,
-}
-
-impl Default for SchedulerConfigInput {
-    fn default() -> Self {
-        Self {
-            slot_granularity_minutes: 5,
-            stability_weight: 4,
-            default_soft_weight: 100,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ComposeScheduleResult {
@@ -343,22 +223,6 @@ impl TryFrom<&dayweave_core::Occurrence> for OccurrenceOutput {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, ToSchema)]
-pub struct RejectedScheduleItem {
-    pub item_id: Uuid,
-    pub is_sensitive: bool,
-    pub title: String,
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, ToSchema)]
-pub struct IgnoredPreviousAssignment {
-    pub item_id: Uuid,
-    pub requested_revision: u64,
-    pub current_revision: Option<u64>,
-    pub reason: String,
-}
-
 #[derive(Debug, Error)]
 pub enum ComposeScheduleError {
     #[error("invalid schedule preview request: {0}")]
@@ -424,7 +288,7 @@ async fn compose_canonical_schedule_inner(
     projection: Option<&PostgresSchedulingRepository>,
     request: ComposeScheduleRequest,
 ) -> Result<ComposeScheduleResult, ComposeScheduleError> {
-    validate_request_shape(&request)?;
+    validate_schedule_request(&request).map_err(map_prepare_error)?;
     let projection_before = match projection {
         Some(projection) => projection
             .calendar_projection_stamps(request.horizon_start, request.horizon_end)
@@ -493,7 +357,6 @@ fn compose_items_for_schema(
     )
 }
 
-#[allow(clippy::too_many_lines)] // One pipeline keeps snapshot counts, digest, and plan atomic.
 fn compose_items_with_projection_for_schema(
     source_items: Vec<Item>,
     request: ComposeScheduleRequest,
@@ -511,105 +374,38 @@ fn compose_items_with_projection_for_schema(
                 .to_owned(),
         ));
     }
-    let publication_timezone = request.timezone_name.clone();
-    let source_item_count = source_items.len();
-    let source_item_revisions = source_items
-        .iter()
-        .map(|item| (item.id, item.revision))
-        .collect();
-    let effective_sensitivity = effective_sensitivity_by_item(&source_items);
-    let inbox_subtree_item_ids = inbox_subtree_item_ids(&source_items);
-    let mut rejected_items = Vec::new();
-    let mut accepted = Vec::with_capacity(source_items.len());
-    let mut accepted_without_work_count = 0_usize;
-    for item in source_items {
-        if inbox_subtree_item_ids.contains(&item.id) {
-            accepted_without_work_count = accepted_without_work_count
-                .checked_add(1)
-                .ok_or(ComposeScheduleError::Encoding)?;
-            continue;
-        }
-        let is_sensitive = effective_sensitivity.get(&item.id).copied().unwrap_or(true);
-        match classify_item(&item, is_sensitive) {
-            Ok(MappedScheduleItem::Plannable(mapped)) => accepted.push(*mapped),
-            Ok(MappedScheduleItem::ContextOnly) => {
-                accepted_without_work_count = accepted_without_work_count
-                    .checked_add(1)
-                    .ok_or(ComposeScheduleError::Encoding)?;
-            }
-            Err(reason) => rejected_items.push(RejectedScheduleItem {
-                item_id: item.id,
-                is_sensitive,
-                title: item.title,
-                reason,
-            }),
-        }
-    }
-    prune_orphaned_items(&mut accepted, &mut rejected_items);
-    accepted.sort_by_key(|item| item.id);
+    let source_items = source_items.into_iter().map(into_canonical_item).collect();
+    let prepared = prepare_canonical_schedule(source_items, request).map_err(map_prepare_error)?;
+    compose_prepared_for_schema(
+        prepared,
+        scheduler_publication_schema,
+        calendar_projection_stamps,
+    )
+}
 
-    let revisions: BTreeMap<_, _> = accepted
-        .iter()
-        .map(|item| (item.id, item.revision))
-        .collect();
-    let mut recurrence_context = request.recurrence_context;
-    remove_inbox_subtree_recurrence_references(&mut recurrence_context, &inbox_subtree_item_ids);
-    validate_recurrence_context_references(&recurrence_context, &revisions)?;
-    let planning_timezone: Tz = request
-        .timezone_name
-        .parse()
-        .map_err(|_| ComposeScheduleError::InvalidRequest("invalid timezone_name".into()))?;
-    let (previous_assignments, ignored_previous_assignments) =
-        map_previous_assignments(&request.previous_assignments, &revisions, planning_timezone)?;
-
-    let horizon_start = to_time_in_timezone(request.horizon_start, planning_timezone)?;
-    let horizon_end = to_time_in_timezone(request.horizon_end, planning_timezone)?;
-    populate_recurrence_calendar(
-        &mut recurrence_context,
-        &request.timezone_name,
-        request.horizon_start,
-        request.horizon_end,
-    )?;
-    let plan_request = PlanRequest {
-        as_of: to_time_in_timezone(request.as_of, planning_timezone)?,
-        horizon_start,
-        horizon_end,
-        items: accepted,
-        availability: request
-            .availability
-            .into_iter()
-            .map(|input| map_availability(input, planning_timezone))
-            .collect::<Result<_, _>>()?,
-        fixed_blocks: request
-            .fixed_blocks
-            .into_iter()
-            .map(|input| map_fixed_block(input, planning_timezone))
-            .collect::<Result<_, _>>()?,
-        previous_assignments,
-        config: SchedulerConfig {
-            slot_granularity: Minutes(request.config.slot_granularity_minutes),
-            stability_weight: request.config.stability_weight,
-            default_soft_weight: request.config.default_soft_weight,
-        },
-        recurrence_context,
-    };
-
+fn compose_prepared_for_schema(
+    prepared: PreparedSchedule,
+    scheduler_publication_schema: &str,
+    calendar_projection_stamps: Vec<CalendarProjectionStamp>,
+) -> Result<ComposeScheduleResult, ComposeScheduleError> {
+    let PreparedSchedule {
+        timezone_name,
+        source_item_count,
+        source_item_revisions,
+        effective_sensitivity,
+        accepted_item_count,
+        rejected_items,
+        ignored_previous_assignments,
+        plan_request,
+    } = prepared;
     let input_digest = request_digest(
         scheduler_publication_schema,
-        &request.timezone_name,
+        &timezone_name,
         &source_item_revisions,
         &calendar_projection_stamps,
         &plan_request,
     )?;
     let plan = Scheduler.plan(&plan_request)?;
-    let accepted_item_count = plan_request
-        .items
-        .len()
-        .checked_add(accepted_without_work_count)
-        .ok_or(ComposeScheduleError::Encoding)?;
-    if accepted_item_count.checked_add(rejected_items.len()) != Some(source_item_count) {
-        return Err(ComposeScheduleError::Encoding);
-    }
     let result = ComposeScheduleResult {
         input_digest,
         source_item_count,
@@ -621,7 +417,7 @@ fn compose_items_with_projection_for_schema(
         ignored_previous_assignments,
         plan: Rfc3339SchedulePlan(plan),
     };
-    super::postgres::validate_publishable_compose_result(&publication_timezone, &result).map_err(
+    super::postgres::validate_publishable_compose_result(&timezone_name, &result).map_err(
         |_| {
             ComposeScheduleError::InvalidRequest(
                 "composed schedule exceeds the durable publication contract".to_owned(),
@@ -631,810 +427,69 @@ fn compose_items_with_projection_for_schema(
     Ok(result)
 }
 
-/// Resolves effective sensitivity over the already-validated canonical tree.
-/// Missing ancestors or a corrupted cycle fail closed without affecting the
-/// scheduler's placement inputs.
-fn effective_sensitivity_by_item(items: &[Item]) -> BTreeMap<Uuid, bool> {
-    fn resolve(
-        id: Uuid,
-        items: &BTreeMap<Uuid, &Item>,
-        resolved: &mut BTreeMap<Uuid, bool>,
-        visiting: &mut BTreeSet<Uuid>,
-    ) -> bool {
-        if let Some(value) = resolved.get(&id) {
-            return *value;
-        }
-        let Some(item) = items.get(&id) else {
-            return true;
-        };
-        if !visiting.insert(id) {
-            return true;
-        }
-        let inherited = item
-            .parent_id
-            .is_some_and(|parent_id| resolve(parent_id, items, resolved, visiting));
-        visiting.remove(&id);
-        let value = item.is_sensitive || inherited;
-        resolved.insert(id, value);
-        value
-    }
-
-    let by_id: BTreeMap<_, _> = items.iter().map(|item| (item.id, item)).collect();
-    let mut resolved = BTreeMap::new();
-    for id in by_id.keys().copied() {
-        resolve(id, &by_id, &mut resolved, &mut BTreeSet::new());
-    }
-    resolved
-}
-
-#[allow(clippy::too_many_lines)] // One validation pass keeps preview and publication acceptance identical.
-fn validate_request_shape(request: &ComposeScheduleRequest) -> Result<(), ComposeScheduleError> {
-    let horizon = request.horizon_end - request.horizon_start;
-    if horizon <= chrono::Duration::zero() || horizon > chrono::Duration::days(MAX_HORIZON_DAYS) {
-        return invalid(format!(
-            "horizon must be positive and no longer than {MAX_HORIZON_DAYS} days"
-        ));
-    }
-    if request.as_of > request.horizon_end {
-        return invalid("as_of must not be later than horizon_end");
-    }
-    let chrono_instant_is_precise =
-        |value: DateTime<Utc>| value.timestamp_subsec_nanos().is_multiple_of(1_000);
-    let offset_instant_is_precise =
-        |value: OffsetDateTime| value.nanosecond().is_multiple_of(1_000);
-    let recurrence_instants_are_precise =
-        request
-            .recurrence_context
-            .completion_anchors
-            .values()
-            .chain(request.recurrence_context.rolling_anchors.values())
-            .all(|value| offset_instant_is_precise(*value))
-            && request.recurrence_context.calendar.days.iter().all(|day| {
-                offset_instant_is_precise(day.start) && offset_instant_is_precise(day.end)
-            })
-            && request.recurrence_context.pauses.iter().all(|pause| {
-                offset_instant_is_precise(pause.start) && offset_instant_is_precise(pause.end)
-            })
-            && request
-                .recurrence_context
-                .exceptions
-                .iter()
-                .all(|exception| {
-                    let selector = match exception.selector {
-                        RecurrenceExceptionSelector::NominalStart { at } => {
-                            offset_instant_is_precise(at)
-                        }
-                        RecurrenceExceptionSelector::Occurrence { .. }
-                        | RecurrenceExceptionSelector::LocalDate { .. } => true,
-                    };
-                    let action = match exception.action {
-                        RecurrenceExceptionAction::Move { start, end } => {
-                            offset_instant_is_precise(start) && offset_instant_is_precise(end)
-                        }
-                        RecurrenceExceptionAction::Skip => true,
-                    };
-                    selector && action
-                });
-    if !chrono_instant_is_precise(request.as_of)
-        || !chrono_instant_is_precise(request.horizon_start)
-        || !chrono_instant_is_precise(request.horizon_end)
-        || request.availability.iter().any(|window| {
-            !chrono_instant_is_precise(window.start) || !chrono_instant_is_precise(window.end)
-        })
-        || request.fixed_blocks.iter().any(|block| {
-            !chrono_instant_is_precise(block.start) || !chrono_instant_is_precise(block.end)
-        })
-        || request.previous_assignments.iter().any(|assignment| {
-            assignment.blocks.iter().any(|block| {
-                !chrono_instant_is_precise(block.start) || !chrono_instant_is_precise(block.end)
-            })
-        })
-        || !recurrence_instants_are_precise
-    {
-        return invalid("schedule instants must use PostgreSQL microsecond precision");
-    }
-    if request.timezone_name.parse::<Tz>().is_err() {
-        return invalid("timezone_name must be a valid IANA timezone");
-    }
-    if request.availability.len() > MAX_AVAILABILITY_WINDOWS {
-        return invalid(format!(
-            "availability supports at most {MAX_AVAILABILITY_WINDOWS} windows"
-        ));
-    }
-    if request.fixed_blocks.len() > MAX_FIXED_BLOCKS {
-        return invalid(format!(
-            "fixed_blocks supports at most {MAX_FIXED_BLOCKS} entries"
-        ));
-    }
-    if request.fixed_blocks.iter().any(|block| {
-        block.title.trim().is_empty()
-            || block.title.chars().count() > MAX_PERSISTED_BLOCK_TITLE_CHARACTERS
-            || block.title.chars().any(char::is_control)
-    }) {
-        return invalid(format!(
-            "fixed block titles must contain 1-{MAX_PERSISTED_BLOCK_TITLE_CHARACTERS} non-control characters"
-        ));
-    }
-    let mut fixed_ids = BTreeSet::new();
-    if request
-        .fixed_blocks
-        .iter()
-        .any(|block| !fixed_ids.insert(block.id))
-    {
-        return invalid("fixed block ids must be unique");
-    }
-    if request.previous_assignments.len() > MAX_PREVIOUS_ASSIGNMENTS {
-        return invalid(format!(
-            "previous_assignments supports at most {MAX_PREVIOUS_ASSIGNMENTS} entries"
-        ));
-    }
-    let previous_blocks = request
-        .previous_assignments
-        .iter()
-        .try_fold(0_usize, |total, assignment| {
-            total.checked_add(assignment.blocks.len())
-        })
-        .ok_or_else(|| ComposeScheduleError::InvalidRequest("too many previous blocks".into()))?;
-    if previous_blocks > MAX_PREVIOUS_BLOCKS {
-        return invalid(format!(
-            "previous assignments support at most {MAX_PREVIOUS_BLOCKS} blocks"
-        ));
-    }
-    if !(1..=60).contains(&request.config.slot_granularity_minutes) {
-        return invalid("slot_granularity_minutes must be in 1..=60");
-    }
-    if request.config.stability_weight > MAX_WEIGHT
-        || request.config.default_soft_weight > MAX_WEIGHT
-    {
-        return invalid(format!("scheduler weights must be at most {MAX_WEIGHT}"));
-    }
-    let context_entries = request
-        .recurrence_context
-        .completion_anchors
-        .len()
-        .saturating_add(request.recurrence_context.rolling_anchors.len())
-        .saturating_add(request.recurrence_context.minimum_spacing.len())
-        .saturating_add(request.recurrence_context.completed_occurrence_ids.len())
-        .saturating_add(request.recurrence_context.pauses.len())
-        .saturating_add(request.recurrence_context.exceptions.len());
-    if context_entries > MAX_RECURRENCE_CONTEXT_ENTRIES {
-        return invalid(format!(
-            "recurrence_context supports at most {MAX_RECURRENCE_CONTEXT_ENTRIES} entries"
-        ));
-    }
-    if request.recurrence_context.calendar.days.len() > MAX_CALENDAR_DAYS {
-        return invalid("recurrence calendar contains more days than the maximum horizon");
-    }
-    Ok(())
-}
-
-fn validate_recurrence_context_references(
-    context: &RecurrenceContext,
-    revisions: &BTreeMap<ItemId, u64>,
-) -> Result<(), ComposeScheduleError> {
-    let mut referenced = BTreeSet::new();
-    referenced.extend(context.completion_anchors.keys().copied());
-    referenced.extend(context.rolling_anchors.keys().copied());
-    referenced.extend(context.minimum_spacing.keys().copied());
-    referenced.extend(context.pauses.iter().map(|pause| pause.item_id));
-    referenced.extend(context.exceptions.iter().map(|exception| exception.item_id));
-    if let Some(missing) = referenced
-        .into_iter()
-        .find(|item_id| !revisions.contains_key(item_id))
-    {
-        return invalid(format!(
-            "recurrence_context references unavailable item {missing}"
-        ));
-    }
-    Ok(())
-}
-
-fn remove_inbox_subtree_recurrence_references(
-    context: &mut RecurrenceContext,
-    inbox_subtree_item_ids: &BTreeSet<Uuid>,
-) {
-    let is_retained = |item_id: &ItemId| !inbox_subtree_item_ids.contains(&item_id.0);
-    context
-        .completion_anchors
-        .retain(|item_id, _| is_retained(item_id));
-    context
-        .rolling_anchors
-        .retain(|item_id, _| is_retained(item_id));
-    context
-        .minimum_spacing
-        .retain(|item_id, _| is_retained(item_id));
-    context.pauses.retain(|pause| is_retained(&pause.item_id));
-    context
-        .exceptions
-        .retain(|exception| is_retained(&exception.item_id));
-    // Completed occurrence IDs are intentionally not item-keyed. With the
-    // excluded series absent from `PlanRequest.items`, they cannot materialize
-    // an Inbox occurrence and remain valid evidence for retained series.
-}
-
-enum MappedScheduleItem {
-    Plannable(Box<WorkItem>),
-    ContextOnly,
-}
-
-fn classify_item(item: &Item, is_sensitive: bool) -> Result<MappedScheduleItem, String> {
-    let item_timezone: Tz = item
-        .timezone_name
-        .parse()
-        .map_err(|_| "canonical item timezone is invalid".to_owned())?;
-    let metadata: SchedulingMetadata = serde_json::from_value(item.flexible_constraints.clone())
-        .map_err(|error| format!("unsupported flexible_constraints: {error}"))?;
-    let recurrence = parse_recurrence(item.recurrence.as_ref())?;
-    if let Some(context) = metadata.calendar_context.as_ref() {
-        validate_calendar_context(item, recurrence.as_ref(), &metadata, context)?;
-        return Ok(MappedScheduleItem::ContextOnly);
-    }
-    if item.kind != ItemKind::Event && metadata.calendar_event.is_some() {
-        return Err("calendar_event metadata is only valid for event items".into());
-    }
-    if metadata.dayweave_firm_block.is_some()
-        && (item.kind != ItemKind::Event
-            || item
-                .flexible_constraints
-                .as_object()
-                .is_none_or(|constraints| {
-                    constraints.len() != 1 || !constraints.contains_key("dayweave_firm_block")
-                }))
-    {
-        return Err(
-            "dayweave_firm_block is only valid as the sole metadata for an event item".into(),
-        );
-    }
-    let duration = item.duration_seconds.map(duration_estimate);
-    let mut constraints = metadata.constraints.clone();
-    if let Some(earliest) = item.earliest_start_at {
-        if constraints.earliest_start.is_some() {
-            return Err(
-                "earliest start is defined in both the canonical field and metadata".into(),
-            );
-        }
-        constraints.earliest_start = Some(Qualified::hard(
-            to_time_in_timezone(earliest, item_timezone).map_err(|error| error.to_string())?,
-        ));
-    }
-    if let Some(deadline) = item.deadline_at {
-        if constraints.latest_finish.is_some() {
-            return Err("deadline is defined in both the canonical field and metadata".into());
-        }
-        constraints.latest_finish = Some(Qualified::hard(
-            to_time_in_timezone(deadline, item_timezone).map_err(|error| error.to_string())?,
-        ));
-    }
-    if let Some(preferred_start) = metadata.preferred_start_minute {
-        add_legacy_preferred_window(
-            &mut constraints,
-            preferred_start,
-            duration,
-            item.duration_seconds,
-        )?;
-    }
-
-    let kind = map_kind(item.kind, recurrence, &metadata)?;
-    let split_policy = map_split_policy(&item.split_policy, &metadata);
-    Ok(MappedScheduleItem::Plannable(Box::new(WorkItem {
-        id: ItemId(item.id),
-        is_sensitive,
+fn into_canonical_item(item: Item) -> CanonicalItem {
+    CanonicalItem {
+        id: item.id,
+        is_sensitive: item.is_sensitive,
+        kind: match item.kind {
+            ItemKind::Event => CanonicalItemKind::Event,
+            ItemKind::Task => CanonicalItemKind::Task,
+            ItemKind::Habit => CanonicalItemKind::Habit,
+            ItemKind::Routine => CanonicalItemKind::Routine,
+            ItemKind::Goal => CanonicalItemKind::Goal,
+            ItemKind::Break => CanonicalItemKind::Break,
+        },
+        status: match item.status {
+            ItemStatus::Inbox => CanonicalItemStatus::Inbox,
+            ItemStatus::Planned => CanonicalItemStatus::Planned,
+            ItemStatus::Scheduled => CanonicalItemStatus::Scheduled,
+            ItemStatus::InProgress => CanonicalItemStatus::InProgress,
+            ItemStatus::Paused => CanonicalItemStatus::Paused,
+            ItemStatus::Completed => CanonicalItemStatus::Completed,
+            ItemStatus::Skipped => CanonicalItemStatus::Skipped,
+            ItemStatus::Cancelled => CanonicalItemStatus::Cancelled,
+        },
+        title: item.title,
+        notes: item.notes,
+        timezone_name: item.timezone_name,
+        duration_seconds: item.duration_seconds,
+        deadline_at: item.deadline_at,
+        earliest_start_at: item.earliest_start_at,
+        recurrence: item.recurrence,
+        flexible_constraints: item.flexible_constraints,
+        split_policy: match item.split_policy {
+            SplitPolicy::Indivisible => CanonicalSplitPolicy::Indivisible,
+            SplitPolicy::Splittable {
+                minimum_chunk_seconds,
+                maximum_chunk_seconds,
+            } => CanonicalSplitPolicy::Splittable {
+                minimum_chunk_seconds,
+                maximum_chunk_seconds,
+            },
+        },
+        importance: item.importance,
+        urgency: item.urgency,
+        parent_id: item.parent_id,
+        sibling_order: item.sibling_order,
+        is_executable: item.is_executable,
         revision: item.revision,
-        title: item.title.clone(),
-        kind,
-        status: map_status(item.status),
-        parent_id: item.parent_id.map(ItemId),
-        sibling_order: Some(item.sibling_order),
-        has_own_effort: metadata.has_own_effort,
-        goal_ids: metadata.goal_ids.into_iter().map(ItemId).collect(),
-        priority: Priority {
-            importance: normalize_priority(item.importance),
-            urgency: normalize_priority(item.urgency),
-        },
-        duration: if item.kind == ItemKind::Event {
-            None
-        } else {
-            duration
-        },
-        constraints,
-        split_policy,
-        energy: metadata.energy.map(EnergyMetadata::into_qualified),
-        tags: metadata.tags,
-        created_at: to_time_in_timezone(item.created_at, item_timezone)
-            .map_err(|error| error.to_string())?,
-        updated_at: to_time_in_timezone(item.updated_at, item_timezone)
-            .map_err(|error| error.to_string())?,
-    })))
+        created_at: item.created_at,
+        updated_at: item.updated_at,
+        completed_at: item.completed_at,
+        deleted_at: item.deleted_at,
+    }
 }
 
-fn validate_calendar_context(
-    item: &Item,
-    recurrence: Option<&Recurrence>,
-    metadata: &SchedulingMetadata,
-    context: &CalendarContextSpec,
-) -> Result<(), String> {
-    if item.kind != ItemKind::Event {
-        return Err("calendar_context metadata is only valid for event items".into());
-    }
-    if item.parent_id.is_some() {
-        return Err("calendar_context event must be a root item".into());
-    }
-    if recurrence.is_some() {
-        return Err("calendar_context event must be one expanded occurrence".into());
-    }
-    if metadata.calendar_event.is_some()
-        || item
-            .flexible_constraints
-            .as_object()
-            .is_none_or(|constraints| {
-                constraints.len() != 1 || !constraints.contains_key("calendar_context")
-            })
-    {
-        return Err("calendar_context cannot be combined with other scheduling metadata".into());
-    }
-    let owner = if context.all_day {
-        "all-day calendar_context"
-    } else {
-        "calendar_context"
-    };
-    validate_calendar_bounds(context.start, context.end, owner)
-}
-
-fn validate_calendar_bounds(
-    start: OffsetDateTime,
-    end: OffsetDateTime,
-    owner: &str,
-) -> Result<(), String> {
-    if start >= end {
-        return Err(format!("{owner} end must follow start"));
-    }
-    if !start.nanosecond().is_multiple_of(1_000) || !end.nanosecond().is_multiple_of(1_000) {
-        return Err(format!(
-            "{owner} instants must use PostgreSQL microsecond precision"
-        ));
-    }
-    Ok(())
-}
-
-fn map_kind(
-    kind: ItemKind,
-    recurrence: Option<Recurrence>,
-    metadata: &SchedulingMetadata,
-) -> Result<PlanningItemKind, String> {
-    match kind {
-        ItemKind::Event => {
-            if recurrence.is_some() {
-                return Err(
-                    "calendar event recurrence must be expanded by its calendar source".into(),
-                );
-            }
-            let event = match (
-                metadata.calendar_event.clone(),
-                metadata.dayweave_firm_block.as_ref(),
-            ) {
-                (Some(event), None) => event,
-                (None, Some(firm)) => firm.as_calendar_event()?,
-                (Some(_), Some(_)) => {
-                    return Err(
-                        "event metadata cannot combine calendar_event and dayweave_firm_block"
-                            .into(),
-                    );
-                }
-                (None, None) => {
-                    return Err(
-                        "event metadata requires calendar_event or dayweave_firm_block".into(),
-                    );
-                }
-            };
-            validate_calendar_bounds(event.start, event.end, "calendar_event")?;
-            Ok(PlanningItemKind::CalendarEvent(event))
+fn map_prepare_error(error: PrepareScheduleError) -> ComposeScheduleError {
+    match error {
+        PrepareScheduleError::InvalidRequest(message) => {
+            ComposeScheduleError::InvalidRequest(message)
         }
-        ItemKind::Task => Ok(recurrence.map_or(PlanningItemKind::Task, |recurrence| {
-            PlanningItemKind::RecurringTask(RecurringTaskSpec { recurrence })
-        })),
-        ItemKind::Habit => recurrence
-            .map(|recurrence| {
-                PlanningItemKind::Habit(HabitSpec {
-                    recurrence,
-                    target: metadata.habit_target.clone(),
-                    preserves_streak_when_paused: metadata.preserves_streak_when_paused,
-                })
-            })
-            .ok_or_else(|| "habit requires recurrence".into()),
-        ItemKind::Routine => Ok(PlanningItemKind::Routine(RoutineSpec {
-            ordered: metadata.routine_ordered,
-            recurrence,
-        })),
-        ItemKind::Goal => {
-            reject_recurrence(recurrence.as_ref(), "goal")?;
-            Ok(PlanningItemKind::Goal(GoalSpec {
-                measures: metadata.goal_measures.clone(),
-                weekly_allocation: metadata.goal_weekly_allocation,
-            }))
-        }
-        ItemKind::Break => {
-            reject_recurrence(recurrence.as_ref(), "break")?;
-            Ok(PlanningItemKind::Break(BreakSpec {
-                category: metadata.break_category.unwrap_or(BreakCategory::Other),
-                mandatory: metadata.break_mandatory,
-                prompt_to_resume: metadata.break_prompt_to_resume,
-            }))
-        }
+        PrepareScheduleError::TooManyItems => ComposeScheduleError::TooManyItems,
+        PrepareScheduleError::DuplicateCanonicalItem(_)
+        | PrepareScheduleError::InvalidCanonicalItem(_)
+        | PrepareScheduleError::AccountingOverflow => ComposeScheduleError::Encoding,
     }
-}
-
-fn reject_recurrence(recurrence: Option<&Recurrence>, kind: &str) -> Result<(), String> {
-    if recurrence.is_some() {
-        Err(format!(
-            "{kind} does not support recurrence; use a routine or habit"
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn parse_recurrence(value: Option<&Value>) -> Result<Option<Recurrence>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let mut value = value.clone();
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "recurrence must be an object".to_owned())?;
-    let recurrence_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "recurrence.type is required".to_owned())?;
-    match recurrence_type {
-        "daily" => {
-            object
-                .entry("times_per_day")
-                .or_insert_with(|| Value::from(1));
-        }
-        "weekly" => {
-            let default = object
-                .get("weekdays")
-                .and_then(Value::as_array)
-                .map_or(1, |days| days.len().max(1));
-            object
-                .entry("times_per_week")
-                .or_insert_with(|| Value::from(default));
-            object
-                .entry("weekdays")
-                .or_insert_with(|| Value::Array(Vec::new()));
-        }
-        "monthly" => {
-            object
-                .entry("times_per_month")
-                .or_insert_with(|| Value::from(1));
-        }
-        _ => {}
-    }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|error| format!("unsupported recurrence: {error}"))
-}
-
-fn map_split_policy(policy: &SplitPolicy, metadata: &SchedulingMetadata) -> PlanningSplitPolicy {
-    match policy {
-        SplitPolicy::Indivisible => PlanningSplitPolicy::Indivisible,
-        SplitPolicy::Splittable {
-            minimum_chunk_seconds,
-            maximum_chunk_seconds,
-        } => PlanningSplitPolicy::Splittable {
-            minimum_session: seconds_to_minutes(*minimum_chunk_seconds),
-            maximum_session: seconds_to_minutes(*maximum_chunk_seconds),
-            maximum_sessions: metadata.maximum_sessions.unwrap_or(u16::MAX),
-            minimum_gap: Minutes(metadata.minimum_gap_minutes),
-            maximum_days: metadata.maximum_split_days,
-        },
-    }
-}
-
-fn duration_estimate(seconds: u32) -> DurationEstimate {
-    DurationEstimate::exact(seconds_to_minutes(seconds).get())
-}
-
-const fn seconds_to_minutes(seconds: u32) -> Minutes {
-    Minutes(seconds.saturating_add(59) / 60)
-}
-
-const fn normalize_priority(value: u8) -> u8 {
-    value.saturating_add(9) / 10
-}
-
-const fn map_status(status: ItemStatus) -> WorkStatus {
-    match status {
-        ItemStatus::Inbox | ItemStatus::Planned => WorkStatus::NotStarted,
-        ItemStatus::Scheduled => WorkStatus::Scheduled,
-        ItemStatus::InProgress => WorkStatus::Active,
-        ItemStatus::Paused => WorkStatus::Paused,
-        ItemStatus::Completed => WorkStatus::Completed,
-        ItemStatus::Skipped => WorkStatus::Skipped,
-        ItemStatus::Cancelled => WorkStatus::Canceled,
-    }
-}
-
-fn add_legacy_preferred_window(
-    constraints: &mut SchedulingConstraints,
-    start_minute: u16,
-    duration: Option<DurationEstimate>,
-    duration_seconds: Option<u32>,
-) -> Result<(), String> {
-    if start_minute > 1_439 {
-        return Err("preferred_start_minute must be in 0..=1439".into());
-    }
-    let duration_minutes = duration.map_or(1, |value| value.expected.get());
-    let end = u32::from(start_minute).saturating_add(duration_minutes);
-    if end > 1_440 || duration_seconds.is_none() {
-        return Err("preferred_start_minute requires a duration that finishes the same day".into());
-    }
-    constraints.preferred_daily_windows.push(Qualified::soft(
-        DailyTimeWindow {
-            weekdays: BTreeSet::new(),
-            start_minute,
-            end_minute: u16::try_from(end).map_err(|_| "invalid preferred window")?,
-        },
-        100,
-    ));
-    Ok(())
-}
-
-/// Returns every Inbox item and every item below an Inbox ancestor.
-///
-/// Canonical storage already rejects duplicate identifiers and hierarchy
-/// cycles. The visited set nevertheless makes this traversal cycle-safe, and
-/// the bounded loop guarantees that malformed in-memory test data cannot make
-/// composition spin indefinitely. Each known identifier is queued at most
-/// once, so a valid graph always drains the frontier within `items.len()`
-/// iterations.
-fn inbox_subtree_item_ids(items: &[Item]) -> BTreeSet<Uuid> {
-    let mut children_by_parent = BTreeMap::<Uuid, Vec<Uuid>>::new();
-    let mut excluded = BTreeSet::new();
-    let mut frontier = VecDeque::new();
-
-    for item in items {
-        if let Some(parent_id) = item.parent_id {
-            children_by_parent
-                .entry(parent_id)
-                .or_default()
-                .push(item.id);
-        }
-        if item.status == ItemStatus::Inbox && excluded.insert(item.id) {
-            frontier.push_back(item.id);
-        }
-    }
-    for children in children_by_parent.values_mut() {
-        children.sort_unstable();
-    }
-
-    for _ in 0..items.len() {
-        let Some(parent_id) = frontier.pop_front() else {
-            break;
-        };
-        if let Some(children) = children_by_parent.get(&parent_id) {
-            for child_id in children {
-                if excluded.insert(*child_id) {
-                    frontier.push_back(*child_id);
-                }
-            }
-        }
-    }
-    debug_assert!(frontier.is_empty());
-    excluded
-}
-
-fn prune_orphaned_items(items: &mut Vec<WorkItem>, rejected: &mut Vec<RejectedScheduleItem>) {
-    loop {
-        let ids: BTreeSet<_> = items.iter().map(|item| item.id).collect();
-        let mut removed = false;
-        items.retain(|item| {
-            let Some(parent_id) = item.parent_id else {
-                return true;
-            };
-            if ids.contains(&parent_id) {
-                return true;
-            }
-            rejected.push(RejectedScheduleItem {
-                item_id: item.id.0,
-                is_sensitive: item.is_sensitive,
-                title: item.title.clone(),
-                reason: format!("parent {parent_id} is unavailable for scheduling"),
-            });
-            removed = true;
-            false
-        });
-        if !removed {
-            break;
-        }
-    }
-    rejected.sort_by_key(|item| item.item_id);
-}
-
-fn map_previous_assignments(
-    assignments: &[PreviousAssignmentInput],
-    revisions: &BTreeMap<ItemId, u64>,
-    timezone: Tz,
-) -> Result<(Vec<PreviousAssignment>, Vec<IgnoredPreviousAssignment>), ComposeScheduleError> {
-    let mut seen = BTreeSet::new();
-    let mut accepted = Vec::new();
-    let mut ignored = Vec::new();
-    for assignment in assignments {
-        let item_id = ItemId(assignment.item_id);
-        if !seen.insert((item_id, assignment.occurrence_id)) {
-            return invalid(format!(
-                "duplicate previous assignment for item {} and occurrence",
-                assignment.item_id
-            ));
-        }
-        let current_revision = revisions.get(&item_id).copied();
-        if current_revision != Some(assignment.item_revision) {
-            ignored.push(IgnoredPreviousAssignment {
-                item_id: assignment.item_id,
-                requested_revision: assignment.item_revision,
-                current_revision,
-                reason: if current_revision.is_some() {
-                    "canonical item revision changed".into()
-                } else {
-                    "canonical item is unavailable for scheduling".into()
-                },
-            });
-            continue;
-        }
-        accepted.push(PreviousAssignment {
-            item_id,
-            occurrence_id: assignment.occurrence_id.map(OccurrenceId),
-            blocks: assignment
-                .blocks
-                .iter()
-                .map(|block| {
-                    Ok(PreviousBlock {
-                        start: to_time_in_timezone(block.start, timezone)?,
-                        end: to_time_in_timezone(block.end, timezone)?,
-                        session_index: block.session_index,
-                    })
-                })
-                .collect::<Result<_, ComposeScheduleError>>()?,
-            pinned: assignment.pinned,
-        });
-    }
-    Ok((accepted, ignored))
-}
-
-fn map_availability(
-    input: AvailabilityInput,
-    timezone: Tz,
-) -> Result<AvailabilityWindow, ComposeScheduleError> {
-    Ok(AvailabilityWindow {
-        start: to_time_in_timezone(input.start, timezone)?,
-        end: to_time_in_timezone(input.end, timezone)?,
-        contexts: input.contexts,
-        location: input.location,
-        energy: match input.energy {
-            EnergyInput::Low => EnergyLevel::Low,
-            EnergyInput::Medium => EnergyLevel::Medium,
-            EnergyInput::Deep => EnergyLevel::Deep,
-        },
-    })
-}
-
-fn map_fixed_block(
-    input: FixedBlockInput,
-    timezone: Tz,
-) -> Result<FixedBlock, ComposeScheduleError> {
-    Ok(FixedBlock {
-        id: input.id,
-        is_sensitive: input.is_sensitive,
-        title: input.title,
-        start: to_time_in_timezone(input.start, timezone)?,
-        end: to_time_in_timezone(input.end, timezone)?,
-        source: match input.source {
-            FixedBlockSourceInput::GoogleCalendar => FixedBlockSource::GoogleCalendar,
-            FixedBlockSourceInput::Sleep => FixedBlockSource::Sleep,
-            FixedBlockSourceInput::ProtectedTime => FixedBlockSource::ProtectedTime,
-            FixedBlockSourceInput::Travel => FixedBlockSource::Travel,
-            FixedBlockSourceInput::Manual => FixedBlockSource::Manual,
-        },
-    })
-}
-
-fn populate_recurrence_calendar(
-    context: &mut RecurrenceContext,
-    timezone_name: &str,
-    horizon_start: DateTime<Utc>,
-    horizon_end: DateTime<Utc>,
-) -> Result<(), ComposeScheduleError> {
-    if !context.calendar.days.is_empty() {
-        if context
-            .calendar
-            .time_zone_id
-            .as_deref()
-            .is_some_and(|value| value != timezone_name)
-        {
-            return invalid("recurrence calendar timezone does not match timezone_name");
-        }
-        context.calendar.time_zone_id = Some(timezone_name.to_owned());
-        return Ok(());
-    }
-
-    let timezone: Tz = timezone_name
-        .parse()
-        .map_err(|_| ComposeScheduleError::InvalidRequest("invalid timezone_name".into()))?;
-    let mut date = horizon_start.with_timezone(&timezone).date_naive();
-    let mut days = Vec::new();
-    loop {
-        let next = date
-            .succ_opt()
-            .ok_or_else(|| ComposeScheduleError::InvalidRequest("horizon date overflow".into()))?;
-        let start = zoned_midnight(timezone, date)?;
-        let end = zoned_midnight(timezone, next)?;
-        if start < to_time(horizon_end)? && end > to_time(horizon_start)? {
-            days.push(ZonedDayBoundary {
-                local_date: time::Date::from_calendar_date(
-                    date.year(),
-                    time::Month::try_from(u8::try_from(date.month()).map_err(|_| {
-                        ComposeScheduleError::InvalidRequest("invalid local month".into())
-                    })?)
-                    .map_err(|_| {
-                        ComposeScheduleError::InvalidRequest("invalid local month".into())
-                    })?,
-                    u8::try_from(date.day()).map_err(|_| {
-                        ComposeScheduleError::InvalidRequest("invalid local day".into())
-                    })?,
-                )
-                .map_err(|_| ComposeScheduleError::InvalidRequest("invalid local date".into()))?,
-                start,
-                end,
-            });
-        }
-        if end >= to_time(horizon_end)? {
-            break;
-        }
-        date = next;
-        if days.len() > MAX_CALENDAR_DAYS {
-            return invalid("generated recurrence calendar exceeded horizon bounds");
-        }
-    }
-    context.calendar.time_zone_id = Some(timezone_name.to_owned());
-    context.calendar.days = days;
-    Ok(())
-}
-
-fn zoned_midnight(timezone: Tz, date: NaiveDate) -> Result<OffsetDateTime, ComposeScheduleError> {
-    let local = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| ComposeScheduleError::InvalidRequest("invalid local midnight".into()))?;
-    let resolved = match timezone.from_local_datetime(&local) {
-        LocalResult::Single(value) => value,
-        LocalResult::Ambiguous(first, second) => first.min(second),
-        LocalResult::None => {
-            return invalid(format!(
-                "timezone {timezone} has no representable midnight on {date}"
-            ));
-        }
-    };
-    let utc = resolved.with_timezone(&Utc);
-    let offset = UtcOffset::from_whole_seconds(resolved.offset().fix().local_minus_utc())
-        .map_err(|_| ComposeScheduleError::InvalidRequest("timezone offset is invalid".into()))?;
-    Ok(to_time(utc)?.to_offset(offset))
-}
-
-fn to_time(value: DateTime<Utc>) -> Result<OffsetDateTime, ComposeScheduleError> {
-    OffsetDateTime::from_unix_timestamp(value.timestamp())
-        .and_then(|instant| instant.replace_nanosecond(value.timestamp_subsec_nanos()))
-        .map_err(|_| {
-            ComposeScheduleError::InvalidRequest("timestamp is outside supported range".into())
-        })
-}
-
-fn to_time_in_timezone(
-    value: DateTime<Utc>,
-    timezone: Tz,
-) -> Result<OffsetDateTime, ComposeScheduleError> {
-    let localized = value.with_timezone(&timezone);
-    let offset = UtcOffset::from_whole_seconds(localized.offset().fix().local_minus_utc())
-        .map_err(|_| ComposeScheduleError::InvalidRequest("timezone offset is invalid".into()))?;
-    Ok(to_time(value)?.to_offset(offset))
 }
 
 fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
@@ -1474,141 +529,17 @@ fn request_digest(
     Ok(encoded)
 }
 
-fn invalid<T>(message: impl Into<String>) -> Result<T, ComposeScheduleError> {
-    Err(ComposeScheduleError::InvalidRequest(message.into()))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // These are independent persisted user toggles.
-struct SchedulingMetadata {
-    constraints: SchedulingConstraints,
-    has_own_effort: bool,
-    goal_ids: BTreeSet<Uuid>,
-    energy: Option<EnergyMetadata>,
-    tags: BTreeSet<String>,
-    calendar_event: Option<CalendarEventSpec>,
-    calendar_context: Option<CalendarContextSpec>,
-    /// Backward-compatible ownership/publication shape used by already-created
-    /// `DayWeave` Calendar blocks. New provider projections never emit it.
-    dayweave_firm_block: Option<DayWeaveFirmBlockSpec>,
-    habit_target: Option<QuantityTarget>,
-    preserves_streak_when_paused: bool,
-    routine_ordered: bool,
-    goal_measures: Vec<GoalMeasure>,
-    goal_weekly_allocation: Option<AllocationRange>,
-    break_category: Option<BreakCategory>,
-    break_mandatory: bool,
-    break_prompt_to_resume: bool,
-    maximum_sessions: Option<u16>,
-    minimum_gap_minutes: u32,
-    maximum_split_days: Option<u16>,
-    preferred_start_minute: Option<u16>,
-}
-
-impl Default for SchedulingMetadata {
-    fn default() -> Self {
-        Self {
-            constraints: SchedulingConstraints::default(),
-            has_own_effort: false,
-            goal_ids: BTreeSet::new(),
-            energy: None,
-            tags: BTreeSet::new(),
-            calendar_event: None,
-            calendar_context: None,
-            dayweave_firm_block: None,
-            habit_target: None,
-            preserves_streak_when_paused: true,
-            routine_ordered: false,
-            goal_measures: Vec::new(),
-            goal_weekly_allocation: None,
-            break_category: None,
-            break_mandatory: false,
-            break_prompt_to_resume: true,
-            maximum_sessions: None,
-            minimum_gap_minutes: 0,
-            maximum_split_days: None,
-            preferred_start_minute: None,
-        }
-    }
-}
-
-/// A retained provider occurrence that is useful calendar context but must not
-/// reserve planner capacity. Provider identifiers deliberately do not belong
-/// in this scheduling representation.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CalendarContextSpec {
-    #[serde(with = "time::serde::rfc3339")]
-    start: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    end: OffsetDateTime,
-    all_day: bool,
-}
-
-/// Legacy canonical shape for a DayWeave-owned event. It remains strict so
-/// accepting an existing owned block cannot smuggle provider identifiers into
-/// scheduling evidence. Google echoes are independently authenticated and
-/// deduplicated by the provider mapping layer.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // Independent provider publication semantics.
-struct DayWeaveFirmBlockSpec {
-    owned: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    starts_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    ends_at: OffsetDateTime,
-    #[serde(default)]
-    all_day: bool,
-    #[serde(default)]
-    tentative: bool,
-    #[serde(default = "default_true")]
-    busy: bool,
-}
-
-impl DayWeaveFirmBlockSpec {
-    fn as_calendar_event(&self) -> Result<CalendarEventSpec, String> {
-        if !self.owned {
-            return Err("dayweave_firm_block must be explicitly owned".into());
-        }
-        // These publication flags affect only the provider representation.
-        // The locally owned work still reserves capacity in either state.
-        let _ = (self.tentative, self.busy);
-        validate_calendar_bounds(self.starts_at, self.ends_at, "dayweave_firm_block")?;
-        Ok(CalendarEventSpec {
-            start: self.starts_at,
-            end: self.ends_at,
-            immutable: true,
-            all_day: self.all_day,
-            source_calendar_id: None,
-        })
-    }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum EnergyMetadata {
-    Simple(EnergyLevel),
-    Qualified(Qualified<EnergyLevel>),
-}
-
-impl EnergyMetadata {
-    fn into_qualified(self) -> Qualified<EnergyLevel> {
-        match self {
-            Self::Simple(value) => Qualified::soft(value, 100),
-            Self::Qualified(value) => value,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
+    use chrono::{TimeZone as _, Utc};
+    use dayweave_compose::{
+        AvailabilityInput, EnergyInput, FixedBlockInput, PreviousAssignmentInput,
+        SchedulerConfigInput,
+    };
+    use dayweave_core::{ItemKind as PlanningItemKind, RecurrenceContext, WorkItem};
     use serde_json::json;
 
     fn canonical_item(id: Uuid) -> Item {
@@ -1660,18 +591,32 @@ mod tests {
     }
 
     fn map_plannable(item: &Item) -> WorkItem {
-        match classify_item(item, item.is_sensitive).expect("valid plannable item") {
-            MappedScheduleItem::Plannable(item) => *item,
-            MappedScheduleItem::ContextOnly => panic!("expected plannable item"),
-        }
+        let prepared =
+            prepare_canonical_schedule(vec![into_canonical_item(item.clone())], preview_request())
+                .expect("valid canonical preparation");
+        assert!(prepared.rejected_items.is_empty());
+        prepared
+            .plan_request
+            .items
+            .into_iter()
+            .next()
+            .expect("expected plannable item")
     }
 
     #[test]
     fn composes_canonical_item_and_is_digest_stable() {
+        const LEGACY_DIGEST: &str =
+            "sha256:45da53ed109c08d0ac9a442b722f0f10ebb3ca813bf346fa10f79a4ccff53def";
+        const LEGACY_RESPONSE: &str = r#"{"input_digest":"sha256:45da53ed109c08d0ac9a442b722f0f10ebb3ca813bf346fa10f79a4ccff53def","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
         let item = canonical_item(Uuid::from_u128(1));
         let first = compose_items(vec![item.clone()], preview_request()).unwrap();
         let second = compose_items(vec![item], preview_request()).unwrap();
         assert_eq!(first.input_digest, second.input_digest);
+        assert_eq!(first.input_digest, LEGACY_DIGEST);
+        assert_eq!(
+            serde_json::to_string(&first).expect("migrated response encoding"),
+            LEGACY_RESPONSE
+        );
         assert_eq!(first.accepted_item_count, 1);
         assert_eq!(
             first.source_item_revisions.get(&Uuid::from_u128(1)),
@@ -1682,15 +627,181 @@ mod tests {
     }
 
     #[test]
+    fn item_to_canonical_item_conversion_is_lossless_and_exhaustive() {
+        let item = Item {
+            id: Uuid::from_u128(900),
+            is_sensitive: true,
+            kind: ItemKind::Event,
+            status: ItemStatus::Cancelled,
+            title: "Lossless conversion".into(),
+            notes: Some("Every canonical field crosses the crate boundary.".into()),
+            timezone_name: "America/New_York".into(),
+            duration_seconds: Some(7_201),
+            deadline_at: Some(Utc.with_ymd_and_hms(2026, 9, 3, 18, 0, 0).unwrap()),
+            earliest_start_at: Some(Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 0).unwrap()),
+            recurrence: Some(json!({"type": "monthly", "times_per_month": 2})),
+            flexible_constraints: json!({"tags": ["boundary"], "has_own_effort": true}),
+            split_policy: SplitPolicy::Splittable {
+                minimum_chunk_seconds: 601,
+                maximum_chunk_seconds: 3_601,
+            },
+            importance: 91,
+            urgency: 42,
+            parent_id: Some(Uuid::from_u128(899)),
+            sibling_order: 17,
+            is_executable: false,
+            revision: 23,
+            created_at: Utc.with_ymd_and_hms(2026, 8, 1, 1, 2, 3).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 8, 2, 4, 5, 6).unwrap(),
+            completed_at: Some(Utc.with_ymd_and_hms(2026, 8, 3, 7, 8, 9).unwrap()),
+            deleted_at: Some(Utc.with_ymd_and_hms(2026, 8, 4, 10, 11, 12).unwrap()),
+        };
+        let expected = CanonicalItem {
+            id: item.id,
+            is_sensitive: item.is_sensitive,
+            kind: CanonicalItemKind::Event,
+            status: CanonicalItemStatus::Cancelled,
+            title: item.title.clone(),
+            notes: item.notes.clone(),
+            timezone_name: item.timezone_name.clone(),
+            duration_seconds: item.duration_seconds,
+            deadline_at: item.deadline_at,
+            earliest_start_at: item.earliest_start_at,
+            recurrence: item.recurrence.clone(),
+            flexible_constraints: item.flexible_constraints.clone(),
+            split_policy: CanonicalSplitPolicy::Splittable {
+                minimum_chunk_seconds: 601,
+                maximum_chunk_seconds: 3_601,
+            },
+            importance: item.importance,
+            urgency: item.urgency,
+            parent_id: item.parent_id,
+            sibling_order: item.sibling_order,
+            is_executable: item.is_executable,
+            revision: item.revision,
+            created_at: item.created_at,
+            updated_at: item.updated_at,
+            completed_at: item.completed_at,
+            deleted_at: item.deleted_at,
+        };
+        assert_eq!(into_canonical_item(item), expected);
+
+        for (kind, expected) in [
+            (ItemKind::Event, CanonicalItemKind::Event),
+            (ItemKind::Task, CanonicalItemKind::Task),
+            (ItemKind::Habit, CanonicalItemKind::Habit),
+            (ItemKind::Routine, CanonicalItemKind::Routine),
+            (ItemKind::Goal, CanonicalItemKind::Goal),
+            (ItemKind::Break, CanonicalItemKind::Break),
+        ] {
+            let mut item = canonical_item(Uuid::new_v4());
+            item.kind = kind;
+            assert_eq!(into_canonical_item(item).kind, expected);
+        }
+        for (status, expected) in [
+            (ItemStatus::Inbox, CanonicalItemStatus::Inbox),
+            (ItemStatus::Planned, CanonicalItemStatus::Planned),
+            (ItemStatus::Scheduled, CanonicalItemStatus::Scheduled),
+            (ItemStatus::InProgress, CanonicalItemStatus::InProgress),
+            (ItemStatus::Paused, CanonicalItemStatus::Paused),
+            (ItemStatus::Completed, CanonicalItemStatus::Completed),
+            (ItemStatus::Skipped, CanonicalItemStatus::Skipped),
+            (ItemStatus::Cancelled, CanonicalItemStatus::Cancelled),
+        ] {
+            let mut item = canonical_item(Uuid::new_v4());
+            item.status = status;
+            assert_eq!(into_canonical_item(item).status, expected);
+        }
+        let mut indivisible = canonical_item(Uuid::new_v4());
+        indivisible.split_policy = SplitPolicy::Indivisible;
+        assert_eq!(
+            into_canonical_item(indivisible).split_policy,
+            CanonicalSplitPolicy::Indivisible
+        );
+    }
+
+    #[test]
+    fn preparation_errors_preserve_the_server_error_contract() {
+        assert!(matches!(
+            map_prepare_error(PrepareScheduleError::InvalidRequest("fixture".into())),
+            ComposeScheduleError::InvalidRequest(message) if message == "fixture"
+        ));
+        assert!(matches!(
+            map_prepare_error(PrepareScheduleError::TooManyItems),
+            ComposeScheduleError::TooManyItems
+        ));
+        for error in [
+            PrepareScheduleError::DuplicateCanonicalItem(Uuid::from_u128(1)),
+            PrepareScheduleError::InvalidCanonicalItem(Uuid::from_u128(2)),
+            PrepareScheduleError::AccountingOverflow,
+        ] {
+            assert!(matches!(
+                map_prepare_error(error),
+                ComposeScheduleError::Encoding
+            ));
+        }
+    }
+
+    #[test]
+    fn previous_assignment_order_remains_digest_and_response_significant() {
+        let high = canonical_item(Uuid::from_u128(920));
+        let low = canonical_item(Uuid::from_u128(910));
+        let assignment = |item_id, item_revision, occurrence_id| PreviousAssignmentInput {
+            item_id,
+            item_revision,
+            occurrence_id,
+            blocks: Vec::new(),
+            pinned: false,
+        };
+        let mut request = preview_request();
+        request.previous_assignments = vec![
+            assignment(high.id, high.revision, None),
+            assignment(low.id, low.revision, None),
+            assignment(high.id, high.revision - 1, Some(Uuid::from_u128(921))),
+            assignment(low.id, low.revision - 1, Some(Uuid::from_u128(911))),
+        ];
+
+        let first = compose_items(vec![low.clone(), high.clone()], request.clone()).unwrap();
+        assert_eq!(
+            first
+                .ignored_previous_assignments
+                .iter()
+                .map(|assignment| assignment.item_id)
+                .collect::<Vec<_>>(),
+            vec![high.id, low.id]
+        );
+
+        request.previous_assignments.swap(0, 1);
+        let reversed = compose_items(vec![high, low], request).unwrap();
+        assert_ne!(first.input_digest, reversed.input_digest);
+        assert_eq!(
+            serde_json::to_value(&first.plan).unwrap(),
+            serde_json::to_value(&reversed.plan).unwrap()
+        );
+        assert_eq!(
+            reversed
+                .ignored_previous_assignments
+                .iter()
+                .map(|assignment| assignment.item_id)
+                .collect::<Vec<_>>(),
+            first
+                .ignored_previous_assignments
+                .iter()
+                .map(|assignment| assignment.item_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn duration_bearing_inbox_root_is_accepted_without_entering_the_plan() {
         let item_id = Uuid::from_u128(100);
         let mut item = canonical_item(item_id);
         item.status = ItemStatus::Inbox;
         let mut request = preview_request();
-        request
-            .recurrence_context
-            .completion_anchors
-            .insert(ItemId(item_id), to_time(item.updated_at).unwrap());
+        request.recurrence_context.completion_anchors.insert(
+            ItemId(item_id),
+            OffsetDateTime::from_unix_timestamp(item.updated_at.timestamp()).unwrap(),
+        );
 
         let first = compose_items(vec![item.clone()], request.clone()).unwrap();
         let repeated = compose_items(vec![item.clone()], request.clone()).unwrap();
@@ -1872,16 +983,14 @@ mod tests {
             .collect();
         assert!(elapsed.is_empty());
 
-        let mut context = RecurrenceContext::default();
-        populate_recurrence_calendar(
-            &mut context,
-            "Europe/Madrid",
-            Utc.with_ymd_and_hms(2026, 10, 24, 0, 0, 0).unwrap(),
-            Utc.with_ymd_and_hms(2026, 10, 27, 0, 0, 0).unwrap(),
-        )
-        .unwrap();
+        let mut preparation_request = preview_request();
+        preparation_request.horizon_start = Utc.with_ymd_and_hms(2026, 10, 24, 0, 0, 0).unwrap();
+        preparation_request.horizon_end = Utc.with_ymd_and_hms(2026, 10, 27, 0, 0, 0).unwrap();
+        let prepared = prepare_canonical_schedule(Vec::new(), preparation_request).unwrap();
         assert!(
-            context
+            prepared
+                .plan_request
+                .recurrence_context
                 .calendar
                 .days
                 .iter()
@@ -2138,7 +1247,8 @@ mod tests {
                 }]
             }
         });
-        let sensitivity = invalid.is_sensitive;
-        assert!(classify_item(&invalid, sensitivity).is_err());
+        let result = compose_items(vec![invalid], preview_request()).unwrap();
+        assert_eq!(result.accepted_item_count, 0);
+        assert_eq!(result.rejected_items.len(), 1);
     }
 }

@@ -17,6 +17,7 @@ axum = { version = "0.8", features = ["json", "macros"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
+dayweave-compose = { path = "../../crates/dayweave-compose" }
 dayweave-core = { path = "../../crates/dayweave-core" }
 dayweave-google = { path = "../../crates/dayweave-google" }
 getrandom = "0.4"
