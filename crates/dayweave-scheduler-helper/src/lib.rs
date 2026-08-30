@@ -422,6 +422,14 @@ const fn map_schedule_error(error: &ScheduleError) -> ErrorCode {
         ScheduleError::InvalidHierarchy(_) => ErrorCode::InvalidHierarchy,
         ScheduleError::InvalidRecurrence(_) => ErrorCode::InvalidRecurrence,
         ScheduleError::ConflictEvidenceLimit => ErrorCode::ResourceLimitExceeded,
+        ScheduleError::InvalidDeferCandidate { .. }
+        | ScheduleError::MissingDeferSourceWorkUnit { .. }
+        | ScheduleError::AmbiguousDeferSourceWorkUnit { .. }
+        | ScheduleError::MissingDeferSourceReservation { .. }
+        | ScheduleError::AmbiguousDeferSourceReservation { .. } => ErrorCode::InvalidRequest,
+        ScheduleError::MissingDeferAssessment(_) | ScheduleError::AmbiguousDeferAssessment(_) => {
+            ErrorCode::InternalFailure
+        }
     }
 }
 
@@ -1223,6 +1231,22 @@ mod tests {
                 .stdout
                 .windows(13)
                 .any(|value| value == b"private title")
+        );
+    }
+
+    #[test]
+    fn defer_assessment_only_errors_keep_the_existing_helper_protocol_closed() {
+        let placement_id = Uuid::from_u128(42);
+        assert_eq!(
+            map_schedule_error(&ScheduleError::InvalidDeferCandidate {
+                placement_id,
+                message: "private assessment detail".to_owned(),
+            }),
+            ErrorCode::InvalidRequest,
+        );
+        assert_eq!(
+            map_schedule_error(&ScheduleError::MissingDeferAssessment(placement_id)),
+            ErrorCode::InternalFailure,
         );
     }
 
