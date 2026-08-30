@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
 use dayweave_core::*;
-use time::{Duration, OffsetDateTime, macros::datetime};
+use serde_json::json;
+use time::{Duration, OffsetDateTime, Time, UtcOffset, macros::datetime};
 use uuid::Uuid;
 
 const START: OffsetDateTime = datetime!(2026-09-01 0:00 UTC);
@@ -47,6 +48,17 @@ fn request(item: WorkItem, start: OffsetDateTime, end: OffsetDateTime) -> PlanRe
         previous_assignments: Vec::new(),
         config: SchedulerConfig::default(),
         recurrence_context: RecurrenceContext::default(),
+    }
+}
+
+fn move_source(item: &WorkItem, occurrence: &Occurrence) -> RecurrenceMoveSource {
+    RecurrenceMoveSource {
+        item_revision: item.revision,
+        identity: occurrence.identity,
+        nominal_start: occurrence.nominal_start,
+        nominal_end: occurrence.nominal_end,
+        local_date: occurrence.local_date,
+        ordinal: occurrence.ordinal,
     }
 }
 
@@ -263,6 +275,7 @@ fn completed_paused_skipped_and_moved_occurrences_integrate_with_planning() {
             action: RecurrenceExceptionAction::Move {
                 start: moved_start,
                 end: moved_start + Duration::hours(1),
+                source: move_source(&item, &baseline[3]),
             },
         });
 
@@ -305,6 +318,7 @@ fn occurrence_id_move_survives_from_its_nominal_day_to_its_destination_day() {
         action: RecurrenceExceptionAction::Move {
             start: moved_start,
             end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source_occurrence),
         },
     };
 
@@ -335,6 +349,10 @@ fn occurrence_id_move_survives_from_its_nominal_day_to_its_destination_day() {
     assert_eq!(restored.window_start, moved_start);
     assert_eq!(restored.window_end, moved_start + Duration::hours(1));
     assert_eq!(restored.state, OccurrenceState::Generated);
+    assert_eq!(restored.nominal_start, source_occurrence.nominal_start);
+    assert_eq!(restored.nominal_end, source_occurrence.nominal_end);
+    assert_eq!(restored.local_date, source_occurrence.local_date);
+    assert_eq!(restored.ordinal, source_occurrence.ordinal);
     let destination_plan = Scheduler.plan(&destination_request).unwrap();
     let moved_block = destination_plan
         .blocks_for(item.id)
@@ -349,6 +367,578 @@ fn occurrence_id_move_survives_from_its_nominal_day_to_its_destination_day() {
     let after_expansion = expand_occurrences(&after_request).unwrap();
     assert_eq!(after_expansion.len(), 1);
     assert_ne!(after_expansion[0].id, source_occurrence.id);
+
+    let mut wide_request = request(
+        recurring_item(800, Recurrence::Daily { times_per_day: 1 }),
+        source_start,
+        destination_end,
+    );
+    wide_request.recurrence_context.exceptions =
+        source_request.recurrence_context.exceptions.clone();
+    let wide_occurrence = expand_occurrences(&wide_request)
+        .unwrap()
+        .into_iter()
+        .find(|occurrence| occurrence.id == source_occurrence.id)
+        .unwrap();
+    assert_eq!(
+        (
+            wide_occurrence.nominal_start,
+            wide_occurrence.nominal_end,
+            wide_occurrence.local_date,
+            wide_occurrence.ordinal,
+            wide_occurrence.window_start,
+            wide_occurrence.window_end,
+        ),
+        (
+            restored.nominal_start,
+            restored.nominal_end,
+            restored.local_date,
+            restored.ordinal,
+            restored.window_start,
+            restored.window_end,
+        ),
+    );
+}
+
+#[test]
+fn cross_horizon_move_source_and_boundaries_fail_closed() {
+    let item = recurring_item(803, Recurrence::Daily { times_per_day: 1 });
+    let source_request = request(item.clone(), START, START + Duration::days(1));
+    let source = expand_occurrences(&source_request).unwrap()[0];
+    let target_start = START + Duration::days(1) + Duration::hours(23) + Duration::minutes(30);
+    let mut crossing = source_request.clone();
+    crossing.horizon_start = START + Duration::days(1);
+    crossing.horizon_end = START + Duration::days(2);
+    crossing.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: target_start,
+            end: target_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    }];
+    assert_eq!(
+        serde_json::to_value(crossing.recurrence_context.exceptions[0].action).unwrap(),
+        json!({
+            "type": "move",
+            "start": "2026-09-02T23:30:00Z",
+            "end": "2026-09-03T00:30:00Z",
+            "source": {
+                "item_revision": 1,
+                "identity": {
+                    "type": "calendar_day",
+                    "date": "2026-09-01",
+                    "bucket_ordinal": 0
+                },
+                "nominal_start": "2026-09-01T00:00:00Z",
+                "nominal_end": "2026-09-02T00:00:00Z",
+                "local_date": "2026-09-01",
+                "ordinal": 0
+            }
+        }),
+    );
+    assert_eq!(
+        expand_occurrences(&crossing).unwrap_err(),
+        RecurrenceError::MoveCrossesHorizon(item.id),
+    );
+
+    assert!(
+        serde_json::from_value::<RecurrenceExceptionAction>(json!({
+            "type": "move",
+            "start": "2026-09-02T09:00:00Z",
+            "end": "2026-09-02T10:00:00Z"
+        }))
+        .is_err(),
+        "move source is mandatory at the wire boundary"
+    );
+
+    let mut stale_source = crossing;
+    stale_source.horizon_end = START + Duration::days(3);
+    if let RecurrenceExceptionAction::Move { source, .. } =
+        &mut stale_source.recurrence_context.exceptions[0].action
+    {
+        source.item_revision += 1;
+    }
+    assert_eq!(
+        expand_occurrences(&stale_source).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(item.id),
+    );
+}
+
+#[test]
+fn move_identity_rejects_fabricated_ids_and_tampered_ordinals() {
+    let item = recurring_item(807, Recurrence::Daily { times_per_day: 1 });
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let moved_start = START + Duration::days(1) + Duration::hours(9);
+    let make_request = |id, source_envelope| {
+        let mut input = request(
+            item.clone(),
+            START + Duration::days(1),
+            START + Duration::days(2),
+        );
+        input.recurrence_context.exceptions = vec![RecurrenceException {
+            item_id: item.id,
+            selector: RecurrenceExceptionSelector::Occurrence { id },
+            action: RecurrenceExceptionAction::Move {
+                start: moved_start,
+                end: moved_start + Duration::hours(1),
+                source: source_envelope,
+            },
+        }];
+        input
+    };
+
+    let fabricated = OccurrenceId(Uuid::new_v5(&item.id.0, b"daily:plausible-but-not-issued"));
+    assert_eq!(
+        expand_occurrences(&make_request(fabricated, move_source(&item, &source))).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(item.id),
+    );
+
+    let mut tampered = move_source(&item, &source);
+    tampered.ordinal = u32::MAX;
+    assert_eq!(
+        expand_occurrences(&make_request(source.id, tampered)).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(item.id),
+    );
+}
+
+#[test]
+fn only_occurrence_selectors_can_move_recurring_work() {
+    let item = recurring_item(808, Recurrence::Daily { times_per_day: 1 });
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    for selector in [
+        RecurrenceExceptionSelector::LocalDate {
+            date: source.local_date.unwrap(),
+        },
+        RecurrenceExceptionSelector::NominalStart {
+            at: source.nominal_start,
+        },
+    ] {
+        let mut input = request(item.clone(), START, START + Duration::days(2));
+        input.recurrence_context.exceptions = vec![RecurrenceException {
+            item_id: item.id,
+            selector,
+            action: RecurrenceExceptionAction::Move {
+                start: START + Duration::days(1) + Duration::hours(9),
+                end: START + Duration::days(1) + Duration::hours(10),
+                source: move_source(&item, &source),
+            },
+        }];
+        assert_eq!(
+            expand_occurrences(&input).unwrap_err(),
+            RecurrenceError::InvalidMoveSource(item.id),
+        );
+    }
+}
+
+#[test]
+fn weekly_and_monthly_identity_is_stable_for_partial_buckets() {
+    let monday = datetime!(2026-08-31 0:00 UTC);
+    let weekly_item = recurring_item(
+        809,
+        Recurrence::Weekly {
+            times_per_week: 3,
+            weekdays: BTreeSet::from([DayOfWeek::Monday, DayOfWeek::Wednesday, DayOfWeek::Friday]),
+        },
+    );
+    let full_week = expand_occurrences(&request(
+        weekly_item.clone(),
+        monday,
+        monday + Duration::days(7),
+    ))
+    .unwrap();
+    let wednesday = monday + Duration::days(2);
+    let partial_week = expand_occurrences(&request(
+        weekly_item,
+        wednesday,
+        wednesday + Duration::days(1),
+    ))
+    .unwrap();
+    assert_eq!(partial_week.len(), 1);
+    assert_eq!(partial_week[0].id, full_week[1].id);
+    assert_eq!(partial_week[0].identity, full_week[1].identity);
+
+    let october = datetime!(2026-10-01 0:00 UTC);
+    let monthly_item = recurring_item(810, Recurrence::Monthly { times_per_month: 4 });
+    let full_month = expand_occurrences(&request(
+        monthly_item.clone(),
+        october,
+        datetime!(2026-11-01 0:00 UTC),
+    ))
+    .unwrap();
+    let sixteenth = datetime!(2026-10-16 0:00 UTC);
+    let partial_month = expand_occurrences(&request(
+        monthly_item,
+        sixteenth,
+        sixteenth + Duration::days(1),
+    ))
+    .unwrap();
+    assert_eq!(partial_month.len(), 1);
+    assert_eq!(partial_month[0].id, full_month[2].id);
+    assert_eq!(partial_month[0].identity, full_month[2].identity);
+}
+
+#[test]
+fn out_of_horizon_calendar_bucket_never_uses_a_fabricated_dst_offset() {
+    let item = recurring_item(
+        816,
+        Recurrence::Weekly {
+            times_per_week: 1,
+            weekdays: BTreeSet::from([DayOfWeek::Monday]),
+        },
+    );
+    let start = datetime!(2026-10-25 0:00 +02:00);
+    let day_end = datetime!(2026-10-26 0:00 +01:00);
+    let mut input = request(item, start, day_end - Duration::minutes(30));
+    input.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Sunday,
+        days: vec![ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 10 - 25),
+            start,
+            end: day_end,
+        }],
+    };
+    assert!(expand_occurrences(&input).unwrap().is_empty());
+}
+
+#[test]
+fn after_completion_move_accepts_a_new_horizon_end() {
+    let item = recurring_item(
+        811,
+        Recurrence::AfterCompletion {
+            interval: Minutes(60),
+        },
+    );
+    let mut source_request = request(item.clone(), START, START + Duration::days(1));
+    source_request
+        .recurrence_context
+        .completion_anchors
+        .insert(item.id, START);
+    let source = expand_occurrences(&source_request).unwrap()[0];
+    let moved_start = START + Duration::days(2) + Duration::hours(9);
+    let exception = RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    };
+    let mut destination = request(
+        item.clone(),
+        START + Duration::days(2),
+        START + Duration::days(3),
+    );
+    destination
+        .recurrence_context
+        .completion_anchors
+        .insert(item.id, START);
+    destination.recurrence_context.exceptions = vec![exception];
+    let restored = expand_occurrences(&destination).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, source.id);
+    assert_eq!(restored[0].window_start, moved_start);
+    assert_eq!(restored[0].nominal_end, source.nominal_end);
+}
+
+#[test]
+fn custom_placeholder_move_is_rejected_without_an_instance_identity() {
+    let item = recurring_item(
+        813,
+        Recurrence::Custom {
+            rrule: "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=1".to_owned(),
+        },
+    );
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let moved_start = START + Duration::days(2) + Duration::hours(9);
+    let mut destination = request(
+        item.clone(),
+        START + Duration::days(2),
+        START + Duration::days(3),
+    );
+    destination.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    }];
+    assert_eq!(
+        expand_occurrences(&destination).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(item.id),
+    );
+}
+
+#[test]
+fn move_source_preserves_non_utc_rfc3339_offsets() {
+    let item = recurring_item(814, Recurrence::Daily { times_per_day: 1 });
+    let madrid_start = datetime!(2026-09-01 0:00 +02:00);
+    let madrid_end = datetime!(2026-09-02 0:00 +02:00);
+    let mut source_request = request(item.clone(), madrid_start, madrid_end);
+    source_request.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: vec![ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 09 - 01),
+            start: madrid_start,
+            end: madrid_end,
+        }],
+    };
+    let source = expand_occurrences(&source_request).unwrap()[0];
+    let action = RecurrenceExceptionAction::Move {
+        start: datetime!(2026-09-02 9:00 +02:00),
+        end: datetime!(2026-09-02 10:00 +02:00),
+        source: move_source(&item, &source),
+    };
+    let encoded = serde_json::to_value(action).unwrap();
+    assert_eq!(
+        encoded["source"]["nominal_start"],
+        json!("2026-09-01T00:00:00+02:00")
+    );
+    assert_eq!(
+        encoded["source"]["nominal_end"],
+        json!("2026-09-02T00:00:00+02:00")
+    );
+}
+
+#[test]
+fn move_accepts_a_calendar_occurrence_spanning_the_fall_dst_day() {
+    let item = recurring_item(818, Recurrence::Daily { times_per_day: 1 });
+    let start = datetime!(2026-10-25 0:00 +02:00);
+    let end = datetime!(2026-10-26 0:00 +01:00);
+    let mut input = request(item.clone(), start, end);
+    input.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days: vec![ZonedDayBoundary {
+            local_date: time::macros::date!(2026 - 10 - 25),
+            start,
+            end,
+        }],
+    };
+    let source = expand_occurrences(&input).unwrap()[0];
+    assert_eq!(source.nominal_end, end);
+    assert_eq!(source.nominal_end.offset(), end.offset());
+    let moved_start = datetime!(2026-10-25 9:00 +01:00);
+    input.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    }];
+    let moved = expand_occurrences(&input).unwrap();
+    assert_eq!(moved[0].window_start, moved_start);
+}
+
+#[test]
+fn hostile_rolling_identity_arithmetic_fails_without_panicking() {
+    let item = recurring_item(
+        815,
+        Recurrence::EveryInterval {
+            interval: Minutes(5_000_000),
+        },
+    );
+    let index = i64::from(i32::MAX);
+    let occurrence_id = OccurrenceId(Uuid::new_v5(
+        &item.id.0,
+        format!("interval:{index}").as_bytes(),
+    ));
+    let moved_start = START + Duration::hours(9);
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: occurrence_id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: RecurrenceMoveSource {
+                item_revision: item.revision,
+                identity: RecurrenceOccurrenceIdentity::RollingMinutes {
+                    index,
+                    anchor: item.created_at,
+                },
+                nominal_start: START,
+                nominal_end: START + Duration::hours(1),
+                local_date: None,
+                ordinal: u32::try_from(index).unwrap(),
+            },
+        },
+    }];
+    assert_eq!(
+        expand_occurrences(&input).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(item.id),
+    );
+}
+
+#[test]
+fn rolling_month_move_keeps_source_metadata_when_horizon_offset_changes() {
+    let anchor = datetime!(2026-09-01 0:00 +02:00);
+    let item = recurring_item(
+        817,
+        Recurrence::Frequency {
+            target: 1,
+            period: RecurrencePeriod::Month,
+            semantics: RecurrenceSemantics::Rolling,
+            weekdays: BTreeSet::new(),
+            minimum_spacing: Minutes::ZERO,
+            anchor: Some(anchor),
+        },
+    );
+    let source_horizon_start = datetime!(2026-10-01 0:00 +02:00);
+    let source_horizon_end = datetime!(2026-11-01 0:00 +01:00);
+    let mut source_request = request(item.clone(), source_horizon_start, source_horizon_end);
+    let summer = UtcOffset::from_hms(2, 0, 0).unwrap();
+    let winter = UtcOffset::from_hms(1, 0, 0).unwrap();
+    let days = (1..=31)
+        .map(|day| {
+            let date = time::Date::from_calendar_date(2026, time::Month::October, day).unwrap();
+            let next = date.next_day().unwrap();
+            let start_offset = if day <= 25 { summer } else { winter };
+            let end_offset = if day < 25 { summer } else { winter };
+            ZonedDayBoundary {
+                local_date: date,
+                start: date.with_time(Time::MIDNIGHT).assume_offset(start_offset),
+                end: next.with_time(Time::MIDNIGHT).assume_offset(end_offset),
+            }
+        })
+        .collect();
+    source_request.recurrence_context.calendar = RecurrenceCalendar {
+        time_zone_id: Some("Europe/Madrid".to_owned()),
+        week_starts_on: DayOfWeek::Monday,
+        days,
+    };
+    let source = expand_occurrences(&source_request)
+        .unwrap()
+        .into_iter()
+        .find(|occurrence| {
+            matches!(
+                occurrence.identity,
+                RecurrenceOccurrenceIdentity::RollingMonth { cycle: 1, .. }
+            )
+        })
+        .unwrap();
+    assert_eq!(source.nominal_start.offset(), summer);
+    assert_eq!(source.nominal_end.offset(), winter);
+    let moved_start = datetime!(2026-10-30 9:00 +01:00);
+    let mut destination = request(
+        item.clone(),
+        datetime!(2026-10-30 0:00 +01:00),
+        datetime!(2026-10-31 0:00 +01:00),
+    );
+    destination.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    }];
+    let restored = expand_occurrences(&destination)
+        .unwrap()
+        .into_iter()
+        .find(|occurrence| occurrence.id == source.id)
+        .unwrap();
+    assert_eq!(restored.nominal_start, source.nominal_start);
+    assert_eq!(
+        restored.nominal_start.offset(),
+        source.nominal_start.offset()
+    );
+    assert_eq!(restored.nominal_end, source.nominal_end);
+    assert_eq!(restored.window_start, moved_start);
+}
+
+#[test]
+fn inert_skip_survives_when_a_series_is_no_longer_recurring() {
+    let mut item = recurring_item(812, Recurrence::Daily { times_per_day: 1 });
+    let occurrence =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    item.kind = ItemKind::Task;
+    let mut input = request(item.clone(), START, START + Duration::days(1));
+    input.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: occurrence.id },
+        action: RecurrenceExceptionAction::Skip,
+    }];
+    assert!(expand_occurrences(&input).unwrap().is_empty());
+}
+
+#[test]
+fn moved_occurrence_metadata_keeps_mixed_selectors_horizon_stable() {
+    let item = recurring_item(804, Recurrence::Daily { times_per_day: 1 });
+    let source =
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let moved_start = START + Duration::days(1) + Duration::hours(9);
+    let move_exception = RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+            source: move_source(&item, &source),
+        },
+    };
+    let skip_by_original_date = RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::LocalDate {
+            date: source.local_date.unwrap(),
+        },
+        action: RecurrenceExceptionAction::Skip,
+    };
+    for (start, end) in [
+        (START, START + Duration::days(2)),
+        (START + Duration::days(1), START + Duration::days(2)),
+    ] {
+        let mut input = request(item.clone(), start, end);
+        input.recurrence_context.exceptions =
+            vec![move_exception.clone(), skip_by_original_date.clone()];
+        let moved = expand_occurrences(&input)
+            .unwrap()
+            .into_iter()
+            .find(|occurrence| occurrence.id == source.id)
+            .unwrap();
+        assert_eq!(moved.state, OccurrenceState::Skipped);
+        assert_eq!(moved.nominal_start, source.nominal_start);
+        assert_eq!(moved.local_date, source.local_date);
+    }
+}
+
+#[test]
+fn cross_series_occurrence_id_collision_is_rejected() {
+    let first = recurring_item(805, Recurrence::Daily { times_per_day: 1 });
+    let second = recurring_item(806, Recurrence::Daily { times_per_day: 1 });
+    let first_occurrence =
+        expand_occurrences(&request(first.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let second_occurrence =
+        expand_occurrences(&request(second.clone(), START, START + Duration::days(1))).unwrap()[0];
+    let mut input = request(first, START, START + Duration::days(1));
+    input.items.push(second.clone());
+    input.recurrence_context.exceptions = vec![RecurrenceException {
+        item_id: second.id,
+        selector: RecurrenceExceptionSelector::Occurrence {
+            id: first_occurrence.id,
+        },
+        action: RecurrenceExceptionAction::Move {
+            start: START + Duration::hours(9),
+            end: START + Duration::hours(10),
+            source: move_source(&second, &second_occurrence),
+        },
+    }];
+    assert_eq!(
+        expand_occurrences(&input).unwrap_err(),
+        RecurrenceError::InvalidMoveSource(second.id),
+    );
 }
 
 #[test]

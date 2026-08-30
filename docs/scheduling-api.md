@@ -445,6 +445,48 @@ completed occurrence IDs, pauses, and exceptions. References to unavailable
 canonical items fail the request rather than silently changing recurrence
 semantics.
 
+Every generated occurrence includes an `identity` object that binds its UUID
+to the current recurrence rule. Moving recurring work is occurrence-scoped:
+the selector must be `{"type":"occurrence","id":"..."}`, and the move must
+echo the complete source envelope returned by the scheduler. The source is
+mandatory even when the original and destination are in the same horizon.
+
+```json
+{
+  "item_id": "00000000-0000-0000-0000-000000000001",
+  "selector": {
+    "type": "occurrence",
+    "id": "00000000-0000-5000-8000-000000000002"
+  },
+  "action": {
+    "type": "move",
+    "start": "2026-09-02T09:00:00+02:00",
+    "end": "2026-09-02T10:00:00+02:00",
+    "source": {
+      "item_revision": 7,
+      "identity": {
+        "type": "calendar_day",
+        "date": "2026-09-01",
+        "bucket_ordinal": 0
+      },
+      "nominal_start": "2026-09-01T00:00:00+02:00",
+      "nominal_end": "2026-09-02T00:00:00+02:00",
+      "local_date": "2026-09-01",
+      "ordinal": 0
+    }
+  }
+}
+```
+
+Identity types are `calendar_day`, `calendar_week`, `calendar_month`,
+`rolling_minutes`, `after_completion`, `rolling_month`, and `custom`.
+Rolling identities include their exact RFC 3339 anchor. Clients must preserve
+the source timestamps and identity exactly; stale item revisions, fabricated
+UUID-v5 values, malformed identities, duplicate moves, and moves that straddle
+a planning-horizon boundary fail closed. The bounded `custom` RFC 5545
+placeholder is not movable until the calendar adapter supplies a true
+per-instance identity; clients must disable that action for `custom`.
+
 ## Partial item rejection
 
 Malformed legacy metadata is isolated under `rejected_items`, and descendants

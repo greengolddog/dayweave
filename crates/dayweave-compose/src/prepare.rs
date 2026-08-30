@@ -7,9 +7,10 @@ use dayweave_core::{
     DailyTimeWindow, DurationEstimate, EnergyLevel, FixedBlock, FixedBlockSource, GoalMeasure,
     GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
     PreviousAssignment, PreviousBlock, Priority, Qualified, QuantityTarget, Recurrence,
-    RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurringTaskSpec,
-    RoutineSpec, SchedulerConfig, SchedulingConstraints, SplitPolicy as PlanningSplitPolicy,
-    WorkItem, WorkStatus, ZonedDayBoundary,
+    RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    RecurrenceOccurrenceIdentity, RecurringTaskSpec, RoutineSpec, SchedulerConfig,
+    SchedulingConstraints, SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus,
+    ZonedDayBoundary,
 };
 use serde::Deserialize;
 use time::{OffsetDateTime, UtcOffset};
@@ -102,8 +103,24 @@ pub fn validate_schedule_request(
                         | RecurrenceExceptionSelector::LocalDate { .. } => true,
                     };
                     let action = match exception.action {
-                        RecurrenceExceptionAction::Move { start, end } => {
-                            offset_instant_is_precise(start) && offset_instant_is_precise(end)
+                        RecurrenceExceptionAction::Move { start, end, source } => {
+                            offset_instant_is_precise(start)
+                                && offset_instant_is_precise(end)
+                                && offset_instant_is_precise(source.nominal_start)
+                                && offset_instant_is_precise(source.nominal_end)
+                                && !matches!(
+                                    source.identity,
+                                    RecurrenceOccurrenceIdentity::AfterCompletion { anchor }
+                                        | RecurrenceOccurrenceIdentity::RollingMinutes {
+                                            anchor,
+                                            ..
+                                        }
+                                        | RecurrenceOccurrenceIdentity::RollingMonth {
+                                            anchor,
+                                            ..
+                                        }
+                                        if !offset_instant_is_precise(anchor)
+                                )
                         }
                         RecurrenceExceptionAction::Skip => true,
                     };

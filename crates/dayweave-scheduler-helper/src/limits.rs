@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
 use dayweave_core::{
     ConstraintStrength, ItemId, ItemKind, PlanRequest, Recurrence, RecurrenceExceptionAction,
-    RecurrenceExceptionSelector, RecurrencePeriod, RecurrenceSemantics, ScheduleError, SplitPolicy,
-    WorkItem,
+    RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity, RecurrencePeriod,
+    RecurrenceSemantics, ScheduleError, SplitPolicy, WorkItem,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -258,8 +258,24 @@ fn recurrence_context_has_imprecise_instant(request: &PlanRequest) -> bool {
                 | RecurrenceExceptionSelector::LocalDate { .. } => false,
             };
             let action = match exception.action {
-                RecurrenceExceptionAction::Move { start, end } => {
-                    !is_microsecond(start) || !is_microsecond(end)
+                RecurrenceExceptionAction::Move { start, end, source } => {
+                    !is_microsecond(start)
+                        || !is_microsecond(end)
+                        || !is_microsecond(source.nominal_start)
+                        || !is_microsecond(source.nominal_end)
+                        || matches!(
+                            source.identity,
+                            RecurrenceOccurrenceIdentity::AfterCompletion { anchor }
+                                | RecurrenceOccurrenceIdentity::RollingMinutes {
+                                    anchor,
+                                    ..
+                                }
+                                | RecurrenceOccurrenceIdentity::RollingMonth {
+                                    anchor,
+                                    ..
+                                }
+                                if !is_microsecond(anchor)
+                        )
                 }
                 RecurrenceExceptionAction::Skip => false,
             };
@@ -1083,7 +1099,7 @@ fn moved_occurrence_bounds(request: &PlanRequest) -> BTreeMap<ItemId, usize> {
         let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
             continue;
         };
-        let RecurrenceExceptionAction::Move { start, end } = exception.action else {
+        let RecurrenceExceptionAction::Move { start, end, .. } = exception.action else {
             continue;
         };
         if request.horizon_start <= start && end <= request.horizon_end {
@@ -1343,12 +1359,15 @@ fn invalid_item(item_id: ItemId) -> PreflightError {
 mod tests {
     use dayweave_core::{
         ItemId, OccurrenceId, PlanRequest, RecurrenceContext, RecurrenceException,
-        RecurrenceExceptionAction, RecurrenceExceptionSelector, SchedulerConfig,
+        RecurrenceExceptionAction, RecurrenceExceptionSelector, RecurrenceMoveSource,
+        RecurrenceOccurrenceIdentity, SchedulerConfig,
     };
     use time::{Duration, macros::datetime};
     use uuid::Uuid;
 
-    use super::{moved_occurrence_bounds, shrink_attempt_bound};
+    use super::{
+        moved_occurrence_bounds, recurrence_context_has_imprecise_instant, shrink_attempt_bound,
+    };
 
     #[test]
     fn shrink_attempt_bound_includes_the_clamped_minimum_attempt() {
@@ -1381,6 +1400,14 @@ mod tests {
             action: RecurrenceExceptionAction::Move {
                 start: move_start,
                 end: move_end,
+                source: RecurrenceMoveSource {
+                    item_revision: 1,
+                    identity: RecurrenceOccurrenceIdentity::Custom,
+                    nominal_start: start,
+                    nominal_end: start + Duration::hours(1),
+                    local_date: None,
+                    ordinal: 0,
+                },
             },
         };
         request.recurrence_context.exceptions = vec![
@@ -1415,6 +1442,14 @@ mod tests {
                 action: RecurrenceExceptionAction::Move {
                     start: start + Duration::hours(7),
                     end: start + Duration::hours(8),
+                    source: RecurrenceMoveSource {
+                        item_revision: 1,
+                        identity: RecurrenceOccurrenceIdentity::Custom,
+                        nominal_start: start,
+                        nominal_end: start + Duration::hours(1),
+                        local_date: None,
+                        ordinal: 0,
+                    },
                 },
             },
         ];
@@ -1422,5 +1457,55 @@ mod tests {
         let bounds = moved_occurrence_bounds(&request);
         assert_eq!(bounds.get(&item_id), Some(&2));
         assert_eq!(bounds.get(&other_item_id), Some(&1));
+    }
+
+    #[test]
+    fn recurrence_identity_anchors_obey_microsecond_precision() {
+        let base = datetime!(2026-09-01 0:00 UTC);
+        let item_id = ItemId::from_uuid(Uuid::from_u128(10));
+        let imprecise = base + Duration::nanoseconds(1);
+        for identity in [
+            RecurrenceOccurrenceIdentity::RollingMinutes {
+                index: 0,
+                anchor: imprecise,
+            },
+            RecurrenceOccurrenceIdentity::AfterCompletion { anchor: imprecise },
+            RecurrenceOccurrenceIdentity::RollingMonth {
+                cycle: 0,
+                index: 0,
+                anchor: imprecise,
+            },
+        ] {
+            let mut request = PlanRequest {
+                as_of: base,
+                horizon_start: base,
+                horizon_end: base + Duration::days(1),
+                items: Vec::new(),
+                availability: Vec::new(),
+                fixed_blocks: Vec::new(),
+                previous_assignments: Vec::new(),
+                config: SchedulerConfig::default(),
+                recurrence_context: RecurrenceContext::default(),
+            };
+            request.recurrence_context.exceptions = vec![RecurrenceException {
+                item_id,
+                selector: RecurrenceExceptionSelector::Occurrence {
+                    id: OccurrenceId(Uuid::from_u128(11)),
+                },
+                action: RecurrenceExceptionAction::Move {
+                    start: base + Duration::hours(9),
+                    end: base + Duration::hours(10),
+                    source: RecurrenceMoveSource {
+                        item_revision: 1,
+                        identity,
+                        nominal_start: base,
+                        nominal_end: base + Duration::hours(1),
+                        local_date: None,
+                        ordinal: 0,
+                    },
+                },
+            }];
+            assert!(recurrence_context_has_imprecise_instant(&request));
+        }
     }
 }

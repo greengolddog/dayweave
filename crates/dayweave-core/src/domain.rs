@@ -940,7 +940,114 @@ pub enum RecurrenceExceptionAction {
         start: OffsetDateTime,
         #[serde(with = "time::serde::rfc3339")]
         end: OffsetDateTime,
+        /// Exact scheduler-returned source metadata. The embedded identity is checked against the
+        /// current recurrence rule and selector ID before a move can suppress or restore work.
+        source: RecurrenceMoveSource,
     },
+}
+
+/// Durable identity envelope for restoring one moved occurrence in a later planning horizon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecurrenceMoveSource {
+    pub item_revision: u64,
+    pub identity: RecurrenceOccurrenceIdentity,
+    #[serde(with = "time::serde::rfc3339")]
+    pub nominal_start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub nominal_end: OffsetDateTime,
+    #[serde(with = "optional_iso_date")]
+    pub local_date: Option<time::Date>,
+    pub ordinal: u32,
+}
+
+/// The bounded, rule-specific name used to derive a recurrence occurrence UUID.
+///
+/// Unlike caller-supplied presentation timestamps, this value can be validated against the
+/// current recurrence definition. It therefore lets a later planning horizon prove that a moved
+/// occurrence is a real member of the series rather than an arbitrary UUID-v5 value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecurrenceOccurrenceIdentity {
+    CalendarDay {
+        #[serde(with = "iso_date")]
+        date: time::Date,
+        bucket_ordinal: u16,
+    },
+    CalendarWeek {
+        week_key: i32,
+        bucket_ordinal: u16,
+    },
+    CalendarMonth {
+        year: i32,
+        month: u8,
+        bucket_ordinal: u16,
+    },
+    RollingMinutes {
+        index: i64,
+        #[serde(with = "time::serde::rfc3339")]
+        anchor: OffsetDateTime,
+    },
+    AfterCompletion {
+        #[serde(with = "time::serde::rfc3339")]
+        anchor: OffsetDateTime,
+    },
+    RollingMonth {
+        cycle: i64,
+        index: u16,
+        #[serde(with = "time::serde::rfc3339")]
+        anchor: OffsetDateTime,
+    },
+    Custom,
+}
+
+mod iso_date {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+    use time::{Date, macros::format_description};
+
+    const FORMAT: &[time::format_description::BorrowedFormatItem<'static>] =
+        format_description!("[year]-[month]-[day]");
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(date: &Date, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&date.format(FORMAT).map_err(serde::ser::Error::custom)?)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Date, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Date::parse(&String::deserialize(deserializer)?, FORMAT).map_err(D::Error::custom)
+    }
+}
+
+mod optional_iso_date {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::Date;
+
+    #[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+    pub fn serialize<S>(date: &Option<Date>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match date {
+            Some(value) => super::iso_date::serialize(value, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Date>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?.map_or(Ok(None), |value| {
+            let deserializer = serde::de::value::StringDeserializer::<D::Error>::new(value);
+            super::iso_date::deserialize(deserializer).map(Some)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -957,6 +1064,7 @@ impl std::fmt::Display for OccurrenceId {
 pub struct Occurrence {
     pub id: OccurrenceId,
     pub series_item_id: ItemId,
+    pub identity: RecurrenceOccurrenceIdentity,
     #[serde(with = "time::serde::rfc3339")]
     pub nominal_start: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]

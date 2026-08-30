@@ -1,7 +1,8 @@
 use dayweave_core::{
     DecisionKind, ExplanationCode, ItemId, OccurrenceId, OccurrenceState, PlacementExplanation,
-    PlanDecision, PlanScore, PlanViolation, ScheduleBlock, ScheduleBlockKind, SchedulePlan,
-    UnscheduledReason, UnscheduledWork, ViolationKind, ViolationSeverity,
+    PlanDecision, PlanScore, PlanViolation, RecurrenceOccurrenceIdentity, ScheduleBlock,
+    ScheduleBlockKind, SchedulePlan, UnscheduledReason, UnscheduledWork, ViolationKind,
+    ViolationSeverity,
 };
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -207,6 +208,7 @@ impl From<PlanScore> for ScoreOutput {
 struct OccurrenceOutput {
     id: OccurrenceId,
     series_item_id: ItemId,
+    identity: RecurrenceOccurrenceIdentity,
     nominal_start: String,
     nominal_end: String,
     window_start: String,
@@ -223,6 +225,7 @@ impl TryFrom<dayweave_core::Occurrence> for OccurrenceOutput {
         Ok(Self {
             id: occurrence.id,
             series_item_id: occurrence.series_item_id,
+            identity: occurrence.identity,
             nominal_start: rfc3339(occurrence.nominal_start)?,
             nominal_end: rfc3339(occurrence.nominal_end)?,
             window_start: rfc3339(occurrence.window_start)?,
@@ -236,4 +239,46 @@ impl TryFrom<dayweave_core::Occurrence> for OccurrenceOutput {
 
 fn rfc3339(value: OffsetDateTime) -> Result<String, WireEncodingError> {
     value.format(&Rfc3339).map_err(|_| WireEncodingError)
+}
+
+#[cfg(test)]
+mod tests {
+    use dayweave_core::{
+        ItemId, Occurrence, OccurrenceId, OccurrenceState, RecurrenceOccurrenceIdentity,
+    };
+    use serde_json::json;
+    use time::macros::{date, datetime};
+    use uuid::Uuid;
+
+    use super::OccurrenceOutput;
+
+    #[test]
+    fn occurrence_output_exposes_the_exact_move_identity() {
+        let occurrence = Occurrence {
+            id: OccurrenceId(Uuid::from_u128(2)),
+            series_item_id: ItemId::from_uuid(Uuid::from_u128(1)),
+            identity: RecurrenceOccurrenceIdentity::CalendarDay {
+                date: date!(2026 - 09 - 01),
+                bucket_ordinal: 2,
+            },
+            nominal_start: datetime!(2026-09-01 8:00 +02:00),
+            nominal_end: datetime!(2026-09-01 9:00 +02:00),
+            window_start: datetime!(2026-09-01 8:00 +02:00),
+            window_end: datetime!(2026-09-01 9:00 +02:00),
+            local_date: Some(date!(2026 - 09 - 01)),
+            ordinal: 2,
+            state: OccurrenceState::Generated,
+        };
+        let encoded =
+            serde_json::to_value(OccurrenceOutput::try_from(occurrence).unwrap()).unwrap();
+        assert_eq!(
+            encoded["identity"],
+            json!({
+                "type": "calendar_day",
+                "date": "2026-09-01",
+                "bucket_ordinal": 2
+            })
+        );
+        assert_eq!(encoded["nominal_start"], json!("2026-09-01T08:00:00+02:00"));
+    }
 }

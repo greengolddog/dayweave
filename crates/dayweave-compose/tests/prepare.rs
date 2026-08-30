@@ -9,9 +9,11 @@ use dayweave_compose::{
 };
 use dayweave_core::{
     ConstraintStrength, EnergyLevel, FixedBlockSource, ItemId, ItemKind, Minutes, Recurrence,
-    SplitPolicy, WorkStatus,
+    RecurrenceException, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    RecurrenceMoveSource, RecurrenceOccurrenceIdentity, SplitPolicy, WorkStatus,
 };
 use serde_json::json;
+use time::{Duration as TimeDuration, macros::datetime};
 use uuid::Uuid;
 
 fn canonical_item(value: u128) -> CanonicalItem {
@@ -500,4 +502,39 @@ fn validates_request_bounds_and_maps_fixed_sources() {
         FixedBlockSource::ProtectedTime
     );
     assert_eq!(prepared.plan_request.fixed_blocks[0].start.hour(), 11);
+}
+
+#[test]
+fn recurrence_identity_anchor_obeys_microsecond_precision() {
+    let mut request = preview_request();
+    let item_id = ItemId(Uuid::from_u128(901));
+    let base = datetime!(2026-09-01 0:00 UTC);
+    request
+        .recurrence_context
+        .exceptions
+        .push(RecurrenceException {
+            item_id,
+            selector: RecurrenceExceptionSelector::Occurrence {
+                id: dayweave_core::OccurrenceId(Uuid::new_v5(&item_id.0, b"interval:0")),
+            },
+            action: RecurrenceExceptionAction::Move {
+                start: base + TimeDuration::hours(9),
+                end: base + TimeDuration::hours(10),
+                source: RecurrenceMoveSource {
+                    item_revision: 1,
+                    identity: RecurrenceOccurrenceIdentity::RollingMinutes {
+                        index: 0,
+                        anchor: base + TimeDuration::nanoseconds(1),
+                    },
+                    nominal_start: base,
+                    nominal_end: base + TimeDuration::hours(1),
+                    local_date: None,
+                    ordinal: 0,
+                },
+            },
+        });
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(_))
+    ));
 }
