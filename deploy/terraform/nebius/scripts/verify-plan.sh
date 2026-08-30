@@ -15,7 +15,7 @@ cloud_init_template="${terraform_dir}/cloud-init.yaml.tftpl"
 expected_cloud_init_template_sha256="22ce2bb7528d8a7c0b10b6e663fdcc08af0b74a1bea44d39e5fda8068948328b"
 expected_main_tf_sha256="47fd64afaa9130b50a6c46bf54400ae84e237a77f7acba4e3f0c39b7b91ba568"
 expected_versions_tf_sha256="740c8325be3aa973a984b32632736abb8f42681c6be5d78c7dd6fb223d9d4ccc"
-expected_variables_tf_sha256="b0d5144a87092971c7df65989c6dc396033d15611f64200c221a7be6dd547a37"
+expected_variables_tf_sha256="f718737a1bd21ae6a7d90eb9153f55c56d0c321903a58309b88e8383fd5b264b"
 expected_outputs_tf_sha256="2398924278dafd5d82d2be4bc9e744342f8841ff8ea01bb6173255894ce126bd"
 expected_lock_file_sha256="0a92a22310ce7e61f2266e3c924d85b022318e3f1f9efef7a340f1c34b803b0a"
 
@@ -57,7 +57,15 @@ verify_reviewed_digest \
 verify_reviewed_digest \
   "${terraform_dir}/.terraform.lock.hcl" "${expected_lock_file_sha256}" "provider lock file"
 
-jq -e '
+jq -e \
+  --arg profile_first_pattern "$DAYWEAVE_NEBIUS_PROFILE_FIRST_PATTERN" \
+  --arg profile_forbidden_pattern "$DAYWEAVE_NEBIUS_PROFILE_FORBIDDEN_PATTERN" '
+  def valid_profile:
+    type == "string" and
+    length >= 1 and
+    length <= 64 and
+    test($profile_first_pattern) and
+    (test($profile_forbidden_pattern) | not);
   def changes: [.resource_changes[]];
   def managed: [changes[] | select(.mode == "managed")];
   def change($address):
@@ -113,7 +121,7 @@ jq -e '
     "nebius_profile", "project_id", "ssh_public_key",
     "ssh_user", "subnet_id", "tenant_id"
   ]) and
-  (.variables.nebius_profile.value == "lol") and
+  (.variables.nebius_profile.value | valid_profile) and
   ($project_id | type == "string" and startswith("project-")) and
   ($tenant_id | type == "string" and startswith("tenant-")) and
   ($subnet_id | type == "string" and startswith("vpcsubnet-")) and

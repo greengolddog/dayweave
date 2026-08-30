@@ -1,6 +1,6 @@
 # Do not put real IDs or keys in this tracked example. The discovery script writes
 # these values to ignored local.auto.tfvars.json.
-nebius_profile = "lol"
+nebius_profile = "owner-profile"
 project_id     = "project-replace"
 tenant_id      = "tenant-replace"
 subnet_id      = "vpcsubnet-replace"

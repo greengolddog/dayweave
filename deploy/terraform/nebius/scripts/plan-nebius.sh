@@ -8,6 +8,7 @@ terraform_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${terraform_dir}/scripts/guard-lib.sh"
 
 terraform_bin="${DAYWEAVE_TERRAFORM_BIN:-terraform}"
+profile="${DAYWEAVE_NEBIUS_PROFILE:-}"
 plan_file="${terraform_dir}/dayweave.tfplan"
 plan_json="${terraform_dir}/dayweave.tfplan.json"
 review_file="${terraform_dir}/dayweave.tfplan.review.json"
@@ -16,6 +17,11 @@ pending_plan="${terraform_dir}/dayweave.pending.tfplan"
 pending_plan_json="${terraform_dir}/dayweave.pending.tfplan.json"
 pending_review="${terraform_dir}/dayweave.pending.tfplan.review.json"
 context_file="${terraform_dir}/local.auto.tfvars.json"
+
+if ! require_nebius_profile "$profile"; then
+  echo "Set DAYWEAVE_NEBIUS_PROFILE explicitly before planning." >&2
+  exit 1
+fi
 
 cleanup() {
   rm -f -- "$pending_plan" "$pending_plan_json" "$pending_review"
@@ -32,7 +38,7 @@ done
 # A new plan invalidates every unconsumed approval for an older artifact set.
 rm -f -- "$plan_file" "$plan_json" "$review_file" "$approval_file" \
   "$pending_plan" "$pending_plan_json" "$pending_review"
-"${terraform_dir}/scripts/discover-context.sh"
+DAYWEAVE_NEBIUS_PROFILE="$profile" "${terraform_dir}/scripts/discover-context.sh"
 assert_private_artifact "$context_file" "$DAYWEAVE_MAX_CONTEXT_BYTES" "discovered context"
 
 export TF_IN_AUTOMATION=1

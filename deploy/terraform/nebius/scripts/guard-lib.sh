@@ -12,6 +12,57 @@ DAYWEAVE_MAX_PLAN_BINARY_BYTES=67108864
 DAYWEAVE_MAX_NEBIUS_BODY_BYTES=4194304
 # shellcheck disable=SC2034
 DAYWEAVE_MAX_CONTEXT_BYTES=65536
+DAYWEAVE_NEBIUS_PROFILE_FIRST_PATTERN='^[A-Za-z0-9]'
+DAYWEAVE_NEBIUS_PROFILE_FORBIDDEN_PATTERN='[^A-Za-z0-9._-]'
+
+is_valid_nebius_profile() {
+  local profile="${1-}"
+
+  [[ -n "$profile" ]] || return 1
+  ((${#profile} <= 64)) || return 1
+  [[ "$profile" =~ ^[A-Za-z0-9] ]] || return 1
+  [[ ! "$profile" =~ [^A-Za-z0-9._-] ]]
+}
+
+require_nebius_profile() {
+  if ! is_valid_nebius_profile "${1-}"; then
+    echo "A Nebius profile name must be 1-64 ASCII letters, digits, dots, underscores, or hyphens, beginning with a letter or digit." >&2
+    return 1
+  fi
+}
+
+nebius_profile_from_plan() {
+  local plan_json="$1"
+
+  jq -er \
+    --arg first_pattern "$DAYWEAVE_NEBIUS_PROFILE_FIRST_PATTERN" \
+    --arg forbidden_pattern "$DAYWEAVE_NEBIUS_PROFILE_FORBIDDEN_PATTERN" '
+      .variables.nebius_profile.value as $profile |
+      if (
+        ($profile | type) == "string" and
+        ($profile | length) >= 1 and
+        ($profile | length) <= 64 and
+        ($profile | test($first_pattern)) and
+        (($profile | test($forbidden_pattern)) | not)
+      ) then $profile else error("invalid Nebius profile in plan") end
+    ' "$plan_json"
+}
+
+assert_nebius_profile_matches_plan() {
+  local requested_profile="${1-}"
+  local plan_json="$2"
+  local approved_profile
+
+  require_nebius_profile "$requested_profile" || return 1
+  if ! approved_profile="$(nebius_profile_from_plan "$plan_json")"; then
+    echo "The approved plan does not contain a valid Nebius profile name." >&2
+    return 1
+  fi
+  if [[ "$requested_profile" != "$approved_profile" ]]; then
+    echo "DAYWEAVE_NEBIUS_PROFILE does not exactly match the profile bound to the approved plan." >&2
+    return 1
+  fi
+}
 
 file_size_bytes() {
   if stat -f '%z' -- "$1" >/dev/null 2>&1; then
@@ -197,15 +248,30 @@ assert_context_matches_plan() {
   local context_file="$1"
   local plan_json="$2"
 
-  jq -e --slurpfile context "$context_file" '
+  if ! jq -e \
+    --arg first_pattern "$DAYWEAVE_NEBIUS_PROFILE_FIRST_PATTERN" \
+    --arg forbidden_pattern "$DAYWEAVE_NEBIUS_PROFILE_FORBIDDEN_PATTERN" \
+    --slurpfile context "$context_file" '
+    def valid_profile:
+      type == "string" and
+      length >= 1 and
+      length <= 64 and
+      test($first_pattern) and
+      (test($forbidden_pattern) | not);
+
     ($context | length) == 1 and
     ($context[0] | keys | sort) == [
       "nebius_profile", "project_id", "ssh_public_key", "subnet_id", "tenant_id"
     ] and
+    ($context[0].nebius_profile | valid_profile) and
+    (.variables.nebius_profile.value | valid_profile) and
     .variables.nebius_profile.value == $context[0].nebius_profile and
     .variables.project_id.value == $context[0].project_id and
     .variables.tenant_id.value == $context[0].tenant_id and
     .variables.subnet_id.value == $context[0].subnet_id and
     .variables.ssh_public_key.value == $context[0].ssh_public_key
-  ' "$plan_json" >/dev/null
+  ' "$plan_json" >/dev/null; then
+    echo "The discovered context does not exactly match the approved plan." >&2
+    return 1
+  fi
 }

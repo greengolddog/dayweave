@@ -24,6 +24,7 @@ consumed_approval=""
 apply_lock="${terraform_dir}/.dayweave-apply.lock"
 snapshot_dir=""
 lock_held=false
+requested_profile="${DAYWEAVE_NEBIUS_PROFILE:-}"
 
 cleanup() {
   rm -f -- "$consuming_approval"
@@ -153,16 +154,20 @@ fi
 
 assert_source_digests_match "$terraform_dir" "$snapshot_review"
 "${terraform_dir}/scripts/verify-plan.sh" "$snapshot_json"
+if ! assert_nebius_profile_matches_plan "$requested_profile" "$snapshot_json"; then
+  echo "Apply requires the same explicit Nebius profile that was approved with the plan." >&2
+  exit 1
+fi
 "${terraform_dir}/scripts/estimate-cost.sh" "$snapshot_json"
 
 # This read-only discovery is intentionally repeated immediately before apply.
 # It overwrites only the ignored context file and must match every planned ID and
 # the complete SSH key, while the receipt separately binds the key digest.
-"${terraform_dir}/scripts/discover-context.sh"
-assert_private_artifact "$context_file" "$DAYWEAVE_MAX_CONTEXT_BYTES" "freshly rediscovered lol context"
+DAYWEAVE_NEBIUS_PROFILE="$requested_profile" "${terraform_dir}/scripts/discover-context.sh"
+assert_private_artifact "$context_file" "$DAYWEAVE_MAX_CONTEXT_BYTES" "freshly rediscovered Nebius context"
 assert_context_matches_plan "$context_file" "$snapshot_json"
 if [[ "$(sha256_file "$context_file")" != "$(jq -er '.context_sha256' "$snapshot_review")" ]]; then
-  echo "The freshly rediscovered lol tenant/project/subnet/key context differs from the approved context." >&2
+  echo "The freshly rediscovered Nebius tenant/project/subnet/key/profile context differs from the approved context." >&2
   exit 1
 fi
 if [[ "$(jq -jr '.variables.ssh_public_key.value' "$snapshot_json" | openssl dgst -sha256 | awk '{print $NF}')" != "$(jq -er '.ssh_public_key_sha256' "$snapshot_review")" ]]; then

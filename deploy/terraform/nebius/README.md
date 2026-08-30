@@ -19,12 +19,16 @@ tokens, so it needs no copied tunnel credential.
 ## Plan without spending
 
 Install Terraform 1.10 or later, `jq`, OpenSSL, OpenSSH (`ssh-keygen`), and the
-Nebius CLI. Ensure the `lol` profile is authenticated and has the intended
-eu-north1 project selected. Set `DAYWEAVE_SSH_PUBLIC_KEY_FILE` if the
-administrative public key is not at `~/.ssh/id_ed25519.pub`, then run:
+Nebius CLI. Choose an authenticated profile with the intended eu-north1 project
+selected and pass its name explicitly. Profile names are non-secret operational
+metadata, but personalized names still belong in the shell or ignored local
+state, not tracked files. DayWeave accepts 1-64 ASCII letters, digits, dots,
+underscores, or hyphens, beginning with a letter or digit. Set
+`DAYWEAVE_SSH_PUBLIC_KEY_FILE` if the administrative public key is not at
+`~/.ssh/id_ed25519.pub`, then run with a generic example name:
 
 ```sh
-./scripts/plan-nebius.sh
+DAYWEAVE_NEBIUS_PROFILE=owner-profile ./scripts/plan-nebius.sh
 ```
 
 The script verifies the selected project is active in `eu-north1`, discovers its
@@ -100,21 +104,28 @@ approval. Direct
 
 Immediately before apply, the helper privately snapshots the approved artifacts,
 renders the binary again and byte-compares its JSON, verifies the 13 expected
-creates, checks every source digest, freshly rediscovers the `lol` tenant/project/
-subnet and SSH key, and requires exact semantic and cryptographic equality. It
-reruns the bounded live estimate and then passes that same private binary snapshot
-to Terraform. Plans older than one hour are rejected:
+creates, checks every source digest, freshly rediscovers the selected profile's
+tenant/project/subnet and SSH key, and requires exact semantic and cryptographic
+equality. It reruns the bounded live estimate and then passes that same private
+binary snapshot to Terraform. Plans older than one hour are rejected:
 
 ```sh
+DAYWEAVE_NEBIUS_PROFILE=owner-profile \
 DAYWEAVE_NEBIUS_APPLY=I_ACCEPT_CHARGES_UP_TO_USD_50_PER_MONTH \
   ./scripts/apply-nebius.sh
 ```
 
-Never set that variable in shell startup files or CI. The apply script reruns
-the live estimate, but it is not a price guarantee: Nebius labels the endpoint
-`v1alpha1`, its response has no currency field, and it excludes bucket
-operations, egress, taxes, and future tunnel pricing. Confirm those items and
-the tunnel preview status before every apply, and configure billing alerts.
+The apply helper requires `DAYWEAVE_NEBIUS_PROFILE` again and compares it
+exactly with the profile value cryptographically bound into the approved plan
+and context before any new Nebius discovery. A different or malformed value
+fails closed; there is no built-in profile-name default.
+
+Never set the charge-confirmation variable in shell startup files or CI. The
+apply script reruns the live estimate, but it is not a price guarantee: Nebius
+labels the endpoint `v1alpha1`, its response has no currency field, and it
+excludes bucket operations, egress, taxes, and future tunnel pricing. Confirm
+those items and the tunnel preview status before every apply, and configure
+billing alerts.
 
 This is deliberately a bootstrap-only gate: after the first creation, a
 maintenance plan will fail the create-only assertion. Add narrowly reviewed

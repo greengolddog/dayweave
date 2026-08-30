@@ -7,10 +7,15 @@ terraform_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "${terraform_dir}/scripts/guard-lib.sh"
 
-profile="lol"
+profile="${DAYWEAVE_NEBIUS_PROFILE:-}"
 ssh_key_file="${DAYWEAVE_SSH_PUBLIC_KEY_FILE:-${HOME}/.ssh/id_ed25519.pub}"
 context_file="${terraform_dir}/local.auto.tfvars.json"
 work_dir=""
+
+if ! require_nebius_profile "$profile"; then
+  echo "Set DAYWEAVE_NEBIUS_PROFILE explicitly before discovering deployment context." >&2
+  exit 1
+fi
 
 cleanup() {
   if [[ -n "$work_dir" ]]; then
@@ -54,7 +59,7 @@ bounded_run_to_file "$DAYWEAVE_MAX_CONTEXT_BYTES" "$parent_file" \
   nebius --profile "$profile" --no-browser --no-check-update config get parent-id
 project_id="$(awk 'NR == 1 { print; exit }' "$parent_file")"
 if [[ "$(awk 'END { print NR }' "$parent_file")" -ne 1 || ! "$project_id" =~ ^project-[a-z0-9]+$ ]]; then
-  echo "The lol profile did not return exactly one valid project identifier." >&2
+  echo "The selected Nebius profile did not return exactly one valid project identifier." >&2
   exit 1
 fi
 
@@ -189,4 +194,4 @@ chmod 0600 "$temporary_file"
 assert_private_artifact "$temporary_file" "$DAYWEAVE_MAX_CONTEXT_BYTES" "discovered Terraform context"
 mv -f -- "$temporary_file" "$context_file"
 
-echo "Wrote freshly discovered lol context to ignored local.auto.tfvars.json without printing IDs."
+echo "Wrote freshly discovered Nebius context to ignored local.auto.tfvars.json without printing IDs or the profile name."

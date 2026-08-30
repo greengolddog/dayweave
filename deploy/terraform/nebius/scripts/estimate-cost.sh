@@ -32,7 +32,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-profile="$(jq -er '.variables.nebius_profile.value | select(. == "lol")' "$plan_json")"
+if ! profile="$(nebius_profile_from_plan "$plan_json")"; then
+  echo "The verified plan does not contain an allowed Nebius profile name." >&2
+  exit 1
+fi
 resource_specs_file="$work_dir/resource-specs.json"
 jq -ec '
   def after($address):

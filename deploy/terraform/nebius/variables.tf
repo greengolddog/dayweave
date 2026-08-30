@@ -1,11 +1,16 @@
 variable "nebius_profile" {
-  description = "User-authorized Nebius CLI profile used only to plan and bootstrap least-privilege service accounts."
+  description = "Explicit non-secret Nebius CLI profile name used only to plan and bootstrap least-privilege service accounts."
   type        = string
-  default     = "lol"
+  nullable    = false
 
   validation {
-    condition     = var.nebius_profile == "lol"
-    error_message = "nebius_profile must be the explicitly authorized lol profile."
+    condition = (
+      length(var.nebius_profile) >= 1 &&
+      length(var.nebius_profile) <= 64 &&
+      can(regex("^[A-Za-z0-9]", var.nebius_profile)) &&
+      length(regexall("[^A-Za-z0-9._-]", var.nebius_profile)) == 0
+    )
+    error_message = "nebius_profile must be 1-64 ASCII letters, digits, dots, underscores, or hyphens, beginning with a letter or digit."
   }
 }
 

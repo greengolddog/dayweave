@@ -43,6 +43,90 @@ if assert_private_directory "$private_directory" "test public directory" 2>/dev/
   exit 1
 fi
 
+profile_64="$(printf 'p%.0s' {1..64})"
+profile_65="$(printf 'p%.0s' {1..65})"
+for valid_profile in owner-profile Team.Profile_2 a "$profile_64"; do
+  require_nebius_profile "$valid_profile"
+done
+for invalid_profile in \
+  "" \
+  -leading \
+  .leading \
+  _leading \
+  "contains space" \
+  contains/slash \
+  'contains:semicolon' \
+  $'contains\nnewline' \
+  "$profile_65"; do
+  if require_nebius_profile "$invalid_profile" 2>/dev/null; then
+    echo "An invalid Nebius profile name unexpectedly passed validation." >&2
+    exit 1
+  fi
+done
+
+profile_plan="$work_dir/profile-plan.json"
+profile_context="$work_dir/profile-context.json"
+jq -n \
+  --arg profile "owner-profile" \
+  --arg project "project-test" \
+  --arg tenant "tenant-test" \
+  --arg subnet "vpcsubnet-test" \
+  --arg ssh_key "ssh-ed25519 test" '
+    {
+      variables: {
+        nebius_profile: {value: $profile},
+        project_id: {value: $project},
+        tenant_id: {value: $tenant},
+        subnet_id: {value: $subnet},
+        ssh_public_key: {value: $ssh_key}
+      }
+    }
+  ' >"$profile_plan"
+jq -n \
+  --arg profile "owner-profile" \
+  --arg project "project-test" \
+  --arg tenant "tenant-test" \
+  --arg subnet "vpcsubnet-test" \
+  --arg ssh_key "ssh-ed25519 test" '
+    {
+      nebius_profile: $profile,
+      project_id: $project,
+      tenant_id: $tenant,
+      subnet_id: $subnet,
+      ssh_public_key: $ssh_key
+    }
+  ' >"$profile_context"
+assert_nebius_profile_matches_plan "owner-profile" "$profile_plan"
+assert_context_matches_plan "$profile_context" "$profile_plan"
+if assert_nebius_profile_matches_plan "different-profile" "$profile_plan" 2>/dev/null; then
+  echo "An apply profile different from the approved plan unexpectedly passed." >&2
+  exit 1
+fi
+if jq '.variables.nebius_profile.value = "owner-profile\n"' "$profile_plan" |
+  nebius_profile_from_plan /dev/stdin >/dev/null 2>&1; then
+  echo "A plan profile with a trailing newline unexpectedly passed." >&2
+  exit 1
+fi
+if jq '.nebius_profile = "different-profile"' "$profile_context" |
+  assert_context_matches_plan /dev/stdin "$profile_plan" 2>/dev/null; then
+  echo "A discovered profile different from the plan unexpectedly passed." >&2
+  exit 1
+fi
+if (
+  unset DAYWEAVE_NEBIUS_PROFILE
+  "${terraform_dir}/scripts/discover-context.sh" >/dev/null 2>&1
+); then
+  echo "Discovery unexpectedly accepted a missing explicit profile." >&2
+  exit 1
+fi
+if (
+  unset DAYWEAVE_NEBIUS_PROFILE
+  "${terraform_dir}/scripts/plan-nebius.sh" >/dev/null 2>&1
+); then
+  echo "Planning unexpectedly accepted a missing explicit profile." >&2
+  exit 1
+fi
+
 bounded_file="$work_dir/bounded"
 bounded_run_to_file 1024 "$bounded_file" printf 'bounded\n'
 oversize_file="$work_dir/oversize"

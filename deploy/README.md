@@ -12,10 +12,13 @@ smallest managed PostgreSQL tier alone exceeds it.
 
 ## Verified account context
 
-The `lol` CLI profile can read the active tenant and its projects. The target is
-the existing `eu-north1` default project. Keep IDs in local deployment state or
-CI secrets rather than committed files. No paid resource is created by the
-repository scripts without an explicit apply step.
+An authenticated Nebius CLI profile selected explicitly through
+`DAYWEAVE_NEBIUS_PROFILE` can read the active tenant and its projects. The target
+is the existing `eu-north1` default project. The profile name is not a secret,
+but keep personalized names and discovered IDs in shell configuration, ignored
+local deployment state, or CI configuration rather than committed files. No
+paid resource is created by the repository scripts without an explicit apply
+step.
 
 ## Local service
 
@@ -28,14 +31,15 @@ The API is only bound to loopback on the host. PostgreSQL has no published port.
 ## Production outline
 
 Start with `terraform/nebius/README.md`. Its plan-only workflow discovers the
-authenticated `lol` profile context without committing IDs, enforces the fixed
-budget footprint, and its apply helper refuses to continue unless the explicit
-monthly-charge phrase is provided. Direct Terraform apply bypasses that advisory
-interlock and is forbidden by the deployment procedure. The profile bootstraps
-scoped service accounts; the running service does not use the human identity.
+explicitly selected authenticated profile context without committing IDs,
+enforces the fixed budget footprint, and its apply helper refuses to continue
+unless the explicit monthly-charge phrase is provided. Direct Terraform apply
+bypasses that advisory interlock and is forbidden by the deployment procedure.
+The profile bootstraps scoped service accounts; the running service does not use
+the human identity.
 
 1. Create project-scoped runtime and backup service accounts with least-privilege
-   roles. Do not run the service with the human `lol` profile.
+   roles. Do not run the service with the human administrative CLI profile.
 2. Create a private versioned Object Storage bucket. The backup identity can edit
    only `postgres/*`; the runtime identity can edit only `attachments/*`. Keep
    their S3-compatible credentials separate and outside Terraform.
