@@ -449,12 +449,19 @@ fn validate_complexity(request: &PlanRequest) -> Result<(), PreflightError> {
     let mut cloned_sessions = 0_usize;
     let mut cloned_attempts = 0_usize;
     let mut root_occurrences = BTreeMap::new();
+    let moved_occurrence_bounds = moved_occurrence_bounds(request);
     for root in recurrence_roots {
         let subtree_size = subtree_sizes[&root];
         let subtree_session_count = subtree_sessions[&root];
         let subtree_attempt_count = subtree_attempts[&root];
         let recurrence = recurrence_of(by_id[&root]).ok_or(PreflightError::InvalidRequest)?;
-        let occurrences = recurrence_bound(recurrence, day_count, horizon_minutes)?;
+        // Core can restore an occurrence-ID move after its nominal bucket has rolled out of the
+        // horizon. Count every distinct in-horizon destination conservatively; a selector that
+        // also matches a native occurrence may overestimate by one, but may never bypass the
+        // materialization and candidate-work ceilings.
+        let occurrences = recurrence_bound(recurrence, day_count, horizon_minutes)?
+            .checked_add(moved_occurrence_bounds.get(&root).copied().unwrap_or(0))
+            .ok_or(PreflightError::ResourceLimit)?;
         root_occurrences.insert(root, occurrences);
         removed_items = removed_items
             .checked_add(subtree_size)
@@ -1070,6 +1077,25 @@ fn recurrence_bound(
     }
 }
 
+fn moved_occurrence_bounds(request: &PlanRequest) -> BTreeMap<ItemId, usize> {
+    let mut ids_by_item = BTreeMap::<ItemId, BTreeSet<_>>::new();
+    for exception in &request.recurrence_context.exceptions {
+        let RecurrenceExceptionSelector::Occurrence { id } = exception.selector else {
+            continue;
+        };
+        let RecurrenceExceptionAction::Move { start, end } = exception.action else {
+            continue;
+        };
+        if request.horizon_start <= start && end <= request.horizon_end {
+            ids_by_item.entry(exception.item_id).or_default().insert(id);
+        }
+    }
+    ids_by_item
+        .into_iter()
+        .map(|(item_id, ids)| (item_id, ids.len()))
+        .collect()
+}
+
 fn rolling_frequency_bound(
     target: u16,
     period_minutes: u32,
@@ -1315,12 +1341,86 @@ fn invalid_item(item_id: ItemId) -> PreflightError {
 
 #[cfg(test)]
 mod tests {
-    use super::shrink_attempt_bound;
+    use dayweave_core::{
+        ItemId, OccurrenceId, PlanRequest, RecurrenceContext, RecurrenceException,
+        RecurrenceExceptionAction, RecurrenceExceptionSelector, SchedulerConfig,
+    };
+    use time::{Duration, macros::datetime};
+    use uuid::Uuid;
+
+    use super::{moved_occurrence_bounds, shrink_attempt_bound};
 
     #[test]
     fn shrink_attempt_bound_includes_the_clamped_minimum_attempt() {
         assert_eq!(shrink_attempt_bound(6, 4).unwrap(), 3);
         assert_eq!(shrink_attempt_bound(8, 4).unwrap(), 3);
         assert_eq!(shrink_attempt_bound(1, 60).unwrap(), 1);
+    }
+
+    #[test]
+    fn moved_occurrence_bounds_count_unique_destinations_per_item() {
+        let start = datetime!(2026-09-01 0:00 UTC);
+        let item_id = ItemId::from_uuid(Uuid::from_u128(1));
+        let other_item_id = ItemId::from_uuid(Uuid::from_u128(5));
+        let first = OccurrenceId(Uuid::from_u128(2));
+        let second = OccurrenceId(Uuid::from_u128(3));
+        let mut request = PlanRequest {
+            as_of: start,
+            horizon_start: start,
+            horizon_end: start + Duration::days(1),
+            items: Vec::new(),
+            availability: Vec::new(),
+            fixed_blocks: Vec::new(),
+            previous_assignments: Vec::new(),
+            config: SchedulerConfig::default(),
+            recurrence_context: RecurrenceContext::default(),
+        };
+        let exception = |id, move_start, move_end| RecurrenceException {
+            item_id,
+            selector: RecurrenceExceptionSelector::Occurrence { id },
+            action: RecurrenceExceptionAction::Move {
+                start: move_start,
+                end: move_end,
+            },
+        };
+        request.recurrence_context.exceptions = vec![
+            exception(
+                first,
+                start + Duration::hours(1),
+                start + Duration::hours(2),
+            ),
+            exception(
+                first,
+                start + Duration::hours(3),
+                start + Duration::hours(4),
+            ),
+            exception(
+                second,
+                start + Duration::hours(5),
+                start + Duration::hours(6),
+            ),
+            exception(
+                OccurrenceId(Uuid::from_u128(4)),
+                start + Duration::days(1),
+                start + Duration::days(1) + Duration::hours(1),
+            ),
+            RecurrenceException {
+                item_id,
+                selector: RecurrenceExceptionSelector::LocalDate { date: start.date() },
+                action: RecurrenceExceptionAction::Skip,
+            },
+            RecurrenceException {
+                item_id: other_item_id,
+                selector: RecurrenceExceptionSelector::Occurrence { id: first },
+                action: RecurrenceExceptionAction::Move {
+                    start: start + Duration::hours(7),
+                    end: start + Duration::hours(8),
+                },
+            },
+        ];
+
+        let bounds = moved_occurrence_bounds(&request);
+        assert_eq!(bounds.get(&item_id), Some(&2));
+        assert_eq!(bounds.get(&other_item_id), Some(&1));
     }
 }
