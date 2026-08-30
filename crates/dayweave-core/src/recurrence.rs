@@ -60,6 +60,7 @@ pub fn expand_occurrences(request: &PlanRequest) -> Result<Vec<Occurrence>, Recu
             continue;
         };
         let mut occurrences = expand_series(request, item, recurrence, &days)?;
+        append_moved_occurrences_for_horizon(request, item.id, &mut occurrences);
         apply_pauses_and_exceptions(request, item.id, &mut occurrences);
         result.extend(occurrences);
     }
@@ -803,11 +804,60 @@ fn apply_pauses_and_exceptions(
             match exception.action {
                 RecurrenceExceptionAction::Skip => occurrence.state = OccurrenceState::Skipped,
                 RecurrenceExceptionAction::Move { start, end } => {
-                    occurrence.window_start = start;
-                    occurrence.window_end = end;
-                    occurrence.state = OccurrenceState::Generated;
+                    // A moved occurrence belongs to exactly one planning horizon. Suppress its
+                    // nominal placement until a request fully contains the destination window;
+                    // otherwise adjacent rolling horizons could schedule partial duplicates.
+                    if request.horizon_start <= start && end <= request.horizon_end {
+                        occurrence.window_start = start;
+                        occurrence.window_end = end;
+                        occurrence.state = OccurrenceState::Generated;
+                    } else {
+                        occurrence.state = OccurrenceState::Paused;
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Restores an occurrence-ID move when its nominal occurrence has rolled out of the horizon.
+///
+/// Occurrence IDs are the durable identity used by completion and execution evidence. A move
+/// exception already supplies that identity and its exact destination window, so the target-day
+/// request can safely materialize the moved work without regenerating the old nominal bucket.
+/// The synthetic nominal fields are presentation metadata only; materialization and subsequent
+/// reconciliation continue to use the original occurrence ID.
+fn append_moved_occurrences_for_horizon(
+    request: &PlanRequest,
+    item_id: ItemId,
+    occurrences: &mut Vec<Occurrence>,
+) {
+    let mut known_ids: BTreeSet<_> = occurrences.iter().map(|occurrence| occurrence.id).collect();
+    for exception in request
+        .recurrence_context
+        .exceptions
+        .iter()
+        .filter(|exception| exception.item_id == item_id)
+    {
+        let (
+            RecurrenceExceptionSelector::Occurrence { id },
+            RecurrenceExceptionAction::Move { start, end },
+        ) = (exception.selector, exception.action)
+        else {
+            continue;
+        };
+        if request.horizon_start <= start && end <= request.horizon_end && known_ids.insert(id) {
+            occurrences.push(Occurrence {
+                id,
+                series_item_id: item_id,
+                nominal_start: start,
+                nominal_end: end,
+                window_start: start,
+                window_end: end,
+                local_date: None,
+                ordinal: u32::MAX,
+                state: OccurrenceState::Generated,
+            });
         }
     }
 }

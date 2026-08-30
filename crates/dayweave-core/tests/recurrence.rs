@@ -285,6 +285,73 @@ fn completed_paused_skipped_and_moved_occurrences_integrate_with_planning() {
 }
 
 #[test]
+fn occurrence_id_move_survives_from_its_nominal_day_to_its_destination_day() {
+    let item = recurring_item(800, Recurrence::Daily { times_per_day: 1 });
+    let source_start = START;
+    let destination_start = START + Duration::days(1);
+    let destination_end = destination_start + Duration::days(1);
+    let source_occurrence =
+        expand_occurrences(&request(item.clone(), source_start, destination_start))
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+    let moved_start = destination_start + Duration::hours(9);
+    let exception = RecurrenceException {
+        item_id: item.id,
+        selector: RecurrenceExceptionSelector::Occurrence {
+            id: source_occurrence.id,
+        },
+        action: RecurrenceExceptionAction::Move {
+            start: moved_start,
+            end: moved_start + Duration::hours(1),
+        },
+    };
+
+    let mut source_request = request(item.clone(), source_start, destination_start);
+    source_request.availability = all_day_availability(source_start, 1);
+    source_request
+        .recurrence_context
+        .exceptions
+        .push(exception.clone());
+    let source_expansion = expand_occurrences(&source_request).unwrap();
+    assert_eq!(source_expansion.len(), 1);
+    assert_eq!(source_expansion[0].id, source_occurrence.id);
+    assert_eq!(source_expansion[0].state, OccurrenceState::Paused);
+    assert!(Scheduler.plan(&source_request).unwrap().blocks.is_empty());
+
+    let mut destination_request = request(item.clone(), destination_start, destination_end);
+    destination_request.availability = all_day_availability(destination_start, 1);
+    destination_request
+        .recurrence_context
+        .exceptions
+        .push(exception.clone());
+    let destination_expansion = expand_occurrences(&destination_request).unwrap();
+    assert_eq!(destination_expansion.len(), 2);
+    let restored = destination_expansion
+        .iter()
+        .find(|occurrence| occurrence.id == source_occurrence.id)
+        .unwrap();
+    assert_eq!(restored.window_start, moved_start);
+    assert_eq!(restored.window_end, moved_start + Duration::hours(1));
+    assert_eq!(restored.state, OccurrenceState::Generated);
+    let destination_plan = Scheduler.plan(&destination_request).unwrap();
+    let moved_block = destination_plan
+        .blocks_for(item.id)
+        .find(|block| block.occurrence_id == Some(source_occurrence.id))
+        .unwrap();
+    assert_eq!(moved_block.start, moved_start);
+
+    let after_start = destination_end;
+    let mut after_request = request(item, after_start, after_start + Duration::days(1));
+    after_request.availability = all_day_availability(after_start, 1);
+    after_request.recurrence_context.exceptions.push(exception);
+    let after_expansion = expand_occurrences(&after_request).unwrap();
+    assert_eq!(after_expansion.len(), 1);
+    assert_ne!(after_expansion[0].id, source_occurrence.id);
+}
+
+#[test]
 fn execution_evidence_maps_only_to_its_exact_recurring_occurrence() {
     let item = recurring_item(801, Recurrence::Daily { times_per_day: 1 });
     let mut input = request(item.clone(), START, START + Duration::days(2));
