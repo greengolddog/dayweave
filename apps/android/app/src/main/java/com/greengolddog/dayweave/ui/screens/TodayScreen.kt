@@ -24,7 +24,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
+import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
+import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
+import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.ui.components.ActiveItemActions
 import com.greengolddog.dayweave.ui.components.EnergySignalCard
 import com.greengolddog.dayweave.ui.components.MetricCard
@@ -44,6 +50,8 @@ fun TodayScreen(
     onComplete: () -> Unit,
     onSkip: () -> Unit,
     onLater: () -> Unit,
+    onSkipScheduled: (String) -> Unit,
+    onLaterScheduled: (String) -> Unit,
     onRetryTerminalProjection: (String) -> Unit,
     onKeepLatestItem: (String) -> Unit,
     onEnergyCheckIn: (EnergyLevel) -> Unit,
@@ -247,7 +255,7 @@ fun TodayScreen(
                         }
                         ActiveItemActions(
                             isPaused = activeSession.isPaused,
-                            canDefer = activeItem.canonicalItemId == null,
+                            canDefer = activeItem.isMoveLaterEligible(),
                             actionsEnabled = activeItem.canonicalItemId == null ||
                                 canonicalExecutionActionsEnabled,
                             onPause = onPause,
@@ -346,6 +354,20 @@ fun TodayScreen(
             ScheduleItemCard(
                 item = item,
                 onStart = { onStart(item.id) },
+                onLater = if (
+                    state.canMoveScheduledLater(item)
+                ) {
+                    { onLaterScheduled(item.id) }
+                } else {
+                    null
+                },
+                onSkip = if (
+                    item.canonicalItemId != null && state.canSafelySkipScheduled(item)
+                ) {
+                    { onSkipScheduled(item.id) }
+                } else {
+                    null
+                },
                 canStart = !terminalStartBlocked && (
                     item.canonicalItemId == null || canonicalExecutionActionsEnabled
                 ),
@@ -373,5 +395,47 @@ fun TodayScreen(
                 }
             }
         }
+    }
+}
+
+internal fun ScheduleItem.isMoveLaterEligible(): Boolean {
+    return isRepresentableMoveLaterSource()
+}
+
+internal fun DayWeaveUiState.canSafelySkipScheduled(item: ScheduleItem): Boolean {
+    val itemId = item.canonicalItemId ?: return false
+    return item.status == ItemStatus.SCHEDULED &&
+        item.isMoveLaterEligible() && item.occurrenceId == null && !item.isSplittable &&
+        schedule.count { block ->
+            block.canonicalItemId == itemId && block.occurrenceId == null
+        } == 1 && unscheduledWork.none { work ->
+            work.itemId == itemId && work.occurrenceId == null && work.remainingMinutes > 0
+        }
+}
+
+internal fun DayWeaveUiState.canMoveScheduledLater(item: ScheduleItem): Boolean {
+    val itemId = item.canonicalItemId ?: return false
+    if (item.status != ItemStatus.SCHEDULED || !item.isMoveLaterEligible()) return false
+    item.occurrenceId?.let { occurrenceId ->
+        if (hasOpenOrPendingExecutionForOccurrence(occurrenceId)) return false
+        val occurrenceBlocks = schedule.filter { block -> block.occurrenceId == occurrenceId }
+        if (
+            occurrenceBlocks.isEmpty() || occurrenceBlocks.any { block ->
+                block.status != ItemStatus.SCHEDULED || !block.isMoveLaterEligible()
+            } || unscheduledWork.any { work ->
+                work.occurrenceId == occurrenceId && work.remainingMinutes > 0
+            }
+        ) {
+            return false
+        }
+        val identityType = recurrenceIdentityType(
+            recurrenceOccurrenceSources[occurrenceId]?.identityJson,
+        )
+        return identityType != null && identityType != "custom"
+    }
+    return !item.isSplittable && schedule.count { block ->
+        block.canonicalItemId == itemId && block.occurrenceId == null
+    } == 1 && unscheduledWork.none { work ->
+        work.itemId == itemId && work.occurrenceId == null && work.remainingMinutes > 0
     }
 }

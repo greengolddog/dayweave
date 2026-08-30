@@ -1,15 +1,19 @@
 package com.greengolddog.dayweave.sync
 
+import com.greengolddog.dayweave.deferredExecutionRecompositionNeeded
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -39,8 +43,10 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -567,8 +573,186 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
-    fun canonicalDeferProducerRemainsDisabledInCompatibilityFoundation() = runBlocking {
-        val store = plannerStore()
+    fun confirmedActiveCanonicalDeferPausesThenMovesExactRemainingPublishedDuration() = runBlocking {
+        val moveStart = NOW.plusSeconds(3_600)
+        val moveEnd = moveStart.plusSeconds(1_800)
+        val original = plannerStore()
+        val pinnedSource = original.state.value.schedule.single().copy(
+            isFlexible = false,
+            isHardConstraint = true,
+            canonicalBlockKind = "pinned",
+        )
+        val hardBlock = ScheduleItem(
+            id = "99999999-9999-4999-8999-999999999999",
+            title = "Fixed appointment",
+            kind = ItemKind.EVENT,
+            startMinute = 10 * 60 + 10,
+            durationMinutes = 10,
+            status = ItemStatus.SCHEDULED,
+            isFlexible = false,
+            isHardConstraint = true,
+            absoluteStartAt = moveStart.plusSeconds(10 * 60L).toString(),
+            absoluteEndAt = moveStart.plusSeconds(20 * 60L).toString(),
+            planningZoneId = "Europe/Madrid",
+            canonicalBlockKind = "external_fixed",
+        )
+        val store = PlannerStore(
+            original.state.value.copy(
+                schedule = listOf(pinnedSource, hardBlock),
+                publishedScheduleProof = requireNotNull(
+                    original.state.value.publishedScheduleProof,
+                ).copy(blocks = listOf(publishedBlockProof(pinnedSource))),
+            ),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        var serverSession = activeSession(SESSION_ID)
+        var globalRevision = 1L
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(globalRevision, serverSession)
+            historyResult = listOf(serverSession)
+        }
+        transport.commandHandler = { _, body ->
+            val command = Json.parseToJsonElement(body).jsonObject.getValue("command").jsonObject
+            globalRevision += 1
+            serverSession = when (command.getValue("type").jsonPrimitive.content) {
+                "pause" -> serverSession.copy(
+                    status = "paused",
+                    revision = 2,
+                    runningSince = null,
+                    pausedAt = NOW.toString(),
+                    updatedAt = NOW.toString(),
+                )
+                "defer" -> {
+                    assertEquals("0", command.getValue("actual_seconds").jsonPrimitive.content)
+                    assertEquals(moveStart.toString(), command.getValue("move_start").jsonPrimitive.content)
+                    assertEquals(moveEnd.toString(), command.getValue("move_end").jsonPrimitive.content)
+                    serverSession.copy(
+                        status = "deferred",
+                        revision = 3,
+                        accumulatedSeconds = 0,
+                        actualSeconds = 0,
+                        runningSince = null,
+                        pauseUntil = null,
+                        pauseReason = null,
+                        moveStart = moveStart.toString(),
+                        moveEnd = moveEnd.toString(),
+                        endedAt = NOW.toString(),
+                        updatedAt = NOW.toString(),
+                    )
+                }
+                else -> error("Unexpected execution command")
+            }
+            val active = serverSession.takeIf { it.status in setOf("active", "paused") }
+            transport.snapshotResult = RemoteExecutionSnapshot(globalRevision, active)
+            transport.historyResult = listOf(serverSession)
+            RemoteExecutionMutation(globalRevision, active, serverSession, replayed = false)
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        val approval = requireNotNull(
+            store.state.value.assessMoveLater(BLOCK_ID, moveStart, NOW),
+        ).toApprovalEnvelope()
+
+        assertEquals(
+            ExecutionSyncOutcome.SUCCESS,
+            manager.doLater(BLOCK_ID, moveStart, approval),
+        )
+
+        assertEquals(listOf("pause", "defer"), transport.commandBodies.map { body ->
+            Json.parseToJsonElement(body).jsonObject.getValue("command").jsonObject
+                .getValue("type").jsonPrimitive.content
+        })
+        assertNull(store.state.value.canonicalExecutionSession)
+        assertNull(store.state.value.activeSession)
+        assertEquals("deferred", store.state.value.terminalExecutionOutcomes
+            .getValue(SESSION_ID).session.status)
+        assertNull(store.state.value.publishedScheduleProof)
+        assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.scheduleInputDigest)
+    }
+
+    @Test
+    fun activeDeferRejectsConflictThatArrivedAfterExactWarningReview() = runBlocking {
+        val moveStart = NOW.plusSeconds(3_600)
+        fun hardBlock(id: String, title: String, minuteOffset: Long) = ScheduleItem(
+            id = id,
+            title = title,
+            kind = ItemKind.EVENT,
+            startMinute = 10 * 60,
+            durationMinutes = 10,
+            status = ItemStatus.SCHEDULED,
+            isFlexible = false,
+            isHardConstraint = true,
+            absoluteStartAt = moveStart.plusSeconds(minuteOffset * 60L).toString(),
+            absoluteEndAt = moveStart.plusSeconds((minuteOffset + 10L) * 60L).toString(),
+            planningZoneId = "Europe/Madrid",
+            canonicalBlockKind = "external_fixed",
+        )
+        val reviewedConflict = hardBlock(
+            "88888888-8888-4888-8888-888888888888",
+            "Reviewed conflict",
+            5,
+        )
+        val reviewedStore = PlannerStore(
+            plannerStore().state.value.let { state ->
+                state.copy(schedule = state.schedule + reviewedConflict)
+            },
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val active = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, active)
+            historyResult = listOf(active)
+        }
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(reviewedStore, transport).refresh())
+        val approval = requireNotNull(
+            reviewedStore.state.value.assessMoveLater(BLOCK_ID, moveStart, NOW),
+        ).toApprovalEnvelope()
+        val newlyArrivedConflict = hardBlock(
+            "99999999-9999-4999-8999-999999999999",
+            "New conflict",
+            20,
+        )
+        val mutationStore = PlannerStore(
+            reviewedStore.state.value.let { state ->
+                state.copy(schedule = state.schedule + newlyArrivedConflict)
+            },
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val mutationManager = manager(mutationStore, transport)
+
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            mutationManager.doLater(BLOCK_ID, moveStart, approval),
+        )
+
+        assertTrue(transport.commandBodies.isEmpty())
+        assertNull(mutationStore.state.value.pendingExecutionDeferIntent)
+        assertEquals("active", mutationStore.state.value.canonicalExecutionSession?.status)
+        assertTrue(mutationManager.state.value.message.contains("changed after review"))
+    }
+
+    @Test
+    fun activeCanonicalDeferRequiresApprovalBeforeOverlappingHardTime() = runBlocking {
+        val original = plannerStore()
+        val hardBlock = ScheduleItem(
+            id = "99999999-9999-4999-8999-999999999999",
+            title = "Fixed appointment",
+            kind = ItemKind.EVENT,
+            startMinute = 10 * 60 + 10,
+            durationMinutes = 20,
+            status = ItemStatus.SCHEDULED,
+            isFlexible = false,
+            isHardConstraint = true,
+            absoluteStartAt = "2026-09-01T08:10:00Z",
+            absoluteEndAt = "2026-09-01T08:30:00Z",
+            planningZoneId = "Europe/Madrid",
+            canonicalBlockKind = "external_fixed",
+        )
+        val store = PlannerStore(
+            original.state.value.copy(schedule = original.state.value.schedule + hardBlock),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
         val running = activeSession(SESSION_ID)
         val transport = FakeExecutionTransport().apply {
             snapshotResult = RemoteExecutionSnapshot(1, running)
@@ -577,9 +761,349 @@ class ExecutionSyncManagerTest {
         val manager = manager(store, transport)
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
 
-        assertEquals(ExecutionSyncOutcome.INVALID_LOCAL_STATE, manager.doLater(BLOCK_ID))
-        assertEquals(SESSION_ID, store.state.value.canonicalExecutionSession?.id)
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, NOW.plusSeconds(3_600)),
+        )
+
         assertTrue(transport.commandBodies.isEmpty())
+        assertNull(store.state.value.pendingExecutionDeferIntent)
+        assertEquals("active", store.state.value.canonicalExecutionSession?.status)
+    }
+
+    @Test
+    fun exactPauseCannotExpandMoveBeyondTheConflictEnvelopeUserReviewed() = runBlocking {
+        val managerNow = NOW.plusSeconds(15 * 60L)
+        val moveStart = managerNow.plusSeconds(60 * 60L)
+        val original = plannerStore()
+        val hardBlock = ScheduleItem(
+            id = "99999999-9999-4999-8999-999999999999",
+            title = "Fixed appointment",
+            kind = ItemKind.EVENT,
+            startMinute = 10 * 60 + 35,
+            durationMinutes = 10,
+            status = ItemStatus.SCHEDULED,
+            isFlexible = false,
+            isHardConstraint = true,
+            absoluteStartAt = moveStart.plusSeconds(20 * 60L).toString(),
+            absoluteEndAt = moveStart.plusSeconds(30 * 60L).toString(),
+            planningZoneId = "Europe/Madrid",
+            canonicalBlockKind = "external_fixed",
+        )
+        val store = PlannerStore(
+            original.state.value.copy(schedule = original.state.value.schedule + hardBlock),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val running = activeSession(SESSION_ID)
+        val paused = running.copy(
+            status = "paused",
+            revision = 2,
+            accumulatedSeconds = 0,
+            runningSince = null,
+            pausedAt = managerNow.toString(),
+            updatedAt = managerNow.toString(),
+        )
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+            commandHandler = { _, body ->
+                val command = Json.parseToJsonElement(body).jsonObject
+                    .getValue("command").jsonObject
+                assertEquals("pause", command.getValue("type").jsonPrimitive.content)
+                snapshotResult = RemoteExecutionSnapshot(2, paused)
+                historyResult = listOf(paused)
+                RemoteExecutionMutation(2, paused, paused, replayed = false)
+            }
+        }
+        val manager = manager(store, transport, currentNow = { managerNow })
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        // The wall-clock estimate ends before the appointment, but the exact server Pause proves
+        // 30 minutes remain and would overlap it. A Defer may not silently broaden the warning.
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+
+        assertEquals(listOf("pause"), transport.commandBodies.map { body ->
+            Json.parseToJsonElement(body).jsonObject.getValue("command").jsonObject
+                .getValue("type").jsonPrimitive.content
+        })
+        assertEquals("paused", store.state.value.canonicalExecutionSession?.status)
+        assertNull(store.state.value.pendingExecutionDeferIntent)
+        assertTrue(manager.state.value.message.contains("review", ignoreCase = true))
+    }
+
+    @Test
+    fun invalidPublishedDurationIsRejectedBeforeTheActiveLeaseIsPaused() = runBlocking {
+        val original = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+        }
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(original, transport).refresh())
+        val malformed = PlannerStore(
+            original.state.value.copy(
+                schedule = original.state.value.schedule.map { block ->
+                    block.copy(absoluteEndAt = block.absoluteStartAt)
+                },
+            ),
+        )
+
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            manager(malformed, transport).doLater(BLOCK_ID, NOW.plusSeconds(3_600)),
+        )
+
+        assertTrue(transport.commandBodies.isEmpty())
+        assertEquals("active", malformed.state.value.canonicalExecutionSession?.status)
+        assertNull(malformed.state.value.pendingExecutionDeferIntent)
+    }
+
+    @Test
+    fun lostPauseResponseRetainsMoveIntentAndRelaunchCompletesExactDefer() = runBlocking {
+        val store = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val paused = running.copy(
+            status = "paused",
+            revision = 2,
+            accumulatedSeconds = 0,
+            runningSince = null,
+            pausedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        val moveStart = NOW.plusSeconds(3_600)
+        val moveEnd = moveStart.plusSeconds(1_800)
+        var firstPauseResponse = true
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+            commandHandler = { _, body ->
+                val type = Json.parseToJsonElement(body).jsonObject.getValue("command")
+                    .jsonObject.getValue("type").jsonPrimitive.content
+                when (type) {
+                    "pause" -> {
+                        snapshotResult = RemoteExecutionSnapshot(2, paused)
+                        historyResult = listOf(paused)
+                        if (firstPauseResponse) {
+                            firstPauseResponse = false
+                            throw IOException("synthetic lost pause response")
+                        }
+                        RemoteExecutionMutation(2, paused, paused, replayed = true)
+                    }
+                    "defer" -> {
+                        val deferred = paused.copy(
+                            status = "deferred",
+                            revision = 3,
+                            actualSeconds = 0,
+                            moveStart = moveStart.toString(),
+                            moveEnd = moveEnd.toString(),
+                            endedAt = NOW.toString(),
+                            updatedAt = NOW.toString(),
+                        )
+                        snapshotResult = RemoteExecutionSnapshot(3, null)
+                        historyResult = listOf(deferred)
+                        RemoteExecutionMutation(3, null, deferred, replayed = false)
+                    }
+                    else -> error("Unexpected execution command")
+                }
+            }
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+        assertEquals(moveStart.toString(), store.state.value.pendingExecutionDeferIntent?.moveStart)
+        assertEquals("pause", store.state.value.pendingExecutionCommand?.commandType)
+
+        val relaunched = PlannerStore(store.state.value)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(relaunched, transport).refresh())
+
+        assertNull(relaunched.state.value.pendingExecutionCommand)
+        assertNull(relaunched.state.value.pendingExecutionDeferIntent)
+        assertEquals("deferred", relaunched.state.value.terminalExecutionOutcomes
+            .getValue(SESSION_ID).session.status)
+        assertEquals(listOf("pause", "pause", "defer"), transport.commandBodies.map { body ->
+            Json.parseToJsonElement(body).jsonObject.getValue("command").jsonObject
+                .getValue("type").jsonPrimitive.content
+        })
+    }
+
+    @Test
+    fun expiredSavedMoveIsClearedAfterPauseRecoveryAndLeavesLeasePaused() = runBlocking {
+        val store = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val paused = running.copy(
+            status = "paused",
+            revision = 2,
+            accumulatedSeconds = 0,
+            runningSince = null,
+            pausedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        var firstPauseResponse = true
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+            commandHandler = { _, _ ->
+                snapshotResult = RemoteExecutionSnapshot(2, paused)
+                historyResult = listOf(paused)
+                if (firstPauseResponse) {
+                    firstPauseResponse = false
+                    throw IOException("synthetic lost pause response")
+                }
+                RemoteExecutionMutation(2, paused, paused, replayed = true)
+            }
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        val selected = NOW.plusSeconds(600)
+        assertEquals(
+            ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager.doLater(BLOCK_ID, selected),
+        )
+
+        val relaunched = PlannerStore(store.state.value)
+        val afterExpiry = manager(
+            relaunched,
+            transport,
+            currentNow = { selected.plusSeconds(1) },
+        )
+        assertEquals(ExecutionSyncOutcome.INVALID_LOCAL_STATE, afterExpiry.refresh())
+
+        assertNull(relaunched.state.value.pendingExecutionCommand)
+        assertNull(relaunched.state.value.pendingExecutionDeferIntent)
+        assertEquals("paused", relaunched.state.value.canonicalExecutionSession?.status)
+        assertTrue(afterExpiry.state.value.message.contains("choose a new time", ignoreCase = true))
+        assertEquals(2, transport.commandBodies.size)
+    }
+
+    @Test
+    fun pausedCanonicalDeferUsesConfirmedAccumulationAndRejectsMutatedMoveResponse() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(3 * 3_600)
+        val expectedMoveEnd = moveStart.plusSeconds(1_680)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+            commandHandler = { _, body ->
+                val command = Json.parseToJsonElement(body).jsonObject
+                    .getValue("command").jsonObject
+                assertEquals("defer", command.getValue("type").jsonPrimitive.content)
+                assertEquals("120", command.getValue("actual_seconds").jsonPrimitive.content)
+                assertEquals(
+                    expectedMoveEnd.toString(),
+                    command.getValue("move_end").jsonPrimitive.content,
+                )
+                val malformed = paused.copy(
+                    status = "deferred",
+                    revision = 3,
+                    actualSeconds = 120,
+                    pauseUntil = null,
+                    moveStart = moveStart.plusSeconds(60).toString(),
+                    moveEnd = expectedMoveEnd.plusSeconds(60).toString(),
+                    endedAt = NOW.toString(),
+                    updatedAt = NOW.toString(),
+                )
+                RemoteExecutionMutation(3, null, malformed, replayed = false)
+            }
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.PROTOCOL_FAILURE,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+
+        assertNotNull(store.state.value.pendingExecutionCommand)
+        assertEquals("paused", store.state.value.canonicalExecutionSession?.status)
+        assertEquals(1, transport.commandBodies.size)
+    }
+
+    @Test
+    fun recoveredOlderPendingDeferIsReportedWithoutSendingTheNewlySelectedTime() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val oldMoveStart = NOW.plusSeconds(3_600)
+        val oldMoveEnd = oldMoveStart.plusSeconds(1_680)
+        val newlySelectedStart = NOW.plusSeconds(3 * 3_600)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        val requestJson = buildJsonObject {
+            put("expected_revision", 2)
+            put(
+                "command",
+                buildJsonObject {
+                    put("type", "defer")
+                    put("session_id", SESSION_ID)
+                    put("move_start", oldMoveStart.toString())
+                    put("move_end", oldMoveEnd.toString())
+                    put("actual_seconds", 120)
+                },
+            )
+        }.toString()
+        assertNotNull(
+            store.stageExecutionCommand(
+                PendingExecutionCommand(
+                    idempotencyKey = "99999999-9999-4999-8999-999999999999",
+                    syncOrigin = "https://api.example.test/",
+                    configurationId = DEFAULT_CONFIGURATION_ID,
+                    expectedRevision = 2,
+                    sessionId = SESSION_ID,
+                    itemId = ITEM_ID,
+                    itemRevision = 7,
+                    sessionIndex = 0,
+                    plannedBlockId = BLOCK_ID,
+                    sourceDeviceId = DEVICE_ID,
+                    commandType = "defer",
+                    requestJson = requestJson,
+                    focusedBlockId = BLOCK_ID,
+                    startedAt = NOW.toString(),
+                ),
+            ),
+        )
+        val recovered = paused.copy(
+            status = "deferred",
+            revision = 3,
+            actualSeconds = 120,
+            pauseUntil = null,
+            moveStart = oldMoveStart.toString(),
+            moveEnd = oldMoveEnd.toString(),
+            endedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        transport.commandHandler = { _, _ ->
+            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
+            transport.historyResult = listOf(recovered)
+            RemoteExecutionMutation(3, null, recovered, replayed = true)
+        }
+
+        assertEquals(
+            ExecutionSyncOutcome.RECOVERED_COMMAND,
+            manager.doLater(BLOCK_ID, newlySelectedStart),
+        )
+
+        assertEquals(1, transport.commandBodies.size)
+        assertEquals(oldMoveStart.toString(), store.state.value.terminalExecutionOutcomes
+            .getValue(SESSION_ID).session.moveStart)
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertNull(store.state.value.publishedScheduleProof)
     }
 
     @Test
@@ -1302,11 +1826,16 @@ class ExecutionSyncManagerTest {
         assertNull(deferredOutcome.canonicalProjectionRetryAuthorizedAt)
         assertTrue(state.recurrenceOutcomes.isEmpty())
         assertTrue(state.recurrenceCompletionAnchors.isEmpty())
+        assertTrue(state.deferredExecutionRecompositionNeeded())
         assertEquals(deferred.toSnapshot(), state.canonicalExecutionHistoryWindow.single())
         assertEquals(2L, state.canonicalExecutionHistoryWindowRevision)
         assertTrue(state.canonicalExecutionHistoryVerified)
         assertTrue(store.isCanonicalExecutionStartBlocked(BLOCK_ID))
         assertTrue(transport.commandBodies.isEmpty())
+        assertFalse(
+            state.copy(schedule = emptyList(), publishedScheduleProof = null)
+                .deferredExecutionRecompositionNeeded(),
+        )
 
         val restarted = PlannerStore(state)
         val retained = restarted.state.value.canonicalExecutionHistoryWindow.single()
@@ -1445,6 +1974,7 @@ class ExecutionSyncManagerTest {
             valid.copy(moveStart = NOW.toString()),
             valid.copy(moveEnd = valid.moveStart),
             valid.copy(moveEnd = NOW.plusSeconds(60 + 24 * 60 * 60 + 1L).toString()),
+            valid.copy(moveEnd = NOW.plusSeconds(120).plusNanos(1).toString()),
             valid.copy(status = "completed"),
         )
 
@@ -1847,11 +2377,12 @@ class ExecutionSyncManagerTest {
         store: PlannerStore,
         transport: FakeExecutionTransport,
         credentialStore: ApiCredentialStore = ExecutionCredentialStore(),
+        currentNow: () -> Instant = { NOW },
     ) = ExecutionSyncManager(
         plannerStore = store,
         credentialStore = credentialStore,
         transport = transport,
-        now = { NOW },
+        now = currentNow,
         newUuid = UUIDS.iterator().let { iterator -> { iterator.next() } },
     )
 

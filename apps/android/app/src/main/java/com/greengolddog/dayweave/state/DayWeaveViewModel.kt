@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
@@ -78,7 +79,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             val current = plannerStore.state.value
             if (
                 current.canonicalExecutionSession == null &&
-                current.pendingExecutionCommand == null
+                current.pendingExecutionCommand == null &&
+                current.pendingExecutionDeferIntent == null
             ) {
                 plannerStore.startItem(id)
             }
@@ -140,11 +142,45 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         )
     }
 
-    fun doActiveLater() {
+    fun doActiveLater(
+        moveStart: Instant? = null,
+        approval: MoveLaterApprovalEnvelope? = null,
+    ) {
+        val activeId = plannerStore.state.value.activeSession?.itemId ?: return
+        if (isCanonicalBlock(activeId) && moveStart == null) return
         withActiveBlock(
-            canonicalAction = executionSyncManager::doLater,
+            canonicalAction = { id ->
+                deferCanonicalExecutionAndRefresh(
+                    command = {
+                        executionSyncManager.doLater(
+                            id,
+                            requireNotNull(moveStart),
+                            approval,
+                        )
+                    },
+                    refreshCanonicalState = dayWeaveApplication::refreshCanonicalState,
+                )
+            },
             localAction = plannerStore::doActiveLater,
         )
+    }
+
+    fun doScheduledLater(
+        id: String,
+        moveStart: Instant,
+        approval: MoveLaterApprovalEnvelope? = null,
+    ) {
+        if (!isCanonicalBlock(id) || isCanonicalBusy()) return
+        dayWeaveApplication.launchCanonicalAction {
+            canonicalSyncManager.doLater(id, moveStart, approval)
+        }
+    }
+
+    fun skipScheduled(id: String) {
+        if (!isCanonicalBlock(id) || isCanonicalBusy()) return
+        dayWeaveApplication.launchCanonicalAction {
+            canonicalSyncManager.skipScheduled(id)
+        }
     }
     suspend fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean): Boolean =
         canonicalAuthoringAction {
@@ -432,6 +468,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private fun isCanonicalBusy(): Boolean =
         canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
             proposalApplicationManager.state.value.isBusy ||
+            plannerStore.state.value.pendingExecutionDeferIntent != null ||
             plannerStore.state.value.pendingProposalApplicationMutation != null
 
     private suspend inline fun canonicalAuthoringAction(
@@ -471,6 +508,21 @@ internal suspend fun finishCanonicalExecution(
 ): ExecutionSyncOutcome {
     val outcome = command()
     if (outcome == ExecutionSyncOutcome.SUCCESS) refreshCanonicalState()
+    return outcome
+}
+
+/** A confirmed Defer must be followed by compose+publish before its replacement can start. */
+internal suspend fun deferCanonicalExecutionAndRefresh(
+    command: suspend () -> ExecutionSyncOutcome,
+    refreshCanonicalState: suspend () -> Unit,
+): ExecutionSyncOutcome {
+    val outcome = command()
+    if (
+        outcome == ExecutionSyncOutcome.SUCCESS ||
+        outcome == ExecutionSyncOutcome.RECOVERED_COMMAND
+    ) {
+        refreshCanonicalState()
+    }
     return outcome
 }
 

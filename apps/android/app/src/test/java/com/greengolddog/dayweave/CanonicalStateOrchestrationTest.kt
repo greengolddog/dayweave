@@ -58,7 +58,7 @@ class CanonicalStateOrchestrationTest {
                 calls += "execution"
                 ExecutionSyncOutcome.SUCCESS
             },
-            terminalProjectionNeeded = { projectionNeeded },
+            canonicalRefreshNeeded = { projectionNeeded },
             canonicalRefresh = {
                 calls += "canonical-projection-compose"
                 projectionNeeded = false
@@ -81,7 +81,7 @@ class CanonicalStateOrchestrationTest {
                 calls += "execution"
                 ExecutionSyncOutcome.SUCCESS
             },
-            terminalProjectionNeeded = { false },
+            canonicalRefreshNeeded = { false },
             canonicalRefresh = {
                 calls += "canonical"
                 CanonicalRefreshOutcome.SUCCESS
@@ -89,5 +89,29 @@ class CanonicalStateOrchestrationTest {
         )
 
         assertEquals(listOf("execution"), calls)
+    }
+
+    @Test
+    fun foregroundCrossDeviceDeferRecomposesAndPublishesThenRechecksExecution() = runBlocking {
+        val calls = mutableListOf<String>()
+        var deferredSourceStillPublished = true
+
+        refreshForegroundExecutionSequence(
+            executionRefresh = {
+                calls += "execution"
+                ExecutionSyncOutcome.SUCCESS
+            },
+            canonicalRefreshNeeded = { deferredSourceStillPublished },
+            canonicalRefresh = {
+                calls += "canonical-compose-publish"
+                deferredSourceStillPublished = false
+                CanonicalRefreshOutcome.SUCCESS
+            },
+        )
+
+        assertEquals(
+            listOf("execution", "canonical-compose-publish", "execution"),
+            calls,
+        )
     }
 }

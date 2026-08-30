@@ -68,6 +68,51 @@ class DayWeaveViewModelRoutingTest {
     }
 
     @Test
+    fun successfulDeferImmediatelyRunsComposeAndPublicationRefresh() = runBlocking {
+        val calls = mutableListOf<String>()
+
+        val outcome = deferCanonicalExecutionAndRefresh(
+            command = {
+                calls += "defer"
+                ExecutionSyncOutcome.SUCCESS
+            },
+            refreshCanonicalState = { calls += "compose-publish" },
+        )
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, outcome)
+        assertEquals(listOf("defer", "compose-publish"), calls)
+    }
+
+    @Test
+    fun failedDeferRetainsRecoveryStateWithoutClaimingARefresh() = runBlocking {
+        var refreshed = false
+
+        val outcome = deferCanonicalExecutionAndRefresh(
+            command = { ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE },
+            refreshCanonicalState = { refreshed = true },
+        )
+
+        assertEquals(ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE, outcome)
+        assertEquals(false, refreshed)
+    }
+
+    @Test
+    fun recoveredPriorDeferStillRunsComposeAndPublicationRefresh() = runBlocking {
+        val calls = mutableListOf<String>()
+
+        val outcome = deferCanonicalExecutionAndRefresh(
+            command = {
+                calls += "recover-prior-defer"
+                ExecutionSyncOutcome.RECOVERED_COMMAND
+            },
+            refreshCanonicalState = { calls += "compose-publish" },
+        )
+
+        assertEquals(ExecutionSyncOutcome.RECOVERED_COMMAND, outcome)
+        assertEquals(listOf("recover-prior-defer", "compose-publish"), calls)
+    }
+
+    @Test
     fun durableCanonicalAuthoringSchedulesBackgroundSyncWithoutChangingLocalSuccess() = runBlocking {
         val calls = mutableListOf<String>()
 

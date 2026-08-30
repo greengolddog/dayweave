@@ -8,13 +8,23 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
+import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
+import com.greengolddog.dayweave.model.isCoveredBy
+import com.greengolddog.dayweave.model.recurrenceIdentityObject
+import com.greengolddog.dayweave.model.recurrenceIdentityType
+import com.greengolddog.dayweave.model.toApprovalEnvelope
+import com.greengolddog.dayweave.model.validatedRecurrenceIdentityJson
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -63,6 +73,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -226,6 +237,7 @@ class CanonicalSyncManager(
             planner.canonicalExecutionHistoryContinuityEstablished ||
             planner.canonicalExecutionHistoryVerified ||
             planner.pendingExecutionCommand != null ||
+            planner.pendingExecutionDeferIntent != null ||
             planner.terminalExecutionOutcomes.isNotEmpty()
         if (
             connection.baseUrl != null || connection.hasBearerToken ||
@@ -1004,15 +1016,125 @@ class CanonicalSyncManager(
         return recomposeAfterTerminalAction(outcome)
     }
 
-    suspend fun doLater(blockId: String): CanonicalRefreshOutcome {
-        if (requiresLocalSessionState(blockId)) {
-            val block = plannerStore.state.value.schedule.firstOrNull { it.id == blockId }
-            if (block?.occurrenceId == null) {
+    /** Skips only a one-shot, wholly scheduled canonical item. */
+    suspend fun skipScheduled(blockId: String): CanonicalRefreshOutcome {
+        val block = plannerStore.state.value.schedule.firstOrNull { it.id == blockId }
+            ?: return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        if (
+            block.status != ItemStatus.SCHEDULED || block.occurrenceId != null ||
+            block.kind !in setOf(ItemKind.TASK, ItemKind.HABIT, ItemKind.ROUTINE, ItemKind.GOAL) ||
+            !block.isFlexible || block.isHardConstraint ||
+            block.canonicalBlockKind == "external_fixed" ||
+            requiresLocalSessionState(blockId) || hasUnscheduledRemaining(blockId)
+        ) {
+            updateError(
+                "Only a fully scheduled one-shot item can be skipped from the timeline.",
+            )
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        return recomposeAfterTerminalAction(
+            mutateCanonicalBlock(
+                blockId = blockId,
+                targetStatus = "skipped",
+                displayStatus = ItemStatus.SKIPPED,
+                allowedStatuses = setOf(ItemStatus.SCHEDULED),
+            ),
+        )
+    }
+
+    suspend fun doLater(
+        blockId: String,
+        moveStart: Instant,
+        approval: MoveLaterApprovalEnvelope? = null,
+    ): CanonicalRefreshOutcome {
+        val exactMoveStart = moveStart.truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
+        if (exactMoveStart != moveStart || exactMoveStart <= now()) {
+            updateError("Choose a future whole-second time for this work.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        val planner = plannerStore.state.value
+        val block = planner.schedule.firstOrNull { it.id == blockId }
+            ?: return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        if (block.status != ItemStatus.SCHEDULED) {
+            updateError("Active or paused synced work must use its exact execution lease to move.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        if (!block.isRepresentableMoveLaterSource()) {
+            updateError("This fixed source cannot be safely represented as moved work.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        block.occurrenceId?.let { occurrenceId ->
+            if (planner.hasOpenOrPendingExecutionForOccurrence(occurrenceId)) {
                 updateError(
-                    "This split task cannot be deferred safely until remaining-work support is available.",
+                    "Pause, finish, skip, or defer the active occurrence session before " +
+                        "moving its scheduled siblings.",
                 )
                 return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
             }
+            val occurrenceBlocks = planner.schedule.filter { it.occurrenceId == occurrenceId }
+            if (
+                occurrenceBlocks.isEmpty() || occurrenceBlocks.any { sibling ->
+                    sibling.status != ItemStatus.SCHEDULED ||
+                        !sibling.isRepresentableMoveLaterSource()
+                } || planner.unscheduledWork.any { work ->
+                    work.occurrenceId == occurrenceId && work.remainingMinutes > 0
+                }
+            ) {
+                updateError(
+                    "Every session in this occurrence must be fully scheduled and flexible " +
+                        "before it can move as one unit.",
+                )
+                return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+            }
+        }
+        val assessment = planner.assessMoveLater(blockId, exactMoveStart, now())
+        if (assessment == null) {
+            updateError("The exact move window could not be verified. Recompose and try again.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        if (!assessment.fitsSinglePlanningDay) {
+            updateError(
+                "That move is outside the currently loaded planning day. Choose a time that " +
+                    "stays within this day.",
+            )
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        if (assessment.crossesUnrelaxableHardDeadline) {
+            updateError(
+                "This occurrence cannot move beyond its hard deadline. Change the item " +
+                    "constraint first.",
+            )
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        val reviewedApproval = approval ?: assessment.takeUnless {
+            it.requiresConfirmation
+        }?.toApprovalEnvelope()
+        if (!assessment.isCoveredBy(reviewedApproval)) {
+            updateError(
+                "The placement risks changed after review. Review the current warning before moving.",
+            )
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        val usesLocalSessionState = requiresLocalSessionState(blockId)
+        block.occurrenceId?.let { occurrenceId ->
+            val identityType = recurrenceIdentityType(
+                planner.recurrenceOccurrenceSources[occurrenceId]?.identityJson,
+            )
+            if (identityType == null || identityType == "custom") {
+                updateError(
+                    "This recurrence does not yet have a movable per-occurrence identity.",
+                )
+                return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+            }
+        }
+        if (usesLocalSessionState && block.occurrenceId == null) {
+            updateError(
+                "This split task cannot be moved as a whole without risking credited " +
+                    "or unscheduled work.",
+            )
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
+        if (usesLocalSessionState) {
             val occurrenceHasTerminalSibling = plannerStore.state.value.schedule.any {
                 it.id != block.id && it.occurrenceId == block.occurrenceId &&
                     it.status in TERMINAL_DISPLAY_STATUSES
@@ -1023,15 +1145,19 @@ class CanonicalSyncManager(
                 )
                 return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
             }
-            val saved = deferLocalCanonicalBlock(blockId)
+            val saved = deferLocalCanonicalBlock(blockId, exactMoveStart, reviewedApproval)
             return if (saved == CanonicalRefreshOutcome.SUCCESS) refreshAndCompose() else saved
         }
         val mutation = mutateCanonicalBlock(
             blockId = blockId,
             targetStatus = "scheduled",
             displayStatus = ItemStatus.SCHEDULED,
-            allowedStatuses = setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED),
-            deferUntil = now().plusSeconds(DO_LATER_SECONDS),
+            allowedStatuses = setOf(
+                ItemStatus.SCHEDULED,
+            ),
+            deferUntil = exactMoveStart,
+            moveLaterStart = exactMoveStart,
+            moveLaterApproval = reviewedApproval,
         )
         return if (mutation == CanonicalRefreshOutcome.SUCCESS) {
             refreshAndCompose()
@@ -1128,8 +1254,17 @@ class CanonicalSyncManager(
                 handleFailure(error)
             }
         }
-        val uncertain = plannerStore.state.value.pendingCanonicalMutation
+        val uncertainState = plannerStore.state.value
+        val uncertain = uncertainState.pendingCanonicalMutation
         if (outcome == CanonicalRefreshOutcome.SUCCESS || uncertain == null) return outcome
+        val previous = uncertainState.canonicalItems.firstOrNull {
+            it.id == uncertain.itemId && it.revision == uncertain.expectedRevision
+        }
+        val requestedReplacement = runCatching {
+            mutationJson.decodeFromString<ReplaceCanonicalItemRequest>(
+                uncertain.replacementRequestJson,
+            ).item
+        }.getOrNull()
         val reconciled = refreshAndCompose()
         if (reconciled != CanonicalRefreshOutcome.SUCCESS) return outcome
         val authoritative = plannerStore.state.value.canonicalItems.firstOrNull {
@@ -1138,7 +1273,9 @@ class CanonicalSyncManager(
         return if (
             authoritative != null && authoritative.revision > uncertain.expectedRevision &&
             authoritative.status == uncertain.targetStatus &&
-            authoritative.isSensitive == uncertain.targetIsSensitive
+            authoritative.isSensitive == uncertain.targetIsSensitive &&
+            previous != null && requestedReplacement != null &&
+            matchesReplacement(authoritative, previous, requestedReplacement)
         ) {
             CanonicalRefreshOutcome.SUCCESS
         } else {
@@ -1350,7 +1487,11 @@ class CanonicalSyncManager(
         }
     }
 
-    private suspend fun deferLocalCanonicalBlock(blockId: String): CanonicalRefreshOutcome {
+    private suspend fun deferLocalCanonicalBlock(
+        blockId: String,
+        moveStart: Instant,
+        approval: MoveLaterApprovalEnvelope?,
+    ): CanonicalRefreshOutcome {
         val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
         if (loadState != PlannerLoadState.READY) {
             updateError("Encrypted planner storage is unavailable; the cached plan was kept.")
@@ -1362,17 +1503,29 @@ class CanonicalSyncManager(
             val block = initial.schedule.firstOrNull { it.id == blockId }
             if (
                 block?.canonicalItemId == null ||
-                block.status !in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED) ||
+                block.status !in setOf(
+                    ItemStatus.SCHEDULED,
+                    ItemStatus.ACTIVE,
+                    ItemStatus.PAUSED,
+                ) ||
                 !requiresLocalSessionState(blockId)
             ) {
                 return@withLock handleFailure(InvalidCanonicalTransitionException())
+            }
+            val currentAssessment = initial.assessMoveLater(blockId, moveStart, now())
+            if (
+                currentAssessment == null || !currentAssessment.fitsSinglePlanningDay ||
+                currentAssessment.crossesUnrelaxableHardDeadline ||
+                !currentAssessment.isCoveredBy(approval)
+            ) {
+                return@withLock handleFailure(MoveLaterRisksChangedException())
             }
             mutableState.value = CanonicalSyncState(
                 CanonicalSyncPhase.SYNCING,
                 "Saving a recurrence/session deferral…",
             )
             try {
-                val receipt = plannerStore.deferLocalCanonicalSession(blockId, 60)
+                val receipt = plannerStore.deferLocalCanonicalSession(blockId, moveStart, approval)
                 if (receipt == null || !receipt.awaitDurable()) {
                     throw LocalPlannerStorageException()
                 }
@@ -1412,6 +1565,8 @@ class CanonicalSyncManager(
         pauseLabel: String? = null,
         pauseMinutes: Int? = null,
         deferUntil: Instant? = null,
+        moveLaterStart: Instant? = null,
+        moveLaterApproval: MoveLaterApprovalEnvelope? = null,
     ): CanonicalRefreshOutcome {
         val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
         if (loadState != PlannerLoadState.READY) {
@@ -1443,6 +1598,13 @@ class CanonicalSyncManager(
                 if (requestedBlock.canonicalItemId == null) {
                     throw InvalidCanonicalTransitionException()
                 }
+                val moveAssessment = moveLaterStart?.let { moveStart ->
+                    initial.assessMoveLater(blockId, moveStart, now())?.takeIf { assessment ->
+                        assessment.fitsSinglePlanningDay &&
+                            !assessment.crossesUnrelaxableHardDeadline &&
+                            assessment.isCoveredBy(moveLaterApproval)
+                    } ?: throw MoveLaterRisksChangedException()
+                }
 
                 replaceCanonicalBlock(
                     configuration = configuration,
@@ -1452,6 +1614,7 @@ class CanonicalSyncManager(
                     pauseLabel = pauseLabel,
                     pauseMinutes = pauseMinutes,
                     deferUntil = deferUntil,
+                    relaxDeadlineUntil = moveAssessment?.canonicalDeadlineRelaxation,
                 )
                 val savedAt = now()
                 val metadataSaved = runCatching {
@@ -1483,8 +1646,17 @@ class CanonicalSyncManager(
                 handleFailure(error)
             }
         }
-        val uncertain = plannerStore.state.value.pendingCanonicalMutation
+        val uncertainState = plannerStore.state.value
+        val uncertain = uncertainState.pendingCanonicalMutation
         if (outcome == CanonicalRefreshOutcome.SUCCESS || uncertain == null) return outcome
+        val previous = uncertainState.canonicalItems.firstOrNull {
+            it.id == uncertain.itemId && it.revision == uncertain.expectedRevision
+        }
+        val requestedReplacement = runCatching {
+            mutationJson.decodeFromString<ReplaceCanonicalItemRequest>(
+                uncertain.replacementRequestJson,
+            ).item
+        }.getOrNull()
         val reconciled = refreshAndCompose()
         if (reconciled != CanonicalRefreshOutcome.SUCCESS) return outcome
         val authoritative = plannerStore.state.value.canonicalItems.firstOrNull {
@@ -1493,7 +1665,9 @@ class CanonicalSyncManager(
         return if (
             authoritative != null && authoritative.revision > uncertain.expectedRevision &&
             authoritative.status == uncertain.targetStatus &&
-            authoritative.isSensitive == uncertain.targetIsSensitive
+            authoritative.isSensitive == uncertain.targetIsSensitive &&
+            previous != null && requestedReplacement != null &&
+            matchesReplacement(authoritative, previous, requestedReplacement)
         ) {
             CanonicalRefreshOutcome.SUCCESS
         } else {
@@ -1510,6 +1684,7 @@ class CanonicalSyncManager(
         pauseLabel: String? = null,
         pauseMinutes: Int? = null,
         deferUntil: Instant? = null,
+        relaxDeadlineUntil: Instant? = null,
         terminalExecutionSessionId: String? = null,
     ): PendingMutationResolution {
         val current = plannerStore.state.value
@@ -1535,6 +1710,7 @@ class CanonicalSyncManager(
             targetStatus = targetStatus,
             targetIsSensitive = item.isSensitive,
             earliestStartAt = earliestStartAt,
+            deadlineAt = relaxDeadlineUntil?.toString() ?: item.deadlineAt,
         )
         val idempotencyKey = UUID.randomUUID().toString()
         val replaceRequest = ReplaceCanonicalItemRequest(
@@ -1625,6 +1801,7 @@ class CanonicalSyncManager(
         targetStatus: String,
         targetIsSensitive: Boolean,
         earliestStartAt: String?,
+        deadlineAt: String? = item.deadlineAt,
     ) = CanonicalItemReplacement(
         isSensitive = targetIsSensitive,
         kind = item.kind,
@@ -1633,7 +1810,7 @@ class CanonicalSyncManager(
         notes = item.notes,
         timezoneName = item.timezoneName,
         durationSeconds = item.durationSeconds,
-        deadlineAt = item.deadlineAt,
+        deadlineAt = deadlineAt,
         earliestStartAt = earliestStartAt,
         recurrence = item.recurrenceJson?.let(::parseJsonObject),
         flexibleConstraints = parseJsonObject(item.flexibleConstraintsJson),
@@ -2209,6 +2386,7 @@ class CanonicalSyncManager(
         val horizonEnd = date.plusDays(1).atStartOfDay(planningZone)
         val availableStart = localMinute(date, planningZone, dayStartMinute)
         val availableEnd = localMinute(date, planningZone, dayEndMinute)
+        val itemsById = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         val revisions = canonicalItems.associate { it.id to it.revision }
         val cached = plannerStore.state.value
         val sameOrigin = cached.canonicalSyncOrigin == syncOrigin &&
@@ -2244,15 +2422,41 @@ class CanonicalSyncManager(
             }
         val recurrenceMoves = (if (sameOrigin) cached.recurrenceMoves else emptyMap()).entries
             .sortedBy { it.key }
-            .filter { (_, move) -> move.itemId in revisions }
+            .filter { (occurrenceId, _) ->
+                runCatching { UUID.fromString(occurrenceId).version() == 5 }
+                    .getOrDefault(false)
+            }
+            .filter { (_, move) ->
+                move.source?.let { source ->
+                    source.itemId == move.itemId &&
+                        revisions[move.itemId] == source.itemRevision
+                } == true
+            }
             .filter { (_, move) ->
                 val movedAt = parseTimestamp(move.movedAt).toInstant()
-                movedAt >= relevantOutcomeStart && movedAt < relevantOutcomeEnd
+                val moveEnd = parseTimestamp(move.endAt).toInstant()
+                // A future move must suppress its original occurrence on every intervening
+                // preview, then expire immediately after its destination day.
+                movedAt < relevantOutcomeEnd && moveEnd >= horizonStart.toInstant()
             }
             .onEach { (occurrenceId, move) ->
                 validateUuid(occurrenceId)
                 validateUuid(move.itemId)
-                if (parseTimestamp(move.startAt) >= parseTimestamp(move.endAt)) {
+                val source = move.source ?: throw RemotePlannerMappingException()
+                val nominalStart = parseTimestamp(source.nominalStart)
+                if (source.itemId !in itemsById) throw RemotePlannerMappingException()
+                if (
+                    recurrenceIdentityObject(source.identityJson) == null ||
+                    recurrenceIdentityType(source.identityJson) == "custom" ||
+                    parseTimestamp(move.startAt) >= parseTimestamp(move.endAt) ||
+                    nominalStart.toInstant() >= parseTimestamp(source.nominalEnd).toInstant() ||
+                    source.itemRevision <= 0 || source.ordinal !in 0..UInt.MAX_VALUE.toLong() ||
+                    source.localDate?.let { rawDate ->
+                        runCatching {
+                            LocalDate.parse(rawDate) == nominalStart.toLocalDate()
+                        }.getOrDefault(false)
+                    } == false
+                ) {
                     throw RemotePlannerMappingException()
                 }
             }
@@ -2390,6 +2594,29 @@ class CanonicalSyncManager(
                                             put("type", "move")
                                             put("start", move.startAt)
                                             put("end", move.endAt)
+                                            put(
+                                                "source",
+                                                buildJsonObject {
+                                                    val source = requireNotNull(move.source)
+                                                    put("item_revision", source.itemRevision)
+                                                    put(
+                                                        "identity",
+                                                        requireNotNull(
+                                                            recurrenceIdentityObject(
+                                                                source.identityJson,
+                                                            ),
+                                                        ),
+                                                    )
+                                                    put("nominal_start", source.nominalStart)
+                                                    put("nominal_end", source.nominalEnd)
+                                                    put(
+                                                        "local_date",
+                                                        source.localDate?.let(::JsonPrimitive)
+                                                            ?: JsonNull,
+                                                    )
+                                                    put("ordinal", source.ordinal)
+                                                },
+                                            )
                                         },
                                     )
                                 },
@@ -2461,8 +2688,11 @@ class CanonicalSyncManager(
         }
 
         val occurrencesById = preview.plan.occurrences.associateBy { occurrence ->
-            validateUuid(occurrence.id)
+            validateOccurrenceUuid(occurrence.id)
             validateUuid(occurrence.seriesItemId)
+            if (validatedRecurrenceIdentityJson(occurrence.identity) == null) {
+                throw RemotePlannerMappingException()
+            }
             if (
                 occurrence.seriesItemId !in items || occurrence.ordinal !in 0..UInt.MAX_VALUE.toLong() ||
                 occurrence.state !in SUPPORTED_OCCURRENCE_STATES
@@ -2477,8 +2707,11 @@ class CanonicalSyncManager(
                 throw RemotePlannerMappingException()
             }
             occurrence.localDate?.let { raw ->
-                runCatching { LocalDate.parse(raw) }.getOrElse {
+                val localDate = runCatching { LocalDate.parse(raw) }.getOrElse {
                     throw RemotePlannerMappingException(it)
+                }
+                if (occurrence.seriesItemId !in items || localDate != nominalStart.toLocalDate()) {
+                    throw RemotePlannerMappingException()
                 }
             }
             occurrence.id
@@ -2648,6 +2881,20 @@ class CanonicalSyncManager(
             unscheduledWork = unscheduledWork,
             occurrenceSeriesItemIds = preview.plan.occurrences.associate {
                 it.id to it.seriesItemId
+            },
+            occurrenceSources = preview.plan.occurrences.associate { occurrence ->
+                val series = items[occurrence.seriesItemId]
+                    ?: throw RemotePlannerMappingException()
+                occurrence.id to RecurrenceOccurrenceSourceSnapshot(
+                    itemId = occurrence.seriesItemId,
+                    itemRevision = series.revision,
+                    identityJson = validatedRecurrenceIdentityJson(occurrence.identity)
+                        ?: throw RemotePlannerMappingException(),
+                    nominalStart = occurrence.nominalStart,
+                    nominalEnd = occurrence.nominalEnd,
+                    localDate = occurrence.localDate,
+                    ordinal = occurrence.ordinal,
+                )
             },
             message = message,
         )
@@ -2949,7 +3196,8 @@ class CanonicalSyncManager(
             current.canonicalExecutionHistoryContinuityEstablished ||
             current.canonicalExecutionHistoryVerified ||
             current.terminalExecutionOutcomes.isNotEmpty() ||
-            current.pendingExecutionCommand != null
+            current.pendingExecutionCommand != null ||
+            current.pendingExecutionDeferIntent != null
         val canonicalMismatch = pendingPublicationMismatch || proposalBindingMismatch || hasCanonicalCache &&
             (current.canonicalSyncOrigin != origin ||
                 current.canonicalConfigurationId != configurationId)
@@ -3024,6 +3272,11 @@ class CanonicalSyncManager(
             is InvalidCanonicalTransitionException -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "This action no longer matches the cached item state. Recompose and try again.",
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            )
+            is MoveLaterRisksChangedException -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "The placement risks changed after review. Review the current warning before moving.",
                 CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
             )
             is CanonicalMutationNeedsReconciliationException -> Triple(
@@ -3174,6 +3427,9 @@ class CanonicalSyncManager(
     private class InvalidCanonicalTransitionException :
         IllegalStateException("Invalid canonical transition")
 
+    private class MoveLaterRisksChangedException :
+        IllegalStateException("Move-later risks changed after review")
+
     private class LocalPlannerStorageException :
         IllegalStateException("Canonical mutation was not durably persisted")
 
@@ -3220,7 +3476,6 @@ class CanonicalSyncManager(
         private const val MAX_SCORE_PENALTY = 20
         private const val MAX_CURSOR_CHARS = 4_096
         private const val MAX_PAUSE_MINUTES = 24 * 60
-        private const val DO_LATER_SECONDS = 60L * 60L
         private const val FREEZE_HORIZON_SECONDS = 2L * 60L * 60L
         private const val MAX_TITLE_CHARS = 500
         private const val MAX_NOTES_CHARS = 100_000
@@ -3451,6 +3706,11 @@ class CanonicalSyncManager(
             } catch (error: IllegalArgumentException) {
                 throw RemotePlannerMappingException(error)
             }
+        }
+
+        private fun validateOccurrenceUuid(raw: String) {
+            validateUuid(raw)
+            if (UUID.fromString(raw).version() != 5) throw RemotePlannerMappingException()
         }
 
         private fun parseTimestamp(raw: String): OffsetDateTime = try {

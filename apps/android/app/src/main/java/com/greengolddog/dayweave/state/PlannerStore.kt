@@ -22,10 +22,13 @@ import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.ManualEnergyCheckIn
+import com.greengolddog.dayweave.model.MoveLaterDeadlineRisk
+import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingExecutionCommand
+import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
@@ -36,6 +39,7 @@ import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
@@ -48,14 +52,22 @@ import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
+import com.greengolddog.dayweave.model.hasValidRecurrenceSourceFor
+import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
+import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
+import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.isCoveredBy
+import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
+import com.greengolddog.dayweave.model.savedApprovalEnvelope
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
 import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.util.ArrayDeque
 import java.util.UUID
@@ -124,6 +136,77 @@ private data class CanonicalAuthoringRefreshOverlay(
     val deleted: List<CanonicalRecentlyDeletedRecord>,
 )
 
+private fun PendingExecutionDeferIntent.requireValidApprovalShape(
+    scheduleSize: Int,
+    moveStart: Instant,
+) {
+    fun requireUuid(raw: String) {
+        val parsed = UUID.fromString(raw)
+        require(parsed != UUID(0L, 0L) && parsed.toString() == raw)
+    }
+    approvedItemRevisions.forEach { (itemId, revision) ->
+        requireUuid(itemId)
+        require(revision > 0)
+    }
+    require(approvedHardConflicts.map { it.id }.sorted() == approvedHardBlockIds.sorted())
+    require(approvedHardBlockIds.size <= scheduleSize)
+    require(approvedHardConflicts.distinctBy { it.id }.size == approvedHardConflicts.size)
+    approvedHardConflicts.forEach { conflict ->
+        requireUuid(conflict.id)
+        conflict.canonicalItemId?.let(::requireUuid)
+        require(conflict.canonicalRevision == null || conflict.canonicalRevision > 0)
+        val start = Instant.parse(conflict.startAt)
+        val end = Instant.parse(conflict.endAt)
+        require(
+            start.toString() == conflict.startAt && end.toString() == conflict.endAt &&
+                start < end && conflict.canonicalBlockKind?.let {
+                    it.isNotBlank() && it.length <= 255 && it.none(Char::isISOControl)
+                } != false && (
+                conflict.isHardConstraint || !conflict.isFlexible ||
+                    conflict.itemKind == ItemKind.EVENT ||
+                    conflict.canonicalBlockKind in setOf(
+                        "pinned",
+                        "calendar_event",
+                        "external_fixed",
+                    )
+                ),
+        )
+    }
+    val approvedEnd = approvedConflictTargetEnd?.let(Instant::parse)
+    if (approvedEnd == null) {
+        require(
+            approvedDeadlineRisks.isEmpty() && !approvedSourceOverride &&
+                approvedItemRevisions.isEmpty() && approvedHardBlockIds.isEmpty() &&
+                approvedHardConflicts.isEmpty(),
+        )
+        return
+    }
+    require(approvedEnd.toString() == approvedConflictTargetEnd && approvedEnd > moveStart)
+    require(approvedItemRevisions == mapOf(itemId to itemRevision))
+    require(approvedDeadlineRisks.size <= approvedItemRevisions.size)
+    require(
+        approvedDeadlineRisks.distinctBy { risk ->
+            listOf(
+                risk.itemId,
+                risk.itemRevision,
+                risk.deadline,
+                risk.isHard,
+                risk.isCanonicalField,
+            )
+        }.size == approvedDeadlineRisks.size,
+    )
+    approvedDeadlineRisks.forEach { risk: MoveLaterDeadlineRisk ->
+        requireUuid(risk.itemId)
+        require(approvedItemRevisions[risk.itemId] == risk.itemRevision)
+        val deadline = Instant.parse(risk.deadline)
+        val targetEnd = Instant.parse(risk.targetEnd)
+        require(
+            deadline.toString() == risk.deadline && targetEnd.toString() == risk.targetEnd &&
+                deadline < targetEnd && targetEnd <= approvedEnd,
+        )
+    }
+}
+
 /**
  * Owns presentation state and serializes it to an optional offline repository.
  *
@@ -144,6 +227,8 @@ class PlannerStore(
         initialState
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
+            .withInvalidRecurrenceMoveSourcesAbandoned()
+            .withInvalidExecutionDeferIntentAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) },
     )
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
@@ -508,8 +593,15 @@ class PlannerStore(
             update.unscheduledWork.size
         ) { "Canonical unscheduled work is invalid" }
         require(update.occurrenceSeriesItemIds.all { (occurrenceId, seriesItemId) ->
-            runCatching { UUID.fromString(occurrenceId) }.isSuccess && seriesItemId in itemsById
+            runCatching { UUID.fromString(occurrenceId).version() == 5 }.getOrDefault(false) &&
+                seriesItemId in itemsById
         }) { "Canonical occurrence ownership is invalid" }
+        require(update.occurrenceSources.keys == update.occurrenceSeriesItemIds.keys)
+        require(update.occurrenceSources.all { (occurrenceId, source) ->
+            val item = itemsById[source.itemId] ?: return@all false
+            update.occurrenceSeriesItemIds[occurrenceId] == source.itemId &&
+                source.hasValidRecurrenceSourceFor(item)
+        }) { "Canonical occurrence source envelopes are invalid" }
         require(update.items.all { it.id.isNotBlank() && it.revision > 0 && it.deletedAt == null }) {
             "Canonical items must be active, identified, positive revisions"
         }
@@ -546,6 +638,7 @@ class PlannerStore(
                         current.pendingSchedulePublication == null &&
                         current.pendingCanonicalMutation == null &&
                         current.pendingExecutionCommand == null &&
+                        current.pendingExecutionDeferIntent == null &&
                         current.canonicalExecutionSession == null &&
                         current.canonicalExecutionHistoryWindow.isEmpty() &&
                         current.canonicalExecutionHistoryWindowRevision == null &&
@@ -721,7 +814,16 @@ class PlannerStore(
                     emptyMap()
                 },
                 recurrenceMoves = if (sameBinding) {
-                    current.recurrenceMoves.filterValues { it.itemId in reconciledItemIds }
+                    current.recurrenceMoves.filterValues { move ->
+                        move.source?.let { source ->
+                            source.itemId == move.itemId &&
+                                reconciledItemsById[move.itemId]?.revision == source.itemRevision &&
+                                runCatching {
+                                    Instant.parse(move.endAt) >=
+                                        planningDate.atStartOfDay(planningZone).toInstant()
+                                }.getOrDefault(false)
+                        } == true
+                    }
                 } else {
                     emptyMap()
                 },
@@ -732,6 +834,9 @@ class PlannerStore(
                 unscheduledWork = update.unscheduledWork.filter { it.itemId in reconciledItemIds },
                 occurrenceSeriesItemIds = update.occurrenceSeriesItemIds.filterValues {
                     it in reconciledItemIds
+                },
+                recurrenceOccurrenceSources = update.occurrenceSources.filterValues { source ->
+                    reconciledItemsById[source.itemId]?.revision == source.itemRevision
                 },
                 rejectedCanonicalItemCount = update.rejectedItemCount,
                 unscheduledCanonicalItemCount = update.unscheduledItemCount,
@@ -758,6 +863,9 @@ class PlannerStore(
             }
             require(current.pendingExecutionCommand == null) {
                 "An execution command must be reconciled before schedule publication"
+            }
+            require(current.pendingExecutionDeferIntent == null) {
+                "A move-later intent must be reconciled before schedule publication"
             }
             require(current.pendingProposalApplicationMutation == null) {
                 "A proposal application must be reconciled before schedule publication"
@@ -882,6 +990,9 @@ class PlannerStore(
             }
             require(current.pendingExecutionCommand == null) {
                 "An execution command must be reconciled before applying a proposal"
+            }
+            require(current.pendingExecutionDeferIntent == null) {
+                "A move-later intent must be reconciled before applying a proposal"
             }
             require(!current.hasPendingCanonicalAuthoringOverlay()) {
                 "Canonical authoring must be reconciled before applying a proposal"
@@ -1969,6 +2080,7 @@ class PlannerStore(
         require(current.pendingProposalApplicationMutation == null)
         require(current.pendingCanonicalMutation == null)
         require(current.pendingExecutionCommand == null)
+        require(current.pendingExecutionDeferIntent == null)
         require(allowDetachedInboxCapture || current.canonicalExecutionSession == null) {
             "Schedule-affecting authoring is unavailable during an active execution lease"
         }
@@ -2020,6 +2132,7 @@ class PlannerStore(
         require(current.pendingProposalApplicationMutation == null)
         require(current.pendingCanonicalMutation == null)
         require(current.pendingExecutionCommand == null)
+        require(current.pendingExecutionDeferIntent == null)
         require(current.canonicalExecutionSession == null)
         require(!current.hasUnresolvedTerminalProjection()) {
             "A terminal execution projection must be resolved before canonical authoring"
@@ -2390,6 +2503,9 @@ class PlannerStore(
         require(current.pendingExecutionCommand == null) {
             "An execution command already needs reconciliation"
         }
+        require(current.pendingExecutionDeferIntent == null) {
+            "A move-later intent already needs reconciliation"
+        }
         require(current.pendingProposalApplicationMutation == null) {
             "A proposal application already needs reconciliation"
         }
@@ -2691,6 +2807,117 @@ class PlannerStore(
         )
     }
 
+    /** Persists the user's exact move target before Pause can cross the network boundary. */
+    fun stageExecutionDeferIntent(
+        intent: PendingExecutionDeferIntent,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        require(current.pendingExecutionDeferIntent == null) {
+            "A move-later intent already needs reconciliation"
+        }
+        require(current.pendingSchedulePublication == null) {
+            "A schedule publication must be reconciled before moving later"
+        }
+        require(current.pendingCanonicalMutation == null) {
+            "A canonical mutation must be reconciled before moving later"
+        }
+        require(current.pendingProposalApplicationMutation == null) {
+            "A proposal application must be reconciled before moving later"
+        }
+        require(!current.hasExecutionBlockingCanonicalAuthoringOverlay()) {
+            "A canonical authoring change must be reconciled before moving later"
+        }
+        require(
+            intent.syncOrigin == current.canonicalExecutionSyncOrigin &&
+                intent.configurationId == current.canonicalExecutionConfigurationId,
+        ) { "Move-later intent does not match the execution binding" }
+        listOf(
+            intent.sessionId,
+            intent.itemId,
+            intent.plannedBlockId,
+            intent.sourceDeviceId,
+            intent.focusedBlockId,
+            *intent.approvedHardBlockIds.toTypedArray(),
+        ).forEach { raw -> require(UUID.fromString(raw).toString() == raw) }
+        require(
+            intent.approvedHardBlockIds.size <= current.schedule.size &&
+                intent.approvedHardBlockIds.distinct().size == intent.approvedHardBlockIds.size,
+        ) { "Move-later conflict approvals are invalid" }
+        intent.occurrenceId?.let { require(UUID.fromString(it).toString() == it) }
+        require(intent.itemRevision > 0 && intent.sessionIndex in 0..UShort.MAX_VALUE.toInt())
+        val sourceStart = Instant.parse(intent.sourceStart)
+        val sourceEnd = Instant.parse(intent.sourceEnd)
+        val moveStart = Instant.parse(intent.moveStart)
+        val stagedAt = Instant.parse(intent.stagedAt)
+        intent.requireValidApprovalShape(current.schedule.size, moveStart)
+        val sourceDuration = Duration.between(sourceStart, sourceEnd)
+        require(
+            sourceStart < sourceEnd && sourceDuration.nano == 0 &&
+                moveStart > stagedAt && moveStart.nano == 0,
+        ) { "Move-later intent does not contain exact future bounds" }
+        val authoritative = current.canonicalExecutionSession
+            ?: throw IllegalArgumentException("The authoritative execution lease is unavailable")
+        require(authoritative.status in OPEN_EXECUTION_STATUSES)
+        require(intent.hasSameImmutableIdentity(authoritative)) {
+            "Move-later intent does not match the authoritative lease"
+        }
+        current.pendingExecutionCommand?.let { command ->
+            require(command.commandType in setOf("pause", "defer")) {
+                "A different execution command must be reconciled before moving later"
+            }
+            require(intent.hasSameImmutableIdentity(command)) {
+                "The pending execution command belongs to a different lease"
+            }
+        }
+        val focused = current.schedule.firstOrNull { it.id == intent.focusedBlockId }
+            ?: throw IllegalArgumentException("The execution source block is unavailable")
+        require(
+            intent.focusedBlockId == intent.plannedBlockId &&
+                focused.canonicalItemId == intent.itemId &&
+                focused.canonicalRevision == intent.itemRevision &&
+                focused.occurrenceId == intent.occurrenceId &&
+                focused.sessionIndex == intent.sessionIndex &&
+                focused.absoluteStartAt == intent.sourceStart &&
+                focused.absoluteEndAt == intent.sourceEnd,
+        ) { "Move-later intent does not match the exact source block" }
+        require(focused.isRepresentableMoveLaterSource()) {
+            "This fixed source cannot be safely represented as moved work"
+        }
+        val currentAssessment = current.assessMoveLater(
+            intent.focusedBlockId,
+            moveStart,
+            stagedAt,
+        )
+        require(currentAssessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) {
+            "Move-later risks changed after the user's exact review"
+        }
+        val proof = current.publishedScheduleProof?.blocks?.singleOrNull {
+            it.id == intent.plannedBlockId
+        } ?: throw IllegalArgumentException("The execution source has no publication proof")
+        require(
+            proof.itemId == intent.itemId && proof.itemRevision == intent.itemRevision &&
+                proof.occurrenceId == intent.occurrenceId &&
+                proof.sessionIndex == intent.sessionIndex && proof.start == intent.sourceStart &&
+                proof.end == intent.sourceEnd,
+        ) { "Move-later intent does not match its publication proof" }
+        current.copy(
+            pendingExecutionDeferIntent = intent,
+            scheduleMessage = "Move saved locally · confirming an exact pause",
+        )
+    }
+
+    fun clearExecutionDeferIntent(
+        sessionId: String,
+        message: String,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val intent = current.pendingExecutionDeferIntent
+            ?: throw IllegalArgumentException("No move-later intent is pending")
+        require(intent.sessionId == sessionId) { "A different move-later intent is pending" }
+        current.copy(
+            pendingExecutionDeferIntent = null,
+            scheduleMessage = message,
+        )
+    }
+
     /** Persists the exact command and idempotency key before execution network I/O. */
     fun stageExecutionCommand(
         command: PendingExecutionCommand,
@@ -2727,6 +2954,23 @@ class PlannerStore(
         require(command.commandType in EXECUTION_COMMAND_TYPES)
         require(command.requestJson.length in 2..MAX_PENDING_EXECUTION_REQUEST_CHARS)
         Instant.parse(command.startedAt)
+        current.pendingExecutionDeferIntent?.let { intent ->
+            require(command.commandType in setOf("pause", "defer")) {
+                "Only the pending move-later transition can change this lease"
+            }
+            require(intent.hasSameImmutableIdentity(command)) {
+                "Execution command does not match the pending move-later intent"
+            }
+            val moveStart = Instant.parse(intent.moveStart)
+            val assessment = current.assessMoveLater(
+                intent.focusedBlockId,
+                moveStart,
+                Instant.parse(command.startedAt),
+            )
+            require(assessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) {
+                "Move-later risks changed before the exact execution command was staged"
+            }
+        }
         val focused = current.schedule.firstOrNull { it.id == command.focusedBlockId }
             ?: throw IllegalArgumentException("The execution block changed before staging")
         require(
@@ -2773,6 +3017,7 @@ class PlannerStore(
         return current.pendingCanonicalMutation != null ||
             current.pendingSchedulePublication != null ||
             current.pendingExecutionCommand != null ||
+            current.pendingExecutionDeferIntent != null ||
             current.pendingProposalApplicationMutation != null ||
             current.pendingCanonicalAuthoringMutations.any {
                 it.id !in preservableAuthoringIds
@@ -2960,10 +3205,12 @@ class PlannerStore(
             current.canonicalExecutionHistoryWindowRevision != null ||
             current.canonicalExecutionHistoryContinuityEstablished ||
             current.canonicalExecutionHistoryVerified ||
-            current.terminalExecutionOutcomes.isNotEmpty()
+            current.terminalExecutionOutcomes.isNotEmpty() ||
+            current.pendingExecutionDeferIntent != null
         ) {
             require(
                 current.pendingExecutionCommand == null &&
+                    current.pendingExecutionDeferIntent == null &&
                     current.terminalExecutionOutcomes.isEmpty() &&
                     current.canonicalExecutionHistoryWindow.isEmpty() &&
                     current.canonicalExecutionHistoryWindowRevision == null &&
@@ -3203,6 +3450,7 @@ class PlannerStore(
         val recurrenceChanged = recurrenceOutcomes != current.recurrenceOutcomes ||
             recurrenceMoves != current.recurrenceMoves ||
             completionAnchors != current.recurrenceCompletionAnchors
+        val executionDeferred = authoritativeChangedSession?.status == "deferred"
         current.copy(
             schedule = schedule,
             activeSession = localActiveSession,
@@ -3216,15 +3464,23 @@ class PlannerStore(
             } else {
                 current.pendingExecutionCommand
             },
+            pendingExecutionDeferIntent = current.pendingExecutionDeferIntent?.takeUnless { intent ->
+                authoritativeChangedSession?.let { changed ->
+                    changed.id == intent.sessionId && changed.status in CLOSED_EXECUTION_STATUSES
+                } == true
+            },
             recurrenceOutcomes = recurrenceOutcomes,
             recurrenceMoves = recurrenceMoves,
             recurrenceCompletionAnchors = completionAnchors,
             publishedScheduleRevision = current.publishedScheduleRevision
-                .takeUnless { recurrenceChanged },
+                .takeUnless { recurrenceChanged || executionDeferred },
             publishedScheduleProof = current.publishedScheduleProof
-                .takeUnless { recurrenceChanged },
-            scheduleInputDigest = current.scheduleInputDigest.takeUnless { recurrenceChanged },
+                .takeUnless { recurrenceChanged || executionDeferred },
+            scheduleInputDigest = current.scheduleInputDigest
+                .takeUnless { recurrenceChanged || executionDeferred },
             scheduleMessage = when {
+                executionDeferred ->
+                    "Move saved · publishing the exact remaining-work placement"
                 authoritativeActiveSession != null && activeBlock == null ->
                     "Another device owns an execution session that is not in this plan · recompose to locate it"
                 interruptedLocalSession != null ->
@@ -3277,8 +3533,10 @@ class PlannerStore(
             canonicalExecutionHistoryVerified = false,
             terminalExecutionOutcomes = emptyMap(),
             pendingExecutionCommand = null,
+            pendingExecutionDeferIntent = null,
             unscheduledWork = emptyList(),
             occurrenceSeriesItemIds = emptyMap(),
+            recurrenceOccurrenceSources = emptyMap(),
             rejectedCanonicalItemCount = 0,
             unscheduledCanonicalItemCount = 0,
             scheduleViolationMessages = emptyList(),
@@ -3660,9 +3918,9 @@ class PlannerStore(
 
     fun deferLocalCanonicalSession(
         focusedBlockId: String,
-        minutes: Int,
+        moveStart: Instant,
+        approval: MoveLaterApprovalEnvelope? = null,
     ): PlannerPersistenceReceipt? = mutateDurably { current ->
-        require(minutes in 1..24 * 60) { "Session deferral is out of range" }
         val focused = current.schedule.firstOrNull { it.id == focusedBlockId }
             ?: throw IllegalArgumentException("Focused schedule block is not cached")
         val itemId = focused.canonicalItemId
@@ -3676,6 +3934,22 @@ class PlannerStore(
             ?: throw IllegalArgumentException(
                 "A non-recurring split session cannot be deferred without remaining-work support",
             )
+        require(!current.hasOpenOrPendingExecutionForOccurrence(occurrenceId)) {
+            "An active, paused, or pending execution lease still owns this occurrence"
+        }
+        require(UUID.fromString(occurrenceId).version() == 5) {
+            "The occurrence identity is not a server-issued v5 UUID"
+        }
+        val occurrenceSource = current.recurrenceOccurrenceSources[occurrenceId]
+            ?: throw IllegalArgumentException("The exact occurrence source is unavailable")
+        val occurrenceSeries = current.canonicalItems.firstOrNull {
+            it.id == occurrenceSource.itemId
+        } ?: throw IllegalArgumentException("The occurrence series is unavailable")
+        require(
+            occurrenceSource.itemId == current.occurrenceSeriesItemIds[occurrenceId] &&
+                occurrenceSource.hasValidRecurrenceSourceFor(occurrenceSeries) &&
+                recurrenceIdentityType(occurrenceSource.identityJson) != "custom",
+        ) { "The occurrence source no longer matches its series revision" }
         val targetIds = current.schedule.asSequence()
             .filter {
                 it.occurrenceId == occurrenceId
@@ -3687,21 +3961,57 @@ class PlannerStore(
                 it.status in TERMINAL_SESSION_STATUSES
         }) { "A partially resolved occurrence cannot be deferred as a whole" }
         val movedBlocks = current.schedule.filter { it.id in targetIds }
+        require(
+            movedBlocks.isNotEmpty() && movedBlocks.all { block ->
+                block.status == ItemStatus.SCHEDULED &&
+                    block.isRepresentableMoveLaterSource()
+            },
+        ) { "Every occurrence session must be scheduled and flexible before moving" }
+        require(current.unscheduledWork.none { work ->
+            work.occurrenceId == occurrenceId && work.remainingMinutes > 0
+        }) { "An occurrence with unscheduled remaining work cannot move as a partial span" }
+        val currentAssessment = current.assessMoveLater(
+            focusedBlockId,
+            moveStart,
+            Instant.ofEpochMilli(nowEpochMillis()),
+        )
+        require(
+            currentAssessment != null && currentAssessment.fitsSinglePlanningDay &&
+                !currentAssessment.crossesUnrelaxableHardDeadline &&
+                currentAssessment.isCoveredBy(approval),
+        ) { "Move-later risks changed after the user's review" }
+        val focusedStart = focused.absoluteStartAt?.let(Instant::parse)
+            ?: throw IllegalArgumentException("Canonical block has no exact start")
+        val shift = Duration.between(focusedStart, moveStart)
+        require(!shift.isNegative && !shift.isZero && shift.nano == 0) {
+            "Session deferral must start later on a whole second"
+        }
         val shiftedBounds = movedBlocks.map { block ->
             val start = block.absoluteStartAt?.let(Instant::parse)
                 ?: throw IllegalArgumentException("Canonical block has no exact start")
             val end = block.absoluteEndAt?.let(Instant::parse)
                 ?: throw IllegalArgumentException("Canonical block has no exact end")
-            start.plusSeconds(minutes.toLong() * 60L) to
-                end.plusSeconds(minutes.toLong() * 60L)
+            start.plus(shift) to end.plus(shift)
+        }
+        val movedWindowStart = requireNotNull(shiftedBounds.minOfOrNull { it.first })
+        val movedWindowEnd = requireNotNull(shiftedBounds.maxOfOrNull { it.second })
+        val planningZone = listOfNotNull(current.schedulePlanningZoneId, focused.planningZoneId)
+            .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
+            ?: throw IllegalArgumentException("The planning timezone is unavailable")
+        val targetDate = movedWindowStart.atZone(planningZone).toLocalDate()
+        val targetHorizonStart = targetDate.atStartOfDay(planningZone).toInstant()
+        val targetHorizonEnd = targetDate.plusDays(1).atStartOfDay(planningZone).toInstant()
+        require(movedWindowStart >= targetHorizonStart && movedWindowEnd <= targetHorizonEnd) {
+            "A recurrence move must fit wholly inside one planning-day preview"
         }
         val moves = current.recurrenceMoves + (
             occurrenceId to RecurrenceMoveSnapshot(
                 itemId = current.occurrenceSeriesItemIds[occurrenceId]
                     ?: throw IllegalArgumentException("Occurrence owner is unavailable"),
-                startAt = requireNotNull(shiftedBounds.minOfOrNull { it.first }).toString(),
-                endAt = requireNotNull(shiftedBounds.maxOfOrNull { it.second }).toString(),
+                startAt = movedWindowStart.toString(),
+                endAt = movedWindowEnd.toString(),
                 movedAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+                source = occurrenceSource,
             )
         )
         current.copy(
@@ -3860,8 +4170,10 @@ class PlannerStore(
                     (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
                     moveStart != null && moveStart > endedAt &&
                     moveEnd != null && moveEnd > moveStart &&
-                    Duration.between(moveStart, moveEnd) <=
-                    Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()),
+                    Duration.between(moveStart, moveEnd).let { duration ->
+                        duration.nano == 0 && duration <=
+                            Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong())
+                    },
             )
         }
     }
@@ -4153,6 +4465,22 @@ class PlannerStore(
             plannedBlockId == session.plannedBlockId &&
             sourceDeviceId == session.sourceDeviceId
 
+    private fun PendingExecutionDeferIntent.hasSameImmutableIdentity(
+        session: CanonicalExecutionSessionSnapshot,
+    ): Boolean =
+        sessionId == session.id && itemId == session.itemId &&
+            itemRevision == session.itemRevision && occurrenceId == session.occurrenceId &&
+            sessionIndex == session.sessionIndex && plannedBlockId == session.plannedBlockId &&
+            sourceDeviceId == session.sourceDeviceId
+
+    private fun PendingExecutionDeferIntent.hasSameImmutableIdentity(
+        command: PendingExecutionCommand,
+    ): Boolean =
+        sessionId == command.sessionId && itemId == command.itemId &&
+            itemRevision == command.itemRevision && occurrenceId == command.occurrenceId &&
+            sessionIndex == command.sessionIndex && plannedBlockId == command.plannedBlockId &&
+            sourceDeviceId == command.sourceDeviceId && focusedBlockId == command.focusedBlockId
+
     private fun CanonicalExecutionSessionSnapshot.toActiveSession(
         blockId: String,
     ): ActiveSession {
@@ -4243,6 +4571,172 @@ class PlannerStore(
         return mutation
     }
 
+    /**
+     * Legacy or corrupt recurrence source metadata cannot authorize a later cross-horizon Move.
+     * Quarantine only those envelopes and their dependent moves; current canonical/schedule truth
+     * remains available, and removing a previously effective move invalidates publication proof.
+     */
+    private fun DayWeaveUiState.withInvalidRecurrenceMoveSourcesAbandoned(): DayWeaveUiState {
+        if (recurrenceOccurrenceSources.isEmpty() && recurrenceMoves.isEmpty()) return this
+        val itemsById = canonicalItems.associateBy(CanonicalItemSnapshot::id)
+        val validOccurrenceSources = recurrenceOccurrenceSources.filter { (occurrenceId, source) ->
+            runCatching {
+                val id = UUID.fromString(occurrenceId)
+                require(id != NIL_UUID && id.version() == 5 && id.toString() == occurrenceId)
+                require(occurrenceSeriesItemIds[occurrenceId] == source.itemId)
+                val item = requireNotNull(itemsById[source.itemId])
+                require(source.hasValidRecurrenceSourceFor(item))
+            }.isSuccess
+        }
+        val validMoves = recurrenceMoves.filter { (occurrenceId, move) ->
+            runCatching {
+                val id = UUID.fromString(occurrenceId)
+                require(id != NIL_UUID && id.version() == 5 && id.toString() == occurrenceId)
+                require(move.itemId == move.source?.itemId)
+                val item = requireNotNull(itemsById[move.itemId])
+                require(requireNotNull(move.source).hasValidRecurrenceSourceFor(item))
+                require(recurrenceIdentityType(move.source.identityJson) != "custom")
+                val start = Instant.parse(move.startAt)
+                val end = Instant.parse(move.endAt)
+                val movedAt = Instant.parse(move.movedAt)
+                require(
+                    start.toString() == move.startAt && end.toString() == move.endAt &&
+                        movedAt.toString() == move.movedAt && start < end,
+                )
+            }.isSuccess
+        }
+        if (
+            validOccurrenceSources == recurrenceOccurrenceSources && validMoves == recurrenceMoves
+        ) {
+            return this
+        }
+        val moveWasAbandoned = validMoves.size != recurrenceMoves.size
+        return copy(
+            recurrenceOccurrenceSources = validOccurrenceSources,
+            recurrenceMoves = validMoves,
+            publishedScheduleRevision = publishedScheduleRevision.takeUnless { moveWasAbandoned },
+            publishedScheduleProof = publishedScheduleProof.takeUnless { moveWasAbandoned },
+            scheduleInputDigest = scheduleInputDigest.takeUnless { moveWasAbandoned },
+            scheduleMessage = if (moveWasAbandoned) {
+                "A saved recurrence move lacked verifiable source identity and was abandoned"
+            } else {
+                scheduleMessage
+            },
+        )
+    }
+
+    /**
+     * A user-level Defer intent may outlive a process, but it may never outlive its exact lease,
+     * publication proof, or credential binding. Invalid/superseded intent is safe to abandon: no
+     * server write is inferred, while the reconciled active/paused lease remains untouched.
+     */
+    private fun DayWeaveUiState.withInvalidExecutionDeferIntentAbandoned(): DayWeaveUiState {
+        val intent = pendingExecutionDeferIntent ?: return this
+        val valid = runCatching {
+            require(
+                intent.syncOrigin.isNotBlank() && intent.syncOrigin.length <= 4_096 &&
+                    intent.syncOrigin.none(Char::isISOControl),
+            )
+            require(
+                intent.configurationId?.let {
+                    it.isNotBlank() && it.length <= 4_096 && it.none(Char::isISOControl)
+                } != false,
+            )
+            listOf(
+                intent.sessionId,
+                intent.itemId,
+                intent.plannedBlockId,
+                intent.sourceDeviceId,
+                intent.focusedBlockId,
+                *intent.approvedHardBlockIds.toTypedArray(),
+            ).forEach { raw ->
+                val id = UUID.fromString(raw)
+                require(id != NIL_UUID && id.toString() == raw)
+            }
+            require(
+                intent.approvedHardBlockIds.size <= schedule.size &&
+                    intent.approvedHardBlockIds.distinct().size ==
+                    intent.approvedHardBlockIds.size,
+            )
+            intent.occurrenceId?.let { raw ->
+                val id = UUID.fromString(raw)
+                require(id != NIL_UUID && id.toString() == raw)
+            }
+            require(intent.itemRevision > 0 && intent.sessionIndex in 0..UShort.MAX_VALUE.toInt())
+            require(
+                intent.syncOrigin == canonicalSyncOrigin &&
+                    intent.configurationId == canonicalConfigurationId &&
+                    intent.syncOrigin == canonicalExecutionSyncOrigin &&
+                    intent.configurationId == canonicalExecutionConfigurationId,
+            )
+            val sourceStart = Instant.parse(intent.sourceStart)
+            val sourceEnd = Instant.parse(intent.sourceEnd)
+            val moveStart = Instant.parse(intent.moveStart)
+            val stagedAt = Instant.parse(intent.stagedAt)
+            val approvedEnd = intent.approvedConflictTargetEnd?.let(Instant::parse)
+            intent.requireValidApprovalShape(schedule.size, moveStart)
+            require(
+                sourceStart.toString() == intent.sourceStart &&
+                    sourceEnd.toString() == intent.sourceEnd &&
+                    moveStart.toString() == intent.moveStart &&
+                    stagedAt.toString() == intent.stagedAt &&
+                    approvedEnd?.toString() == intent.approvedConflictTargetEnd,
+            )
+            val sourceDuration = Duration.between(sourceStart, sourceEnd)
+            require(
+                sourceDuration.nano == 0 &&
+                    sourceDuration.seconds in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong() &&
+                    moveStart.nano == 0 && moveStart > stagedAt &&
+                    moveStart > Instant.ofEpochMilli(nowEpochMillis()),
+            )
+            val lease = requireNotNull(canonicalExecutionSession)
+            require(lease.status in OPEN_EXECUTION_STATUSES)
+            require(intent.hasSameImmutableIdentity(lease))
+            val remainingFloor = Math.subtractExact(
+                sourceDuration.seconds,
+                lease.accumulatedSeconds,
+            )
+            require(remainingFloor in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong())
+            val source = schedule.single { it.id == intent.focusedBlockId }
+            require(
+                intent.focusedBlockId == intent.plannedBlockId &&
+                    source.canonicalItemId == intent.itemId &&
+                    source.canonicalRevision == intent.itemRevision &&
+                    source.occurrenceId == intent.occurrenceId &&
+                    source.sessionIndex == intent.sessionIndex &&
+                    source.absoluteStartAt == intent.sourceStart &&
+                    source.absoluteEndAt == intent.sourceEnd &&
+                    source.isRepresentableMoveLaterSource(),
+            )
+            val proofEnvelope = requireNotNull(publishedScheduleProof)
+            require(
+                proofEnvelope.syncOrigin == intent.syncOrigin &&
+                    proofEnvelope.configurationId == intent.configurationId,
+            )
+            val proof = proofEnvelope.blocks.single { it.id == intent.plannedBlockId }
+            require(
+                proof.itemId == intent.itemId && proof.itemRevision == intent.itemRevision &&
+                    proof.occurrenceId == intent.occurrenceId &&
+                    proof.sessionIndex == intent.sessionIndex &&
+                    proof.start == intent.sourceStart && proof.end == intent.sourceEnd,
+            )
+            pendingExecutionCommand?.let { command ->
+                require(command.commandType in setOf("pause", "defer"))
+                require(intent.hasSameImmutableIdentity(command))
+            }
+        }.isSuccess
+        return if (valid) {
+            this
+        } else {
+            copy(
+                pendingExecutionDeferIntent = null,
+                scheduleMessage =
+                    "Saved move could not be verified and was abandoned safely · " +
+                        "authoritative execution state was retained",
+            )
+        }
+    }
+
     private fun mutateInternal(
         requireExactSave: Boolean,
         transform: (DayWeaveUiState) -> DayWeaveUiState,
@@ -4256,6 +4750,8 @@ class PlannerStore(
         val snapshot = transform(mutableState.value)
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
+            .withInvalidRecurrenceMoveSourcesAbandoned()
+            .withInvalidExecutionDeferIntentAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot
         currentGeneration += 1
@@ -4311,6 +4807,8 @@ class PlannerStore(
             val snapshot = (persistedState ?: initialState)
                 .withCanonicalTrashRetention(nowEpochMillis())
                 .withPendingSensitivityHardened()
+                .withInvalidRecurrenceMoveSourcesAbandoned()
+                .withInvalidExecutionDeferIntentAbandoned()
                 .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
             mutableState.value = snapshot
             currentGeneration += 1
@@ -4439,7 +4937,14 @@ class PlannerStore(
         val CLOSED_EXECUTION_STATUSES = TERMINAL_EXECUTION_STATUSES + "deferred"
         val TERMINAL_CANONICAL_STATUSES = setOf("completed", "skipped")
         val ALL_EXECUTION_STATUSES = OPEN_EXECUTION_STATUSES + CLOSED_EXECUTION_STATUSES
-        val EXECUTION_COMMAND_TYPES = setOf("start", "pause", "resume", "complete", "skip")
+        val EXECUTION_COMMAND_TYPES = setOf(
+            "start",
+            "pause",
+            "resume",
+            "complete",
+            "skip",
+            "defer",
+        )
         const val MAX_PENDING_EXECUTION_REQUEST_CHARS = 64 * 1024
         const val MAX_EXECUTION_HISTORY_WINDOW = 100
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60

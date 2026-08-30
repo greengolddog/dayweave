@@ -244,9 +244,9 @@ class DayWeaveApplication : Application() {
     suspend fun refreshForegroundExecution() {
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,
-            terminalProjectionNeeded = {
+            canonicalRefreshNeeded = {
                 val state = plannerStore.state.value
-                state.terminalExecutionOutcomes.values.any { outcome ->
+                val terminalProjectionNeeded = state.terminalExecutionOutcomes.values.any { outcome ->
                     outcome.syncOrigin == state.canonicalSyncOrigin &&
                         outcome.session.status in CANONICAL_TERMINAL_EXECUTION_STATUSES &&
                         state.isNewestExecutionForProjection(outcome.session) &&
@@ -258,6 +258,7 @@ class DayWeaveApplication : Application() {
                                 outcome.canonicalProjectionRetryAuthorizedAt != null
                         )
                 }
+                terminalProjectionNeeded || state.deferredExecutionRecompositionNeeded()
             },
             canonicalRefresh = canonicalSyncManager::refreshAndCompose,
         )
@@ -274,7 +275,7 @@ internal suspend fun refreshCanonicalStateSequence(
     executionRefresh: suspend () -> ExecutionSyncOutcome,
     canonicalRefresh: suspend () -> CanonicalRefreshOutcome,
 ) {
-    if (executionRefresh() != ExecutionSyncOutcome.SUCCESS) return
+    if (executionRefresh() !in EXECUTION_REFRESH_SUCCESSES) return
     canonicalRefresh()
     executionRefresh()
 }
@@ -282,9 +283,38 @@ internal suspend fun refreshCanonicalStateSequence(
 /** Runs the expensive compose/projection pass only when the execution poll discovered work. */
 internal suspend fun refreshForegroundExecutionSequence(
     executionRefresh: suspend () -> ExecutionSyncOutcome,
-    terminalProjectionNeeded: () -> Boolean,
+    canonicalRefreshNeeded: () -> Boolean,
     canonicalRefresh: suspend () -> CanonicalRefreshOutcome,
 ) {
-    if (executionRefresh() != ExecutionSyncOutcome.SUCCESS || !terminalProjectionNeeded()) return
+    if (executionRefresh() !in EXECUTION_REFRESH_SUCCESSES || !canonicalRefreshNeeded()) return
     if (canonicalRefresh() == CanonicalRefreshOutcome.SUCCESS) executionRefresh()
+}
+
+private val EXECUTION_REFRESH_SUCCESSES = setOf(
+    ExecutionSyncOutcome.SUCCESS,
+    ExecutionSyncOutcome.RECOVERED_COMMAND,
+)
+
+/** A remote Defer must replace and republish its exact source block before execution can restart. */
+internal fun DayWeaveUiState.deferredExecutionRecompositionNeeded(): Boolean {
+    val currentOrigin = canonicalSyncOrigin ?: return false
+    return terminalExecutionOutcomes.values.any { outcome ->
+        val session = outcome.session
+        val sourceBlockId = session.plannedBlockId
+        outcome.syncOrigin == currentOrigin && session.status == "deferred" &&
+            sourceBlockId != null && (
+                schedule.any { block ->
+                    block.id == sourceBlockId &&
+                        block.canonicalItemId == session.itemId &&
+                        block.canonicalRevision == session.itemRevision &&
+                        block.occurrenceId == session.occurrenceId &&
+                        block.sessionIndex == session.sessionIndex
+                } || publishedScheduleProof?.blocks?.any { block ->
+                    block.id == sourceBlockId && block.itemId == session.itemId &&
+                        block.itemRevision == session.itemRevision &&
+                        block.occurrenceId == session.occurrenceId &&
+                        block.sessionIndex == session.sessionIndex
+                } == true
+            )
+    }
 }

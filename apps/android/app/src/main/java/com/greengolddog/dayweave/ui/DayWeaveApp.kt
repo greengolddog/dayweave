@@ -46,7 +46,10 @@ import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.AppDestination
+import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.MoveLaterPlacementMode
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.health.EnergyProviderAvailability
 import com.greengolddog.dayweave.health.HealthConnectIntents
 import com.greengolddog.dayweave.security.AppLockController
@@ -59,6 +62,7 @@ import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
 import com.greengolddog.dayweave.ui.components.AppLockedScreen
 import com.greengolddog.dayweave.ui.components.BreakEndedDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
+import com.greengolddog.dayweave.ui.components.MoveLaterChooserDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
 import com.greengolddog.dayweave.ui.components.ProposalReviewDialog
 import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
@@ -76,6 +80,7 @@ import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import java.time.ZoneId
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 
@@ -227,6 +232,7 @@ private fun DayWeaveRoot(
         !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
             !proposalApplicationState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
+            state.pendingExecutionDeferIntent == null &&
             state.pendingProposalApplicationMutation == null
     val canonicalAuthoringActionsEnabled = canonicalExecutionActionsEnabled &&
         state.canonicalExecutionSession == null &&
@@ -237,6 +243,7 @@ private fun DayWeaveRoot(
         }
     var showQuickCapture by remember { mutableStateOf(false) }
     var showPauseChooser by remember { mutableStateOf(false) }
+    var moveLaterTargetId by remember { mutableStateOf<String?>(null) }
     var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
     var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
@@ -355,7 +362,13 @@ private fun DayWeaveRoot(
                 onResume = viewModel::resumeActive,
                 onComplete = viewModel::completeActive,
                 onSkip = viewModel::skipActive,
-                onLater = viewModel::doActiveLater,
+                onLater = {
+                    state.activeItem?.takeIf { it.canonicalItemId != null }?.let { active ->
+                        moveLaterTargetId = active.id
+                    }
+                },
+                onSkipScheduled = viewModel::skipScheduled,
+                onLaterScheduled = { moveLaterTargetId = it },
                 onRetryTerminalProjection = viewModel::retryTerminalProjection,
                 onKeepLatestItem = viewModel::keepLatestItemAfterTerminalConflict,
                 onEnergyCheckIn = viewModel::recordManualEnergyCheckIn,
@@ -508,6 +521,45 @@ private fun DayWeaveRoot(
                 showPauseChooser = false
             },
         )
+    }
+
+    moveLaterTargetId?.let { targetId ->
+        state.schedule.firstOrNull { it.id == targetId }?.let { target ->
+            val loadedPlanningDate = state.canonicalPlanningDate() ?: return@let
+            val moveZone = if (target.canonicalItemId == null) {
+                ZoneId.systemDefault()
+            } else {
+                listOfNotNull(state.schedulePlanningZoneId, target.planningZoneId)
+                    .firstNotNullOfOrNull { raw ->
+                        runCatching { ZoneId.of(raw) }.getOrNull()
+                    } ?: return@let
+            }
+            MoveLaterChooserDialog(
+                itemTitle = target.title,
+                itemIsSensitive = target.isSensitive,
+                placementMode = when {
+                    target.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED) ->
+                        MoveLaterPlacementMode.EXACT
+                    target.occurrenceId != null -> MoveLaterPlacementMode.RECOMPOSED_WINDOW
+                    else -> MoveLaterPlacementMode.EARLIEST_START
+                },
+                zoneId = moveZone,
+                loadedPlanningDate = loadedPlanningDate,
+                notBefore = target.timelineInstant(),
+                assessMove = { moveStart ->
+                    state.assessMoveLater(targetId, moveStart)
+                },
+                onDismiss = { moveLaterTargetId = null },
+                onMove = { moveStart, approval ->
+                    if (state.activeSession?.itemId == targetId) {
+                        viewModel.doActiveLater(moveStart, approval)
+                    } else {
+                        viewModel.doScheduledLater(targetId, moveStart, approval)
+                    }
+                    moveLaterTargetId = null
+                },
+            )
+        }
     }
 
     val endedBreak = state.activeSession?.takeIf { it.timedBreakEnded }

@@ -284,6 +284,7 @@ data class RemotePlanDecision(
 data class RemotePlanOccurrence(
     val id: String,
     @SerialName("series_item_id") val seriesItemId: String,
+    val identity: JsonObject,
     @SerialName("nominal_start") val nominalStart: String,
     @SerialName("nominal_end") val nominalEnd: String,
     @SerialName("window_start") val windowStart: String,

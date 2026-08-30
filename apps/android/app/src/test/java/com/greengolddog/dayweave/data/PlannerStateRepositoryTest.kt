@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.PendingSchedulePublication
+import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationReceiptSnapshot
@@ -17,6 +18,8 @@ import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
+import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
@@ -25,7 +28,18 @@ import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.prepareProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.prepareProposalUndoHttpRequest
+import com.greengolddog.dayweave.state.PlannerLoadState
+import com.greengolddog.dayweave.state.PlannerStore
+import java.time.Instant
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -147,6 +161,133 @@ class PlannerStateRepositoryTest {
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
+
+    @Test
+    fun recurrenceMoveSourceEnvelopeSurvivesEncryptedSnapshotRoundTrip() = runBlocking {
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
+        val itemId = "11111111-1111-4111-8111-111111111111"
+        val source = RecurrenceOccurrenceSourceSnapshot(
+            itemId = itemId,
+            itemRevision = 7,
+            identityJson =
+                """{"type":"calendar_day","date":"2026-09-01","bucket_ordinal":0}""",
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+        )
+        val move = RecurrenceMoveSnapshot(
+            itemId = itemId,
+            startAt = "2026-09-03T10:00:00Z",
+            endAt = "2026-09-03T11:00:00Z",
+            movedAt = "2026-09-01T07:05:00Z",
+            source = source,
+        )
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao)
+        val base = publishedScheduleState()
+        val state = base.copy(
+            canonicalItems = base.canonicalItems.map { item ->
+                item.copy(recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}")
+            },
+            recurrenceMoves = mapOf(occurrenceId to move),
+            occurrenceSeriesItemIds = mapOf(occurrenceId to itemId),
+            recurrenceOccurrenceSources = mapOf(occurrenceId to source),
+        )
+
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(state.recurrenceMoves, restored.recurrenceMoves)
+        assertEquals(state.recurrenceOccurrenceSources, restored.recurrenceOccurrenceSources)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"nominalStart\":"))
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("\"itemRevision\":7"))
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("calendar_day"))
+        assertEquals("2026-09-01T09:00:00+02:00", restored.recurrenceMoves
+            .getValue(occurrenceId).source?.nominalStart)
+        val relaunched = PlannerStore(restored).state.value
+        assertEquals(move, relaunched.recurrenceMoves[occurrenceId])
+        assertEquals(source, relaunched.recurrenceOccurrenceSources[occurrenceId])
+    }
+
+    @Test
+    fun pendingExecutionDeferIntentSurvivesSerializedRepositoryAndStoreRelaunch() = runBlocking {
+        val reference = Instant.parse("2026-08-29T08:30:00Z").toEpochMilli()
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { reference }
+        val expected = pendingExecutionDeferState()
+
+        repository.save(expected)
+        assertTrue(requireNotNull(dao.snapshot).payload.contains("pendingExecutionDeferIntent"))
+        assertEquals(
+            expected.pendingExecutionDeferIntent,
+            requireNotNull(repository.load()).pendingExecutionDeferIntent,
+        )
+
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val relaunched = PlannerStore(
+                repository = RoomPlannerStateRepository(dao) { reference },
+                scope = scope,
+                nowEpochMillis = { reference },
+            )
+            withTimeout(3_000) {
+                relaunched.loadState.first { it == PlannerLoadState.READY }
+            }
+
+            assertEquals(
+                expected.pendingExecutionDeferIntent,
+                relaunched.state.value.pendingExecutionDeferIntent,
+            )
+            assertTrue(relaunched.hasCredentialReplacementBlocker())
+        } finally {
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun malformedRestoredDeferIntentIsDurablyNormalizedThroughSerializedRepository() =
+        runBlocking {
+            val reference = Instant.parse("2026-08-29T08:30:00Z").toEpochMilli()
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { reference }
+            val malformed = pendingExecutionDeferState().let { state ->
+                state.copy(
+                    pendingExecutionDeferIntent = requireNotNull(
+                        state.pendingExecutionDeferIntent,
+                    ).copy(moveStart = "not-an-instant"),
+                )
+            }
+            repository.save(malformed)
+            val seedSaveCount = dao.saveCount
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+            try {
+                val relaunched = PlannerStore(
+                    repository = RoomPlannerStateRepository(dao) { reference },
+                    scope = scope,
+                    nowEpochMillis = { reference },
+                )
+                withTimeout(3_000) {
+                    relaunched.loadState.first { it == PlannerLoadState.READY }
+                }
+                assertEquals(null, relaunched.state.value.pendingExecutionDeferIntent)
+                assertEquals("paused", relaunched.state.value.canonicalExecutionSession?.status)
+                assertTrue(relaunched.state.value.scheduleMessage.contains("abandoned safely"))
+
+                withTimeout(3_000) {
+                    while (dao.saveCount <= seedSaveCount) delay(1)
+                }
+                val durable = requireNotNull(
+                    RoomPlannerStateRepository(dao) { reference }.load(),
+                )
+                assertEquals(null, durable.pendingExecutionDeferIntent)
+                assertEquals("paused", durable.canonicalExecutionSession?.status)
+                assertTrue(durable.scheduleMessage.contains("abandoned safely"))
+            } finally {
+                scope.cancel()
+            }
+        }
 
     @Test
     fun exactSchedulePublicationJournalRoundTripsAndTamperingFailsClosed() = runBlocking {
@@ -659,17 +800,65 @@ class PlannerStateRepositoryTest {
         )
     }
 
+    private fun pendingExecutionDeferState(): DayWeaveUiState {
+        val published = publishedScheduleState()
+        val block = published.schedule.single().copy(status = ItemStatus.PAUSED)
+        val session = CanonicalExecutionSessionSnapshot(
+            id = EXECUTION_SESSION_ID,
+            itemId = requireNotNull(block.canonicalItemId),
+            itemRevision = requireNotNull(block.canonicalRevision),
+            sessionIndex = requireNotNull(block.sessionIndex),
+            plannedBlockId = block.id,
+            sourceDeviceId = EXECUTION_DEVICE_ID,
+            status = "paused",
+            revision = 2,
+            accumulatedSeconds = 300,
+            startedAt = requireNotNull(block.absoluteStartAt),
+            pausedAt = "2026-08-29T09:05:00Z",
+            createdAt = requireNotNull(block.absoluteStartAt),
+            updatedAt = "2026-08-29T09:05:00Z",
+        )
+        return published.copy(
+            schedule = listOf(block),
+            canonicalExecutionSyncOrigin = requireNotNull(published.canonicalSyncOrigin),
+            canonicalExecutionConfigurationId = published.canonicalConfigurationId,
+            canonicalExecutionRevision = session.revision,
+            canonicalExecutionSession = session,
+            pendingExecutionDeferIntent = PendingExecutionDeferIntent(
+                syncOrigin = requireNotNull(published.canonicalSyncOrigin),
+                configurationId = published.canonicalConfigurationId,
+                sessionId = session.id,
+                itemId = session.itemId,
+                itemRevision = session.itemRevision,
+                sessionIndex = session.sessionIndex,
+                plannedBlockId = requireNotNull(session.plannedBlockId),
+                sourceDeviceId = session.sourceDeviceId,
+                focusedBlockId = block.id,
+                sourceStart = requireNotNull(block.absoluteStartAt),
+                sourceEnd = requireNotNull(block.absoluteEndAt),
+                moveStart = "2026-08-29T10:00:00Z",
+                stagedAt = "2026-08-29T09:05:00Z",
+            ),
+        )
+    }
+
     private class FakePlannerSnapshotDao(
         var snapshot: PlannerSnapshotEntity? = null,
     ) : PlannerSnapshotDao {
+        private val saveCounter = AtomicInteger(0)
+        val saveCount: Int get() = saveCounter.get()
+
         override suspend fun load(singletonId: Int): PlannerSnapshotEntity? = snapshot
 
         override suspend fun save(snapshot: PlannerSnapshotEntity) {
             this.snapshot = snapshot
+            saveCounter.incrementAndGet()
         }
     }
 
     private companion object {
+        const val EXECUTION_SESSION_ID = "44444444-4444-4444-8444-444444444444"
+        const val EXECUTION_DEVICE_ID = "55555555-5555-4555-8555-555555555555"
         const val LEGACY_V2_PAYLOAD = """
             {
               "schedule": [{

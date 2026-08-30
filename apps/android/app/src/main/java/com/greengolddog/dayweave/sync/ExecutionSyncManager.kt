@@ -2,8 +2,15 @@ package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PendingExecutionCommand
+import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
+import com.greengolddog.dayweave.model.isCoveredBy
+import com.greengolddog.dayweave.model.savedApprovalEnvelope
+import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
@@ -20,6 +27,7 @@ import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
 import java.time.Duration
 import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,6 +47,7 @@ import kotlinx.serialization.json.put
 
 enum class ExecutionSyncOutcome {
     SUCCESS,
+    RECOVERED_COMMAND,
     NOT_CONFIGURED,
     AUTH_REQUIRED,
     CONFLICT,
@@ -85,7 +94,19 @@ class ExecutionSyncManager(
         )
     }
 
-    suspend fun refresh(): ExecutionSyncOutcome = withReadyStore {
+    suspend fun refresh(): ExecutionSyncOutcome {
+        val intentBeforeRefresh = plannerStore.state.value.pendingExecutionDeferIntent
+        val outcome = refreshExecutionState()
+        if (outcome != ExecutionSyncOutcome.SUCCESS) return outcome
+        intentBeforeRefresh?.let { intent ->
+            deferredClosureOutcome(intent)?.let { return it }
+        }
+        val intent = plannerStore.state.value.pendingExecutionDeferIntent
+            ?: return ExecutionSyncOutcome.SUCCESS
+        return continueDeferIntent(intent)
+    }
+
+    private suspend fun refreshExecutionState(): ExecutionSyncOutcome = withReadyStore {
         operationMutex.withLock {
             val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
             updateBusy("Reconciling cross-device execution…")
@@ -93,8 +114,9 @@ class ExecutionSyncManager(
                 configuration.withBindingOperation {
                     ensureDeviceIdentity()
                     beginHistoryVerification(configuration)
-                    val hadPending = plannerStore.state.value.pendingExecutionCommand != null
-                    if (hadPending) reconcilePending(configuration)
+                    if (plannerStore.state.value.pendingExecutionCommand != null) {
+                        reconcilePending(configuration)
+                    }
                     reconcileSnapshot(
                         configuration,
                         transport.snapshot(configuration),
@@ -209,19 +231,469 @@ class ExecutionSyncManager(
         actualSeconds: Long? = null,
     ): ExecutionSyncOutcome = finish(blockId, "skip", actualSeconds)
 
-    /** Compatibility phase: consume remote defers before this client is allowed to produce one. */
-    suspend fun doLater(blockId: String): ExecutionSyncOutcome = withReadyStore {
-        operationMutex.withLock {
-            val state = plannerStore.state.value
-            if (state.schedule.none { it.id == blockId && it.canonicalItemId != null }) {
-                return@withLock ExecutionSyncOutcome.INVALID_LOCAL_STATE
-            }
-            updateError(
-                "Will do later is not enabled on this client yet. " +
-                    "Complete or skip this session for now.",
-            )
-            ExecutionSyncOutcome.INVALID_LOCAL_STATE
+    /**
+     * Closes an exact server-owned lease and reserves its unconsumed work at [moveStart].
+     *
+     * A running lease is paused first. That gives the client one server-confirmed, whole-second
+     * accumulated value instead of estimating time while two network requests are in flight.
+     * The Defer then carries that value as `actual_seconds`, and its move window is exactly the
+     * published source duration minus the confirmed accumulation.
+     */
+    suspend fun doLater(
+        blockId: String,
+        moveStart: Instant,
+        approval: MoveLaterApprovalEnvelope? = null,
+    ): ExecutionSyncOutcome {
+        val exactMoveStart = moveStart.truncatedTo(ChronoUnit.SECONDS)
+        if (exactMoveStart != moveStart || exactMoveStart <= now()) {
+            updateError("Choose a future whole-second time for this work.")
+            return ExecutionSyncOutcome.INVALID_LOCAL_STATE
         }
+
+        var preparedIntent: PendingExecutionDeferIntent? = null
+        val preparation = withReadyStore {
+            try {
+                val current = plannerStore.state.value
+                val existing = current.pendingExecutionDeferIntent
+                if (existing != null) {
+                    if (
+                        existing.focusedBlockId != blockId ||
+                        existing.moveStart != exactMoveStart.toString()
+                    ) {
+                        throw InvalidExecutionStateException(
+                            "Another move-later request is still reconciling.",
+                        )
+                    }
+                    preparedIntent = existing
+                    return@withReadyStore ExecutionSyncOutcome.SUCCESS
+                }
+                val session = current.canonicalExecutionSession
+                    ?: throw InvalidExecutionStateException(
+                        "Only an active or paused synced session can be moved later.",
+                    )
+                if (session.status !in OPEN_STATUSES) {
+                    throw InvalidExecutionStateException(
+                        "Only an active or paused synced session can be moved later.",
+                    )
+                }
+                val block = current.schedule.firstOrNull { it.id == blockId }
+                    ?: throw InvalidExecutionStateException(
+                        "The exact published source block is unavailable.",
+                    )
+                if (!block.isRepresentableMoveLaterSource()) {
+                    throw InvalidExecutionStateException(
+                        "This fixed source cannot be safely represented as moved work.",
+                    )
+                }
+                val plannedBlockId = session.plannedBlockId
+                    ?: throw InvalidExecutionStateException(
+                        "The execution lease has no published source block.",
+                    )
+                if (
+                    plannedBlockId != block.id || block.canonicalItemId != session.itemId ||
+                    block.canonicalRevision != session.itemRevision ||
+                    block.occurrenceId != session.occurrenceId ||
+                    block.sessionIndex != session.sessionIndex
+                ) {
+                    throw InvalidExecutionStateException(
+                        "The execution lease no longer matches its published source block.",
+                    )
+                }
+                val assessment = current.assessMoveLater(blockId, exactMoveStart, now())
+                    ?: throw InvalidExecutionStateException(
+                        "The exact move window could not be verified.",
+                    )
+                if (!assessment.fitsSinglePlanningDay) {
+                    throw InvalidExecutionStateException(
+                        "That move is outside the currently loaded planning day and cannot " +
+                            "be published safely.",
+                    )
+                }
+                if (assessment.crossesUnrelaxableHardDeadline) {
+                    throw InvalidExecutionStateException(
+                        "This running session cannot move beyond its hard deadline. Pause it " +
+                            "and change the item constraint first.",
+                    )
+                }
+                val reviewedApproval = approval ?: assessment.takeUnless {
+                    it.requiresConfirmation
+                }?.toApprovalEnvelope()
+                if (!assessment.isCoveredBy(reviewedApproval)) {
+                    throw InvalidExecutionStateException(
+                        "The placement risks changed after review. Review the current warning " +
+                            "before moving.",
+                    )
+                }
+                val plannedSeconds = block.exactPublishedDurationSeconds()
+                val remainingFloor = runCatching {
+                    Math.subtractExact(plannedSeconds, session.accumulatedSeconds)
+                }.getOrElse {
+                    throw InvalidExecutionStateException("The remaining duration is unavailable.")
+                }
+                if (remainingFloor !in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()) {
+                    throw InvalidExecutionStateException(
+                        "No supported whole-second planned work remains to move later.",
+                    )
+                }
+                val stagedAt = now()
+                if (exactMoveStart <= stagedAt) {
+                    throw InvalidExecutionStateException("The selected move time has already passed.")
+                }
+                val intent = PendingExecutionDeferIntent(
+                    syncOrigin = current.canonicalExecutionSyncOrigin
+                        ?: throw InvalidExecutionStateException(
+                            "The execution binding is unavailable.",
+                        ),
+                    configurationId = current.canonicalExecutionConfigurationId,
+                    sessionId = session.id,
+                    itemId = session.itemId,
+                    itemRevision = session.itemRevision,
+                    occurrenceId = session.occurrenceId,
+                    sessionIndex = session.sessionIndex,
+                    plannedBlockId = plannedBlockId,
+                    sourceDeviceId = session.sourceDeviceId,
+                    focusedBlockId = blockId,
+                    sourceStart = requireNotNull(block.absoluteStartAt),
+                    sourceEnd = requireNotNull(block.absoluteEndAt),
+                    moveStart = exactMoveStart.toString(),
+                    stagedAt = stagedAt.toString(),
+                    approvedConflictTargetEnd = reviewedApproval?.maximumTargetEnd?.toString(),
+                    approvedDeadlineRisks = reviewedApproval?.deadlineRisks
+                        ?.sortedWith(compareBy({ it.deadline }, { it.itemId })).orEmpty(),
+                    approvedSourceOverride = reviewedApproval?.sourceOverrideApproved == true,
+                    approvedItemRevisions = reviewedApproval?.sourceItemRevisions.orEmpty(),
+                    approvedHardBlockIds = reviewedApproval?.hardConflicts?.map { it.id }
+                        ?.sorted().orEmpty(),
+                    approvedHardConflicts = reviewedApproval?.hardConflicts
+                        ?.sortedBy { it.id }.orEmpty(),
+                )
+                val receipt = plannerStore.stageExecutionDeferIntent(intent)
+                if (receipt == null || !receipt.awaitDurable()) {
+                    throw LocalExecutionStorageException()
+                }
+                preparedIntent = plannerStore.state.value.pendingExecutionDeferIntent
+                    ?: throw LocalExecutionStorageException()
+                ExecutionSyncOutcome.SUCCESS
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+        if (preparation != ExecutionSyncOutcome.SUCCESS) return preparation
+        return continueDeferIntent(requireNotNull(preparedIntent))
+    }
+
+    private suspend fun continueDeferIntent(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome {
+        val moveStart = runCatching { Instant.parse(intent.moveStart) }.getOrNull()
+            ?: return invalidLocalState("The saved move time is invalid; the session was kept safe.")
+        if (moveStart <= now()) {
+            if (!clearDeferIntent(intent, "Move time expired · the session remains paused")) {
+                return handleFailure(LocalExecutionStorageException())
+            }
+            return invalidLocalState(
+                "The selected move time passed while synchronizing; choose a new time. " +
+                    "The session remains paused.",
+            )
+        }
+
+        verifySavedMoveRisksBeforeCommand(intent, moveStart)?.let { return it }
+
+        val paused = ensurePausedForDefer(intent)
+        deferredClosureOutcome(intent)?.let { return it }
+        if (paused != ExecutionSyncOutcome.SUCCESS) return paused
+        if (plannerStore.state.value.pendingExecutionDeferIntent != intent) {
+            return invalidLocalState(
+                "The saved move was no longer valid after pausing. The session remains paused.",
+            )
+        }
+        verifyExactPausedMoveRisks(intent)?.let { return it }
+
+        repeat(MAX_RECONCILED_COMMAND_ATTEMPTS) {
+            val outcome = deferPaused(intent)
+            deferredClosureOutcome(intent)?.let { return it }
+            if (outcome != ExecutionSyncOutcome.SUCCESS) return outcome
+            val current = plannerStore.state.value
+            if (
+                current.pendingExecutionCommand != null ||
+                current.canonicalExecutionSession?.let {
+                    it.id != intent.sessionId || it.status != "paused"
+                } != false
+            ) {
+                return invalidLocalState(
+                    "Execution changed while the move was being prepared; review it before retrying.",
+                )
+            }
+        }
+        return invalidLocalState(
+            "A previous execution command was reconciled; review the paused session before retrying.",
+        )
+    }
+
+    private suspend fun verifySavedMoveRisksBeforeCommand(
+        intent: PendingExecutionDeferIntent,
+        moveStart: Instant,
+    ): ExecutionSyncOutcome? {
+        val assessment = plannerStore.state.value.assessMoveLater(
+            intent.focusedBlockId,
+            moveStart,
+            now(),
+        )
+        if (assessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) return null
+        val message =
+            "The placement risks changed after review. Review the move again; execution was " +
+                "left unchanged."
+        if (!clearDeferIntent(intent, message)) {
+            return handleFailure(LocalExecutionStorageException())
+        }
+        return invalidLocalState(message)
+    }
+
+    private suspend fun ensurePausedForDefer(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome {
+        repeat(MAX_RECONCILED_COMMAND_ATTEMPTS) {
+            val current = plannerStore.state.value.canonicalExecutionSession
+            if (current?.id != intent.sessionId) {
+                return invalidLocalState(
+                    "Execution changed while the saved move was reconciling; review the session.",
+                )
+            }
+            when (current?.status) {
+                "paused" -> return ExecutionSyncOutcome.SUCCESS
+                "active" -> {
+                    val outcome = pauseForDefer(intent)
+                    if (outcome != ExecutionSyncOutcome.SUCCESS) {
+                        val reconciled = plannerStore.state.value.canonicalExecutionSession
+                        if (reconciled?.id == intent.sessionId && reconciled.status == "paused") {
+                            return ExecutionSyncOutcome.SUCCESS
+                        }
+                        return outcome
+                    }
+                }
+                else -> return invalidLocalState(
+                    "Only an active or paused synced session can be moved later.",
+                )
+            }
+        }
+        return if (
+            plannerStore.state.value.canonicalExecutionSession?.let {
+                it.id == intent.sessionId && it.status == "paused"
+            } == true
+        ) {
+            ExecutionSyncOutcome.SUCCESS
+        } else {
+            invalidLocalState(
+                "A previous execution command was reconciled; review the session before retrying.",
+            )
+        }
+    }
+
+    private suspend fun pauseForDefer(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome = command(intent.focusedBlockId) { context ->
+        val active = context.requireActiveSession(intent.focusedBlockId)
+        if (active.id != intent.sessionId || active.status != "active") {
+            throw InvalidExecutionStateException(
+                "The execution lease changed before its exact pause.",
+            )
+        }
+        CommandSpec(
+            type = "pause",
+            identity = active.immutableIdentity(),
+            focusedBlockId = intent.focusedBlockId,
+            command = buildJsonObject {
+                put("type", "pause")
+                put("session_id", active.id)
+            },
+        )
+    }
+
+    private suspend fun deferPaused(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome = command(intent.focusedBlockId) { context ->
+        val paused = context.requireActiveSession(intent.focusedBlockId)
+        if (
+            paused.id != intent.sessionId || paused.status != "paused" ||
+            paused.runningSince != null
+        ) {
+            throw InvalidExecutionStateException(
+                "The server must confirm an exact pause before this work can move.",
+            )
+        }
+        if (
+            context.block.id != intent.plannedBlockId ||
+            context.block.absoluteStartAt != intent.sourceStart ||
+            context.block.absoluteEndAt != intent.sourceEnd
+        ) {
+            throw InvalidExecutionStateException(
+                "The exact published source changed before this work could move.",
+            )
+        }
+        val plannedSeconds = intent.exactPublishedDurationSeconds()
+        val actualSeconds = paused.accumulatedSeconds
+        val remainingSeconds = runCatching {
+            Math.subtractExact(plannedSeconds, actualSeconds)
+        }.getOrElse { throw InvalidExecutionStateException("The remaining duration is unavailable.") }
+        if (remainingSeconds !in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()) {
+            throw InvalidExecutionStateException(
+                "No whole-second planned work remains to move later.",
+            )
+        }
+        val moveStart = Instant.parse(intent.moveStart)
+        if (moveStart <= now()) {
+            throw InvalidExecutionStateException("The selected move time has already passed.")
+        }
+        val moveEnd = runCatching { moveStart.plusSeconds(remainingSeconds) }
+            .getOrElse { throw InvalidExecutionStateException("The move window is unavailable.") }
+        CommandSpec(
+            type = "defer",
+            identity = paused.immutableIdentity(),
+            focusedBlockId = intent.focusedBlockId,
+            command = buildJsonObject {
+                put("type", "defer")
+                put("session_id", paused.id)
+                put("move_start", moveStart.toString())
+                put("move_end", moveEnd.toString())
+                put("actual_seconds", actualSeconds)
+            },
+        )
+    }
+
+    /**
+     * A running lease's exact remaining duration exists only after Pause. Never let that server
+     * truth extend beyond the deadline/calendar envelope the user actually reviewed.
+     */
+    private suspend fun verifyExactPausedMoveRisks(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome? {
+        val current = plannerStore.state.value
+        val moveStart = runCatching { Instant.parse(intent.moveStart) }.getOrNull()
+            ?: return abandonDeferAfterExactPause(
+                intent,
+                "The exact saved move time is invalid. The session remains paused.",
+            )
+        val assessment = current.assessMoveLater(intent.focusedBlockId, moveStart, now())
+            ?: return abandonDeferAfterExactPause(
+                intent,
+                "The exact paused move window could not be verified. The session remains paused.",
+            )
+        if (!assessment.fitsSinglePlanningDay) {
+            return abandonDeferAfterExactPause(
+                intent,
+                "The exact remaining work is outside the currently loaded planning day. " +
+                    "Choose a same-day time; the session remains paused.",
+            )
+        }
+        if (assessment.crossesUnrelaxableHardDeadline) {
+            return abandonDeferAfterExactPause(
+                intent,
+                "The exact remaining work would cross its hard deadline. Change the item " +
+                    "constraint first; the session remains paused.",
+            )
+        }
+        if (assessment.isCoveredBy(intent.savedApprovalEnvelope())) return null
+
+        return abandonDeferAfterExactPause(
+            intent,
+            "The exact paused duration has a new deadline or calendar conflict. Review the " +
+                "move again; the session remains paused.",
+        )
+    }
+
+    private suspend fun abandonDeferAfterExactPause(
+        intent: PendingExecutionDeferIntent,
+        message: String,
+    ): ExecutionSyncOutcome {
+        if (!clearDeferIntent(intent, message)) {
+            return handleFailure(LocalExecutionStorageException())
+        }
+        return invalidLocalState(message)
+    }
+
+    private fun ScheduleItem.exactPublishedDurationSeconds(): Long {
+        val start = absoluteStartAt?.let(Instant::parse)
+            ?: throw InvalidExecutionStateException("The published start is unavailable.")
+        val end = absoluteEndAt?.let(Instant::parse)
+            ?: throw InvalidExecutionStateException("The published end is unavailable.")
+        val duration = Duration.between(start, end)
+        if (duration.isNegative || duration.isZero || duration.nano != 0) {
+            throw InvalidExecutionStateException("The published duration is not a whole second.")
+        }
+        return duration.seconds
+    }
+
+    private fun PendingExecutionDeferIntent.exactPublishedDurationSeconds(): Long {
+        val start = runCatching { Instant.parse(sourceStart) }.getOrElse {
+            throw InvalidExecutionStateException("The saved published start is unavailable.")
+        }
+        val end = runCatching { Instant.parse(sourceEnd) }.getOrElse {
+            throw InvalidExecutionStateException("The saved published end is unavailable.")
+        }
+        val duration = Duration.between(start, end)
+        if (duration.isNegative || duration.isZero || duration.nano != 0) {
+            throw InvalidExecutionStateException("The saved published duration is not exact.")
+        }
+        return duration.seconds
+    }
+
+    private fun exactDeferredClosure(
+        intent: PendingExecutionDeferIntent,
+    ): CanonicalExecutionSessionSnapshot? {
+        val current = plannerStore.state.value
+        val deferred = current.terminalExecutionOutcomes[intent.sessionId]?.session
+            ?: return null
+        val actualSeconds = deferred.actualSeconds ?: return null
+        val plannedSeconds = runCatching { intent.exactPublishedDurationSeconds() }.getOrNull()
+            ?: return null
+        val remainingSeconds = runCatching {
+            Math.subtractExact(plannedSeconds, actualSeconds)
+        }.getOrNull()?.takeIf { it > 0 } ?: return null
+        val recoveredStart = deferred.moveStart?.let {
+            runCatching { Instant.parse(it) }.getOrNull()
+        } ?: return null
+        val recoveredEnd = runCatching { recoveredStart.plusSeconds(remainingSeconds) }.getOrNull()
+            ?: return null
+        return deferred.takeIf {
+            it.status == "deferred" && it.itemId == intent.itemId &&
+                it.itemRevision == intent.itemRevision && it.occurrenceId == intent.occurrenceId &&
+                it.sessionIndex == intent.sessionIndex &&
+                it.plannedBlockId == intent.plannedBlockId &&
+                it.sourceDeviceId == intent.sourceDeviceId &&
+                it.moveEnd == recoveredEnd.toString()
+        }
+    }
+
+    private suspend fun deferredClosureOutcome(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome? {
+        val deferred = exactDeferredClosure(intent) ?: return null
+        if (!clearDeferIntent(intent, "Move confirmed · publishing the replacement placement")) {
+            return handleFailure(LocalExecutionStorageException())
+        }
+        return if (deferred.moveStart == intent.moveStart) {
+            ExecutionSyncOutcome.SUCCESS
+        } else {
+            updateConnected(
+                "Recovered the previously requested move; the newly selected time was not sent.",
+            )
+            ExecutionSyncOutcome.RECOVERED_COMMAND
+        }
+    }
+
+    private suspend fun clearDeferIntent(
+        intent: PendingExecutionDeferIntent,
+        message: String,
+    ): Boolean {
+        val current = plannerStore.state.value.pendingExecutionDeferIntent ?: return true
+        if (current.sessionId != intent.sessionId) return false
+        val receipt = plannerStore.clearExecutionDeferIntent(intent.sessionId, message)
+        return receipt?.awaitDurable() == true
+    }
+
+    private fun invalidLocalState(message: String): ExecutionSyncOutcome {
+        updateError(message)
+        return ExecutionSyncOutcome.INVALID_LOCAL_STATE
     }
 
     private suspend fun finish(
@@ -878,7 +1350,8 @@ class ExecutionSyncManager(
             current.canonicalExecutionHistoryContinuityEstablished ||
             current.canonicalExecutionHistoryVerified ||
             current.terminalExecutionOutcomes.isNotEmpty() ||
-            current.pendingExecutionCommand != null
+            current.pendingExecutionCommand != null ||
+            current.pendingExecutionDeferIntent != null
         val canonicalMismatch = hasCanonicalState &&
             (current.canonicalSyncOrigin != origin ||
                 current.canonicalConfigurationId != configurationId)
@@ -1006,6 +1479,27 @@ class ExecutionSyncManager(
                         require(!primitive.isString && primitive.long >= 0)
                     }
                 }
+                "defer" -> {
+                    require(
+                        command.keys == setOf(
+                            "type",
+                            "session_id",
+                            "move_start",
+                            "move_end",
+                            "actual_seconds",
+                        ),
+                    )
+                    val moveStart = Instant.parse(command.requireString("move_start"))
+                    val moveEnd = Instant.parse(command.requireString("move_end"))
+                    val requestStartedAt = Instant.parse(pending.startedAt)
+                    val duration = Duration.between(moveStart, moveEnd)
+                    require(
+                        moveStart > requestStartedAt && moveEnd > moveStart &&
+                            duration.nano == 0 &&
+                            duration.seconds in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong(),
+                    )
+                    require(command.requireLong("actual_seconds") >= 0)
+                }
                 else -> throw InvalidExecutionProtocolException()
             }
             command
@@ -1039,6 +1533,7 @@ class ExecutionSyncManager(
             "pause" -> "paused"
             "complete" -> "completed"
             "skip" -> "skipped"
+            "defer" -> "deferred"
             else -> throw InvalidExecutionProtocolException()
         }
         if (changed.status != expectedStatus) {
@@ -1116,6 +1611,22 @@ class ExecutionSyncManager(
                     !accumulatedMatchesClosedAnchor ||
                     changed.actualSeconds != (corrected ?: changed.accumulatedSeconds) ||
                     changed.pausedAt?.let(Instant::parse) != expectedPausedAt
+                ) {
+                    throw InvalidExecutionProtocolException()
+                }
+            }
+            "defer" -> {
+                if (prior.status != "paused") throw InvalidExecutionProtocolException()
+                val corrected = command.requireLong("actual_seconds")
+                val expectedMoveStart = Instant.parse(command.requireString("move_start"))
+                val expectedMoveEnd = Instant.parse(command.requireString("move_end"))
+                val expectedPausedAt = prior.pausedAt?.let(Instant::parse) ?: changedAt
+                if (
+                    changed.accumulatedSeconds != prior.accumulatedSeconds ||
+                    changed.actualSeconds != corrected || corrected != prior.accumulatedSeconds ||
+                    changed.pausedAt?.let(Instant::parse) != expectedPausedAt ||
+                    changed.moveStart?.let(Instant::parse) != expectedMoveStart ||
+                    changed.moveEnd?.let(Instant::parse) != expectedMoveEnd
                 ) {
                     throw InvalidExecutionProtocolException()
                 }
@@ -1203,8 +1714,10 @@ class ExecutionSyncManager(
                         (pausedAt == null || pausedAt >= startedAt && pausedAt <= updatedAt) &&
                         moveStart != null && moveStart > endedAt &&
                         moveEnd != null && moveEnd > moveStart &&
-                        Duration.between(moveStart, moveEnd) <=
-                        Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()),
+                        Duration.between(moveStart, moveEnd).let { duration ->
+                            duration.nano == 0 && duration <=
+                                Duration.ofSeconds(MAX_DEFER_MOVE_WINDOW_SECONDS.toLong())
+                        },
                 )
             }
         } catch (error: Exception) {
@@ -1416,10 +1929,13 @@ class ExecutionSyncManager(
             )
             is ExecutionApiException.Authentication -> Triple(
                 CanonicalSyncPhase.AUTH_REQUIRED,
-                if (plannerStore.state.value.pendingExecutionCommand != null) {
-                    "Authentication failed. The pending command is retained for an exact retry."
-                } else {
-                    "Authentication failed. Re-enter the bearer token to reconcile execution."
+                when {
+                    plannerStore.state.value.pendingExecutionCommand != null ->
+                        "Authentication failed. The pending command is retained for an exact retry."
+                    plannerStore.state.value.pendingExecutionDeferIntent != null ->
+                        "Authentication failed. The move request is saved for reconciliation."
+                    else ->
+                        "Authentication failed. Re-enter the bearer token to reconcile execution."
                 },
                 ExecutionSyncOutcome.AUTH_REQUIRED,
             )
@@ -1445,10 +1961,12 @@ class ExecutionSyncManager(
             )
             is IOException -> Triple(
                 CanonicalSyncPhase.OFFLINE,
-                if (plannerStore.state.value.pendingExecutionCommand != null) {
-                    "Offline · canonical execution was not changed locally and will be retried exactly."
-                } else {
-                    "Offline · canonical execution was not changed locally."
+                when {
+                    plannerStore.state.value.pendingExecutionCommand != null ->
+                        "Offline · the exact execution command will be retried."
+                    plannerStore.state.value.pendingExecutionDeferIntent != null ->
+                        "Offline · the selected move time is saved and will resume after sync."
+                    else -> "Offline · canonical execution was not changed locally."
                 },
                 ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE,
             )
@@ -1585,6 +2103,7 @@ class ExecutionSyncManager(
         const val MAX_HISTORY_SESSIONS = 100
         const val MAX_BOOTSTRAP_HISTORY_PAGES = 1_000
         const val MAX_STABLE_READ_ATTEMPTS = 2
+        const val MAX_RECONCILED_COMMAND_ATTEMPTS = 2
         val NIL_UUID: UUID = UUID(0L, 0L)
         val OPEN_STATUSES = setOf("active", "paused")
         val TERMINAL_STATUSES = setOf("completed", "skipped")

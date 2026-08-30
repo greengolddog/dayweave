@@ -1,5 +1,8 @@
 package com.greengolddog.dayweave.ui.components
 
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
+import android.text.format.DateFormat
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -14,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AddTask
 import androidx.compose.material.icons.outlined.Coffee
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
@@ -35,12 +39,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.DialogProperties
+import androidx.compose.ui.window.SecureFlagPolicy
 import com.greengolddog.dayweave.model.ItemKind
+import com.greengolddog.dayweave.model.MoveLaterAssessment
+import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
+import com.greengolddog.dayweave.model.MoveLaterPlacementMode
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.network.DeviceAuthPhase
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
@@ -48,6 +60,13 @@ import com.greengolddog.dayweave.network.RemoteProposalItemField
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonPrimitive
@@ -197,6 +216,353 @@ fun PauseChooserDialog(
             TextButton(onClick = { onPause(null) }) { Text("No end time") }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+internal data class MoveLaterPreset(
+    val label: String,
+    val detail: String,
+    val moveStart: Instant,
+)
+
+internal data class MoveLaterConflictPresentation(
+    val labels: List<String>,
+    val requiresSecureWindow: Boolean,
+)
+
+internal fun moveLaterConflictPresentation(
+    blocks: List<ScheduleItem>,
+): MoveLaterConflictPresentation = MoveLaterConflictPresentation(
+    labels = blocks.map { block ->
+        if (block.isSensitive) "Sensitive busy time" else block.title
+    }.distinct().take(3),
+    requiresSecureWindow = blocks.any(ScheduleItem::isSensitive),
+)
+
+internal fun moveLaterRequiresSecureWindow(
+    itemIsSensitive: Boolean,
+    conflicts: MoveLaterConflictPresentation,
+): Boolean = itemIsSensitive || conflicts.requiresSecureWindow
+
+internal fun moveLaterPresets(
+    now: Instant,
+    zoneId: ZoneId,
+    use24HourFormat: Boolean,
+    loadedPlanningDate: LocalDate? = null,
+): List<MoveLaterPreset> {
+    fun afterHours(hours: Long): Instant {
+        val candidate = now.plus(hours, ChronoUnit.HOURS)
+        val minute = candidate.atZone(zoneId).truncatedTo(ChronoUnit.MINUTES)
+        return (if (minute.toInstant() < candidate) minute.plusMinutes(1) else minute).toInstant()
+    }
+    val tomorrowMorning = ZonedDateTime.of(
+        now.atZone(zoneId).toLocalDate().plusDays(1),
+        LocalTime.of(9, 0),
+        zoneId,
+    ).toInstant()
+    val formatter = DateTimeFormatter.ofPattern(
+        if (use24HourFormat) "EEE, MMM d · HH:mm z" else "EEE, MMM d · h:mm a z",
+    )
+    fun detail(instant: Instant) = instant.atZone(zoneId).format(formatter)
+    val inOneHour = afterHours(1)
+    val inThreeHours = afterHours(3)
+    return listOf(
+        MoveLaterPreset("In 1 hour", detail(inOneHour), inOneHour),
+        MoveLaterPreset("In 3 hours", detail(inThreeHours), inThreeHours),
+        MoveLaterPreset("Tomorrow morning", detail(tomorrowMorning), tomorrowMorning),
+    ).filter { preset ->
+        loadedPlanningDate == null ||
+            preset.moveStart.atZone(zoneId).toLocalDate() == loadedPlanningDate
+    }
+}
+
+internal fun customMoveStart(
+    date: LocalDate,
+    time: LocalTime,
+    zoneId: ZoneId,
+    now: Instant,
+): Instant? {
+    val localDateTime = LocalDateTime.of(date, time.truncatedTo(ChronoUnit.MINUTES))
+    val offset = zoneId.rules.getValidOffsets(localDateTime).singleOrNull() ?: return null
+    val selected = localDateTime.toInstant(offset)
+    return selected.takeIf { it > now.plusSeconds(MIN_CUSTOM_MOVE_LEAD_SECONDS) }
+}
+
+internal fun moveLaterChooserExplanation(placementMode: MoveLaterPlacementMode): String =
+    when (placementMode) {
+        MoveLaterPlacementMode.EXACT ->
+            "DayWeave will preserve the exact remaining time and publish its new placement."
+        MoveLaterPlacementMode.RECOMPOSED_WINDOW ->
+            "DayWeave will move this occurrence window and recompose its sessions inside it."
+        MoveLaterPlacementMode.EARLIEST_START ->
+            "DayWeave will allow scheduling this work from the selected time, then recompose your day."
+    }
+
+internal fun moveLaterConfirmationPromise(placementMode: MoveLaterPlacementMode): String =
+    when (placementMode) {
+        MoveLaterPlacementMode.EXACT ->
+            "DayWeave will preserve the exact move you approve."
+        MoveLaterPlacementMode.RECOMPOSED_WINDOW ->
+            "DayWeave will preserve the occurrence window and recompose inside it."
+        MoveLaterPlacementMode.EARLIEST_START ->
+            "DayWeave will preserve the earliest start and deadline change you approve."
+    }
+
+@Composable
+internal fun MoveLaterChooserDialog(
+    itemTitle: String,
+    itemIsSensitive: Boolean,
+    placementMode: MoveLaterPlacementMode,
+    zoneId: ZoneId,
+    loadedPlanningDate: LocalDate,
+    notBefore: Instant? = null,
+    assessMove: (Instant) -> MoveLaterAssessment?,
+    onDismiss: () -> Unit,
+    onMove: (Instant, MoveLaterApprovalEnvelope?) -> Unit,
+) {
+    val context = LocalContext.current
+    val referenceNow = remember { Instant.now() }
+    val use24HourFormat = DateFormat.is24HourFormat(context)
+    val moveAnchor = remember(referenceNow, notBefore) {
+        maxOf(referenceNow, notBefore ?: referenceNow)
+    }
+    val presets = remember(moveAnchor, zoneId, use24HourFormat, loadedPlanningDate) {
+        moveLaterPresets(moveAnchor, zoneId, use24HourFormat, loadedPlanningDate)
+    }
+    var customError by remember { mutableStateOf<String?>(null) }
+    var pendingConfirmation by remember {
+        mutableStateOf<Pair<Instant, MoveLaterAssessment>?>(null)
+    }
+    val initialCustom = presets.lastOrNull()?.moveStart?.atZone(zoneId)
+        ?: loadedPlanningDate.atTime(9, 0).atZone(zoneId)
+
+    fun requestMove(selected: Instant) {
+        val assessment = assessMove(selected)
+        when {
+            assessment == null -> {
+                customError = "The exact move window could not be verified. Recompose and try again."
+            }
+            !assessment.fitsSinglePlanningDay -> {
+                customError =
+                    "That move falls outside the currently loaded planning day. Choose a time " +
+                        "that stays within this day."
+            }
+            assessment.crossesUnrelaxableHardDeadline -> {
+                customError =
+                    "That exact replacement ends after a hard deadline this action cannot " +
+                        "safely relax. Change the item constraint first."
+            }
+            assessment.requiresConfirmation -> {
+                customError = null
+                pendingConfirmation = selected to assessment
+            }
+            else -> onMove(selected, assessment.toApprovalEnvelope())
+        }
+    }
+
+    fun chooseCustomTime() {
+        DatePickerDialog(
+            context,
+            { _, year, zeroBasedMonth, day ->
+                val date = LocalDate.of(year, zeroBasedMonth + 1, day)
+                if (date != loadedPlanningDate) {
+                    customError = "Only the currently loaded planning day can be moved safely."
+                    return@DatePickerDialog
+                }
+                TimePickerDialog(
+                    context,
+                    { _, hour, minute ->
+                        val localDateTime = LocalDateTime.of(
+                            date,
+                            LocalTime.of(hour, minute),
+                        )
+                        val hasOneExactOffset =
+                            zoneId.rules.getValidOffsets(localDateTime).size == 1
+                        val selected = customMoveStart(
+                            date = date,
+                            time = localDateTime.toLocalTime(),
+                            zoneId = zoneId,
+                            now = maxOf(Instant.now(), notBefore ?: Instant.MIN),
+                        )
+                        if (selected == null) {
+                            customError = if (hasOneExactOffset) {
+                                "Choose a time at least a minute from now."
+                            } else {
+                                "That clock time is unavailable or ambiguous because of " +
+                                    "daylight saving. Choose another time."
+                            }
+                        } else {
+                            requestMove(selected)
+                        }
+                    },
+                    initialCustom.hour,
+                    initialCustom.minute,
+                    use24HourFormat,
+                ).show()
+            },
+            initialCustom.year,
+            initialCustom.monthValue - 1,
+            initialCustom.dayOfMonth,
+        ).also { dialog ->
+            val deviceZone = ZoneId.systemDefault()
+            dialog.datePicker.minDate = loadedPlanningDate.atStartOfDay(deviceZone)
+                .toInstant().toEpochMilli()
+            dialog.datePicker.maxDate = loadedPlanningDate.plusDays(1)
+                .atStartOfDay(deviceZone).toInstant().toEpochMilli() - 1
+        }.show()
+    }
+
+    pendingConfirmation?.let { (selected, assessment) ->
+        val formatter = DateTimeFormatter.ofPattern(
+            if (use24HourFormat) "EEE, MMM d · HH:mm z" else "EEE, MMM d · h:mm a z",
+        )
+        val conflictPresentation = moveLaterConflictPresentation(
+            assessment.overlappingHardBlocks,
+        )
+        val requiresSecureWindow = moveLaterRequiresSecureWindow(
+            itemIsSensitive,
+            conflictPresentation,
+        )
+        val details = buildList {
+            if (assessment.sourceRequiresOverride) {
+                add(
+                    "The current placement is pinned. Moving it overrides that exact " +
+                        "stability lock; its underlying task constraints remain unchanged.",
+                )
+            }
+            assessment.crossedDeadlines.forEach { risk ->
+                val deadline = Instant.parse(risk.deadline)
+                val itemTargetEnd = Instant.parse(risk.targetEnd)
+                val deadlineText = deadline.atZone(zoneId).format(formatter)
+                val endText = itemTargetEnd.atZone(zoneId).format(formatter)
+                add(
+                    if (
+                        assessment.canonicalDeadlineRelaxation == itemTargetEnd &&
+                        risk.isCanonicalField
+                    ) {
+                        "This will extend the item deadline from $deadlineText to $endText."
+                    } else if (!risk.isHard) {
+                        when (assessment.placementMode) {
+                            MoveLaterPlacementMode.EXACT ->
+                                "The exact replacement ends at $endText, after its preferred " +
+                                    "deadline at $deadlineText."
+                            MoveLaterPlacementMode.RECOMPOSED_WINDOW ->
+                                "The recomposed occurrence may place an item as late as " +
+                                    "$endText, after its preferred deadline at $deadlineText."
+                            MoveLaterPlacementMode.EARLIEST_START ->
+                                "The earliest possible finish is $endText, after the preferred " +
+                                    "deadline at $deadlineText."
+                        }
+                    } else {
+                        "The moved work may end at $endText, after its deadline at $deadlineText."
+                    },
+                )
+            }
+            if (assessment.overlappingHardBlocks.isNotEmpty()) {
+                val titles = conflictPresentation.labels.joinToString(", ")
+                add("The replacement overlaps fixed or hard time: $titles.")
+            }
+        }
+        AlertDialog(
+            onDismissRequest = { pendingConfirmation = null },
+            icon = { Icon(Icons.Outlined.Schedule, contentDescription = null) },
+            title = { Text("Move despite this conflict?") },
+            text = {
+                Text(
+                    details.joinToString("\n\n") +
+                        "\n\n${moveLaterConfirmationPromise(assessment.placementMode)}",
+                    modifier = Modifier.testTag("move_later_warning"),
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = { onMove(selected, assessment.toApprovalEnvelope()) },
+                    modifier = Modifier.testTag("move_later_confirm_conflict"),
+                ) { Text("Move anyway") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingConfirmation = null }) { Text("Go back") }
+            },
+            properties = DialogProperties(
+                securePolicy = if (requiresSecureWindow) {
+                    SecureFlagPolicy.SecureOn
+                } else {
+                    SecureFlagPolicy.Inherit
+                },
+            ),
+        )
+        return
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Outlined.Schedule, contentDescription = null) },
+        title = { Text("When should this continue?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    itemTitle,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                )
+                Text(
+                    moveLaterChooserExplanation(placementMode),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                presets.forEachIndexed { index, preset ->
+                    OutlinedButton(
+                        onClick = {
+                            if (preset.moveStart <= maxOf(
+                                    Instant.now(),
+                                    notBefore ?: Instant.MIN,
+                                ).plusSeconds(
+                                    MIN_CUSTOM_MOVE_LEAD_SECONDS,
+                                )
+                            ) {
+                                customError = "That option has passed; choose another time."
+                            } else {
+                                requestMove(preset.moveStart)
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("move_later_preset_$index"),
+                    ) {
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(preset.label)
+                            Text(
+                                preset.detail,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+                customError?.let { message ->
+                    Text(
+                        message,
+                        modifier = Modifier.testTag("move_later_error"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = ::chooseCustomTime,
+                modifier = Modifier.testTag("move_later_custom"),
+            ) { Text("Custom date & time") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+        properties = DialogProperties(
+            securePolicy = if (itemIsSensitive) {
+                SecureFlagPolicy.SecureOn
+            } else {
+                SecureFlagPolicy.Inherit
+            },
+        ),
     )
 }
 
@@ -845,3 +1211,5 @@ private enum class DeviceAuthEntryMode {
     ONE_TIME_CODE,
     HYBRID_BOOTSTRAP,
 }
+
+private const val MIN_CUSTOM_MOVE_LEAD_SECONDS = 60L

@@ -261,11 +261,25 @@ data class RecurrenceOutcomeSnapshot(
 )
 
 @Serializable
+data class RecurrenceOccurrenceSourceSnapshot(
+    val itemId: String,
+    val itemRevision: Long,
+    /** Nullable only for migration; a new Move requires a validated server-issued identity. */
+    val identityJson: String? = null,
+    val nominalStart: String,
+    val nominalEnd: String,
+    val localDate: String? = null,
+    val ordinal: Long,
+)
+
+@Serializable
 data class RecurrenceMoveSnapshot(
     val itemId: String,
     val startAt: String,
     val endAt: String,
     val movedAt: String,
+    /** Exact source identity required to restore this occurrence outside its nominal horizon. */
+    val source: RecurrenceOccurrenceSourceSnapshot? = null,
 )
 
 /**
@@ -383,6 +397,37 @@ data class PendingExecutionCommand(
     val canonicalProjectionEligibleAtLeaseStart: Boolean = false,
 )
 
+/**
+ * Durable user intent spanning the active-to-paused-to-deferred execution transition.
+ *
+ * Pause and Defer are separate server commands. Persisting this exact source/target tuple before
+ * Pause prevents a lost pause response or process death from forgetting the user's selected time.
+ */
+@Serializable
+data class PendingExecutionDeferIntent(
+    val syncOrigin: String,
+    val configurationId: String? = null,
+    val sessionId: String,
+    val itemId: String,
+    val itemRevision: Long,
+    val occurrenceId: String? = null,
+    val sessionIndex: Int,
+    val plannedBlockId: String,
+    val sourceDeviceId: String,
+    val focusedBlockId: String,
+    val sourceStart: String,
+    val sourceEnd: String,
+    val moveStart: String,
+    val stagedAt: String,
+    /** Exact warning envelope the user approved before an active lease was paused. */
+    val approvedConflictTargetEnd: String? = null,
+    val approvedDeadlineRisks: List<MoveLaterDeadlineRisk> = emptyList(),
+    val approvedSourceOverride: Boolean = false,
+    val approvedItemRevisions: Map<String, Long> = emptyMap(),
+    val approvedHardBlockIds: List<String> = emptyList(),
+    val approvedHardConflicts: List<MoveLaterConflictIdentity> = emptyList(),
+)
+
 @Serializable
 data class UnscheduledWorkSnapshot(
     val itemId: String,
@@ -412,6 +457,7 @@ data class CanonicalPlanUpdate(
     val errorViolationCount: Int,
     val unscheduledWork: List<UnscheduledWorkSnapshot>,
     val occurrenceSeriesItemIds: Map<String, String>,
+    val occurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot> = emptyMap(),
     val message: String,
 )
 
@@ -790,11 +836,15 @@ data class DayWeaveUiState(
     /** Lifetime ledger preventing a confirmed closed execution from being recomposed away. */
     val terminalExecutionOutcomes: Map<String, TerminalExecutionOutcomeSnapshot> = emptyMap(),
     val pendingExecutionCommand: PendingExecutionCommand? = null,
+    /** User-level move request retained while Pause and Defer reconcile across process death. */
+    val pendingExecutionDeferIntent: PendingExecutionDeferIntent? = null,
     /** Random device identity generated once and retained only inside encrypted planner state. */
     val executionDeviceId: String? = null,
     val unscheduledWork: List<UnscheduledWorkSnapshot> = emptyList(),
     /** Materialized occurrence id to the recurring root that owns its context/actions. */
     val occurrenceSeriesItemIds: Map<String, String> = emptyMap(),
+    /** Exact source envelopes for visible occurrence-scoped actions. */
+    val recurrenceOccurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot> = emptyMap(),
 ) {
     val visibleSchedule: List<ScheduleItem>
         get() = schedule
@@ -1063,6 +1113,24 @@ internal fun DayWeaveUiState.isNewestExecutionForProjection(
         )
     newest?.id == session.id
 }.getOrDefault(false)
+
+/**
+ * Returns true while any server-owned execution transition can still mutate this occurrence.
+ *
+ * A split occurrence may contain scheduled siblings beside its active block. Moving the whole
+ * occurrence from one of those siblings would otherwise detach the authoritative lease from its
+ * published source. Pending commands/intents are included because response loss can temporarily
+ * hide the lease transition from the visible timeline.
+ */
+internal fun DayWeaveUiState.hasOpenOrPendingExecutionForOccurrence(
+    occurrenceId: String,
+): Boolean = canonicalExecutionSession?.let { session ->
+    session.occurrenceId == occurrenceId && session.status in setOf("active", "paused")
+} == true || pendingExecutionCommand?.occurrenceId == occurrenceId ||
+    pendingExecutionDeferIntent?.occurrenceId == occurrenceId || schedule.any { block ->
+        block.occurrenceId == occurrenceId &&
+            block.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
+    }
 
 private fun CanonicalExecutionSessionSnapshot.hasSameExecutionProjectionKey(
     other: CanonicalExecutionSessionSnapshot,

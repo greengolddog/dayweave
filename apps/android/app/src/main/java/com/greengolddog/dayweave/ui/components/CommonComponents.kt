@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.PrivacyTip
+import androidx.compose.material.icons.outlined.Schedule
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -78,6 +79,8 @@ fun MetricCard(
 fun ScheduleItemCard(
     item: ScheduleItem,
     onStart: () -> Unit,
+    onLater: (() -> Unit)? = null,
+    onSkip: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     canStart: Boolean = true,
     unavailableLabel: String = "Needs review",
@@ -166,12 +169,33 @@ fun ScheduleItemCard(
                 )
 
                 if (item.status == ItemStatus.SCHEDULED && item.kind != ItemKind.EVENT) {
-                    AssistChip(
-                        onClick = onStart,
-                        enabled = canStart,
-                        label = { Text(if (canStart) "Start" else unavailableLabel) },
-                        leadingIcon = { Icon(Icons.Default.PlayArrow, contentDescription = null) },
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        AssistChip(
+                            onClick = onStart,
+                            enabled = canStart,
+                            label = { Text(if (canStart) "Start" else unavailableLabel) },
+                            leadingIcon = {
+                                Icon(Icons.Default.PlayArrow, contentDescription = null)
+                            },
+                        )
+                        onLater?.let { later ->
+                            AssistChip(
+                                onClick = later,
+                                enabled = canStart,
+                                label = { Text("Later") },
+                                leadingIcon = {
+                                    Icon(Icons.Outlined.Schedule, contentDescription = null)
+                                },
+                            )
+                        }
+                        onSkip?.let { skip ->
+                            AssistChip(
+                                onClick = skip,
+                                enabled = canStart,
+                                label = { Text("Skip") },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -273,17 +297,14 @@ fun ActiveItemActions(
                 modifier = Modifier.weight(1f),
             ) { Text("Skipped") }
             if (canDefer) {
-                OutlinedButton(onClick = onLater, modifier = Modifier.weight(1f)) {
+                OutlinedButton(
+                    onClick = onLater,
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
                     Text("Will do later")
                 }
             }
-        }
-        if (!canDefer) {
-            Text(
-                "Moving an active synced session later needs server support. Keep it paused, complete it, or skip it.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
         }
     }
 }

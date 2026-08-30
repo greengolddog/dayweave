@@ -12,6 +12,7 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PendingProposalApplicationMutation
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
@@ -20,6 +21,8 @@ import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
+import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
@@ -559,6 +562,7 @@ class PlannerStoreTest {
         val store = PlannerStore(
             publishedCanonicalState(item, block).copy(
                 occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+                recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
             ),
             nowEpochMillis = { 60_000L },
         )
@@ -684,7 +688,9 @@ class PlannerStoreTest {
         assertEquals(deferred.moveStart, state.canonicalExecutionHistoryWindow.single().moveStart)
         assertEquals(deferred.moveEnd, state.canonicalExecutionHistoryWindow.single().moveEnd)
         assertTrue(store.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
-        assertNotNull(state.publishedScheduleRevision)
+        assertNull(state.publishedScheduleRevision)
+        assertNull(state.publishedScheduleProof)
+        assertNull(state.scheduleInputDigest)
 
         val restarted = PlannerStore(state)
         assertTrue(restarted.isCanonicalExecutionStartBlocked(CANONICAL_BLOCK_ID))
@@ -707,22 +713,267 @@ class PlannerStoreTest {
 
     @Test
     fun recurringDeferralInvalidatesPublishedReceiptWithItsInputDigest() {
-        val occurrenceId = "66666666-6666-4666-8666-666666666666"
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
         val item = canonicalItem("planned", 7).copy(
-            recurrenceJson = "{\"frequency\":\"daily\"}",
+            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
         )
         val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
         val store = PlannerStore(
             publishedCanonicalState(item, block).copy(
                 occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+                recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
             ),
             nowEpochMillis = { 60_000L },
         )
 
-        assertNotNull(store.deferLocalCanonicalSession(CANONICAL_BLOCK_ID, 60))
+        assertNotNull(
+            store.deferLocalCanonicalSession(
+                CANONICAL_BLOCK_ID,
+                Instant.parse("1970-01-01T03:00:00Z"),
+            ),
+        )
 
         assertPublishedPlanInvalidated(store)
-        assertTrue(occurrenceId in store.state.value.recurrenceMoves)
+        val move = store.state.value.recurrenceMoves.getValue(occurrenceId)
+        assertEquals("1970-01-01T03:00:00Z", move.startAt)
+        assertEquals("1970-01-01T04:00:00Z", move.endAt)
+        assertEquals(
+            move,
+            PlannerStore(store.state.value).state.value.recurrenceMoves[occurrenceId],
+        )
+    }
+
+    @Test
+    fun recurringDeferralAnchorsTheTappedSplitAtTheChosenTime() {
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
+        val first = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(
+            occurrenceId = occurrenceId,
+            durationMinutes = 60,
+            isSplittable = true,
+        )
+        val second = first.copy(
+            id = "77777777-7777-4777-8777-777777777777",
+            startMinute = 3 * 60,
+            sessionIndex = 1,
+            absoluteStartAt = "1970-01-01T03:00:00Z",
+            absoluteEndAt = "1970-01-01T04:00:00Z",
+        )
+        val store = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(
+                    canonicalItem("planned", 7).copy(
+                        recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+                        splitPolicyJson = "{\"type\":\"splittable\"}",
+                    ),
+                ),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                schedule = listOf(first, second),
+                scheduleGeneratedAt = "1970-01-01T00:01:00Z",
+                schedulePlanningZoneId = "UTC",
+                occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+                recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
+            ),
+            nowEpochMillis = { 60_000L },
+        )
+
+        assertNotNull(
+            store.deferLocalCanonicalSession(
+                second.id,
+                Instant.parse("1970-01-01T05:00:00Z"),
+            ),
+        )
+
+        val move = store.state.value.recurrenceMoves.getValue(occurrenceId)
+        assertEquals("1970-01-01T03:00:00Z", move.startAt)
+        assertEquals("1970-01-01T06:00:00Z", move.endAt)
+    }
+
+    @Test
+    fun recurringDeferralCannotShiftScheduledSiblingOfAuthoritativeOpenLease() {
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
+        val secondBlockId = "77777777-7777-4777-8777-777777777777"
+        val first = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(
+            occurrenceId = occurrenceId,
+            durationMinutes = 30,
+            isSplittable = true,
+            absoluteEndAt = "1970-01-01T01:30:00Z",
+        )
+        val second = first.copy(
+            id = secondBlockId,
+            startMinute = 90,
+            sessionIndex = 1,
+            absoluteStartAt = "1970-01-01T01:30:00Z",
+            absoluteEndAt = "1970-01-01T02:00:00Z",
+        )
+        val openLease = executionSession("active", 1).copy(
+            occurrenceId = occurrenceId,
+            sessionIndex = 1,
+            plannedBlockId = secondBlockId,
+        )
+        val initial = DayWeaveUiState(
+            canonicalItems = listOf(
+                canonicalItem("planned", 7).copy(
+                    recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+                    splitPolicyJson = "{\"type\":\"splittable\"}",
+                ),
+            ),
+            canonicalSyncOrigin = CANONICAL_ORIGIN,
+            canonicalConfigurationId = "connection-1",
+            canonicalExecutionSyncOrigin = CANONICAL_ORIGIN,
+            canonicalExecutionConfigurationId = "connection-1",
+            canonicalExecutionSession = openLease,
+            schedule = listOf(first, second),
+            occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
+        )
+        val store = PlannerStore(initial, nowEpochMillis = { 60_000L })
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            store.deferLocalCanonicalSession(
+                CANONICAL_BLOCK_ID,
+                Instant.parse("1970-01-01T03:00:00Z"),
+            )
+        }
+
+        assertEquals(initial.schedule, store.state.value.schedule)
+        assertTrue(store.state.value.recurrenceMoves.isEmpty())
+        assertEquals(openLease, store.state.value.canonicalExecutionSession)
+    }
+
+    @Test
+    fun recurringDeferralRejectsPinnedSiblingAndUnscheduledOccurrenceRemainder() {
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
+        val focused = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(
+            occurrenceId = occurrenceId,
+            durationMinutes = 30,
+            isSplittable = true,
+            absoluteEndAt = "1970-01-01T01:30:00Z",
+        )
+        val pinnedSibling = focused.copy(
+            id = "77777777-7777-4777-8777-777777777777",
+            sessionIndex = 1,
+            startMinute = 90,
+            absoluteStartAt = "1970-01-01T01:30:00Z",
+            absoluteEndAt = "1970-01-01T02:00:00Z",
+            isFlexible = false,
+            isHardConstraint = true,
+            canonicalBlockKind = "pinned",
+        )
+        fun state(
+            schedule: List<ScheduleItem>,
+            unscheduled: List<UnscheduledWorkSnapshot> = emptyList(),
+        ) = DayWeaveUiState(
+            canonicalItems = listOf(
+                canonicalItem("planned", 7).copy(
+                    recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+                    splitPolicyJson = "{\"type\":\"splittable\"}",
+                ),
+            ),
+            canonicalSyncOrigin = CANONICAL_ORIGIN,
+            canonicalConfigurationId = "connection-1",
+            schedule = schedule,
+            unscheduledWork = unscheduled,
+            occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+            recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
+        )
+        val unsafeStates = listOf(
+            state(listOf(focused, pinnedSibling)),
+            state(
+                listOf(focused),
+                listOf(
+                    UnscheduledWorkSnapshot(
+                        itemId = "99999999-9999-4999-8999-999999999999",
+                        occurrenceId = occurrenceId,
+                        remainingMinutes = 15,
+                        reason = "no_capacity",
+                    ),
+                ),
+            ),
+        )
+
+        unsafeStates.forEach { unsafe ->
+            val store = PlannerStore(unsafe, nowEpochMillis = { 60_000L })
+            org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+                store.deferLocalCanonicalSession(
+                    CANONICAL_BLOCK_ID,
+                    Instant.parse("1970-01-01T03:00:00Z"),
+                )
+            }
+            assertTrue(store.state.value.recurrenceMoves.isEmpty())
+            assertEquals(unsafe.schedule, store.state.value.schedule)
+        }
+    }
+
+    @Test
+    fun malformedOrCustomRestoredIdentityCannotAuthorizeARecurrenceMove() {
+        val occurrenceId = "66666666-6666-5666-8666-666666666666"
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+        )
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7).copy(occurrenceId = occurrenceId)
+        val validSource = occurrenceSource()
+        val validMove = RecurrenceMoveSnapshot(
+            itemId = CANONICAL_ITEM_ID,
+            startAt = "1970-01-01T03:00:00Z",
+            endAt = "1970-01-01T04:00:00Z",
+            movedAt = "1970-01-01T00:01:00Z",
+            source = validSource,
+        )
+        val base = publishedCanonicalState(item, block).copy(
+            occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
+        )
+
+        listOf(
+            validSource.copy(identityJson = "{\"type\":\"unknown\"}"),
+            validSource.copy(identityJson = "{\"type\":\"custom\"}", localDate = null),
+        ).forEach { invalidSource ->
+            val restored = PlannerStore(
+                base.copy(
+                    recurrenceOccurrenceSources = mapOf(occurrenceId to invalidSource),
+                    recurrenceMoves = mapOf(
+                        occurrenceId to validMove.copy(source = invalidSource),
+                    ),
+                ),
+            ).state.value
+
+            if (invalidSource.identityJson?.contains("custom") == true) {
+                assertEquals(invalidSource, restored.recurrenceOccurrenceSources[occurrenceId])
+            } else {
+                assertFalse(occurrenceId in restored.recurrenceOccurrenceSources)
+            }
+            assertFalse(occurrenceId in restored.recurrenceMoves)
+            assertNull(restored.publishedScheduleProof)
+            assertTrue(restored.scheduleMessage.contains("abandoned"))
+        }
+    }
+
+    @Test
+    fun durableExecutionRejectsFractionalDeferredMoveWindows() {
+        val store = PlannerStore(publishedCanonicalState())
+        val deferred = executionSession("active", 1).copy(
+            status = "deferred",
+            revision = 2,
+            accumulatedSeconds = 60,
+            actualSeconds = 60,
+            runningSince = null,
+            endedAt = "1970-01-01T01:01:00Z",
+            moveStart = "1970-01-01T02:00:00Z",
+            moveEnd = "1970-01-01T03:00:00.500Z",
+            updatedAt = "1970-01-01T01:01:00Z",
+        )
+
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            store.reconcileCanonicalExecution(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                revision = 2,
+                activeSession = null,
+                changedSession = deferred,
+                message = "Invalid fractional defer",
+            )
+        }
+        assertTrue(store.state.value.terminalExecutionOutcomes.isEmpty())
     }
 
     @Test
@@ -2116,6 +2367,55 @@ class PlannerStoreTest {
         assertEquals(original.startMinute + 60, moved.startMinute)
     }
 
+    @Test
+    fun invalidOrSupersededRestoredDeferIntentsAreAbandonedWithoutChangingLeaseTruth() {
+        val valid = pendingExecutionDeferState()
+        val intent = requireNotNull(valid.pendingExecutionDeferIntent)
+        val session = requireNotNull(valid.canonicalExecutionSession)
+        val invalidStates = listOf(
+            "malformed timestamp" to valid.copy(
+                pendingExecutionDeferIntent = intent.copy(moveStart = "not-an-instant"),
+            ),
+            "missing lease" to valid.copy(canonicalExecutionSession = null),
+            "mismatched lease" to valid.copy(
+                canonicalExecutionSession = session.copy(
+                    id = "66666666-6666-4666-8666-666666666666",
+                ),
+            ),
+            "binding mismatch" to valid.copy(
+                canonicalExecutionConfigurationId = "connection-2",
+            ),
+        )
+
+        invalidStates.forEach { (label, restored) ->
+            val store = PlannerStore(restored, nowEpochMillis = { 3_600_000L })
+
+            assertNull(label, store.state.value.pendingExecutionDeferIntent)
+            assertEquals(
+                label,
+                restored.canonicalExecutionSession,
+                store.state.value.canonicalExecutionSession,
+            )
+            assertTrue(label, store.state.value.scheduleMessage.contains("abandoned safely"))
+        }
+    }
+
+    @Test
+    fun abandonedInvalidDeferIntentCannotWedgeCredentialQuarantine() = runBlocking {
+        val restored = pendingExecutionDeferState().copy(
+            canonicalExecutionConfigurationId = "superseded-connection",
+        )
+        val store = PlannerStore(restored, nowEpochMillis = { 3_600_000L })
+
+        assertNull(store.state.value.pendingExecutionDeferIntent)
+        assertFalse(store.hasCredentialReplacementBlocker())
+        val abandonment = requireNotNull(store.abandonCanonicalConnection())
+        assertTrue(abandonment.awaitDurable())
+        assertNull(store.state.value.canonicalSyncOrigin)
+        assertNull(store.state.value.canonicalExecutionSession)
+        assertTrue(store.state.value.schedule.isEmpty())
+    }
+
     private fun remoteSuggestion() = PlanningSuggestion(
         id = "remote-proposal",
         title = "Protect recovery time",
@@ -2248,6 +2548,48 @@ class PlannerStoreTest {
             schedulePlanningZoneId = "UTC",
         )
     }
+
+    private fun pendingExecutionDeferState(): DayWeaveUiState {
+        val block = canonicalBlock(ItemStatus.PAUSED, 7)
+        val session = executionSession("paused", 2).copy(
+            runningSince = null,
+            pausedAt = "1970-01-01T01:05:00Z",
+            accumulatedSeconds = 300,
+            updatedAt = "1970-01-01T01:05:00Z",
+        )
+        return publishedCanonicalState(block = block).copy(
+            canonicalExecutionSyncOrigin = CANONICAL_ORIGIN,
+            canonicalExecutionConfigurationId = "connection-1",
+            canonicalExecutionRevision = session.revision,
+            canonicalExecutionSession = session,
+            pendingExecutionDeferIntent = PendingExecutionDeferIntent(
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+                sessionId = session.id,
+                itemId = session.itemId,
+                itemRevision = session.itemRevision,
+                sessionIndex = session.sessionIndex,
+                plannedBlockId = requireNotNull(session.plannedBlockId),
+                sourceDeviceId = session.sourceDeviceId,
+                focusedBlockId = block.id,
+                sourceStart = requireNotNull(block.absoluteStartAt),
+                sourceEnd = requireNotNull(block.absoluteEndAt),
+                moveStart = "1970-01-01T03:00:00Z",
+                stagedAt = "1970-01-01T01:05:00Z",
+            ),
+        )
+    }
+
+    private fun occurrenceSource() = RecurrenceOccurrenceSourceSnapshot(
+        itemId = CANONICAL_ITEM_ID,
+        itemRevision = 7,
+        identityJson =
+            """{"type":"calendar_day","date":"1970-01-01","bucket_ordinal":0}""",
+        nominalStart = "1970-01-01T01:00:00Z",
+        nominalEnd = "1970-01-01T02:00:00Z",
+        localDate = "1970-01-01",
+        ordinal = 0,
+    )
 
     private fun publishedProof(
         block: ScheduleItem,

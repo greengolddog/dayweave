@@ -9,6 +9,12 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
+import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
@@ -41,6 +47,7 @@ import java.time.ZoneId
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,6 +61,9 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1252,6 +1262,341 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun scheduledOneShotLaterPersistsEarliestStartThenPublishesMovedPlan() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val moveStart = clock.plusSeconds(3 * 3_600)
+        val moved = initial.copy(
+            status = "scheduled",
+            earliestStartAt = moveStart.toString(),
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.replacementResult = moved
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = moved)),
+            "cursor-2",
+            false,
+        )
+        transport.previewResult = scheduledPreview(moved).copy(
+            plan = scheduledPreview(moved).plan.copy(
+                blocks = listOf(
+                    scheduledPreview(moved).plan.blocks.single().copy(
+                        start = "2026-09-01T12:00:00+02:00",
+                        end = "2026-09-01T13:00:00+02:00",
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.doLater(BLOCK_ID, moveStart))
+
+        assertEquals("scheduled", transport.replacementRequest?.item?.status)
+        assertEquals(moveStart.toString(), transport.replacementRequest?.item?.earliestStartAt)
+        assertEquals("cursor-2", plannerStore.state.value.canonicalDeltaCursor)
+        assertEquals("2026-09-01T10:00:00Z", plannerStore.state.value.schedule.single().absoluteStartAt)
+        assertNotNull(plannerStore.state.value.publishedScheduleProof)
+    }
+
+    @Test
+    fun scheduledLaterRequiresConflictApprovalAndDurablyExtendsCrossedDeadline() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val moveStart = Instant.parse("2026-09-01T12:00:00Z")
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+        assertEquals(null, transport.replacementRequest)
+        val approval = requireNotNull(
+            plannerStore.state.value.assessMoveLater(BLOCK_ID, moveStart, clock),
+        ).toApprovalEnvelope()
+
+        val relaxed = initial.copy(
+            status = "scheduled",
+            earliestStartAt = moveStart.toString(),
+            deadlineAt = "2026-09-01T13:00:00Z",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.replacementResult = relaxed
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = relaxed)),
+            "cursor-2",
+            false,
+        )
+        transport.previewResult = scheduledPreview(relaxed).copy(
+            plan = scheduledPreview(relaxed).plan.copy(
+                blocks = listOf(
+                    scheduledPreview(relaxed).plan.blocks.single().copy(
+                        start = "2026-09-01T14:00:00+02:00",
+                        end = "2026-09-01T15:00:00+02:00",
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager.doLater(BLOCK_ID, moveStart, approval),
+        )
+        assertEquals(moveStart.toString(), transport.replacementRequest?.item?.earliestStartAt)
+        assertEquals("2026-09-01T13:00:00Z", transport.replacementRequest?.item?.deadlineAt)
+        assertEquals("2026-09-01T13:00:00Z", plannerStore.state.value.canonicalItems.single().deadlineAt)
+    }
+
+    @Test
+    fun scheduledLaterRechecksReviewedRevisionInsideTheOperationLock() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val secondNowCall = CompletableDeferred<Unit>()
+        val nowCalls = AtomicInteger(0)
+        val signalNowCalls = AtomicBoolean(false)
+        val manager = CanonicalSyncManager(
+            plannerStore = plannerStore,
+            credentialStore = CanonicalCredentialStore(),
+            transport = transport,
+            now = {
+                if (signalNowCalls.get() && nowCalls.incrementAndGet() == 2) {
+                    secondNowCall.complete(Unit)
+                }
+                clock
+            },
+            zoneId = { ZoneId.of("Europe/Madrid") },
+        )
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager.refreshAndCompose(),
+        )
+        val moveStart = Instant.parse("2026-09-01T10:00:00Z")
+        assertFalse(
+            requireNotNull(
+                plannerStore.state.value.assessMoveLater(BLOCK_ID, moveStart, clock),
+            ).requiresConfirmation,
+        )
+
+        val lockReady = CompletableDeferred<Unit>()
+        val releaseLock = CompletableDeferred<Unit>()
+        val lockHolder = async {
+            manager.withConfigurationLock {
+                lockReady.complete(Unit)
+                releaseLock.await()
+            }
+        }
+        lockReady.await()
+        nowCalls.set(0)
+        signalNowCalls.set(true)
+        val move = async { manager.doLater(BLOCK_ID, moveStart) }
+        secondNowCall.await()
+
+        val beforeChange = plannerStore.state.value
+        val changedItem = beforeChange.canonicalItems.single().copy(
+            revision = 8,
+            deadlineAt = "2026-09-01T12:30:00Z",
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        val changedBlock = beforeChange.schedule.single().copy(canonicalRevision = 8)
+        val changeReceipt = requireNotNull(
+            plannerStore.replaceCanonicalPlan(
+                CanonicalPlanUpdate(
+                    items = listOf(changedItem),
+                    schedule = listOf(changedBlock),
+                    syncOrigin = requireNotNull(beforeChange.canonicalSyncOrigin),
+                    configurationId = beforeChange.canonicalConfigurationId,
+                    deltaCursor = "cursor-2",
+                    inputDigest = "sha256:${"b".repeat(64)}",
+                    generatedAt = clock.toString(),
+                    planningZoneId = "Europe/Madrid",
+                    rejectedItemCount = 0,
+                    unscheduledItemCount = 0,
+                    protectedFreeMinutes = 840,
+                    dayScore = 100,
+                    violationMessages = emptyList(),
+                    violationCount = 0,
+                    errorViolationCount = 0,
+                    unscheduledWork = emptyList(),
+                    occurrenceSeriesItemIds = emptyMap(),
+                    message = "New revision arrived during warning approval",
+                ),
+            ),
+        )
+        assertTrue(changeReceipt.awaitDurable())
+        releaseLock.complete(Unit)
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            move.await(),
+        )
+        lockHolder.await()
+        assertEquals(null, transport.replacementRequest)
+        assertTrue(manager.state.value.message.contains("changed after review"))
+    }
+
+    @Test
+    fun uncertainDeadlineRelaxationNeverClaimsAStatusOnlySupersedingRevision() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false)
+        var replacementAttempt = 0
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+            replacementHandler = { _, _, _ ->
+                replacementAttempt += 1
+                if (replacementAttempt == 1) {
+                    throw IOException("synthetic response loss")
+                }
+                throw PlannerApiException.Conflict()
+            }
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val superseding = initial.copy(
+            status = "scheduled",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.queuedPages.getOrPut("cursor-1", ::ArrayDeque).apply {
+            repeat(2) {
+                add(
+                    RemoteItemDeltaPage(
+                        listOf(RemoteItemDeltaChange(type = "upsert", item = superseding)),
+                        "cursor-2",
+                        false,
+                    ),
+                )
+            }
+        }
+        transport.previewResult = preview().copy(
+            sourceItemRevisions = mapOf(TASK_ID to 8L),
+        )
+
+        val moveStart = Instant.parse("2026-09-01T12:00:00Z")
+        val approval = requireNotNull(
+            plannerStore.state.value.assessMoveLater(BLOCK_ID, moveStart, clock),
+        ).toApprovalEnvelope()
+        val outcome = manager.doLater(BLOCK_ID, moveStart, approval)
+
+        assertEquals(CanonicalRefreshOutcome.TRANSIENT_NETWORK_FAILURE, outcome)
+        assertEquals(null, plannerStore.state.value.pendingCanonicalMutation)
+        assertEquals(8L, plannerStore.state.value.canonicalItems.single().revision)
+        assertEquals(initial.deadlineAt, plannerStore.state.value.canonicalItems.single().deadlineAt)
+        assertEquals(2, transport.replacementRequests.size)
+        assertTrue(transport.replacementRequests.all {
+            it.item.deadlineAt == "2026-09-01T13:00:00Z"
+        })
+    }
+
+    @Test
+    fun scheduledSkipIsLimitedToAWholeOneShotItem() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val initial = remoteItem(split = false)
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = initial)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val skipped = initial.copy(
+            status = "skipped",
+            revision = 8,
+            updatedAt = "2026-09-01T07:01:00Z",
+        )
+        transport.replacementResult = skipped
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = skipped)),
+            "cursor-2",
+            false,
+        )
+        transport.previewResult = terminalPreview(8)
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.skipScheduled(BLOCK_ID))
+        assertEquals("skipped", transport.replacementRequest?.item?.status)
+
+        assertEquals(ItemStatus.SKIPPED, plannerStore.state.value.schedule.single().status)
+    }
+
+    @Test
+    fun scheduledSkipRejectsSplitWorkWithoutWritingCanonicalStatus() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem(split = true))),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.skipScheduled(BLOCK_ID),
+        )
+        assertEquals(null, transport.replacementRequest)
+        assertEquals(ItemStatus.SCHEDULED, plannerStore.state.value.schedule.single().status)
+    }
+
+    @Test
+    fun scheduledLaterRejectsNonRecurringSplitWorkWithoutReplacingItsParent() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem(split = true))),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview()
+        }
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, clock.plusSeconds(3_600)),
+        )
+        assertEquals(null, transport.replacementRequest)
+        assertEquals(ItemStatus.SCHEDULED, plannerStore.state.value.schedule.single().status)
+    }
+
+    @Test
     fun anExpiredCanonicalBreakCanBeExtendedWithoutImplicitResume() = runBlocking {
         val plannerStore = PlannerStore(DayWeaveUiState())
         val transport = FakeCanonicalTransport().apply {
@@ -2270,11 +2615,12 @@ class CanonicalSyncManagerTest {
             sessionIndex = 1,
         )
         val recurringItem = remoteItem().copy(
-            recurrence = buildJsonObject { put("rrule", "FREQ=DAILY") },
+            recurrence = dailyRecurrence(),
         )
         val occurrence = RemotePlanOccurrence(
             id = OCCURRENCE_ID,
             seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
             nominalStart = "2026-09-01T09:00:00+02:00",
             nominalEnd = "2026-09-01T10:00:00+02:00",
             windowStart = "2026-09-01T07:00:00+02:00",
@@ -2305,6 +2651,535 @@ class CanonicalSyncManagerTest {
 
         assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, manager.skip(SECOND_BLOCK_ID))
         assertTrue(plannerStore.state.value.recurrenceOutcomes.isEmpty())
+    }
+
+    @Test
+    fun occurrenceLocalDateUsesEmbeddedNominalOffsetAcrossNegativeSeriesZone() = runBlocking {
+        val recurringItem = remoteItem(split = false).copy(
+            kind = "habit",
+            timezoneName = "America/Los_Angeles",
+            recurrence = dailyRecurrence(),
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T00:00:00Z",
+            nominalEnd = "2026-09-01T01:00:00Z",
+            windowStart = "2026-09-01T00:00:00Z",
+            windowEnd = "2026-09-01T12:00:00Z",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(
+                        preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                    ),
+                    occurrences = listOf(occurrence),
+                ),
+            )
+        }
+        val plannerStore = PlannerStore(DayWeaveUiState())
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+
+        val source = plannerStore.state.value.recurrenceOccurrenceSources
+            .getValue(OCCURRENCE_ID)
+        assertEquals("2026-09-01", source.localDate)
+        assertEquals("2026-09-01T00:00:00Z", source.nominalStart)
+    }
+
+    @Test
+    fun futureRecurrenceMoveRemainsInPreviewContextUntilItsTargetWindow() = runBlocking {
+        val recurringItem = remoteItem(split = false).copy(
+            kind = "habit",
+            recurrence = dailyRecurrence(),
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val recurringPreview = preview().copy(
+            plan = preview().plan.copy(
+                blocks = listOf(
+                    preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                ),
+                occurrences = listOf(occurrence),
+            ),
+        )
+        val initialStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                "cursor-1",
+                false,
+            )
+            previewResult = recurringPreview
+        }
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(initialStore, transport).refreshAndCompose(),
+        )
+        val movedStore = PlannerStore(
+            initialStore.state.value.copy(
+                recurrenceMoves = mapOf(
+                    OCCURRENCE_ID to RecurrenceMoveSnapshot(
+                        itemId = TASK_ID,
+                        startAt = "2026-09-01T10:00:00Z",
+                        endAt = "2026-09-01T11:00:00Z",
+                        movedAt = "2026-07-01T00:00:00Z",
+                        source = RecurrenceOccurrenceSourceSnapshot(
+                            itemId = TASK_ID,
+                            itemRevision = 7,
+                            identityJson = dailyOccurrenceIdentity().toString(),
+                            nominalStart = "2026-09-01T09:00:00+02:00",
+                            nominalEnd = "2026-09-01T10:00:00+02:00",
+                            localDate = "2026-09-01",
+                            ordinal = 0,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(movedStore, transport).refreshAndCompose(),
+        )
+
+        val exception = requireNotNull(transport.previewRequests.last().recurrenceContext["exceptions"])
+            .jsonArray.single().jsonObject
+        assertEquals(TASK_ID, exception.getValue("item_id").jsonPrimitive.content)
+        assertEquals(
+            "move",
+            exception.getValue("action").jsonObject.getValue("type").jsonPrimitive.content,
+        )
+        val source = exception.getValue("action").jsonObject.getValue("source").jsonObject
+        assertEquals("7", source.getValue("item_revision").jsonPrimitive.content)
+        assertEquals(
+            "2026-09-01T09:00:00+02:00",
+            source.getValue("nominal_start").jsonPrimitive.content,
+        )
+        assertEquals(dailyOccurrenceIdentity(), source.getValue("identity").jsonObject)
+        assertEquals("2026-09-01", source.getValue("local_date").jsonPrimitive.content)
+        assertEquals("0", source.getValue("ordinal").jsonPrimitive.content)
+    }
+
+    @Test
+    fun recurrenceMoveRejectsTomorrowAndFarTargetsWithoutATargetDayPreview() = runBlocking {
+        suspend fun verify(dayOffset: Long) {
+            val recurringItem = remoteItem(split = false).copy(
+                kind = "habit",
+                deadlineAt = null,
+                recurrence = dailyRecurrence(),
+            )
+            val sourceOccurrence = RemotePlanOccurrence(
+                id = OCCURRENCE_ID,
+                seriesItemId = TASK_ID,
+                identity = dailyOccurrenceIdentity(),
+                nominalStart = "2026-09-01T09:00:00+02:00",
+                nominalEnd = "2026-09-01T10:00:00+02:00",
+                windowStart = "2026-09-01T07:00:00+02:00",
+                windowEnd = "2026-09-01T12:00:00+02:00",
+                localDate = "2026-09-01",
+                ordinal = 0,
+                state = "generated",
+            )
+            val sourcePreview = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(
+                        preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                    ),
+                    occurrences = listOf(sourceOccurrence),
+                ),
+            )
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                    "cursor-1",
+                    false,
+                )
+                previewResult = sourcePreview
+            }
+            val sourceManager = manager(plannerStore, transport)
+            assertEquals(CanonicalRefreshOutcome.SUCCESS, sourceManager.refreshAndCompose())
+            val previewCount = transport.previewRequests.size
+            val moveStart = clock.plusSeconds(dayOffset * 86_400L + 3 * 3_600L)
+
+            assertEquals(
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+                sourceManager.doLater(BLOCK_ID, moveStart),
+            )
+            assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
+            assertEquals(previewCount, transport.previewRequests.size)
+            assertTrue(sourceManager.state.value.message.contains("loaded planning day"))
+        }
+
+        verify(dayOffset = 1)
+        verify(dayOffset = 3)
+    }
+
+    @Test
+    fun recurrenceMoveCrossingPlanningMidnightIsRejectedBeforeDurableMutation() = runBlocking {
+        val recurringItem = remoteItem(split = false).copy(
+            kind = "habit",
+            recurrence = dailyRecurrence(),
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(
+                        preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                    ),
+                    occurrences = listOf(occurrence),
+                ),
+            )
+        }
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val previewCount = transport.previewRequests.size
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-01T21:30:00Z"),
+            ),
+        )
+
+        assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
+        assertEquals(previewCount, transport.previewRequests.size)
+        assertTrue(manager.state.value.message.contains("loaded planning day"))
+    }
+
+    @Test
+    fun customRecurrenceOccurrenceCannotBeMovedWithoutARealInstanceDiscriminator() = runBlocking {
+        val recurringItem = remoteItem(split = false).copy(
+            kind = "habit",
+            recurrence = buildJsonObject {
+                put("type", "custom")
+                put("rrule", "FREQ=DAILY")
+            },
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = buildJsonObject { put("type", "custom") },
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = null,
+            ordinal = 0,
+            state = "generated",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(
+                        preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                    ),
+                    occurrences = listOf(occurrence),
+                ),
+            )
+        }
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val manager = manager(plannerStore, transport)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val previewCount = transport.previewRequests.size
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, clock.plusSeconds(3 * 3_600L)),
+        )
+
+        assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
+        assertEquals(previewCount, transport.previewRequests.size)
+        assertTrue(manager.state.value.message.contains("per-occurrence identity"))
+    }
+
+    @Test
+    fun recurrenceMoveCannotShiftScheduledSiblingOfAuthoritativeOpenLease() = runBlocking {
+        val first = preview().plan.blocks.single().copy(
+            occurrenceId = OCCURRENCE_ID,
+            end = "2026-09-01T09:30:00+02:00",
+        )
+        val second = first.copy(
+            id = SECOND_BLOCK_ID,
+            start = "2026-09-01T09:30:00+02:00",
+            end = "2026-09-01T10:00:00+02:00",
+            sessionIndex = 1,
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(
+                    RemoteItemDeltaChange(
+                        type = "upsert",
+                        item = remoteItem().copy(recurrence = dailyRecurrence()),
+                    ),
+                ),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(first, second),
+                    occurrences = listOf(occurrence),
+                ),
+            )
+        }
+        val initialStore = PlannerStore(DayWeaveUiState())
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(initialStore, transport).refreshAndCompose(),
+        )
+        val openLease = CanonicalExecutionSessionSnapshot(
+            id = "99999999-9999-4999-8999-999999999999",
+            itemId = TASK_ID,
+            itemRevision = 7,
+            occurrenceId = OCCURRENCE_ID,
+            sessionIndex = 1,
+            plannedBlockId = SECOND_BLOCK_ID,
+            sourceDeviceId = "88888888-8888-4888-8888-888888888888",
+            status = "active",
+            revision = 1,
+            accumulatedSeconds = 0,
+            startedAt = clock.toString(),
+            runningSince = clock.toString(),
+            createdAt = clock.toString(),
+            updatedAt = clock.toString(),
+        )
+        val guardedStore = PlannerStore(
+            initialStore.state.value.copy(
+                canonicalExecutionSyncOrigin = initialStore.state.value.canonicalSyncOrigin,
+                canonicalExecutionConfigurationId =
+                    initialStore.state.value.canonicalConfigurationId,
+                canonicalExecutionSession = openLease,
+            ),
+        )
+        val guardedManager = manager(guardedStore, transport)
+        val previewCount = transport.previewRequests.size
+
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            guardedManager.doLater(BLOCK_ID, clock.plusSeconds(4 * 3_600L)),
+        )
+
+        assertTrue(guardedStore.state.value.recurrenceMoves.isEmpty())
+        assertEquals(openLease, guardedStore.state.value.canonicalExecutionSession)
+        assertEquals(previewCount, transport.previewRequests.size)
+        assertTrue(guardedManager.state.value.message.contains("active occurrence session"))
+    }
+
+    @Test
+    fun recurrenceMoveRejectsPinnedSiblingAndPartialOccurrenceCapacity() = runBlocking {
+        val recurringItem = remoteItem(split = false).copy(
+            kind = "habit",
+            recurrence = dailyRecurrence(),
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(
+                    blocks = listOf(
+                        preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                    ),
+                    occurrences = listOf(occurrence),
+                ),
+            )
+        }
+        val initialStore = PlannerStore(DayWeaveUiState())
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(initialStore, transport).refreshAndCompose(),
+        )
+        val focused = initialStore.state.value.schedule.single()
+        val pinnedSibling = focused.copy(
+            id = SECOND_BLOCK_ID,
+            sessionIndex = 1,
+            absoluteStartAt = "2026-09-01T08:00:00Z",
+            absoluteEndAt = "2026-09-01T08:30:00Z",
+            isFlexible = false,
+            isHardConstraint = true,
+            canonicalBlockKind = "pinned",
+        )
+        val unsafeStates = listOf(
+            initialStore.state.value.copy(
+                schedule = initialStore.state.value.schedule + pinnedSibling,
+            ),
+            initialStore.state.value.copy(
+                unscheduledWork = listOf(
+                    UnscheduledWorkSnapshot(
+                        itemId = TASK_ID,
+                        occurrenceId = OCCURRENCE_ID,
+                        remainingMinutes = 15,
+                        reason = "no_capacity",
+                    ),
+                ),
+            ),
+        )
+        val previewCount = transport.previewRequests.size
+
+        unsafeStates.forEach { unsafe ->
+            val unsafeStore = PlannerStore(unsafe)
+            val unsafeManager = manager(unsafeStore, transport)
+            assertEquals(
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+                unsafeManager.doLater(BLOCK_ID, clock.plusSeconds(4 * 3_600L)),
+            )
+            assertTrue(unsafeStore.state.value.recurrenceMoves.isEmpty())
+            assertTrue(unsafeManager.state.value.message.contains("fully scheduled and flexible"))
+        }
+        assertEquals(previewCount, transport.previewRequests.size)
+    }
+
+    @Test
+    fun recurrenceMoveWithStaleSeriesRevisionIsNotSentAndIsClearedAfterRefresh() = runBlocking {
+        val recurring = remoteItem(split = false).copy(
+            kind = "habit",
+            recurrence = dailyRecurrence(),
+        )
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        fun occurrencePreview(revision: Long) = preview().copy(
+            sourceItemRevisions = mapOf(TASK_ID to revision),
+            plan = preview().plan.copy(
+                blocks = listOf(
+                    preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                ),
+                occurrences = listOf(occurrence),
+            ),
+        )
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurring)),
+                "cursor-1",
+                false,
+            )
+            previewResult = occurrencePreview(7)
+        }
+        val initialStore = PlannerStore(DayWeaveUiState())
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(initialStore, transport).refreshAndCompose(),
+        )
+        val staleMove = RecurrenceMoveSnapshot(
+            itemId = TASK_ID,
+            startAt = "2026-09-01T10:00:00Z",
+            endAt = "2026-09-01T11:00:00Z",
+            movedAt = "2026-09-01T07:00:00Z",
+            source = requireNotNull(
+                initialStore.state.value.recurrenceOccurrenceSources[OCCURRENCE_ID],
+            ),
+        )
+        val movedStore = PlannerStore(
+            initialStore.state.value.copy(recurrenceMoves = mapOf(OCCURRENCE_ID to staleMove)),
+        )
+        val revised = recurring.copy(revision = 8, updatedAt = "2026-09-01T07:01:00Z")
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(
+            listOf(RemoteItemDeltaChange(type = "upsert", item = revised)),
+            "cursor-2",
+            false,
+        )
+        transport.previewResult = occurrencePreview(8)
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(movedStore, transport).refreshAndCompose(),
+        )
+
+        assertTrue(
+            requireNotNull(transport.previewRequests.last().recurrenceContext["exceptions"])
+                .jsonArray.isEmpty(),
+        )
+        assertTrue(movedStore.state.value.recurrenceMoves.isEmpty())
+        assertEquals(
+            8L,
+            movedStore.state.value.recurrenceOccurrenceSources
+                .getValue(OCCURRENCE_ID).itemRevision,
+        )
     }
 
     @Test
@@ -2760,11 +3635,12 @@ class CanonicalSyncManagerTest {
         plannerStore: PlannerStore,
         transport: FakeCanonicalTransport,
         credentialStore: ApiCredentialStore = CanonicalCredentialStore(),
+        currentInstant: Instant = clock,
     ) = CanonicalSyncManager(
         plannerStore = plannerStore,
         credentialStore = credentialStore,
         transport = transport,
-        now = { clock },
+        now = { currentInstant },
         zoneId = { ZoneId.of("Europe/Madrid") },
     )
 
@@ -3053,11 +3929,22 @@ class CanonicalSyncManagerTest {
         )
     }
 
+    private fun dailyOccurrenceIdentity() = buildJsonObject {
+        put("type", "calendar_day")
+        put("date", "2026-09-01")
+        put("bucket_ordinal", 0)
+    }
+
+    private fun dailyRecurrence() = buildJsonObject {
+        put("type", "daily")
+        put("times_per_day", 1)
+    }
+
     private companion object {
         const val TASK_ID = "11111111-1111-4111-8111-111111111111"
         const val BLOCK_ID = "22222222-2222-4222-8222-222222222222"
         const val SECOND_BLOCK_ID = "33333333-3333-4333-8333-333333333333"
-        const val OCCURRENCE_ID = "44444444-4444-4444-8444-444444444444"
+        const val OCCURRENCE_ID = "44444444-4444-5444-8444-444444444444"
         const val EXECUTION_ID = "55555555-5555-4555-8555-555555555555"
         const val DEVICE_ID = "66666666-6666-4666-8666-666666666666"
     }
