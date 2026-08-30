@@ -202,7 +202,7 @@ publication body, accepted preview, configuration binding, and idempotency
 UUID needed after a crash. Schema v9 adds proposal-application recovery and
 content-free receipts; schema v10 adds canonical authoring journals, recent
 deletions, and canonical selection. Older binaries reject newer snapshots
-instead of rewriting away new state. Recently Deleted keeps seven days and at
+instead of rewriting away new state. Recently Deleted keeps 30 days and at
 most 500 metadata records; full item bodies are retained newest-first within
 per-item and aggregate byte budgets, while independent tombstone watermarks
 continue preventing stale resurrection. A sibling-file
