@@ -773,6 +773,148 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func canonicalAuthoringJournalRoundTrip() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let itemID = UUID(uuidString: "a1000000-0000-4000-8000-000000000001")!
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "a2000000-0000-4000-8000-000000000002")!,
+            itemID: itemID,
+            operation: .create,
+            draft: .init(
+                isSensitive: true,
+                title: "ENCRYPTED-AUTHORING-CANARY",
+                notes: "Offline private draft",
+                timezoneName: "Europe/Madrid",
+                durationSeconds: nil
+            ),
+            createdAt: base.savedAt
+        )
+        let snapshot = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: .inbox,
+            selectedBlockID: nil,
+            selectedCanonicalItemID: itemID,
+            blocks: [],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "Offline draft",
+            protectedFreeMinutes: 90,
+            freezeHours: 2,
+            showCompleted: true,
+            pendingCanonicalAuthoringMutations: [mutation],
+            canonicalTrash: []
+        )
+
+        try context.persistence.save(snapshot)
+        let restored = try requireValue(
+            context.persistence.load(),
+            "Canonical authoring journal was not restored"
+        )
+        try require(
+            restored.pendingCanonicalAuthoringMutations == [mutation],
+            "Canonical authoring mutation changed during encrypted round-trip"
+        )
+        try require(
+            restored.selectedCanonicalItemID == itemID,
+            "Destination-aware canonical selection was not restored"
+        )
+        let encrypted = try Data(contentsOf: context.fileURL)
+        try require(
+            encrypted.range(of: Data("ENCRYPTED-AUTHORING-CANARY".utf8)) == nil,
+            "Canonical authoring content leaked outside the encrypted snapshot"
+        )
+    }
+
+    static func schemaNineAddsNoCanonicalAuthoringIntent() throws {
+        let base = makeSnapshot()
+        let legacy = PlannerSnapshot(
+            schemaVersion: 9,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted,
+            pendingCanonicalSensitivityMutations: [],
+            proposalApplicationReceipts: [],
+            executionState: .empty
+        )
+
+        let migrated = try legacy.migratedToCurrentSchema()
+
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema-9 snapshot did not migrate to schema 10"
+        )
+        try require(
+            migrated.pendingCanonicalAuthoringMutations == [],
+            "Schema-9 migration invented canonical authoring intent"
+        )
+        try require(
+            migrated.canonicalTrash == [],
+            "Schema-9 migration invented deleted-item history"
+        )
+        try require(
+            migrated.selectedCanonicalItemID == nil,
+            "Schema-9 migration invented a canonical selection"
+        )
+    }
+
+    static func malformedCanonicalAuthoringStateIsRejected() throws {
+        let base = makeSnapshot()
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: UUID(),
+            operation: .create,
+            draft: .init(title: "Submitted without binding", timezoneName: "UTC"),
+            createdAt: base.savedAt,
+            hasBeenSubmitted: true
+        )
+        let malformed = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: .inbox,
+            selectedBlockID: nil,
+            blocks: [],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "Malformed",
+            protectedFreeMinutes: 90,
+            freezeHours: 2,
+            showCompleted: true,
+            pendingCanonicalAuthoringMutations: [mutation],
+            canonicalTrash: []
+        )
+
+        var observedMigrationError: PlannerPersistenceError?
+        do {
+            _ = try malformed.migratedToCurrentSchema()
+        } catch {
+            observedMigrationError = error
+        }
+        try require(
+            observedMigrationError == .snapshotDecodingFailed,
+            "Submitted unbound authoring state did not fail strict decoding"
+        )
+
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        var observedSaveError: PlannerPersistenceError?
+        do {
+            try context.persistence.save(malformed)
+        } catch {
+            observedSaveError = error
+        }
+        try require(
+            observedSaveError == .snapshotEncodingFailed,
+            "Malformed authoring state was written to encrypted persistence"
+        )
+    }
+
     private static func require(
         _ condition: @autoclosure () -> Bool,
         _ message: String
@@ -982,6 +1124,18 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
     func testSchemaEightProposalApplicationMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaEightAddsNoProposalApplicationIntent()
     }
+
+    func testCanonicalAuthoringJournalRoundTrip() throws {
+        try EncryptedPlannerPersistenceScenarios.canonicalAuthoringJournalRoundTrip()
+    }
+
+    func testSchemaNineCanonicalAuthoringMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaNineAddsNoCanonicalAuthoringIntent()
+    }
+
+    func testMalformedCanonicalAuthoringStateIsRejected() throws {
+        try EncryptedPlannerPersistenceScenarios.malformedCanonicalAuthoringStateIsRejected()
+    }
 }
 #elseif canImport(Testing)
 @Suite("Encrypted planner persistence")
@@ -1070,6 +1224,21 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Schema 8 migrates without inventing proposal application state")
     func schemaEightProposalApplicationMigration() throws {
         try EncryptedPlannerPersistenceScenarios.schemaEightAddsNoProposalApplicationIntent()
+    }
+
+    @Test("Canonical authoring recovery state is encrypted and round-trips exactly")
+    func canonicalAuthoringJournalRoundTrip() throws {
+        try EncryptedPlannerPersistenceScenarios.canonicalAuthoringJournalRoundTrip()
+    }
+
+    @Test("Schema 9 migrates without inventing canonical authoring intent")
+    func schemaNineCanonicalAuthoringMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaNineAddsNoCanonicalAuthoringIntent()
+    }
+
+    @Test("Malformed canonical authoring state fails closed")
+    func malformedCanonicalAuthoringState() throws {
+        try EncryptedPlannerPersistenceScenarios.malformedCanonicalAuthoringStateIsRejected()
     }
 }
 #endif

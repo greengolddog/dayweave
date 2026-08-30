@@ -373,6 +373,307 @@ struct DayWeaveAPIClientTests {
         #expect((replace["item"] as? [String: Any])?["is_sensitive"] as? Bool == false)
     }
 
+    @Test("canonical list carries exact filters and decodes items")
+    func testCanonicalListCarriesExactFiltersAndDecodesItems() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(Self.canonicalItemObject(revision: 9))]}".utf8)
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        let items = try await client.listCanonicalItems(
+            includeDeleted: true,
+            parentID: Self.parentID,
+            limit: 37
+        )
+
+        let item = try #require(items.first)
+        #expect(items.count == 1)
+        #expect(item.id == Self.itemID)
+        #expect(item.revision == 9)
+        #expect(item.title == "Canonical deep work")
+
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
+        #expect(request.method == "GET")
+        #expect(request.url.path == "/gateway/v1/items")
+        #expect(
+            request.url.query
+                == "include_deleted=true&parent_id=\(Self.parentID.uuidString.lowercased())&limit=37"
+        )
+        #expect(request.body == nil)
+        #expect(request.headers["Authorization"] == "Bearer \(Self.apiToken)")
+        #expect(request.headers["Accept"] == "application/json")
+    }
+
+    @Test("canonical get validates the requested active identity")
+    func testCanonicalGetValidatesIdentity() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.canonicalItemObject(revision: 9))}".utf8)
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        let item = try await client.canonicalItem(Self.itemID)
+
+        #expect(item.id == Self.itemID)
+        #expect(item.revision == 9)
+        let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
+        #expect(request.method == "GET")
+        #expect(request.url.path == "/gateway/v1/items/\(Self.itemID.uuidString.lowercased())")
+        #expect(request.url.query == nil)
+        #expect(request.body == nil)
+    }
+
+    @Test("canonical trash and restore carry exact revision contracts")
+    func testCanonicalTrashAndRestoreCarryExactContracts() async throws {
+        let trashedObject = Self.canonicalItemObject(
+            revision: 10,
+            deletedAt: "\"2026-08-30T09:00:00Z\""
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(trashedObject)}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.canonicalItemObject(revision: 11))}".utf8)
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        let trashed = try await client.trashCanonicalItem(
+            Self.itemID,
+            expectedRevision: 9,
+            idempotencyKey: "mac:trash-stable"
+        )
+        let restored = try await client.restoreCanonicalItem(
+            Self.itemID,
+            expectedRevision: 10,
+            idempotencyKey: "mac:restore-stable"
+        )
+
+        #expect(trashed.revision == 10)
+        #expect(trashed.deletedAt != nil)
+        #expect(restored.revision == 11)
+        #expect(restored.deletedAt == nil)
+
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        #expect(requests.count == 2)
+        #expect(requests.map(\.method) == ["DELETE", "POST"])
+        #expect(requests[0].url.path == "/gateway/v1/items/\(Self.itemID.uuidString.lowercased())")
+        #expect(requests[0].url.query == "expected_revision=9")
+        #expect(requests[0].headers["Idempotency-Key"] == "mac:trash-stable")
+        #expect(requests[0].body == nil)
+        #expect(requests[1].url.path == "/gateway/v1/items/\(Self.itemID.uuidString.lowercased())/restore")
+        #expect(requests[1].url.query == nil)
+        #expect(requests[1].headers["Idempotency-Key"] == "mac:restore-stable")
+        #expect(requests[1].headers["Content-Type"] == "application/json")
+        let restoreBody = try #require(requests[1].jsonBody)
+        #expect((restoreBody["expected_revision"] as? NSNumber)?.uint64Value == 10)
+        #expect(restoreBody.count == 1)
+    }
+
+    @Test("canonical authoring rejects invalid requests before transport")
+    func testCanonicalAuthoringRejectsInvalidRequestsBeforeTransport() async throws {
+        let client = makeClient(token: Self.apiToken)
+
+        await #expect(throws: DayWeaveAPIError.requestEncodingFailed) {
+            _ = try await client.listCanonicalItems(limit: 0)
+        }
+        await #expect(throws: DayWeaveAPIError.requestEncodingFailed) {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 0,
+                idempotencyKey: "mac:trash-stable"
+            )
+        }
+        await #expect(throws: DayWeaveAPIError.requestEncodingFailed) {
+            _ = try await client.restoreCanonicalItem(
+                Self.itemID,
+                expectedRevision: 1,
+                idempotencyKey: "contains spaces"
+            )
+        }
+        #expect(URLProtocolStub.storage.requests(for: Self.apiToken).isEmpty)
+    }
+
+    @Test("canonical mutations trust only the exact in-progress conflict contract")
+    func testCanonicalMutationTrustsExactInProgressConflict() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 409,
+                headers: [
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Cache-Control": "no-store, max-age=0",
+                    "Pragma": "no-cache",
+                ],
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"matching idempotent request is still in progress"}}"#.utf8
+                )
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        await #expect(throws: DayWeaveAPIError.trustedCanonicalMutationInProgress) {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-stable"
+            )
+        }
+    }
+
+    @Test("canonical trash trusts the exact HasChildren no-effect conflict")
+    func testCanonicalTrashTrustsExactHasChildrenConflict() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 409,
+                headers: [
+                    "Content-Type": "application/json; charset=utf-8",
+                    "Cache-Control": "no-store, max-age=0",
+                    "Pragma": "no-cache",
+                ],
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"an item with active children cannot be deleted"}}"#.utf8
+                )
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        await #expect(
+            throws: DayWeaveAPIError.trustedCanonicalMutationNoEffect(
+                conflictCode: "has_children"
+            )
+        ) {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-stable"
+            )
+        }
+    }
+
+    @Test("canonical revision conflicts require strict positive integer details")
+    func testCanonicalRevisionConflictRequiresStrictIntegerDetails() async throws {
+        let headers = [
+            "Content-Type": "application/json; charset=utf-8",
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        ]
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 409,
+                headers: headers,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"item was changed by another request","details":{"expected_revision":9,"actual_revision":10}}}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 409,
+                headers: headers,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"item was changed by another request","details":{"expected_revision":true,"actual_revision":10}}}"#.utf8
+                )
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        await #expect(
+            throws: DayWeaveAPIError.trustedCanonicalMutationNoEffect(
+                conflictCode: "revision_conflict"
+            )
+        ) {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-revision"
+            )
+        }
+
+        do {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-malformed-revision"
+            )
+            Issue.record("Expected malformed revision evidence to remain generic")
+        } catch let error as DayWeaveAPIError {
+            guard case let .server(statusCode, code, _, _) = error else {
+                Issue.record("Expected a generic server error, got \(error)")
+                return
+            }
+            #expect(statusCode == 409)
+            #expect(code == "conflict")
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("canonical conflict bodies without the required headers remain generic")
+    func testCanonicalConflictMissingRequiredHeadersFallsBackToServerError() async throws {
+        let message = "an item with active children cannot be deleted"
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 409,
+                headers: ["Content-Type": "application/json; charset=utf-8"],
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"an item with active children cannot be deleted"}}"#.utf8
+                )
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        do {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-stable"
+            )
+            Issue.record("Expected a generic conflict")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .server(
+                statusCode: 409,
+                code: "conflict",
+                message: message,
+                requestID: nil
+            ))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+    }
+
+    @Test("canonical trash rejects a response that is not a tombstone")
+    func testCanonicalTrashRejectsActiveResponse() async throws {
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"item\":\(Self.canonicalItemObject(revision: 10))}".utf8)
+            )
+        )
+        let client = makeClient(token: Self.apiToken)
+
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            _ = try await client.trashCanonicalItem(
+                Self.itemID,
+                expectedRevision: 9,
+                idempotencyKey: "mac:trash-stable"
+            )
+        }
+    }
+
     @Test("canonical sensitivity is required on current wire payloads")
     func testCanonicalSensitivityCannotBeOmitted() throws {
         var object = try #require(
@@ -558,6 +859,7 @@ struct DayWeaveAPIClientTests {
         status: String = "scheduled",
         deadlineAt: String = "\"2026-09-01T17:00:00Z\"",
         recurrence: String = #"{"type":"weekly","times_per_week":2,"weekdays":["monday","thursday"]}"#,
+        deletedAt: String = "null",
         includeFutureField: Bool = false
     ) -> String {
         let futureField = includeFutureField
@@ -587,7 +889,7 @@ struct DayWeaveAPIClientTests {
           "created_at":"2026-08-29T09:00:00Z",
           "updated_at":"2026-08-29T09:00:00.125Z",
           "completed_at":null,
-          "deleted_at":null\(futureField)
+          "deleted_at":\(deletedAt)\(futureField)
         }
         """
     }

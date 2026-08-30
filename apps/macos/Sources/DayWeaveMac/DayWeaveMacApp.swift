@@ -1,6 +1,29 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+private struct DayWeaveCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+    @ObservedObject var store: PlannerStore
+    @ObservedObject var appLock: AppLockController
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("Quick Capture…") {
+                openWindow(id: "quick-capture")
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift])
+            .disabled(!appLock.isContentAvailable || !store.canMutatePlan)
+
+            Button("Recompose Schedule") {
+                store.recomposeSchedule()
+            }
+            .keyboardShortcut("r", modifiers: [.command, .option])
+            .disabled(!appLock.isContentAvailable || !store.canRecomposeSchedule)
+        }
+    }
+}
+
 @main
 @MainActor
 struct DayWeaveMacApp: App {
@@ -137,20 +160,78 @@ struct DayWeaveMacApp: App {
         }
         .defaultSize(width: 1_420, height: 900)
         .commands {
-            CommandGroup(after: .newItem) {
-                Button("Quick Add…") {
-                    store.isQuickAddPresented = true
-                }
-                .keyboardShortcut("n", modifiers: [.command, .shift])
-                .disabled(!appLock.isContentAvailable || !store.canMutatePlan)
+            DayWeaveCommands(store: store, appLock: appLock)
+        }
 
-                Button("Recompose Schedule") {
-                    store.recomposeSchedule()
+        Window("Quick Capture", id: "quick-capture") {
+            Group {
+                if appLock.isContentAvailable {
+                    QuickCaptureView()
+                        .environmentObject(store)
+                } else {
+                    AppLockedView()
                 }
-                .keyboardShortcut("r", modifiers: [.command, .option])
-                .disabled(!appLock.isContentAvailable || !store.canRecomposeSchedule)
+            }
+            .environmentObject(appLock)
+            .environmentObject(appearance)
+            .preferredColorScheme(appearance.preferredColorScheme)
+            .tint(appearance.accentColor)
+            .onAppear {
+                updateAppLock(for: scenePhase)
+                if scenePhase == .active { activateServices() }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                updateAppLock(for: phase)
+                if phase == .active {
+                    activateServices()
+                } else {
+                    deactivateServices()
+                    store.flushPersistence()
+                }
+            }
+            .onChange(of: appLock.isContentAvailable) { _, isAvailable in
+                if isAvailable, scenePhase == .active {
+                    activateServices()
+                } else {
+                    deactivateServices()
+                    store.flushPersistence()
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(
+                for: NSApplication.willTerminateNotification
+            )) { _ in
+                deactivateServices()
+                store.flushPersistence()
+                codexConversation.shutDown()
+                codex.shutDown()
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                for: NSWorkspace.sessionDidResignActiveNotification
+            )) { _ in
+                appLock.applicationBecameInactive()
+                deactivateServices()
+                store.flushPersistence()
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                for: NSWorkspace.willSleepNotification
+            )) { _ in
+                appLock.applicationBecameInactive()
+                deactivateServices()
+                store.flushPersistence()
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                for: NSWorkspace.sessionDidBecomeActiveNotification
+            )) { _ in
+                resumeAfterSystemBoundaryIfFrontmost()
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(
+                for: NSWorkspace.didWakeNotification
+            )) { _ in
+                resumeAfterSystemBoundaryIfFrontmost()
             }
         }
+        .defaultPosition(.center)
+        .windowResizability(.contentSize)
 
         MenuBarExtra(
             "DayWeave",

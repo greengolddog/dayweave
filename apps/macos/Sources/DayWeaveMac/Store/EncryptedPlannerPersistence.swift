@@ -306,6 +306,109 @@ enum PlannerProposalApplicationJournalValidator {
     }
 }
 
+enum PlannerCanonicalAuthoringJournalValidator {
+    static let maximumMutations = 500
+    static let maximumTrashEntries = 500
+    static let maximumDiagnosticBytes = 2 * 1_024
+    static let maximumMutationBytes = 2 * 1_048_576
+    static let maximumAggregateMutationBytes = 4 * 1_048_576
+
+    static func isValidState(
+        mutations: [DayWeavePendingCanonicalAuthoringMutation],
+        trash: [DayWeaveCanonicalTrashEntry],
+        canonicalItems: [DayWeaveCanonicalItem],
+        tombstoneRevisions: [UUID: UInt64],
+        configurationIdentifier: String?
+    ) -> Bool {
+        guard mutations.count <= maximumMutations,
+              trash.count <= maximumTrashEntries,
+              Set(mutations.map(\.id)).count == mutations.count,
+              Set(mutations.map(\.itemID)).count == mutations.count,
+              Set(trash.map(\.id)).count == trash.count,
+              Set(canonicalItems.map(\.id)).count == canonicalItems.count,
+              mutations.allSatisfy(isValid),
+              trash.allSatisfy({ isValid($0, tombstoneRevisions: tombstoneRevisions) }) else {
+            return false
+        }
+
+        var aggregateMutationBytes = 0
+        for mutation in mutations {
+            guard let mutationBytes = encodedBytes(of: mutation),
+                  mutationBytes <= maximumMutationBytes,
+                  aggregateMutationBytes
+                    <= maximumAggregateMutationBytes - mutationBytes else {
+                return false
+            }
+            aggregateMutationBytes += mutationBytes
+        }
+
+        let activeItems = Dictionary(
+            canonicalItems.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let activeIDs = Set(activeItems.keys)
+        let trashIDs = Set(trash.map(\.id))
+        guard activeIDs.isDisjoint(with: trashIDs),
+              mutations.allSatisfy({ mutation in
+                  guard mutation.operation == .restore else { return true }
+                  if trashIDs.contains(mutation.itemID) { return true }
+                  // Another device may have restored the item after this
+                  // journal was written. A newer active revision is durable
+                  // evidence that keeps the intent recoverable until sync can
+                  // either reconcile exact content or expose a conflict.
+                  guard let expectedRevision = mutation.expectedRevision,
+                        let active = activeItems[mutation.itemID] else { return false }
+                  return active.deletedAt == nil && active.revision > expectedRevision
+              }) else { return false }
+
+        let bindings = Set(mutations.compactMap(\.configurationIdentifier))
+        guard bindings.count <= 1,
+              bindings.isEmpty || configurationIdentifier.map(bindings.contains) == true else {
+            return false
+        }
+        return true
+    }
+
+    static func isValid(_ mutation: DayWeavePendingCanonicalAuthoringMutation) -> Bool {
+        guard mutation.isValid,
+              mutation.createdAt.timeIntervalSinceReferenceDate.isFinite,
+              encodedBytes(of: mutation).map({ $0 <= maximumMutationBytes }) == true else {
+            return false
+        }
+        if mutation.hasBeenSubmitted, mutation.configurationIdentifier == nil { return false }
+        switch mutation.disposition {
+        case .pending:
+            return mutation.diagnostic == nil
+        case .conflicted:
+            guard let diagnostic = mutation.diagnostic else { return false }
+            return !diagnostic.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && diagnostic.utf8.count <= maximumDiagnosticBytes
+        }
+    }
+
+    private static func encodedBytes(
+        of mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) -> Int? {
+        try? JSONEncoder().encode(mutation).count
+    }
+
+    static func isValid(
+        _ entry: DayWeaveCanonicalTrashEntry,
+        tombstoneRevisions: [UUID: UInt64]
+    ) -> Bool {
+        guard entry.revision > 0,
+              entry.deletedAt.timeIntervalSinceReferenceDate.isFinite,
+              entry.parentID != entry.id,
+              tombstoneRevisions[entry.id].map({ $0 >= entry.revision }) == true else {
+            return false
+        }
+        guard let item = entry.lastKnownItem else { return true }
+        return item.id == entry.id
+            && item.revision <= entry.revision
+            && item.parentID != item.id
+    }
+}
+
 struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// Version 2 added canonical sync state, version 3 added persistent local
     /// capture quarantine diagnostics, version 4 added the encrypted execution
@@ -314,15 +417,18 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// adds durable, revision-bound sensitivity edits, version 7 adds the
     /// submitted-request and follow-up fence, version 8 adds the exact
     /// schedule-publication replay journal, and version 9 adds exact pending
-    /// proposal-application/undo requests plus bounded content-free receipts.
+    /// proposal-application/undo requests plus bounded content-free receipts,
+    /// and version 10 adds canonical authoring journals, deleted-item records,
+    /// and a destination-aware canonical selection.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 9
+    static let currentSchemaVersion = 10
 
     let schemaVersion: Int
     let savedAt: Date
     let destination: SidebarDestination?
     let selectedBlockID: UUID?
+    let selectedCanonicalItemID: UUID?
     let blocks: [ScheduleBlock]
     let suggestions: [PlanningSuggestion]
     let assistantMessages: [AssistantMessage]
@@ -342,6 +448,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let pendingSchedulePublication: PendingSchedulePublication?
     let pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation?
     let proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]?
+    let pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]?
+    let canonicalTrash: [DayWeaveCanonicalTrashEntry]?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
 
@@ -350,6 +458,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         savedAt: Date = Date(),
         destination: SidebarDestination?,
         selectedBlockID: UUID?,
+        selectedCanonicalItemID: UUID? = nil,
         blocks: [ScheduleBlock],
         suggestions: [PlanningSuggestion],
         assistantMessages: [AssistantMessage],
@@ -369,6 +478,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
         proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt]? = [],
+        pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]? = [],
+        canonicalTrash: [DayWeaveCanonicalTrashEntry]? = [],
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty
     ) {
@@ -376,6 +487,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.savedAt = savedAt
         self.destination = destination
         self.selectedBlockID = selectedBlockID
+        self.selectedCanonicalItemID = selectedCanonicalItemID
         self.blocks = blocks
         self.suggestions = suggestions
         self.assistantMessages = assistantMessages
@@ -395,6 +507,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.pendingSchedulePublication = pendingSchedulePublication
         self.pendingProposalApplicationMutation = pendingProposalApplicationMutation
         self.proposalApplicationReceipts = proposalApplicationReceipts
+        self.pendingCanonicalAuthoringMutations = pendingCanonicalAuthoringMutations
+        self.canonicalTrash = canonicalTrash
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
     }
@@ -405,13 +519,60 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
             guard executionState != nil,
                   pendingCanonicalSensitivityMutations != nil,
                   let proposalApplicationReceipts,
+                  let pendingCanonicalAuthoringMutations,
+                  let canonicalTrash,
+                  PlannerProposalApplicationJournalValidator.isValidState(
+                      pending: pendingProposalApplicationMutation,
+                      receipts: proposalApplicationReceipts
+                  ),
+                  PlannerCanonicalAuthoringJournalValidator.isValidState(
+                      mutations: pendingCanonicalAuthoringMutations,
+                      trash: canonicalTrash,
+                      canonicalItems: canonicalItems ?? [],
+                      tombstoneRevisions: canonicalTombstoneRevisions ?? [:],
+                      configurationIdentifier: canonicalConfigurationIdentifier
+                  ) else {
+                throw .snapshotDecodingFailed
+            }
+            return self
+        case 9:
+            guard executionState != nil,
+                  pendingCanonicalSensitivityMutations != nil,
+                  let proposalApplicationReceipts,
                   PlannerProposalApplicationJournalValidator.isValidState(
                       pending: pendingProposalApplicationMutation,
                       receipts: proposalApplicationReceipts
                   ) else {
                 throw .snapshotDecodingFailed
             }
-            return self
+            return PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: nil,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: [],
+                canonicalTrash: [],
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            )
         case 8:
             guard executionState != nil,
                   pendingCanonicalSensitivityMutations != nil else {
@@ -753,6 +914,12 @@ struct EncryptedPlannerPersistence: Sendable {
         _ = try save(snapshot, expectedRevision: .missing)
     }
 
+    /// Runs the exact schema and plaintext-size checks used by `save` without
+    /// loading a key, encrypting, locking, or touching durable error state.
+    func preflightSave(_ snapshot: PlannerSnapshot) throws(PlannerPersistenceError) {
+        _ = try Self.encodePlaintext(for: snapshot)
+    }
+
     @discardableResult
     func save(
         _ snapshot: PlannerSnapshot,
@@ -771,22 +938,7 @@ struct EncryptedPlannerPersistence: Sendable {
     }
 
     private func encodeEnvelope(for snapshot: PlannerSnapshot) throws(PlannerPersistenceError) -> Data {
-        guard snapshot.schemaVersion == PlannerSnapshot.currentSchemaVersion else {
-            throw .unsupportedSnapshotVersion(snapshot.schemaVersion)
-        }
-
-        let plaintext: Data
-        do {
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .millisecondsSince1970
-            encoder.outputFormatting = [.sortedKeys]
-            plaintext = try encoder.encode(snapshot)
-        } catch {
-            throw .snapshotEncodingFailed
-        }
-        guard plaintext.count <= Self.maximumPlaintextBytes else {
-            throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
-        }
+        let plaintext = try Self.encodePlaintext(for: snapshot)
 
         let key = try keyProvider.loadOrCreateKey()
         let sealedBox: AES.GCM.SealedBox
@@ -822,6 +974,31 @@ struct EncryptedPlannerPersistence: Sendable {
         }
 
         return data
+    }
+
+    private static func encodePlaintext(
+        for snapshot: PlannerSnapshot
+    ) throws(PlannerPersistenceError) -> Data {
+        guard snapshot.schemaVersion == PlannerSnapshot.currentSchemaVersion else {
+            throw .unsupportedSnapshotVersion(snapshot.schemaVersion)
+        }
+        guard (try? snapshot.migratedToCurrentSchema()) == snapshot else {
+            throw .snapshotEncodingFailed
+        }
+
+        let plaintext: Data
+        do {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .millisecondsSince1970
+            encoder.outputFormatting = [.sortedKeys]
+            plaintext = try encoder.encode(snapshot)
+        } catch {
+            throw .snapshotEncodingFailed
+        }
+        guard plaintext.count <= Self.maximumPlaintextBytes else {
+            throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
+        }
+        return plaintext
     }
 
     private func writeEnvelopeData(_ data: Data) throws(PlannerPersistenceError) {

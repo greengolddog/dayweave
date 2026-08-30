@@ -289,6 +289,388 @@ final class PlannerStoreTests: XCTestCase {
         store.complete(block.id)
         XCTAssertEqual(store.blocks.first?.status, .completed)
     }
+
+    func testCanonicalCreateDraftIsEncryptedOfflineAndRestoresWithoutSchedulePlacement() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let itemID = UUID(uuidString: "aa100000-0000-4000-8000-000000000001")!
+        let draft = DayWeaveCanonicalItemDraft(
+            isSensitive: true,
+            title: "AUTHORING-SECRET-OFFLINE-TASK",
+            notes: "Private offline authoring notes",
+            timezoneName: "Europe/Madrid",
+            durationSeconds: nil,
+            deadlineAt: now.addingTimeInterval(86_400)
+        )
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+
+        let mutation = try store.enqueueCanonicalCreate(itemID: itemID, draft: draft)
+
+        XCTAssertTrue(store.blocks.isEmpty)
+        XCTAssertEqual(store.pendingCanonicalAuthoringMutations, [mutation])
+        XCTAssertEqual(store.selectedCanonicalItemID, itemID)
+        let encrypted = try Data(contentsOf: context.fileURL)
+        XCTAssertNil(encrypted.range(of: Data("AUTHORING-SECRET-OFFLINE-TASK".utf8)))
+
+        let restored = PlannerStore(persistence: context.persistence)
+        XCTAssertEqual(restored.pendingCanonicalAuthoringMutations, [mutation])
+        XCTAssertEqual(restored.selectedCanonicalItemID, itemID)
+        XCTAssertTrue(restored.blocks.isEmpty)
+    }
+
+    func testSubmittedCanonicalDraftIsConfigurationBoundImmutableAndRestartSafe() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID(uuidString: "aa200000-0000-4000-8000-000000000002")!
+        let binding = authoringConfigurationIdentifier
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { Date(timeIntervalSince1970: 1_800_000_100) }
+        )
+        let queued = try store.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: .init(title: "Restart-safe create", timezoneName: "UTC")
+        )
+        XCTAssertTrue(store.beginCanonicalSync())
+        try store.prepareCanonicalSync(configurationIdentifier: binding)
+        _ = try store.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: binding
+        )
+        let submitted = try store.markCanonicalAuthoringMutationSubmitted(queued.id)
+
+        XCTAssertTrue(submitted.hasBeenSubmitted)
+        XCTAssertEqual(submitted.configurationIdentifier, binding)
+        store.endCanonicalSync()
+        XCTAssertThrowsError(try store.updateCanonicalAuthoringDraft(
+            submitted.id,
+            draft: .init(title: "Changed", timezoneName: "UTC")
+        ))
+        XCTAssertThrowsError(try store.discardCanonicalAuthoringMutation(submitted.id))
+
+        let restored = PlannerStore(persistence: context.persistence)
+        XCTAssertEqual(restored.pendingCanonicalAuthoringMutations, [submitted])
+        XCTAssertEqual(restored.canonicalConfigurationIdentifier, binding)
+    }
+
+    func testCanonicalTrashResponseAndRestoreRoundTripFullDeletedItem() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID(uuidString: "aa300000-0000-4000-8000-000000000003")!
+        let active = try authoringItem(id: itemID, revision: 1, deleted: false)
+        let deleted = try authoringItem(id: itemID, revision: 2, deleted: true)
+        let restoredItem = try authoringItem(id: itemID, revision: 3, deleted: false)
+        let store = PlannerStore(
+            canonicalItems: [active],
+            canonicalConfigurationIdentifier: authoringConfigurationIdentifier,
+            persistence: context.persistence,
+            restoreFromPersistence: false
+        )
+
+        let trash = try store.enqueueCanonicalTrash(itemID: itemID)
+        XCTAssertTrue(store.beginCanonicalSync())
+        _ = try store.bindCanonicalAuthoringMutation(
+            trash.id,
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        _ = try store.markCanonicalAuthoringMutationSubmitted(trash.id)
+        try store.applyCanonicalAuthoringResponse(trash.id, item: deleted)
+
+        XCTAssertNil(store.canonicalItem(id: itemID))
+        XCTAssertEqual(store.canonicalTrash.first?.lastKnownItem, deleted)
+        XCTAssertEqual(store.canonicalTombstoneRevisions[itemID], 2)
+        XCTAssertEqual(store.selectedCanonicalItemID, itemID)
+        store.endCanonicalSync()
+
+        let restore = try store.enqueueCanonicalRestore(itemID: itemID)
+        XCTAssertTrue(store.beginCanonicalSync())
+        _ = try store.bindCanonicalAuthoringMutation(
+            restore.id,
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        _ = try store.markCanonicalAuthoringMutationSubmitted(restore.id)
+        let changedRestoredItem = try authoringItem(
+            id: itemID,
+            revision: 3,
+            deleted: false,
+            title: "Unexpected replacement content"
+        )
+        XCTAssertThrowsError(
+            try store.applyCanonicalAuthoringResponse(restore.id, item: changedRestoredItem)
+        ) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .invalidRemoteResponse)
+        }
+        XCTAssertEqual(store.canonicalTrash.first?.lastKnownItem, deleted)
+        XCTAssertEqual(store.canonicalAuthoringMutation(id: restore.id)?.hasBeenSubmitted, true)
+        try store.applyCanonicalAuthoringResponse(restore.id, item: restoredItem)
+
+        XCTAssertEqual(store.canonicalItem(id: itemID), restoredItem)
+        XCTAssertTrue(store.canonicalTrash.isEmpty)
+        XCTAssertNil(store.canonicalTombstoneRevisions[itemID])
+        XCTAssertTrue(store.pendingCanonicalAuthoringMutations.isEmpty)
+        store.endCanonicalSync()
+
+        let restarted = PlannerStore(persistence: context.persistence)
+        XCTAssertEqual(restarted.canonicalItem(id: itemID), restoredItem)
+        XCTAssertTrue(restarted.canonicalTrash.isEmpty)
+    }
+
+    func testCanonicalDeltaRetainsTrashAndNewerUpsertClearsIt() throws {
+        let itemID = UUID(uuidString: "aa400000-0000-4000-8000-000000000004")!
+        let active = try authoringItem(id: itemID, revision: 1, deleted: false)
+        let newer = try authoringItem(id: itemID, revision: 3, deleted: false)
+        let deletedAt = Date(timeIntervalSince1970: 1_800_000_300)
+        let store = PlannerStore(canonicalItems: [active], restoreFromPersistence: false)
+
+        store.applyCanonicalDelta(
+            [.tombstone(.init(
+                id: itemID,
+                revision: 2,
+                deletedAt: deletedAt,
+                parentID: nil
+            ))],
+            nextCursor: "trash"
+        )
+        XCTAssertEqual(store.canonicalTrash.first?.lastKnownItem, active)
+        XCTAssertEqual(store.canonicalTrash.first?.revision, 2)
+        XCTAssertNil(store.canonicalItem(id: itemID))
+
+        store.applyCanonicalDelta([.upsert(newer)], nextCursor: "restored")
+        XCTAssertEqual(store.canonicalItem(id: itemID), newer)
+        XCTAssertTrue(store.canonicalTrash.isEmpty)
+    }
+
+    func testCanonicalAuthoringRejectsDuplicatesSelfParentAndMutationFence() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let store = PlannerStore(persistence: context.persistence, restoreFromPersistence: false)
+        let itemID = UUID(uuidString: "aa500000-0000-4000-8000-000000000005")!
+        _ = try store.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: .init(title: "First", timezoneName: "UTC")
+        )
+
+        XCTAssertThrowsError(try store.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: .init(title: "Duplicate", timezoneName: "UTC")
+        )) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .duplicateItemOperation)
+        }
+        let selfParentID = UUID()
+        XCTAssertThrowsError(try store.enqueueCanonicalCreate(
+            itemID: selfParentID,
+            draft: .init(
+                title: "Self parent",
+                timezoneName: "UTC",
+                parentID: selfParentID
+            )
+        ))
+
+        XCTAssertTrue(store.beginCanonicalSync())
+        XCTAssertThrowsError(try store.enqueueCanonicalCreate(
+            draft: .init(title: "Fenced", timezoneName: "UTC")
+        )) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .mutationFenceActive)
+        }
+        store.endCanonicalSync()
+
+        let memoryOnly = PlannerStore(restoreFromPersistence: false)
+        XCTAssertThrowsError(try memoryOnly.enqueueCanonicalCreate(
+            draft: .init(title: "Not durable", timezoneName: "UTC")
+        )) { error in
+            XCTAssertEqual(
+                error as? PlannerCanonicalAuthoringError,
+                .encryptedPersistenceRequired
+            )
+        }
+    }
+
+    func testCanonicalAuthoringSyncTransitionsRequireTheOwnedFence() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID(uuidString: "aa510000-0000-4000-8000-000000000005")!
+        let response = try authoringItem(id: itemID, revision: 1, deleted: false)
+        let store = PlannerStore(persistence: context.persistence, restoreFromPersistence: false)
+        let queued = try store.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: DayWeaveCanonicalItemDraft(item: response)
+        )
+
+        XCTAssertThrowsError(try store.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: authoringConfigurationIdentifier
+        )) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .mutationFenceActive)
+        }
+
+        XCTAssertTrue(store.beginCanonicalSync())
+        try store.prepareCanonicalSync(
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        _ = try store.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        store.endCanonicalSync()
+
+        XCTAssertThrowsError(try store.markCanonicalAuthoringMutationSubmitted(queued.id)) {
+            error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .mutationFenceActive)
+        }
+
+        XCTAssertTrue(store.beginCanonicalSync())
+        _ = try store.markCanonicalAuthoringMutationSubmitted(queued.id)
+        store.endCanonicalSync()
+
+        XCTAssertThrowsError(try store.markCanonicalAuthoringMutationConflicted(
+            queued.id,
+            diagnostic: "Must own sync fence"
+        )) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .mutationFenceActive)
+        }
+        XCTAssertThrowsError(try store.applyCanonicalAuthoringResponse(
+            queued.id,
+            item: response
+        )) { error in
+            XCTAssertEqual(error as? PlannerCanonicalAuthoringError, .mutationFenceActive)
+        }
+
+        XCTAssertTrue(store.beginCanonicalSync())
+        try store.applyCanonicalAuthoringResponse(queued.id, item: response)
+        store.endCanonicalSync()
+        XCTAssertEqual(store.canonicalItem(id: itemID), response)
+        XCTAssertTrue(store.pendingCanonicalAuthoringMutations.isEmpty)
+    }
+
+    func testConflictedSubmittedDraftCanBeCopiedWithoutDestroyingTheOriginal() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sourceID = UUID(uuidString: "aa520000-0000-4000-8000-000000000005")!
+        let copyID = UUID(uuidString: "aa520000-0000-4000-8000-000000000006")!
+        let parentID = UUID(uuidString: "aa520000-0000-4000-8000-000000000007")!
+        let parent = try authoringItem(id: parentID, revision: 1, deleted: false)
+        let store = PlannerStore(
+            canonicalItems: [parent],
+            persistence: context.persistence,
+            restoreFromPersistence: false
+        )
+        let source = try store.enqueueCanonicalCreate(
+            itemID: sourceID,
+            draft: .init(
+                status: .planned,
+                title: "Preserve this exact draft",
+                timezoneName: "UTC",
+                parentID: parentID,
+                siblingOrder: 42
+            )
+        )
+        XCTAssertTrue(store.beginCanonicalSync())
+        try store.prepareCanonicalSync(
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        _ = try store.bindCanonicalAuthoringMutation(
+            source.id,
+            configurationIdentifier: authoringConfigurationIdentifier
+        )
+        _ = try store.markCanonicalAuthoringMutationSubmitted(source.id)
+        let conflicted = try store.markCanonicalAuthoringMutationConflicted(
+            source.id,
+            diagnostic: "Server rejected the retained contract"
+        )
+        store.endCanonicalSync()
+
+        let copy = try store.duplicateConflictedCanonicalDraft(source.id, as: copyID)
+
+        XCTAssertEqual(store.canonicalAuthoringMutation(id: source.id), conflicted)
+        XCTAssertTrue(conflicted.hasBeenSubmitted)
+        XCTAssertEqual(conflicted.disposition, .conflicted)
+        XCTAssertEqual(copy.itemID, copyID)
+        XCTAssertNotEqual(copy.idempotencyKey, source.idempotencyKey)
+        XCTAssertFalse(copy.hasBeenSubmitted)
+        XCTAssertNil(copy.configurationIdentifier)
+        XCTAssertEqual(copy.draft?.status, .inbox)
+        XCTAssertNil(copy.draft?.parentID)
+        XCTAssertEqual(copy.draft?.siblingOrder, 0)
+        XCTAssertEqual(copy.draft?.title, "Preserve this exact draft")
+    }
+
+    func testCanonicalAuthoringEnqueueRollsBackOnConcurrentPersistenceFailure() throws {
+        let context = try makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let seed = PlannerStore(persistence: context.persistence, restoreFromPersistence: false)
+        seed.flushPersistence()
+        let stale = PlannerStore(persistence: context.persistence)
+        let writer = PlannerStore(persistence: context.persistence)
+        writer.lastScheduleMessage = "A newer writer committed first"
+        writer.flushPersistence()
+
+        XCTAssertThrowsError(try stale.enqueueCanonicalCreate(
+            draft: .init(title: "Must roll back", timezoneName: "UTC")
+        )) { error in
+            XCTAssertEqual(error as? PlannerPersistenceError, .concurrentModification)
+        }
+        XCTAssertTrue(stale.pendingCanonicalAuthoringMutations.isEmpty)
+        XCTAssertNil(stale.selectedCanonicalItemID)
+        XCTAssertEqual(stale.loadState, .persistenceFailed)
+    }
+
+    private var authoringConfigurationIdentifier: String {
+        "https://api.example.com/gateway|auth=static-v1:\(String(repeating: "a", count: 64))"
+    }
+
+    private func makeAuthoringPersistence() throws -> (
+        directory: URL,
+        fileURL: URL,
+        persistence: EncryptedPlannerPersistence
+    ) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "DayWeaveAuthoringStoreTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        let fileURL = directory.appendingPathComponent("planner.snapshot.encrypted")
+        let key = try PlannerEncryptionKey(data: Data(repeating: 41, count: 32))
+        return (
+            directory,
+            fileURL,
+            EncryptedPlannerPersistence(fileURL: fileURL, key: key)
+        )
+    }
+
+    private func authoringItem(
+        id: UUID,
+        revision: UInt64,
+        deleted: Bool,
+        title: String = "Canonical authoring item"
+    ) throws -> DayWeaveCanonicalItem {
+        let deletedAt = deleted ? #""2027-01-15T12:00:00Z""# : "null"
+        let data = Data(#"""
+        {
+          "id":"\#(id.uuidString.lowercased())","is_sensitive":false,
+          "kind":"task","status":"inbox","title":"\#(title)",
+          "notes":"Retained notes","timezone_name":"UTC","duration_seconds":1800,
+          "deadline_at":null,"earliest_start_at":null,"recurrence":null,
+          "flexible_constraints":{"energy":"deep"},
+          "split_policy":{"type":"indivisible"},"importance":50,"urgency":50,
+          "parent_id":null,"sibling_order":0,"is_executable":true,
+          "revision":\#(revision),"created_at":"2027-01-15T10:00:00Z",
+          "updated_at":"2027-01-15T12:00:00Z","completed_at":null,
+          "deleted_at":\#(deletedAt)
+        }
+        """#.utf8)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode(DayWeaveCanonicalItem.self, from: data)
+    }
 }
 #elseif canImport(Testing)
 import Testing

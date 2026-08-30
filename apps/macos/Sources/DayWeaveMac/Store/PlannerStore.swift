@@ -86,6 +86,56 @@ enum PlannerProposalApplicationJournalError: LocalizedError, Equatable, Sendable
     }
 }
 
+enum PlannerCanonicalAuthoringError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case mutationFenceActive
+    case activeExecution
+    case invalidDraft
+    case itemNotFound
+    case trashEntryNotFound
+    case unsupportedReplacement
+    case duplicateItemOperation
+    case mutationNotFound
+    case submittedMutationIsImmutable
+    case invalidConfiguration
+    case invalidMutation
+    case journalCapacityReached
+    case invalidRemoteResponse
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Encrypted planner persistence is required before canonical items can be authored."
+        case .mutationFenceActive:
+            "Wait for the active canonical or proposal mutation to finish."
+        case .activeExecution:
+            "Finish or pause the active cross-device execution before changing canonical items."
+        case .invalidDraft:
+            "The item draft violates the canonical item contract or hierarchy."
+        case .itemNotFound:
+            "The canonical item is no longer available."
+        case .trashEntryNotFound:
+            "The deleted item is no longer available to restore."
+        case .unsupportedReplacement:
+            "This item contains fields that this version of DayWeave cannot replace safely."
+        case .duplicateItemOperation:
+            "Another authoring operation already targets this item."
+        case .mutationNotFound:
+            "The canonical authoring operation is no longer pending."
+        case .submittedMutationIsImmutable:
+            "A submitted authoring operation is immutable until it is reconciled or conflicted."
+        case .invalidConfiguration:
+            "The authoring operation belongs to another API configuration or credential binding."
+        case .invalidMutation:
+            "The encrypted canonical authoring journal is invalid."
+        case .journalCapacityReached:
+            "The offline authoring queue is full. Sync or remove a queued item before adding more content."
+        case .invalidRemoteResponse:
+            "The server response does not prove the pending authoring operation was applied."
+        }
+    }
+}
+
 enum CanonicalSensitivityPresentation: Equatable, Sendable {
     case standard
     case own
@@ -109,10 +159,17 @@ private struct ExecutionProjectionKey: Hashable {
 final class PlannerStore: ObservableObject {
     static let maximumCanonicalTitleScalars = 500
     static let maximumRecurrenceSessionOutcomes = 10_000
+    static let maximumCanonicalTrashEntries = 500
+    static let maximumCanonicalTrashItemBytes = 256 * 1_024
+    static let maximumCanonicalTrashRetainedItemBytes = 4 * 1_024 * 1_024
+    static let canonicalTrashRetentionInterval: TimeInterval = 7 * 24 * 60 * 60
     @Published var destination: SidebarDestination? = .today {
         didSet { scheduleAutosave() }
     }
     @Published var selectedBlockID: UUID? {
+        didSet { scheduleAutosave() }
+    }
+    @Published var selectedCanonicalItemID: UUID? = nil {
         didSet { scheduleAutosave() }
     }
     @Published var blocks: [ScheduleBlock] {
@@ -162,6 +219,13 @@ final class PlannerStore: ObservableObject {
         [DayWeaveStoredProposalApplicationReceipt] {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var pendingCanonicalAuthoringMutations:
+        [DayWeavePendingCanonicalAuthoringMutation] {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var canonicalTrash: [DayWeaveCanonicalTrashEntry] {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localCaptureDiagnostics: [UUID: String] {
         didSet { scheduleAutosave() }
     }
@@ -189,6 +253,7 @@ final class PlannerStore: ObservableObject {
     private let autosaveDelay: Duration
     private let now: @Sendable () -> Date
     private var autosaveTask: Task<Void, Never>?
+    private var canonicalTrashRetentionTask: Task<Void, Never>?
     private var isCanonicalPreviewValidatedForCurrentLaunch = false
     private var persistenceRevision: PlannerPersistenceRevision = .missing
 
@@ -208,6 +273,9 @@ final class PlannerStore: ObservableObject {
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
         proposalApplicationReceipts: [DayWeaveStoredProposalApplicationReceipt] = [],
+        pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation] = [],
+        canonicalTrash: [DayWeaveCanonicalTrashEntry] = [],
+        selectedCanonicalItemID: UUID? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
         previewValidatedForCurrentLaunch: Bool = false,
@@ -234,20 +302,23 @@ final class PlannerStore: ObservableObject {
             }
         }
         let initialBlocks = restoredSnapshot?.blocks ?? blocks
+        let initialCanonicalItems = restoredSnapshot?.canonicalItems ?? canonicalItems
+        let initialCanonicalTombstoneRevisions = restoredSnapshot?.canonicalTombstoneRevisions
+            ?? canonicalTombstoneRevisions
+        let initialCanonicalConfigurationIdentifier = restoredSnapshot?.canonicalConfigurationIdentifier
+            ?? canonicalConfigurationIdentifier
         self.blocks = initialBlocks
         self.suggestions = restoredSnapshot?.suggestions ?? suggestions
         self.assistantMessages = restoredSnapshot?.assistantMessages ?? assistantMessages
-        self.canonicalItems = restoredSnapshot?.canonicalItems ?? canonicalItems
+        self.canonicalItems = initialCanonicalItems
         self.canonicalDeltaCursor = restoredSnapshot?.canonicalDeltaCursor ?? canonicalDeltaCursor
-        self.canonicalTombstoneRevisions = restoredSnapshot?.canonicalTombstoneRevisions
-            ?? canonicalTombstoneRevisions
+        self.canonicalTombstoneRevisions = initialCanonicalTombstoneRevisions
         self.completedOccurrenceIDs = restoredSnapshot?.completedOccurrenceIDs ?? completedOccurrenceIDs
         self.pendingCanonicalMutations = restoredSnapshot?.pendingCanonicalMutations ?? pendingCanonicalMutations
         self.pendingCanonicalSensitivityMutations = restoredSnapshot?.pendingCanonicalSensitivityMutations
             ?? pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = restoredSnapshot?.recurrenceSessionOutcomes ?? recurrenceSessionOutcomes
-        self.canonicalConfigurationIdentifier = restoredSnapshot?.canonicalConfigurationIdentifier
-            ?? canonicalConfigurationIdentifier
+        self.canonicalConfigurationIdentifier = initialCanonicalConfigurationIdentifier
         self.schedulePreviewProvenance = restoredSnapshot?.schedulePreviewProvenance
             ?? schedulePreviewProvenance
         self.pendingSchedulePublication = restoredSnapshot?.pendingSchedulePublication
@@ -268,6 +339,35 @@ final class PlannerStore: ObservableObject {
         ) {
             restorationError = .snapshotDecodingFailed
         }
+        let initialCanonicalAuthoringMutations = restoredSnapshot?.pendingCanonicalAuthoringMutations
+            ?? pendingCanonicalAuthoringMutations
+        let initialCanonicalTrash = restoredSnapshot?.canonicalTrash ?? canonicalTrash
+        let retentionReferenceDate = now()
+        let boundedCanonicalAuthoringMutations = Self.boundedCanonicalAuthoringMutations(
+            initialCanonicalAuthoringMutations,
+            referenceDate: retentionReferenceDate
+        )
+        let boundedCanonicalTrash = Self.boundedCanonicalTrash(
+            initialCanonicalTrash,
+            referenceDate: retentionReferenceDate,
+            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(
+                boundedCanonicalAuthoringMutations
+            )
+        )
+        let restoredCanonicalRetentionNeedsRewrite = restoredSnapshot != nil
+            && (initialCanonicalTrash != boundedCanonicalTrash
+                || initialCanonicalAuthoringMutations != boundedCanonicalAuthoringMutations)
+        self.pendingCanonicalAuthoringMutations = boundedCanonicalAuthoringMutations
+        self.canonicalTrash = boundedCanonicalTrash
+        if !PlannerCanonicalAuthoringJournalValidator.isValidState(
+            mutations: boundedCanonicalAuthoringMutations,
+            trash: boundedCanonicalTrash,
+            canonicalItems: initialCanonicalItems,
+            tombstoneRevisions: initialCanonicalTombstoneRevisions,
+            configurationIdentifier: initialCanonicalConfigurationIdentifier
+        ) {
+            restorationError = .snapshotDecodingFailed
+        }
         self.localCaptureDiagnostics = restoredSnapshot?.localCaptureDiagnostics
             ?? localCaptureDiagnostics
         let initialExecutionState = restoredSnapshot?.executionState ?? executionState
@@ -283,6 +383,15 @@ final class PlannerStore: ObservableObject {
         } else {
             selectedBlockID = initialBlocks.first?.id
         }
+        let requestedCanonicalSelection = restoredSnapshot == nil
+            ? selectedCanonicalItemID
+            : restoredSnapshot?.selectedCanonicalItemID
+        let selectableCanonicalIDs = Set(initialCanonicalItems.map(\.id))
+            .union(boundedCanonicalTrash.map(\.id))
+            .union(boundedCanonicalAuthoringMutations.map(\.itemID))
+        self.selectedCanonicalItemID = requestedCanonicalSelection.flatMap {
+            selectableCanonicalIDs.contains($0) ? $0 : nil
+        }
         self.lastScheduleMessage = restoredSnapshot?.lastScheduleMessage ?? lastScheduleMessage
         protectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes ?? 90
         freezeHours = restoredSnapshot?.freezeHours ?? 2
@@ -292,23 +401,63 @@ final class PlannerStore: ObservableObject {
         persistenceRevision = restoredRevision
 
         pruneRecurrenceHistory()
+        hardenPendingSensitivityPresentation()
 
-        if persistence != nil, restoreFromPersistence, restoredSnapshot == nil, restorationError == nil {
-            scheduleAutosave()
+        if persistence != nil, restorationError == nil {
+            if restoreFromPersistence, restoredSnapshot == nil {
+                scheduleAutosave()
+            } else if restoredCanonicalRetentionNeedsRewrite {
+                // Retention is a durable privacy boundary. Rewrite an old
+                // snapshot before exposing an indefinitely quiet restored app.
+                flushPersistence()
+            } else {
+                scheduleCanonicalTrashRetention()
+            }
         }
+    }
+
+    deinit {
+        autosaveTask?.cancel()
+        canonicalTrashRetentionTask?.cancel()
     }
 
     func flushPersistence() {
         autosaveTask?.cancel()
         autosaveTask = nil
+        canonicalTrashRetentionTask?.cancel()
+        canonicalTrashRetentionTask = nil
         guard loadState == .ready, let persistence else { return }
+        let retentionReferenceDate = now()
+        let boundedMutations = Self.boundedCanonicalAuthoringMutations(
+            pendingCanonicalAuthoringMutations,
+            referenceDate: retentionReferenceDate
+        )
+        let boundedTrash = Self.boundedCanonicalTrash(
+            canonicalTrash,
+            referenceDate: retentionReferenceDate,
+            pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+        )
 
         do {
             persistenceRevision = try persistence.save(
-                makeSnapshot(),
+                makeSnapshot(
+                    canonicalTrashOverride: boundedTrash,
+                    canonicalAuthoringMutationsOverride: boundedMutations
+                ),
                 expectedRevision: persistenceRevision
             )
+            // Install retention changes only after the exact bounded snapshot
+            // commits. A failed CAS/write leaves user transactions able to
+            // restore their complete in-memory preimage.
+            if boundedMutations != pendingCanonicalAuthoringMutations {
+                pendingCanonicalAuthoringMutations = boundedMutations
+                hardenPendingSensitivityPresentation()
+            }
+            if boundedTrash != canonicalTrash { canonicalTrash = boundedTrash }
+            autosaveTask?.cancel()
+            autosaveTask = nil
             persistenceError = nil
+            scheduleCanonicalTrashRetention()
         } catch {
             persistenceError = error
             loadState = .persistenceFailed
@@ -355,6 +504,12 @@ final class PlannerStore: ObservableObject {
         if let savedIdentifier = canonicalConfigurationIdentifier,
            Self.canonicalConfigurationIdentifier(savedIdentifier) == requestedIdentifier {
             canonicalConfigurationIdentifier = requestedIdentifier
+            for index in pendingCanonicalAuthoringMutations.indices {
+                if let saved = pendingCanonicalAuthoringMutations[index].configurationIdentifier,
+                   Self.canonicalConfigurationIdentifier(saved) == requestedIdentifier {
+                    pendingCanonicalAuthoringMutations[index].configurationIdentifier = requestedIdentifier
+                }
+            }
             if let provenance = schedulePreviewProvenance,
                Self.canonicalConfigurationIdentifier(provenance.configurationIdentifier)
                 == requestedIdentifier,
@@ -387,7 +542,16 @@ final class PlannerStore: ObservableObject {
     }
 
     func resetCanonicalSyncState() {
-        guard canMutatePlan, !hasExecutionCredentialReplacementBlocker else { return }
+        guard canMutatePlan,
+              !executionState.hasCredentialReplacementBlocker,
+              pendingCanonicalMutations.isEmpty,
+              pendingCanonicalSensitivityMutations.isEmpty,
+              pendingSchedulePublication == nil,
+              pendingProposalApplicationMutation == nil,
+              !pendingCanonicalAuthoringMutations.contains(where: \.hasBeenSubmitted) else {
+            return
+        }
+        let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
         blocks.removeAll {
             $0.sourceItemID != nil
                 || $0.syncOrigin == .canonicalPreview
@@ -395,6 +559,7 @@ final class PlannerStore: ObservableObject {
                 || $0.syncOrigin == .remoteExecutionLease
         }
         canonicalItems = []
+        canonicalTrash = []
         canonicalDeltaCursor = nil
         canonicalTombstoneRevisions = [:]
         completedOccurrenceIDs = []
@@ -406,6 +571,7 @@ final class PlannerStore: ObservableObject {
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
+        pendingCanonicalAuthoringMutations = preservedCreates
         localCaptureDiagnostics = localCaptureDiagnostics.filter { id, _ in
             blocks.contains { $0.id == id && $0.isLocallyAuthored && $0.sourceItemID == nil }
         }
@@ -414,6 +580,7 @@ final class PlannerStore: ObservableObject {
         executionState = resetExecution
         isCanonicalPreviewValidatedForCurrentLaunch = false
         selectedBlockID = blocks.first?.id
+        reconcileSelectedCanonicalItem()
         lastScheduleMessage = "Canonical cache reset locally; no server data was changed"
         flushPersistence()
     }
@@ -451,6 +618,8 @@ final class PlannerStore: ObservableObject {
     func canMutate(_ block: ScheduleBlock) -> Bool {
         guard canMutatePlan else { return false }
         guard block.syncOrigin != .remoteExecutionLease else { return false }
+        if let itemID = block.sourceItemID,
+           canonicalAuthoringMutation(itemID: itemID) != nil { return false }
         guard block.syncOrigin == .canonicalPreview || block.syncOrigin == .externalPreview else {
             return true
         }
@@ -476,6 +645,7 @@ final class PlannerStore: ObservableObject {
 
     private var hasCanonicalRemoteState: Bool {
         !canonicalItems.isEmpty
+            || !canonicalTrash.isEmpty
             || canonicalDeltaCursor != nil
             || !canonicalTombstoneRevisions.isEmpty
             || !completedOccurrenceIDs.isEmpty
@@ -486,6 +656,11 @@ final class PlannerStore: ObservableObject {
             || pendingSchedulePublication != nil
             || pendingProposalApplicationMutation != nil
             || !proposalApplicationReceipts.isEmpty
+            || pendingCanonicalAuthoringMutations.contains {
+                $0.operation != .create
+                    || $0.hasBeenSubmitted
+                    || $0.configurationIdentifier != nil
+            }
             || blocks.contains {
                 $0.syncOrigin == .canonicalPreview
                     || $0.syncOrigin == .externalPreview
@@ -653,6 +828,9 @@ final class PlannerStore: ObservableObject {
                    (indexed[item.id] == nil || item.revision > (indexed[item.id]?.revision ?? 0)) {
                     indexed[item.id] = item
                     canonicalTombstoneRevisions.removeValue(forKey: item.id)
+                    canonicalTrash.removeAll {
+                        $0.id == item.id && $0.revision < item.revision
+                    }
                     if let mutation = pendingCanonicalMutations.first(where: {
                         $0.itemID == item.id && $0.baseRevision != item.revision
                     }) {
@@ -677,8 +855,14 @@ final class PlannerStore: ObservableObject {
             case let .tombstone(tombstone):
                 if tombstone.revision >= (indexed[tombstone.id]?.revision ?? 0),
                    tombstone.revision >= (canonicalTombstoneRevisions[tombstone.id] ?? 0) {
+                    let lastKnownItem = indexed[tombstone.id]
+                        ?? canonicalTrash.first(where: { $0.id == tombstone.id })?.lastKnownItem
                     indexed.removeValue(forKey: tombstone.id)
                     canonicalTombstoneRevisions[tombstone.id] = tombstone.revision
+                    upsertCanonicalTrash(.init(
+                        tombstone: tombstone,
+                        lastKnownItem: lastKnownItem
+                    ))
                     markCanonicalMutationConflicted(
                         itemID: tombstone.id,
                         diagnostic: "The item was deleted remotely at revision \(tombstone.revision)."
@@ -690,10 +874,61 @@ final class PlannerStore: ObservableObject {
                 }
             }
         }
+        // Reconcile restore intent only against the final state of the whole
+        // delta batch. A later tombstone in this same page must win over an
+        // earlier matching upsert without silently clearing local intent.
+        for mutation in pendingCanonicalAuthoringMutations
+            where mutation.operation == .restore {
+            if let finalActiveItem = indexed[mutation.itemID] {
+                reconcileCanonicalRestoreObservation(finalActiveItem)
+            }
+        }
+        pendingCanonicalAuthoringMutations.removeAll { mutation in
+            guard mutation.operation == .trash,
+                  !mutation.hasBeenSubmitted,
+                  let expectedRevision = mutation.expectedRevision,
+                  indexed[mutation.itemID] == nil else { return false }
+            // A final newer tombstone proves the requested end state even if
+            // another device performed the delete. Clear the full local base
+            // body instead of retaining stale deleted content indefinitely.
+            return (canonicalTombstoneRevisions[mutation.itemID] ?? 0)
+                > expectedRevision
+        }
         canonicalItems = Self.hierarchicallySorted(Array(indexed.values))
+        canonicalTrash = Self.boundedCanonicalTrash(
+            canonicalTrash,
+            referenceDate: now(),
+            pinnedItemIDs: pendingCanonicalRecoveryItemIDs
+        )
         canonicalDeltaCursor = nextCursor
+        reconcileSelectedCanonicalItem()
         hardenPendingSensitivityPresentation()
         pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys))
+    }
+
+    /// A newer active upsert is cross-device evidence for a queued restore.
+    /// Resolve an exact semantic match or retain a body-backed conflict before
+    /// removing trash, keeping every intermediate snapshot schema-valid.
+    private func reconcileCanonicalRestoreObservation(
+        _ item: DayWeaveCanonicalItem
+    ) {
+        guard item.deletedAt == nil,
+              let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+                  $0.itemID == item.id && $0.operation == .restore
+              }),
+              let expectedRevision = pendingCanonicalAuthoringMutations[index]
+                  .expectedRevision,
+              item.revision > expectedRevision else { return }
+        let mutation = pendingCanonicalAuthoringMutations[index]
+        if mutation.baseItem.map({
+            DayWeaveCanonicalItemDraft(item: $0).matches(item)
+        }) ?? true {
+            pendingCanonicalAuthoringMutations.remove(at: index)
+        } else {
+            pendingCanonicalAuthoringMutations[index].disposition = .conflicted
+            pendingCanonicalAuthoringMutations[index].diagnostic =
+                "The item was restored elsewhere with different content. Review the retained deleted version and the active revision."
+        }
     }
 
     func replaceCanonicalState(
@@ -701,10 +936,100 @@ final class PlannerStore: ObservableObject {
         nextCursor: String
     ) {
         guard canPersistPlan else { return }
+        let recoveryItemIDs = pendingCanonicalRecoveryItemIDs
+        var retainedRestoreTrashByID = Dictionary(
+            uniqueKeysWithValues: canonicalTrash
+                .filter { recoveryItemIDs.contains($0.id) }
+                .map { ($0.id, $0) }
+        )
+        var retainedRestoreTombstones = canonicalTombstoneRevisions.filter {
+            recoveryItemIDs.contains($0.key)
+        }
+        for mutation in pendingCanonicalAuthoringMutations
+            where mutation.operation == .restore {
+            guard let expectedRevision = mutation.expectedRevision else { continue }
+            retainedRestoreTombstones[mutation.itemID] = max(
+                retainedRestoreTombstones[mutation.itemID] ?? 0,
+                expectedRevision
+            )
+            if retainedRestoreTrashByID[mutation.itemID] == nil {
+                // A conflicted restore can be represented by newer active
+                // evidence with no trash. Normalize its exact pre-restore
+                // revision back into a recovery record before clearing the
+                // old cursor scope, so an empty rebuilt stream cannot erase
+                // the only validator evidence for local intent.
+                retainedRestoreTrashByID[mutation.itemID] = .init(
+                    id: mutation.itemID,
+                    revision: expectedRevision,
+                    deletedAt: mutation.baseItem?.deletedAt ?? mutation.createdAt,
+                    parentID: mutation.baseItem?.parentID,
+                    lastKnownItem: mutation.baseItem
+                )
+            }
+        }
         canonicalItems = []
         canonicalDeltaCursor = nil
-        canonicalTombstoneRevisions = [:]
+        // A cursor-scope rebuild may omit deleted history. Preserve the
+        // minimum evidence pinned by a local restore journal until the rebuilt
+        // final stream supplies a newer active item or tombstone.
+        canonicalTombstoneRevisions = retainedRestoreTombstones
+        canonicalTrash = Array(retainedRestoreTrashByID.values)
         applyCanonicalDelta(changes, nextCursor: nextCursor)
+
+        let finalActiveByID = Dictionary(
+            canonicalItems.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        for mutation in pendingCanonicalAuthoringMutations
+            where mutation.operation == .trash
+                && mutation.hasBeenSubmitted
+                && finalActiveByID[mutation.itemID] == nil
+                && canonicalTrashEntry(id: mutation.itemID) == nil {
+            guard let expectedRevision = mutation.expectedRevision else { continue }
+            let nextRevision = expectedRevision.addingReportingOverflow(1)
+            guard !nextRevision.overflow else { continue }
+            canonicalTombstoneRevisions[mutation.itemID] = max(
+                canonicalTombstoneRevisions[mutation.itemID] ?? 0,
+                nextRevision.partialValue
+            )
+            canonicalTrash.append(.init(
+                id: mutation.itemID,
+                revision: nextRevision.partialValue,
+                deletedAt: now(),
+                parentID: mutation.baseItem?.parentID,
+                lastKnownItem: mutation.baseItem
+            ))
+        }
+        pendingCanonicalAuthoringMutations.removeAll { mutation in
+            mutation.operation == .trash
+                && !mutation.hasBeenSubmitted
+                && finalActiveByID[mutation.itemID] == nil
+        }
+        for index in pendingCanonicalAuthoringMutations.indices {
+            let mutation = pendingCanonicalAuthoringMutations[index]
+            switch mutation.operation {
+            case .replace where finalActiveByID[mutation.itemID] == nil:
+                pendingCanonicalAuthoringMutations[index].disposition = .conflicted
+                pendingCanonicalAuthoringMutations[index].diagnostic =
+                    "The item is absent from the authoritative canonical state. Copy the retained draft or keep the server deletion."
+            case .replace, .trash:
+                guard let expectedRevision = mutation.expectedRevision,
+                      let active = finalActiveByID[mutation.itemID],
+                      active.revision != expectedRevision else { continue }
+                pendingCanonicalAuthoringMutations[index].disposition = .conflicted
+                pendingCanonicalAuthoringMutations[index].diagnostic =
+                    "The authoritative item is now revision \(active.revision), not the retained base revision \(expectedRevision)."
+            default:
+                continue
+            }
+        }
+        canonicalTrash = Self.boundedCanonicalTrash(
+            canonicalTrash,
+            referenceDate: now(),
+            pinnedItemIDs: pendingCanonicalRecoveryItemIDs
+        )
+        reconcileSelectedCanonicalItem()
+        hardenPendingSensitivityPresentation()
     }
 
     func upsertCanonicalItem(_ item: DayWeaveCanonicalItem) {
@@ -717,6 +1042,7 @@ final class PlannerStore: ObservableObject {
             canonicalItems.append(item)
         }
         canonicalTombstoneRevisions.removeValue(forKey: item.id)
+        canonicalTrash.removeAll { $0.id == item.id && $0.revision < item.revision }
         canonicalItems = Self.hierarchicallySorted(canonicalItems)
     }
 
@@ -728,6 +1054,796 @@ final class PlannerStore: ObservableObject {
         blocks[index].syncOrigin = .canonicalPreview
         localCaptureDiagnostics.removeValue(forKey: blockID)
         upsertCanonicalItem(item)
+    }
+
+    var sortedPendingCanonicalAuthoringMutations:
+        [DayWeavePendingCanonicalAuthoringMutation] {
+        pendingCanonicalAuthoringMutations.sorted {
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+    }
+
+    func canonicalAuthoringMutation(
+        id: UUID
+    ) -> DayWeavePendingCanonicalAuthoringMutation? {
+        pendingCanonicalAuthoringMutations.first { $0.id == id }
+    }
+
+    func canonicalAuthoringMutation(
+        itemID: UUID
+    ) -> DayWeavePendingCanonicalAuthoringMutation? {
+        pendingCanonicalAuthoringMutations.first { $0.itemID == itemID }
+    }
+
+    func canonicalTrashEntry(id: UUID) -> DayWeaveCanonicalTrashEntry? {
+        canonicalTrash.first { $0.id == id }
+    }
+
+    func selectCanonicalItem(_ itemID: UUID?) {
+        guard let itemID else {
+            selectedCanonicalItemID = nil
+            return
+        }
+        let exists = canonicalItems.contains { $0.id == itemID }
+            || canonicalTrash.contains { $0.id == itemID }
+            || pendingCanonicalAuthoringMutations.contains { $0.itemID == itemID }
+        if exists { selectedCanonicalItemID = itemID }
+    }
+
+    @discardableResult
+    func enqueueCanonicalCreate(
+        itemID: UUID = UUID(),
+        draft: DayWeaveCanonicalItemDraft
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        // Capturing a new, unrelated Inbox identity is safe while another
+        // canonical item is executing. Existing-item edits keep the stricter
+        // lease fence below.
+        try requireCanonicalAuthoringUserFence(allowDuringExecution: true)
+        guard canonicalItem(id: itemID) == nil,
+              canonicalTrashEntry(id: itemID) == nil,
+              canonicalTombstoneRevisions[itemID] == nil else {
+            throw PlannerCanonicalAuthoringError.duplicateItemOperation
+        }
+        try validateCanonicalAuthoringDraft(draft, itemID: itemID)
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: itemID,
+            operation: .create,
+            draft: draft,
+            createdAt: now()
+        )
+        return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    @discardableResult
+    func enqueueCanonicalReplace(
+        itemID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringUserFence()
+        guard let item = canonicalItem(id: itemID), item.deletedAt == nil else {
+            throw PlannerCanonicalAuthoringError.itemNotFound
+        }
+        guard item.supportsCanonicalAuthoringReplacement else {
+            throw PlannerCanonicalAuthoringError.unsupportedReplacement
+        }
+        try validateCanonicalAuthoringDraft(draft, itemID: itemID)
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: itemID,
+            operation: .replace,
+            draft: draft,
+            expectedRevision: item.revision,
+            baseItem: item,
+            createdAt: now()
+        )
+        return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    @discardableResult
+    func enqueueCanonicalTrash(
+        itemID: UUID
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringUserFence()
+        guard let item = canonicalItem(id: itemID), item.deletedAt == nil else {
+            throw PlannerCanonicalAuthoringError.itemNotFound
+        }
+        guard !canonicalItems.contains(where: { $0.parentID == itemID && $0.deletedAt == nil }),
+              !pendingCanonicalAuthoringMutations.contains(where: {
+                  guard $0.disposition == .pending else { return false }
+                  if $0.draft?.parentID == itemID { return true }
+                  guard $0.operation == .restore else { return false }
+                  return canonicalTrashEntry(id: $0.itemID)?.parentID == itemID
+                      || $0.baseItem?.parentID == itemID
+              }) else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: itemID,
+            operation: .trash,
+            expectedRevision: item.revision,
+            baseItem: item,
+            createdAt: now()
+        )
+        return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    @discardableResult
+    func enqueueCanonicalRestore(
+        itemID: UUID
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringUserFence()
+        guard let entry = canonicalTrashEntry(id: itemID) else {
+            throw PlannerCanonicalAuthoringError.trashEntryNotFound
+        }
+        if let parentID = entry.parentID,
+           (!canonicalItems.contains(where: { $0.id == parentID && $0.deletedAt == nil })
+            || canonicalAuthoringMutation(itemID: parentID)?.operation == .trash) {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let deletedBase = entry.lastKnownItem.flatMap { $0.deletedAt == nil ? nil : $0 }
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: itemID,
+            operation: .restore,
+            expectedRevision: entry.revision,
+            baseItem: deletedBase,
+            createdAt: now()
+        )
+        return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    @discardableResult
+    func updateCanonicalAuthoringDraft(
+        _ mutationID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringUserFence()
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        let prior = pendingCanonicalAuthoringMutations[index]
+        guard !prior.hasBeenSubmitted,
+              prior.operation == .create || prior.operation == .replace else {
+            throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
+        }
+        try validateCanonicalAuthoringDraft(draft, itemID: prior.itemID)
+        let replacement = DayWeavePendingCanonicalAuthoringMutation(
+            id: prior.id,
+            itemID: prior.itemID,
+            operation: prior.operation,
+            draft: draft,
+            expectedRevision: prior.expectedRevision,
+            baseItem: prior.baseItem,
+            createdAt: prior.createdAt
+        )
+        guard PlannerCanonicalAuthoringJournalValidator.isValid(replacement) else {
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        pendingCanonicalAuthoringMutations[index] = replacement
+        hardenPendingSensitivityPresentation()
+        guard currentCanonicalAuthoringStateIsValid else {
+            pendingCanonicalAuthoringMutations[index] = prior
+            hardenPendingSensitivityPresentation()
+            throw PlannerCanonicalAuthoringError.journalCapacityReached
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            pendingCanonicalAuthoringMutations[index] = prior
+            throw error
+        }
+        return replacement
+    }
+
+    @discardableResult
+    func bindCanonicalAuthoringMutation(
+        _ mutationID: UUID,
+        configurationIdentifier requestedIdentifier: String
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringSyncFence()
+        guard let normalized = Self.canonicalConfigurationIdentifier(requestedIdentifier),
+              normalized == requestedIdentifier else {
+            throw PlannerCanonicalAuthoringError.invalidConfiguration
+        }
+        guard canonicalConfigurationIdentifier == nil
+                || Self.canonicalConfigurationIdentifier(canonicalConfigurationIdentifier ?? "")
+                    == normalized else {
+            throw PlannerCanonicalAuthoringError.invalidConfiguration
+        }
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        let priorMutation = pendingCanonicalAuthoringMutations[index]
+        guard !priorMutation.hasBeenSubmitted,
+              priorMutation.disposition == .pending else {
+            throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
+        }
+        if let existing = priorMutation.configurationIdentifier {
+            guard existing == normalized else {
+                throw PlannerCanonicalAuthoringError.invalidConfiguration
+            }
+            return priorMutation
+        }
+
+        let priorConfiguration = canonicalConfigurationIdentifier
+        canonicalConfigurationIdentifier = normalized
+        pendingCanonicalAuthoringMutations[index].configurationIdentifier = normalized
+        guard currentCanonicalAuthoringStateIsValid else {
+            canonicalConfigurationIdentifier = priorConfiguration
+            pendingCanonicalAuthoringMutations[index] = priorMutation
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            canonicalConfigurationIdentifier = priorConfiguration
+            pendingCanonicalAuthoringMutations[index] = priorMutation
+            throw error
+        }
+        return pendingCanonicalAuthoringMutations[index]
+    }
+
+    @discardableResult
+    func markCanonicalAuthoringMutationSubmitted(
+        _ mutationID: UUID
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringSyncFence()
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        let prior = pendingCanonicalAuthoringMutations[index]
+        guard !prior.hasBeenSubmitted,
+              prior.disposition == .pending else {
+            throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
+        }
+        guard let binding = prior.configurationIdentifier,
+              binding == canonicalConfigurationIdentifier else {
+            throw PlannerCanonicalAuthoringError.invalidConfiguration
+        }
+        pendingCanonicalAuthoringMutations[index].hasBeenSubmitted = true
+        guard currentCanonicalAuthoringStateIsValid else {
+            pendingCanonicalAuthoringMutations[index] = prior
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            pendingCanonicalAuthoringMutations[index] = prior
+            throw error
+        }
+        return pendingCanonicalAuthoringMutations[index]
+    }
+
+    @discardableResult
+    func markCanonicalAuthoringMutationConflicted(
+        _ mutationID: UUID,
+        diagnostic: String
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringSyncFence()
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        guard let bounded = Self.boundedCanonicalAuthoringDiagnostic(diagnostic) else {
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        let prior = pendingCanonicalAuthoringMutations[index]
+        pendingCanonicalAuthoringMutations[index].disposition = .conflicted
+        pendingCanonicalAuthoringMutations[index].diagnostic = bounded
+        guard currentCanonicalAuthoringStateIsValid else {
+            pendingCanonicalAuthoringMutations[index] = prior
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            pendingCanonicalAuthoringMutations[index] = prior
+            throw error
+        }
+        return pendingCanonicalAuthoringMutations[index]
+    }
+
+    func discardCanonicalAuthoringMutation(_ mutationID: UUID) throws {
+        try requireCanonicalAuthoringUserFence()
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        let mutation = pendingCanonicalAuthoringMutations[index]
+        guard !mutation.hasBeenSubmitted || mutation.disposition == .conflicted else {
+            throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
+        }
+        let priorSelection = selectedCanonicalItemID
+        pendingCanonicalAuthoringMutations.remove(at: index)
+        reconcileSelectedCanonicalItem()
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            pendingCanonicalAuthoringMutations.insert(mutation, at: index)
+            selectedCanonicalItemID = priorSelection
+            throw error
+        }
+    }
+
+    /// Preserves a conflicted submitted body while creating a fresh, editable
+    /// standalone Inbox copy with a new item identity and idempotency key. The
+    /// original conflict remains available until the user explicitly discards
+    /// it, so recovery never destroys the only retained draft.
+    @discardableResult
+    func duplicateConflictedCanonicalDraft(
+        _ mutationID: UUID,
+        as newItemID: UUID = UUID()
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        try requireCanonicalAuthoringUserFence()
+        guard let source = canonicalAuthoringMutation(id: mutationID),
+              source.disposition == .conflicted,
+              source.operation == .create || source.operation == .replace,
+              var draft = source.draft else {
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        if canonicalItemRequiresSensitivePresentation(itemID: source.itemID) {
+            // Detaching the copy from its ancestry must never downgrade an
+            // inherited privacy boundary into an ordinary standalone item.
+            draft.isSensitive = true
+        }
+        draft.status = .inbox
+        draft.parentID = nil
+        draft.siblingOrder = 0
+        return try enqueueCanonicalCreate(itemID: newItemID, draft: draft)
+    }
+
+    func applyCanonicalAuthoringResponse(
+        _ mutationID: UUID,
+        item response: DayWeaveCanonicalItem
+    ) throws {
+        try requireCanonicalAuthoringSyncFence()
+        guard let index = pendingCanonicalAuthoringMutations.firstIndex(where: {
+            $0.id == mutationID
+        }) else { throw PlannerCanonicalAuthoringError.mutationNotFound }
+        let mutation = pendingCanonicalAuthoringMutations[index]
+        guard mutation.hasBeenSubmitted,
+              mutation.disposition == .pending,
+              response.id == mutation.itemID,
+              response.revision > 0 else {
+            throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+        }
+        let minimumRevision: UInt64
+        switch mutation.operation {
+        case .create:
+            minimumRevision = 1
+            guard response.deletedAt == nil,
+                  mutation.draft?.matches(response) == true else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+        case .replace:
+            guard let expected = mutation.expectedRevision,
+                  let draft = mutation.draft,
+                  response.deletedAt == nil,
+                  draft.matches(response) else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            let next = expected.addingReportingOverflow(1)
+            guard !next.overflow else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            minimumRevision = next.partialValue
+        case .trash:
+            guard let expected = mutation.expectedRevision,
+                  response.deletedAt != nil,
+                  mutation.baseItem.map({
+                      DayWeaveCanonicalItemDraft(item: $0).matches(response)
+                  }) ?? true else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            let next = expected.addingReportingOverflow(1)
+            guard !next.overflow else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            minimumRevision = next.partialValue
+        case .restore:
+            guard let expected = mutation.expectedRevision,
+                  response.deletedAt == nil,
+                  mutation.baseItem.map({
+                      DayWeaveCanonicalItemDraft(item: $0).matches(response)
+                  }) ?? true else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            let next = expected.addingReportingOverflow(1)
+            guard !next.overflow else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            minimumRevision = next.partialValue
+        }
+        guard response.revision >= minimumRevision else {
+            throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+        }
+
+        let priorItems = canonicalItems
+        let priorTrash = canonicalTrash
+        let priorTombstones = canonicalTombstoneRevisions
+        let priorMutations = pendingCanonicalAuthoringMutations
+        let priorSelection = selectedCanonicalItemID
+
+        switch mutation.operation {
+        case .trash:
+            guard (canonicalItems.first(where: { $0.id == response.id })?.revision ?? 0)
+                    <= response.revision else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            canonicalItems.removeAll { $0.id == response.id }
+            canonicalTombstoneRevisions[response.id] = max(
+                canonicalTombstoneRevisions[response.id] ?? 0,
+                response.revision
+            )
+            upsertCanonicalTrash(DayWeaveCanonicalTrashEntry(item: response))
+        case .create, .replace, .restore:
+            guard response.revision > (canonicalTombstoneRevisions[response.id] ?? 0) else {
+                throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+            }
+            if let current = canonicalItems.first(where: { $0.id == response.id }),
+               current.revision > response.revision {
+                guard mutation.operation == .restore
+                        || mutation.draft?.matches(current) == true else {
+                    throw PlannerCanonicalAuthoringError.invalidRemoteResponse
+                }
+            } else {
+                canonicalItems.removeAll { $0.id == response.id }
+                canonicalItems.append(response)
+                canonicalItems = Self.hierarchicallySorted(canonicalItems)
+            }
+            canonicalTombstoneRevisions.removeValue(forKey: response.id)
+            canonicalTrash.removeAll { $0.id == response.id }
+        }
+        pendingCanonicalAuthoringMutations.remove(at: index)
+        selectedCanonicalItemID = response.id
+        guard currentCanonicalAuthoringStateIsValid else {
+            canonicalItems = priorItems
+            canonicalTrash = priorTrash
+            canonicalTombstoneRevisions = priorTombstones
+            pendingCanonicalAuthoringMutations = priorMutations
+            selectedCanonicalItemID = priorSelection
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            canonicalItems = priorItems
+            canonicalTrash = priorTrash
+            canonicalTombstoneRevisions = priorTombstones
+            pendingCanonicalAuthoringMutations = priorMutations
+            selectedCanonicalItemID = priorSelection
+            throw error
+        }
+    }
+
+    private func requireCanonicalAuthoringPersistence(
+        allowDuringExecution: Bool = false
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerCanonicalAuthoringError.encryptedPersistenceRequired
+        }
+        guard pendingProposalApplicationMutation == nil,
+              pendingSchedulePublication == nil else {
+            throw PlannerCanonicalAuthoringError.mutationFenceActive
+        }
+        if !allowDuringExecution {
+            guard executionState.activeSession == nil,
+                  executionState.pendingCommand == nil else {
+                throw PlannerCanonicalAuthoringError.activeExecution
+            }
+        }
+    }
+
+    private func requireCanonicalAuthoringUserFence(
+        allowDuringExecution: Bool = false
+    ) throws {
+        try requireCanonicalAuthoringPersistence(
+            allowDuringExecution: allowDuringExecution
+        )
+        guard canMutatePlan else {
+            throw PlannerCanonicalAuthoringError.mutationFenceActive
+        }
+    }
+
+    private func requireCanonicalAuthoringSyncFence() throws {
+        try requireCanonicalAuthoringPersistence()
+        guard isCanonicalSyncLocked else {
+            throw PlannerCanonicalAuthoringError.mutationFenceActive
+        }
+    }
+
+    private func validateCanonicalAuthoringDraft(
+        _ draft: DayWeaveCanonicalItemDraft,
+        itemID: UUID
+    ) throws {
+        guard draft.validationIssue(itemID: itemID) == nil,
+              canonicalAuthoringDraftHierarchyIsCurrent(
+                  draft,
+                  itemID: itemID,
+                  requiresCommittedParent: false
+              ) else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+    }
+
+    func canonicalAuthoringDraftHierarchyIsCurrent(
+        _ draft: DayWeaveCanonicalItemDraft,
+        itemID: UUID,
+        requiresCommittedParent: Bool
+    ) -> Bool {
+        guard !wouldCreateCanonicalHierarchyCycle(
+            itemID: itemID,
+            parentID: draft.parentID
+        ) else { return false }
+        guard let parentID = draft.parentID else { return true }
+
+        let parentStatus: DayWeaveCanonicalItemStatus?
+        if requiresCommittedParent {
+            parentStatus = canonicalItem(id: parentID)?.status
+        } else if let mutation = canonicalAuthoringMutation(itemID: parentID) {
+            guard mutation.disposition == .pending else { return false }
+            switch mutation.operation {
+            case .create, .replace:
+                parentStatus = mutation.draft?.status
+            case .restore:
+                parentStatus = mutation.baseItem?.status
+                    ?? canonicalTrashEntry(id: parentID)?.lastKnownItem?.status
+            case .trash:
+                return false
+            }
+        } else {
+            parentStatus = canonicalItem(id: parentID)?.status
+        }
+        return parentStatus == .inbox || parentStatus == .planned
+    }
+
+    private func wouldCreateCanonicalHierarchyCycle(
+        itemID: UUID,
+        parentID: UUID?
+    ) -> Bool {
+        guard let parentID else { return false }
+        var parentByID = Dictionary(uniqueKeysWithValues: canonicalItems.compactMap { item in
+            item.parentID.map { (item.id, $0) }
+        })
+        var knownIDs = Set(canonicalItems.map(\.id))
+        for mutation in pendingCanonicalAuthoringMutations {
+            knownIDs.insert(mutation.itemID)
+            if let parent = mutation.draft?.parentID {
+                parentByID[mutation.itemID] = parent
+            } else if mutation.draft != nil {
+                parentByID.removeValue(forKey: mutation.itemID)
+            }
+        }
+        knownIDs.insert(itemID)
+        parentByID[itemID] = parentID
+        guard knownIDs.contains(parentID) else { return true }
+
+        var visited = Set([itemID])
+        var current: UUID? = parentID
+        while let candidate = current {
+            guard visited.insert(candidate).inserted else { return true }
+            current = parentByID[candidate]
+        }
+        return false
+    }
+
+    private func appendCanonicalAuthoringMutation(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        guard canonicalAuthoringMutation(itemID: mutation.itemID) == nil,
+              pendingCanonicalMutations.allSatisfy({ $0.itemID != mutation.itemID }),
+              pendingCanonicalSensitivityMutations.allSatisfy({
+                  $0.itemID != mutation.itemID
+              }) else {
+            throw PlannerCanonicalAuthoringError.duplicateItemOperation
+        }
+        guard PlannerCanonicalAuthoringJournalValidator.isValid(mutation) else {
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+        let priorSelection = selectedCanonicalItemID
+        pendingCanonicalAuthoringMutations.append(mutation)
+        selectedCanonicalItemID = mutation.itemID
+        hardenPendingSensitivityPresentation()
+        guard currentCanonicalAuthoringStateIsValid else {
+            pendingCanonicalAuthoringMutations.removeAll { $0.id == mutation.id }
+            selectedCanonicalItemID = priorSelection
+            throw PlannerCanonicalAuthoringError.journalCapacityReached
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            pendingCanonicalAuthoringMutations.removeAll { $0.id == mutation.id }
+            selectedCanonicalItemID = priorSelection
+            throw error
+        }
+        return mutation
+    }
+
+    private var currentCanonicalAuthoringStateIsValid: Bool {
+        PlannerCanonicalAuthoringJournalValidator.isValidState(
+            mutations: pendingCanonicalAuthoringMutations,
+            trash: canonicalTrash,
+            canonicalItems: canonicalItems,
+            tombstoneRevisions: canonicalTombstoneRevisions,
+            configurationIdentifier: canonicalConfigurationIdentifier
+        )
+    }
+
+    private func flushCanonicalAuthoringTransition() throws {
+        if let persistence {
+            let retentionReferenceDate = now()
+            let boundedMutations = Self.boundedCanonicalAuthoringMutations(
+                pendingCanonicalAuthoringMutations,
+                referenceDate: retentionReferenceDate
+            )
+            let boundedTrash = Self.boundedCanonicalTrash(
+                canonicalTrash,
+                referenceDate: retentionReferenceDate,
+                pinnedItemIDs: Self.canonicalRecoveryPinnedItemIDs(boundedMutations)
+            )
+            try persistence.preflightSave(makeSnapshot(
+                canonicalTrashOverride: boundedTrash,
+                canonicalAuthoringMutationsOverride: boundedMutations
+            ))
+        }
+        flushPersistence()
+        if let persistenceError { throw persistenceError }
+    }
+
+    private static func boundedCanonicalAuthoringDiagnostic(
+        _ diagnostic: String
+    ) -> String? {
+        let source = diagnostic.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else { return nil }
+        var result = ""
+        var usedBytes = 0
+        for scalar in source.unicodeScalars {
+            let value = scalar.value
+            let byteCount: Int = switch value {
+            case 0...0x7F: 1
+            case 0x80...0x7FF: 2
+            case 0x800...0xFFFF: 3
+            default: 4
+            }
+            guard usedBytes + byteCount
+                    <= PlannerCanonicalAuthoringJournalValidator.maximumDiagnosticBytes else {
+                break
+            }
+            result.unicodeScalars.append(scalar)
+            usedBytes += byteCount
+        }
+        return result.isEmpty ? nil : result
+    }
+
+    private func upsertCanonicalTrash(_ entry: DayWeaveCanonicalTrashEntry) {
+        if let index = canonicalTrash.firstIndex(where: { $0.id == entry.id }) {
+            guard canonicalTrash[index].revision <= entry.revision else { return }
+            canonicalTrash[index] = entry
+        } else {
+            canonicalTrash.append(entry)
+        }
+        canonicalTrash = Self.boundedCanonicalTrash(
+            canonicalTrash,
+            referenceDate: now(),
+            pinnedItemIDs: pendingCanonicalRecoveryItemIDs
+        )
+    }
+
+    private static func sortedCanonicalTrash(
+        _ entries: [DayWeaveCanonicalTrashEntry]
+    ) -> [DayWeaveCanonicalTrashEntry] {
+        entries.sorted { left, right in
+            if left.deletedAt != right.deletedAt { return left.deletedAt > right.deletedAt }
+            return left.id.uuidString < right.id.uuidString
+        }
+    }
+
+    /// Trash and restore requests need only item identity, expected revision,
+    /// and their stable idempotency key. A full base body improves short-term
+    /// response validation, but must not outlive the same seven-day privacy
+    /// boundary as Recently Deleted. Rebuilding with the same mutation ID
+    /// preserves the exact request identity and every sync/conflict fence.
+    private static func boundedCanonicalAuthoringMutations(
+        _ mutations: [DayWeavePendingCanonicalAuthoringMutation],
+        referenceDate: Date
+    ) -> [DayWeavePendingCanonicalAuthoringMutation] {
+        let cutoff = referenceDate.addingTimeInterval(-canonicalTrashRetentionInterval)
+        return mutations.map { mutation in
+            guard let baseItem = mutation.baseItem else { return mutation }
+            let retentionAnchor: Date
+            switch mutation.operation {
+            case .trash:
+                retentionAnchor = mutation.createdAt
+            case .restore:
+                guard let deletedAt = baseItem.deletedAt else { return mutation }
+                // A remote future timestamp cannot postpone local expiry.
+                retentionAnchor = min(deletedAt, mutation.createdAt)
+            case .create, .replace:
+                return mutation
+            }
+            guard retentionAnchor <= cutoff else { return mutation }
+            return DayWeavePendingCanonicalAuthoringMutation(
+                id: mutation.id,
+                itemID: mutation.itemID,
+                operation: mutation.operation,
+                draft: nil,
+                expectedRevision: mutation.expectedRevision,
+                baseItem: nil,
+                createdAt: mutation.createdAt,
+                configurationIdentifier: mutation.configurationIdentifier,
+                hasBeenSubmitted: mutation.hasBeenSubmitted,
+                disposition: mutation.disposition,
+                diagnostic: mutation.diagnostic
+            )
+        }
+    }
+
+    /// Recently deleted metadata is useful for recovery, but retaining every
+    /// full item body forever lets ordinary deletion history exhaust the
+    /// encrypted snapshot. Keep seven days of bounded metadata and retain full
+    /// bodies newest-first within a separate byte budget. Tombstone revision
+    /// watermarks remain independent, so pruning can never resurrect an item.
+    private static func boundedCanonicalTrash(
+        _ entries: [DayWeaveCanonicalTrashEntry],
+        referenceDate: Date,
+        pinnedItemIDs: Set<UUID>
+    ) -> [DayWeaveCanonicalTrashEntry] {
+        let cutoff = referenceDate.addingTimeInterval(-canonicalTrashRetentionInterval)
+        let encoder = JSONEncoder()
+        var seen = Set<UUID>()
+        let locallyAnchored = entries.map {
+            $0.clampingDeletedAt(to: referenceDate)
+        }
+        let sorted = sortedCanonicalTrash(locallyAnchored).filter {
+            seen.insert($0.id).inserted
+        }
+        let pinned = sorted.filter { pinnedItemIDs.contains($0.id) }
+            .prefix(maximumCanonicalTrashEntries)
+        let availableUnpinnedSlots = maximumCanonicalTrashEntries - pinned.count
+        let recentUnpinned = sorted.filter {
+            !pinnedItemIDs.contains($0.id) && $0.deletedAt > cutoff
+        }.prefix(availableUnpinnedSlots)
+        let candidates = sortedCanonicalTrash(Array(pinned) + Array(recentUnpinned))
+        var retainedBodyBytes = 0
+        var result: [DayWeaveCanonicalTrashEntry] = []
+        result.reserveCapacity(candidates.count)
+
+        for source in candidates {
+            guard source.deletedAt > cutoff,
+                  let item = source.lastKnownItem,
+                  let bodyBytes = try? encoder.encode(item).count,
+                  bodyBytes <= maximumCanonicalTrashItemBytes,
+                  bodyBytes <= maximumCanonicalTrashRetainedItemBytes - retainedBodyBytes else {
+                result.append(source.withoutRetainedItemBody)
+                continue
+            }
+            result.append(source)
+            retainedBodyBytes += bodyBytes
+        }
+        return result
+    }
+
+    private static func canonicalRecoveryPinnedItemIDs(
+        _ mutations: [DayWeavePendingCanonicalAuthoringMutation]
+    ) -> Set<UUID> {
+        Set(mutations.compactMap { mutation in
+            if mutation.operation == .restore
+                || (mutation.operation == .trash && mutation.hasBeenSubmitted) {
+                return mutation.itemID
+            }
+            return nil
+        })
+    }
+
+    private var pendingCanonicalRecoveryItemIDs: Set<UUID> {
+        Self.canonicalRecoveryPinnedItemIDs(pendingCanonicalAuthoringMutations)
+    }
+
+    private func reconcileSelectedCanonicalItem() {
+        guard let selectedCanonicalItemID else { return }
+        let stillExists = canonicalItems.contains { $0.id == selectedCanonicalItemID }
+            || canonicalTrash.contains { $0.id == selectedCanonicalItemID }
+            || pendingCanonicalAuthoringMutations.contains {
+                $0.itemID == selectedCanonicalItemID
+            }
+        if !stillExists { self.selectedCanonicalItemID = nil }
     }
 
     func persistPendingSchedulePublication(
@@ -1136,27 +2252,80 @@ final class PlannerStore: ObservableObject {
         itemID: UUID,
         includingPendingMarks: Bool = true
     ) -> Bool {
-        let items = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
-        let pendingMarks: Set<UUID> = includingPendingMarks
-            ? Set(pendingCanonicalSensitivityMutations.compactMap {
-                $0.requiresSensitivePresentation ? $0.itemID : nil
-            })
-            : Set()
-        var visited = Set<UUID>()
-        var currentID: UUID? = itemID
-        var sensitive = false
-        while let id = currentID {
-            guard visited.insert(id).inserted, let item = items[id] else { return true }
-            sensitive = sensitive || item.isSensitive || pendingMarks.contains(id)
-            currentID = item.parentID
+        var ownSensitivity = Dictionary(uniqueKeysWithValues: canonicalItems.map {
+            ($0.id, $0.isSensitive)
+        })
+        var parents = Dictionary(uniqueKeysWithValues: canonicalItems.map { item in
+            (item.id, Set([item.parentID].compactMap { $0 }))
+        })
+
+        if includingPendingMarks {
+            for mutation in pendingCanonicalSensitivityMutations
+                where mutation.requiresSensitivePresentation {
+                ownSensitivity[mutation.itemID] = true
+            }
+            for mutation in pendingCanonicalAuthoringMutations {
+                if let baseItem = mutation.baseItem {
+                    // Restore/trash/replace recovery may retain an older body
+                    // or ancestry that is more sensitive than the active
+                    // revision. Keep that one-way boundary until the exact
+                    // journal is resolved or its bounded body expires.
+                    ownSensitivity[mutation.itemID] =
+                        (ownSensitivity[mutation.itemID] ?? false) || baseItem.isSensitive
+                    parents[mutation.itemID, default: []].formUnion(
+                        [baseItem.parentID].compactMap { $0 }
+                    )
+                }
+                guard mutation.operation == .create || mutation.operation == .replace,
+                      let draft = mutation.draft else { continue }
+                // Pending authoring is a one-way privacy boundary: a new mark
+                // or sensitive parent applies immediately, while the old own
+                // mark and old ancestry remain protective until confirmation.
+                ownSensitivity[mutation.itemID] =
+                    (ownSensitivity[mutation.itemID] ?? false) || draft.isSensitive
+                parents[mutation.itemID, default: []].formUnion(
+                    [draft.parentID].compactMap { $0 }
+                )
+            }
         }
-        return sensitive
+
+        var visiting = Set<UUID>()
+        var completed = Set<UUID>()
+        var stack: [(id: UUID, isExit: Bool)] = [(itemID, false)]
+        while let frame = stack.popLast() {
+            if frame.isExit {
+                visiting.remove(frame.id)
+                completed.insert(frame.id)
+                continue
+            }
+            if completed.contains(frame.id) { continue }
+            guard let isSensitive = ownSensitivity[frame.id] else { return true }
+            if isSensitive { return true }
+            guard visiting.insert(frame.id).inserted else { return true }
+            stack.append((frame.id, true))
+            for parentID in parents[frame.id] ?? [] {
+                if visiting.contains(parentID) { return true }
+                stack.append((parentID, false))
+            }
+        }
+        return false
+    }
+
+    func canonicalItemRequiresSensitivePresentation(itemID: UUID) -> Bool {
+        effectiveSensitivity(itemID: itemID, includingPendingMarks: true)
     }
 
     func canonicalSensitivityPresentation(itemID: UUID) -> CanonicalSensitivityPresentation {
-        guard let item = canonicalItem(id: itemID) else { return .inherited }
-        if item.isSensitive { return .own }
-        return effectiveSensitivity(itemID: itemID, includingPendingMarks: false)
+        let item = canonicalItem(id: itemID)
+        let pendingOwnMark = pendingCanonicalSensitivityMutations.contains {
+            $0.itemID == itemID && $0.requiresSensitivePresentation
+        } || pendingCanonicalAuthoringMutations.contains {
+            $0.itemID == itemID
+                && ($0.draft?.isSensitive == true || $0.baseItem?.isSensitive == true)
+        }
+        let retainedTrashOwnMark = canonicalTrash.first { $0.id == itemID }?.isSensitive == true
+        if item?.isSensitive == true || retainedTrashOwnMark || pendingOwnMark { return .own }
+        return effectiveSensitivity(itemID: itemID, includingPendingMarks: true)
             ? .inherited
             : .standard
     }
@@ -1354,7 +2523,9 @@ final class PlannerStore: ObservableObject {
     private func hardenPendingSensitivityPresentation() {
         for index in blocks.indices {
             guard let itemID = blocks[index].sourceItemID else { continue }
-            if effectiveSensitivity(itemID: itemID) { blocks[index].isSensitive = true }
+            if canonicalItemRequiresSensitivePresentation(itemID: itemID) {
+                blocks[index].isSensitive = true
+            }
         }
     }
 
@@ -1487,6 +2658,8 @@ final class PlannerStore: ObservableObject {
     func capturePendingCanonicalMutations() {
         guard canPersistPlan else { return }
         let itemByID = Dictionary(uniqueKeysWithValues: canonicalItems.map { ($0.id, $0) })
+        let authoringItemIDs = Set(pendingCanonicalAuthoringMutations.map(\.itemID))
+        pendingCanonicalMutations.removeAll { authoringItemIDs.contains($0.itemID) }
         var existingKeys = Set(pendingCanonicalMutations.map {
             CanonicalSessionKey(
                 itemID: $0.itemID,
@@ -1503,6 +2676,7 @@ final class PlannerStore: ObservableObject {
                 continue
             }
             guard let itemID = block.sourceItemID,
+                  !authoringItemIDs.contains(itemID),
                   let item = itemByID[itemID] else { continue }
             let key = CanonicalSessionKey(
                 itemID: itemID,
@@ -1635,6 +2809,11 @@ final class PlannerStore: ObservableObject {
             || !pendingCanonicalSensitivityMutations.isEmpty
             || pendingSchedulePublication != nil
             || pendingProposalApplicationMutation != nil
+            || pendingCanonicalAuthoringMutations.contains {
+                $0.operation != .create
+                    || $0.hasBeenSubmitted
+                    || $0.configurationIdentifier != nil
+            }
     }
 
     /// Binds the encrypted execution cache to an opaque URL+credential digest.
@@ -1750,6 +2929,7 @@ final class PlannerStore: ObservableObject {
 
     private func quarantineCredentialBoundState(preservingDeviceID: Bool) {
         let deviceID = preservingDeviceID ? executionState.deviceID : nil
+        let preservedCreates = localCreatesPreservedAcrossConfigurationReset()
         blocks.removeAll {
             $0.sourceItemID != nil
                 || $0.syncOrigin == .canonicalPreview
@@ -1757,6 +2937,7 @@ final class PlannerStore: ObservableObject {
                 || $0.syncOrigin == .remoteExecutionLease
         }
         canonicalItems = []
+        canonicalTrash = []
         canonicalDeltaCursor = nil
         canonicalTombstoneRevisions = [:]
         completedOccurrenceIDs = []
@@ -1768,12 +2949,49 @@ final class PlannerStore: ObservableObject {
         pendingSchedulePublication = nil
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
+        pendingCanonicalAuthoringMutations = preservedCreates
         isCanonicalPreviewValidatedForCurrentLaunch = false
         var empty = DayWeaveExecutionDurableState.empty
         empty.deviceID = deviceID
         executionState = empty
         selectedBlockID = blocks.first?.id
+        reconcileSelectedCanonicalItem()
         lastScheduleMessage = "Credential-bound canonical state was quarantined locally"
+    }
+
+    /// Unsubmitted local creates belong to the user rather than a server
+    /// configuration. Their links to server-owned parents do not: carrying such
+    /// UUIDs into another tenant could either strand the draft or silently bind
+    /// it to an unrelated item. Keep only links within the preserved local set.
+    private func localCreatesPreservedAcrossConfigurationReset()
+        -> [DayWeavePendingCanonicalAuthoringMutation] {
+        let candidates = pendingCanonicalAuthoringMutations.filter {
+            $0.operation == .create && !$0.hasBeenSubmitted
+        }
+        let localItemIDs = Set(candidates.map(\.itemID))
+        return candidates.compactMap { mutation in
+            guard var draft = mutation.draft else { return nil }
+            if let parentID = draft.parentID, !localItemIDs.contains(parentID) {
+                if canonicalItemRequiresSensitivePresentation(itemID: mutation.itemID) {
+                    // Once the server-owned ancestor is removed, preserve its
+                    // privacy boundary as an explicit mark on the new root.
+                    draft.isSensitive = true
+                }
+                draft.parentID = nil
+                draft.siblingOrder = 0
+            }
+            return DayWeavePendingCanonicalAuthoringMutation(
+                id: mutation.id,
+                itemID: mutation.itemID,
+                operation: .create,
+                draft: draft,
+                createdAt: mutation.createdAt,
+                configurationIdentifier: nil,
+                hasBeenSubmitted: false,
+                disposition: mutation.disposition,
+                diagnostic: mutation.diagnostic
+            )
+        }
     }
 
     private func applyExecutionPresentation(to state: inout DayWeaveExecutionDurableState) {
@@ -2137,6 +3355,7 @@ final class PlannerStore: ObservableObject {
 
     private func recordPendingMutation(for block: ScheduleBlock) {
         guard let itemID = block.sourceItemID,
+              canonicalAuthoringMutation(itemID: itemID) == nil,
               let revision = canonicalItem(id: itemID)?.revision ?? block.sourceItemRevision else { return }
         let matches: (PendingCanonicalMutation) -> Bool = {
             $0.itemID == itemID
@@ -2329,10 +3548,70 @@ final class PlannerStore: ObservableObject {
         }
     }
 
-    private func makeSnapshot() -> PlannerSnapshot {
+    /// Schedules the next metadata/body expiry independently of UI activity,
+    /// so a quiet process cannot retain deleted sensitive content indefinitely.
+    private func scheduleCanonicalTrashRetention() {
+        canonicalTrashRetentionTask?.cancel()
+        canonicalTrashRetentionTask = nil
+        guard loadState == .ready, persistence != nil else { return }
+
+        let pinnedItemIDs = pendingCanonicalRecoveryItemIDs
+        let currentDate = now()
+        let trashExpirations = canonicalTrash.compactMap { entry -> Date? in
+            if pinnedItemIDs.contains(entry.id), entry.lastKnownItem == nil {
+                // Restore intent pins minimum tombstone metadata, not an old
+                // full body. With no body left, this entry has no timed expiry.
+                return nil
+            }
+            return entry.deletedAt.addingTimeInterval(
+                Self.canonicalTrashRetentionInterval
+            )
+        }
+        let retainedJournalBodyExpirations = pendingCanonicalAuthoringMutations.compactMap {
+            mutation -> Date? in
+            guard mutation.baseItem != nil else { return nil }
+            let retentionAnchor: Date
+            switch mutation.operation {
+            case .trash:
+                retentionAnchor = mutation.createdAt
+            case .restore:
+                guard let deletedAt = mutation.baseItem?.deletedAt else { return nil }
+                retentionAnchor = min(deletedAt, mutation.createdAt)
+            case .create, .replace:
+                return nil
+            }
+            return retentionAnchor.addingTimeInterval(
+                Self.canonicalTrashRetentionInterval
+            )
+        }
+        let nextExpiration = (trashExpirations + retainedJournalBodyExpirations).min()
+        guard let nextExpiration else { return }
+
+        let seconds = min(
+            Self.canonicalTrashRetentionInterval,
+            max(0, nextExpiration.timeIntervalSince(currentDate))
+        )
+        let milliseconds = max(Int64(1), Int64((seconds * 1_000).rounded(.up)))
+        canonicalTrashRetentionTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(milliseconds))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            self?.flushPersistence()
+        }
+    }
+
+    private func makeSnapshot(
+        canonicalTrashOverride: [DayWeaveCanonicalTrashEntry]? = nil,
+        canonicalAuthoringMutationsOverride:
+            [DayWeavePendingCanonicalAuthoringMutation]? = nil
+    ) -> PlannerSnapshot {
         PlannerSnapshot(
             destination: destination,
             selectedBlockID: selectedBlockID,
+            selectedCanonicalItemID: selectedCanonicalItemID,
             blocks: blocks,
             suggestions: suggestions,
             assistantMessages: assistantMessages,
@@ -2352,6 +3631,9 @@ final class PlannerStore: ObservableObject {
             pendingSchedulePublication: pendingSchedulePublication,
             pendingProposalApplicationMutation: pendingProposalApplicationMutation,
             proposalApplicationReceipts: proposalApplicationReceipts,
+            pendingCanonicalAuthoringMutations: canonicalAuthoringMutationsOverride
+                ?? pendingCanonicalAuthoringMutations,
+            canonicalTrash: canonicalTrashOverride ?? canonicalTrash,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )

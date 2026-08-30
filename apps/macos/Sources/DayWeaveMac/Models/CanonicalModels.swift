@@ -392,10 +392,12 @@ struct DayWeaveCanonicalItemFields: Encodable, Equatable, Sendable {
         if case .unknown = kind { kindIsKnown = false } else { kindIsKnown = true }
         let statusIsKnown: Bool
         if case .unknown = status { statusIsKnown = false } else { statusIsKnown = true }
+        let recurrenceIsWritable = recurrence?.supportsLosslessRoundTrip ?? true
+            || recurrence?.supportsCanonicalAuthoringRecurrence == true
         permitsLosslessEncoding = kindIsKnown
             && statusIsKnown
             && splitPolicy.isSupportedForWrite
-            && (recurrence?.supportsLosslessRoundTrip ?? true)
+            && recurrenceIsWritable
             && flexibleConstraints.supportsLosslessRoundTrip
     }
 

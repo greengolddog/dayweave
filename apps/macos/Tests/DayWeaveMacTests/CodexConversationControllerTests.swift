@@ -9,6 +9,14 @@ struct CodexConversationControllerTests {
     @Test("planner context is explicit, bounded, and omits private planner fields")
     func testPlannerContextRedaction() throws {
         let sourceID = UUID()
+        let source = try Self.canonicalItem(
+            id: sourceID,
+            parentID: nil,
+            isSensitive: false,
+            title: "Prepare launch plan",
+            kind: "task",
+            isExecutable: true
+        )
         let block = ScheduleBlock(
             id: UUID(),
             title: "Prepare launch plan",
@@ -23,7 +31,7 @@ struct CodexConversationControllerTests {
             isHardConstraint: false,
             actualMinutes: nil,
             sourceItemID: sourceID,
-            sourceItemRevision: 91,
+            sourceItemRevision: 1,
             occurrenceID: UUID(),
             sessionIndex: 2,
             syncOrigin: .local,
@@ -33,6 +41,7 @@ struct CodexConversationControllerTests {
         )
         let store = PlannerStore(
             blocks: [block],
+            canonicalItems: [source],
             restoreFromPersistence: false
         )
 

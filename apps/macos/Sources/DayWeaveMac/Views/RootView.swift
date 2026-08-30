@@ -1,6 +1,12 @@
 import AppKit
 import SwiftUI
 
+private extension Notification.Name {
+    static let dayWeaveShowSuggestionsInbox = Notification.Name(
+        "com.greengolddog.dayweave.show-suggestions-inbox"
+    )
+}
+
 private func executionSession(
     _ session: DayWeaveExecutionSession,
     matches block: ScheduleBlock
@@ -48,7 +54,7 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
         }
         .sheet(isPresented: $store.isQuickAddPresented) {
-            QuickAddView()
+            QuickCaptureView()
                 .environmentObject(store)
         }
         .onAppear {
@@ -105,13 +111,16 @@ struct RootView: View {
                 .help("Reorder local flexible blocks; sync validates server constraints")
                 .disabled(!store.canRecomposeSchedule)
 
-                Button {
-                    store.isQuickAddPresented = true
-                } label: {
-                    Label("Quick Add", systemImage: "plus")
+                if store.destination != .inbox {
+                    Button {
+                        store.isQuickAddPresented = true
+                    } label: {
+                        Label("Quick Capture", systemImage: "plus")
+                    }
+                    .help("Quick Capture (⇧⌘N)")
+                    .disabled(!store.canMutatePlan)
+                    .accessibilityIdentifier("planner.quick-capture")
                 }
-                .help("Quick Add (⇧⌘N)")
-                .disabled(!store.canMutatePlan)
             }
         }
     }
@@ -138,7 +147,7 @@ struct RootView: View {
         case .calendar:
             CalendarDestinationView()
         case .inbox:
-            SuggestionsInboxView()
+            UnifiedInboxView()
         case .habits:
             HabitsDestinationView()
         case .projects:
@@ -298,14 +307,23 @@ private struct TodayView: View {
                 ContentUnavailableView {
                     Label(
                         emptyTitle,
-                        systemImage: store.canonicalItems.isEmpty ? "calendar.badge.plus" : "calendar.badge.exclamationmark"
+                        systemImage: inboxItemCount == 0
+                            ? "calendar.badge.plus"
+                            : "tray.full"
                     )
                 } description: {
                     Text(emptyDescription)
                 } actions: {
-                    Button("Quick Add") { store.isQuickAddPresented = true }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!store.canMutatePlan)
+                    HStack {
+                        if inboxItemCount > 0 {
+                            Button("Open Inbox") { store.destination = .inbox }
+                                .buttonStyle(.borderedProminent)
+                                .accessibilityIdentifier("today.open-inbox")
+                            quickCaptureButton.buttonStyle(.bordered)
+                        } else {
+                            quickCaptureButton.buttonStyle(.borderedProminent)
+                        }
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -325,18 +343,36 @@ private struct TodayView: View {
     }
 
     private var emptyTitle: String {
-        if store.canonicalItems.isEmpty { return "No plan yet" }
+        if inboxItemCount == 0, store.canonicalItems.isEmpty { return "No plan yet" }
+        if inboxItemCount > 0 { return "Items are waiting in Inbox" }
         return store.blocks.isEmpty ? "No blocks fit this preview" : "No blocks scheduled today"
     }
 
     private var emptyDescription: String {
-        if store.canonicalItems.isEmpty {
-            return "Start with Quick Add. Nothing is scheduled until you add it."
+        if inboxItemCount == 0, store.canonicalItems.isEmpty {
+            return "Start with Quick Capture. It stays in Inbox until you decide it is ready for planning."
+        }
+        if inboxItemCount > 0 {
+            return "\(inboxItemCount) item\(inboxItemCount == 1 ? " is" : "s are") safely retained for triage. Planned items become eligible after sync and composition."
         }
         if store.blocks.isEmpty {
             return "\(store.canonicalItems.count) canonical items are safely cached. Review the preview diagnostics or adjust availability."
         }
         return "The canonical plan has work on later days. Open Calendar to review the full seven-day preview."
+    }
+
+    private var inboxItemCount: Int {
+        var ids = Set(store.canonicalItems.compactMap { item in
+            item.status == .inbox || item.status == .planned ? item.id : nil
+        })
+        ids.formUnion(store.pendingCanonicalAuthoringMutations.map(\.itemID))
+        return ids.count
+    }
+
+    private var quickCaptureButton: some View {
+        Button("Quick Capture") { store.isQuickAddPresented = true }
+            .disabled(!store.canMutatePlan)
+            .accessibilityIdentifier("today.quick-capture")
     }
 }
 
@@ -1087,7 +1123,9 @@ private struct InspectorView: View {
             Divider()
 
             if tab == 0 {
-                if let block = store.selectedBlock {
+                if destinationIsInbox {
+                    CanonicalInboxInspector()
+                } else if let block = store.selectedBlock {
                     BlockInspector(block: block)
                         .id(block.id)
                 } else {
@@ -1097,7 +1135,280 @@ private struct InspectorView: View {
                 AssistantView()
             }
         }
-        .navigationTitle(tab == 0 ? "Inspector" : "Assistant")
+        .navigationTitle(inspectorTitle)
+    }
+
+    private var destinationIsInbox: Bool {
+        (store.destination ?? .today) == .inbox
+    }
+
+    private var inspectorTitle: String {
+        if tab == 1 { return "Assistant" }
+        return destinationIsInbox ? "Inbox Details" : "Inspector"
+    }
+}
+
+private struct CanonicalInboxInspector: View {
+    @EnvironmentObject private var store: PlannerStore
+
+    private var selectedRow: CanonicalInboxPresentation.Row? {
+        guard let selectedID = store.selectedCanonicalItemID else { return nil }
+        let presentation = CanonicalInboxPresentation.build(
+            activeItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            sensitivityPresentation: {
+                store.canonicalSensitivityPresentation(itemID: $0)
+            }
+        )
+        return (presentation.conflicts
+            + presentation.inbox
+            + presentation.planned
+            + presentation.trash)
+            .first { $0.itemID == selectedID }
+    }
+
+    var body: some View {
+        if let row = selectedRow {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .top, spacing: 12) {
+                        Image(systemName: kindSymbol(row.kind))
+                            .font(.title2)
+                            .foregroundStyle(.tint)
+                            .frame(width: 42, height: 42)
+                            .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 10))
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(row.title)
+                                .font(.headline)
+                                .textSelection(.enabled)
+                                .privacySensitive(row.isSensitive)
+                            Text(kindTitle(row.kind))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+
+                    InspectorSection(title: "Inbox state") {
+                        LabeledContent("Status", value: statusTitle(row.status))
+                        LabeledContent("Sync", value: syncTitle(row.syncState))
+                        LabeledContent("Source", value: sourceTitle(row.source))
+                        LabeledContent(
+                            "Privacy",
+                            value: privacyTitle(row)
+                        )
+                    }
+
+                    InspectorSection(title: "Planning") {
+                        LabeledContent(
+                            "Duration",
+                            value: CanonicalItemEditorState.durationDescription(row.durationSeconds)
+                        )
+                        LabeledContent(
+                            "Deadline",
+                            value: row.deadlineAt?.formatted(date: .abbreviated, time: .shortened)
+                                ?? "None"
+                        )
+                        LabeledContent("Hierarchy level", value: String(row.depth + 1))
+                        if !row.breadcrumb.isEmpty {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Parents")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Text(row.breadcrumb.joined(separator: " › "))
+                                    .font(.subheadline)
+                                    .lineLimit(4)
+                                    .textSelection(.enabled)
+                                    .privacySensitive(row.isSensitive)
+                            }
+                        }
+                    }
+
+                    if row.hasHierarchyCycle || row.hasMissingParent {
+                        Label(
+                            row.hasHierarchyCycle
+                                ? "This hierarchy contains a cycle and is read-only."
+                                : "This item's parent is unavailable and it is read-only.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+
+                    if case let .conflicted(message) = row.syncState {
+                        InspectorSection(title: "Conflict review") {
+                            Label(
+                                message ?? "This saved change differs from canonical state.",
+                                systemImage: "arrow.triangle.branch"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .textSelection(.enabled)
+                            Text(row.source == .activeRestore
+                                ? "The main details show the active version. Use Keep Active to discard local restore intent."
+                                : "The title above and Notes section show the retained local draft. Use the Inbox row actions to copy it or keep canonical state.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            if row.source == .localCreate || row.source == .pendingReplace {
+                                Divider()
+                                Text("Latest canonical version")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                if let active = row.activeCanonicalItem {
+                                    Text(active.title)
+                                        .font(.subheadline.weight(.medium))
+                                        .textSelection(.enabled)
+                                        .privacySensitive(row.isSensitive || active.isSensitive)
+                                    LabeledContent(
+                                        "Revision",
+                                        value: String(active.revision)
+                                    )
+                                    if let notes = active.notes, !notes.isEmpty {
+                                        Text(String(notes.prefix(2_000)))
+                                            .font(.caption)
+                                            .textSelection(.enabled)
+                                            .privacySensitive(row.isSensitive || active.isSensitive)
+                                    }
+                                } else {
+                                    Label(
+                                        "No active canonical item remains; the server state is deleted or unavailable.",
+                                        systemImage: "trash"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                }
+                            }
+                            if let retained = retainedRestoreItem(for: row) {
+                                Divider()
+                                Text("Retained deleted version")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                Text(retained.title)
+                                    .font(.subheadline.weight(.medium))
+                                    .textSelection(.enabled)
+                                    .privacySensitive(row.isSensitive)
+                                if let notes = retained.notes, !notes.isEmpty {
+                                    Text(String(notes.prefix(2_000)))
+                                        .font(.caption)
+                                        .textSelection(.enabled)
+                                        .privacySensitive(row.isSensitive)
+                                }
+                            }
+                        }
+                    }
+
+                    if let notes = notes(for: row), !notes.isEmpty {
+                        InspectorSection(title: "Notes") {
+                            Text(String(notes.prefix(2_000)))
+                                .font(.subheadline)
+                                .textSelection(.enabled)
+                                .privacySensitive(row.isSensitive)
+                            if notes.count > 2_000 {
+                                Text("Open the item editor to read the remaining notes.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+
+                    Label(
+                        usesSensitivePresentation(row)
+                            ? "Sensitive content is shown only while DayWeave is unlocked."
+                            : "Canonical details are stored in the encrypted local plan.",
+                        systemImage: usesSensitivePresentation(row) ? "lock.shield.fill" : "lock"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .padding(20)
+            }
+            .id(row.id)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(row.accessibilitySummary)
+            .accessibilityIdentifier("canonical-inbox.inspector")
+        } else {
+            ContentUnavailableView {
+                Label("Select an Inbox item", systemImage: "tray.full")
+            } description: {
+                Text("Choose a captured, planned, conflicted, or recently deleted item to inspect it here.")
+            }
+            .accessibilityIdentifier("canonical-inbox.inspector.empty")
+        }
+    }
+
+    private func notes(for row: CanonicalInboxPresentation.Row) -> String? {
+        let mutation = row.mutationID.flatMap { store.canonicalAuthoringMutation(id: $0) }
+        if row.source == .activeRestore {
+            return store.canonicalItems.first(where: { $0.id == row.itemID })?.notes
+        }
+        return mutation?.draft?.notes
+            ?? mutation?.baseItem?.notes
+            ?? store.canonicalItems.first(where: { $0.id == row.itemID })?.notes
+            ?? store.canonicalTrash.first(where: { $0.id == row.itemID })?.lastKnownItem?.notes
+    }
+
+    private func retainedRestoreItem(
+        for row: CanonicalInboxPresentation.Row
+    ) -> DayWeaveCanonicalItem? {
+        guard row.source == .activeRestore, let mutationID = row.mutationID else { return nil }
+        return store.canonicalAuthoringMutation(id: mutationID)?.baseItem
+    }
+
+    private func kindTitle(_ kind: DayWeaveCanonicalItemKind) -> String {
+        switch kind {
+        case .breakTime: "Break"
+        default: kind.wireValue.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+    private func kindSymbol(_ kind: DayWeaveCanonicalItemKind) -> String {
+        switch kind {
+        case .event: "calendar"
+        case .task: "checkmark.circle"
+        case .habit: "repeat"
+        case .routine: "list.number"
+        case .goal: "target"
+        case .breakTime: "cup.and.saucer"
+        case .unknown: "questionmark.diamond"
+        }
+    }
+
+    private func statusTitle(_ status: DayWeaveCanonicalItemStatus) -> String {
+        status.wireValue.replacingOccurrences(of: "_", with: " ").capitalized
+    }
+
+    private func syncTitle(_ state: CanonicalInboxPresentation.Row.SyncState) -> String {
+        switch state {
+        case .synced: "Synced"
+        case .waiting: "Queued locally"
+        case .submitted: "Submitted; recovering"
+        case .conflicted: "Needs review"
+        }
+    }
+
+    private func sourceTitle(_ source: CanonicalInboxPresentation.Row.Source) -> String {
+        switch source {
+        case .canonical: "Canonical"
+        case .localCreate: "Local capture"
+        case .pendingReplace: "Queued edit"
+        case .pendingTrash: "Queued deletion"
+        case .pendingRestore: "Queued restore"
+        case .activeRestore: "Restore conflict"
+        case .recentTrash: "Recently deleted"
+        }
+    }
+
+    private func privacyTitle(_ row: CanonicalInboxPresentation.Row) -> String {
+        switch row.sensitivityPresentation {
+        case .standard: return "Standard marker"
+        case .own: return "Sensitive marker"
+        case .inherited: return "Inherited sensitive"
+        }
+    }
+
+    private func usesSensitivePresentation(_ row: CanonicalInboxPresentation.Row) -> Bool {
+        row.isSensitive
     }
 }
 
@@ -1505,6 +1816,15 @@ private struct AssistantView: View {
             } else if conversation.lastProposalCount > 0 {
                 Button {
                     store.destination = .inbox
+                    store.selectCanonicalItem(nil)
+                    NotificationCenter.default.post(name: .dayWeaveShowSuggestionsInbox, object: nil)
+                    Task { @MainActor in
+                        await Task.yield()
+                        NotificationCenter.default.post(
+                            name: .dayWeaveShowSuggestionsInbox,
+                            object: nil
+                        )
+                    }
                 } label: {
                     Label(
                         "\(conversation.lastProposalCount) proposal\(conversation.lastProposalCount == 1 ? "" : "s") sent to Inbox for review",
@@ -1659,6 +1979,121 @@ private struct AssistantBubble: View {
     }
 }
 
+private struct UnifiedInboxView: View {
+    private enum Section: String, CaseIterable, Identifiable {
+        case items
+        case suggestions
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .items: "Items"
+            case .suggestions: "Suggestions"
+            }
+        }
+    }
+
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var suggestionSync: SuggestionSyncStore
+    @State private var section: Section = .items
+
+    private var canonicalPresentation: CanonicalInboxPresentation {
+        CanonicalInboxPresentation.build(
+            activeItems: store.canonicalItems,
+            pendingMutations: store.pendingCanonicalAuthoringMutations,
+            trashEntries: store.canonicalTrash,
+            sensitivityPresentation: {
+                store.canonicalSensitivityPresentation(itemID: $0)
+            }
+        )
+    }
+
+    private var capturedItemCount: Int {
+        let presentation = canonicalPresentation
+        return Set(
+            (presentation.inbox + presentation.planned + presentation.trash).map(\.itemID)
+        ).count
+    }
+
+    private var suggestionCount: Int {
+        store.suggestions.count(where: { $0.state == .pending })
+            + suggestionSync.proposals.count
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 18) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Inbox")
+                        .font(.title2.weight(.semibold))
+                    Text(sectionDescription)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 16)
+
+                Picker("Inbox section", selection: $section) {
+                    Text("Items · \(capturedItemCount)").tag(Section.items)
+                    Text("Suggestions · \(suggestionCount)").tag(Section.suggestions)
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 260)
+                .accessibilityIdentifier("inbox.section-picker")
+
+                if section == .suggestions {
+                    Button {
+                        section = .items
+                        store.isQuickAddPresented = true
+                    } label: {
+                        Label("Quick Capture", systemImage: "plus")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!store.canMutatePlan)
+                    .help("Capture an encrypted canonical Inbox item")
+                    .accessibilityIdentifier("inbox.quick-capture")
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 14)
+            .background(.bar)
+
+            Divider()
+
+            switch section {
+            case .items:
+                CanonicalCapturedInboxView()
+            case .suggestions:
+                SuggestionsInboxView()
+            }
+        }
+        .navigationTitle("Inbox")
+        .onChange(of: section) { _, value in
+            if value == .suggestions {
+                store.selectCanonicalItem(nil)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: .dayWeaveShowSuggestionsInbox
+        )) { _ in
+            section = .suggestions
+            store.selectCanonicalItem(nil)
+        }
+        .accessibilityIdentifier("unified-inbox")
+    }
+
+    private var sectionDescription: String {
+        switch section {
+        case .items:
+            "Capture and prepare your own work before it becomes schedulable."
+        case .suggestions:
+            "Review local and external proposals before any canonical change is applied."
+        }
+    }
+}
+
 private struct SuggestionsInboxView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
@@ -1790,7 +2225,7 @@ private struct SuggestionsInboxView: View {
                 }
             }
         }
-        .navigationTitle("Inbox")
+        .navigationTitle("Suggestions")
         .task {
             guard suggestionSync.isConfigured,
                   !proposalApplications.hasPendingRecovery else { return }
@@ -2585,77 +3020,6 @@ private func proposalRiskColor(_ level: String) -> Color {
     }
 }
 
-private struct QuickAddView: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var store: PlannerStore
-    @State private var title = ""
-    @State private var kind: PlannerItemKind = .task
-    @State private var minutes = 30
-    @State private var isSensitive = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack {
-                VStack(alignment: .leading) {
-                    Text("Quick Add").font(.title2.weight(.semibold))
-                    Text("Captured locally first; sync validates and composes its placement.")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button("Cancel") { dismiss() }
-            }
-
-            TextField("What needs to happen?", text: $title)
-                .textFieldStyle(.roundedBorder)
-                .font(.title3)
-
-            Text("\(title.unicodeScalars.count)/\(PlannerStore.maximumCanonicalTitleScalars) Unicode characters")
-                .font(.caption)
-                .foregroundStyle(titleIsValid ? Color.secondary : Color.red)
-
-            Picker("Type", selection: $kind) {
-                ForEach(PlannerItemKind.allCases) { itemKind in
-                    Label(itemKind.title, systemImage: itemKind.symbol).tag(itemKind)
-                }
-            }
-
-            Stepper("Estimated duration: \(minutes) minutes", value: $minutes, in: 5...480, step: 5)
-
-            Toggle(isOn: $isSensitive) {
-                Label("Sensitive", systemImage: "checkmark.shield")
-            }
-            Text("Sensitive captures stay encrypted locally and are excluded from Codex context except for anonymous schedule occupancy.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            HStack {
-                Spacer()
-                Button("Add locally") {
-                    if store.quickAdd(
-                        title: title,
-                        kind: kind,
-                        minutes: minutes,
-                        isSensitive: isSensitive
-                    ) {
-                        dismiss()
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.defaultAction)
-                .disabled(
-                    !titleIsValid || !store.canMutatePlan
-                )
-            }
-        }
-        .padding(24)
-        .frame(width: 520)
-    }
-
-    private var titleIsValid: Bool {
-        PlannerStore.normalizedCanonicalTitle(title) != nil
-    }
-}
-
 struct AppLockedView: View {
     @EnvironmentObject private var appLock: AppLockController
 
@@ -2748,6 +3112,7 @@ struct AppLockMenuBarView: View {
 }
 
 struct MenuBarView: View {
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
 
@@ -2783,8 +3148,9 @@ struct MenuBarView: View {
                 ContentUnavailableView("Nothing active", systemImage: "checkmark.circle")
             }
             Divider()
-            Button("Quick Add…") { store.isQuickAddPresented = true }
+            Button("Quick Capture…") { openWindow(id: "quick-capture") }
                 .disabled(!store.canMutatePlan)
+                .accessibilityIdentifier("menu-bar.quick-capture")
             Button("Recompose") { store.recomposeSchedule() }
                 .disabled(!store.canRecomposeSchedule)
             Divider()

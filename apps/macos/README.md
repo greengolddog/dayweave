@@ -95,9 +95,13 @@ new identity. Legacy raw-token records have no trustworthy origin and require
 explicit re-entry. Credentials are device-only and are never added to the
 Codable planner snapshot or application diagnostics.
 
-The Inbox fetches pending proposals and supports refresh, edit, accept, and
-reject with the proposal's optimistic `expected_revision`. Remote proposals
-remain a separate, in-memory review feed. Accepting an ordinary advisory
+The unified Inbox separates **Items** from **Suggestions**. Items are canonical,
+encrypted local drafts: Quick Capture needs only a title, while the detailed
+editor supports Inbox/Planned state, type, recurrence, constraints, hierarchy,
+privacy, deletion, restore, and explicit conflict recovery. Suggestions fetches
+pending proposals and supports refresh, edit, accept, and reject with the
+proposal's optimistic `expected_revision`. Remote proposals remain a separate,
+in-memory review feed. Accepting an ordinary advisory
 proposal records the decision at the API and intentionally does **not** create
 or mutate a schedule block. A supported
 `dayweave.proposal-change-set/1` proposal instead exposes a complete exact-diff
@@ -110,7 +114,8 @@ absent or offline, with the last request state shown in the Inbox.
 The same authenticated configuration powers canonical planner sync. A sync:
 
 1. pulls the ordered `/v1/items/delta` stream using its opaque cursor;
-2. publishes local Quick Add captures with stable idempotency keys;
+2. publishes durable canonical create/replace/trash/restore journals from the
+   Items Inbox with stable idempotency keys, followed by retained legacy captures;
 3. sends revision-guarded privacy and status replacements only when every
    canonical field can be round-tripped without loss; and
 4. requests and fully validates the side-effect-free
@@ -122,15 +127,20 @@ The same authenticated configuration powers canonical planner sync. A sync:
 
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
-live in the schema-v8 AES-GCM encrypted planner snapshot. Schema-v1 through v4
+live in the schema-v10 AES-GCM encrypted planner snapshot. Schema-v1 through v4
 snapshots are migrated once with explicit legacy sensitivity defaults; schema
 v5 remains sensitivity-strict and migrates with no invented privacy edit.
 Schema-v6 retained privacy edits migrate as conservatively submitted because an
 older snapshot cannot prove that no request bytes were sent. Schema v7 adds no
 invented publication when it migrates; schema v8 retains the bounded exact
 publication body, accepted preview, configuration binding, and idempotency
-UUID needed after a crash. Older binaries reject schema v8 instead of
-rewriting away new state. A sibling-file
+UUID needed after a crash. Schema v9 adds proposal-application recovery and
+content-free receipts; schema v10 adds canonical authoring journals, recent
+deletions, and canonical selection. Older binaries reject newer snapshots
+instead of rewriting away new state. Recently Deleted keeps seven days and at
+most 500 metadata records; full item bodies are retained newest-first within
+per-item and aggregate byte budgets, while independent tombstone watermarks
+continue preventing stale resurrection. A sibling-file
 lock and ciphertext compare-and-swap revision stop a second app process from
 silently overwriting a newer snapshot. Unknown future
 item fields and nested split-policy fields are
@@ -142,8 +152,9 @@ recovered by staging a complete, resource-bounded delta before replacing the
 cache. Network, contract, and revision failures keep recoverable local intent
 and are shown in the Today diagnostics. Conflicted edits remain encrypted and
 can be explicitly rebased from the selected block after a fresh preview.
-Quick Add trims titles and enforces the API's 500-Unicode-scalar limit. Invalid
-legacy captures are skipped individually, kept locally with a persistent
+Quick Capture trims titles, enforces the API's 500-Unicode-scalar limit, and
+durably encrypts the complete canonical draft before it appears saved. Invalid
+legacy captures are still skipped individually, kept locally with a persistent
 diagnostic, and can be edited or deleted in the inspector. Create/privacy/status
 pushes resume across syncs after bounded per-run request caps; stability hints are
 trimmed deterministically to the API's assignment and block-count limits.
@@ -170,7 +181,8 @@ while an exact result is ambiguous, with Settings directing the user to restore
 the original configuration and authentication and run Planner sync. A failed
 publication never marks the candidate preview current.
 
-Quick Add and local-capture recovery expose an own-item **Sensitive** marker.
+Quick Capture, the canonical item editor, and legacy-capture recovery expose an
+own-item **Sensitive** marker.
 For canonical items, the inspector distinguishes a marker set on that item from
 effective sensitivity inherited through an ancestor. Privacy edits are stored
 as encrypted, revision-bound intent with explicit conflict recovery and stable
@@ -189,10 +201,12 @@ applied. Status replacements require the exact response validation, including
 hierarchy fields. An inherited marker cannot be overridden on a child. The
 locked main window, Settings, and menu-bar surfaces continue to expose no
 schedule content.
-Canonical privacy authoring currently starts from a selected rendered block;
-an unscheduled canonical item has no general item-browser editor yet. Any
-already-durable privacy conflict remains visible and recoverable from Today
-diagnostics even when the item has no rendered block.
+The Items Inbox is the general browser and typed editor for both unscheduled
+and Planned canonical items, including own/inherited privacy presentation,
+queued changes, conflicts, and bounded Recently Deleted recovery. Sensitive
+titles and notes stay privacy-marked while editing, including through pending
+hierarchy changes. Quick Capture is also available as an independent window,
+so its menu-bar command remains usable after every main planner window closes.
 
 The seven-day preview validates the server's complete `source_item_revisions`
 map and performs a bounded delta-plus-preview retry if it raced a write. It uses

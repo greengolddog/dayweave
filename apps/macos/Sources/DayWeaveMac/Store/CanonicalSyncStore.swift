@@ -28,6 +28,7 @@ final class CanonicalSyncStore: ObservableObject {
     static let maximumRetainedDeltaBytes = 32 * 1_048_576
     static let maximumDeltaCursorBytes = 4_096
     static let maximumCreatePushesPerSync = 100
+    static let maximumAuthoringPushesPerSync = 100
     static let maximumStatusPushesPerSync = 100
     static let maximumPreviousAssignments = 10_000
     static let maximumPreviousAssignmentBlocks = 50_000
@@ -43,6 +44,7 @@ final class CanonicalSyncStore: ObservableObject {
     private let session: URLSession
     private let now: @Sendable () -> Date
     private let createPushLimit: Int
+    private let authoringPushLimit: Int
     private let statusPushLimit: Int
     private let previousAssignmentLimit: Int
     private let previousAssignmentBlockLimit: Int
@@ -57,6 +59,7 @@ final class CanonicalSyncStore: ObservableObject {
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         createPushLimit: Int = CanonicalSyncStore.maximumCreatePushesPerSync,
+        authoringPushLimit: Int = CanonicalSyncStore.maximumAuthoringPushesPerSync,
         statusPushLimit: Int = CanonicalSyncStore.maximumStatusPushesPerSync,
         previousAssignmentLimit: Int = CanonicalSyncStore.maximumPreviousAssignments,
         previousAssignmentBlockLimit: Int = CanonicalSyncStore.maximumPreviousAssignmentBlocks,
@@ -68,6 +71,7 @@ final class CanonicalSyncStore: ObservableObject {
         self.authCoordinator = authCoordinator
         self.session = session
         self.createPushLimit = max(0, createPushLimit)
+        self.authoringPushLimit = max(0, authoringPushLimit)
         self.statusPushLimit = max(0, statusPushLimit)
         self.previousAssignmentLimit = max(0, previousAssignmentLimit)
         self.previousAssignmentBlockLimit = max(0, previousAssignmentBlockLimit)
@@ -243,6 +247,21 @@ final class CanonicalSyncStore: ObservableObject {
                 generation: generation
             )
             try ensureOperationCurrent(operationID: operationID, generation: generation)
+            status = .syncing("Publishing encrypted Inbox edits…")
+            let authored = try await publishCanonicalAuthoringMutations(
+                client: client,
+                operationID: operationID,
+                generation: generation
+            )
+            if authored > 0 {
+                status = .syncing("Refreshing authored item revisions…")
+                try await pullCanonicalItems(
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+            }
             planner.capturePendingCanonicalMutations()
             planner.flushPersistence()
             if let persistenceError = planner.persistenceError { throw persistenceError }
@@ -281,7 +300,9 @@ final class CanonicalSyncStore: ObservableObject {
             lastPreview = installed.preview
             status = .online(
                 updatedAt: now(),
-                message: "Synced \(planner.canonicalItems.count) items; composed \(installed.blockCount) blocks"
+                message: "Synced \(planner.canonicalItems.count) items"
+                    + (authored > 0 ? "; applied \(authored) Inbox edit\(authored == 1 ? "" : "s")" : "")
+                    + "; composed \(installed.blockCount) blocks"
             )
         } catch {
             planner.flushPersistence()
@@ -846,6 +867,404 @@ final class CanonicalSyncStore: ObservableObject {
             fixedByID[fixed.id] = fixed
         }
         return fixedByID
+    }
+
+    private func publishCanonicalAuthoringMutations(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> Int {
+        let ordered = orderedCanonicalAuthoringMutations(
+            planner.sortedPendingCanonicalAuthoringMutations.filter {
+                $0.disposition == .pending
+            }
+        )
+        var appliedCount = 0
+        var attemptedCount = 0
+
+        for (offset, original) in ordered.enumerated() {
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            guard attemptedCount < authoringPushLimit else {
+                let deferred = ordered.count - offset
+                warnings.append(
+                    "Deferred \(deferred) encrypted Inbox edit\(deferred == 1 ? "" : "s") after reaching the \(authoringPushLimit)-request safety cap."
+                )
+                break
+            }
+            guard var mutation = planner.canonicalAuthoringMutation(id: original.id),
+                  mutation.disposition == .pending else { continue }
+
+            if mutation.hasBeenSubmitted,
+               let observed = try reconcileCanonicalAuthoringFromCache(mutation) {
+                if observed { appliedCount += 1 }
+                continue
+            }
+            guard try canonicalAuthoringPreflightIsCurrent(mutation) else { continue }
+            if !mutation.hasBeenSubmitted {
+                mutation = try planner.bindCanonicalAuthoringMutation(
+                    mutation.id,
+                    configurationIdentifier: client.configurationIdentifier
+                )
+                mutation = try planner.markCanonicalAuthoringMutationSubmitted(mutation.id)
+            }
+            guard mutation.configurationIdentifier == client.configurationIdentifier else {
+                throw PlannerCanonicalAuthoringError.invalidConfiguration
+            }
+
+            attemptedCount += 1
+            do {
+                let response = try await sendCanonicalAuthoringMutation(
+                    mutation,
+                    client: client
+                )
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                try planner.applyCanonicalAuthoringResponse(mutation.id, item: response)
+                appliedCount += 1
+            } catch let error as DayWeaveAPIError {
+                try ensureOperationCurrent(operationID: operationID, generation: generation)
+                if let reconciled = try await reconcileCanonicalAuthoringAfterServerError(
+                    mutation,
+                    error: error,
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                ) {
+                    if reconciled { appliedCount += 1 }
+                    continue
+                }
+                throw error
+            }
+        }
+        return appliedCount
+    }
+
+    /// Every mutation of a child may refresh both its old and new canonical
+    /// parents. Publish any queued parent operation first so that the child's
+    /// hierarchy side effect cannot make the parent's exact base revision stale
+    /// inside the same offline batch. Submitted work otherwise retains priority
+    /// among unrelated nodes so uncertain requests are reconciled first.
+    private func orderedCanonicalAuthoringMutations(
+        _ mutations: [DayWeavePendingCanonicalAuthoringMutation]
+    ) -> [DayWeavePendingCanonicalAuthoringMutation] {
+        let stable = mutations.sorted {
+            if $0.hasBeenSubmitted != $1.hasBeenSubmitted {
+                return $0.hasBeenSubmitted && !$1.hasBeenSubmitted
+            }
+            if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        let byItemID = Dictionary(
+            stable.map { ($0.itemID, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let stableRank = Dictionary(uniqueKeysWithValues: stable.enumerated().map {
+            ($0.element.id, $0.offset)
+        })
+        var childrenByParentMutationID: [UUID: Set<UUID>] = [:]
+        var dependencyCount = Dictionary(uniqueKeysWithValues: stable.map { ($0.id, 0) })
+        for child in stable {
+            for parentItemID in canonicalAuthoringAffectedParentIDs(child) {
+                guard let parent = byItemID[parentItemID], parent.id != child.id else { continue }
+                if childrenByParentMutationID[parent.id, default: []].insert(child.id).inserted {
+                    dependencyCount[child.id, default: 0] += 1
+                }
+            }
+        }
+
+        func stableOrder(_ left: DayWeavePendingCanonicalAuthoringMutation,
+                         _ right: DayWeavePendingCanonicalAuthoringMutation) -> Bool {
+            (stableRank[left.id] ?? .max) < (stableRank[right.id] ?? .max)
+        }
+
+        var ready = stable.filter { dependencyCount[$0.id] == 0 }.sorted(by: stableOrder)
+        var emitted = Set<UUID>()
+        var result: [DayWeavePendingCanonicalAuthoringMutation] = []
+        result.reserveCapacity(stable.count)
+
+        while !ready.isEmpty {
+            let mutation = ready.removeFirst()
+            guard emitted.insert(mutation.id).inserted else { continue }
+            result.append(mutation)
+            for childID in childrenByParentMutationID[mutation.id] ?? [] {
+                let remaining = max(0, (dependencyCount[childID] ?? 0) - 1)
+                dependencyCount[childID] = remaining
+                if remaining == 0, let child = stable.first(where: { $0.id == childID }) {
+                    ready.append(child)
+                    ready.sort(by: stableOrder)
+                }
+            }
+        }
+        // A cycle across old and new ancestry cannot be serialized with exact
+        // per-item revisions. Keep deterministic order; normal preflight and
+        // conflict recovery retain every request rather than dropping it.
+        result.append(contentsOf: stable.filter { !emitted.contains($0.id) })
+        return result
+    }
+
+    private func canonicalAuthoringAffectedParentIDs(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) -> Set<UUID> {
+        var parentIDs = Set<UUID>()
+        if let parentID = mutation.draft?.parentID { parentIDs.insert(parentID) }
+        if let parentID = mutation.baseItem?.parentID { parentIDs.insert(parentID) }
+        if mutation.operation == .restore,
+           let parentID = planner.canonicalTrashEntry(id: mutation.itemID)?.parentID {
+            parentIDs.insert(parentID)
+        }
+        parentIDs.remove(mutation.itemID)
+        return parentIDs
+    }
+
+    private func canonicalAuthoringPreflightIsCurrent(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) throws -> Bool {
+        let diagnostic: String?
+        switch mutation.operation {
+        case .create:
+            diagnostic = if planner.canonicalItem(id: mutation.itemID) != nil
+                || planner.canonicalTombstoneRevisions[mutation.itemID] != nil {
+                "This identifier already belongs to canonical history. Keep the latest item or create a new draft."
+            } else if let draft = mutation.draft,
+                      !planner.canonicalAuthoringDraftHierarchyIsCurrent(
+                          draft,
+                          itemID: mutation.itemID,
+                          requiresCommittedParent: true
+                      ) {
+                "The selected parent is no longer available for this item. Choose an active Inbox or Planned parent before retrying."
+            } else {
+                nil
+            }
+        case .replace, .trash:
+            if let expected = mutation.expectedRevision,
+               planner.canonicalItem(id: mutation.itemID)?.revision == expected {
+                if mutation.operation == .replace,
+                   let draft = mutation.draft,
+                   !planner.canonicalAuthoringDraftHierarchyIsCurrent(
+                       draft,
+                       itemID: mutation.itemID,
+                       requiresCommittedParent: true
+                   ) {
+                    diagnostic = "The selected parent is no longer available for this item. Review the latest hierarchy before retrying."
+                } else if mutation.operation == .trash,
+                          planner.canonicalItems.contains(where: {
+                              $0.parentID == mutation.itemID && $0.deletedAt == nil
+                          }) {
+                    diagnostic = "This item now has active children and cannot be deleted until they are moved or deleted."
+                } else {
+                    diagnostic = nil
+                }
+            } else if mutation.operation == .trash,
+                      mutation.hasBeenSubmitted,
+                      let expected = mutation.expectedRevision,
+                      let entry = planner.canonicalTrashEntry(id: mutation.itemID),
+                      entry.revision > expected {
+                // A pulled tombstone proves the item left the active set, but
+                // delta deliberately retains only the pre-delete body. Replay
+                // the immutable request to recover the full deleted response;
+                // do not misclassify response loss as a revision conflict.
+                diagnostic = nil
+            } else {
+                diagnostic = "The item changed after this edit was saved. Review the latest revision before retrying."
+            }
+        case .restore:
+            if let expected = mutation.expectedRevision,
+               let entry = planner.canonicalTrashEntry(id: mutation.itemID),
+               entry.revision == expected {
+                if let parentID = entry.parentID,
+                   planner.canonicalItem(id: parentID) == nil {
+                    diagnostic = "The deleted item's parent is no longer active, so it cannot be restored in place."
+                } else {
+                    diagnostic = nil
+                }
+            } else {
+                diagnostic = "The deleted item changed after restore was requested. Review the latest revision before retrying."
+            }
+        }
+        guard let diagnostic else { return true }
+        _ = try planner.markCanonicalAuthoringMutationConflicted(
+            mutation.id,
+            diagnostic: diagnostic
+        )
+        warnings.append("An Inbox edit needs conflict review before it can be published.")
+        return false
+    }
+
+    private func sendCanonicalAuthoringMutation(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation,
+        client: DayWeaveAPIClient
+    ) async throws -> DayWeaveCanonicalItem {
+        switch mutation.operation {
+        case .create:
+            guard let draft = mutation.draft else {
+                throw PlannerCanonicalAuthoringError.invalidMutation
+            }
+            return try await client.createCanonicalItem(
+                DayWeaveNewCanonicalItem(id: mutation.itemID, fields: draft.requestFields),
+                idempotencyKey: mutation.idempotencyKey
+            )
+        case .replace:
+            guard let draft = mutation.draft,
+                  let expectedRevision = mutation.expectedRevision else {
+                throw PlannerCanonicalAuthoringError.invalidMutation
+            }
+            return try await client.replaceCanonicalItem(
+                mutation.itemID,
+                expectedRevision: expectedRevision,
+                item: draft.requestFields,
+                idempotencyKey: mutation.idempotencyKey
+            )
+        case .trash:
+            guard let expectedRevision = mutation.expectedRevision else {
+                throw PlannerCanonicalAuthoringError.invalidMutation
+            }
+            return try await client.trashCanonicalItem(
+                mutation.itemID,
+                expectedRevision: expectedRevision,
+                idempotencyKey: mutation.idempotencyKey
+            )
+        case .restore:
+            guard let expectedRevision = mutation.expectedRevision else {
+                throw PlannerCanonicalAuthoringError.invalidMutation
+            }
+            return try await client.restoreCanonicalItem(
+                mutation.itemID,
+                expectedRevision: expectedRevision,
+                idempotencyKey: mutation.idempotencyKey
+            )
+        }
+    }
+
+    /// Returns `true` when the exact journal was committed, `false` when it was
+    /// moved to explicit conflict review, and `nil` when no conclusive local
+    /// observation exists and the exact request still needs replay.
+    private func reconcileCanonicalAuthoringFromCache(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) throws -> Bool? {
+        let candidate: DayWeaveCanonicalItem?
+        switch mutation.operation {
+        case .create:
+            candidate = planner.canonicalItem(id: mutation.itemID)
+        case .replace, .restore:
+            guard let expected = mutation.expectedRevision,
+                  let observed = planner.canonicalItem(id: mutation.itemID),
+                  observed.revision > expected else { return nil }
+            candidate = observed
+        case .trash:
+            guard let expected = mutation.expectedRevision,
+                  let entry = planner.canonicalTrashEntry(id: mutation.itemID),
+                  entry.revision > expected,
+                  entry.lastKnownItem?.deletedAt != nil else { return nil }
+            candidate = entry.lastKnownItem
+        }
+        guard let candidate else { return nil }
+        return try reconcileCanonicalAuthoringCandidate(candidate, mutation: mutation)
+    }
+
+    private func reconcileCanonicalAuthoringCandidate(
+        _ candidate: DayWeaveCanonicalItem,
+        mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) throws -> Bool {
+        do {
+            try planner.applyCanonicalAuthoringResponse(mutation.id, item: candidate)
+            return true
+        } catch PlannerCanonicalAuthoringError.invalidRemoteResponse {
+            _ = try planner.markCanonicalAuthoringMutationConflicted(
+                mutation.id,
+                diagnostic: "The canonical item now has different content or revision state. Review both versions before deciding which to keep."
+            )
+            warnings.append("An Inbox edit resolved to different canonical content and needs review.")
+            return false
+        }
+    }
+
+    private func reconcileCanonicalAuthoringAfterServerError(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation,
+        error: DayWeaveAPIError,
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> Bool? {
+        let statusCode: Int
+        let trustedNoEffect: Bool
+        switch error {
+        case .trustedCanonicalMutationInProgress:
+            return nil
+        case .trustedCanonicalMutationNoEffect:
+            statusCode = 409
+            trustedNoEffect = true
+        case let .server(code, _, _, _):
+            statusCode = code
+            trustedNoEffect = false
+        default:
+            return nil
+        }
+        if statusCode == 400 || statusCode == 422 {
+            _ = try planner.markCanonicalAuthoringMutationConflicted(
+                mutation.id,
+                diagnostic: "The server rejected this saved item contract. Edit the retained draft before retrying."
+            )
+            warnings.append("An Inbox edit was rejected by the canonical contract and remains encrypted for review.")
+            return false
+        }
+        guard statusCode == 404 || statusCode == 409 else { return nil }
+
+        let observed: [DayWeaveCanonicalItem]
+        do {
+            observed = try await client.listCanonicalItems(
+                includeDeleted: true,
+                limit: DayWeaveAPIClient.maximumCanonicalItemListLimit
+            )
+        } catch {
+            if trustedNoEffect {
+                return try markCanonicalAuthoringNoEffectConflict(mutation)
+            }
+            // The original exact mutation remains submitted. Failure to obtain
+            // independent canonical evidence must never turn ambiguity into a
+            // destructive conflict decision.
+            return nil
+        }
+        try ensureOperationCurrent(operationID: operationID, generation: generation)
+        if let candidate = observed.first(where: { $0.id == mutation.itemID }) {
+            if mutation.operation != .create,
+               let expected = mutation.expectedRevision,
+               candidate.revision <= expected {
+                // A matching idempotent request can return 409 while it still
+                // owns the mutation. During that window the list endpoint
+                // legitimately exposes the unchanged base item (or deleted
+                // restore base). It is not evidence of a conflicting result.
+                return trustedNoEffect
+                    ? try markCanonicalAuthoringNoEffectConflict(mutation)
+                    : nil
+            }
+            return try reconcileCanonicalAuthoringCandidate(candidate, mutation: mutation)
+        }
+        if trustedNoEffect {
+            return try markCanonicalAuthoringNoEffectConflict(mutation)
+        }
+        if statusCode == 404,
+           observed.count < DayWeaveAPIClient.maximumCanonicalItemListLimit {
+            _ = try planner.markCanonicalAuthoringMutationConflicted(
+                mutation.id,
+                diagnostic: "The authenticated server confirmed that this item is absent. Keep the saved draft or discard this operation."
+            )
+            warnings.append("An Inbox edit references an item that is no longer available.")
+            return false
+        }
+        // A 409 with no observed item can mean the matching idempotent request
+        // is still in progress. A full 200-item list can also be truncated.
+        // Preserve the exact submitted journal and retry later.
+        return nil
+    }
+
+    private func markCanonicalAuthoringNoEffectConflict(
+        _ mutation: DayWeavePendingCanonicalAuthoringMutation
+    ) throws -> Bool {
+        _ = try planner.markCanonicalAuthoringMutationConflicted(
+            mutation.id,
+            diagnostic: "The authenticated server proved this exact request made no change. Review the latest canonical hierarchy and revision, then keep or copy the retained draft."
+        )
+        warnings.append("An Inbox edit made no canonical change and needs conflict review.")
+        return false
     }
 
     private func publishLocalCaptures(

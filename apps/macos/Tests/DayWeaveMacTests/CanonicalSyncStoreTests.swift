@@ -2212,6 +2212,805 @@ struct CanonicalSyncStoreTests {
         }
     }
 
+    @Test("an exact Inbox create journal survives transport failure and restart")
+    func canonicalAuthoringCreateReplaysExactlyAfterRestart() async throws {
+        let token = "canonical-authoring-create-replay-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000000")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let createdItemObject = Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        )
+        let item = try Self.decodeItem(createdItemObject)
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: DayWeaveCanonicalItemDraft(item: item)
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-retry-0","has_more":false}"#.utf8
+                )
+            )
+        )
+
+        await Self.makeSync(planner: planner, token: token, now: now).sync()
+
+        let submitted = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(submitted.hasBeenSubmitted)
+        #expect(submitted.configurationIdentifier == Self.configurationIdentifier(token: token))
+        #expect(planner.canonicalItem(id: itemID) == nil)
+        let firstCreate = try #require(URLProtocolStub.storage.requests(for: token).last)
+        #expect(firstCreate.method == "POST")
+        #expect(firstCreate.url.path == "/gateway/v1/items")
+
+        let restored = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restored.pendingCanonicalAuthoringMutations == [submitted])
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-retry-1","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 201,
+                body: Data("{\"item\":\(createdItemObject)}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-retry-2","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 1]).utf8)
+            )
+        )
+
+        let resumedSync = Self.makeSync(planner: restored, token: token, now: now)
+        await resumedSync.sync()
+
+        #expect(restored.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(restored.canonicalItem(id: itemID) == item)
+        if case .online = resumedSync.status {} else {
+            Issue.record("Expected the exact restarted authoring request to reconcile")
+        }
+        let creates = URLProtocolStub.storage.requests(for: token).filter {
+            $0.method == "POST" && $0.url.path == "/gateway/v1/items"
+        }
+        #expect(creates.count == 2)
+        #expect(creates[0].body == creates[1].body)
+        #expect(creates[0].headers["Idempotency-Key"] == queued.idempotencyKey)
+        #expect(creates[1].headers["Idempotency-Key"] == queued.idempotencyKey)
+    }
+
+    @Test("a pulled matching create resolves a submitted journal without another create")
+    func canonicalAuthoringReconcilesSubmittedCreateFromDelta() async throws {
+        let token = "canonical-authoring-delta-reconcile-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000001")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let itemObject = Self.itemObject(id: itemID, revision: 1, status: "inbox")
+        let item = try Self.decodeItem(itemObject)
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalCreate(
+            itemID: itemID,
+            draft: DayWeaveCanonicalItemDraft(item: item)
+        )
+        #expect(planner.beginCanonicalSync())
+        try planner.prepareCanonicalSync(
+            configurationIdentifier: Self.configurationIdentifier(token: token)
+        )
+        _ = try planner.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: Self.configurationIdentifier(token: token)
+        )
+        _ = try planner.markCanonicalAuthoringMutationSubmitted(queued.id)
+        planner.endCanonicalSync()
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data("{\"changes\":[{\"type\":\"upsert\",\"item\":\(itemObject)}],\"next_cursor\":\"authoring-observed-1\",\"has_more\":false}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-observed-2","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 1]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(planner.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(planner.canonicalItem(id: itemID) == item)
+        #expect(URLProtocolStub.storage.requests(for: token).allSatisfy {
+            !($0.method == "POST" && $0.url.path == "/gateway/v1/items")
+        })
+        if case .online = sync.status {} else {
+            Issue.record("Expected delta evidence to reconcile the submitted create")
+        }
+    }
+
+    @Test("a remote revision change conflicts an unsubmitted replacement before PUT")
+    func canonicalAuthoringPreflightConflictsStaleReplace() async throws {
+        let token = "canonical-authoring-preflight-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000002")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let originalObject = Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        )
+        let original = try Self.decodeItem(originalObject)
+        let remoteObject = Self.itemObject(id: itemID, revision: 2, status: "inbox")
+            .replacingOccurrences(of: "Write launch plan", with: "Changed elsewhere")
+        var localDraft = DayWeaveCanonicalItemDraft(item: original)
+        localDraft.title = "My local edit"
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [original],
+            canonicalDeltaCursor: "authoring-before-stale",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalReplace(itemID: itemID, draft: localDraft)
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data("{\"changes\":[{\"type\":\"upsert\",\"item\":\(remoteObject)}],\"next_cursor\":\"authoring-after-stale\",\"has_more\":false}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 2]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let conflicted = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(conflicted.disposition == .conflicted)
+        #expect(!conflicted.hasBeenSubmitted)
+        #expect(conflicted.diagnostic?.contains("changed") == true)
+        #expect(URLProtocolStub.storage.requests(for: token).allSatisfy { $0.method != "PUT" })
+        #expect(sync.warnings.contains { $0.contains("conflict review") })
+    }
+
+    @Test("idempotency-in-progress with the unchanged base retains the exact journal")
+    func canonicalAuthoringAmbiguous409RetainsSubmittedJournal() async throws {
+        let token = "canonical-authoring-ambiguous-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000003")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let originalObject = Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        )
+        let original = try Self.decodeItem(originalObject)
+        var draft = DayWeaveCanonicalItemDraft(item: original)
+        draft.title = "Queued replacement"
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [original],
+            canonicalDeltaCursor: "authoring-before-ambiguous",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalReplace(itemID: itemID, draft: draft)
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-ambiguous","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 409,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"matching idempotent request is still in progress"}}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(originalObject)]}".utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let retained = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(retained.hasBeenSubmitted)
+        #expect(retained.disposition == .pending)
+        #expect(retained.configurationIdentifier == Self.configurationIdentifier(token: token))
+        #expect(sync.status.isFailure)
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.map(\.method) == ["GET", "PUT", "GET"])
+        #expect(requests[1].headers["Idempotency-Key"] == queued.idempotencyKey)
+        #expect(requests[2].url.query?.contains("include_deleted=true") == true)
+        #expect(requests[2].url.query?.contains("limit=200") == true)
+    }
+
+    @Test("trusted idempotency-in-progress retains the exact journal without treating a list as proof")
+    func canonicalAuthoringTrustedInProgressRetainsSubmittedJournal() async throws {
+        let token = "canonical-authoring-trusted-in-progress-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000004")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let original = try Self.decodeItem(Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        ))
+        var draft = DayWeaveCanonicalItemDraft(item: original)
+        draft.title = "Queued trusted replacement"
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [original],
+            canonicalDeltaCursor: "authoring-before-trusted-in-progress",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalReplace(itemID: itemID, draft: draft)
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-trusted-in-progress","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 409,
+                headers: Self.trustedCanonicalMutationErrorHeaders,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"matching idempotent request is still in progress"}}"#.utf8
+                )
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let retained = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(retained.hasBeenSubmitted)
+        #expect(retained.disposition == .pending)
+        #expect(sync.status.isFailure)
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.map(\.method) == ["GET", "PUT"])
+        #expect(requests[1].headers["Idempotency-Key"] == queued.idempotencyKey)
+    }
+
+    @Test("trusted no-effect trash conflict exits the retry loop into explicit review")
+    func canonicalAuthoringTrustedTrashNoEffectBecomesConflict() async throws {
+        let token = "canonical-authoring-trusted-trash-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000005")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let originalObject = Self.itemObject(id: itemID, revision: 1, status: "inbox")
+        let original = try Self.decodeItem(originalObject)
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [original],
+            canonicalDeltaCursor: "authoring-before-trusted-trash",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalTrash(itemID: itemID)
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-trusted-trash","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 409,
+                headers: Self.trustedCanonicalMutationErrorHeaders,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"an item with active children cannot be deleted"}}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(originalObject)]}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [itemID: 1]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let conflicted = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(conflicted.hasBeenSubmitted)
+        #expect(conflicted.disposition == .conflicted)
+        #expect(conflicted.diagnostic?.contains("made no change") == true)
+        #expect(planner.canonicalItem(id: itemID) == original)
+        if case .online = sync.status {} else {
+            Issue.record("Expected a trusted no-effect result to remain reviewable without failing sync")
+        }
+        #expect(URLProtocolStub.storage.requests(for: token).map(\.method) == [
+            "GET", "DELETE", "GET", "POST",
+        ])
+    }
+
+    @Test("trusted absent create hierarchy conflict exits the retry loop into explicit review")
+    func canonicalAuthoringTrustedAbsentCreateBecomesConflict() async throws {
+        let token = "canonical-authoring-trusted-create-token"
+        let parentID = UUID(uuidString: "27500000-2222-4333-8444-200000000006")!
+        let childID = UUID(uuidString: "27500000-2222-4333-8444-200000000007")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let parentObject = Self.itemObject(id: parentID, revision: 1, status: "inbox")
+        let child = try Self.decodeItem(Self.itemObject(
+            id: childID,
+            revision: 1,
+            status: "inbox",
+            parentID: parentID
+        ))
+        let parent = try Self.decodeItem(parentObject)
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [parent],
+            canonicalDeltaCursor: "authoring-before-trusted-create",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalCreate(
+            itemID: childID,
+            draft: DayWeaveCanonicalItemDraft(item: child)
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"authoring-trusted-create","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 409,
+                headers: Self.trustedCanonicalMutationErrorHeaders,
+                body: Data(
+                    #"{"error":{"code":"conflict","message":"item hierarchy would contain a cycle"}}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(parentObject)]}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [parentID: 1]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let conflicted = try #require(planner.canonicalAuthoringMutation(id: queued.id))
+        #expect(conflicted.hasBeenSubmitted)
+        #expect(conflicted.disposition == .conflicted)
+        #expect(conflicted.diagnostic?.contains("made no change") == true)
+        #expect(planner.canonicalItem(id: childID) == nil)
+        if case .online = sync.status {} else {
+            Issue.record("Expected a trusted absent create conflict to remain reviewable")
+        }
+        let requests = URLProtocolStub.storage.requests(for: token)
+        #expect(requests.map(\.method) == ["GET", "POST", "GET", "POST"])
+        #expect(requests[1].url.path == "/gateway/v1/items")
+    }
+
+    @Test("parent creates are published before same-time child creates")
+    func canonicalAuthoringOrdersHierarchyDependencies() async throws {
+        let token = "canonical-authoring-hierarchy-order-token"
+        let parentID = UUID(uuidString: "27500000-2222-4333-8444-200000000010")!
+        let childID = UUID(uuidString: "27500000-2222-4333-8444-200000000011")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let parentObject = Self.itemObject(id: parentID, revision: 1, status: "inbox")
+        let childObject = Self.itemObject(
+            id: childID,
+            revision: 1,
+            status: "inbox",
+            parentID: parentID
+        )
+        let parent = try Self.decodeItem(parentObject)
+        let child = try Self.decodeItem(childObject)
+        let parentMutation = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "ffffffff-ffff-4fff-8fff-ffffffffffff")!,
+            itemID: parentID,
+            operation: .create,
+            draft: DayWeaveCanonicalItemDraft(item: parent),
+            createdAt: now
+        )
+        let childMutation = DayWeavePendingCanonicalAuthoringMutation(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000001")!,
+            itemID: childID,
+            operation: .create,
+            draft: DayWeaveCanonicalItemDraft(item: child),
+            createdAt: now
+        )
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            pendingCanonicalAuthoringMutations: [childMutation, parentMutation],
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let refreshedParentObject = Self.itemObject(
+            id: parentID,
+            revision: 2,
+            status: "inbox",
+            isExecutable: false
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"hierarchy-before","has_more":false}"#.utf8
+                )
+            ),
+            .init(statusCode: 201, body: Data("{\"item\":\(parentObject)}".utf8)),
+            .init(statusCode: 201, body: Data("{\"item\":\(childObject)}".utf8)),
+            .init(
+                statusCode: 200,
+                body: Data("{\"changes\":[{\"type\":\"upsert\",\"item\":\(refreshedParentObject)}],\"next_cursor\":\"hierarchy-after\",\"has_more\":false}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(
+                    sourceRevisions: [parentID: 2, childID: 1]
+                ).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let creates = URLProtocolStub.storage.requests(for: token).filter {
+            $0.method == "POST" && $0.url.path == "/gateway/v1/items"
+        }
+        #expect(creates.compactMap { $0.jsonBody?["id"] as? String } == [
+            parentID.uuidString.lowercased(),
+            childID.uuidString.lowercased(),
+        ])
+        #expect(planner.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(planner.canonicalItem(id: childID)?.parentID == parentID)
+        if case .online = sync.status {} else {
+            Issue.record("Expected parent-before-child authoring to complete")
+        }
+    }
+
+    @Test("a queued parent edit publishes before a child deletion can refresh it")
+    func canonicalAuthoringOrdersOldParentRevisionDependencies() async throws {
+        let token = "canonical-authoring-old-parent-order-token"
+        let parentID = UUID(uuidString: "27500000-2222-4333-8444-200000000020")!
+        let childID = UUID(uuidString: "27500000-2222-4333-8444-200000000021")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let parentObject = Self.itemObject(id: parentID, revision: 1, status: "inbox")
+        let childObject = Self.itemObject(
+            id: childID,
+            revision: 1,
+            status: "inbox",
+            parentID: parentID
+        )
+        let parent = try Self.decodeItem(parentObject)
+        let child = try Self.decodeItem(childObject)
+        var parentDraft = DayWeaveCanonicalItemDraft(item: parent)
+        parentDraft.title = "Edited parent before child deletion"
+        let childTrash = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: childID,
+            operation: .trash,
+            expectedRevision: child.revision,
+            baseItem: child,
+            createdAt: now
+        )
+        let parentReplace = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: parentID,
+            operation: .replace,
+            draft: parentDraft,
+            expectedRevision: parent.revision,
+            baseItem: parent,
+            createdAt: now.addingTimeInterval(1)
+        )
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [parent, child],
+            canonicalDeltaCursor: "old-parent-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            pendingCanonicalAuthoringMutations: [childTrash, parentReplace],
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+
+        let replacedParentObject = Self.itemObject(
+            id: parentID,
+            revision: 2,
+            status: "inbox"
+        ).replacingOccurrences(
+            of: "Write launch plan",
+            with: "Edited parent before child deletion"
+        )
+        let refreshedParentObject = Self.itemObject(
+            id: parentID,
+            revision: 3,
+            status: "inbox"
+        ).replacingOccurrences(
+            of: "Write launch plan",
+            with: "Edited parent before child deletion"
+        )
+        let deletedChildObject = Self.itemObject(
+            id: childID,
+            revision: 2,
+            status: "inbox",
+            parentID: parentID,
+            deletedAt: #""2026-08-29T08:02:00Z""#
+        )
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"old-parent-pull","has_more":false}"#.utf8
+                )
+            ),
+            .init(statusCode: 200, body: Data("{\"item\":\(replacedParentObject)}".utf8)),
+            .init(statusCode: 200, body: Data("{\"item\":\(deletedChildObject)}".utf8)),
+            .init(
+                statusCode: 200,
+                body: Data("{\"changes\":[{\"type\":\"upsert\",\"item\":\(refreshedParentObject)}],\"next_cursor\":\"old-parent-after\",\"has_more\":false}".utf8)
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [parentID: 3]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        let authoringRequests = URLProtocolStub.storage.requests(for: token).filter {
+            $0.method == "PUT" || $0.method == "DELETE"
+        }
+        #expect(authoringRequests.map(\.method) == ["PUT", "DELETE"])
+        #expect(authoringRequests.first?.url.path.hasSuffix(parentID.uuidString.lowercased()) == true)
+        #expect(authoringRequests.last?.url.path.hasSuffix(childID.uuidString.lowercased()) == true)
+        #expect(planner.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(planner.canonicalItem(id: parentID)?.revision == 3)
+        #expect(planner.canonicalItem(id: childID) == nil)
+        if case .online = sync.status {} else {
+            Issue.record("Expected the dependency-ordered offline batch to complete")
+        }
+    }
+
+    @Test("a pulled tombstone replays submitted trash to recover its full response")
+    func canonicalAuthoringRecoversTrashResponseLoss() async throws {
+        let token = "canonical-authoring-trash-recovery-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000012")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let active = try Self.decodeItem(Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        ))
+        let deletedAt = "2026-08-29T08:10:00Z"
+        let deletedObject = Self.itemObject(
+            id: itemID,
+            revision: 2,
+            status: "inbox",
+            deletedAt: "\"\(deletedAt)\""
+        )
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = PlannerStore(
+            canonicalItems: [active],
+            canonicalDeltaCursor: "trash-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try planner.enqueueCanonicalTrash(itemID: itemID)
+        #expect(planner.beginCanonicalSync())
+        _ = try planner.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: Self.configurationIdentifier(token: token)
+        )
+        _ = try planner.markCanonicalAuthoringMutationSubmitted(queued.id)
+        planner.endCanonicalSync()
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data("{\"changes\":[{\"type\":\"tombstone\",\"tombstone\":{\"id\":\"\(itemID.uuidString.lowercased())\",\"revision\":2,\"deleted_at\":\"\(deletedAt)\",\"parent_id\":null}}],\"next_cursor\":\"trash-observed\",\"has_more\":false}".utf8)
+            ),
+            .init(statusCode: 200, body: Data("{\"item\":\(deletedObject)}".utf8)),
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"trash-final","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(planner.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(planner.canonicalItem(id: itemID) == nil)
+        #expect(planner.canonicalTrashEntry(id: itemID)?.revision == 2)
+        #expect(planner.canonicalTrashEntry(id: itemID)?.lastKnownItem?.deletedAt != nil)
+        let deletion = try #require(URLProtocolStub.storage.requests(for: token).first {
+            $0.method == "DELETE"
+        })
+        #expect(deletion.headers["Idempotency-Key"] == queued.idempotencyKey)
+        if case .online = sync.status {} else {
+            Issue.record("Expected tombstone recovery to replay and retain the full deleted item")
+        }
+    }
+
+    @Test("submitted trash replays after an empty cursor rebuild and restart")
+    func canonicalAuthoringReplaysTrashAfterCursorRebuild() async throws {
+        let token = "canonical-authoring-trash-rebuild-token"
+        let itemID = UUID(uuidString: "27500000-2222-4333-8444-200000000013")!
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z")
+        )
+        let active = try Self.decodeItem(Self.itemObject(
+            id: itemID,
+            revision: 1,
+            status: "inbox"
+        ))
+        let deletedObject = Self.itemObject(
+            id: itemID,
+            revision: 2,
+            status: "inbox",
+            deletedAt: #""2026-08-29T08:10:00Z""#
+        )
+        let context = try Self.makeAuthoringPersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let seed = PlannerStore(
+            canonicalItems: [active],
+            canonicalDeltaCursor: "expired-before-rebuild",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let queued = try seed.enqueueCanonicalTrash(itemID: itemID)
+        #expect(seed.beginCanonicalSync())
+        _ = try seed.bindCanonicalAuthoringMutation(
+            queued.id,
+            configurationIdentifier: Self.configurationIdentifier(token: token)
+        )
+        _ = try seed.markCanonicalAuthoringMutationSubmitted(queued.id)
+        seed.endCanonicalSync()
+        seed.replaceCanonicalState(changes: [], nextCursor: "rebuilt-empty")
+        seed.flushPersistence()
+
+        let planner = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(planner.loadState == .ready)
+        #expect(planner.canonicalAuthoringMutation(id: queued.id)?.hasBeenSubmitted == true)
+        #expect(planner.canonicalTrashEntry(id: itemID)?.revision == 2)
+
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"rebuilt-pull","has_more":false}"#.utf8
+                )
+            ),
+            .init(statusCode: 200, body: Data("{\"item\":\(deletedObject)}".utf8)),
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"rebuilt-final","has_more":false}"#.utf8
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Data(Self.emptyPreviewObject(sourceRevisions: [:]).utf8)
+            )
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        #expect(planner.pendingCanonicalAuthoringMutations.isEmpty)
+        let deletion = try #require(URLProtocolStub.storage.requests(for: token).first {
+            $0.method == "DELETE"
+        })
+        #expect(deletion.headers["Idempotency-Key"] == queued.idempotencyKey)
+        if case .online = sync.status {} else {
+            Issue.record("Expected rebuilt submitted deletion to replay exactly")
+        }
+    }
+
     private static func itemObject(
         id: UUID,
         revision: UInt64,
@@ -2219,7 +3018,9 @@ struct CanonicalSyncStoreTests {
         parentID: UUID? = nil,
         siblingOrder: UInt32 = 0,
         isSensitive: Bool = false,
-        splitPolicy: String = #"{"type":"indivisible"}"#
+        splitPolicy: String = #"{"type":"indivisible"}"#,
+        isExecutable: Bool = true,
+        deletedAt: String = "null"
     ) -> String {
         let parent = parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"
         return """
@@ -2227,9 +3028,9 @@ struct CanonicalSyncStoreTests {
          "title":"Write launch plan","notes":"Private local notes","timezone_name":"Europe/Madrid",
          "duration_seconds":2700,"deadline_at":null,"earliest_start_at":null,"recurrence":null,
          "flexible_constraints":{"energy":"deep"},"split_policy":\(splitPolicy),
-         "importance":50,"urgency":50,"parent_id":\(parent),"sibling_order":\(siblingOrder),"is_executable":true,
+         "importance":50,"urgency":50,"parent_id":\(parent),"sibling_order":\(siblingOrder),"is_executable":\(isExecutable),
          "revision":\(revision),"created_at":"2026-08-29T08:00:00Z",
-         "updated_at":"2026-08-29T08:00:00Z","completed_at":null,"deleted_at":null}
+         "updated_at":"2026-08-29T08:00:00Z","completed_at":null,"deleted_at":\(deletedAt)}
         """
     }
 
@@ -2287,6 +3088,12 @@ struct CanonicalSyncStoreTests {
 
     private static let emptyInputDigest =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+    private static let trustedCanonicalMutationErrorHeaders = [
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+    ]
 
     private static func publicationResponse(
         inputDigest: String,
@@ -2368,6 +3175,28 @@ struct CanonicalSyncStoreTests {
     }
 
     private static let baseURLString = "https://api.example.com/gateway"
+
+    private static func makeAuthoringPersistence() throws -> (
+        directory: URL,
+        persistence: EncryptedPlannerPersistence
+    ) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "DayWeaveCanonicalSyncAuthoringTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        let key = try PlannerEncryptionKey(data: Data(repeating: 73, count: 32))
+        return (
+            directory,
+            EncryptedPlannerPersistence(
+                fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+                key: key
+            )
+        )
+    }
 
     private static func configurationIdentifier(token: String) -> String {
         DayWeaveAPIClient(

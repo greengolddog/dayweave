@@ -510,6 +510,12 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     /// Emitted only for an endpoint-specific typed conflict that the server
     /// guarantees was detected before any proposal mutation committed.
     case trustedProposalApplicationNoEffect(conflictCode: String)
+    /// Exact authenticated item-mutation evidence that the matching
+    /// idempotent request still owns the operation and must be retried.
+    case trustedCanonicalMutationInProgress
+    /// Exact authenticated item-mutation evidence that this request made no
+    /// change. Callers may still reconcile independently observed semantics.
+    case trustedCanonicalMutationNoEffect(conflictCode: String)
     case server(statusCode: Int, code: String?, message: String?, requestID: String?)
     case responseDecodingFailed
 }
@@ -545,6 +551,10 @@ extension DayWeaveAPIError: LocalizedError {
             return "The exact proposal application resource is absent on the authenticated server."
         case .trustedProposalApplicationNoEffect:
             return "The authenticated server proved that the exact proposal request had no effect."
+        case .trustedCanonicalMutationInProgress:
+            return "The matching canonical item request is still in progress."
+        case .trustedCanonicalMutationNoEffect:
+            return "The authenticated server proved that the canonical item request had no effect."
         case let .server(statusCode, code, message, requestID):
             let safeCode = DayWeaveDiagnosticSanitizer.code(code, secrets: [])
             let safeMessage = DayWeaveDiagnosticSanitizer.text(
@@ -650,6 +660,9 @@ struct DayWeaveAPIClient: Sendable {
     static let maximumResponseBytes = 16 * 1_048_576
     static let maximumRequestBytes = 16 * 1_048_576
     static let maximumExecutionHistoryLimit = 100
+    static let maximumCanonicalItemListLimit = 200
+
+    private static let defaultCanonicalItemListLimit = 100
 
     private struct SuggestionListEnvelope: Decodable {
         let suggestions: [DayWeaveProposal]
@@ -661,6 +674,10 @@ struct DayWeaveAPIClient: Sendable {
 
     private struct ItemEnvelope: Decodable {
         let item: DayWeaveCanonicalItem
+    }
+
+    private struct ItemListEnvelope: Decodable {
+        let items: [DayWeaveCanonicalItem]
     }
 
     private struct ItemDeltaEnvelope: Decodable {
@@ -682,6 +699,14 @@ struct DayWeaveAPIClient: Sendable {
         private enum CodingKeys: String, CodingKey {
             case expectedRevision = "expected_revision"
             case item
+        }
+    }
+
+    private struct RevisionRequest: Encodable {
+        let expectedRevision: UInt64
+
+        private enum CodingKeys: String, CodingKey {
+            case expectedRevision = "expected_revision"
         }
     }
 
@@ -1118,6 +1143,56 @@ struct DayWeaveAPIClient: Sendable {
         )
     }
 
+    func listCanonicalItems(
+        includeDeleted: Bool = false,
+        parentID: UUID? = nil,
+        limit: Int? = nil
+    ) async throws -> [DayWeaveCanonicalItem] {
+        guard limit.map({ (1...Self.maximumCanonicalItemListLimit).contains($0) }) ?? true else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        var queryItems = [
+            URLQueryItem(name: "include_deleted", value: includeDeleted ? "true" : "false"),
+        ]
+        if let parentID {
+            queryItems.append(URLQueryItem(
+                name: "parent_id",
+                value: parentID.uuidString.lowercased()
+            ))
+        }
+        if let limit {
+            queryItems.append(URLQueryItem(name: "limit", value: String(limit)))
+        }
+        let envelope: ItemListEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "items"],
+            queryItems: queryItems,
+            requiredStatusCode: 200
+        )
+        let effectiveLimit = limit ?? Self.defaultCanonicalItemListLimit
+        guard envelope.items.count <= effectiveLimit,
+              Set(envelope.items.map(\.id)).count == envelope.items.count,
+              envelope.items.allSatisfy({ item in
+                  (includeDeleted || item.deletedAt == nil)
+                      && (parentID.map({ item.parentID == $0 }) ?? true)
+              }) else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return envelope.items
+    }
+
+    func canonicalItem(_ id: UUID) async throws -> DayWeaveCanonicalItem {
+        let envelope: ItemEnvelope = try await send(
+            method: "GET",
+            pathComponents: ["v1", "items", id.uuidString.lowercased()],
+            requiredStatusCode: 200
+        )
+        guard envelope.item.id == id, envelope.item.deletedAt == nil else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return envelope.item
+    }
+
     func createCanonicalItem(
         _ item: DayWeaveNewCanonicalItem,
         idempotencyKey: String
@@ -1144,6 +1219,91 @@ struct DayWeaveAPIClient: Sendable {
             body: try encode(ReplaceItemRequest(expectedRevision: expectedRevision, item: item))
         )
         return envelope.item
+    }
+
+    func trashCanonicalItem(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> DayWeaveCanonicalItem {
+        try validateCanonicalMutationRequest(
+            expectedRevision: expectedRevision,
+            idempotencyKey: idempotencyKey
+        )
+        let envelope: ItemEnvelope = try await send(
+            method: "DELETE",
+            pathComponents: ["v1", "items", id.uuidString.lowercased()],
+            queryItems: [
+                URLQueryItem(name: "expected_revision", value: String(expectedRevision)),
+            ],
+            headers: ["Idempotency-Key": idempotencyKey],
+            requiredStatusCode: 200
+        )
+        return try validateCanonicalMutationResponse(
+            envelope.item,
+            id: id,
+            expectedRevision: expectedRevision,
+            isDeleted: true
+        )
+    }
+
+    func restoreCanonicalItem(
+        _ id: UUID,
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) async throws -> DayWeaveCanonicalItem {
+        try validateCanonicalMutationRequest(
+            expectedRevision: expectedRevision,
+            idempotencyKey: idempotencyKey
+        )
+        let envelope: ItemEnvelope = try await send(
+            method: "POST",
+            pathComponents: ["v1", "items", id.uuidString.lowercased(), "restore"],
+            headers: ["Idempotency-Key": idempotencyKey],
+            body: try encode(RevisionRequest(expectedRevision: expectedRevision)),
+            requiredStatusCode: 200
+        )
+        return try validateCanonicalMutationResponse(
+            envelope.item,
+            id: id,
+            expectedRevision: expectedRevision,
+            isDeleted: false
+        )
+    }
+
+    private func validateCanonicalMutationRequest(
+        expectedRevision: UInt64,
+        idempotencyKey: String
+    ) throws {
+        guard expectedRevision > 0,
+              expectedRevision < UInt64.max,
+              Self.isValidCanonicalItemIdempotencyKey(idempotencyKey) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+    }
+
+    private func validateCanonicalMutationResponse(
+        _ item: DayWeaveCanonicalItem,
+        id: UUID,
+        expectedRevision: UInt64,
+        isDeleted: Bool
+    ) throws -> DayWeaveCanonicalItem {
+        guard item.id == id,
+              item.revision == expectedRevision + 1,
+              (item.deletedAt != nil) == isDeleted else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return item
+    }
+
+    private static func isValidCanonicalItemIdempotencyKey(_ value: String) -> Bool {
+        (8...128).contains(value.utf8.count)
+            && value.utf8.allSatisfy { byte in
+                (byte >= 65 && byte <= 90)
+                    || (byte >= 97 && byte <= 122)
+                    || (byte >= 48 && byte <= 57)
+                    || [45, 46, 58, 95].contains(byte)
+            }
     }
 
     func previewSchedule(
@@ -1355,6 +1515,17 @@ struct DayWeaveAPIClient: Sendable {
             ) {
                 throw trusted
             }
+            if let trusted = Self.trustedCanonicalMutationError(
+                method: method,
+                pathComponents: pathComponents,
+                statusCode: httpResponse.statusCode,
+                contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                body: data
+            ) {
+                throw trusted
+            }
             let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: data)
             throw DayWeaveAPIError.server(
                 statusCode: httpResponse.statusCode,
@@ -1385,6 +1556,119 @@ struct DayWeaveAPIClient: Sendable {
         case lookup
         case apply
         case undo
+    }
+
+    private enum CanonicalMutationEndpoint: Equatable {
+        case create
+        case replace
+        case trash
+        case restore
+    }
+
+    private static func trustedCanonicalMutationError(
+        method: String,
+        pathComponents: [String],
+        statusCode: Int,
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> DayWeaveAPIError? {
+        guard statusCode == 409,
+              body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              cacheControl?.lowercased() == "no-store, max-age=0",
+              pragma?.lowercased() == "no-cache",
+              let endpoint = canonicalMutationEndpoint(
+                  method: method,
+                  pathComponents: pathComponents
+              ),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              error["code"] as? String == "conflict",
+              let message = error["message"] as? String else { return nil }
+
+        if Set(error.keys) == ["code", "message"],
+           message == "matching idempotent request is still in progress" {
+            return .trustedCanonicalMutationInProgress
+        }
+
+        if Set(error.keys) == ["code", "message", "details"],
+           endpoint != .create,
+           message == "item was changed by another request",
+           let details = error["details"] as? [String: Any],
+           Set(details.keys) == ["expected_revision", "actual_revision"],
+           isStrictPositiveJSONInteger(details["expected_revision"]),
+           isStrictPositiveJSONInteger(details["actual_revision"]) {
+            return .trustedCanonicalMutationNoEffect(conflictCode: "revision_conflict")
+        }
+
+        guard Set(error.keys) == ["code", "message"] else { return nil }
+        let common = [
+            "Idempotency-Key was already used for different content": "idempotency_conflict",
+        ]
+        let endpointSpecific: [String: String] = switch endpoint {
+        case .create:
+            [
+                "item already exists": "item_already_exists",
+                "item cannot be its own parent": "self_parent",
+                "item hierarchy would contain a cycle": "hierarchy_cycle",
+                "an executing or terminal item cannot become a parent": "invalid_parent_state",
+            ]
+        case .replace:
+            [
+                "item cannot be its own parent": "self_parent",
+                "item hierarchy would contain a cycle": "hierarchy_cycle",
+                "an executing or terminal item cannot become a parent": "invalid_parent_state",
+                "only leaf items can enter an executable state": "non_leaf_executable",
+            ]
+        case .trash:
+            ["an item with active children cannot be deleted": "has_children"]
+        case .restore:
+            [
+                "deleted item's parent must be restored first": "deleted_parent",
+                "only leaf items can enter an executable state": "non_leaf_executable",
+            ]
+        }
+        guard let conflictCode = endpointSpecific[message] ?? common[message] else {
+            return nil
+        }
+        return .trustedCanonicalMutationNoEffect(conflictCode: conflictCode)
+    }
+
+    private static func isStrictPositiveJSONInteger(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let parsed = UInt64(number.stringValue),
+              parsed > 0,
+              number.stringValue == String(parsed) else { return false }
+        return true
+    }
+
+    private static func canonicalMutationEndpoint(
+        method: String,
+        pathComponents: [String]
+    ) -> CanonicalMutationEndpoint? {
+        if method == "POST", pathComponents == ["v1", "items"] {
+            return .create
+        }
+        if pathComponents.count == 3,
+           pathComponents[0] == "v1", pathComponents[1] == "items",
+           UUID(uuidString: pathComponents[2]) != nil {
+            return switch method {
+            case "PUT": .replace
+            case "DELETE": .trash
+            default: nil
+            }
+        }
+        if method == "POST", pathComponents.count == 4,
+           pathComponents[0] == "v1", pathComponents[1] == "items",
+           UUID(uuidString: pathComponents[2]) != nil,
+           pathComponents[3] == "restore" {
+            return .restore
+        }
+        return nil
     }
 
     private static func trustedProposalApplicationError(
