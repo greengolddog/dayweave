@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Write as _,
     ops::Deref,
 };
@@ -166,9 +166,9 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) calendar_projection_stamps: Vec<CalendarProjectionStamp>,
-    /// Canonical items understood by this scheduler schema. This includes
-    /// retained nonblocking calendar context even though it emits no work item
-    /// or schedule block.
+    /// Canonical items accepted by this scheduler schema. This includes Inbox
+    /// subtrees and retained nonblocking calendar context even though neither
+    /// emits a work item or schedule block.
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
@@ -518,15 +518,22 @@ fn compose_items_with_projection_for_schema(
         .map(|item| (item.id, item.revision))
         .collect();
     let effective_sensitivity = effective_sensitivity_by_item(&source_items);
+    let inbox_subtree_item_ids = inbox_subtree_item_ids(&source_items);
     let mut rejected_items = Vec::new();
     let mut accepted = Vec::with_capacity(source_items.len());
-    let mut context_only_count = 0_usize;
+    let mut accepted_without_work_count = 0_usize;
     for item in source_items {
+        if inbox_subtree_item_ids.contains(&item.id) {
+            accepted_without_work_count = accepted_without_work_count
+                .checked_add(1)
+                .ok_or(ComposeScheduleError::Encoding)?;
+            continue;
+        }
         let is_sensitive = effective_sensitivity.get(&item.id).copied().unwrap_or(true);
         match classify_item(&item, is_sensitive) {
             Ok(MappedScheduleItem::Plannable(mapped)) => accepted.push(*mapped),
             Ok(MappedScheduleItem::ContextOnly) => {
-                context_only_count = context_only_count
+                accepted_without_work_count = accepted_without_work_count
                     .checked_add(1)
                     .ok_or(ComposeScheduleError::Encoding)?;
             }
@@ -545,7 +552,9 @@ fn compose_items_with_projection_for_schema(
         .iter()
         .map(|item| (item.id, item.revision))
         .collect();
-    validate_recurrence_context_references(&request.recurrence_context, &revisions)?;
+    let mut recurrence_context = request.recurrence_context;
+    remove_inbox_subtree_recurrence_references(&mut recurrence_context, &inbox_subtree_item_ids);
+    validate_recurrence_context_references(&recurrence_context, &revisions)?;
     let planning_timezone: Tz = request
         .timezone_name
         .parse()
@@ -555,7 +564,6 @@ fn compose_items_with_projection_for_schema(
 
     let horizon_start = to_time_in_timezone(request.horizon_start, planning_timezone)?;
     let horizon_end = to_time_in_timezone(request.horizon_end, planning_timezone)?;
-    let mut recurrence_context = request.recurrence_context;
     populate_recurrence_calendar(
         &mut recurrence_context,
         &request.timezone_name,
@@ -597,7 +605,7 @@ fn compose_items_with_projection_for_schema(
     let accepted_item_count = plan_request
         .items
         .len()
-        .checked_add(context_only_count)
+        .checked_add(accepted_without_work_count)
         .ok_or(ComposeScheduleError::Encoding)?;
     if accepted_item_count.checked_add(rejected_items.len()) != Some(source_item_count) {
         return Err(ComposeScheduleError::Encoding);
@@ -819,6 +827,29 @@ fn validate_recurrence_context_references(
         ));
     }
     Ok(())
+}
+
+fn remove_inbox_subtree_recurrence_references(
+    context: &mut RecurrenceContext,
+    inbox_subtree_item_ids: &BTreeSet<Uuid>,
+) {
+    let is_retained = |item_id: &ItemId| !inbox_subtree_item_ids.contains(&item_id.0);
+    context
+        .completion_anchors
+        .retain(|item_id, _| is_retained(item_id));
+    context
+        .rolling_anchors
+        .retain(|item_id, _| is_retained(item_id));
+    context
+        .minimum_spacing
+        .retain(|item_id, _| is_retained(item_id));
+    context.pauses.retain(|pause| is_retained(&pause.item_id));
+    context
+        .exceptions
+        .retain(|exception| is_retained(&exception.item_id));
+    // Completed occurrence IDs are intentionally not item-keyed. With the
+    // excluded series absent from `PlanRequest.items`, they cannot materialize
+    // an Inbox occurrence and remain valid evidence for retained series.
 }
 
 enum MappedScheduleItem {
@@ -1147,6 +1178,50 @@ fn add_legacy_preferred_window(
         100,
     ));
     Ok(())
+}
+
+/// Returns every Inbox item and every item below an Inbox ancestor.
+///
+/// Canonical storage already rejects duplicate identifiers and hierarchy
+/// cycles. The visited set nevertheless makes this traversal cycle-safe, and
+/// the bounded loop guarantees that malformed in-memory test data cannot make
+/// composition spin indefinitely. Each known identifier is queued at most
+/// once, so a valid graph always drains the frontier within `items.len()`
+/// iterations.
+fn inbox_subtree_item_ids(items: &[Item]) -> BTreeSet<Uuid> {
+    let mut children_by_parent = BTreeMap::<Uuid, Vec<Uuid>>::new();
+    let mut excluded = BTreeSet::new();
+    let mut frontier = VecDeque::new();
+
+    for item in items {
+        if let Some(parent_id) = item.parent_id {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(item.id);
+        }
+        if item.status == ItemStatus::Inbox && excluded.insert(item.id) {
+            frontier.push_back(item.id);
+        }
+    }
+    for children in children_by_parent.values_mut() {
+        children.sort_unstable();
+    }
+
+    for _ in 0..items.len() {
+        let Some(parent_id) = frontier.pop_front() else {
+            break;
+        };
+        if let Some(children) = children_by_parent.get(&parent_id) {
+            for child_id in children {
+                if excluded.insert(*child_id) {
+                    frontier.push_back(*child_id);
+                }
+            }
+        }
+    }
+    debug_assert!(frontier.is_empty());
+    excluded
 }
 
 fn prune_orphaned_items(items: &mut Vec<WorkItem>, rejected: &mut Vec<RejectedScheduleItem>) {
@@ -1604,6 +1679,104 @@ mod tests {
         );
         assert_eq!(first.plan.blocks.len(), 1);
         assert!(first.input_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn duration_bearing_inbox_root_is_accepted_without_entering_the_plan() {
+        let item_id = Uuid::from_u128(100);
+        let mut item = canonical_item(item_id);
+        item.status = ItemStatus::Inbox;
+        let mut request = preview_request();
+        request
+            .recurrence_context
+            .completion_anchors
+            .insert(ItemId(item_id), to_time(item.updated_at).unwrap());
+
+        let first = compose_items(vec![item.clone()], request.clone()).unwrap();
+        let repeated = compose_items(vec![item.clone()], request.clone()).unwrap();
+        item.revision += 1;
+        let revised = compose_items(vec![item], request).unwrap();
+
+        assert_eq!(first.input_digest, repeated.input_digest);
+        assert_ne!(first.input_digest, revised.input_digest);
+        assert_eq!(first.source_item_count, 1);
+        assert_eq!(first.accepted_item_count, 1);
+        assert_eq!(first.source_item_revisions.get(&item_id), Some(&3));
+        assert!(first.rejected_items.is_empty());
+        assert!(first.plan.blocks.is_empty());
+        assert!(first.plan.unscheduled.is_empty());
+        assert!(first.plan.decisions.is_empty());
+        assert!(first.plan.occurrences.is_empty());
+    }
+
+    #[test]
+    fn every_descendant_of_an_inbox_item_is_accepted_without_orphan_rejection() {
+        let root_id = Uuid::from_u128(101);
+        let child_id = Uuid::from_u128(102);
+        let grandchild_id = Uuid::from_u128(103);
+        let mut root = canonical_item(root_id);
+        root.status = ItemStatus::Inbox;
+        let mut child = canonical_item(child_id);
+        child.parent_id = Some(root_id);
+        let mut grandchild = canonical_item(grandchild_id);
+        grandchild.parent_id = Some(child_id);
+        grandchild.flexible_constraints = json!({"unsupported_descendant_metadata": true});
+
+        let result = compose_items(vec![grandchild, root, child], preview_request()).unwrap();
+
+        assert_eq!(result.source_item_count, 3);
+        assert_eq!(result.accepted_item_count, 3);
+        assert_eq!(result.source_item_revisions.len(), 3);
+        assert!(result.rejected_items.is_empty());
+        assert!(result.plan.blocks.is_empty());
+        assert!(result.plan.unscheduled.is_empty());
+        assert_eq!(
+            result.accepted_item_count + result.rejected_items.len(),
+            result.source_item_count
+        );
+    }
+
+    #[test]
+    fn planned_sibling_outside_an_inbox_subtree_remains_schedulable() {
+        let root_id = Uuid::from_u128(104);
+        let child_id = Uuid::from_u128(105);
+        let sibling_id = Uuid::from_u128(106);
+        let mut root = canonical_item(root_id);
+        root.status = ItemStatus::Inbox;
+        let mut child = canonical_item(child_id);
+        child.parent_id = Some(root_id);
+        let sibling = canonical_item(sibling_id);
+
+        let result = compose_items(vec![child, sibling, root], preview_request()).unwrap();
+
+        assert_eq!(result.source_item_count, 3);
+        assert_eq!(result.accepted_item_count, 3);
+        assert!(result.rejected_items.is_empty());
+        assert!(result.plan.unscheduled.is_empty());
+        assert_eq!(result.plan.blocks.len(), 1);
+        assert_eq!(result.plan.blocks[0].item_id, Some(ItemId(sibling_id)));
+    }
+
+    #[test]
+    fn changing_an_inbox_item_to_planned_makes_it_schedulable() {
+        let item_id = Uuid::from_u128(107);
+        let mut inbox = canonical_item(item_id);
+        inbox.status = ItemStatus::Inbox;
+        let inbox_result = compose_items(vec![inbox.clone()], preview_request()).unwrap();
+
+        inbox.status = ItemStatus::Planned;
+        inbox.revision += 1;
+        let planned = compose_items(vec![inbox.clone()], preview_request()).unwrap();
+        let repeated = compose_items(vec![inbox], preview_request()).unwrap();
+
+        assert!(inbox_result.plan.blocks.is_empty());
+        assert_ne!(inbox_result.input_digest, planned.input_digest);
+        assert_eq!(planned.input_digest, repeated.input_digest);
+        assert_eq!(planned.source_item_count, 1);
+        assert_eq!(planned.accepted_item_count, 1);
+        assert!(planned.rejected_items.is_empty());
+        assert_eq!(planned.plan.blocks.len(), 1);
+        assert_eq!(planned.plan.blocks[0].item_id, Some(ItemId(item_id)));
     }
 
     #[test]

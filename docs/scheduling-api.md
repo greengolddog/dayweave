@@ -34,6 +34,13 @@ and install different blocks. Effective sensitivity evidence is retained
 internally for publication/redaction; it is deliberately not exposed as a
 whole-item map in the preview JSON or OpenAPI schema.
 
+An active canonical item with `status: "inbox"`, and every descendant below an
+Inbox ancestor, remains accepted and included in `source_item_revisions` and the
+digest but is omitted from the scheduler `PlanRequest`. An Inbox subtree emits
+no blocks, unscheduled work, occurrences, or orphan rejection. Moving an Inbox
+ancestor to `planned` makes that item and its non-Inbox descendants eligible on
+the next preview; a nested Inbox item starts a new excluded subtree.
+
 Every selected `blocking` or `writable` Google Calendar whose policy can reserve
 time must also have one complete expanded-occurrence generation under its
 current collection revision, covering the entire requested horizon. Otherwise
