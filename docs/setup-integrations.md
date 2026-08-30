@@ -273,6 +273,18 @@ retired once; later complete generations leave their dormant mappings untouched
 until the occurrence reappears, keeping refresh work bounded by the current
 window instead of all retained Calendar history.
 
+The same preservation rule applies when an occurrence is the target of the
+open execution lease. Calendar deselection, provider removal or downgrade,
+account pause, disconnect, and operator recovery remain authority fences and
+must complete immediately: DayWeave leaves the executing canonical item and its
+revision unchanged, retires the restricted mapping as an execution-active
+conflict, and keeps the lease intact. The retained item currently requires
+later user cleanup; automatic post-execution retirement remains a client UX gap
+until it has its own durable, reviewable cleanup intent. Ordinary inbound
+completion or deletion is different: it rolls back without changing the item,
+mapping, cursor, audit record, or outbox and retries after a short backoff once
+the execution lease closes.
+
 Provider changes never silently overwrite a locally edited canonical item. The
 mapping records the last imported local revision: a provider update or deletion
 applies only while that revision still matches. Otherwise it becomes an

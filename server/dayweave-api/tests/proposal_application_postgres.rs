@@ -6,12 +6,17 @@ use std::{
 
 use chrono::{DateTime, Duration, Utc};
 use dayweave_api::{
+    execution::{
+        ExecutionCommand, ExecutionIdempotencyKey, ExecutionService, FinishExecution,
+        StartExecution,
+    },
     items::{
         IdempotencyKey, Item, ItemKind, ItemService, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
     },
     persistence::{
-        DatabaseScope, MIGRATOR, PostgresItemRepository, PostgresProposalApplicationRepository,
-        PostgresProposalRepository, ProposalApplicationError,
+        DatabaseScope, MIGRATOR, PostgresExecutionRepository, PostgresItemRepository,
+        PostgresProposalApplicationRepository, PostgresProposalRepository,
+        ProposalApplicationError,
     },
     proposals::{
         Clock, NewProposal, Proposal, ProposalApplicationStatus, ProposalApplyRequest,
@@ -563,6 +568,384 @@ async fn undo_restores_completion_and_deletion_timestamps_while_advancing_revisi
     assert_eq!(deleted_state.0, deleted.revision + 2);
     assert_eq!(deleted_state.1, deleted.completed_at);
     assert_eq!(deleted_state.2, Some(original_deleted_at));
+
+    fixture.database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Covers both proposal apply and snapshot undo terminal guards.
+async fn proposal_terminal_apply_and_undo_wait_for_execution_to_close() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; proposal execution guard test skipped");
+        return;
+    };
+    let fixture = ApplicationFixture::create(&database_url).await;
+    let execution_clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let execution_items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            fixture.database.pool.clone(),
+            fixture.scope,
+        )),
+        execution_clock.clone(),
+    ));
+    let execution = ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(
+            fixture.database.pool.clone(),
+            fixture.scope,
+        )),
+        execution_items,
+        execution_clock,
+    );
+
+    let projected = fixture
+        .items
+        .create(
+            item(
+                Uuid::new_v4(),
+                ItemKind::Task,
+                "Proposal completion waits for execution",
+                false,
+                None,
+            ),
+            item_key("proposal-execution-create", 51),
+        )
+        .await
+        .expect("projection fixture created")
+        .item;
+    let projection_proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Complete the active item",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: projected.id,
+            expected_revision: projected.revision,
+            item: replacement(&projected, ItemStatus::Completed),
+        }],
+    )
+    .await;
+    let projection_preview = fixture
+        .applications
+        .preview(preview_request(&projection_proposal))
+        .await
+        .expect("terminal proposal previews before execution starts");
+    assert!(projection_preview.can_apply);
+
+    let projection_session = Uuid::new_v4();
+    execution
+        .command(
+            0,
+            ExecutionCommand::Start(StartExecution {
+                session_id: projection_session,
+                item_id: projected.id,
+                item_revision: projected.revision,
+                occurrence_id: None,
+                session_index: 0,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_key("proposal-execution-start", 52),
+        )
+        .await
+        .expect("projection execution starts");
+    let blocked_apply_effects_before =
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let blocked_apply = fixture
+        .applications
+        .apply(
+            projection_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: projection_preview.review_hash.clone(),
+            },
+            "proposal-execution-apply",
+            None,
+        )
+        .await;
+    assert!(matches!(
+        blocked_apply,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::InvalidItem
+        ))
+    ));
+    assert_eq!(
+        fixture.items.get(projected.id).await.unwrap().status,
+        projected.status
+    );
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        blocked_apply_effects_before,
+        "failed apply must roll back receipts, fences, item deltas, outbox, and audit",
+    );
+
+    execution
+        .command(
+            1,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id: projection_session,
+                actual_seconds: Some(0),
+            }),
+            execution_key("proposal-execution-close", 53),
+        )
+        .await
+        .expect("projection execution closes");
+    let applied = fixture
+        .applications
+        .apply(
+            projection_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: projection_preview.review_hash.clone(),
+            },
+            "proposal-execution-apply",
+            None,
+        )
+        .await
+        .expect("same failed apply key succeeds after close");
+    assert!(!applied.replayed);
+    assert_eq!(
+        fixture.items.get(projected.id).await.unwrap().status,
+        ItemStatus::Completed
+    );
+    let terminal_projection = fixture.items.get(projected.id).await.unwrap();
+    let reopened_projection = fixture
+        .items
+        .replace(
+            terminal_projection.id,
+            terminal_projection.revision,
+            replacement(&terminal_projection, ItemStatus::Planned),
+            item_key("proposal-execution-reopen", 57),
+        )
+        .await
+        .expect("reopen applied item before exact replay")
+        .item;
+    let projection_replay_session = Uuid::new_v4();
+    execution
+        .command(
+            2,
+            ExecutionCommand::Start(StartExecution {
+                session_id: projection_replay_session,
+                item_id: reopened_projection.id,
+                item_revision: reopened_projection.revision,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_key("proposal-execution-replay-start", 58),
+        )
+        .await
+        .expect("later lease opens before exact apply replay");
+    let replayed_apply = fixture
+        .applications
+        .apply(
+            projection_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: projection_preview.review_hash,
+            },
+            "proposal-execution-apply",
+            None,
+        )
+        .await
+        .expect("exact apply response replays during later lease");
+    assert!(replayed_apply.replayed);
+    assert_eq!(
+        replayed_apply.application.application_id,
+        applied.application.application_id
+    );
+    assert_eq!(
+        fixture.items.get(projected.id).await.unwrap(),
+        reopened_projection
+    );
+    execution
+        .command(
+            3,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id: projection_replay_session,
+                actual_seconds: Some(0),
+            }),
+            execution_key("proposal-execution-replay-close", 59),
+        )
+        .await
+        .expect("close later apply-replay lease");
+
+    let mut originally_completed = item(
+        Uuid::new_v4(),
+        ItemKind::Task,
+        "Undo completion waits for execution",
+        false,
+        None,
+    );
+    originally_completed.status = ItemStatus::Completed;
+    let originally_completed = fixture
+        .items
+        .create(originally_completed, item_key("undo-execution-create", 54))
+        .await
+        .expect("undo fixture created")
+        .item;
+    let undo_proposal = insert_change_set_proposal(
+        &fixture.proposals,
+        ProposalKind::UpdateItem,
+        "Reopen a completed item",
+        vec![ProposalCommand::ReplaceItem {
+            command_id: Uuid::new_v4(),
+            item_id: originally_completed.id,
+            expected_revision: originally_completed.revision,
+            item: replacement(&originally_completed, ItemStatus::Planned),
+        }],
+    )
+    .await;
+    let undo_preview = fixture
+        .applications
+        .preview(preview_request(&undo_proposal))
+        .await
+        .expect("undo fixture previews");
+    let undo_application = fixture
+        .applications
+        .apply(
+            undo_preview.preview_id,
+            ProposalApplyRequest {
+                expected_review_hash: undo_preview.review_hash,
+            },
+            "undo-execution-apply",
+            None,
+        )
+        .await
+        .expect("undo fixture applies");
+    let reopened = fixture
+        .items
+        .get(originally_completed.id)
+        .await
+        .expect("completed item reopened");
+    assert_eq!(reopened.status, ItemStatus::Planned);
+
+    let undo_session = Uuid::new_v4();
+    execution
+        .command(
+            4,
+            ExecutionCommand::Start(StartExecution {
+                session_id: undo_session,
+                item_id: reopened.id,
+                item_revision: reopened.revision,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_key("undo-execution-start", 55),
+        )
+        .await
+        .expect("undo fixture execution starts");
+    let blocked_undo_effects_before =
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await;
+    let blocked_undo = fixture
+        .applications
+        .undo(
+            undo_application.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: undo_application.application.application_revision,
+            },
+            "undo-execution-undo",
+            None,
+        )
+        .await;
+    assert!(matches!(
+        blocked_undo,
+        Err(ProposalApplicationError::Stale(
+            ProposalConflictCode::InvalidItem
+        ))
+    ));
+    assert_eq!(
+        application_side_effect_counts(&fixture.database.pool, fixture.scope).await,
+        blocked_undo_effects_before,
+        "failed undo must roll back receipts, fences, item deltas, outbox, and audit",
+    );
+
+    execution
+        .command(
+            5,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id: undo_session,
+                actual_seconds: Some(0),
+            }),
+            execution_key("undo-execution-close", 56),
+        )
+        .await
+        .expect("undo fixture execution closes");
+    let undone = fixture
+        .applications
+        .undo(
+            undo_application.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: undo_application.application.application_revision,
+            },
+            "undo-execution-undo",
+            None,
+        )
+        .await
+        .expect("same failed undo key succeeds after close");
+    assert!(!undone.replayed);
+    assert_eq!(
+        fixture
+            .items
+            .get(originally_completed.id)
+            .await
+            .unwrap()
+            .status,
+        ItemStatus::Completed
+    );
+    let restored_terminal = fixture
+        .items
+        .get(originally_completed.id)
+        .await
+        .expect("terminal snapshot restored");
+    let reopened_after_undo = fixture
+        .items
+        .replace(
+            restored_terminal.id,
+            restored_terminal.revision,
+            replacement(&restored_terminal, ItemStatus::Planned),
+            item_key("undo-execution-reopen-replay", 60),
+        )
+        .await
+        .expect("reopen restored item before exact undo replay")
+        .item;
+    let undo_replay_session = Uuid::new_v4();
+    execution
+        .command(
+            6,
+            ExecutionCommand::Start(StartExecution {
+                session_id: undo_replay_session,
+                item_id: reopened_after_undo.id,
+                item_revision: reopened_after_undo.revision,
+                occurrence_id: None,
+                session_index: 2,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_key("undo-execution-replay-start", 61),
+        )
+        .await
+        .expect("later lease opens before exact undo replay");
+    let replayed_undo = fixture
+        .applications
+        .undo(
+            undo_application.application.application_id,
+            ProposalUndoRequest {
+                expected_application_revision: undo_application.application.application_revision,
+            },
+            "undo-execution-undo",
+            None,
+        )
+        .await
+        .expect("exact undo response replays during later lease");
+    assert!(replayed_undo.replayed);
+    assert_eq!(
+        replayed_undo.application.application_id,
+        undone.application.application_id
+    );
+    assert_eq!(
+        fixture.items.get(originally_completed.id).await.unwrap(),
+        reopened_after_undo
+    );
 
     fixture.database.destroy().await;
 }
@@ -1641,6 +2024,26 @@ impl ApplicationFixture {
     }
 }
 
+async fn application_side_effect_counts(
+    pool: &PgPool,
+    scope: DatabaseScope,
+) -> (i64, i64, i64, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM proposal_applications WHERE workspace_id = $1 AND user_id = $2), \
+         (SELECT count(*) FROM proposal_application_members WHERE workspace_id = $1 AND user_id = $2), \
+         (SELECT count(*) FROM proposal_application_requests WHERE workspace_id = $1 AND user_id = $2), \
+         (SELECT count(*) FROM item_changes WHERE workspace_id = $1), \
+         (SELECT count(*) FROM outbox_messages WHERE workspace_id = $1), \
+         (SELECT count(*) FROM audit_operations WHERE workspace_id = $1)",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .fetch_one(pool)
+    .await
+    .expect("proposal application side-effect counts")
+}
+
 #[derive(Clone, Copy)]
 struct FixedClock(DateTime<Utc>);
 
@@ -1712,6 +2115,13 @@ fn preview_request(proposal: &Proposal) -> ProposalPreviewRequest {
 
 fn item_key(key: &str, marker: u8) -> IdempotencyKey {
     IdempotencyKey {
+        key: key.to_owned(),
+        fingerprint: [marker; 32],
+    }
+}
+
+fn execution_key(key: &str, marker: u8) -> ExecutionIdempotencyKey {
+    ExecutionIdempotencyKey {
         key: key.to_owned(),
         fingerprint: [marker; 32],
     }

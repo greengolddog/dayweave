@@ -11,6 +11,8 @@ use tokio::sync::Mutex;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::execution::ExecutionRepository;
+
 use super::{Item, ItemDomainError, ReplaceItem};
 
 #[derive(Clone, Debug)]
@@ -74,6 +76,8 @@ pub enum ItemRepositoryError {
     InvalidParentState,
     #[error("only leaf items can enter an executable state")]
     NonLeafExecutable,
+    #[error("item {item_id} is targeted by active execution session {session_id}")]
+    ActiveExecutionConflict { item_id: Uuid, session_id: Uuid },
     #[error("an item with active children cannot be deleted")]
     HasChildren,
     #[error("deleted item's parent must be restored first")]
@@ -132,10 +136,21 @@ pub trait ItemRepository: Send + Sync {
     async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct InMemoryItemRepository {
     state: Arc<Mutex<MemoryState>>,
     cursor_scope: Uuid,
+    execution_guard: Option<MemoryExecutionGuard>,
+}
+
+impl std::fmt::Debug for InMemoryItemRepository {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("InMemoryItemRepository")
+            .field("cursor_scope", &self.cursor_scope)
+            .field("execution_guard", &self.execution_guard.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for InMemoryItemRepository {
@@ -143,8 +158,30 @@ impl Default for InMemoryItemRepository {
         Self {
             state: Arc::new(Mutex::new(MemoryState::default())),
             cursor_scope: Uuid::new_v4(),
+            execution_guard: None,
         }
     }
+}
+
+impl InMemoryItemRepository {
+    pub(crate) fn with_execution_guard(
+        execution: Arc<dyn ExecutionRepository>,
+        operation_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            execution_guard: Some(MemoryExecutionGuard {
+                execution,
+                operation_gate,
+            }),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone)]
+struct MemoryExecutionGuard {
+    execution: Arc<dyn ExecutionRepository>,
+    operation_gate: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -246,46 +283,68 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
-        let mut guard = self.state.lock().await;
-        if let Some(replay) = replay(&mut guard, &idempotency) {
-            return replay;
-        }
-        let mut state = guard.clone();
-        let current = state
-            .items
-            .get(&id)
-            .filter(|item| item.deleted_at.is_none())
-            .cloned()
-            .ok_or(ItemRepositoryError::NotFound(id))?;
-        ensure_revision(&current, expected_revision)?;
-        let previous_parent_id = current.parent_id;
-        let previous_sibling_order = current.sibling_order;
-        let mut item = current.replaced(replacement, now)?;
-        validate_parent(&state.items, id, item.parent_id)?;
-        if has_active_children(id, &state.items) && item.status.is_executing_state() {
-            return Err(ItemRepositoryError::NonLeafExecutable);
-        }
-        item.is_executable = !has_active_children(id, &state.items);
-        state.items.insert(id, item.clone());
-        append_change(
-            &mut state,
-            DeltaChange::Upsert {
-                item: Box::new(item.clone()),
-            },
-        )?;
-        if previous_parent_id != item.parent_id || previous_sibling_order != item.sibling_order {
-            refresh_parents(
+        if replacement.status.is_terminal()
+            && let Some(execution_guard) = &self.execution_guard
+        {
+            let _operation = execution_guard.operation_gate.lock().await;
+            {
+                let mut state = self.state.lock().await;
+                if let Some(replay) = replay(&mut state, &idempotency) {
+                    return replay;
+                }
+                let current = state
+                    .items
+                    .get(&id)
+                    .filter(|item| item.deleted_at.is_none())
+                    .ok_or(ItemRepositoryError::NotFound(id))?;
+                ensure_revision(current, expected_revision)?;
+                if current.status.is_terminal() {
+                    return replace_memory(
+                        &mut state,
+                        id,
+                        expected_revision,
+                        replacement,
+                        now,
+                        idempotency,
+                    );
+                }
+            }
+
+            let snapshot = execution_guard
+                .execution
+                .snapshot()
+                .await
+                .map_err(|_| ItemRepositoryError::Internal)?;
+            if let Some(session) = snapshot
+                .active_session
+                .filter(|session| session.item_id == id)
+            {
+                return Err(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: id,
+                    session_id: session.id,
+                });
+            }
+
+            let mut state = self.state.lock().await;
+            return replace_memory(
                 &mut state,
-                [previous_parent_id, item.parent_id],
-                item.updated_at,
-            )?;
+                id,
+                expected_revision,
+                replacement,
+                now,
+                idempotency,
+            );
         }
-        remember(&mut state, idempotency, item.clone());
-        *guard = state;
-        Ok(ItemMutation {
-            item,
-            replayed: false,
-        })
+
+        let mut guard = self.state.lock().await;
+        replace_memory(
+            &mut guard,
+            id,
+            expected_revision,
+            replacement,
+            now,
+            idempotency,
+        )
     }
 
     async fn trash(
@@ -295,42 +354,42 @@ impl ItemRepository for InMemoryItemRepository {
         now: DateTime<Utc>,
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError> {
+        if let Some(execution_guard) = &self.execution_guard {
+            let _operation = execution_guard.operation_gate.lock().await;
+            {
+                let mut state = self.state.lock().await;
+                if let Some(replay) = replay(&mut state, &idempotency) {
+                    return replay;
+                }
+                let current = state
+                    .items
+                    .get(&id)
+                    .filter(|item| item.deleted_at.is_none())
+                    .ok_or(ItemRepositoryError::NotFound(id))?;
+                ensure_revision(current, expected_revision)?;
+            }
+
+            let snapshot = execution_guard
+                .execution
+                .snapshot()
+                .await
+                .map_err(|_| ItemRepositoryError::Internal)?;
+            if let Some(session) = snapshot
+                .active_session
+                .filter(|session| session.item_id == id)
+            {
+                return Err(ItemRepositoryError::ActiveExecutionConflict {
+                    item_id: id,
+                    session_id: session.id,
+                });
+            }
+
+            let mut state = self.state.lock().await;
+            return trash_memory(&mut state, id, expected_revision, now, idempotency);
+        }
+
         let mut guard = self.state.lock().await;
-        if let Some(replay) = replay(&mut guard, &idempotency) {
-            return replay;
-        }
-        let mut state = guard.clone();
-        let current = state
-            .items
-            .get(&id)
-            .filter(|item| item.deleted_at.is_none())
-            .cloned()
-            .ok_or(ItemRepositoryError::NotFound(id))?;
-        ensure_revision(&current, expected_revision)?;
-        if has_active_children(id, &state.items) {
-            return Err(ItemRepositoryError::HasChildren);
-        }
-        let item = current.trashed(now)?;
-        let deleted_at = item.deleted_at.ok_or(ItemRepositoryError::Internal)?;
-        state.items.insert(id, item.clone());
-        append_change(
-            &mut state,
-            DeltaChange::Tombstone {
-                tombstone: ItemTombstone {
-                    id,
-                    revision: item.revision,
-                    deleted_at,
-                    parent_id: item.parent_id,
-                },
-            },
-        )?;
-        refresh_parents(&mut state, [item.parent_id], item.updated_at)?;
-        remember(&mut state, idempotency, item.clone());
-        *guard = state;
-        Ok(ItemMutation {
-            item,
-            replayed: false,
-        })
+        trash_memory(&mut guard, id, expected_revision, now, idempotency)
     }
 
     async fn restore(
@@ -411,6 +470,99 @@ impl ItemRepository for InMemoryItemRepository {
             has_more,
         })
     }
+}
+
+fn replace_memory(
+    state: &mut MemoryState,
+    id: Uuid,
+    expected_revision: u64,
+    replacement: ReplaceItem,
+    now: DateTime<Utc>,
+    idempotency: IdempotencyContext,
+) -> Result<ItemMutation, ItemRepositoryError> {
+    if let Some(replay) = replay(state, &idempotency) {
+        return replay;
+    }
+    let mut next = state.clone();
+    let current = next
+        .items
+        .get(&id)
+        .filter(|item| item.deleted_at.is_none())
+        .cloned()
+        .ok_or(ItemRepositoryError::NotFound(id))?;
+    ensure_revision(&current, expected_revision)?;
+    let previous_parent_id = current.parent_id;
+    let previous_sibling_order = current.sibling_order;
+    let mut item = current.replaced(replacement, now)?;
+    validate_parent(&next.items, id, item.parent_id)?;
+    if has_active_children(id, &next.items) && item.status.is_executing_state() {
+        return Err(ItemRepositoryError::NonLeafExecutable);
+    }
+    item.is_executable = !has_active_children(id, &next.items);
+    next.items.insert(id, item.clone());
+    append_change(
+        &mut next,
+        DeltaChange::Upsert {
+            item: Box::new(item.clone()),
+        },
+    )?;
+    if previous_parent_id != item.parent_id || previous_sibling_order != item.sibling_order {
+        refresh_parents(
+            &mut next,
+            [previous_parent_id, item.parent_id],
+            item.updated_at,
+        )?;
+    }
+    remember(&mut next, idempotency, item.clone());
+    *state = next;
+    Ok(ItemMutation {
+        item,
+        replayed: false,
+    })
+}
+
+fn trash_memory(
+    state: &mut MemoryState,
+    id: Uuid,
+    expected_revision: u64,
+    now: DateTime<Utc>,
+    idempotency: IdempotencyContext,
+) -> Result<ItemMutation, ItemRepositoryError> {
+    if let Some(replay) = replay(state, &idempotency) {
+        return replay;
+    }
+    let mut next = state.clone();
+    let current = next
+        .items
+        .get(&id)
+        .filter(|item| item.deleted_at.is_none())
+        .cloned()
+        .ok_or(ItemRepositoryError::NotFound(id))?;
+    ensure_revision(&current, expected_revision)?;
+    if has_active_children(id, &next.items) {
+        return Err(ItemRepositoryError::HasChildren);
+    }
+    let item = current.trashed(now)?;
+    let deleted_at = item.deleted_at.ok_or(ItemRepositoryError::Internal)?;
+    next.items.insert(id, item.clone());
+    append_change(
+        &mut next,
+        DeltaChange::Tombstone {
+            tombstone: ItemTombstone {
+                id,
+                revision: item.revision,
+                deleted_at,
+                parent_id: item.parent_id,
+            },
+        },
+    )?;
+    refresh_parents(&mut next, [item.parent_id], item.updated_at)?;
+    remember(&mut next, idempotency, item.clone());
+    *state = next;
+    Ok(ItemMutation {
+        item,
+        replayed: false,
+    })
 }
 
 fn validate_parent(

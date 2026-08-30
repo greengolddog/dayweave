@@ -208,6 +208,15 @@ impl ItemRepository for PostgresItemRepository {
                 replayed: true,
             });
         }
+        // Execution Start locks `execution_state` before canonical items. A terminal item
+        // projection must take the same order so either Start observes the terminal item or
+        // this replacement observes the open lease, without an item/state deadlock. Exact
+        // idempotency replays intentionally return before taking this current-state guard.
+        let active_execution = if replacement.status.is_terminal() {
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?
+        } else {
+            None
+        };
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
@@ -215,6 +224,16 @@ impl ItemRepository for PostgresItemRepository {
         let previous_parent_id = current.parent_id;
         let previous_sibling_order = current.sibling_order;
         let item = current.replaced(replacement, now)?;
+        if !current.status.is_terminal()
+            && item.status.is_terminal()
+            && let Some((session_id, active_item_id)) = active_execution
+            && active_item_id == id
+        {
+            return Err(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: id,
+                session_id,
+            });
+        }
         validate_parent(
             &mut transaction,
             self.scope.workspace_id,
@@ -281,10 +300,20 @@ impl ItemRepository for PostgresItemRepository {
                 replayed: true,
             });
         }
+        let active_execution =
+            lock_active_execution(&mut transaction, self.scope.workspace_id).await?;
         lock_workspace_items(&mut transaction, self.scope.workspace_id).await?;
         let current =
             fetch_item_transaction(&mut transaction, self.scope.workspace_id, id, false).await?;
         ensure_revision(&current, expected_revision)?;
+        if let Some((session_id, active_item_id)) = active_execution
+            && active_item_id == id
+        {
+            return Err(ItemRepositoryError::ActiveExecutionConflict {
+                item_id: id,
+                session_id,
+            });
+        }
         if has_active_children(&mut transaction, self.scope.workspace_id, id).await? {
             return Err(ItemRepositoryError::HasChildren);
         }
@@ -445,6 +474,17 @@ pub(crate) async fn lock_item_batch_tx(
     lock_workspace_items(transaction, workspace_id).await
 }
 
+/// Locks execution state before the canonical item space. Proposal preview,
+/// apply, and undo retain this order for every command in their transaction so
+/// terminal writes serialize with execution Start without a lock cycle.
+pub(crate) async fn lock_execution_item_batch_tx(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    lock_execution_state(transaction, workspace_id).await?;
+    lock_workspace_items(transaction, workspace_id).await
+}
+
 pub(crate) async fn fetch_item_batch_tx(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -473,9 +513,9 @@ pub(crate) async fn list_item_batch_tx(
         .collect()
 }
 
-/// Executes one item command inside a transaction that already owns the
-/// canonical workspace lock. `record` is false for rolled-back previews and
-/// true for committed application/undo transactions.
+/// Executes one item command inside a transaction that already owns execution
+/// state followed by the canonical workspace item lock. `record` is false for
+/// rolled-back previews and true for committed application/undo transactions.
 #[allow(clippy::too_many_lines)] // Mirrors all four ordinary item mutation invariants in one atomic boundary.
 pub(crate) async fn apply_item_command_tx(
     transaction: &mut Transaction<'_, Postgres>,
@@ -534,6 +574,13 @@ pub(crate) async fn apply_item_command_tx(
             let previous_parent_id = current.parent_id;
             let previous_sibling_order = current.sibling_order;
             let item = current.replaced(replacement, now)?;
+            reject_closing_transition_for_active_execution(
+                transaction,
+                scope.workspace_id,
+                &current,
+                &item,
+            )
+            .await?;
             validate_parent(transaction, scope.workspace_id, item_id, item.parent_id).await?;
             if has_active_children(transaction, scope.workspace_id, item_id).await?
                 && item.status.is_executing_state()
@@ -589,6 +636,13 @@ pub(crate) async fn apply_item_command_tx(
                 return Err(ItemRepositoryError::HasChildren);
             }
             let item = current.trashed(now)?;
+            reject_closing_transition_for_active_execution(
+                transaction,
+                scope.workspace_id,
+                &current,
+                &item,
+            )
+            .await?;
             update_item(transaction, scope.workspace_id, &item).await?;
             let item =
                 fetch_item_transaction(transaction, scope.workspace_id, item_id, true).await?;
@@ -699,6 +753,13 @@ async fn restore_item_snapshot_tx(
     if snapshot.id != item_id || snapshot.created_at != current.created_at {
         return Err(ItemRepositoryError::Internal);
     }
+    reject_closing_transition_for_active_execution(
+        transaction,
+        scope.workspace_id,
+        &current,
+        &snapshot,
+    )
+    .await?;
     if snapshot.deleted_at.is_none() {
         validate_parent(transaction, scope.workspace_id, item_id, snapshot.parent_id).await?;
         if has_active_children(transaction, scope.workspace_id, item_id).await?
@@ -892,6 +953,89 @@ async fn lock_workspace_items(
         .fetch_all(&mut **transaction)
         .await
         .map_err(internal)?;
+    Ok(())
+}
+
+async fn lock_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Option<(Uuid, Uuid)>, ItemRepositoryError> {
+    lock_execution_state(transaction, workspace_id).await?;
+    active_execution(transaction, workspace_id).await
+}
+
+async fn lock_execution_state(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), ItemRepositoryError> {
+    // `execution_state` is lazy, so materialize its workspace mutex before locking it. A
+    // concurrent execution command performs the same insert-and-lock sequence.
+    sqlx::query("INSERT INTO execution_state (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(workspace_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(internal)?;
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT workspace_id FROM execution_state WHERE workspace_id = $1 FOR UPDATE",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
+async fn active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Option<(Uuid, Uuid)>, ItemRepositoryError> {
+    let active_session_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT active_session_id FROM execution_state WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(internal)?;
+    let Some(session_id) = active_session_id else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT item_id, state FROM execution_sessions WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(workspace_id)
+    .bind(session_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(ItemRepositoryError::Internal)?;
+    let state: String = row.try_get("state").map_err(internal)?;
+    if !matches!(state.as_str(), "active" | "paused") {
+        return Err(ItemRepositoryError::Internal);
+    }
+    Ok(Some((
+        session_id,
+        row.try_get("item_id").map_err(internal)?,
+    )))
+}
+
+async fn reject_closing_transition_for_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    current: &Item,
+    replacement: &Item,
+) -> Result<(), ItemRepositoryError> {
+    let becomes_terminal = !current.status.is_terminal() && replacement.status.is_terminal();
+    let becomes_trashed = current.deleted_at.is_none() && replacement.deleted_at.is_some();
+    if !becomes_terminal && !becomes_trashed {
+        return Ok(());
+    }
+    if let Some((session_id, active_item_id)) = active_execution(transaction, workspace_id).await?
+        && active_item_id == current.id
+    {
+        return Err(ItemRepositoryError::ActiveExecutionConflict {
+            item_id: current.id,
+            session_id,
+        });
+    }
     Ok(())
 }
 

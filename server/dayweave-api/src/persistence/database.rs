@@ -33,6 +33,26 @@ pub(crate) async fn lock_canonical_item_space(
     Ok(())
 }
 
+/// Serializes an execution-sensitive canonical item transaction with execution
+/// Start. Callers take the workspace execution mutex before the canonical item
+/// advisory lock so every path uses the same deadlock-free order.
+pub(crate) async fn lock_execution_and_canonical_item_space(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO execution_state (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(workspace_id)
+        .execute(&mut **transaction)
+        .await?;
+    let _: Uuid = sqlx::query_scalar(
+        "SELECT workspace_id FROM execution_state WHERE workspace_id = $1 FOR UPDATE",
+    )
+    .bind(workspace_id)
+    .fetch_one(&mut **transaction)
+    .await?;
+    lock_canonical_item_space(transaction, workspace_id).await
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,

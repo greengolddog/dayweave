@@ -51,12 +51,14 @@ use scheduling::{
     PlanningSimulationPort, PostgresSchedulingRepository, ScheduleQueryPort,
     UnavailableScheduleQueryPort, UnavailableSimulationPort,
 };
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 type Repositories = (
     Arc<dyn ProposalRepository>,
     Arc<dyn ItemRepository>,
     Arc<dyn ExecutionRepository>,
+    Option<Arc<Mutex<()>>>,
     Arc<dyn GoogleOAuthRepository>,
     Option<Arc<dyn GoogleSyncRepository>>,
     Option<Arc<dyn CredentialRepository>>,
@@ -98,6 +100,7 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
                 database.pool().clone(),
                 database.scope(),
             )),
+            None,
             Arc::new(PostgresGoogleOAuthRepository::new(
                 database.pool().clone(),
                 database.scope(),
@@ -123,10 +126,19 @@ async fn repositories(config: &Config) -> Result<Repositories, PersistenceError>
             ),
         ));
     }
+    let execution_repository: Arc<dyn ExecutionRepository> =
+        Arc::new(InMemoryExecutionRepository::default());
+    let execution_item_gate = Arc::new(Mutex::new(()));
+    let item_repository: Arc<dyn ItemRepository> =
+        Arc::new(InMemoryItemRepository::with_execution_guard(
+            execution_repository.clone(),
+            execution_item_gate.clone(),
+        ));
     Ok((
         Arc::new(InMemoryProposalRepository::default()),
-        Arc::new(InMemoryItemRepository::default()),
-        Arc::new(InMemoryExecutionRepository::default()),
+        item_repository,
+        execution_repository,
+        Some(execution_item_gate),
         Arc::new(InMemoryGoogleOAuthRepository::default()),
         None,
         None,
@@ -156,7 +168,6 @@ pub struct AppState {
     pub(crate) google_sync: Option<Arc<GoogleSyncService>>,
     pub(crate) proposal_applications: Option<Arc<PostgresProposalApplicationRepository>>,
     pub(crate) scheduling: Option<Arc<PostgresSchedulingRepository>>,
-    execution_repository: Arc<dyn ExecutionRepository>,
     pub(crate) clock: Arc<dyn Clock>,
 }
 
@@ -177,6 +188,7 @@ impl AppState {
             repository,
             item_repository,
             execution_repository,
+            execution_item_gate,
             google_oauth_repository,
             google_sync_repository,
             credential_repository,
@@ -191,11 +203,12 @@ impl AppState {
             config.proposal_ttl,
         ));
         let items = Arc::new(ItemService::new(item_repository, clock.clone()));
-        let execution = Arc::new(ExecutionService::new(
-            execution_repository.clone(),
-            items.clone(),
-            clock.clone(),
-        ));
+        let mut execution_service =
+            ExecutionService::new(execution_repository.clone(), items.clone(), clock.clone());
+        if let Some(gate) = execution_item_gate.as_ref() {
+            execution_service = execution_service.with_start_operation_gate(gate.clone());
+        }
+        let execution = Arc::new(execution_service);
         let authenticator: Arc<dyn Authenticator> = match config.auth_mode {
             AuthMode::LegacyStatic => Arc::new(StaticTokenAuthenticator::from_hashes(
                 config.api_token_hashes.clone(),
@@ -328,7 +341,6 @@ impl AppState {
             google_sync,
             proposal_applications,
             scheduling,
-            execution_repository,
             clock,
         })
     }
@@ -347,16 +359,19 @@ impl AppState {
         ));
         let execution_repository: Arc<dyn ExecutionRepository> =
             Arc::new(InMemoryExecutionRepository::default());
+        let execution_item_gate = Arc::new(Mutex::new(()));
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let items = Arc::new(ItemService::new(
-            Arc::new(InMemoryItemRepository::default()),
+            Arc::new(InMemoryItemRepository::with_execution_guard(
+                execution_repository.clone(),
+                execution_item_gate.clone(),
+            )),
             clock.clone(),
         ));
-        let execution = Arc::new(ExecutionService::new(
-            execution_repository.clone(),
-            items.clone(),
-            clock.clone(),
-        ));
+        let execution = Arc::new(
+            ExecutionService::new(execution_repository.clone(), items.clone(), clock.clone())
+                .with_start_operation_gate(execution_item_gate.clone()),
+        );
         Self {
             proposals,
             items,
@@ -371,19 +386,17 @@ impl AppState {
             google_sync: None,
             proposal_applications: None,
             scheduling: None,
-            execution_repository,
             clock,
         }
     }
 
     #[must_use]
     pub fn with_items(mut self, items: Arc<ItemService>) -> Self {
+        // This test/embedded hook replaces only the public item graph. Rebuilding execution with
+        // an independently injected repository would sever the shared in-memory gate (or mix a
+        // memory lease with PostgreSQL item state), so execution deliberately retains its
+        // original paired ItemService and fails closed for items that exist only in `items`.
         self.items = items;
-        self.execution = Arc::new(ExecutionService::new(
-            self.execution_repository.clone(),
-            self.items.clone(),
-            self.clock.clone(),
-        ));
         self
     }
 

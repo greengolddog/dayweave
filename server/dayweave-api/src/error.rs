@@ -59,6 +59,11 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn item_execution_active(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "item_execution_active", message)
+    }
+
+    #[must_use]
     pub(crate) fn schedule_publication_stale(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "schedule_publication_stale", message)
     }

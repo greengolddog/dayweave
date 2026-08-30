@@ -515,6 +515,9 @@ fn map_repository_error(error: &GoogleSyncRepositoryError) -> ApiError {
         GoogleSyncRepositoryError::ApprovalAlreadyIssued => {
             ApiError::conflict("outbound preview was already approved")
         }
+        GoogleSyncRepositoryError::ItemExecutionActive => ApiError::conflict(
+            "an active execution session must close before Google can close the canonical item",
+        ),
         GoogleSyncRepositoryError::ClaimLost
         | GoogleSyncRepositoryError::CursorConflict
         | GoogleSyncRepositoryError::InvalidProjectionBatch

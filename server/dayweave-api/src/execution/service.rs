@@ -2,9 +2,10 @@ use std::{sync::Arc, time::Duration as StdDuration};
 
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 use crate::{
-    items::{ItemService, ItemServiceError, ItemStatus},
+    items::{ItemService, ItemServiceError},
     proposals::Clock,
     scheduling::truncate_to_postgres_timestamp_precision,
 };
@@ -12,6 +13,7 @@ use crate::{
 use super::{
     ExecutionCommand, ExecutionDomainError, ExecutionIdempotency, ExecutionMutation,
     ExecutionRepository, ExecutionRepositoryError, ExecutionSession, ExecutionSnapshot,
+    StartExecution,
 };
 
 const IDEMPOTENCY_TTL: StdDuration = StdDuration::from_hours(24);
@@ -33,6 +35,7 @@ pub struct ExecutionService {
     repository: Arc<dyn ExecutionRepository>,
     items: Arc<ItemService>,
     clock: Arc<dyn Clock>,
+    start_operation_gate: Option<Arc<Mutex<()>>>,
 }
 
 impl std::fmt::Debug for ExecutionService {
@@ -54,7 +57,13 @@ impl ExecutionService {
             repository,
             items,
             clock,
+            start_operation_gate: None,
         }
+    }
+
+    pub(crate) fn with_start_operation_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
+        self.start_operation_gate = Some(gate);
+        self
     }
 
     /// Returns the canonical cross-device execution lease.
@@ -99,27 +108,38 @@ impl ExecutionService {
         command.validate(now)?;
 
         if let ExecutionCommand::Start(input) = &command {
-            let item = self.items.get(input.item_id).await?;
-            if item.revision != input.item_revision {
-                return Err(ExecutionServiceError::ItemRevisionConflict {
-                    expected: input.item_revision,
-                    actual: item.revision,
-                });
+            if let Some(gate) = &self.start_operation_gate {
+                let _operation = gate.lock().await;
+                self.validate_start_item(input).await?;
+                return Ok(self
+                    .repository
+                    .apply(expected_revision, command, now, idempotency)
+                    .await?);
             }
-            if !item.is_executable
-                || matches!(
-                    item.status,
-                    ItemStatus::Completed | ItemStatus::Skipped | ItemStatus::Cancelled
-                )
-            {
-                return Err(ExecutionServiceError::ItemNotExecutable);
-            }
+            self.validate_start_item(input).await?;
         }
 
         Ok(self
             .repository
             .apply(expected_revision, command, now, idempotency)
             .await?)
+    }
+
+    async fn validate_start_item(
+        &self,
+        input: &StartExecution,
+    ) -> Result<(), ExecutionServiceError> {
+        let item = self.items.get(input.item_id).await?;
+        if item.revision != input.item_revision {
+            return Err(ExecutionServiceError::ItemRevisionConflict {
+                expected: input.item_revision,
+                actual: item.revision,
+            });
+        }
+        if !item.is_executable || item.status.is_terminal() {
+            return Err(ExecutionServiceError::ItemNotExecutable);
+        }
+        Ok(())
     }
 
     /// Returns newest-first immutable execution history.
@@ -216,7 +236,9 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        items::{IdempotencyKey, InMemoryItemRepository, ItemKind, NewItem, SplitPolicy},
+        items::{
+            IdempotencyKey, InMemoryItemRepository, ItemKind, ItemStatus, NewItem, SplitPolicy,
+        },
         proposals::Clock,
     };
 

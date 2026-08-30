@@ -28,7 +28,8 @@ use crate::{
 
 use super::{
     DatabaseScope, TransactionalItemCommand, TransactionalItemEffect, apply_item_command_tx,
-    fetch_item_batch_tx, list_item_batch_tx, lock_item_batch_tx, proposal_from_row,
+    fetch_item_batch_tx, list_item_batch_tx, lock_execution_item_batch_tx, lock_item_batch_tx,
+    proposal_from_row,
 };
 
 const PREVIEW_TTL: StdDuration = StdDuration::from_mins(15);
@@ -136,7 +137,7 @@ impl PostgresProposalApplicationRepository {
     ) -> Result<ProposalChangeSetPreview, ProposalApplicationError> {
         validate_preview_request(&request)?;
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+        lock_execution_item_batch_tx(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(map_item_error)?;
         lock_owner(&mut transaction, self.scope).await?;
@@ -326,7 +327,7 @@ impl PostgresProposalApplicationRepository {
         let request_hash = hash_bytes(&request_evidence);
         let key_hash = hash_bytes(idempotency_key.as_bytes());
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+        lock_execution_item_batch_tx(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(map_item_error)?;
         lock_owner(&mut transaction, self.scope).await?;
@@ -539,7 +540,7 @@ impl PostgresProposalApplicationRepository {
         );
         let key_hash = hash_bytes(idempotency_key.as_bytes());
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_item_batch_tx(&mut transaction, self.scope.workspace_id)
+        lock_execution_item_batch_tx(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(map_item_error)?;
         lock_owner(&mut transaction, self.scope).await?;
@@ -975,6 +976,9 @@ fn item_conflict(command: &ProposalCommand, error: &ItemRepositoryError) -> Prop
         }
         ItemRepositoryError::NonLeafExecutable => {
             (ProposalConflictCode::NonLeafExecutable, None, None)
+        }
+        ItemRepositoryError::ActiveExecutionConflict { .. } => {
+            (ProposalConflictCode::InvalidItem, None, None)
         }
         ItemRepositoryError::HasChildren => (ProposalConflictCode::HasChildren, None, None),
         ItemRepositoryError::DeletedParent => (ProposalConflictCode::DeletedParent, None, None),
@@ -2502,14 +2506,15 @@ fn map_item_error(error: ItemRepositoryError) -> ProposalApplicationError {
         ItemRepositoryError::NonLeafExecutable => {
             ProposalApplicationError::Stale(ProposalConflictCode::NonLeafExecutable)
         }
+        ItemRepositoryError::ActiveExecutionConflict { .. }
+        | ItemRepositoryError::InvalidItem(_) => {
+            ProposalApplicationError::Stale(ProposalConflictCode::InvalidItem)
+        }
         ItemRepositoryError::HasChildren => {
             ProposalApplicationError::Stale(ProposalConflictCode::HasChildren)
         }
         ItemRepositoryError::DeletedParent => {
             ProposalApplicationError::Stale(ProposalConflictCode::DeletedParent)
-        }
-        ItemRepositoryError::InvalidItem(_) => {
-            ProposalApplicationError::Stale(ProposalConflictCode::InvalidItem)
         }
         _ => ProposalApplicationError::Internal,
     }

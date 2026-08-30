@@ -3315,6 +3315,9 @@ impl GoogleSyncServiceError {
                 code: "cursor_conflict",
                 delay: Duration::seconds(30),
             },
+            Self::Repository(GoogleSyncRepositoryError::ItemExecutionActive) => {
+                short_backoff("item_execution_active")
+            }
             Self::Repository(GoogleSyncRepositoryError::ClaimLost) => FailureDisposition {
                 kind: SyncFailureKind::Backoff,
                 code: "claim_lost",
@@ -3366,6 +3369,14 @@ impl GoogleSyncServiceError {
     }
 }
 
+fn short_backoff(code: &'static str) -> FailureDisposition {
+    FailureDisposition {
+        kind: SyncFailureKind::Backoff,
+        code,
+        delay: Duration::seconds(30),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NormalizationError {
     Rejected(&'static str),
@@ -3376,6 +3387,16 @@ mod tests {
     use super::*;
     use dayweave_google::calendar::{EventAttachment, EventAttendee};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn active_execution_close_conflict_is_a_short_backoff() {
+        let failure =
+            GoogleSyncServiceError::Repository(GoogleSyncRepositoryError::ItemExecutionActive)
+                .failure();
+        assert_eq!(failure.kind, SyncFailureKind::Backoff);
+        assert_eq!(failure.code, "item_execution_active");
+        assert_eq!(failure.delay, Duration::seconds(30));
+    }
 
     #[tokio::test]
     async fn provider_write_sequence_rechecks_guardians_after_token_preparation() {

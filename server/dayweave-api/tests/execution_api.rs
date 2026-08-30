@@ -326,6 +326,310 @@ async fn execution_is_authenticated_cross_device_revisioned_and_idempotent() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // Keeps the conflict, closed-lease retry, and exact replay contract together.
+async fn terminal_item_projection_waits_for_the_execution_lease_to_close() {
+    let app = test_app();
+    let item_id = Uuid::new_v4();
+    let session_id = Uuid::new_v4();
+    let created_item = item(item_id);
+    let created = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(created_item.clone()),
+            true,
+            Some("execution-guard-create-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    let started = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                0,
+                json!({
+                    "type": "start",
+                    "session_id": session_id,
+                    "item_id": item_id,
+                    "item_revision": 1,
+                    "occurrence_id": null,
+                    "session_index": 0,
+                    "planned_block_id": null,
+                    "device_id": Uuid::new_v4()
+                }),
+            )),
+            true,
+            Some("execution-guard-start-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(started.status(), StatusCode::OK);
+
+    let mut completed_fields = created_item;
+    completed_fields.as_object_mut().unwrap().remove("id");
+    completed_fields["status"] = json!("completed");
+    let completed_request = json!({
+        "expected_revision": 1,
+        "item": completed_fields,
+    });
+    let blocked = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{item_id}"),
+            Some(completed_request.clone()),
+            true,
+            Some("execution-guard-terminal-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    let blocked = body_json(blocked).await;
+    assert_eq!(blocked["error"]["code"], "item_execution_active");
+    assert_eq!(blocked["error"]["details"]["item_id"], item_id.to_string());
+    assert_eq!(
+        blocked["error"]["details"]["session_id"],
+        session_id.to_string()
+    );
+
+    let closed = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                1,
+                json!({
+                    "type": "complete",
+                    "session_id": session_id,
+                    "actual_seconds": 0
+                }),
+            )),
+            true,
+            Some("execution-guard-close-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(closed.status(), StatusCode::OK);
+
+    let reconciled = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{item_id}"),
+            Some(completed_request.clone()),
+            true,
+            Some("execution-guard-terminal-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reconciled.status(), StatusCode::OK);
+    assert_eq!(reconciled.headers()["idempotency-replayed"], "false");
+    assert_eq!(body_json(reconciled).await["item"]["revision"], 2);
+
+    let mut reopened_request = completed_request.clone();
+    reopened_request["expected_revision"] = json!(2);
+    reopened_request["item"]["status"] = json!("planned");
+    let reopened = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{item_id}"),
+            Some(reopened_request),
+            true,
+            Some("execution-guard-reopen-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(reopened.status(), StatusCode::OK);
+
+    let second_session_id = Uuid::new_v4();
+    let second_started = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                2,
+                json!({
+                    "type": "start",
+                    "session_id": second_session_id,
+                    "item_id": item_id,
+                    "item_revision": 3,
+                    "occurrence_id": null,
+                    "session_index": 1,
+                    "planned_block_id": null,
+                    "device_id": Uuid::new_v4()
+                }),
+            )),
+            true,
+            Some("execution-guard-second-start-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_started.status(), StatusCode::OK);
+
+    // Exact idempotency replay is historical: it must return the stored response without
+    // projecting it again or being rejected by a lease that opened later.
+    let replay = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{item_id}"),
+            Some(completed_request),
+            true,
+            Some("execution-guard-terminal-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(body_json(replay).await["item"]["revision"], 2);
+
+    let canonical = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/v1/items/{item_id}"),
+            None,
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    let canonical = body_json(canonical).await;
+    assert_eq!(canonical["item"]["status"], "planned");
+    assert_eq!(canonical["item"]["revision"], 3);
+
+    let blocked_trash = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/v1/items/{item_id}?expected_revision=3"),
+            None,
+            true,
+            Some("execution-guard-trash-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked_trash.status(), StatusCode::CONFLICT);
+    let blocked_trash = body_json(blocked_trash).await;
+    assert_eq!(blocked_trash["error"]["code"], "item_execution_active");
+    assert_eq!(
+        blocked_trash["error"]["details"]["session_id"],
+        second_session_id.to_string()
+    );
+
+    let second_closed = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                3,
+                json!({
+                    "type": "complete",
+                    "session_id": second_session_id,
+                    "actual_seconds": 0
+                }),
+            )),
+            true,
+            Some("execution-guard-second-close-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second_closed.status(), StatusCode::OK);
+
+    let trashed = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/v1/items/{item_id}?expected_revision=3"),
+            None,
+            true,
+            Some("execution-guard-trash-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trashed.status(), StatusCode::OK);
+    assert_eq!(trashed.headers()["idempotency-replayed"], "false");
+    assert_eq!(body_json(trashed).await["item"]["revision"], 4);
+
+    let restored = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            &format!("/v1/items/{item_id}/restore"),
+            Some(json!({ "expected_revision": 4 })),
+            true,
+            Some("execution-guard-restore-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+
+    let third_session_id = Uuid::new_v4();
+    let third_started = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/execution/commands",
+            Some(command(
+                4,
+                json!({
+                    "type": "start",
+                    "session_id": third_session_id,
+                    "item_id": item_id,
+                    "item_revision": 5,
+                    "occurrence_id": null,
+                    "session_index": 2,
+                    "planned_block_id": null,
+                    "device_id": Uuid::new_v4()
+                }),
+            )),
+            true,
+            Some("execution-guard-third-start-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(third_started.status(), StatusCode::OK);
+
+    let trash_replay = app
+        .clone()
+        .oneshot(request(
+            "DELETE",
+            &format!("/v1/items/{item_id}?expected_revision=3"),
+            None,
+            true,
+            Some("execution-guard-trash-item-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(trash_replay.status(), StatusCode::OK);
+    assert_eq!(trash_replay.headers()["idempotency-replayed"], "true");
+    assert_eq!(body_json(trash_replay).await["item"]["revision"], 4);
+    let canonical = app
+        .clone()
+        .oneshot(request(
+            "GET",
+            &format!("/v1/items/{item_id}"),
+            None,
+            true,
+            None,
+        ))
+        .await
+        .unwrap();
+    let canonical = body_json(canonical).await;
+    assert_eq!(canonical["item"]["status"], "planned");
+    assert_eq!(canonical["item"]["revision"], 5);
+}
+
+#[tokio::test]
 async fn execution_rejects_malformed_breaks_and_unknown_fields() {
     let app = test_app();
     let invalid = app

@@ -214,9 +214,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
     ) -> Result<Vec<GoogleSyncCollection>, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
         if kind == GoogleCollectionKind::Calendar {
-            super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-                .await
-                .map_err(internal)?;
+            super::database::lock_execution_and_canonical_item_space(
+                &mut transaction,
+                self.scope.workspace_id,
+            )
+            .await
+            .map_err(internal)?;
         }
         let granted_scopes = self
             .ensure_account(&mut transaction, account_id, true)
@@ -483,9 +486,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<GoogleSyncCollection, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         let granted_scopes = self
             .ensure_account(&mut transaction, account_id, true)
             .await?;
@@ -831,9 +837,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<(), GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         ensure_run_claim(&mut transaction, self.scope, claim, now).await?;
         sqlx::query(
             "UPDATE google_sync_collections SET planning_projection_state = 'uninitialized', \
@@ -1250,9 +1259,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             return Err(GoogleSyncRepositoryError::ClaimLost);
         }
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,
@@ -1309,9 +1321,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
     ) -> Result<CalendarProjectionResult, GoogleSyncRepositoryError> {
         validate_calendar_projection_batch(claim, &batch)?;
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,
@@ -1407,9 +1422,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
     ) -> Result<ImportOutcome, GoogleSyncRepositoryError> {
         validate_calendar_series_change(claim, &change)?;
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,
@@ -1477,9 +1495,12 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        super::database::lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
-            .await
-            .map_err(internal)?;
+        super::database::lock_execution_and_canonical_item_space(
+            &mut transaction,
+            self.scope.workspace_id,
+        )
+        .await
+        .map_err(internal)?;
         ensure_inbound_claim(
             &mut transaction,
             self.scope,
@@ -4292,6 +4313,8 @@ async fn apply_calendar_occurrence_change(
     if restored {
         updated.deleted_at = None;
     }
+    reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
+        .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
     record_import_mutation(
         transaction,
@@ -4520,9 +4543,11 @@ async fn retire_calendar_occurrence_mapping(
 }
 
 /// Removes active canonical occurrence projections while retaining their
-/// provider mapping identities for a later full refresh. The caller must hold
-/// the workspace canonical-item advisory lock before any account/collection
-/// row lock so teardown cannot race schedule publication or deadlock it.
+/// provider mapping identities for a later full refresh. The caller must lock
+/// `execution_state` and then the workspace canonical-item advisory space
+/// before any account/collection row. An occurrence targeted by the open
+/// execution lease is detached as a conflict instead of blocking an authority
+/// or configuration fence or silently trashing the running item.
 pub(crate) async fn retire_active_calendar_occurrences(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -4530,6 +4555,9 @@ pub(crate) async fn retire_active_calendar_occurrences(
     collection_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<SyncCounts, GoogleSyncRepositoryError> {
+    let active_item_id = google_active_execution(transaction, scope.workspace_id)
+        .await?
+        .map(|(_, item_id)| item_id);
     let rows = sqlx::query(
         "SELECT mapping.id, mapping.local_entity_id, mapping.local_revision, item.revision \
          FROM provider_sync_mappings mapping JOIN items item \
@@ -4551,6 +4579,26 @@ pub(crate) async fn retire_active_calendar_occurrences(
         let item_id: Uuid = row.try_get("local_entity_id").map_err(internal)?;
         let imported_revision: Option<i64> = row.try_get("local_revision").map_err(internal)?;
         let current_revision: i64 = row.try_get("revision").map_err(internal)?;
+        if active_item_id == Some(item_id) {
+            sqlx::query(
+                "UPDATE provider_sync_mappings SET sync_state = 'conflict', \
+                 conflict_metadata = jsonb_build_object( \
+                   'reason', 'calendar_occurrence_configuration_retired_execution_active', \
+                   'local_item_id', $2, 'mapping_local_revision', $3, \
+                   'item_revision', $4), tombstoned_at = $5, updated_at = $5 \
+                 WHERE id = $1",
+            )
+            .bind(mapping_id)
+            .bind(item_id)
+            .bind(imported_revision)
+            .bind(current_revision)
+            .bind(now)
+            .execute(&mut **transaction)
+            .await
+            .map_err(internal)?;
+            counts.add(ImportOutcome::Conflict);
+            continue;
+        }
         if imported_revision != Some(current_revision) {
             // Configuration teardown must never turn a locally edited provider
             // projection into a tombstone. Retire the provider association so
@@ -4610,8 +4658,8 @@ pub(crate) async fn retire_active_calendar_occurrences(
 }
 
 /// Account-wide companion for OAuth pause/revocation transactions. Callers
-/// must acquire the canonical-item advisory lock before locking the provider
-/// account row, then invoke this helper before disabling the account.
+/// must lock `execution_state`, then the canonical-item advisory space, and
+/// only then provider/account rows before disabling the account.
 pub(crate) async fn retire_active_calendar_occurrences_for_account(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -4672,6 +4720,8 @@ async fn trash_projected_item(
     let deleted = current
         .trashed(now)
         .map_err(|_| GoogleSyncRepositoryError::Internal)?;
+    reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &deleted)
+        .await?;
     update_imported_item(transaction, scope.workspace_id, &deleted).await?;
     let tombstone = ItemTombstone {
         id: deleted.id,
@@ -5263,6 +5313,7 @@ async fn apply_remote_delete(
     let next_revision = if already_deleted.is_some() {
         actual
     } else {
+        reject_google_item_for_active_execution(transaction, scope.workspace_id, local_id).await?;
         let next = actual
             .checked_add(1)
             .ok_or(GoogleSyncRepositoryError::Internal)?;
@@ -5595,6 +5646,8 @@ async fn apply_remote_upsert(
     if restored {
         updated.deleted_at = None;
     }
+    reject_google_close_for_active_execution(transaction, scope.workspace_id, &current, &updated)
+        .await?;
     update_imported_item(transaction, scope.workspace_id, &updated).await?;
     record_import_mutation(
         transaction,
@@ -6104,6 +6157,67 @@ async fn record_import_mutation(
     Ok(())
 }
 
+async fn reject_google_close_for_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    current: &Item,
+    replacement: &Item,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let becomes_terminal = !current.status.is_terminal() && replacement.status.is_terminal();
+    let becomes_trashed = current.deleted_at.is_none() && replacement.deleted_at.is_some();
+    if !becomes_terminal && !becomes_trashed {
+        return Ok(());
+    }
+    reject_google_item_for_active_execution(transaction, workspace_id, current.id).await
+}
+
+async fn reject_google_item_for_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    item_id: Uuid,
+) -> Result<(), GoogleSyncRepositoryError> {
+    let Some((_session_id, active_item_id)) =
+        google_active_execution(transaction, workspace_id).await?
+    else {
+        return Ok(());
+    };
+    if active_item_id == item_id {
+        return Err(GoogleSyncRepositoryError::ItemExecutionActive);
+    }
+    Ok(())
+}
+
+async fn google_active_execution(
+    transaction: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Option<(Uuid, Uuid)>, GoogleSyncRepositoryError> {
+    let active_session_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT active_session_id FROM execution_state WHERE workspace_id = $1")
+            .bind(workspace_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(internal)?
+            .flatten();
+    let Some(session_id) = active_session_id else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        "SELECT item_id, state FROM execution_sessions WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(workspace_id)
+    .bind(session_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?
+    .ok_or(GoogleSyncRepositoryError::Internal)?;
+    let state: String = row.try_get("state").map_err(internal)?;
+    if !matches!(state.as_str(), "active" | "paused") {
+        return Err(GoogleSyncRepositoryError::Internal);
+    }
+    let active_item_id: Uuid = row.try_get("item_id").map_err(internal)?;
+    Ok(Some((session_id, active_item_id)))
+}
+
 async fn fetch_import_item(
     transaction: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -6504,7 +6618,7 @@ fn i16_to_u8(value: i16) -> Result<u8, GoogleSyncRepositoryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 
     use chrono::Duration;
     use serde_json::json;
@@ -6514,10 +6628,18 @@ mod tests {
     };
 
     use crate::{
+        execution::{
+            ExecutionCommand, ExecutionIdempotencyKey, ExecutionRepositoryError, ExecutionService,
+            ExecutionServiceError, StartExecution,
+        },
         google_oauth::{GoogleOAuthRepository, OAuthIdempotency},
         google_sync::{CalendarProjectionWindow, OutboundOperation, RejectedRemoteItem},
-        items::{ItemKind, NewItem},
-        persistence::{MIGRATOR, PostgresGoogleOAuthRepository},
+        items::{ItemKind, ItemService, NewItem},
+        persistence::{
+            MIGRATOR, PostgresExecutionRepository, PostgresGoogleOAuthRepository,
+            PostgresItemRepository,
+        },
+        proposals::SystemClock,
     };
 
     use super::*;
@@ -6627,6 +6749,153 @@ mod tests {
             request_fingerprint: [marker.wrapping_add(1); 32],
             expires_at: now + Duration::days(1),
         }
+    }
+
+    async fn seed_execution_lease(
+        pool: &PgPool,
+        scope: DatabaseScope,
+        item_id: Uuid,
+        state: &str,
+        now: DateTime<Utc>,
+    ) -> Uuid {
+        let item_revision: i64 =
+            sqlx::query_scalar("SELECT revision FROM items WHERE workspace_id = $1 AND id = $2")
+                .bind(scope.workspace_id)
+                .bind(item_id)
+                .fetch_one(pool)
+                .await
+                .expect("execution target revision");
+        let session_id = Uuid::new_v4();
+        match state {
+            "active" => {
+                sqlx::query(
+                    "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+                     session_index, source_device_id, state, revision, accumulated_seconds, \
+                     started_at, running_since, observed_running_since, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, 0, $5, 'active', 1, 0, $6, $6, $6, $6, $6)",
+                )
+                .bind(session_id)
+                .bind(scope.workspace_id)
+                .bind(item_id)
+                .bind(item_revision)
+                .bind(Uuid::new_v4())
+                .bind(now)
+                .execute(pool)
+                .await
+                .expect("active execution fixture");
+            }
+            "paused" => {
+                sqlx::query(
+                    "INSERT INTO execution_sessions (id, workspace_id, item_id, item_revision, \
+                     session_index, source_device_id, state, revision, accumulated_seconds, \
+                     started_at, paused_at, created_at, updated_at) \
+                     VALUES ($1, $2, $3, $4, 0, $5, 'paused', 1, 0, $6, $6, $6, $6)",
+                )
+                .bind(session_id)
+                .bind(scope.workspace_id)
+                .bind(item_id)
+                .bind(item_revision)
+                .bind(Uuid::new_v4())
+                .bind(now)
+                .execute(pool)
+                .await
+                .expect("paused execution fixture");
+            }
+            _ => panic!("unsupported execution fixture state"),
+        }
+        sqlx::query(
+            "INSERT INTO execution_state (workspace_id, revision, active_session_id, updated_at) \
+             VALUES ($1, 1, $2, $3) ON CONFLICT (workspace_id) DO UPDATE SET \
+             revision = execution_state.revision + 1, active_session_id = EXCLUDED.active_session_id, \
+             updated_at = EXCLUDED.updated_at",
+        )
+        .bind(scope.workspace_id)
+        .bind(session_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("execution state fixture");
+        session_id
+    }
+
+    async fn close_execution_lease(
+        pool: &PgPool,
+        scope: DatabaseScope,
+        session_id: Uuid,
+        now: DateTime<Utc>,
+    ) {
+        sqlx::query(
+            "UPDATE execution_sessions SET state = 'completed', revision = revision + 1, \
+             actual_seconds = accumulated_seconds, running_since = NULL, observed_running_since = NULL, \
+             ended_at = $3, updated_at = $3 WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(scope.workspace_id)
+        .bind(session_id)
+        .bind(now)
+        .execute(pool)
+        .await
+        .expect("close execution fixture");
+        sqlx::query(
+            "UPDATE execution_state SET revision = revision + 1, active_session_id = NULL, \
+             updated_at = $2 WHERE workspace_id = $1 AND active_session_id = $3",
+        )
+        .bind(scope.workspace_id)
+        .bind(now)
+        .bind(session_id)
+        .execute(pool)
+        .await
+        .expect("release execution state fixture");
+    }
+
+    async fn wait_until_execution_state_is_locked(pool: &PgPool, scope: DatabaseScope) {
+        tokio::time::timeout(StdDuration::from_secs(10), async {
+            loop {
+                let mut probe = pool.begin().await.expect("begin execution lock probe");
+                let result = sqlx::query(
+                    "SELECT workspace_id FROM execution_state WHERE workspace_id = $1 FOR UPDATE NOWAIT",
+                )
+                .bind(scope.workspace_id)
+                .fetch_one(&mut *probe)
+                .await;
+                let locked = result
+                    .as_ref()
+                    .err()
+                    .and_then(sqlx::Error::as_database_error)
+                    .and_then(sqlx::error::DatabaseError::code)
+                    .as_deref()
+                    == Some("55P03");
+                probe
+                    .rollback()
+                    .await
+                    .expect("release execution lock probe");
+                if locked {
+                    break;
+                }
+                result.expect("unexpected execution lock probe failure");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("execution state was not locked before timeout");
+    }
+
+    async fn canonical_mutation_counts(
+        pool: &PgPool,
+        workspace_id: Uuid,
+    ) -> (i64, i64, i64, i64, i64, i64) {
+        sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM items WHERE workspace_id = $1), \
+             (SELECT count(*) FROM provider_sync_mappings WHERE workspace_id = $1), \
+             (SELECT count(*) FROM item_changes WHERE workspace_id = $1), \
+             (SELECT count(*) FROM provider_sync_cursors WHERE workspace_id = $1), \
+             (SELECT count(*) FROM google_sync_outbox WHERE workspace_id = $1), \
+             (SELECT count(*) FROM audit_operations WHERE workspace_id = $1)",
+        )
+        .bind(workspace_id)
+        .fetch_one(pool)
+        .await
+        .expect("canonical mutation counts")
     }
 
     fn local_firm_block(id: Uuid, title: &str, now: DateTime<Utc>) -> Item {
@@ -8868,6 +9137,189 @@ mod tests {
         fixture.database.destroy().await;
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Covers both authority-fence variants and durable no-cleanup behavior.
+    async fn postgres_calendar_authority_fences_detach_an_executing_occurrence() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; active Calendar teardown test skipped");
+            return;
+        };
+        for provider_delete in [false, true] {
+            let fixture = sync_fixture(&database_url).await;
+            let remote_id = if provider_delete {
+                "active-provider-delete"
+            } else {
+                "active-deselect"
+            };
+            fixture
+                .repository
+                .replace_calendar_projection(
+                    &fixture.claim,
+                    projection_batch(
+                        &fixture,
+                        vec![projected_occurrence(
+                            &fixture,
+                            remote_id,
+                            "Executing authority fence",
+                            false,
+                            if provider_delete { 119 } else { 118 },
+                        )],
+                    ),
+                    fixture.now,
+                )
+                .await
+                .expect("initial authority-fence projection");
+            let item_id: Uuid = sqlx::query_scalar(
+                "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+                 AND collection_id = $2 AND remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.collection.id)
+            .bind(remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("authority-fence occurrence identity");
+            let item_before: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(item_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("item before authority fence");
+            let session_id = seed_execution_lease(
+                &fixture.database.pool,
+                fixture.scope,
+                item_id,
+                if provider_delete { "paused" } else { "active" },
+                fixture.now + Duration::seconds(1),
+            )
+            .await;
+
+            if provider_delete {
+                fixture
+                    .repository
+                    .replace_discovered(
+                        fixture.account_id,
+                        Some(&fixture.claim),
+                        GoogleCollectionKind::Calendar,
+                        Vec::new(),
+                        fixture.now + Duration::seconds(2),
+                    )
+                    .await
+                    .expect("provider deletion commits during execution");
+            } else {
+                fixture
+                    .repository
+                    .configure_collection(
+                        fixture.account_id,
+                        fixture.collection.id,
+                        fixture.collection.revision,
+                        false,
+                        true,
+                        GoogleSyncRole::Writable,
+                        GoogleCalendarPolicy::default(),
+                        fixture.now + Duration::seconds(2),
+                    )
+                    .await
+                    .expect("deselection commits during execution");
+            }
+            let item_after: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(item_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("item after authority fence");
+            let mapping: (String, Option<DateTime<Utc>>, Option<i64>, Option<String>) =
+                sqlx::query_as(
+                    "SELECT sync_state, tombstoned_at, local_revision, \
+                     conflict_metadata->>'reason' FROM provider_sync_mappings \
+                     WHERE workspace_id = $1 AND collection_id = $2 AND remote_resource_id = $3",
+                )
+                .bind(fixture.scope.workspace_id)
+                .bind(fixture.collection.id)
+                .bind(remote_id)
+                .fetch_one(&fixture.database.pool)
+                .await
+                .expect("detached authority-fence mapping");
+            let lease: (String, Option<Uuid>) = sqlx::query_as(
+                "SELECT session.state, state.active_session_id FROM execution_sessions session \
+                 JOIN execution_state state ON state.workspace_id = session.workspace_id \
+                 WHERE session.workspace_id = $1 AND session.id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(session_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("authority fence leaves lease open");
+            assert_eq!(item_after, item_before);
+            assert_eq!(mapping.0, "conflict");
+            assert_eq!(mapping.1, Some(fixture.now + Duration::seconds(2)));
+            assert_eq!(mapping.2, Some(item_before.1));
+            assert_eq!(
+                mapping.3.as_deref(),
+                Some("calendar_occurrence_configuration_retired_execution_active")
+            );
+            assert_eq!(lease.1, Some(session_id));
+
+            // The detached mapping is durable cleanup debt. Repeating the authority state must
+            // not silently trash the preserved item after the lease disappears or without an
+            // explicit cleanup journal.
+            if provider_delete {
+                fixture
+                    .repository
+                    .replace_discovered(
+                        fixture.account_id,
+                        Some(&fixture.claim),
+                        GoogleCollectionKind::Calendar,
+                        Vec::new(),
+                        fixture.now + Duration::seconds(3),
+                    )
+                    .await
+                    .expect("steady provider deletion");
+            } else {
+                let current = fixture
+                    .repository
+                    .collection(fixture.account_id, fixture.collection.id)
+                    .await
+                    .expect("deselected collection");
+                fixture
+                    .repository
+                    .configure_collection(
+                        fixture.account_id,
+                        current.id,
+                        current.revision,
+                        false,
+                        true,
+                        GoogleSyncRole::Writable,
+                        GoogleCalendarPolicy::default(),
+                        fixture.now + Duration::seconds(3),
+                    )
+                    .await
+                    .expect("steady deselection");
+            }
+            let item_after_repeat: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+                "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(item_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("preserved item after steady authority state");
+            assert_eq!(item_after_repeat, item_before);
+            close_execution_lease(
+                &fixture.database.pool,
+                fixture.scope,
+                session_id,
+                fixture.now + Duration::seconds(4),
+            )
+            .await;
+            fixture.database.destroy().await;
+        }
+    }
+
     #[derive(Clone, Copy, Debug)]
     enum CalendarTeardownCase {
         Deselect,
@@ -10239,6 +10691,602 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn postgres_inbound_task_close_respects_active_and_paused_execution_leases() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; inbound execution guard test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let discovered = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                None,
+                GoogleCollectionKind::TaskList,
+                vec![DiscoveredCollection {
+                    kind: GoogleCollectionKind::TaskList,
+                    remote_id: "execution-guard-tasks".to_owned(),
+                    display_name: "Execution guard tasks".to_owned(),
+                    provider_access_role: None,
+                    provider_primary: false,
+                    provider_selected: true,
+                    provider_hidden: false,
+                    provider_deleted: false,
+                }],
+                fixture.now,
+            )
+            .await
+            .expect("task list discovery");
+        let task_list = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                discovered
+                    .iter()
+                    .find(|collection| collection.kind == GoogleCollectionKind::TaskList)
+                    .expect("task list")
+                    .id,
+                discovered
+                    .iter()
+                    .find(|collection| collection.kind == GoogleCollectionKind::TaskList)
+                    .expect("task list")
+                    .revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .expect("task list configured");
+
+        let completed_remote_id = "execution-active-completed-task";
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_task(
+                        fixture.account_id,
+                        task_list.id,
+                        task_list.revision,
+                        completed_remote_id,
+                        "Run before completion",
+                        ItemStatus::Planned,
+                        [121; 32],
+                    ),
+                    fixture.now,
+                )
+                .await
+                .expect("initial task import"),
+            ImportOutcome::Created
+        );
+        let completed_item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task_list.id)
+        .bind(completed_remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("completed task identity");
+        let active_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            completed_item_id,
+            "active",
+            fixture.now + Duration::seconds(1),
+        )
+        .await;
+        let counts_before =
+            canonical_mutation_counts(&fixture.database.pool, fixture.scope.workspace_id).await;
+        let item_before: (String, i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT status, revision, completed_at, trashed_at FROM items \
+                 WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(completed_item_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("task before blocked completion");
+        let mapping_before: (Option<String>, Option<Vec<u8>>, Option<i64>, String) =
+            sqlx::query_as(
+                "SELECT remote_etag, remote_payload_hash, local_revision, sync_state \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+                   AND remote_resource_id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(task_list.id)
+            .bind(completed_remote_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("mapping before blocked completion");
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_task(
+                        fixture.account_id,
+                        task_list.id,
+                        task_list.revision,
+                        completed_remote_id,
+                        "Completed at Google",
+                        ItemStatus::Completed,
+                        [122; 32],
+                    ),
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ItemExecutionActive)
+        );
+        let item_after: (String, i64, Option<DateTime<Utc>>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT status, revision, completed_at, trashed_at FROM items \
+                 WHERE workspace_id = $1 AND id = $2",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(completed_item_id)
+            .fetch_one(&fixture.database.pool)
+            .await
+            .expect("task after blocked completion");
+        let mapping_after: (Option<String>, Option<Vec<u8>>, Option<i64>, String) = sqlx::query_as(
+            "SELECT remote_etag, remote_payload_hash, local_revision, sync_state \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+                   AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task_list.id)
+        .bind(completed_remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("mapping after blocked completion");
+        assert_eq!(item_after, item_before);
+        assert_eq!(mapping_after, mapping_before);
+        assert_eq!(
+            canonical_mutation_counts(&fixture.database.pool, fixture.scope.workspace_id).await,
+            counts_before,
+            "a blocked inbound completion must not advance canonical, mapping, cursor, outbox, or audit state",
+        );
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            active_session,
+            fixture.now + Duration::seconds(3),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_task(
+                        fixture.account_id,
+                        task_list.id,
+                        task_list.revision,
+                        completed_remote_id,
+                        "Completed at Google",
+                        ItemStatus::Completed,
+                        [122; 32],
+                    ),
+                    fixture.now + Duration::seconds(4),
+                )
+                .await
+                .expect("completion after lease close"),
+            ImportOutcome::Updated
+        );
+
+        let deleted_remote_id = "execution-paused-deleted-task";
+        fixture
+            .repository
+            .apply_remote_item(
+                &fixture.claim,
+                remote_task(
+                    fixture.account_id,
+                    task_list.id,
+                    task_list.revision,
+                    deleted_remote_id,
+                    "Pause before deletion",
+                    ItemStatus::Planned,
+                    [123; 32],
+                ),
+                fixture.now + Duration::seconds(5),
+            )
+            .await
+            .expect("second task import");
+        let deleted_item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(task_list.id)
+        .bind(deleted_remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("deleted task identity");
+        let paused_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            deleted_item_id,
+            "paused",
+            fixture.now + Duration::seconds(6),
+        )
+        .await;
+        let counts_before =
+            canonical_mutation_counts(&fixture.database.pool, fixture.scope.workspace_id).await;
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_tombstone(
+                        fixture.account_id,
+                        task_list.id,
+                        task_list.revision,
+                        deleted_remote_id,
+                        [124; 32],
+                    ),
+                    fixture.now + Duration::seconds(7),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ItemExecutionActive)
+        );
+        let retained: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT status, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(deleted_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("task retained while paused");
+        assert_eq!(retained, ("planned".to_owned(), 1, None));
+        assert_eq!(
+            canonical_mutation_counts(&fixture.database.pool, fixture.scope.workspace_id).await,
+            counts_before,
+        );
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            paused_session,
+            fixture.now + Duration::seconds(8),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(
+                    &fixture.claim,
+                    remote_tombstone(
+                        fixture.account_id,
+                        task_list.id,
+                        task_list.revision,
+                        deleted_remote_id,
+                        [124; 32],
+                    ),
+                    fixture.now + Duration::seconds(9),
+                )
+                .await
+                .expect("delete after lease close"),
+            ImportOutcome::Deleted
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_calendar_projection_rolls_back_the_whole_batch_on_active_execution() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; Calendar execution guard test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let first_remote = "execution-guard-first-occurrence";
+        let active_remote = "execution-guard-later-occurrence";
+        fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![
+                        projected_occurrence(&fixture, first_remote, "Original first", false, 125),
+                        projected_occurrence(&fixture, active_remote, "Active later", false, 126),
+                    ],
+                ),
+                fixture.now,
+            )
+            .await
+            .expect("initial two-member projection");
+        let active_item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(active_remote)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence identity");
+        let first_before: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT item.title, item.revision, item.trashed_at FROM items item \
+             JOIN provider_sync_mappings mapping ON mapping.workspace_id = item.workspace_id \
+               AND mapping.local_entity_id = item.id WHERE mapping.workspace_id = $1 \
+               AND mapping.collection_id = $2 AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(first_remote)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("first occurrence before replacement");
+        let generation_before: i64 = sqlx::query_scalar(
+            "SELECT planning_generation FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("projection generation before replacement");
+        let active_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            active_item_id,
+            "active",
+            fixture.now + Duration::seconds(1),
+        )
+        .await;
+        assert_eq!(
+            fixture
+                .repository
+                .replace_calendar_projection(
+                    &fixture.claim,
+                    projection_batch(
+                        &fixture,
+                        vec![projected_occurrence(
+                            &fixture,
+                            first_remote,
+                            "Must roll back",
+                            false,
+                            127,
+                        )],
+                    ),
+                    fixture.now + Duration::seconds(2),
+                )
+                .await,
+            Err(GoogleSyncRepositoryError::ItemExecutionActive)
+        );
+        let first_after: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT item.title, item.revision, item.trashed_at FROM items item \
+             JOIN provider_sync_mappings mapping ON mapping.workspace_id = item.workspace_id \
+               AND mapping.local_entity_id = item.id WHERE mapping.workspace_id = $1 \
+               AND mapping.collection_id = $2 AND mapping.remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(first_remote)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("first occurrence after rejected replacement");
+        let active_trashed_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT trashed_at FROM items WHERE workspace_id = $1 AND id = $2")
+                .bind(fixture.scope.workspace_id)
+                .bind(active_item_id)
+                .fetch_one(&fixture.database.pool)
+                .await
+                .expect("active occurrence retained");
+        let generation_after: i64 = sqlx::query_scalar(
+            "SELECT planning_generation FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("projection generation after rejection");
+        assert_eq!(first_after, first_before);
+        assert_eq!(active_trashed_at, None);
+        assert_eq!(generation_after, generation_before);
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            active_session,
+            fixture.now + Duration::seconds(3),
+        )
+        .await;
+        let accepted = fixture
+            .repository
+            .replace_calendar_projection(
+                &fixture.claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(
+                        &fixture,
+                        first_remote,
+                        "Must roll back",
+                        false,
+                        127,
+                    )],
+                ),
+                fixture.now + Duration::seconds(4),
+            )
+            .await
+            .expect("same batch accepted after lease close");
+        assert!(accepted.complete);
+        let accepted_state: (String, bool) = sqlx::query_as(
+            "SELECT \
+             (SELECT item.title FROM items item JOIN provider_sync_mappings mapping \
+               ON mapping.workspace_id = item.workspace_id AND mapping.local_entity_id = item.id \
+               WHERE mapping.workspace_id = $1 AND mapping.collection_id = $2 \
+                 AND mapping.remote_resource_id = $3), \
+             (SELECT trashed_at IS NOT NULL FROM items WHERE workspace_id = $1 AND id = $4)",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(first_remote)
+        .bind(active_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("accepted projection state");
+        assert_eq!(accepted_state, ("Must roll back".to_owned(), true));
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Keeps the deterministic lock choreography and rollback assertions together.
+    async fn postgres_inbound_close_and_execution_start_serialize_without_deadlock() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; inbound/Start race test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let remote_id = "execution-inbound-race";
+        fixture
+            .repository
+            .apply_remote_item(
+                &fixture.claim,
+                remote_event(
+                    fixture.account_id,
+                    fixture.collection.id,
+                    fixture.collection.revision,
+                    remote_id,
+                    "Inbound race",
+                    [128; 32],
+                ),
+                fixture.now,
+            )
+            .await
+            .expect("race item imported");
+        let item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .bind(remote_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("race item identity");
+        let clock = Arc::new(SystemClock);
+        let items = Arc::new(ItemService::new(
+            Arc::new(PostgresItemRepository::new(
+                fixture.database.pool.clone(),
+                fixture.scope,
+            )),
+            clock.clone(),
+        ));
+        let execution = Arc::new(ExecutionService::new(
+            Arc::new(PostgresExecutionRepository::new(
+                fixture.database.pool.clone(),
+                fixture.scope,
+            )),
+            items,
+            clock,
+        ));
+
+        // Stop the inbound transaction after it owns execution_state but before it can enter
+        // canonical item space. Start must queue behind state, then reject the committed close.
+        let mut canonical_blocker = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("begin canonical blocker");
+        super::super::database::lock_canonical_item_space(
+            &mut canonical_blocker,
+            fixture.scope.workspace_id,
+        )
+        .await
+        .expect("hold canonical item space");
+        let mut completed = remote_event(
+            fixture.account_id,
+            fixture.collection.id,
+            fixture.collection.revision,
+            remote_id,
+            "Completed remotely",
+            [129; 32],
+        );
+        completed.item.as_mut().expect("completed item").status = ItemStatus::Completed;
+        let inbound_task = {
+            let repository = fixture.repository.clone();
+            let claim = fixture.claim.clone();
+            tokio::spawn(async move {
+                repository
+                    .apply_remote_item(&claim, completed, fixture.now + Duration::seconds(1))
+                    .await
+            })
+        };
+        wait_until_execution_state_is_locked(&fixture.database.pool, fixture.scope).await;
+        let session_id = Uuid::new_v4();
+        let start_task = {
+            let execution = execution.clone();
+            tokio::spawn(async move {
+                execution
+                    .command(
+                        0,
+                        ExecutionCommand::Start(StartExecution {
+                            session_id,
+                            item_id,
+                            item_revision: 1,
+                            occurrence_id: None,
+                            session_index: 0,
+                            planned_block_id: None,
+                            device_id: Uuid::new_v4(),
+                        }),
+                        ExecutionIdempotencyKey {
+                            key: "google-inbound-start-race-001".to_owned(),
+                            fingerprint: [130; 32],
+                        },
+                    )
+                    .await
+            })
+        };
+        canonical_blocker
+            .commit()
+            .await
+            .expect("release canonical item space");
+        let (inbound, start) = tokio::time::timeout(StdDuration::from_secs(10), async {
+            tokio::join!(inbound_task, start_task)
+        })
+        .await
+        .expect("inbound/Start race completes without deadlock");
+        assert_eq!(
+            inbound
+                .expect("inbound task joins")
+                .expect("inbound close wins"),
+            ImportOutcome::Updated
+        );
+        assert!(matches!(
+            start.expect("Start task joins"),
+            Err(ExecutionServiceError::Repository(
+                ExecutionRepositoryError::ItemRevisionConflict
+            ))
+        ));
+        let state: (String, i64, Option<Uuid>) = sqlx::query_as(
+            "SELECT item.status, item.revision, state.active_session_id FROM items item \
+             JOIN execution_state state ON state.workspace_id = item.workspace_id \
+             WHERE item.workspace_id = $1 AND item.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("race terminal state");
+        assert_eq!(state, ("completed".to_owned(), 2, None));
+        let start_fence_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM idempotency_keys WHERE workspace_id = $1 \
+             AND namespace = 'execution.command'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("failed Start fence rollback");
+        assert_eq!(start_fence_count, 0);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn postgres_pause_disconnect_and_post_provider_guardians_revoke_stale_work() {
         let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
             eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL Google sync test skipped");
@@ -10361,13 +11409,22 @@ mod tests {
                 &fixture.claim,
                 projection_batch(
                     &fixture,
-                    vec![projected_occurrence(
-                        &fixture,
-                        "pause-projected-occurrence",
-                        "Projected meeting retired on pause",
-                        false,
-                        96,
-                    )],
+                    vec![
+                        projected_occurrence(
+                            &fixture,
+                            "pause-projected-occurrence",
+                            "Projected meeting retired on pause",
+                            false,
+                            96,
+                        ),
+                        projected_occurrence(
+                            &fixture,
+                            "pause-active-occurrence",
+                            "Active meeting blocks pause",
+                            false,
+                            97,
+                        ),
+                    ],
                 ),
                 fixture.now,
             )
@@ -10385,6 +11442,16 @@ mod tests {
         .await
         .expect("projected occurrence identity before pause");
         let pause_projected_item_id = pause_projection_identity.1;
+        let pause_active_item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = 'pause-active-occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active projected occurrence identity before pause");
         assert_eq!(pause_projection_identity.2, Some(1));
         sqlx::query(
             "UPDATE items SET title = 'Locally edited before account pause', \
@@ -10399,6 +11466,22 @@ mod tests {
         .expect("local edit before account pause");
         let oauth =
             PostgresGoogleOAuthRepository::new(fixture.database.pool.clone(), fixture.scope);
+        let pause_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            pause_active_item_id,
+            "active",
+            fixture.now + Duration::seconds(31),
+        )
+        .await;
+        let pause_active_before: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(pause_active_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence before account pause");
         let paused = oauth
             .set_paused(
                 fixture.account_id,
@@ -10409,7 +11492,53 @@ mod tests {
                 oauth_idempotency("google_oauth_pause", 70, fixture.now),
             )
             .await
-            .expect("account paused");
+            .expect("security pause commits while an occurrence is executing");
+        let pause_active_after: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(pause_active_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence after account pause");
+        let pause_active_mapping: (String, Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
+            "SELECT sync_state, tombstoned_at, conflict_metadata->>'reason' \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+                   AND remote_resource_id = 'pause-active-occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence mapping detached by account pause");
+        let active_lease: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT session.state, state.active_session_id FROM execution_sessions session \
+             JOIN execution_state state ON state.workspace_id = session.workspace_id \
+             WHERE session.workspace_id = $1 AND session.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(pause_session)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("execution lease survives account pause");
+        assert_eq!(pause_active_after, pause_active_before);
+        assert_eq!(pause_active_mapping.0, "conflict");
+        assert_eq!(
+            pause_active_mapping.1,
+            Some(fixture.now + Duration::minutes(1))
+        );
+        assert_eq!(
+            pause_active_mapping.2.as_deref(),
+            Some("calendar_occurrence_configuration_retired_execution_active")
+        );
+        assert_eq!(active_lease, ("active".to_owned(), Some(pause_session)));
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            pause_session,
+            fixture.now + Duration::minutes(1) + Duration::seconds(1),
+        )
+        .await;
         let pause_projection_state: (String, Option<DateTime<Utc>>) = sqlx::query_as(
             "SELECT planning_projection_state, planning_window_start \
              FROM google_sync_collections WHERE workspace_id = $1 AND id = $2",
@@ -10581,6 +11710,50 @@ mod tests {
             .await
             .expect("resumed claim scan")
             .expect("resumed run claim");
+        repository
+            .replace_calendar_projection(
+                &resumed_claim,
+                projection_batch(
+                    &fixture,
+                    vec![projected_occurrence(
+                        &fixture,
+                        "disconnect-active-occurrence",
+                        "Active meeting blocks disconnect",
+                        false,
+                        98,
+                    )],
+                ),
+                fixture.now + Duration::minutes(2),
+            )
+            .await
+            .expect("complete projection before blocked disconnect");
+        let disconnect_active_item_id: Uuid = sqlx::query_scalar(
+            "SELECT local_entity_id FROM provider_sync_mappings WHERE workspace_id = $1 \
+             AND collection_id = $2 AND entity_kind = 'calendar_occurrence' \
+             AND remote_resource_id = 'disconnect-active-occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active projected occurrence identity before disconnect");
+        let disconnect_session = seed_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            disconnect_active_item_id,
+            "paused",
+            fixture.now + Duration::minutes(2) + Duration::seconds(1),
+        )
+        .await;
+        let disconnect_item_before: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(disconnect_active_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence before disconnect");
+        let disconnect_claim_id = Uuid::new_v4();
         assert!(matches!(
             repository
                 .claim_outbound(&fixture.claim, fixture.now + Duration::minutes(2))
@@ -10704,14 +11877,63 @@ mod tests {
             .claim_disconnect(
                 fixture.account_id,
                 resumed.account.revision,
-                Uuid::new_v4(),
+                disconnect_claim_id,
                 fixture.now + Duration::minutes(3),
                 fixture.now,
                 fixture.now,
                 oauth_idempotency("google_oauth_disconnect", 74, fixture.now),
             )
             .await
-            .expect("disconnect guardian claimed");
+            .expect("disconnect guardian commits while an occurrence is executing");
+        let disconnect_item_after: (String, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT title, revision, trashed_at FROM items WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(disconnect_active_item_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence after disconnect claim");
+        let disconnect_mapping: (String, Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
+            "SELECT sync_state, tombstoned_at, conflict_metadata->>'reason' \
+                 FROM provider_sync_mappings WHERE workspace_id = $1 AND collection_id = $2 \
+                   AND remote_resource_id = 'disconnect-active-occurrence'",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.collection.id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("active occurrence mapping detached by disconnect");
+        let disconnect_lease: (String, Option<Uuid>) = sqlx::query_as(
+            "SELECT session.state, state.active_session_id FROM execution_sessions session \
+             JOIN execution_state state ON state.workspace_id = session.workspace_id \
+             WHERE session.workspace_id = $1 AND session.id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(disconnect_session)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("execution lease survives disconnect claim");
+        assert_eq!(disconnect_item_after, disconnect_item_before);
+        assert_eq!(disconnect_mapping.0, "conflict");
+        assert_eq!(
+            disconnect_mapping.1,
+            Some(fixture.now + Duration::minutes(3))
+        );
+        assert_eq!(
+            disconnect_mapping.2.as_deref(),
+            Some("calendar_occurrence_configuration_retired_execution_active")
+        );
+        assert_eq!(
+            disconnect_lease,
+            ("paused".to_owned(), Some(disconnect_session))
+        );
+        close_execution_lease(
+            &fixture.database.pool,
+            fixture.scope,
+            disconnect_session,
+            fixture.now + Duration::minutes(3) + Duration::seconds(1),
+        )
+        .await;
         assert_eq!(
             repository
                 .apply_remote_item(
@@ -12468,6 +13690,49 @@ mod tests {
                 duration_seconds: Some(3600),
                 deadline_at: Some("2026-08-29T11:00:00Z".parse().expect("end")),
                 earliest_start_at: Some("2026-08-29T10:00:00Z".parse().expect("start")),
+                recurrence: None,
+                flexible_constraints: json!({"google_sync": {"remote_id": remote_id}}),
+                split_policy: SplitPolicy::Indivisible,
+                importance: 0,
+                urgency: 0,
+                parent_id: None,
+                sibling_order: 0,
+            }),
+        }
+    }
+
+    fn remote_task(
+        account_id: Uuid,
+        collection_id: Uuid,
+        collection_revision: u64,
+        remote_id: &str,
+        title: &str,
+        status: ItemStatus,
+        hash: [u8; 32],
+    ) -> RemoteItemChange {
+        RemoteItemChange {
+            account_id,
+            collection_id,
+            collection_revision,
+            dayweave_item_id: None,
+            remote_id: remote_id.to_owned(),
+            remote_parent_id: None,
+            remote_etag: Some(format!("etag-{remote_id}-{}", hash[0])),
+            remote_updated_at: None,
+            remote_payload_hash: hash,
+            remote_projection_hash: hash,
+            reviewed_provider_projection: None,
+            item: Some(NewItem {
+                id: Uuid::new_v4(),
+                is_sensitive: false,
+                kind: ItemKind::Task,
+                status,
+                title: title.to_owned(),
+                notes: None,
+                timezone_name: "UTC".to_owned(),
+                duration_seconds: Some(1_800),
+                deadline_at: None,
+                earliest_start_at: None,
                 recurrence: None,
                 flexible_constraints: json!({"google_sync": {"remote_id": remote_id}}),
                 split_policy: SplitPolicy::Indivisible,

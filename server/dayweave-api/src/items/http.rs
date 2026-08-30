@@ -209,7 +209,7 @@ pub(crate) async fn get_item(
         (status = 200, description = "Item replaced", body = ItemEnvelope),
         (status = 400, description = "Malformed replacement JSON", body = crate::error::ErrorEnvelope),
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
-        (status = 409, description = "Stale revision or hierarchy conflict", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale revision, hierarchy, or active execution conflict", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid item contract", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -247,7 +247,7 @@ pub(crate) async fn replace_item(
     responses(
         (status = 200, description = "Item soft-deleted", body = ItemEnvelope),
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
-        (status = 409, description = "Stale revision or item has active children", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Stale revision, active children, or active execution conflict", body = crate::error::ErrorEnvelope),
         (status = 422, description = "Invalid revision or idempotency key", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -385,6 +385,13 @@ fn map_item_error(error: ItemServiceError) -> ApiError {
         ItemServiceError::Repository(ItemRepositoryError::IdempotencyInProgress) => {
             ApiError::conflict("matching idempotent request is still in progress")
         }
+        ItemServiceError::Repository(ItemRepositoryError::ActiveExecutionConflict {
+            item_id,
+            session_id,
+        }) => ApiError::item_execution_active(
+            "an active execution session must close before the item can become terminal or trashed",
+        )
+        .with_details(json!({ "item_id": item_id, "session_id": session_id })),
         ItemServiceError::Repository(ItemRepositoryError::InvalidCursor) => {
             ApiError::validation("delta cursor is invalid")
         }

@@ -1,6 +1,7 @@
 use std::{
     str::FromStr,
     sync::{Arc, RwLock},
+    time::Duration as StdDuration,
 };
 
 use chrono::{DateTime, Duration, Utc};
@@ -11,8 +12,8 @@ use dayweave_api::{
         FinishExecution, PauseExecution, ResumeExecution, StartExecution,
     },
     items::{
-        IdempotencyKey as ItemIdempotencyKey, ItemKind, ItemService, ItemStatus, NewItem,
-        SplitPolicy,
+        IdempotencyKey as ItemIdempotencyKey, ItemKind, ItemRepositoryError, ItemService,
+        ItemServiceError, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
     },
     persistence::{DatabaseScope, MIGRATOR, PostgresExecutionRepository, PostgresItemRepository},
     proposals::Clock,
@@ -56,6 +57,539 @@ async fn execution_defer_upgrade_repairs_the_legacy_workspace_clock() {
 
     test_database.destroy().await;
     scenario.expect("PostgreSQL execution upgrade scenario task succeeds");
+}
+
+#[tokio::test]
+async fn terminal_item_projection_and_execution_start_serialize_without_deadlock() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL execution race test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let scenario = tokio::spawn(run_terminal_projection_races(test_database.pool.clone())).await;
+
+    test_database.destroy().await;
+    scenario.expect("PostgreSQL execution race scenario task succeeds");
+}
+
+async fn run_terminal_projection_races(pool: PgPool) {
+    MIGRATOR.run(&pool).await.expect("migrations apply");
+    start_holds_execution_state_before_terminal_projection(&pool).await;
+    terminal_projection_holds_execution_state_before_start(&pool).await;
+    start_holds_execution_state_before_trash(&pool).await;
+    trash_holds_execution_state_before_start(&pool).await;
+}
+
+#[allow(clippy::too_many_lines)] // One deterministic race plus retry and later exact-replay proof.
+async fn start_holds_execution_state_before_terminal_projection(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-race-start-owner",
+        "execution-race-start-workspace",
+    )
+    .await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let execution = Arc::new(ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    ));
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Start wins terminal projection race", 80).await;
+    let item = items.get(item_id).await.expect("race item");
+    ensure_execution_state(pool, scope).await;
+
+    // Hold the row Start needs after it acquires execution_state. Once NOWAIT proves Start owns
+    // that state lock, launch the terminal projection behind it and release the row.
+    let mut item_blocker = pool.begin().await.expect("begin item row blocker");
+    sqlx::query("SELECT id FROM items WHERE workspace_id = $1 ORDER BY id FOR UPDATE")
+        .bind(scope.workspace_id)
+        .fetch_all(&mut *item_blocker)
+        .await
+        .expect("hold canonical item rows");
+    let session_id = Uuid::new_v4();
+    let start_task = {
+        let execution = execution.clone();
+        tokio::spawn(async move {
+            execution
+                .command(
+                    0,
+                    start_command(session_id, item_id, Uuid::new_v4()),
+                    execution_idempotency("execution-race-start-wins-001", 81),
+                )
+                .await
+        })
+    };
+    wait_until_execution_state_is_locked(pool, scope).await;
+    let terminal_task = {
+        let items = items.clone();
+        let replacement = item_replacement(&item, ItemStatus::Completed);
+        tokio::spawn(async move {
+            items
+                .replace(
+                    item_id,
+                    item.revision,
+                    replacement,
+                    ItemIdempotencyKey {
+                        key: "execution-race-terminal-loses-001".to_owned(),
+                        fingerprint: [82; 32],
+                    },
+                )
+                .await
+        })
+    };
+    item_blocker
+        .commit()
+        .await
+        .expect("release item row blocker");
+    let (started, blocked) = tokio::time::timeout(StdDuration::from_secs(10), async {
+        tokio::join!(start_task, terminal_task)
+    })
+    .await
+    .expect("state-first race completes without deadlock");
+    let started = started.expect("Start task joins").expect("Start wins");
+    assert_eq!(started.changed_session.id, session_id);
+    assert!(matches!(
+        blocked.expect("terminal task joins"),
+        Err(ItemServiceError::Repository(
+            ItemRepositoryError::ActiveExecutionConflict {
+                item_id: conflict_item,
+                session_id: conflict_session,
+            }
+        )) if conflict_item == item_id && conflict_session == session_id
+    ));
+    assert_eq!(
+        items.get(item_id).await.unwrap().status,
+        ItemStatus::Planned
+    );
+    assert_eq!(
+        item_idempotency_count(
+            pool,
+            scope,
+            "items.replace",
+            "execution-race-terminal-loses-001",
+        )
+        .await,
+        0
+    );
+
+    clock.set(base + Duration::seconds(1));
+    execution
+        .command(
+            1,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id,
+                actual_seconds: Some(1),
+            }),
+            execution_idempotency("execution-race-start-wins-close-001", 83),
+        )
+        .await
+        .expect("close winning lease");
+    let reconciled = items
+        .replace(
+            item_id,
+            item.revision,
+            item_replacement(&item, ItemStatus::Completed),
+            ItemIdempotencyKey {
+                key: "execution-race-terminal-loses-001".to_owned(),
+                fingerprint: [82; 32],
+            },
+        )
+        .await
+        .expect("terminal projection retries after close");
+    assert!(!reconciled.replayed);
+    assert_eq!(reconciled.item.status, ItemStatus::Completed);
+
+    let reopened = items
+        .replace(
+            item_id,
+            reconciled.item.revision,
+            item_replacement(&reconciled.item, ItemStatus::Planned),
+            ItemIdempotencyKey {
+                key: "execution-race-terminal-reopen-001".to_owned(),
+                fingerprint: [87; 32],
+            },
+        )
+        .await
+        .expect("reopen reconciled item");
+    let later_session_id = Uuid::new_v4();
+    execution
+        .command(
+            2,
+            ExecutionCommand::Start(StartExecution {
+                session_id: later_session_id,
+                item_id,
+                item_revision: reopened.item.revision,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-race-terminal-later-start-001", 88),
+        )
+        .await
+        .expect("later lease opens");
+    let replay = items
+        .replace(
+            item_id,
+            item.revision,
+            item_replacement(&item, ItemStatus::Completed),
+            ItemIdempotencyKey {
+                key: "execution-race-terminal-loses-001".to_owned(),
+                fingerprint: [82; 32],
+            },
+        )
+        .await
+        .expect("historical terminal response replays during later lease");
+    assert!(replay.replayed);
+    assert_eq!(replay.item.revision, reconciled.item.revision);
+    assert_eq!(items.get(item_id).await.unwrap(), reopened.item);
+}
+
+async fn terminal_projection_holds_execution_state_before_start(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-race-terminal-owner",
+        "execution-race-terminal-workspace",
+    )
+    .await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let execution = Arc::new(ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock,
+    ));
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Terminal projection wins Start race", 84).await;
+    let item = items.get(item_id).await.expect("race item");
+    ensure_execution_state(pool, scope).await;
+
+    // Hold the canonical advisory item lock so terminal replacement pauses only after owning
+    // execution_state. Start then queues behind state; releasing the item path lets terminal
+    // commit first and Start must reject the now-stale item revision.
+    let mut item_blocker = pool.begin().await.expect("begin advisory blocker");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('dayweave.items.v1:' || $1::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .execute(&mut *item_blocker)
+    .await
+    .expect("hold canonical item advisory lock");
+    let terminal_task = {
+        let items = items.clone();
+        let replacement = item_replacement(&item, ItemStatus::Completed);
+        tokio::spawn(async move {
+            items
+                .replace(
+                    item_id,
+                    item.revision,
+                    replacement,
+                    ItemIdempotencyKey {
+                        key: "execution-race-terminal-wins-001".to_owned(),
+                        fingerprint: [85; 32],
+                    },
+                )
+                .await
+        })
+    };
+    wait_until_execution_state_is_locked(pool, scope).await;
+    let session_id = Uuid::new_v4();
+    let start_task = {
+        let execution = execution.clone();
+        tokio::spawn(async move {
+            execution
+                .command(
+                    0,
+                    start_command(session_id, item_id, Uuid::new_v4()),
+                    execution_idempotency("execution-race-start-loses-001", 86),
+                )
+                .await
+        })
+    };
+    item_blocker
+        .commit()
+        .await
+        .expect("release canonical item advisory lock");
+    let (terminal, start) = tokio::time::timeout(StdDuration::from_secs(10), async {
+        tokio::join!(terminal_task, start_task)
+    })
+    .await
+    .expect("item-first race completes without deadlock");
+    let terminal = terminal
+        .expect("terminal task joins")
+        .expect("terminal projection wins");
+    assert_eq!(terminal.item.status, ItemStatus::Completed);
+    assert!(matches!(
+        start.expect("Start task joins"),
+        Err(ExecutionServiceError::Repository(
+            ExecutionRepositoryError::ItemRevisionConflict
+        ))
+    ));
+    assert!(execution.snapshot().await.unwrap().active_session.is_none());
+    assert_eq!(
+        execution_idempotency_count(pool, scope, "execution-race-start-loses-001").await,
+        0
+    );
+}
+
+#[allow(clippy::too_many_lines)] // One deterministic race plus retry, restore, and later exact replay.
+async fn start_holds_execution_state_before_trash(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-race-trash-start-owner",
+        "execution-race-trash-start-workspace",
+    )
+    .await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let execution = Arc::new(ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock.clone(),
+    ));
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Start wins trash race", 89).await;
+    let item = items.get(item_id).await.expect("trash race item");
+    ensure_execution_state(pool, scope).await;
+
+    let mut item_blocker = pool.begin().await.expect("begin trash item blocker");
+    sqlx::query("SELECT id FROM items WHERE workspace_id = $1 ORDER BY id FOR UPDATE")
+        .bind(scope.workspace_id)
+        .fetch_all(&mut *item_blocker)
+        .await
+        .expect("hold canonical item rows before Start");
+    let session_id = Uuid::new_v4();
+    let start_task = {
+        let execution = execution.clone();
+        tokio::spawn(async move {
+            execution
+                .command(
+                    0,
+                    start_command(session_id, item_id, Uuid::new_v4()),
+                    execution_idempotency("execution-race-trash-start-wins-001", 90),
+                )
+                .await
+        })
+    };
+    wait_until_execution_state_is_locked(pool, scope).await;
+    let trash_task = {
+        let items = items.clone();
+        tokio::spawn(async move {
+            items
+                .trash(
+                    item_id,
+                    item.revision,
+                    ItemIdempotencyKey {
+                        key: "execution-race-trash-loses-001".to_owned(),
+                        fingerprint: [91; 32],
+                    },
+                )
+                .await
+        })
+    };
+    item_blocker
+        .commit()
+        .await
+        .expect("release trash item blocker");
+    let (started, blocked) = tokio::time::timeout(StdDuration::from_secs(10), async {
+        tokio::join!(start_task, trash_task)
+    })
+    .await
+    .expect("Start/trash race completes without deadlock");
+    assert_eq!(
+        started
+            .expect("Start task joins")
+            .expect("Start wins trash race")
+            .changed_session
+            .id,
+        session_id
+    );
+    assert!(matches!(
+        blocked.expect("trash task joins"),
+        Err(ItemServiceError::Repository(
+            ItemRepositoryError::ActiveExecutionConflict {
+                item_id: conflict_item,
+                session_id: conflict_session,
+            }
+        )) if conflict_item == item_id && conflict_session == session_id
+    ));
+    assert_eq!(
+        item_idempotency_count(
+            pool,
+            scope,
+            "items.delete",
+            "execution-race-trash-loses-001",
+        )
+        .await,
+        0
+    );
+
+    clock.set(base + Duration::seconds(1));
+    execution
+        .command(
+            1,
+            ExecutionCommand::Complete(FinishExecution {
+                session_id,
+                actual_seconds: Some(1),
+            }),
+            execution_idempotency("execution-race-trash-close-001", 92),
+        )
+        .await
+        .expect("close lease before trash retry");
+    let trashed = items
+        .trash(
+            item_id,
+            item.revision,
+            ItemIdempotencyKey {
+                key: "execution-race-trash-loses-001".to_owned(),
+                fingerprint: [91; 32],
+            },
+        )
+        .await
+        .expect("trash retries after lease closes");
+    assert!(!trashed.replayed);
+    let restored = items
+        .restore(
+            item_id,
+            trashed.item.revision,
+            ItemIdempotencyKey {
+                key: "execution-race-trash-restore-001".to_owned(),
+                fingerprint: [93; 32],
+            },
+        )
+        .await
+        .expect("restore for later replay");
+    let later_session_id = Uuid::new_v4();
+    execution
+        .command(
+            2,
+            ExecutionCommand::Start(StartExecution {
+                session_id: later_session_id,
+                item_id,
+                item_revision: restored.item.revision,
+                occurrence_id: None,
+                session_index: 1,
+                planned_block_id: None,
+                device_id: Uuid::new_v4(),
+            }),
+            execution_idempotency("execution-race-trash-later-start-001", 94),
+        )
+        .await
+        .expect("later lease opens after restore");
+    let replay = items
+        .trash(
+            item_id,
+            item.revision,
+            ItemIdempotencyKey {
+                key: "execution-race-trash-loses-001".to_owned(),
+                fingerprint: [91; 32],
+            },
+        )
+        .await
+        .expect("historical trash response replays during later lease");
+    assert!(replay.replayed);
+    assert_eq!(replay.item, trashed.item);
+    assert_eq!(items.get(item_id).await.unwrap(), restored.item);
+}
+
+async fn trash_holds_execution_state_before_start(pool: &PgPool) {
+    let scope = seed_scope(
+        pool,
+        "execution-race-trash-owner",
+        "execution-race-trash-workspace",
+    )
+    .await;
+    let base = postgres_now(pool).await;
+    let clock = Arc::new(TestClock::new(base));
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(pool.clone(), scope)),
+        clock.clone(),
+    ));
+    let execution = Arc::new(ExecutionService::new(
+        Arc::new(PostgresExecutionRepository::new(pool.clone(), scope)),
+        items.clone(),
+        clock,
+    ));
+    let item_id = Uuid::new_v4();
+    create_item(&items, item_id, "Trash wins Start race", 95).await;
+    let item = items.get(item_id).await.expect("trash race item");
+    ensure_execution_state(pool, scope).await;
+
+    let mut item_blocker = pool.begin().await.expect("begin trash advisory blocker");
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('dayweave.items.v1:' || $1::text, 0))",
+    )
+    .bind(scope.workspace_id)
+    .execute(&mut *item_blocker)
+    .await
+    .expect("hold canonical item advisory lock");
+    let trash_task = {
+        let items = items.clone();
+        tokio::spawn(async move {
+            items
+                .trash(
+                    item_id,
+                    item.revision,
+                    ItemIdempotencyKey {
+                        key: "execution-race-trash-wins-001".to_owned(),
+                        fingerprint: [96; 32],
+                    },
+                )
+                .await
+        })
+    };
+    wait_until_execution_state_is_locked(pool, scope).await;
+    let session_id = Uuid::new_v4();
+    let start_task = {
+        let execution = execution.clone();
+        tokio::spawn(async move {
+            execution
+                .command(
+                    0,
+                    start_command(session_id, item_id, Uuid::new_v4()),
+                    execution_idempotency("execution-race-trash-start-loses-001", 97),
+                )
+                .await
+        })
+    };
+    item_blocker
+        .commit()
+        .await
+        .expect("release trash advisory blocker");
+    let (trashed, start) = tokio::time::timeout(StdDuration::from_secs(10), async {
+        tokio::join!(trash_task, start_task)
+    })
+    .await
+    .expect("trash/Start race completes without deadlock");
+    let trashed = trashed
+        .expect("trash task joins")
+        .expect("trash wins Start race");
+    assert!(trashed.item.deleted_at.is_some());
+    assert!(matches!(
+        start.expect("Start task joins"),
+        Err(ExecutionServiceError::Repository(
+            ExecutionRepositoryError::ItemRevisionConflict
+        ))
+    ));
+    assert!(execution.snapshot().await.unwrap().active_session.is_none());
+    assert_eq!(
+        execution_idempotency_count(pool, scope, "execution-race-trash-start-loses-001").await,
+        0
+    );
 }
 
 #[allow(clippy::too_many_lines)] // Keeps the exact legacy schema, rows, migration, and first commands together.
@@ -748,6 +1282,69 @@ async fn create_item(service: &ItemService, id: Uuid, title: &str, marker: u8) {
         .unwrap();
 }
 
+fn item_replacement(item: &dayweave_api::items::Item, status: ItemStatus) -> ReplaceItem {
+    ReplaceItem {
+        is_sensitive: item.is_sensitive,
+        kind: item.kind,
+        status,
+        title: item.title.clone(),
+        notes: item.notes.clone(),
+        timezone_name: item.timezone_name.clone(),
+        duration_seconds: item.duration_seconds,
+        deadline_at: item.deadline_at,
+        earliest_start_at: item.earliest_start_at,
+        recurrence: item.recurrence.clone(),
+        flexible_constraints: item.flexible_constraints.clone(),
+        split_policy: item.split_policy.clone(),
+        importance: item.importance,
+        urgency: item.urgency,
+        parent_id: item.parent_id,
+        sibling_order: item.sibling_order,
+    }
+}
+
+async fn ensure_execution_state(pool: &PgPool, scope: DatabaseScope) {
+    sqlx::query("INSERT INTO execution_state (workspace_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(scope.workspace_id)
+        .execute(pool)
+        .await
+        .expect("materialize execution state mutex");
+}
+
+async fn wait_until_execution_state_is_locked(pool: &PgPool, scope: DatabaseScope) {
+    tokio::time::timeout(StdDuration::from_secs(10), async {
+        loop {
+            let mut probe = pool.begin().await.expect("begin execution lock probe");
+            let result = sqlx::query(
+                "SELECT workspace_id FROM execution_state WHERE workspace_id = $1 FOR UPDATE NOWAIT",
+            )
+            .bind(scope.workspace_id)
+            .fetch_one(&mut *probe)
+            .await;
+            match result {
+                Ok(_) => {
+                    probe.rollback().await.expect("release execution lock probe");
+                    tokio::task::yield_now().await;
+                }
+                Err(error) if postgres_error_code(&error).as_deref() == Some("55P03") => {
+                    probe.rollback().await.expect("rollback failed lock probe");
+                    break;
+                }
+                Err(error) => panic!("unexpected execution lock probe failure: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("operation acquires execution_state before timeout");
+}
+
+fn postgres_error_code(error: &sqlx::Error) -> Option<String> {
+    error
+        .as_database_error()
+        .and_then(sqlx::error::DatabaseError::code)
+        .map(std::borrow::Cow::into_owned)
+}
+
 async fn postgres_now(pool: &PgPool) -> DateTime<Utc> {
     let now: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
         .fetch_one(pool)
@@ -807,6 +1404,25 @@ async fn execution_idempotency_count(pool: &PgPool, scope: DatabaseScope, key: &
          AND namespace = 'execution.command' AND key_hash = $2",
     )
     .bind(scope.workspace_id)
+    .bind(key_hash.as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn item_idempotency_count(
+    pool: &PgPool,
+    scope: DatabaseScope,
+    namespace: &str,
+    key: &str,
+) -> i64 {
+    let key_hash: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    sqlx::query_scalar(
+        "SELECT count(*) FROM idempotency_keys WHERE workspace_id = $1 \
+         AND namespace = $2 AND key_hash = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(namespace)
     .bind(key_hash.as_slice())
     .fetch_one(pool)
     .await

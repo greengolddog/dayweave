@@ -294,6 +294,8 @@ pub(crate) enum GoogleSyncRepositoryError {
     ClaimLost,
     #[error("sync cursor changed concurrently")]
     CursorConflict,
+    #[error("canonical item is targeted by an active execution session")]
+    ItemExecutionActive,
     #[error("expanded Calendar projection batch is invalid")]
     InvalidProjectionBatch,
     #[error("Google sync persistence failed")]

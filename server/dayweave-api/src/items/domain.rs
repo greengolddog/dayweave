@@ -41,6 +41,11 @@ pub enum ItemStatus {
 
 impl ItemStatus {
     #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped | Self::Cancelled)
+    }
+
+    #[must_use]
     pub const fn is_executing_state(self) -> bool {
         matches!(
             self,

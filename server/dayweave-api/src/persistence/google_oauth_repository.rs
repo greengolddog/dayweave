@@ -17,7 +17,7 @@ use crate::google_oauth::{
 
 use super::{
     DatabaseScope, google_sync_repository::retire_active_calendar_occurrences_for_account,
-    lock_canonical_item_space,
+    lock_execution_and_canonical_item_space,
 };
 
 const ACCOUNT_COLUMNS: &str = "id, external_account_id, display_label, status, sync_enabled, \
@@ -1339,7 +1339,7 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         now: DateTime<Utc>,
     ) -> Result<OperatorRecoveryResult, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+        lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
@@ -1602,7 +1602,7 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         idempotency: OAuthIdempotency,
     ) -> Result<GoogleAccountMutation, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+        lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
@@ -1751,7 +1751,7 @@ impl GoogleOAuthRepository for PostgresGoogleOAuthRepository {
         idempotency: OAuthIdempotency,
     ) -> Result<DisconnectMutation, GoogleOAuthRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        lock_canonical_item_space(&mut transaction, self.scope.workspace_id)
+        lock_execution_and_canonical_item_space(&mut transaction, self.scope.workspace_id)
             .await
             .map_err(internal)?;
         lock_scope(&mut transaction, self.scope).await?;
