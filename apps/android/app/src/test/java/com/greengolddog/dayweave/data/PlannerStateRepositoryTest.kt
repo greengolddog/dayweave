@@ -4,6 +4,8 @@ import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferViolationSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.InboxItem
@@ -244,6 +246,74 @@ class PlannerStateRepositoryTest {
             scope.cancel()
         }
     }
+
+    @Test
+    fun authoritativeDeferAssessmentAndExactApprovalSurviveEncryptedSnapshotRoundTrip() =
+        runBlocking {
+            val reference = Instant.parse("2026-08-29T08:30:00Z").toEpochMilli()
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { reference }
+            val base = pendingExecutionDeferState()
+            val intent = requireNotNull(base.pendingExecutionDeferIntent)
+            val assessmentDigest = "sha256:${"b".repeat(64)}"
+            val assessment = ExecutionDeferAssessmentSnapshot(
+                sessionId = intent.sessionId,
+                executionRevision = base.canonicalExecutionRevision,
+                sessionRevision = requireNotNull(base.canonicalExecutionSession).revision,
+                itemId = intent.itemId,
+                itemRevision = intent.itemRevision,
+                occurrenceId = intent.occurrenceId,
+                sourceSessionIndex = intent.sessionIndex,
+                replacementSessionIndex = intent.sessionIndex + 1,
+                sourceScheduleRevisionId = requireNotNull(base.publishedScheduleRevision).id,
+                sourceBlockId = intent.plannedBlockId,
+                actualSeconds = 300,
+                creditedSourceSeconds = 300,
+                plannedDurationSeconds = 1_800,
+                remainingDurationSeconds = 1_500,
+                moveStart = intent.moveStart,
+                moveEnd = "2026-08-29T10:25:00Z",
+                environmentDigest = "sha256:${"a".repeat(64)}",
+                assessmentDigest = assessmentDigest,
+                approvalRequired = true,
+                violations = listOf(
+                    ExecutionDeferViolationSnapshot(
+                        code = "outside_availability",
+                        itemIds = listOf(intent.itemId),
+                        occurrenceIds = emptyList(),
+                        conflictingBlockIds = emptyList(),
+                        conflictingBlocks = emptyList(),
+                        start = intent.moveStart,
+                        end = "2026-08-29T10:25:00Z",
+                        message =
+                            "The requested placement is outside an allowed availability window.",
+                    ),
+                ),
+                expiresAt = "2026-08-29T08:35:00Z",
+            )
+            val expected = base.copy(
+                pendingExecutionDeferIntent = intent.copy(
+                    assessment = assessment,
+                    approvedAssessmentDigest = assessmentDigest,
+                ),
+            )
+
+            repository.save(expected)
+            val serialized = requireNotNull(dao.snapshot).payload
+            assertTrue(serialized.contains("\"assessment_digest\""))
+            assertTrue(serialized.contains(assessmentDigest))
+            val restored = requireNotNull(repository.load())
+            assertEquals(expected.pendingExecutionDeferIntent, restored.pendingExecutionDeferIntent)
+            val relaunched = PlannerStore(
+                restored,
+                nowEpochMillis = { reference },
+            ).state.value
+            assertEquals(
+                assessmentDigest,
+                relaunched.pendingExecutionDeferIntent?.approvedAssessmentDigest,
+            )
+            assertEquals(assessment, relaunched.pendingExecutionDeferIntent?.assessment)
+        }
 
     @Test
     fun malformedRestoredDeferIntentIsDurablyNormalizedThroughSerializedRepository() =
@@ -825,6 +895,7 @@ class PlannerStateRepositoryTest {
             canonicalExecutionRevision = session.revision,
             canonicalExecutionSession = session,
             pendingExecutionDeferIntent = PendingExecutionDeferIntent(
+                schemaVersion = 1,
                 syncOrigin = requireNotNull(published.canonicalSyncOrigin),
                 configurationId = published.canonicalConfigurationId,
                 sessionId = session.id,

@@ -46,6 +46,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.SecureFlagPolicy
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.MoveLaterAssessment
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
@@ -249,9 +250,11 @@ internal fun moveLaterPresets(
     zoneId: ZoneId,
     use24HourFormat: Boolean,
     loadedPlanningDate: LocalDate? = null,
+    serverAuthoritativeExecution: Boolean = false,
 ): List<MoveLaterPreset> {
     fun afterHours(hours: Long): Instant {
         val candidate = now.plus(hours, ChronoUnit.HOURS)
+        if (serverAuthoritativeExecution) return roundUpToExecutionDeferSlot(candidate)
         val minute = candidate.atZone(zoneId).truncatedTo(ChronoUnit.MINUTES)
         return (if (minute.toInstant() < candidate) minute.plusMinutes(1) else minute).toInstant()
     }
@@ -281,12 +284,33 @@ internal fun customMoveStart(
     time: LocalTime,
     zoneId: ZoneId,
     now: Instant,
+    serverAuthoritativeExecution: Boolean = false,
 ): Instant? {
     val localDateTime = LocalDateTime.of(date, time.truncatedTo(ChronoUnit.MINUTES))
     val offset = zoneId.rules.getValidOffsets(localDateTime).singleOrNull() ?: return null
     val selected = localDateTime.toInstant(offset)
-    return selected.takeIf { it > now.plusSeconds(MIN_CUSTOM_MOVE_LEAD_SECONDS) }
+    return selected.takeIf {
+        if (serverAuthoritativeExecution) {
+            isSafeExecutionDeferTarget(it, now)
+        } else {
+            it > now.plusSeconds(MIN_CUSTOM_MOVE_LEAD_SECONDS)
+        }
+    }
 }
+
+internal fun roundUpToExecutionDeferSlot(candidate: Instant): Instant {
+    val remainder = Math.floorMod(candidate.epochSecond, EXECUTION_DEFER_SLOT_SECONDS)
+    val roundedSeconds = if (remainder == 0L && candidate.nano == 0) {
+        candidate.epochSecond
+    } else {
+        Math.addExact(candidate.epochSecond, EXECUTION_DEFER_SLOT_SECONDS - remainder)
+    }
+    return Instant.ofEpochSecond(roundedSeconds)
+}
+
+internal fun isSafeExecutionDeferTarget(target: Instant, reference: Instant): Boolean =
+    target.nano == 0 && Math.floorMod(target.epochSecond, EXECUTION_DEFER_SLOT_SECONDS) == 0L &&
+        !target.isBefore(reference.plusSeconds(EXECUTION_DEFER_TARGET_LEAD_SECONDS))
 
 internal fun moveLaterChooserExplanation(placementMode: MoveLaterPlacementMode): String =
     when (placementMode) {
@@ -316,6 +340,7 @@ internal fun MoveLaterChooserDialog(
     zoneId: ZoneId,
     loadedPlanningDate: LocalDate,
     notBefore: Instant? = null,
+    serverAuthoritativeExecution: Boolean = false,
     assessMove: (Instant) -> MoveLaterAssessment?,
     onDismiss: () -> Unit,
     onMove: (Instant, MoveLaterApprovalEnvelope?) -> Unit,
@@ -326,8 +351,20 @@ internal fun MoveLaterChooserDialog(
     val moveAnchor = remember(referenceNow, notBefore) {
         maxOf(referenceNow, notBefore ?: referenceNow)
     }
-    val presets = remember(moveAnchor, zoneId, use24HourFormat, loadedPlanningDate) {
-        moveLaterPresets(moveAnchor, zoneId, use24HourFormat, loadedPlanningDate)
+    val presets = remember(
+        moveAnchor,
+        zoneId,
+        use24HourFormat,
+        loadedPlanningDate,
+        serverAuthoritativeExecution,
+    ) {
+        moveLaterPresets(
+            moveAnchor,
+            zoneId,
+            use24HourFormat,
+            loadedPlanningDate.takeUnless { serverAuthoritativeExecution },
+            serverAuthoritativeExecution = serverAuthoritativeExecution,
+        )
     }
     var customError by remember { mutableStateOf<String?>(null) }
     var pendingConfirmation by remember {
@@ -337,6 +374,11 @@ internal fun MoveLaterChooserDialog(
         ?: loadedPlanningDate.atTime(9, 0).atZone(zoneId)
 
     fun requestMove(selected: Instant) {
+        if (serverAuthoritativeExecution) {
+            customError = null
+            onMove(selected, null)
+            return
+        }
         val assessment = assessMove(selected)
         when {
             assessment == null -> {
@@ -365,7 +407,7 @@ internal fun MoveLaterChooserDialog(
             context,
             { _, year, zeroBasedMonth, day ->
                 val date = LocalDate.of(year, zeroBasedMonth + 1, day)
-                if (date != loadedPlanningDate) {
+                if (!serverAuthoritativeExecution && date != loadedPlanningDate) {
                     customError = "Only the currently loaded planning day can be moved safely."
                     return@DatePickerDialog
                 }
@@ -383,10 +425,15 @@ internal fun MoveLaterChooserDialog(
                             time = localDateTime.toLocalTime(),
                             zoneId = zoneId,
                             now = maxOf(Instant.now(), notBefore ?: Instant.MIN),
+                            serverAuthoritativeExecution = serverAuthoritativeExecution,
                         )
                         if (selected == null) {
                             customError = if (hasOneExactOffset) {
-                                "Choose a time at least a minute from now."
+                                if (serverAuthoritativeExecution) {
+                                    "Choose a five-minute slot at least ten minutes from now."
+                                } else {
+                                    "Choose a time at least a minute from now."
+                                }
                             } else {
                                 "That clock time is unavailable or ambiguous because of " +
                                     "daylight saving. Choose another time."
@@ -407,7 +454,9 @@ internal fun MoveLaterChooserDialog(
             val deviceZone = ZoneId.systemDefault()
             dialog.datePicker.minDate = loadedPlanningDate.atStartOfDay(deviceZone)
                 .toInstant().toEpochMilli()
-            dialog.datePicker.maxDate = loadedPlanningDate.plusDays(1)
+            dialog.datePicker.maxDate = loadedPlanningDate.plusDays(
+                if (serverAuthoritativeExecution) 7 else 1,
+            )
                 .atStartOfDay(deviceZone).toInstant().toEpochMilli() - 1
         }.show()
     }
@@ -506,20 +555,31 @@ internal fun MoveLaterChooserDialog(
                     maxLines = 2,
                 )
                 Text(
-                    moveLaterChooserExplanation(placementMode),
+                    if (serverAuthoritativeExecution) {
+                        "DayWeave will save this target, confirm an exact Pause, then ask the " +
+                            "server to assess the current published plan. Any warning is shown " +
+                            "before the Defer command is saved."
+                    } else {
+                        moveLaterChooserExplanation(placementMode)
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 presets.forEachIndexed { index, preset ->
                     OutlinedButton(
                         onClick = {
-                            if (preset.moveStart <= maxOf(
-                                    Instant.now(),
-                                    notBefore ?: Instant.MIN,
-                                ).plusSeconds(
+                            val currentReference = maxOf(
+                                Instant.now(),
+                                notBefore ?: Instant.MIN,
+                            )
+                            val valid = if (serverAuthoritativeExecution) {
+                                isSafeExecutionDeferTarget(preset.moveStart, currentReference)
+                            } else {
+                                preset.moveStart > currentReference.plusSeconds(
                                     MIN_CUSTOM_MOVE_LEAD_SECONDS,
                                 )
-                            ) {
+                            }
+                            if (!valid) {
                                 customError = "That option has passed; choose another time."
                             } else {
                                 requestMove(preset.moveStart)
@@ -558,6 +618,162 @@ internal fun MoveLaterChooserDialog(
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
         properties = DialogProperties(
             securePolicy = if (itemIsSensitive) {
+                SecureFlagPolicy.SecureOn
+            } else {
+                SecureFlagPolicy.Inherit
+            },
+        ),
+    )
+}
+
+internal data class ExecutionDeferWarningPresentation(
+    val messages: List<String>,
+    val conflictingBlockCount: Int,
+    val requiresSecureWindow: Boolean,
+)
+
+internal fun executionDeferWarningPresentation(
+    assessment: ExecutionDeferAssessmentSnapshot,
+    sourceIsSensitive: Boolean,
+    sensitiveBlockIds: Set<String>,
+): ExecutionDeferWarningPresentation {
+    val conflictIds = assessment.violations
+        .flatMap { it.conflictingBlockIds }
+        .distinct()
+    return ExecutionDeferWarningPresentation(
+        messages = assessment.violations
+            .distinctBy { it.code to it.message }
+            .map { violation -> "${violation.code}: ${violation.message}" },
+        conflictingBlockCount = conflictIds.size,
+        // Even content-free restriction metadata reveals private schedule shape and timing. Treat
+        // every authoritative conflict review as privacy-sensitive, matching the macOS surface.
+        requiresSecureWindow = assessment.violations.isNotEmpty() || sourceIsSensitive ||
+            conflictIds.any(sensitiveBlockIds::contains),
+    )
+}
+
+/** Exact, content-free approval surface restored from the encrypted defer intent. */
+@Composable
+internal fun ExecutionDeferApprovalDialog(
+    assessment: ExecutionDeferAssessmentSnapshot,
+    sourceIsSensitive: Boolean,
+    sensitiveBlockIds: Set<String>,
+    zoneId: ZoneId,
+    onApprove: (String) -> Unit,
+    onKeepPaused: () -> Unit,
+) {
+    val presentation = executionDeferWarningPresentation(
+        assessment,
+        sourceIsSensitive,
+        sensitiveBlockIds,
+    )
+    val formatter = DateTimeFormatter.ofPattern("EEE, MMM d · HH:mm z")
+    val moveStart = runCatching {
+        Instant.parse(assessment.moveStart).atZone(zoneId).format(formatter)
+    }.getOrDefault("the selected time")
+    val moveEnd = runCatching {
+        Instant.parse(assessment.moveEnd).atZone(zoneId).format(formatter)
+    }.getOrDefault("the assessed end")
+    AlertDialog(
+        // Dismissal explicitly cancels only the unsent target; it never resumes or closes work.
+        onDismissRequest = onKeepPaused,
+        icon = { Icon(Icons.Outlined.Schedule, contentDescription = null) },
+        title = { Text("Move despite these restrictions?") },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState())
+                    .testTag("execution_defer_warning"),
+            ) {
+                Text(
+                    "The server assessed the exact paused work from $moveStart to $moveEnd.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                presentation.messages.forEach { message -> Text("• $message") }
+                if (presentation.conflictingBlockCount > 0) {
+                    Text(
+                        "${presentation.conflictingBlockCount} fixed schedule block(s) conflict " +
+                            "with this placement. Titles are hidden in this review.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Text(
+                    "Approval applies only to this exact assessment. Any plan, Calendar, item, " +
+                        "execution, or target change requires a new review.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onApprove(assessment.assessmentDigest) },
+                modifier = Modifier.testTag("execution_defer_approve"),
+            ) { Text("Approve and move") }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onKeepPaused,
+                modifier = Modifier.testTag("execution_defer_keep_paused"),
+            ) { Text("Keep paused") }
+        },
+        properties = DialogProperties(
+            securePolicy = if (presentation.requiresSecureWindow) {
+                SecureFlagPolicy.SecureOn
+            } else {
+                SecureFlagPolicy.Inherit
+            },
+        ),
+    )
+}
+
+@Composable
+internal fun ExecutionDeferPendingDialog(
+    moveStart: String,
+    statusMessage: String,
+    zoneId: ZoneId,
+    sourceIsSensitive: Boolean,
+    onRetry: () -> Unit,
+    onKeepPaused: () -> Unit,
+) {
+    val formatter = DateTimeFormatter.ofPattern("EEE, MMM d · HH:mm z")
+    val target = runCatching {
+        Instant.parse(moveStart).atZone(zoneId).format(formatter)
+    }.getOrDefault("the saved time")
+    AlertDialog(
+        onDismissRequest = onKeepPaused,
+        icon = { Icon(Icons.Outlined.Schedule, contentDescription = null) },
+        title = { Text("Move target is still pending") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Target: $target")
+                Text(statusMessage, style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "Retry keeps the same target, safely rechecks the paused session, and requests " +
+                        "new evidence if the saved assessment is no longer exact. Keep paused " +
+                        "cancels only this unsent move; it does not resume or finish the session.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onRetry,
+                modifier = Modifier.testTag("execution_defer_retry_assessment"),
+            ) { Text("Retry assessment") }
+        },
+        dismissButton = {
+            TextButton(
+                onClick = onKeepPaused,
+                modifier = Modifier.testTag("execution_defer_cancel_pending"),
+            ) { Text("Keep paused") }
+        },
+        properties = DialogProperties(
+            securePolicy = if (sourceIsSensitive) {
                 SecureFlagPolicy.SecureOn
             } else {
                 SecureFlagPolicy.Inherit
@@ -1213,3 +1429,7 @@ private enum class DeviceAuthEntryMode {
 }
 
 private const val MIN_CUSTOM_MOVE_LEAD_SECONDS = 60L
+private const val EXECUTION_DEFER_SLOT_SECONDS = 5 * 60L
+private const val EXECUTION_DEFER_ASSESSMENT_TTL_SECONDS = 5 * 60L
+private const val EXECUTION_DEFER_TARGET_LEAD_SECONDS =
+    EXECUTION_DEFER_ASSESSMENT_TTL_SECONDS + EXECUTION_DEFER_SLOT_SECONDS

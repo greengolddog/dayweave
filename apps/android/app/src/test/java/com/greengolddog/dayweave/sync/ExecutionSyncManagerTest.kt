@@ -5,19 +5,21 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferViolationSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingExecutionCommand
+import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
-import com.greengolddog.dayweave.model.assessMoveLater
-import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
+import com.greengolddog.dayweave.network.DeferAssessmentHttpRequest
 import com.greengolddog.dayweave.network.ExecutionApiException
 import com.greengolddog.dayweave.network.ExecutionTransport
 import com.greengolddog.dayweave.network.RemoteExecutionMutation
@@ -46,6 +48,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -649,13 +652,9 @@ class ExecutionSyncManagerTest {
         }
         val manager = manager(store, transport)
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
-        val approval = requireNotNull(
-            store.state.value.assessMoveLater(BLOCK_ID, moveStart, NOW),
-        ).toApprovalEnvelope()
-
         assertEquals(
             ExecutionSyncOutcome.SUCCESS,
-            manager.doLater(BLOCK_ID, moveStart, approval),
+            manager.doLater(BLOCK_ID, moveStart),
         )
 
         assertEquals(listOf("pause", "defer"), transport.commandBodies.map { body ->
@@ -672,7 +671,283 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
-    fun activeDeferRejectsConflictThatArrivedAfterExactWarningReview() = runBlocking {
+    fun executionDeferRejectsTooCloseOrMisalignedProgrammaticTargetsBeforePausing() = runBlocking {
+        val store = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, NOW.plusSeconds(5 * 60L)),
+        )
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            manager.doLater(BLOCK_ID, NOW.plusSeconds(10 * 60L + 1)),
+        )
+        assertTrue(transport.commandBodies.isEmpty())
+        assertTrue(transport.assessmentRequests.isEmpty())
+        assertNull(store.state.value.pendingExecutionDeferIntent)
+    }
+
+    @Test
+    fun executionDeferAcceptsExactTtlPlusOneSlotBoundary() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+            assessmentHandler = { request -> warningAssessment(this, request) }
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            manager.doLater(BLOCK_ID, NOW.plusSeconds(10 * 60L)),
+        )
+        assertEquals(NOW.plusSeconds(10 * 60L).toString(), transport.assessmentRequests.single().moveStart)
+        assertNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+    }
+
+    @Test
+    fun delayedRestartClearsUnassessableTargetBeforeChangingActiveLease() = runBlocking {
+        val store = plannerStore()
+        val running = activeSession(SESSION_ID)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(1, running)
+            historyResult = listOf(running)
+        }
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager(store, transport).refresh())
+        val block = store.state.value.schedule.single { it.id == BLOCK_ID }
+        val moveStart = NOW.plusSeconds(3_600)
+        val intent = PendingExecutionDeferIntent(
+            schemaVersion = 1,
+            syncOrigin = requireNotNull(store.state.value.canonicalExecutionSyncOrigin),
+            configurationId = store.state.value.canonicalExecutionConfigurationId,
+            sessionId = running.id,
+            itemId = running.itemId,
+            itemRevision = running.itemRevision,
+            occurrenceId = running.occurrenceId,
+            sessionIndex = running.sessionIndex,
+            plannedBlockId = requireNotNull(running.plannedBlockId),
+            sourceDeviceId = running.sourceDeviceId,
+            focusedBlockId = block.id,
+            sourceStart = requireNotNull(block.absoluteStartAt),
+            sourceEnd = requireNotNull(block.absoluteEndAt),
+            moveStart = moveStart.toString(),
+            stagedAt = NOW.toString(),
+        )
+        assertTrue(requireNotNull(store.stageExecutionDeferIntent(intent)).awaitDurable())
+        val delayedNow = moveStart.minusSeconds(5 * 60L)
+        val relaunched = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { delayedNow.toEpochMilli() },
+        )
+        val relaunchedManager = manager(relaunched, transport, currentNow = { delayedNow })
+
+        assertEquals(ExecutionSyncOutcome.INVALID_LOCAL_STATE, relaunchedManager.refresh())
+        assertNull(relaunched.state.value.pendingExecutionDeferIntent)
+        assertEquals("active", relaunched.state.value.canonicalExecutionSession?.status)
+        assertTrue(transport.commandBodies.isEmpty())
+        assertTrue(transport.assessmentRequests.isEmpty())
+        assertTrue(relaunchedManager.state.value.message.contains("at least ten minutes"))
+        val secondRelaunch = PlannerStore(
+            relaunched.state.value,
+            nowEpochMillis = { delayedNow.toEpochMilli() },
+        )
+        assertNull(secondRelaunch.state.value.pendingExecutionDeferIntent)
+        assertEquals("active", secondRelaunch.state.value.canonicalExecutionSession?.status)
+    }
+
+    @Test
+    fun delayedRestartPreservesFreshAssessmentInsideOriginalSafetyMargin() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(10 * 60L)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request ->
+            warningAssessment(transport, request).copy(
+                expiresAt = NOW.plusSeconds(5 * 60L).toString(),
+            )
+        }
+        val initialManager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, initialManager.refresh())
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            initialManager.doLater(BLOCK_ID, moveStart),
+        )
+        val persisted = requireNotNull(store.state.value.pendingExecutionDeferIntent)
+        val assessment = requireNotNull(persisted.assessment)
+        val delayedNow = NOW.plusSeconds(4 * 60L)
+        val relaunched = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { delayedNow.toEpochMilli() },
+        )
+        val deferred = paused.copy(
+            status = "deferred",
+            revision = 3,
+            actualSeconds = assessment.actualSeconds,
+            pauseUntil = null,
+            pauseReason = null,
+            moveStart = assessment.moveStart,
+            moveEnd = assessment.moveEnd,
+            endedAt = delayedNow.toString(),
+            updatedAt = delayedNow.toString(),
+        )
+        transport.commandHandler = { _, _ ->
+            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
+            transport.historyResult = listOf(deferred)
+            RemoteExecutionMutation(3, null, deferred, replayed = false)
+        }
+        val relaunchedManager = manager(relaunched, transport, currentNow = { delayedNow })
+
+        assertEquals(ExecutionSyncOutcome.APPROVAL_REQUIRED, relaunchedManager.refresh())
+        assertEquals(assessment, relaunched.state.value.pendingExecutionDeferIntent?.assessment)
+        assertEquals(1, transport.assessmentRequests.size)
+        assertEquals(
+            ExecutionSyncOutcome.SUCCESS,
+            relaunchedManager.approveDefer(assessment.assessmentDigest),
+        )
+        assertEquals(1, transport.assessmentRequests.size)
+        assertNull(relaunched.state.value.pendingExecutionDeferIntent)
+        assertEquals("deferred", relaunched.state.value.terminalExecutionOutcomes
+            .getValue(SESSION_ID).session.status)
+    }
+
+    @Test
+    fun assessmentExpiringAfterEntryClearsUnsafeTargetWithoutRetryLockout() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(10 * 60L)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request ->
+            warningAssessment(transport, request).copy(
+                expiresAt = NOW.plusSeconds(5 * 60L).toString(),
+            )
+        }
+        val initialManager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, initialManager.refresh())
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            initialManager.doLater(BLOCK_ID, moveStart),
+        )
+        val assessment = requireNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+        val beforeExpiry = NOW.plusSeconds(4 * 60L)
+        val afterExpiry = NOW.plusSeconds(5 * 60L + 1)
+        val relaunched = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { beforeExpiry.toEpochMilli() },
+        )
+        val clockCalls = AtomicInteger()
+        val expiringManager = manager(
+            relaunched,
+            transport,
+            currentNow = {
+                if (clockCalls.incrementAndGet() <= 2) beforeExpiry else afterExpiry
+            },
+        )
+
+        assertEquals(
+            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            expiringManager.approveDefer(assessment.assessmentDigest),
+        )
+        assertNull(relaunched.state.value.pendingExecutionDeferIntent)
+        assertNull(relaunched.state.value.pendingExecutionCommand)
+        assertEquals("paused", relaunched.state.value.canonicalExecutionSession?.status)
+        assertTrue(transport.commandBodies.isEmpty())
+        assertEquals(1, transport.assessmentRequests.size)
+        assertTrue(expiringManager.state.value.message.contains("at least ten minutes"))
+        val secondRelaunch = PlannerStore(
+            relaunched.state.value,
+            nowEpochMillis = { afterExpiry.toEpochMilli() },
+        )
+        assertNull(secondRelaunch.state.value.pendingExecutionDeferIntent)
+        assertEquals("paused", secondRelaunch.state.value.canonicalExecutionSession?.status)
+    }
+
+    @Test
+    fun republishedActiveSourceAcceptsAssessmentBoundToImmutableOriginRevision() = runBlocking {
+        val original = plannerStore()
+        val republishedId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+        val republishedRevision = requireNotNull(original.state.value.publishedScheduleRevision).copy(
+            id = republishedId,
+            revision = "2:$republishedId",
+            revisionNumber = 2uL,
+            inputDigest = "sha256:${"f".repeat(64)}",
+        )
+        val store = PlannerStore(
+            original.state.value.copy(
+                publishedScheduleRevision = republishedRevision,
+                publishedScheduleProof = requireNotNull(
+                    original.state.value.publishedScheduleProof,
+                ).copy(revision = republishedRevision),
+                scheduleInputDigest = republishedRevision.inputDigest,
+            ),
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(3_600)
+        var assessedSourceRevisionId: String? = null
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+            assessmentHandler = { request ->
+                cleanAssessment(request).also { assessment ->
+                    assessedSourceRevisionId = assessment.sourceScheduleRevisionId
+                }
+            }
+        }
+        transport.commandHandler = { _, body ->
+            val command = Json.parseToJsonElement(body).jsonObject.getValue("command").jsonObject
+            assertEquals("defer", command.getValue("type").jsonPrimitive.content)
+            val assessment = transport.cleanAssessment(transport.assessmentRequests.single())
+            val deferred = paused.copy(
+                status = "deferred",
+                revision = 3,
+                actualSeconds = assessment.actualSeconds,
+                pauseUntil = null,
+                moveStart = assessment.moveStart,
+                moveEnd = assessment.moveEnd,
+                endedAt = NOW.toString(),
+                updatedAt = NOW.toString(),
+            )
+            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
+            transport.historyResult = listOf(deferred)
+            RemoteExecutionMutation(3, null, deferred, replayed = false)
+        }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.doLater(BLOCK_ID, moveStart))
+        assertEquals(PUBLISHED_REVISION_ID, assessedSourceRevisionId)
+        assertNull(store.state.value.pendingExecutionDeferIntent)
+    }
+
+    @Test
+    fun serverAssessmentSupersedesChangedLocalConflictEstimate() = runBlocking {
         val moveStart = NOW.plusSeconds(3_600)
         fun hardBlock(id: String, title: String, minuteOffset: Long) = ScheduleItem(
             id = id,
@@ -705,9 +980,6 @@ class ExecutionSyncManagerTest {
             historyResult = listOf(active)
         }
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager(reviewedStore, transport).refresh())
-        val approval = requireNotNull(
-            reviewedStore.state.value.assessMoveLater(BLOCK_ID, moveStart, NOW),
-        ).toApprovalEnvelope()
         val newlyArrivedConflict = hardBlock(
             "99999999-9999-4999-8999-999999999999",
             "New conflict",
@@ -719,17 +991,32 @@ class ExecutionSyncManagerTest {
             },
             nowEpochMillis = { NOW.toEpochMilli() },
         )
+        val paused = active.copy(
+            status = "paused",
+            revision = 2,
+            runningSince = null,
+            pausedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        transport.commandHandler = { _, _ ->
+            transport.snapshotResult = RemoteExecutionSnapshot(2, paused)
+            transport.historyResult = listOf(paused)
+            RemoteExecutionMutation(2, paused, paused, replayed = false)
+        }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
         val mutationManager = manager(mutationStore, transport)
 
         assertEquals(
-            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
-            mutationManager.doLater(BLOCK_ID, moveStart, approval),
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            mutationManager.doLater(BLOCK_ID, moveStart),
         )
 
-        assertTrue(transport.commandBodies.isEmpty())
-        assertNull(mutationStore.state.value.pendingExecutionDeferIntent)
-        assertEquals("active", mutationStore.state.value.canonicalExecutionSession?.status)
-        assertTrue(mutationManager.state.value.message.contains("changed after review"))
+        assertEquals(1, transport.commandBodies.size)
+        assertNotNull(mutationStore.state.value.pendingExecutionDeferIntent?.assessment)
+        assertNull(
+            mutationStore.state.value.pendingExecutionDeferIntent?.approvedAssessmentDigest,
+        )
+        assertEquals("paused", mutationStore.state.value.canonicalExecutionSession?.status)
     }
 
     @Test
@@ -754,21 +1041,277 @@ class ExecutionSyncManagerTest {
             nowEpochMillis = { NOW.toEpochMilli() },
         )
         val running = activeSession(SESSION_ID)
+        val paused = running.copy(
+            status = "paused",
+            revision = 2,
+            runningSince = null,
+            pausedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
         val transport = FakeExecutionTransport().apply {
             snapshotResult = RemoteExecutionSnapshot(1, running)
             historyResult = listOf(running)
+            commandHandler = { _, _ ->
+                snapshotResult = RemoteExecutionSnapshot(2, paused)
+                historyResult = listOf(paused)
+                RemoteExecutionMutation(2, paused, paused, replayed = false)
+            }
         }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
         val manager = manager(store, transport)
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
 
         assertEquals(
-            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
             manager.doLater(BLOCK_ID, NOW.plusSeconds(3_600)),
         )
 
-        assertTrue(transport.commandBodies.isEmpty())
-        assertNull(store.state.value.pendingExecutionDeferIntent)
-        assertEquals("active", store.state.value.canonicalExecutionSession?.status)
+        assertEquals(1, transport.commandBodies.size)
+        assertNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+        assertEquals("paused", store.state.value.canonicalExecutionSession?.status)
+    }
+
+    @Test
+    fun conflictedAssessmentRestoresThenApprovalStagesItsExactServerWindow() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(3_600)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+        val persisted = requireNotNull(store.state.value.pendingExecutionDeferIntent)
+        val assessment = requireNotNull(persisted.assessment)
+        assertNull(persisted.approvedAssessmentDigest)
+        assertEquals(120L, assessment.actualSeconds)
+        assertEquals(moveStart.plusSeconds(1_680).toString(), assessment.moveEnd)
+
+        val restored = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
+        assertEquals(assessment, restored.state.value.pendingExecutionDeferIntent?.assessment)
+        val deferred = paused.copy(
+            status = "deferred",
+            revision = 3,
+            actualSeconds = assessment.actualSeconds,
+            pauseUntil = null,
+            pauseReason = null,
+            moveStart = assessment.moveStart,
+            moveEnd = assessment.moveEnd,
+            endedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        transport.commandHandler = { key, body ->
+            val journal = requireNotNull(restored.state.value.pendingExecutionCommand)
+            assertEquals(key, journal.idempotencyKey)
+            assertEquals(body, journal.requestJson)
+            assertEquals(
+                assessment.assessmentDigest,
+                restored.state.value.pendingExecutionDeferIntent?.approvedAssessmentDigest,
+            )
+            val command = Json.parseToJsonElement(body).jsonObject
+                .getValue("command").jsonObject
+            assertEquals(assessment.moveEnd, command.getValue("move_end").jsonPrimitive.content)
+            assertEquals(
+                assessment.actualSeconds,
+                command.getValue("actual_seconds").jsonPrimitive.long,
+            )
+            assertEquals(
+                assessment.assessmentDigest,
+                command.getValue("assessment_digest").jsonPrimitive.content,
+            )
+            assertEquals(
+                assessment.assessmentDigest,
+                command.getValue("approved_assessment_digest").jsonPrimitive.content,
+            )
+            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
+            transport.historyResult = listOf(deferred)
+            RemoteExecutionMutation(3, null, deferred, replayed = false)
+        }
+
+        assertEquals(
+            ExecutionSyncOutcome.SUCCESS,
+            manager(restored, transport).approveDefer(assessment.assessmentDigest),
+        )
+        assertNull(restored.state.value.pendingExecutionCommand)
+        assertNull(restored.state.value.pendingExecutionDeferIntent)
+        assertEquals(
+            assessment.moveEnd,
+            restored.state.value.terminalExecutionOutcomes[SESSION_ID]?.session?.moveEnd,
+        )
+    }
+
+    @Test
+    fun replacementAssessmentNeverInheritsApprovalFromOlderDigest() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            manager.doLater(BLOCK_ID, NOW.plusSeconds(3_600)),
+        )
+        val first = requireNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+        assertTrue(
+            requireNotNull(
+                store.approveExecutionDeferAssessment(SESSION_ID, first.assessmentDigest),
+            ).awaitDurable(),
+        )
+        assertEquals(
+            first.assessmentDigest,
+            store.state.value.pendingExecutionDeferIntent?.approvedAssessmentDigest,
+        )
+        assertTrue(
+            requireNotNull(
+                store.clearExecutionDeferAssessment(SESSION_ID, "synthetic stale evidence"),
+            ).awaitDurable(),
+        )
+        val replacement = first.copy(
+            environmentDigest = "sha256:${"d".repeat(64)}",
+            assessmentDigest = "sha256:${"e".repeat(64)}",
+        )
+        assertTrue(
+            requireNotNull(
+                store.recordExecutionDeferAssessment(SESSION_ID, replacement),
+            ).awaitDurable(),
+        )
+
+        assertEquals(replacement, store.state.value.pendingExecutionDeferIntent?.assessment)
+        assertNull(store.state.value.pendingExecutionDeferIntent?.approvedAssessmentDigest)
+    }
+
+    @Test
+    fun newerPausedRevisionClearsApprovalAndRequestsFreshAssessmentForSavedTarget() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(3_600)
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
+        val manager = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        assertEquals(
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+        val first = requireNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+        assertTrue(
+            requireNotNull(
+                store.approveExecutionDeferAssessment(SESSION_ID, first.assessmentDigest),
+            ).awaitDurable(),
+        )
+        val newerPaused = paused.copy(
+            revision = 3,
+            updatedAt = NOW.plusSeconds(1).toString(),
+        )
+        transport.snapshotResult = RemoteExecutionSnapshot(3, newerPaused)
+        transport.historyResult = listOf(newerPaused)
+        transport.assessmentHandler = { request ->
+            warningAssessment(transport, request).copy(
+                environmentDigest = "sha256:${"d".repeat(64)}",
+                assessmentDigest = "sha256:${"e".repeat(64)}",
+            )
+        }
+
+        assertEquals(ExecutionSyncOutcome.APPROVAL_REQUIRED, manager.refresh())
+
+        val refreshed = requireNotNull(store.state.value.pendingExecutionDeferIntent)
+        assertEquals(moveStart.toString(), refreshed.moveStart)
+        assertEquals("sha256:${"e".repeat(64)}", refreshed.assessment?.assessmentDigest)
+        assertNull(refreshed.approvedAssessmentDigest)
+        assertEquals(listOf(2L, 3L), transport.assessmentRequests.map { it.expectedRevision })
+        assertEquals("paused", store.state.value.canonicalExecutionSession?.status)
+    }
+
+    @Test
+    fun exactJournalReplaysUnchangedAfterAssessmentExpiry() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = NOW.plusSeconds(600).toString(),
+            revision = 2,
+        )
+        val moveStart = NOW.plusSeconds(3_600)
+        val clock = AtomicReference(NOW)
+        var attempts = 0
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            historyResult = listOf(paused)
+        }
+        transport.assessmentHandler = { request ->
+            transport.cleanAssessment(request).copy(expiresAt = NOW.plusSeconds(5).toString())
+        }
+        val assessmentEnd = moveStart.plusSeconds(1_680).toString()
+        val deferred = paused.copy(
+            status = "deferred",
+            revision = 3,
+            actualSeconds = 120,
+            pauseUntil = null,
+            pauseReason = null,
+            moveStart = moveStart.toString(),
+            moveEnd = assessmentEnd,
+            endedAt = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        transport.commandHandler = { _, _ ->
+            attempts += 1
+            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
+            transport.historyResult = listOf(deferred)
+            if (attempts == 1) throw IOException("synthetic lost defer response")
+            RemoteExecutionMutation(3, null, deferred, replayed = true)
+        }
+        val manager = manager(store, transport, currentNow = clock::get)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+        assertEquals(
+            ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE,
+            manager.doLater(BLOCK_ID, moveStart),
+        )
+        val pending = requireNotNull(store.state.value.pendingExecutionCommand)
+        assertEquals(1, transport.assessmentRequests.size)
+        clock.set(NOW.plusSeconds(10))
+        val restored = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { clock.get().toEpochMilli() },
+        )
+        assertNull(restored.state.value.pendingExecutionDeferIntent?.assessment)
+        assertEquals(pending.requestJson, restored.state.value.pendingExecutionCommand?.requestJson)
+
+        assertEquals(
+            ExecutionSyncOutcome.SUCCESS,
+            manager(restored, transport, currentNow = clock::get).refresh(),
+        )
+
+        assertEquals(listOf(pending.requestJson, pending.requestJson), transport.commandBodies)
+        assertEquals(listOf(pending.idempotencyKey, pending.idempotencyKey), transport.commandKeys)
+        assertEquals(1, transport.assessmentRequests.size)
+        assertNull(restored.state.value.pendingExecutionCommand)
+        assertEquals("deferred", restored.state.value.terminalExecutionOutcomes
+            .getValue(SESSION_ID).session.status)
     }
 
     @Test
@@ -815,13 +1358,14 @@ class ExecutionSyncManagerTest {
                 RemoteExecutionMutation(2, paused, paused, replayed = false)
             }
         }
+        transport.assessmentHandler = { request -> warningAssessment(transport, request) }
         val manager = manager(store, transport, currentNow = { managerNow })
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
 
         // The wall-clock estimate ends before the appointment, but the exact server Pause proves
         // 30 minutes remain and would overlap it. A Defer may not silently broaden the warning.
         assertEquals(
-            ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+            ExecutionSyncOutcome.APPROVAL_REQUIRED,
             manager.doLater(BLOCK_ID, moveStart),
         )
 
@@ -830,8 +1374,8 @@ class ExecutionSyncManagerTest {
                 .getValue("type").jsonPrimitive.content
         })
         assertEquals("paused", store.state.value.canonicalExecutionSession?.status)
-        assertNull(store.state.value.pendingExecutionDeferIntent)
-        assertTrue(manager.state.value.message.contains("review", ignoreCase = true))
+        assertNotNull(store.state.value.pendingExecutionDeferIntent?.assessment)
+        assertNull(store.state.value.pendingExecutionDeferIntent?.approvedAssessmentDigest)
     }
 
     @Test
@@ -1030,7 +1574,7 @@ class ExecutionSyncManagerTest {
     }
 
     @Test
-    fun recoveredOlderPendingDeferIsReportedWithoutSendingTheNewlySelectedTime() = runBlocking {
+    fun legacyDeferJournalWithoutAssessmentDigestFailsClosedBeforeReplay() = runBlocking {
         val store = plannerStore()
         val paused = pausedSession(
             pauseUntil = NOW.plusSeconds(600).toString(),
@@ -1058,52 +1602,34 @@ class ExecutionSyncManagerTest {
                 },
             )
         }.toString()
-        assertNotNull(
-            store.stageExecutionCommand(
-                PendingExecutionCommand(
-                    idempotencyKey = "99999999-9999-4999-8999-999999999999",
-                    syncOrigin = "https://api.example.test/",
-                    configurationId = DEFAULT_CONFIGURATION_ID,
-                    expectedRevision = 2,
-                    sessionId = SESSION_ID,
-                    itemId = ITEM_ID,
-                    itemRevision = 7,
-                    sessionIndex = 0,
-                    plannedBlockId = BLOCK_ID,
-                    sourceDeviceId = DEVICE_ID,
-                    commandType = "defer",
-                    requestJson = requestJson,
-                    focusedBlockId = BLOCK_ID,
-                    startedAt = NOW.toString(),
-                ),
-            ),
+        val legacyPending = PendingExecutionCommand(
+            idempotencyKey = "99999999-9999-4999-8999-999999999999",
+            syncOrigin = "https://api.example.test/",
+            configurationId = DEFAULT_CONFIGURATION_ID,
+            expectedRevision = 2,
+            sessionId = SESSION_ID,
+            itemId = ITEM_ID,
+            itemRevision = 7,
+            sessionIndex = 0,
+            plannedBlockId = BLOCK_ID,
+            sourceDeviceId = DEVICE_ID,
+            commandType = "defer",
+            requestJson = requestJson,
+            focusedBlockId = BLOCK_ID,
+            startedAt = NOW.toString(),
         )
-        val recovered = paused.copy(
-            status = "deferred",
-            revision = 3,
-            actualSeconds = 120,
-            pauseUntil = null,
-            moveStart = oldMoveStart.toString(),
-            moveEnd = oldMoveEnd.toString(),
-            endedAt = NOW.toString(),
-            updatedAt = NOW.toString(),
+        val legacyStore = PlannerStore(
+            store.state.value.copy(pendingExecutionCommand = legacyPending),
+            nowEpochMillis = { NOW.toEpochMilli() },
         )
-        transport.commandHandler = { _, _ ->
-            transport.snapshotResult = RemoteExecutionSnapshot(3, null)
-            transport.historyResult = listOf(recovered)
-            RemoteExecutionMutation(3, null, recovered, replayed = true)
-        }
-
         assertEquals(
-            ExecutionSyncOutcome.RECOVERED_COMMAND,
-            manager.doLater(BLOCK_ID, newlySelectedStart),
+            ExecutionSyncOutcome.PROTOCOL_FAILURE,
+            manager(legacyStore, transport).doLater(BLOCK_ID, newlySelectedStart),
         )
 
-        assertEquals(1, transport.commandBodies.size)
-        assertEquals(oldMoveStart.toString(), store.state.value.terminalExecutionOutcomes
-            .getValue(SESSION_ID).session.moveStart)
-        assertNull(store.state.value.pendingExecutionCommand)
-        assertNull(store.state.value.publishedScheduleProof)
+        assertTrue(transport.commandBodies.isEmpty())
+        assertEquals(legacyPending, legacyStore.state.value.pendingExecutionCommand)
+        assertTrue(legacyStore.state.value.terminalExecutionOutcomes.isEmpty())
     }
 
     @Test
@@ -2457,6 +2983,29 @@ class ExecutionSyncManagerTest {
             kind = requireNotNull(block.canonicalBlockKind),
         )
 
+    private fun warningAssessment(
+        transport: FakeExecutionTransport,
+        request: DeferAssessmentHttpRequest,
+    ): ExecutionDeferAssessmentSnapshot {
+        val clean = transport.cleanAssessment(request)
+        return clean.copy(
+            assessmentDigest = "sha256:${"c".repeat(64)}",
+            approvalRequired = true,
+            violations = listOf(
+                ExecutionDeferViolationSnapshot(
+                    code = "outside_availability",
+                    itemIds = listOf(ITEM_ID),
+                    occurrenceIds = emptyList(),
+                    conflictingBlockIds = emptyList(),
+                    conflictingBlocks = emptyList(),
+                    start = clean.moveStart,
+                    end = clean.moveEnd,
+                    message = "The requested placement is outside an allowed availability window.",
+                ),
+            ),
+        )
+    }
+
     private fun scheduleItem(id: String, sessionIndex: Int) = ScheduleItem(
         id = id,
         title = "Write test plan",
@@ -2603,12 +3152,45 @@ private class FakeExecutionTransport : ExecutionTransport {
     var commandHandler: suspend (String, String) -> RemoteExecutionMutation = { _, _ ->
         error("No command response configured")
     }
+    var assessmentHandler: suspend (DeferAssessmentHttpRequest) ->
+        ExecutionDeferAssessmentSnapshot = ::cleanAssessment
+
+    fun cleanAssessment(request: DeferAssessmentHttpRequest): ExecutionDeferAssessmentSnapshot {
+        val paused = requireNotNull(snapshotResult.activeSession)
+        val plannedSeconds = 1_800L
+        val creditedSeconds = request.actualSeconds.coerceAtMost(plannedSeconds)
+        val remainingSeconds = plannedSeconds - creditedSeconds
+        return ExecutionDeferAssessmentSnapshot(
+            sessionId = request.sessionId,
+            executionRevision = request.expectedRevision,
+            sessionRevision = paused.revision,
+            itemId = paused.itemId,
+            itemRevision = paused.itemRevision,
+            occurrenceId = paused.occurrenceId,
+            sourceSessionIndex = paused.sessionIndex,
+            replacementSessionIndex = paused.sessionIndex + 1,
+            sourceScheduleRevisionId = "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            sourceBlockId = requireNotNull(paused.plannedBlockId),
+            actualSeconds = request.actualSeconds,
+            creditedSourceSeconds = creditedSeconds,
+            plannedDurationSeconds = plannedSeconds,
+            remainingDurationSeconds = remainingSeconds,
+            moveStart = request.moveStart,
+            moveEnd = Instant.parse(request.moveStart).plusSeconds(remainingSeconds).toString(),
+            environmentDigest = "sha256:${"a".repeat(64)}",
+            assessmentDigest = "sha256:${"b".repeat(64)}",
+            approvalRequired = false,
+            violations = emptyList(),
+            expiresAt = Instant.parse(request.moveStart).minusSeconds(1).toString(),
+        )
+    }
     var historyResult: List<RemoteExecutionSession>? = null
     var historyError: Throwable? = null
     var historyHandler: (suspend (Int) -> List<RemoteExecutionSession>)? = null
     var historyPageHandler: (suspend (Int, Long) -> RemoteExecutionHistoryPage)? = null
     val commandKeys = mutableListOf<String>()
     val commandBodies = mutableListOf<String>()
+    val assessmentRequests = mutableListOf<DeferAssessmentHttpRequest>()
     var snapshotCalls = 0
     var historyCalls = 0
 
@@ -2629,6 +3211,14 @@ private class FakeExecutionTransport : ExecutionTransport {
         commandKeys += idempotencyKey
         commandBodies += requestJson
         return commandHandler(idempotencyKey, requestJson)
+    }
+
+    override suspend fun assessDefer(
+        configuration: AuthenticatedApiConfiguration,
+        request: DeferAssessmentHttpRequest,
+    ): ExecutionDeferAssessmentSnapshot {
+        assessmentRequests += request
+        return assessmentHandler(request)
     }
 
     override suspend fun history(

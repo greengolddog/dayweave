@@ -1,5 +1,8 @@
 package com.greengolddog.dayweave.ui.components
 
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferConflictSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferViolationSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
@@ -100,6 +103,50 @@ class MoveLaterChooserTest {
     }
 
     @Test
+    fun executionTargetsRequireFiveMinuteSlotsAndTtlPlusOneSlotLead() {
+        val now = Instant.parse("2026-08-30T18:30:00Z")
+        val zone = ZoneId.of("Europe/Madrid")
+
+        assertNull(
+            customMoveStart(
+                LocalDate.of(2026, 8, 30),
+                LocalTime.of(20, 39),
+                zone,
+                now,
+                serverAuthoritativeExecution = true,
+            ),
+        )
+        assertNull(
+            customMoveStart(
+                LocalDate.of(2026, 8, 30),
+                LocalTime.of(20, 41),
+                zone,
+                now,
+                serverAuthoritativeExecution = true,
+            ),
+        )
+        assertEquals(
+            Instant.parse("2026-08-30T18:40:00Z"),
+            customMoveStart(
+                LocalDate.of(2026, 8, 30),
+                LocalTime.of(20, 40),
+                zone,
+                now,
+                serverAuthoritativeExecution = true,
+            ),
+        )
+        assertEquals(
+            Instant.parse("2026-08-30T19:35:00Z"),
+            moveLaterPresets(
+                Instant.parse("2026-08-30T18:30:20Z"),
+                zone,
+                true,
+                serverAuthoritativeExecution = true,
+            ).first().moveStart,
+        )
+    }
+
+    @Test
     fun sensitiveConflictIsRedactedAndForcesASecureWarningWindow() {
         val public = conflict("Team meeting", isSensitive = false)
         val sensitive = conflict("Private diagnosis", isSensitive = true)
@@ -147,6 +194,115 @@ class MoveLaterChooserTest {
         org.junit.Assert.assertTrue(explanation.contains("recompose"))
         org.junit.Assert.assertTrue(explanation.contains("window"))
         org.junit.Assert.assertFalse(explanation.contains("exact"))
+    }
+
+    @Test
+    fun authoritativeWarningPresentationUsesOnlyContentFreeMessagesAndSecuresSensitiveConflicts() {
+        val sensitiveConflictId = "22222222-2222-4222-8222-222222222222"
+        val assessment = ExecutionDeferAssessmentSnapshot(
+            sessionId = "11111111-1111-4111-8111-111111111111",
+            executionRevision = 4,
+            sessionRevision = 2,
+            itemId = "33333333-3333-4333-8333-333333333333",
+            itemRevision = 7,
+            sourceSessionIndex = 0,
+            replacementSessionIndex = 1,
+            sourceScheduleRevisionId = "44444444-4444-4444-8444-444444444444",
+            sourceBlockId = "55555555-5555-4555-8555-555555555555",
+            actualSeconds = 120,
+            creditedSourceSeconds = 120,
+            plannedDurationSeconds = 1_800,
+            remainingDurationSeconds = 1_680,
+            moveStart = "2026-09-01T08:00:00Z",
+            moveEnd = "2026-09-01T08:28:00Z",
+            environmentDigest = "sha256:${"a".repeat(64)}",
+            assessmentDigest = "sha256:${"b".repeat(64)}",
+            approvalRequired = true,
+            violations = listOf(
+                ExecutionDeferViolationSnapshot(
+                    code = "immutable_overlap",
+                    itemIds = emptyList(),
+                    occurrenceIds = emptyList(),
+                    conflictingBlockIds = listOf(sensitiveConflictId),
+                    conflictingBlocks = listOf(
+                        ExecutionDeferConflictSnapshot(
+                            blockId = sensitiveConflictId,
+                            kind = "calendar_event",
+                            start = "2026-09-01T08:05:00Z",
+                            end = "2026-09-01T08:20:00Z",
+                        ),
+                    ),
+                    start = "2026-09-01T08:00:00Z",
+                    end = "2026-09-01T08:28:00Z",
+                    message = "The placement overlaps immutable scheduled time.",
+                ),
+            ),
+            expiresAt = "2026-09-01T07:05:00Z",
+        )
+
+        val presentation = executionDeferWarningPresentation(
+            assessment = assessment,
+            sourceIsSensitive = false,
+            sensitiveBlockIds = setOf(sensitiveConflictId),
+        )
+
+        assertEquals(
+            listOf("immutable_overlap: The placement overlaps immutable scheduled time."),
+            presentation.messages,
+        )
+        assertEquals(1, presentation.conflictingBlockCount)
+        org.junit.Assert.assertTrue(presentation.requiresSecureWindow)
+        org.junit.Assert.assertFalse(presentation.messages.any { "Private diagnosis" in it })
+    }
+
+    @Test
+    fun authoritativeWarningPresentationNeverSilentlyTruncatesSevenDistinctRestrictions() {
+        val violations = (1..7).map { index ->
+            ExecutionDeferViolationSnapshot(
+                code = if (index % 2 == 0) "dependency" else "outside_availability",
+                itemIds = emptyList(),
+                occurrenceIds = emptyList(),
+                conflictingBlockIds = emptyList(),
+                conflictingBlocks = emptyList(),
+                start = "2026-09-01T08:00:00Z",
+                end = "2026-09-01T08:28:00Z",
+                message = "Restriction $index",
+            )
+        }
+        val assessment = ExecutionDeferAssessmentSnapshot(
+            sessionId = "11111111-1111-4111-8111-111111111111",
+            executionRevision = 4,
+            sessionRevision = 2,
+            itemId = "33333333-3333-4333-8333-333333333333",
+            itemRevision = 7,
+            sourceSessionIndex = 0,
+            replacementSessionIndex = 1,
+            sourceScheduleRevisionId = "44444444-4444-4444-8444-444444444444",
+            sourceBlockId = "55555555-5555-4555-8555-555555555555",
+            actualSeconds = 120,
+            creditedSourceSeconds = 120,
+            plannedDurationSeconds = 1_800,
+            remainingDurationSeconds = 1_680,
+            moveStart = "2026-09-01T08:00:00Z",
+            moveEnd = "2026-09-01T08:28:00Z",
+            environmentDigest = "sha256:${"a".repeat(64)}",
+            assessmentDigest = "sha256:${"b".repeat(64)}",
+            approvalRequired = true,
+            violations = violations,
+            expiresAt = "2026-09-01T07:05:00Z",
+        )
+
+        val presentation = executionDeferWarningPresentation(
+            assessment,
+            sourceIsSensitive = false,
+            sensitiveBlockIds = emptySet(),
+        )
+
+        assertEquals(7, presentation.messages.size)
+        assertEquals(
+            violations.map { "${it.code}: ${it.message}" },
+            presentation.messages,
+        )
     }
 
     private fun conflict(title: String, isSensitive: Boolean) = ScheduleItem(

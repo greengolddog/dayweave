@@ -62,6 +62,8 @@ import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
 import com.greengolddog.dayweave.ui.components.AppLockedScreen
 import com.greengolddog.dayweave.ui.components.BreakEndedDialog
 import com.greengolddog.dayweave.ui.components.EditSuggestionDialog
+import com.greengolddog.dayweave.ui.components.ExecutionDeferApprovalDialog
+import com.greengolddog.dayweave.ui.components.ExecutionDeferPendingDialog
 import com.greengolddog.dayweave.ui.components.MoveLaterChooserDialog
 import com.greengolddog.dayweave.ui.components.PauseChooserDialog
 import com.greengolddog.dayweave.ui.components.ProposalReviewDialog
@@ -546,18 +548,74 @@ private fun DayWeaveRoot(
                 zoneId = moveZone,
                 loadedPlanningDate = loadedPlanningDate,
                 notBefore = target.timelineInstant(),
+                serverAuthoritativeExecution =
+                    state.activeSession?.itemId == targetId &&
+                    state.canonicalExecutionSession?.id ==
+                    state.activeSession?.canonicalExecutionSessionId,
                 assessMove = { moveStart ->
                     state.assessMoveLater(targetId, moveStart)
                 },
                 onDismiss = { moveLaterTargetId = null },
                 onMove = { moveStart, approval ->
                     if (state.activeSession?.itemId == targetId) {
-                        viewModel.doActiveLater(moveStart, approval)
+                        viewModel.doActiveLater(moveStart)
                     } else {
                         viewModel.doScheduledLater(targetId, moveStart, approval)
                     }
                     moveLaterTargetId = null
                 },
+            )
+        }
+    }
+
+    state.pendingExecutionDeferIntent?.let { intent ->
+        val assessment = intent.assessment
+        if (
+            assessment?.approvalRequired == true &&
+            intent.approvedAssessmentDigest != assessment.assessmentDigest
+        ) {
+            val source = state.schedule.firstOrNull { it.id == intent.focusedBlockId }
+            val zone = listOfNotNull(state.schedulePlanningZoneId, source?.planningZoneId)
+                .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
+                ?: ZoneId.systemDefault()
+            val sensitiveBlockIds = state.schedule.asSequence()
+                .filter { it.isSensitive }
+                .map { it.id }
+                .toSet()
+            ExecutionDeferApprovalDialog(
+                assessment = assessment,
+                sourceIsSensitive = source?.isSensitive != false,
+                sensitiveBlockIds = sensitiveBlockIds,
+                zoneId = zone,
+                onApprove = viewModel::approveActiveLater,
+                onKeepPaused = viewModel::cancelActiveLater,
+            )
+        }
+    }
+
+    state.pendingExecutionDeferIntent?.let { intent ->
+        val assessment = intent.assessment
+        val isWaitingForApproval = assessment?.approvalRequired == true &&
+            intent.approvedAssessmentDigest != assessment.assessmentDigest
+        if (
+            !isWaitingForApproval && state.pendingExecutionCommand == null &&
+            executionSyncState.phase in setOf(
+                CanonicalSyncPhase.ERROR,
+                CanonicalSyncPhase.OFFLINE,
+                CanonicalSyncPhase.AUTH_REQUIRED,
+            )
+        ) {
+            val source = state.schedule.firstOrNull { it.id == intent.focusedBlockId }
+            val zone = listOfNotNull(state.schedulePlanningZoneId, source?.planningZoneId)
+                .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
+                ?: ZoneId.systemDefault()
+            ExecutionDeferPendingDialog(
+                moveStart = intent.moveStart,
+                statusMessage = executionSyncState.message,
+                zoneId = zone,
+                sourceIsSensitive = source?.isSensitive != false,
+                onRetry = viewModel::refreshExecution,
+                onKeepPaused = viewModel::cancelActiveLater,
             )
         }
     }

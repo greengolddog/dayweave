@@ -17,12 +17,12 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.DerivedEnergySnapshot
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.EnergySignalSource
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.ManualEnergyCheckIn
-import com.greengolddog.dayweave.model.MoveLaterDeadlineRisk
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
@@ -60,7 +60,6 @@ import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
-import com.greengolddog.dayweave.model.savedApprovalEnvelope
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
@@ -80,6 +79,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.long
 
 enum class PlannerLoadState {
     LOADING,
@@ -135,77 +138,6 @@ private data class CanonicalAuthoringRefreshOverlay(
     val mutations: List<PendingCanonicalAuthoringMutation>,
     val deleted: List<CanonicalRecentlyDeletedRecord>,
 )
-
-private fun PendingExecutionDeferIntent.requireValidApprovalShape(
-    scheduleSize: Int,
-    moveStart: Instant,
-) {
-    fun requireUuid(raw: String) {
-        val parsed = UUID.fromString(raw)
-        require(parsed != UUID(0L, 0L) && parsed.toString() == raw)
-    }
-    approvedItemRevisions.forEach { (itemId, revision) ->
-        requireUuid(itemId)
-        require(revision > 0)
-    }
-    require(approvedHardConflicts.map { it.id }.sorted() == approvedHardBlockIds.sorted())
-    require(approvedHardBlockIds.size <= scheduleSize)
-    require(approvedHardConflicts.distinctBy { it.id }.size == approvedHardConflicts.size)
-    approvedHardConflicts.forEach { conflict ->
-        requireUuid(conflict.id)
-        conflict.canonicalItemId?.let(::requireUuid)
-        require(conflict.canonicalRevision == null || conflict.canonicalRevision > 0)
-        val start = Instant.parse(conflict.startAt)
-        val end = Instant.parse(conflict.endAt)
-        require(
-            start.toString() == conflict.startAt && end.toString() == conflict.endAt &&
-                start < end && conflict.canonicalBlockKind?.let {
-                    it.isNotBlank() && it.length <= 255 && it.none(Char::isISOControl)
-                } != false && (
-                conflict.isHardConstraint || !conflict.isFlexible ||
-                    conflict.itemKind == ItemKind.EVENT ||
-                    conflict.canonicalBlockKind in setOf(
-                        "pinned",
-                        "calendar_event",
-                        "external_fixed",
-                    )
-                ),
-        )
-    }
-    val approvedEnd = approvedConflictTargetEnd?.let(Instant::parse)
-    if (approvedEnd == null) {
-        require(
-            approvedDeadlineRisks.isEmpty() && !approvedSourceOverride &&
-                approvedItemRevisions.isEmpty() && approvedHardBlockIds.isEmpty() &&
-                approvedHardConflicts.isEmpty(),
-        )
-        return
-    }
-    require(approvedEnd.toString() == approvedConflictTargetEnd && approvedEnd > moveStart)
-    require(approvedItemRevisions == mapOf(itemId to itemRevision))
-    require(approvedDeadlineRisks.size <= approvedItemRevisions.size)
-    require(
-        approvedDeadlineRisks.distinctBy { risk ->
-            listOf(
-                risk.itemId,
-                risk.itemRevision,
-                risk.deadline,
-                risk.isHard,
-                risk.isCanonicalField,
-            )
-        }.size == approvedDeadlineRisks.size,
-    )
-    approvedDeadlineRisks.forEach { risk: MoveLaterDeadlineRisk ->
-        requireUuid(risk.itemId)
-        require(approvedItemRevisions[risk.itemId] == risk.itemRevision)
-        val deadline = Instant.parse(risk.deadline)
-        val targetEnd = Instant.parse(risk.targetEnd)
-        require(
-            deadline.toString() == risk.deadline && targetEnd.toString() == risk.targetEnd &&
-                deadline < targetEnd && targetEnd <= approvedEnd,
-        )
-    }
-}
 
 /**
  * Owns presentation state and serializes it to an optional offline repository.
@@ -2830,25 +2762,30 @@ class PlannerStore(
             intent.syncOrigin == current.canonicalExecutionSyncOrigin &&
                 intent.configurationId == current.canonicalExecutionConfigurationId,
         ) { "Move-later intent does not match the execution binding" }
+        require(intent.schemaVersion == EXECUTION_DEFER_INTENT_SCHEMA_VERSION) {
+            "Unsupported move-later intent schema"
+        }
+        require(intent.assessment == null && intent.approvedAssessmentDigest == null) {
+            "A new move target cannot carry prior assessment authority"
+        }
+        require(
+            intent.approvedConflictTargetEnd == null && intent.approvedDeadlineRisks.isEmpty() &&
+                !intent.approvedSourceOverride && intent.approvedItemRevisions.isEmpty() &&
+                intent.approvedHardBlockIds.isEmpty() && intent.approvedHardConflicts.isEmpty(),
+        ) { "Legacy local move approvals cannot authorize execution" }
         listOf(
             intent.sessionId,
             intent.itemId,
             intent.plannedBlockId,
             intent.sourceDeviceId,
             intent.focusedBlockId,
-            *intent.approvedHardBlockIds.toTypedArray(),
         ).forEach { raw -> require(UUID.fromString(raw).toString() == raw) }
-        require(
-            intent.approvedHardBlockIds.size <= current.schedule.size &&
-                intent.approvedHardBlockIds.distinct().size == intent.approvedHardBlockIds.size,
-        ) { "Move-later conflict approvals are invalid" }
         intent.occurrenceId?.let { require(UUID.fromString(it).toString() == it) }
         require(intent.itemRevision > 0 && intent.sessionIndex in 0..UShort.MAX_VALUE.toInt())
         val sourceStart = Instant.parse(intent.sourceStart)
         val sourceEnd = Instant.parse(intent.sourceEnd)
         val moveStart = Instant.parse(intent.moveStart)
         val stagedAt = Instant.parse(intent.stagedAt)
-        intent.requireValidApprovalShape(current.schedule.size, moveStart)
         val sourceDuration = Duration.between(sourceStart, sourceEnd)
         require(
             sourceStart < sourceEnd && sourceDuration.nano == 0 &&
@@ -2879,17 +2816,6 @@ class PlannerStore(
                 focused.absoluteStartAt == intent.sourceStart &&
                 focused.absoluteEndAt == intent.sourceEnd,
         ) { "Move-later intent does not match the exact source block" }
-        require(focused.isRepresentableMoveLaterSource()) {
-            "This fixed source cannot be safely represented as moved work"
-        }
-        val currentAssessment = current.assessMoveLater(
-            intent.focusedBlockId,
-            moveStart,
-            stagedAt,
-        )
-        require(currentAssessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) {
-            "Move-later risks changed after the user's exact review"
-        }
         val proof = current.publishedScheduleProof?.blocks?.singleOrNull {
             it.id == intent.plannedBlockId
         } ?: throw IllegalArgumentException("The execution source has no publication proof")
@@ -2901,7 +2827,73 @@ class PlannerStore(
         ) { "Move-later intent does not match its publication proof" }
         current.copy(
             pendingExecutionDeferIntent = intent,
-            scheduleMessage = "Move saved locally · confirming an exact pause",
+            scheduleMessage = "Move target saved · confirming an exact pause before assessment",
+        )
+    }
+
+    /** Persists one exact server assessment and revokes every approval from older evidence. */
+    fun recordExecutionDeferAssessment(
+        sessionId: String,
+        assessment: ExecutionDeferAssessmentSnapshot,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val intent = current.pendingExecutionDeferIntent
+            ?: throw IllegalArgumentException("No move-later intent is pending")
+        require(intent.sessionId == sessionId) { "A different move-later intent is pending" }
+        current.requireCurrentExecutionDeferAssessment(intent, assessment, requireFresh = true)
+        current.copy(
+            pendingExecutionDeferIntent = intent.copy(
+                assessment = assessment,
+                // A replacement response never inherits approval, even if another assessment had
+                // the same target or superficially identical conflict messages.
+                approvedAssessmentDigest = null,
+            ),
+            scheduleMessage = if (assessment.approvalRequired) {
+                "Move assessed · review the content-free placement warnings"
+            } else {
+                "Move assessed safely · preparing the exact deferred placement"
+            },
+        )
+    }
+
+    /** Persists explicit approval for exactly one current assessment digest. */
+    fun approveExecutionDeferAssessment(
+        sessionId: String,
+        assessmentDigest: String,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val intent = current.pendingExecutionDeferIntent
+            ?: throw IllegalArgumentException("No move-later intent is pending")
+        require(intent.sessionId == sessionId) { "A different move-later intent is pending" }
+        val assessment = intent.assessment
+            ?: throw IllegalArgumentException("The authoritative move assessment is unavailable")
+        current.requireCurrentExecutionDeferAssessment(intent, assessment, requireFresh = true)
+        require(assessment.approvalRequired && assessment.violations.isNotEmpty()) {
+            "This move does not require approval"
+        }
+        require(assessmentDigest == assessment.assessmentDigest) {
+            "Move approval does not match the current assessment"
+        }
+        current.copy(
+            pendingExecutionDeferIntent = intent.copy(
+                approvedAssessmentDigest = assessmentDigest,
+            ),
+            scheduleMessage = "Move warning approved · saving the exact defer command",
+        )
+    }
+
+    /** Keeps the paused lease and chosen target while discarding stale authorization evidence. */
+    fun clearExecutionDeferAssessment(
+        sessionId: String,
+        message: String,
+    ): PlannerPersistenceReceipt? = mutateDurably { current ->
+        val intent = current.pendingExecutionDeferIntent
+            ?: throw IllegalArgumentException("No move-later intent is pending")
+        require(intent.sessionId == sessionId) { "A different move-later intent is pending" }
+        current.copy(
+            pendingExecutionDeferIntent = intent.copy(
+                assessment = null,
+                approvedAssessmentDigest = null,
+            ),
+            scheduleMessage = message,
         )
     }
 
@@ -2954,6 +2946,9 @@ class PlannerStore(
         require(command.commandType in EXECUTION_COMMAND_TYPES)
         require(command.requestJson.length in 2..MAX_PENDING_EXECUTION_REQUEST_CHARS)
         Instant.parse(command.startedAt)
+        require(
+            command.commandType != "defer" || current.pendingExecutionDeferIntent != null,
+        ) { "A new Defer command requires a durable authoritative assessment intent" }
         current.pendingExecutionDeferIntent?.let { intent ->
             require(command.commandType in setOf("pause", "defer")) {
                 "Only the pending move-later transition can change this lease"
@@ -2961,14 +2956,26 @@ class PlannerStore(
             require(intent.hasSameImmutableIdentity(command)) {
                 "Execution command does not match the pending move-later intent"
             }
-            val moveStart = Instant.parse(intent.moveStart)
-            val assessment = current.assessMoveLater(
-                intent.focusedBlockId,
-                moveStart,
-                Instant.parse(command.startedAt),
-            )
-            require(assessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) {
-                "Move-later risks changed before the exact execution command was staged"
+            if (command.commandType == "defer") {
+                val assessment = intent.assessment
+                    ?: throw IllegalArgumentException(
+                        "An authoritative move assessment is required before Defer",
+                    )
+                current.requireCurrentExecutionDeferAssessment(
+                    intent,
+                    assessment,
+                    requireFresh = true,
+                )
+                require(
+                    if (assessment.approvalRequired) {
+                        intent.approvedAssessmentDigest == assessment.assessmentDigest
+                    } else {
+                        intent.approvedAssessmentDigest == null
+                    },
+                ) { "Move approval does not match the exact authoritative assessment" }
+                require(command.matchesExecutionDeferAssessment(assessment)) {
+                    "The exact Defer command does not match its authoritative assessment"
+                }
             }
         }
         val focused = current.schedule.firstOrNull { it.id == command.focusedBlockId }
@@ -4625,6 +4632,192 @@ class PlannerStore(
         )
     }
 
+    private fun DayWeaveUiState.requireCurrentExecutionDeferAssessment(
+        intent: PendingExecutionDeferIntent,
+        assessment: ExecutionDeferAssessmentSnapshot,
+        requireFresh: Boolean,
+    ) {
+        fun requireUuid(raw: String) {
+            val parsed = UUID.fromString(raw)
+            require(parsed != NIL_UUID && parsed.toString() == raw)
+        }
+        fun requireDigest(raw: String) {
+            require(
+                raw.length == 71 && raw.startsWith("sha256:") &&
+                    raw.drop(7).all { it in '0'..'9' || it in 'a'..'f' },
+            )
+        }
+        fun requireServerInstant(raw: String): Instant {
+            require(raw.length <= MAX_EXECUTION_DEFER_TIMESTAMP_CHARS && raw.none(Char::isISOControl))
+            return Instant.parse(raw).also { parsed ->
+                // PostgreSQL is the durable protocol clock; evidence with finer precision cannot
+                // be reproduced by the server's stale-assessment transaction.
+                require(parsed.nano % 1_000 == 0)
+            }
+        }
+        require(intent.schemaVersion == EXECUTION_DEFER_INTENT_SCHEMA_VERSION)
+        require(
+            intent.approvedConflictTargetEnd == null && intent.approvedDeadlineRisks.isEmpty() &&
+                !intent.approvedSourceOverride && intent.approvedItemRevisions.isEmpty() &&
+                intent.approvedHardBlockIds.isEmpty() && intent.approvedHardConflicts.isEmpty(),
+        )
+        listOf(
+            assessment.sessionId,
+            assessment.itemId,
+            assessment.sourceScheduleRevisionId,
+            assessment.sourceBlockId,
+        ).forEach(::requireUuid)
+        assessment.occurrenceId?.let(::requireUuid)
+        requireDigest(assessment.environmentDigest)
+        requireDigest(assessment.assessmentDigest)
+        require(
+            assessment.executionRevision > 0 && assessment.sessionRevision > 0 &&
+                assessment.sessionRevision <= assessment.executionRevision &&
+                assessment.itemRevision > 0 &&
+                assessment.sourceSessionIndex in 0 until UShort.MAX_VALUE.toInt() &&
+                assessment.replacementSessionIndex in 0..UShort.MAX_VALUE.toInt() &&
+                assessment.replacementSessionIndex > assessment.sourceSessionIndex,
+        )
+        require(
+            assessment.actualSeconds >= 0 && assessment.creditedSourceSeconds >= 0 &&
+                assessment.plannedDurationSeconds in
+                1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong() &&
+                assessment.remainingDurationSeconds in
+                1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong() &&
+                assessment.creditedSourceSeconds <= assessment.plannedDurationSeconds &&
+                assessment.plannedDurationSeconds - assessment.creditedSourceSeconds ==
+                assessment.remainingDurationSeconds,
+        )
+        val moveStart = requireServerInstant(assessment.moveStart)
+        val moveEnd = requireServerInstant(assessment.moveEnd)
+        val expiresAt = requireServerInstant(assessment.expiresAt)
+        val moveDuration = Duration.between(moveStart, moveEnd)
+        require(
+            moveStart < moveEnd && moveDuration.nano == 0 &&
+                moveDuration.seconds == assessment.remainingDurationSeconds &&
+                expiresAt < moveStart,
+        )
+        if (requireFresh) {
+            require(expiresAt > Instant.ofEpochMilli(nowEpochMillis()))
+        }
+        require(
+            assessment.violations.size <= MAX_EXECUTION_DEFER_VIOLATIONS &&
+                assessment.approvalRequired == assessment.violations.isNotEmpty(),
+        )
+        assessment.violations.forEach { violation ->
+            require(violation.code in EXECUTION_DEFER_VIOLATION_CODES)
+            require(
+                violation.message.isNotBlank() &&
+                    violation.message.length <= MAX_EXECUTION_DEFER_MESSAGE_CHARS &&
+                    violation.message.none { it.isISOControl() },
+            )
+            require(
+                violation.itemIds.size <= MAX_EXECUTION_DEFER_REFERENCES &&
+                    violation.occurrenceIds.size <= MAX_EXECUTION_DEFER_REFERENCES &&
+                    violation.conflictingBlockIds.size <= MAX_EXECUTION_DEFER_REFERENCES &&
+                    violation.conflictingBlocks.size <= MAX_EXECUTION_DEFER_REFERENCES &&
+                    violation.itemIds.distinct().size == violation.itemIds.size &&
+                    violation.occurrenceIds.distinct().size == violation.occurrenceIds.size &&
+                    violation.conflictingBlockIds.distinct().size ==
+                    violation.conflictingBlockIds.size &&
+                    violation.conflictingBlocks.map { it.blockId }.distinct().size ==
+                    violation.conflictingBlocks.size,
+            )
+            violation.itemIds.forEach(::requireUuid)
+            violation.occurrenceIds.forEach(::requireUuid)
+            violation.conflictingBlockIds.forEach(::requireUuid)
+            val violationStart = requireServerInstant(violation.start)
+            val violationEnd = requireServerInstant(violation.end)
+            require(violationStart < violationEnd)
+            violation.boundaryStart?.let(::requireServerInstant)
+            violation.boundaryEnd?.let(::requireServerInstant)
+            require(
+                violation.conflictingBlocks.map { it.blockId }.toSet() ==
+                    violation.conflictingBlockIds.toSet(),
+            )
+            violation.conflictingBlocks.forEach { conflict ->
+                requireUuid(conflict.blockId)
+                conflict.itemId?.let(::requireUuid)
+                conflict.occurrenceId?.let(::requireUuid)
+                conflict.externalBlockId?.let(::requireUuid)
+                require(conflict.kind in EXECUTION_DEFER_BLOCK_KINDS)
+                require(
+                    requireServerInstant(conflict.start) < requireServerInstant(conflict.end),
+                )
+            }
+        }
+
+        val lease = requireNotNull(canonicalExecutionSession)
+        require(lease.status == "paused" && lease.runningSince == null)
+        require(intent.hasSameImmutableIdentity(lease))
+        require(
+            assessment.sessionId == intent.sessionId &&
+                assessment.executionRevision == canonicalExecutionRevision &&
+                assessment.sessionRevision == lease.revision &&
+                assessment.itemId == intent.itemId &&
+                assessment.itemRevision == intent.itemRevision &&
+                assessment.occurrenceId == intent.occurrenceId &&
+                assessment.sourceSessionIndex == intent.sessionIndex &&
+                assessment.sourceBlockId == intent.plannedBlockId &&
+                assessment.actualSeconds == lease.accumulatedSeconds &&
+                assessment.moveStart == intent.moveStart,
+        )
+        val sourceDuration = Duration.between(
+            Instant.parse(intent.sourceStart),
+            Instant.parse(intent.sourceEnd),
+        )
+        require(
+            sourceDuration.nano == 0 &&
+                sourceDuration.seconds == assessment.plannedDurationSeconds,
+        )
+        val publication = requireNotNull(publishedScheduleProof)
+        require(
+            publication.blocks.single { it.id == intent.plannedBlockId }.let { proof ->
+                    proof.itemId == intent.itemId && proof.itemRevision == intent.itemRevision &&
+                        proof.occurrenceId == intent.occurrenceId &&
+                        proof.sessionIndex == intent.sessionIndex &&
+                        proof.start == intent.sourceStart && proof.end == intent.sourceEnd
+                },
+        )
+    }
+
+    private fun PendingExecutionCommand.matchesExecutionDeferAssessment(
+        assessment: ExecutionDeferAssessmentSnapshot,
+    ): Boolean = runCatching {
+        val root = EXECUTION_JOURNAL_JSON.parseToJsonElement(requestJson).jsonObject
+        require(root.keys == setOf("expected_revision", "command"))
+        val revision = root.getValue("expected_revision").jsonPrimitive
+        require(!revision.isString && revision.long == assessment.executionRevision)
+        val body = root.getValue("command").jsonObject
+        val expectedKeys = mutableSetOf(
+            "type",
+            "session_id",
+            "move_start",
+            "move_end",
+            "actual_seconds",
+            "assessment_digest",
+        )
+        if (assessment.approvalRequired) expectedKeys += "approved_assessment_digest"
+        require(body.keys == expectedKeys)
+        val type = body.getValue("type").jsonPrimitive
+        val session = body.getValue("session_id").jsonPrimitive
+        val moveStart = body.getValue("move_start").jsonPrimitive
+        val moveEnd = body.getValue("move_end").jsonPrimitive
+        val actual = body.getValue("actual_seconds").jsonPrimitive
+        val assessmentDigest = body.getValue("assessment_digest").jsonPrimitive
+        require(type.isString && type.content == "defer")
+        require(session.isString && session.content == assessment.sessionId)
+        require(moveStart.isString && moveStart.content == assessment.moveStart)
+        require(moveEnd.isString && moveEnd.content == assessment.moveEnd)
+        require(!actual.isString && actual.long == assessment.actualSeconds)
+        require(
+            assessmentDigest.isString && assessmentDigest.content == assessment.assessmentDigest,
+        )
+        val approved = body["approved_assessment_digest"]?.jsonPrimitive
+        require(approved?.isString != false)
+        require(approved?.content == assessment.assessmentDigest.takeIf { assessment.approvalRequired })
+    }.isSuccess
+
     /**
      * A user-level Defer intent may outlive a process, but it may never outlive its exact lease,
      * publication proof, or credential binding. Invalid/superseded intent is safe to abandon: no
@@ -4632,7 +4825,15 @@ class PlannerStore(
      */
     private fun DayWeaveUiState.withInvalidExecutionDeferIntentAbandoned(): DayWeaveUiState {
         val intent = pendingExecutionDeferIntent ?: return this
-        val valid = runCatching {
+        val baseValid = runCatching {
+            require(intent.schemaVersion == EXECUTION_DEFER_INTENT_SCHEMA_VERSION)
+            require(
+                intent.approvedConflictTargetEnd == null &&
+                    intent.approvedDeadlineRisks.isEmpty() &&
+                    !intent.approvedSourceOverride && intent.approvedItemRevisions.isEmpty() &&
+                    intent.approvedHardBlockIds.isEmpty() &&
+                    intent.approvedHardConflicts.isEmpty(),
+            )
             require(
                 intent.syncOrigin.isNotBlank() && intent.syncOrigin.length <= 4_096 &&
                     intent.syncOrigin.none(Char::isISOControl),
@@ -4648,16 +4849,10 @@ class PlannerStore(
                 intent.plannedBlockId,
                 intent.sourceDeviceId,
                 intent.focusedBlockId,
-                *intent.approvedHardBlockIds.toTypedArray(),
             ).forEach { raw ->
                 val id = UUID.fromString(raw)
                 require(id != NIL_UUID && id.toString() == raw)
             }
-            require(
-                intent.approvedHardBlockIds.size <= schedule.size &&
-                    intent.approvedHardBlockIds.distinct().size ==
-                    intent.approvedHardBlockIds.size,
-            )
             intent.occurrenceId?.let { raw ->
                 val id = UUID.fromString(raw)
                 require(id != NIL_UUID && id.toString() == raw)
@@ -4673,14 +4868,11 @@ class PlannerStore(
             val sourceEnd = Instant.parse(intent.sourceEnd)
             val moveStart = Instant.parse(intent.moveStart)
             val stagedAt = Instant.parse(intent.stagedAt)
-            val approvedEnd = intent.approvedConflictTargetEnd?.let(Instant::parse)
-            intent.requireValidApprovalShape(schedule.size, moveStart)
             require(
                 sourceStart.toString() == intent.sourceStart &&
                     sourceEnd.toString() == intent.sourceEnd &&
                     moveStart.toString() == intent.moveStart &&
-                    stagedAt.toString() == intent.stagedAt &&
-                    approvedEnd?.toString() == intent.approvedConflictTargetEnd,
+                    stagedAt.toString() == intent.stagedAt,
             )
             val sourceDuration = Duration.between(sourceStart, sourceEnd)
             require(
@@ -4705,8 +4897,7 @@ class PlannerStore(
                     source.occurrenceId == intent.occurrenceId &&
                     source.sessionIndex == intent.sessionIndex &&
                     source.absoluteStartAt == intent.sourceStart &&
-                    source.absoluteEndAt == intent.sourceEnd &&
-                    source.isRepresentableMoveLaterSource(),
+                    source.absoluteEndAt == intent.sourceEnd,
             )
             val proofEnvelope = requireNotNull(publishedScheduleProof)
             require(
@@ -4725,16 +4916,41 @@ class PlannerStore(
                 require(intent.hasSameImmutableIdentity(command))
             }
         }.isSuccess
-        return if (valid) {
-            this
-        } else {
-            copy(
+        if (!baseValid) {
+            return copy(
                 pendingExecutionDeferIntent = null,
                 scheduleMessage =
                     "Saved move could not be verified and was abandoned safely · " +
                         "authoritative execution state was retained",
             )
         }
+
+        val assessment = intent.assessment
+        if (assessment == null) {
+            return if (intent.approvedAssessmentDigest == null) this else copy(
+                pendingExecutionDeferIntent = intent.copy(approvedAssessmentDigest = null),
+                scheduleMessage = "Unbound move approval was discarded safely",
+            )
+        }
+        val evidenceValid = runCatching {
+            requireCurrentExecutionDeferAssessment(intent, assessment, requireFresh = true)
+            require(
+                if (assessment.approvalRequired) {
+                    intent.approvedAssessmentDigest == null ||
+                        intent.approvedAssessmentDigest == assessment.assessmentDigest
+                } else {
+                    intent.approvedAssessmentDigest == null
+                },
+            )
+        }.isSuccess
+        return if (evidenceValid) this else copy(
+            pendingExecutionDeferIntent = intent.copy(
+                assessment = null,
+                approvedAssessmentDigest = null,
+            ),
+            scheduleMessage =
+                "Move assessment expired or became stale · the paused target was retained",
+        )
     }
 
     private fun mutateInternal(
@@ -4949,6 +5165,37 @@ class PlannerStore(
         const val MAX_EXECUTION_HISTORY_WINDOW = 100
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60
         const val MAX_DEFER_MOVE_WINDOW_SECONDS = 24 * 60 * 60
+        const val EXECUTION_DEFER_INTENT_SCHEMA_VERSION = 1
+        const val MAX_EXECUTION_DEFER_VIOLATIONS = 10_000
+        const val MAX_EXECUTION_DEFER_REFERENCES = 10_000
+        const val MAX_EXECUTION_DEFER_MESSAGE_CHARS = 1_000
+        const val MAX_EXECUTION_DEFER_TIMESTAMP_CHARS = 64
+        val EXECUTION_DEFER_VIOLATION_CODES = setOf(
+            "outside_availability",
+            "earliest_start",
+            "latest_finish",
+            "minimum_notice",
+            "allowed_weekday",
+            "preferred_daily_window",
+            "preferred_absolute_window",
+            "forbidden_window",
+            "required_context",
+            "required_location",
+            "required_capabilities",
+            "energy",
+            "dependency",
+            "maximum_daily_work",
+            "maximum_weekly_work",
+            "buffer_compressed",
+            "immutable_overlap",
+        )
+        val EXECUTION_DEFER_BLOCK_KINDS = setOf(
+            "planned",
+            "pinned",
+            "calendar_event",
+            "external_fixed",
+        )
+        val EXECUTION_JOURNAL_JSON = Json { ignoreUnknownKeys = false }
         const val MAX_TERMINAL_PROJECTION_CONFLICT_CHARS = 500
         const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
         const val PROPOSAL_APPLICATION_JOURNAL_VERSION = 1

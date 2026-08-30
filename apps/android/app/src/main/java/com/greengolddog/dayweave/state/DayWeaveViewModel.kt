@@ -144,7 +144,6 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     fun doActiveLater(
         moveStart: Instant? = null,
-        approval: MoveLaterApprovalEnvelope? = null,
     ) {
         val activeId = plannerStore.state.value.activeSession?.itemId ?: return
         if (isCanonicalBlock(activeId) && moveStart == null) return
@@ -155,7 +154,6 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                         executionSyncManager.doLater(
                             id,
                             requireNotNull(moveStart),
-                            approval,
                         )
                     },
                     refreshCanonicalState = dayWeaveApplication::refreshCanonicalState,
@@ -163,6 +161,21 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             },
             localAction = plannerStore::doActiveLater,
         )
+    }
+
+    fun approveActiveLater(assessmentDigest: String) {
+        if (executionSyncManager.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction {
+            deferCanonicalExecutionAndRefresh(
+                command = { executionSyncManager.approveDefer(assessmentDigest) },
+                refreshCanonicalState = dayWeaveApplication::refreshCanonicalState,
+            )
+        }
+    }
+
+    fun cancelActiveLater() {
+        if (executionSyncManager.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction { executionSyncManager.cancelDefer() }
     }
 
     fun doScheduledLater(
@@ -403,7 +416,10 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     /** Called only while the application UI is STARTED; the process action gate coalesces races. */
     fun refreshExecution() {
-        if (isCanonicalBusy()) return
+        if (
+            canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
+            proposalApplicationManager.state.value.isBusy
+        ) return
         dayWeaveApplication.launchCanonicalAction {
             dayWeaveApplication.refreshForegroundExecution()
         }

@@ -8,6 +8,7 @@ import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -397,6 +398,94 @@ data class PendingExecutionCommand(
     val canonicalProjectionEligibleAtLeaseStart: Boolean = false,
 )
 
+/** Content-free fixed-block identity returned by the authoritative defer assessor. */
+@Serializable
+data class ExecutionDeferConflictSnapshot(
+    @SerialName("block_id")
+    val blockId: String,
+    @SerialName("item_id")
+    val itemId: String? = null,
+    @SerialName("occurrence_id")
+    val occurrenceId: String? = null,
+    @SerialName("external_block_id")
+    val externalBlockId: String? = null,
+    val kind: String,
+    val start: String,
+    val end: String,
+)
+
+/** Content-free policy violation returned by the authoritative defer assessor. */
+@Serializable
+data class ExecutionDeferViolationSnapshot(
+    val code: String,
+    @SerialName("item_ids")
+    val itemIds: List<String>,
+    @SerialName("occurrence_ids")
+    val occurrenceIds: List<String>,
+    @SerialName("conflicting_block_ids")
+    val conflictingBlockIds: List<String>,
+    @SerialName("conflicting_blocks")
+    val conflictingBlocks: List<ExecutionDeferConflictSnapshot>,
+    val start: String,
+    val end: String,
+    @SerialName("boundary_start")
+    val boundaryStart: String? = null,
+    @SerialName("boundary_end")
+    val boundaryEnd: String? = null,
+    val message: String,
+)
+
+/**
+ * Exact server response authorizing one paused-session Defer candidate.
+ *
+ * This remains encrypted with the intent so a conflict review can survive process death. It has
+ * no item title, notes, calendar title, or other user content.
+ */
+@Serializable
+data class ExecutionDeferAssessmentSnapshot(
+    @SerialName("session_id")
+    val sessionId: String,
+    @SerialName("execution_revision")
+    val executionRevision: Long,
+    @SerialName("session_revision")
+    val sessionRevision: Long,
+    @SerialName("item_id")
+    val itemId: String,
+    @SerialName("item_revision")
+    val itemRevision: Long,
+    @SerialName("occurrence_id")
+    val occurrenceId: String? = null,
+    @SerialName("source_session_index")
+    val sourceSessionIndex: Int,
+    @SerialName("replacement_session_index")
+    val replacementSessionIndex: Int,
+    @SerialName("source_schedule_revision_id")
+    val sourceScheduleRevisionId: String,
+    @SerialName("source_block_id")
+    val sourceBlockId: String,
+    @SerialName("actual_seconds")
+    val actualSeconds: Long,
+    @SerialName("credited_source_seconds")
+    val creditedSourceSeconds: Long,
+    @SerialName("planned_duration_seconds")
+    val plannedDurationSeconds: Long,
+    @SerialName("remaining_duration_seconds")
+    val remainingDurationSeconds: Long,
+    @SerialName("move_start")
+    val moveStart: String,
+    @SerialName("move_end")
+    val moveEnd: String,
+    @SerialName("environment_digest")
+    val environmentDigest: String,
+    @SerialName("assessment_digest")
+    val assessmentDigest: String,
+    @SerialName("approval_required")
+    val approvalRequired: Boolean,
+    val violations: List<ExecutionDeferViolationSnapshot>,
+    @SerialName("expires_at")
+    val expiresAt: String,
+)
+
 /**
  * Durable user intent spanning the active-to-paused-to-deferred execution transition.
  *
@@ -405,6 +494,8 @@ data class PendingExecutionCommand(
  */
 @Serializable
 data class PendingExecutionDeferIntent(
+    /** Zero is migration-only; legacy locally assessed intents are abandoned fail-closed. */
+    val schemaVersion: Int = 0,
     val syncOrigin: String,
     val configurationId: String? = null,
     val sessionId: String,
@@ -419,7 +510,11 @@ data class PendingExecutionDeferIntent(
     val sourceEnd: String,
     val moveStart: String,
     val stagedAt: String,
-    /** Exact warning envelope the user approved before an active lease was paused. */
+    /** Exact authoritative response; null while Pause or assessment is still pending. */
+    val assessment: ExecutionDeferAssessmentSnapshot? = null,
+    /** Set only by an explicit tap for the exact current [assessment] digest. */
+    val approvedAssessmentDigest: String? = null,
+    /** Legacy local-warning fields retained only so older encrypted snapshots can fail closed. */
     val approvedConflictTargetEnd: String? = null,
     val approvedDeadlineRisks: List<MoveLaterDeadlineRisk> = emptyList(),
     val approvedSourceOverride: Boolean = false,

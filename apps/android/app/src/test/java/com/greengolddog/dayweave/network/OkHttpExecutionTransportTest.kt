@@ -63,6 +63,58 @@ class OkHttpExecutionTransportTest {
     }
 
     @Test
+    fun deferAssessmentPostsExactPausedEvidenceAndDecodesClosedContentFreeShape() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                """{
+                  "assessment":{
+                    "session_id":"$SESSION_ID",
+                    "execution_revision":4,
+                    "session_revision":2,
+                    "item_id":"11111111-1111-4111-8111-111111111111",
+                    "item_revision":7,
+                    "occurrence_id":null,
+                    "source_session_index":0,
+                    "replacement_session_index":1,
+                    "source_schedule_revision_id":"66666666-6666-4666-8666-666666666666",
+                    "source_block_id":"22222222-2222-4222-8222-222222222222",
+                    "actual_seconds":120,
+                    "credited_source_seconds":120,
+                    "planned_duration_seconds":1800,
+                    "remaining_duration_seconds":1680,
+                    "move_start":"2026-09-01T08:00:00Z",
+                    "move_end":"2026-09-01T08:28:00Z",
+                    "environment_digest":"sha256:${"a".repeat(64)}",
+                    "assessment_digest":"sha256:${"b".repeat(64)}",
+                    "approval_required":false,
+                    "violations":[],
+                    "expires_at":"2026-09-01T07:05:00Z"
+                  }
+                }""".trimIndent(),
+            ),
+        )
+        val requestBody = DeferAssessmentHttpRequest(
+            expectedRevision = 4,
+            sessionId = SESSION_ID,
+            moveStart = "2026-09-01T08:00:00Z",
+            actualSeconds = 120,
+        )
+
+        val assessment = transport.assessDefer(configuration(), requestBody)
+
+        assertEquals("sha256:${"b".repeat(64)}", assessment.assessmentDigest)
+        assertEquals("2026-09-01T08:28:00Z", assessment.moveEnd)
+        assertEquals(120L, assessment.actualSeconds)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/tenant/v1/execution/defer-assessments", request.url.encodedPath)
+        assertEquals(
+            """{"expected_revision":4,"session_id":"$SESSION_ID","move_start":"2026-09-01T08:00:00Z","actual_seconds":120}""",
+            requireNotNull(request.body).utf8(),
+        )
+    }
+
+    @Test
     fun invalidIdempotencyKeysFailBeforeNetworkIo() {
         listOf("short", "unsafe/key", "non-ascii-éé").forEach { key ->
             assertThrows(ExecutionApiException.InvalidResponse::class.java) {

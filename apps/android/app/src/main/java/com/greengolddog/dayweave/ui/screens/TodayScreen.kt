@@ -255,7 +255,8 @@ fun TodayScreen(
                         }
                         ActiveItemActions(
                             isPaused = activeSession.isPaused,
-                            canDefer = activeItem.isMoveLaterEligible(),
+                            canDefer = activeSession.canonicalExecutionSessionId != null ||
+                                activeItem.isMoveLaterEligible(),
                             actionsEnabled = activeItem.canonicalItemId == null ||
                                 canonicalExecutionActionsEnabled,
                             onPause = onPause,

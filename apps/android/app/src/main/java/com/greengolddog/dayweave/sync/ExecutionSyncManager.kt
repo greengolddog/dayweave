@@ -1,19 +1,15 @@
 package com.greengolddog.dayweave.sync
 
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import com.greengolddog.dayweave.model.ItemStatus
-import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.ScheduleItem
-import com.greengolddog.dayweave.model.assessMoveLater
-import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
-import com.greengolddog.dayweave.model.isCoveredBy
-import com.greengolddog.dayweave.model.savedApprovalEnvelope
-import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
+import com.greengolddog.dayweave.network.DeferAssessmentHttpRequest
 import com.greengolddog.dayweave.network.ExecutionApiException
 import com.greengolddog.dayweave.network.ExecutionTransport
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
@@ -48,6 +44,7 @@ import kotlinx.serialization.json.put
 enum class ExecutionSyncOutcome {
     SUCCESS,
     RECOVERED_COMMAND,
+    APPROVAL_REQUIRED,
     NOT_CONFIGURED,
     AUTH_REQUIRED,
     CONFLICT,
@@ -242,11 +239,12 @@ class ExecutionSyncManager(
     suspend fun doLater(
         blockId: String,
         moveStart: Instant,
-        approval: MoveLaterApprovalEnvelope? = null,
     ): ExecutionSyncOutcome {
         val exactMoveStart = moveStart.truncatedTo(ChronoUnit.SECONDS)
-        if (exactMoveStart != moveStart || exactMoveStart <= now()) {
-            updateError("Choose a future whole-second time for this work.")
+        if (!isSafeExecutionDeferTarget(exactMoveStart, now()) || exactMoveStart != moveStart) {
+            updateError(
+                "Choose a five-minute slot at least ten minutes from now for this work.",
+            )
             return ExecutionSyncOutcome.INVALID_LOCAL_STATE
         }
 
@@ -280,11 +278,6 @@ class ExecutionSyncManager(
                     ?: throw InvalidExecutionStateException(
                         "The exact published source block is unavailable.",
                     )
-                if (!block.isRepresentableMoveLaterSource()) {
-                    throw InvalidExecutionStateException(
-                        "This fixed source cannot be safely represented as moved work.",
-                    )
-                }
                 val plannedBlockId = session.plannedBlockId
                     ?: throw InvalidExecutionStateException(
                         "The execution lease has no published source block.",
@@ -299,31 +292,6 @@ class ExecutionSyncManager(
                         "The execution lease no longer matches its published source block.",
                     )
                 }
-                val assessment = current.assessMoveLater(blockId, exactMoveStart, now())
-                    ?: throw InvalidExecutionStateException(
-                        "The exact move window could not be verified.",
-                    )
-                if (!assessment.fitsSinglePlanningDay) {
-                    throw InvalidExecutionStateException(
-                        "That move is outside the currently loaded planning day and cannot " +
-                            "be published safely.",
-                    )
-                }
-                if (assessment.crossesUnrelaxableHardDeadline) {
-                    throw InvalidExecutionStateException(
-                        "This running session cannot move beyond its hard deadline. Pause it " +
-                            "and change the item constraint first.",
-                    )
-                }
-                val reviewedApproval = approval ?: assessment.takeUnless {
-                    it.requiresConfirmation
-                }?.toApprovalEnvelope()
-                if (!assessment.isCoveredBy(reviewedApproval)) {
-                    throw InvalidExecutionStateException(
-                        "The placement risks changed after review. Review the current warning " +
-                            "before moving.",
-                    )
-                }
                 val plannedSeconds = block.exactPublishedDurationSeconds()
                 val remainingFloor = runCatching {
                     Math.subtractExact(plannedSeconds, session.accumulatedSeconds)
@@ -336,10 +304,13 @@ class ExecutionSyncManager(
                     )
                 }
                 val stagedAt = now()
-                if (exactMoveStart <= stagedAt) {
-                    throw InvalidExecutionStateException("The selected move time has already passed.")
+                if (!isSafeExecutionDeferTarget(exactMoveStart, stagedAt)) {
+                    throw InvalidExecutionStateException(
+                        "The selected five-minute slot is now too close for a safe assessment.",
+                    )
                 }
                 val intent = PendingExecutionDeferIntent(
+                    schemaVersion = EXECUTION_DEFER_INTENT_SCHEMA_VERSION,
                     syncOrigin = current.canonicalExecutionSyncOrigin
                         ?: throw InvalidExecutionStateException(
                             "The execution binding is unavailable.",
@@ -357,15 +328,6 @@ class ExecutionSyncManager(
                     sourceEnd = requireNotNull(block.absoluteEndAt),
                     moveStart = exactMoveStart.toString(),
                     stagedAt = stagedAt.toString(),
-                    approvedConflictTargetEnd = reviewedApproval?.maximumTargetEnd?.toString(),
-                    approvedDeadlineRisks = reviewedApproval?.deadlineRisks
-                        ?.sortedWith(compareBy({ it.deadline }, { it.itemId })).orEmpty(),
-                    approvedSourceOverride = reviewedApproval?.sourceOverrideApproved == true,
-                    approvedItemRevisions = reviewedApproval?.sourceItemRevisions.orEmpty(),
-                    approvedHardBlockIds = reviewedApproval?.hardConflicts?.map { it.id }
-                        ?.sorted().orEmpty(),
-                    approvedHardConflicts = reviewedApproval?.hardConflicts
-                        ?.sortedBy { it.id }.orEmpty(),
                 )
                 val receipt = plannerStore.stageExecutionDeferIntent(intent)
                 if (receipt == null || !receipt.awaitDurable()) {
@@ -380,6 +342,69 @@ class ExecutionSyncManager(
         }
         if (preparation != ExecutionSyncOutcome.SUCCESS) return preparation
         return continueDeferIntent(requireNotNull(preparedIntent))
+    }
+
+    /** Records explicit approval for the exact visible server assessment, then continues it. */
+    suspend fun approveDefer(assessmentDigest: String): ExecutionSyncOutcome {
+        val approved = withReadyStore {
+            try {
+                val intent = plannerStore.state.value.pendingExecutionDeferIntent
+                    ?: throw InvalidExecutionStateException(
+                        "There is no authoritative move warning to approve.",
+                    )
+                val assessment = intent.assessment
+                    ?: throw InvalidExecutionStateException(
+                        "The move assessment expired; it will be checked again.",
+                    )
+                if (
+                    !assessment.approvalRequired ||
+                    assessment.assessmentDigest != assessmentDigest
+                ) {
+                    throw InvalidExecutionStateException(
+                        "The move warning changed. Review the latest assessment.",
+                    )
+                }
+                val receipt = plannerStore.approveExecutionDeferAssessment(
+                    intent.sessionId,
+                    assessmentDigest,
+                )
+                if (receipt == null || !receipt.awaitDurable()) {
+                    throw LocalExecutionStorageException()
+                }
+                ExecutionSyncOutcome.SUCCESS
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+        if (approved != ExecutionSyncOutcome.SUCCESS) return approved
+        val intent = plannerStore.state.value.pendingExecutionDeferIntent
+            ?: return invalidLocalState("The approved move is no longer pending.")
+        return continueDeferIntent(intent)
+    }
+
+    /** Cancels only the unsent move intent; an already journaled command remains immutable. */
+    suspend fun cancelDefer(): ExecutionSyncOutcome = withReadyStore {
+        try {
+            val current = plannerStore.state.value
+            if (current.pendingExecutionCommand != null) {
+                throw InvalidExecutionStateException(
+                    "The exact execution command must reconcile before this move can be canceled.",
+                )
+            }
+            val intent = current.pendingExecutionDeferIntent
+                ?: return@withReadyStore ExecutionSyncOutcome.SUCCESS
+            val receipt = plannerStore.clearExecutionDeferIntent(
+                intent.sessionId,
+                "Move canceled · the authoritative execution session remains paused",
+            )
+            if (receipt == null || !receipt.awaitDurable()) {
+                throw LocalExecutionStorageException()
+            }
+            updateConnected("Move canceled · the session remains paused")
+            ExecutionSyncOutcome.SUCCESS
+        } catch (error: Throwable) {
+            handleFailure(error)
+        }
     }
 
     private suspend fun continueDeferIntent(
@@ -397,22 +422,99 @@ class ExecutionSyncManager(
             )
         }
 
-        verifySavedMoveRisksBeforeCommand(intent, moveStart)?.let { return it }
+        val recoveryNow = now()
+        val hasFreshAssessment = intent.assessment?.let { assessment ->
+            runCatching { Instant.parse(assessment.expiresAt) > recoveryNow }.getOrDefault(false)
+        } == true
+        if (!hasFreshAssessment && !isSafeExecutionDeferTarget(moveStart, recoveryNow)) {
+            if (!clearDeferIntent(
+                    intent,
+                    "Move target became too close for assessment · execution was left unchanged",
+                )
+            ) {
+                return handleFailure(LocalExecutionStorageException())
+            }
+            return invalidLocalState(
+                "Choose a new five-minute target at least ten minutes away. " +
+                    "The current execution session was left unchanged.",
+            )
+        }
 
         val paused = ensurePausedForDefer(intent)
         deferredClosureOutcome(intent)?.let { return it }
         if (paused != ExecutionSyncOutcome.SUCCESS) return paused
-        if (plannerStore.state.value.pendingExecutionDeferIntent != intent) {
+        if (plannerStore.state.value.pendingExecutionDeferIntent?.sessionId != intent.sessionId) {
             return invalidLocalState(
                 "The saved move was no longer valid after pausing. The session remains paused.",
             )
         }
-        verifyExactPausedMoveRisks(intent)?.let { return it }
 
         repeat(MAX_RECONCILED_COMMAND_ATTEMPTS) {
-            val outcome = deferPaused(intent)
-            deferredClosureOutcome(intent)?.let { return it }
-            if (outcome != ExecutionSyncOutcome.SUCCESS) return outcome
+            var currentIntent = plannerStore.state.value.pendingExecutionDeferIntent
+                ?: return invalidLocalState(
+                    "The saved move is no longer available. The session remains paused.",
+                )
+            val assessment = currentIntent.assessment
+            if (assessment == null || runCatching {
+                    Instant.parse(assessment.expiresAt) <= now()
+                }.getOrDefault(true)
+            ) {
+                if (!isSafeExecutionDeferTarget(moveStart, now())) {
+                    if (!clearDeferIntent(
+                            currentIntent,
+                            "Move target became too close for reassessment · execution was retained",
+                        )
+                    ) {
+                        return handleFailure(LocalExecutionStorageException())
+                    }
+                    return invalidLocalState(
+                        "Choose a new five-minute target at least ten minutes away. " +
+                            "No assessment or Defer was sent; review the current session.",
+                    )
+                }
+                if (assessment != null && !clearDeferAssessmentForRetry(currentIntent)) {
+                    return handleFailure(LocalExecutionStorageException())
+                }
+                val assessmentOutcome = assessPausedDefer(currentIntent)
+                deferredClosureOutcome(currentIntent)?.let { return it }
+                if (assessmentOutcome != ExecutionSyncOutcome.SUCCESS) return assessmentOutcome
+                currentIntent = plannerStore.state.value.pendingExecutionDeferIntent
+                    ?: return invalidLocalState(
+                        "The assessed move is no longer pending. The session remains paused.",
+                    )
+            }
+            val currentAssessment = currentIntent.assessment
+                ?: return invalidLocalState(
+                    "The authoritative move assessment is unavailable. The session remains paused.",
+                )
+            if (
+                currentAssessment.approvalRequired &&
+                currentIntent.approvedAssessmentDigest != currentAssessment.assessmentDigest
+            ) {
+                updateConnected("Move assessed · approve the exact content-free warnings to continue")
+                return ExecutionSyncOutcome.APPROVAL_REQUIRED
+            }
+
+            val outcome = deferPaused(currentIntent, currentAssessment)
+            deferredClosureOutcome(currentIntent)?.let { return it }
+            if (outcome != ExecutionSyncOutcome.SUCCESS) {
+                val after = plannerStore.state.value
+                val canReassess = outcome in setOf(
+                    ExecutionSyncOutcome.CONFLICT,
+                    ExecutionSyncOutcome.VALIDATION_FAILURE,
+                    ExecutionSyncOutcome.INVALID_LOCAL_STATE,
+                ) && after.pendingExecutionCommand == null &&
+                    after.canonicalExecutionSession?.let { session ->
+                        session.id == currentIntent.sessionId && session.status == "paused"
+                    } == true
+                if (canReassess) {
+                    if (!clearDeferAssessmentForRetry(currentIntent)) {
+                        return handleFailure(LocalExecutionStorageException())
+                    }
+                    return@repeat
+                }
+                return outcome
+            }
             val current = plannerStore.state.value
             if (
                 current.pendingExecutionCommand != null ||
@@ -428,25 +530,6 @@ class ExecutionSyncManager(
         return invalidLocalState(
             "A previous execution command was reconciled; review the paused session before retrying.",
         )
-    }
-
-    private suspend fun verifySavedMoveRisksBeforeCommand(
-        intent: PendingExecutionDeferIntent,
-        moveStart: Instant,
-    ): ExecutionSyncOutcome? {
-        val assessment = plannerStore.state.value.assessMoveLater(
-            intent.focusedBlockId,
-            moveStart,
-            now(),
-        )
-        if (assessment?.isCoveredBy(intent.savedApprovalEnvelope()) == true) return null
-        val message =
-            "The placement risks changed after review. Review the move again; execution was " +
-                "left unchanged."
-        if (!clearDeferIntent(intent, message)) {
-            return handleFailure(LocalExecutionStorageException())
-        }
-        return invalidLocalState(message)
     }
 
     private suspend fun ensurePausedForDefer(
@@ -489,6 +572,119 @@ class ExecutionSyncManager(
         }
     }
 
+    private suspend fun assessPausedDefer(
+        intent: PendingExecutionDeferIntent,
+    ): ExecutionSyncOutcome = withReadyStore {
+        operationMutex.withLock {
+            val configuration = authenticatedConfiguration() ?: return@withLock stateOutcome()
+            updateBusy("Checking the exact paused move against the published plan…")
+            try {
+                configuration.withBindingOperation {
+                    ensureDeviceIdentity()
+                    beginHistoryVerification(configuration)
+                    if (plannerStore.state.value.pendingExecutionCommand != null) {
+                        reconcilePending(configuration)
+                    }
+                    val snapshot = reconcileSnapshot(
+                        configuration,
+                        transport.snapshot(configuration),
+                        "Paused execution lease checked before move assessment",
+                    )
+                    val paused = snapshot.activeSession
+                        ?: throw InvalidExecutionStateException(
+                            "The paused execution lease is no longer active.",
+                        )
+                    if (
+                        paused.id != intent.sessionId || paused.status != "paused" ||
+                        paused.runningSince != null || paused.itemId != intent.itemId ||
+                        paused.itemRevision != intent.itemRevision ||
+                        paused.occurrenceId != intent.occurrenceId ||
+                        paused.sessionIndex != intent.sessionIndex ||
+                        paused.plannedBlockId != intent.plannedBlockId ||
+                        paused.sourceDeviceId != intent.sourceDeviceId
+                    ) {
+                        throw InvalidExecutionStateException(
+                            "Execution changed before the authoritative move assessment.",
+                        )
+                    }
+                    val moveStart = Instant.parse(intent.moveStart)
+                    if (!isSafeExecutionDeferTarget(moveStart, now())) {
+                        throw InvalidExecutionStateException(
+                            "The selected five-minute slot is too close for a fresh assessment.",
+                        )
+                    }
+                    val assessment = transport.assessDefer(
+                        configuration,
+                        DeferAssessmentHttpRequest(
+                            expectedRevision = snapshot.revision,
+                            sessionId = paused.id,
+                            moveStart = intent.moveStart,
+                            actualSeconds = paused.accumulatedSeconds,
+                        ),
+                    )
+                    ensureConfigurationCurrent(configuration)
+                    val receipt = try {
+                        plannerStore.recordExecutionDeferAssessment(
+                            intent.sessionId,
+                            assessment,
+                        )
+                    } catch (error: IllegalArgumentException) {
+                        throw InvalidExecutionProtocolException(error)
+                    }
+                    if (receipt == null || !receipt.awaitDurable()) {
+                        throw LocalExecutionStorageException()
+                    }
+                    updateConnected(
+                        if (assessment.approvalRequired) {
+                            "Move assessed · explicit approval is required"
+                        } else {
+                            "Move assessed · no placement warning requires approval"
+                        },
+                    )
+                    ExecutionSyncOutcome.SUCCESS
+                }
+            } catch (_: ExecutionApiException.Conflict) {
+                if (!clearDeferAssessmentForRetry(intent)) {
+                    return@withLock handleFailure(LocalExecutionStorageException())
+                }
+                updateError(
+                    "The plan or execution revision changed during assessment; the paused " +
+                        "target was kept for a fresh check.",
+                )
+                ExecutionSyncOutcome.CONFLICT
+            } catch (_: ExecutionApiException.Validation) {
+                if (!clearDeferAssessmentForRetry(intent)) {
+                    return@withLock handleFailure(LocalExecutionStorageException())
+                }
+                updateError(
+                    "The server rejected this move target; the session remains paused for review.",
+                )
+                ExecutionSyncOutcome.VALIDATION_FAILURE
+            } catch (_: ExecutionApiException.NotFound) {
+                if (!clearDeferAssessmentForRetry(intent)) {
+                    return@withLock handleFailure(LocalExecutionStorageException())
+                }
+                updateError("The execution source was not found; the saved target was retained.")
+                ExecutionSyncOutcome.NOT_FOUND
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
+    private suspend fun clearDeferAssessmentForRetry(
+        intent: PendingExecutionDeferIntent,
+    ): Boolean {
+        val current = plannerStore.state.value.pendingExecutionDeferIntent ?: return true
+        if (current.sessionId != intent.sessionId) return false
+        if (current.assessment == null && current.approvedAssessmentDigest == null) return true
+        val receipt = plannerStore.clearExecutionDeferAssessment(
+            intent.sessionId,
+            "Move evidence changed · retaining the paused target for reassessment",
+        )
+        return receipt?.awaitDurable() == true
+    }
+
     private suspend fun pauseForDefer(
         intent: PendingExecutionDeferIntent,
     ): ExecutionSyncOutcome = command(intent.focusedBlockId) { context ->
@@ -511,6 +707,7 @@ class ExecutionSyncManager(
 
     private suspend fun deferPaused(
         intent: PendingExecutionDeferIntent,
+        assessment: ExecutionDeferAssessmentSnapshot,
     ): ExecutionSyncOutcome = command(intent.focusedBlockId) { context ->
         val paused = context.requireActiveSession(intent.focusedBlockId)
         if (
@@ -530,22 +727,35 @@ class ExecutionSyncManager(
                 "The exact published source changed before this work could move.",
             )
         }
-        val plannedSeconds = intent.exactPublishedDurationSeconds()
-        val actualSeconds = paused.accumulatedSeconds
-        val remainingSeconds = runCatching {
-            Math.subtractExact(plannedSeconds, actualSeconds)
-        }.getOrElse { throw InvalidExecutionStateException("The remaining duration is unavailable.") }
-        if (remainingSeconds !in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong()) {
+        if (
+            context.snapshot.revision != assessment.executionRevision ||
+            paused.revision != assessment.sessionRevision ||
+            paused.accumulatedSeconds != assessment.actualSeconds ||
+            paused.itemId != assessment.itemId ||
+            paused.itemRevision != assessment.itemRevision ||
+            paused.occurrenceId != assessment.occurrenceId ||
+            paused.sessionIndex != assessment.sourceSessionIndex ||
+            intent.plannedBlockId != assessment.sourceBlockId ||
+            intent.moveStart != assessment.moveStart
+        ) {
             throw InvalidExecutionStateException(
-                "No whole-second planned work remains to move later.",
+                "The paused execution revision changed; the move must be assessed again.",
             )
         }
-        val moveStart = Instant.parse(intent.moveStart)
-        if (moveStart <= now()) {
-            throw InvalidExecutionStateException("The selected move time has already passed.")
+        if (Instant.parse(assessment.expiresAt) <= now()) {
+            throw InvalidExecutionStateException(
+                "The authoritative move assessment expired before command staging.",
+            )
         }
-        val moveEnd = runCatching { moveStart.plusSeconds(remainingSeconds) }
-            .getOrElse { throw InvalidExecutionStateException("The move window is unavailable.") }
+        if (
+            if (assessment.approvalRequired) {
+                intent.approvedAssessmentDigest != assessment.assessmentDigest
+            } else {
+                intent.approvedAssessmentDigest != null
+            }
+        ) throw InvalidExecutionStateException(
+            "The exact authoritative move warning has not been approved.",
+        )
         CommandSpec(
             type = "defer",
             identity = paused.immutableIdentity(),
@@ -553,62 +763,15 @@ class ExecutionSyncManager(
             command = buildJsonObject {
                 put("type", "defer")
                 put("session_id", paused.id)
-                put("move_start", moveStart.toString())
-                put("move_end", moveEnd.toString())
-                put("actual_seconds", actualSeconds)
+                put("move_start", assessment.moveStart)
+                put("move_end", assessment.moveEnd)
+                put("actual_seconds", assessment.actualSeconds)
+                put("assessment_digest", assessment.assessmentDigest)
+                intent.approvedAssessmentDigest?.let {
+                    put("approved_assessment_digest", it)
+                }
             },
         )
-    }
-
-    /**
-     * A running lease's exact remaining duration exists only after Pause. Never let that server
-     * truth extend beyond the deadline/calendar envelope the user actually reviewed.
-     */
-    private suspend fun verifyExactPausedMoveRisks(
-        intent: PendingExecutionDeferIntent,
-    ): ExecutionSyncOutcome? {
-        val current = plannerStore.state.value
-        val moveStart = runCatching { Instant.parse(intent.moveStart) }.getOrNull()
-            ?: return abandonDeferAfterExactPause(
-                intent,
-                "The exact saved move time is invalid. The session remains paused.",
-            )
-        val assessment = current.assessMoveLater(intent.focusedBlockId, moveStart, now())
-            ?: return abandonDeferAfterExactPause(
-                intent,
-                "The exact paused move window could not be verified. The session remains paused.",
-            )
-        if (!assessment.fitsSinglePlanningDay) {
-            return abandonDeferAfterExactPause(
-                intent,
-                "The exact remaining work is outside the currently loaded planning day. " +
-                    "Choose a same-day time; the session remains paused.",
-            )
-        }
-        if (assessment.crossesUnrelaxableHardDeadline) {
-            return abandonDeferAfterExactPause(
-                intent,
-                "The exact remaining work would cross its hard deadline. Change the item " +
-                    "constraint first; the session remains paused.",
-            )
-        }
-        if (assessment.isCoveredBy(intent.savedApprovalEnvelope())) return null
-
-        return abandonDeferAfterExactPause(
-            intent,
-            "The exact paused duration has a new deadline or calendar conflict. Review the " +
-                "move again; the session remains paused.",
-        )
-    }
-
-    private suspend fun abandonDeferAfterExactPause(
-        intent: PendingExecutionDeferIntent,
-        message: String,
-    ): ExecutionSyncOutcome {
-        if (!clearDeferIntent(intent, message)) {
-            return handleFailure(LocalExecutionStorageException())
-        }
-        return invalidLocalState(message)
     }
 
     private fun ScheduleItem.exactPublishedDurationSeconds(): Long {
@@ -623,44 +786,21 @@ class ExecutionSyncManager(
         return duration.seconds
     }
 
-    private fun PendingExecutionDeferIntent.exactPublishedDurationSeconds(): Long {
-        val start = runCatching { Instant.parse(sourceStart) }.getOrElse {
-            throw InvalidExecutionStateException("The saved published start is unavailable.")
-        }
-        val end = runCatching { Instant.parse(sourceEnd) }.getOrElse {
-            throw InvalidExecutionStateException("The saved published end is unavailable.")
-        }
-        val duration = Duration.between(start, end)
-        if (duration.isNegative || duration.isZero || duration.nano != 0) {
-            throw InvalidExecutionStateException("The saved published duration is not exact.")
-        }
-        return duration.seconds
-    }
-
     private fun exactDeferredClosure(
         intent: PendingExecutionDeferIntent,
     ): CanonicalExecutionSessionSnapshot? {
         val current = plannerStore.state.value
         val deferred = current.terminalExecutionOutcomes[intent.sessionId]?.session
             ?: return null
-        val actualSeconds = deferred.actualSeconds ?: return null
-        val plannedSeconds = runCatching { intent.exactPublishedDurationSeconds() }.getOrNull()
-            ?: return null
-        val remainingSeconds = runCatching {
-            Math.subtractExact(plannedSeconds, actualSeconds)
-        }.getOrNull()?.takeIf { it > 0 } ?: return null
-        val recoveredStart = deferred.moveStart?.let {
-            runCatching { Instant.parse(it) }.getOrNull()
-        } ?: return null
-        val recoveredEnd = runCatching { recoveredStart.plusSeconds(remainingSeconds) }.getOrNull()
-            ?: return null
+        val assessment = intent.assessment ?: return null
         return deferred.takeIf {
             it.status == "deferred" && it.itemId == intent.itemId &&
                 it.itemRevision == intent.itemRevision && it.occurrenceId == intent.occurrenceId &&
                 it.sessionIndex == intent.sessionIndex &&
                 it.plannedBlockId == intent.plannedBlockId &&
                 it.sourceDeviceId == intent.sourceDeviceId &&
-                it.moveEnd == recoveredEnd.toString()
+                it.actualSeconds == assessment.actualSeconds &&
+                it.moveStart == assessment.moveStart && it.moveEnd == assessment.moveEnd
         }
     }
 
@@ -1480,14 +1620,19 @@ class ExecutionSyncManager(
                     }
                 }
                 "defer" -> {
+                    val expectedKeys = mutableSetOf(
+                        "type",
+                        "session_id",
+                        "move_start",
+                        "move_end",
+                        "actual_seconds",
+                        "assessment_digest",
+                    )
+                    if ("approved_assessment_digest" in command) {
+                        expectedKeys += "approved_assessment_digest"
+                    }
                     require(
-                        command.keys == setOf(
-                            "type",
-                            "session_id",
-                            "move_start",
-                            "move_end",
-                            "actual_seconds",
-                        ),
+                        command.keys == expectedKeys,
                     )
                     val moveStart = Instant.parse(command.requireString("move_start"))
                     val moveEnd = Instant.parse(command.requireString("move_end"))
@@ -1499,6 +1644,11 @@ class ExecutionSyncManager(
                             duration.seconds in 1..MAX_DEFER_MOVE_WINDOW_SECONDS.toLong(),
                     )
                     require(command.requireLong("actual_seconds") >= 0)
+                    val assessmentDigest = command.requireString("assessment_digest")
+                    require(assessmentDigest.isCanonicalSha256Digest())
+                    command["approved_assessment_digest"]?.jsonPrimitive?.let { primitive ->
+                        require(primitive.isString && primitive.content == assessmentDigest)
+                    }
                 }
                 else -> throw InvalidExecutionProtocolException()
             }
@@ -1829,6 +1979,10 @@ class ExecutionSyncManager(
             primitive.long
         }
 
+    private fun String.isCanonicalSha256Digest(): Boolean =
+        length == 71 && startsWith("sha256:") &&
+            drop(7).all { it in '0'..'9' || it in 'a'..'f' }
+
     private fun authenticatedConfiguration(): AuthenticatedApiConfiguration? {
         val snapshot = credentialStore.snapshot()
         if (snapshot.baseUrl == null) {
@@ -2097,6 +2251,11 @@ class ExecutionSyncManager(
     private class InvalidExecutionStateException(message: String) : IllegalStateException(message)
 
     private companion object {
+        const val EXECUTION_DEFER_INTENT_SCHEMA_VERSION = 1
+        const val EXECUTION_DEFER_SLOT_SECONDS = 5 * 60L
+        const val EXECUTION_DEFER_ASSESSMENT_TTL_SECONDS = 5 * 60L
+        const val EXECUTION_DEFER_TARGET_LEAD_SECONDS =
+            EXECUTION_DEFER_ASSESSMENT_TTL_SECONDS + EXECUTION_DEFER_SLOT_SECONDS
         const val MAX_PAUSE_SECONDS = 24 * 60 * 60
         const val MAX_DEFER_MOVE_WINDOW_SECONDS = 24 * 60 * 60
         const val MAX_PENDING_REQUEST_CHARS = 64 * 1024
@@ -2109,5 +2268,9 @@ class ExecutionSyncManager(
         val TERMINAL_STATUSES = setOf("completed", "skipped")
         val CLOSED_STATUSES = TERMINAL_STATUSES + "deferred"
         val ALL_STATUSES = OPEN_STATUSES + CLOSED_STATUSES
+
+        fun isSafeExecutionDeferTarget(target: Instant, reference: Instant): Boolean =
+            target.nano == 0 && target.epochSecond % EXECUTION_DEFER_SLOT_SECONDS == 0L &&
+                !target.isBefore(reference.plusSeconds(EXECUTION_DEFER_TARGET_LEAD_SECONDS))
     }
 }

@@ -1,5 +1,6 @@
 package com.greengolddog.dayweave.network
 
+import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import java.io.IOException
 import java.io.Reader
 import kotlin.coroutines.resumeWithException
@@ -62,10 +63,23 @@ data class RemoteExecutionHistoryPage(
 )
 
 @Serializable
+data class DeferAssessmentHttpRequest(
+    @SerialName("expected_revision") val expectedRevision: Long,
+    @SerialName("session_id") val sessionId: String,
+    @SerialName("move_start") val moveStart: String,
+    @SerialName("actual_seconds") val actualSeconds: Long,
+)
+
+@Serializable
 private data class ExecutionSnapshotEnvelope(val execution: RemoteExecutionSnapshot)
 
 @Serializable
 private data class ExecutionMutationEnvelope(val mutation: RemoteExecutionMutation)
+
+@Serializable
+private data class DeferAssessmentEnvelope(
+    val assessment: ExecutionDeferAssessmentSnapshot,
+)
 
 @Serializable
 private data class ExecutionHistoryEnvelope(
@@ -106,6 +120,11 @@ interface ExecutionTransport {
         idempotencyKey: String,
         requestJson: String,
     ): RemoteExecutionMutation
+
+    suspend fun assessDefer(
+        configuration: AuthenticatedApiConfiguration,
+        request: DeferAssessmentHttpRequest,
+    ): ExecutionDeferAssessmentSnapshot
 
     suspend fun history(
         configuration: AuthenticatedApiConfiguration,
@@ -156,6 +175,27 @@ class OkHttpExecutionTransport(
             .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
             .build()
         return execute<ExecutionMutationEnvelope>(request).mutation
+    }
+
+    override suspend fun assessDefer(
+        configuration: AuthenticatedApiConfiguration,
+        request: DeferAssessmentHttpRequest,
+    ): ExecutionDeferAssessmentSnapshot {
+        val requestJson = try {
+            json.encodeToString(request)
+        } catch (error: SerializationException) {
+            throw ExecutionApiException.InvalidResponse(error)
+        }
+        if (requestJson.length !in 2..MAX_REQUEST_CHARS) {
+            throw ExecutionApiException.InvalidResponse()
+        }
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/execution/defer-assessments")
+            .build()
+        val httpRequest = requestBuilder(configuration, url.toString())
+            .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        return execute<DeferAssessmentEnvelope>(httpRequest).assessment
     }
 
     override suspend fun history(

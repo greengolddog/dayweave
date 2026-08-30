@@ -2373,6 +2373,9 @@ class PlannerStoreTest {
         val intent = requireNotNull(valid.pendingExecutionDeferIntent)
         val session = requireNotNull(valid.canonicalExecutionSession)
         val invalidStates = listOf(
+            "legacy local approval schema" to valid.copy(
+                pendingExecutionDeferIntent = intent.copy(schemaVersion = 0),
+            ),
             "malformed timestamp" to valid.copy(
                 pendingExecutionDeferIntent = intent.copy(moveStart = "not-an-instant"),
             ),
@@ -2563,6 +2566,7 @@ class PlannerStoreTest {
             canonicalExecutionRevision = session.revision,
             canonicalExecutionSession = session,
             pendingExecutionDeferIntent = PendingExecutionDeferIntent(
+                schemaVersion = 1,
                 syncOrigin = CANONICAL_ORIGIN,
                 configurationId = "connection-1",
                 sessionId = session.id,
