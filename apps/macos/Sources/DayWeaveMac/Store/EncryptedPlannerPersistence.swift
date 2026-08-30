@@ -423,10 +423,12 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// encrypted Google outbound preview/approval/enqueue recovery fence, and
     /// version 12 adds provenance for signed on-device schedule composition,
     /// version 13 adds the encrypted, timezone-bound schedule profile, and
-    /// version 14 adds the exact successful schedule-publication proof.
+    /// version 14 adds the exact successful schedule-publication proof, and
+    /// version 15 adds occurrence-scoped moves plus the causal execution ->
+    /// publication recovery watermark.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 14
+    static let currentSchemaVersion = 15
 
     let schemaVersion: Int
     let savedAt: Date
@@ -451,6 +453,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let pendingCanonicalMutations: [PendingCanonicalMutation]?
     let pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation]?
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]?
+    let recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]?
+    let pendingExecutionDeferIntent: DayWeavePendingExecutionDeferIntent?
+    let deferredExecutionPublicationSessionIDs: Set<UUID>?
+    let pendingPublicationDeferredSessionIDs: Set<UUID>?
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
     let publishedScheduleProof: DayWeavePublishedScheduleProof?
@@ -485,6 +491,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         pendingCanonicalMutations: [PendingCanonicalMutation]? = nil,
         pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation]? = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome]? = nil,
+        recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]? = [],
+        pendingExecutionDeferIntent: DayWeavePendingExecutionDeferIntent? = nil,
+        deferredExecutionPublicationSessionIDs: Set<UUID>? = [],
+        pendingPublicationDeferredSessionIDs: Set<UUID>? = [],
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
@@ -528,6 +538,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.pendingCanonicalMutations = pendingCanonicalMutations
         self.pendingCanonicalSensitivityMutations = pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = recurrenceSessionOutcomes
+        self.recurrenceOccurrenceMoves = recurrenceOccurrenceMoves
+        self.pendingExecutionDeferIntent = pendingExecutionDeferIntent
+        self.deferredExecutionPublicationSessionIDs = deferredExecutionPublicationSessionIDs
+        self.pendingPublicationDeferredSessionIDs = pendingPublicationDeferredSessionIDs
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
         self.publishedScheduleProof = publishedScheduleProof
@@ -545,6 +559,13 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         switch schemaVersion {
         case Self.currentSchemaVersion:
+            let deferredPublicationStateIsValid = executionState.map { state in
+                guard let deferredExecutionPublicationSessionIDs else { return false }
+                return deferredExecutionPublicationSessionIDs.count <= 10_000
+                    && deferredExecutionPublicationSessionIDs.allSatisfy { sessionID in
+                        state.terminalOutcomes[sessionID]?.session.status == .deferred
+                    }
+            } ?? false
             guard let scheduleProfile,
                   scheduleProfile.hasValidShape,
                   scheduleProfile.protectedFreeMinutes == protectedFreeMinutes,
@@ -553,8 +574,29 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   localScheduleCompositionProvenance?.timezoneName == nil
                     || localScheduleCompositionProvenance?.timezoneName
                         == scheduleProfile.timezoneName,
-                  executionState != nil,
+                  let executionState,
                   pendingCanonicalSensitivityMutations != nil,
+                  let recurrenceOccurrenceMoves,
+                  let deferredExecutionPublicationSessionIDs,
+                  let pendingPublicationDeferredSessionIDs,
+                  RecurrenceOccurrenceMove.collectionIsValid(
+                      recurrenceOccurrenceMoves,
+                      canonicalItemIDs: Set((canonicalItems ?? []).map(\.id))
+                  ),
+                  pendingExecutionDeferIntent?.hasPersistableShape != false,
+                  (pendingExecutionDeferIntent.map { intent in
+                      executionState.activeSession.map(intent.identity.matches) == true
+                          || executionState.terminalOutcomes[intent.identity.sessionID]
+                            .map { intent.identity.matches($0.session) } == true
+                          || executionState.pendingCommand
+                            .map { $0.identity == intent.identity } == true
+                  } ?? true),
+                  deferredPublicationStateIsValid,
+                  pendingPublicationDeferredSessionIDs.isSubset(
+                      of: deferredExecutionPublicationSessionIDs
+                  ),
+                  pendingSchedulePublication != nil
+                    || pendingPublicationDeferredSessionIDs.isEmpty,
                   let proposalApplicationReceipts,
                   let pendingCanonicalAuthoringMutations,
                   let canonicalTrash,
@@ -595,6 +637,46 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 14:
+            // Schema 14 predates occurrence moves and the causal publication
+            // watermark. Ignore injected newer fields, preserve its valid
+            // publication receipt, then validate the complete migrated shape
+            // through the current-schema branch.
+            return try PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: [],
+                deferredExecutionPublicationSessionIDs: [],
+                pendingPublicationDeferredSessionIDs: [],
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 13:
             // Schema 13 predates durable publication receipts. Ignore any
             // injected newer field so a legacy cache can never gain execution

@@ -16,6 +16,72 @@ final class PlannerStoreTests: XCTestCase {
         XCTAssertEqual(store.blocks.first(where: { $0.id == firstActive.id })?.status, .paused)
     }
 
+    func testLocalWillDoLaterUsesChosenStartAndReturnsOpenWorkToScheduled() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2027-01-15T08:00:00Z"))
+        let profile = try ScheduleProfile.legacyDefault(
+            timezoneName: "UTC",
+            protectedFreeMinutes: 0
+        )
+        let block = ScheduleBlock(
+            id: UUID(),
+            title: "Local focus",
+            kind: .task,
+            start: now,
+            end: now.addingTimeInterval(1_800),
+            status: .active,
+            project: nil,
+            notes: "",
+            energy: .medium,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            scheduleProfile: profile,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let chosenStart = now.addingTimeInterval(10_800)
+
+        store.doLater(block.id, moveStart: chosenStart)
+
+        let moved = try XCTUnwrap(store.blocks.first)
+        XCTAssertEqual(moved.start, chosenStart)
+        XCTAssertEqual(moved.end, chosenStart.addingTimeInterval(1_800))
+        XCTAssertEqual(moved.status, .scheduled)
+        XCTAssertEqual(store.selectedBlockID, block.id)
+    }
+
+    func testLocalWillDoLaterRejectsAnUnloadedFutureDay() throws {
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2027-01-15T08:00:00Z"))
+        let tomorrow = try XCTUnwrap(
+            ISO8601DateFormatter().date(from: "2027-01-16T09:00:00Z")
+        )
+        let profile = try ScheduleProfile.legacyDefault(
+            timezoneName: "UTC",
+            protectedFreeMinutes: 0
+        )
+        let block = ScheduleBlock(
+            id: UUID(), title: "Local focus", kind: .task,
+            start: now, end: now.addingTimeInterval(1_800), status: .scheduled,
+            project: nil, notes: "", energy: .medium, isFlexible: true,
+            isHardConstraint: false, actualMinutes: nil
+        )
+        let store = PlannerStore(
+            blocks: [block], scheduleProfile: profile,
+            restoreFromPersistence: false, now: { now }
+        )
+
+        store.doLater(block.id, moveStart: tomorrow)
+
+        XCTAssertEqual(store.blocks, [block])
+        XCTAssertEqual(
+            store.lastScheduleMessage,
+            "Exact local moves are limited to the currently loaded schedule day"
+        )
+    }
+
     func testQuickAddCreatesFlexibleTaskAfterExistingWork() throws {
         let store = PlannerStore.preview(now: Date(timeIntervalSince1970: 1_700_000_000))
         let previousEnd = try XCTUnwrap(store.blocks.map(\.end).max())
@@ -680,6 +746,65 @@ import Testing
 @Suite("Planner store safety")
 @MainActor
 struct PlannerStoreTestingTests {
+    @Test("local Will do later uses a chosen same-day start")
+    func localWillDoLaterSameDay() throws {
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2027-01-15T08:00:00Z")
+        )
+        let profile = try ScheduleProfile.legacyDefault(
+            timezoneName: "UTC",
+            protectedFreeMinutes: 0
+        )
+        let block = ScheduleBlock(
+            id: UUID(), title: "Local focus", kind: .task,
+            start: now, end: now.addingTimeInterval(1_800), status: .active,
+            project: nil, notes: "", energy: .medium, isFlexible: true,
+            isHardConstraint: false, actualMinutes: nil
+        )
+        let store = PlannerStore(
+            blocks: [block], scheduleProfile: profile,
+            restoreFromPersistence: false, now: { now }
+        )
+        let chosenStart = now.addingTimeInterval(10_800)
+
+        store.doLater(block.id, moveStart: chosenStart)
+
+        let moved = try #require(store.blocks.first)
+        #expect(moved.start == chosenStart)
+        #expect(moved.end == chosenStart.addingTimeInterval(1_800))
+        #expect(moved.status == .scheduled)
+    }
+
+    @Test("local Will do later rejects an unloaded future day")
+    func localWillDoLaterCrossDayFailsClosed() throws {
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2027-01-15T08:00:00Z")
+        )
+        let tomorrow = try #require(
+            ISO8601DateFormatter().date(from: "2027-01-16T09:00:00Z")
+        )
+        let profile = try ScheduleProfile.legacyDefault(
+            timezoneName: "UTC",
+            protectedFreeMinutes: 0
+        )
+        let block = ScheduleBlock(
+            id: UUID(), title: "Local focus", kind: .task,
+            start: now, end: now.addingTimeInterval(1_800), status: .scheduled,
+            project: nil, notes: "", energy: .medium, isFlexible: true,
+            isHardConstraint: false, actualMinutes: nil
+        )
+        let store = PlannerStore(
+            blocks: [block], scheduleProfile: profile,
+            restoreFromPersistence: false, now: { now }
+        )
+
+        store.doLater(block.id, moveStart: tomorrow)
+
+        #expect(store.blocks == [block])
+        #expect(store.lastScheduleMessage
+            == "Exact local moves are limited to the currently loaded schedule day")
+    }
+
     @Test("Quick Add enforces scalar limits and supports local recovery")
     func quickAddRecovery() throws {
         let store = PlannerStore(restoreFromPersistence: false)

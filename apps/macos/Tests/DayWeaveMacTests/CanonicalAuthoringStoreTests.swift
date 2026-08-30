@@ -13,6 +13,60 @@ struct CanonicalAuthoringStoreTests {
         #expect(PlannerStore.canonicalTrashRetentionInterval == 30 * 24 * 60 * 60)
     }
 
+    @Test("scheduled Will do later journals an optimistic canonical earliest start")
+    func scheduledMoveLaterUsesCanonicalReplacementJournal() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let itemID = UUID(uuidString: "aa050000-0000-4000-8000-000000000005")!
+        let blockID = UUID(uuidString: "bb050000-0000-4000-8000-000000000005")!
+        let item = try Self.item(id: itemID, revision: 4, deleted: false)
+        let block = ScheduleBlock(
+            id: blockID,
+            title: item.title,
+            kind: .task,
+            start: now.addingTimeInterval(3_600),
+            end: now.addingTimeInterval(5_400),
+            status: .scheduled,
+            project: nil,
+            notes: item.notes ?? "",
+            energy: .deep,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: itemID,
+            sourceItemRevision: 4,
+            occurrenceID: nil,
+            sessionIndex: 0,
+            syncOrigin: .canonicalPreview,
+            placementReason: "Scheduled from canonical constraints",
+            previewKind: "planned",
+            occurrenceFullyScheduled: true
+        )
+        let store = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let chosenStart = now.addingTimeInterval(10_800)
+
+        let mutation = try store.enqueueCanonicalMoveLater(
+            blockID: blockID,
+            earliestStart: chosenStart
+        )
+
+        #expect(mutation.operation == .replace)
+        #expect(mutation.expectedRevision == 4)
+        #expect(mutation.baseItem == item)
+        #expect(mutation.draft?.earliestStartAt == chosenStart)
+        #expect(mutation.draft?.recurrence == item.recurrence)
+        #expect(store.blocks == [block])
+        #expect(store.pendingCanonicalAuthoringMutations == [mutation])
+    }
+
     @Test("a sensitive title-only Inbox draft is encrypted and restart-safe")
     func encryptedOfflineCreateRoundTrip() throws {
         let context = try Self.makePersistence()

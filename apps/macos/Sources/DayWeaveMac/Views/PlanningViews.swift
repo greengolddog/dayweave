@@ -256,21 +256,50 @@ struct HabitsDestinationView: View {
                         detail: habit.notes,
                         timezoneName: store.scheduleProfile.timezoneName
                     ) {
-                        Button("Complete") { store.complete(habit.id) }
-                            .disabled(!store.canMutate(habit))
-                        Button("Skipped") { store.skip(habit.id) }
-                            .disabled(!store.canMutate(habit))
-                        Button("Will do later") { store.doLater(habit.id) }
-                            .disabled(
-                                !store.canMutate(habit)
-                                    || !habit.isFlexible
-                                    || habit.isHardConstraint
+                        if habit.sourceItemID != nil {
+                            AuthoritativeExecutionControls(
+                                block: habit,
+                                accessibilityScope: "habits-card"
                             )
+                            if canResolveScheduledCanonicalOccurrence(habit) {
+                                Button("Complete") { store.complete(habit.id) }
+                                    .disabled(!store.canMutate(habit))
+                                    .accessibilityIdentifier(
+                                        "habit.complete.scheduled.\(habit.id.uuidString.lowercased())"
+                                    )
+                                Button("Skipped") { store.skip(habit.id) }
+                                    .disabled(!store.canMutate(habit))
+                                    .accessibilityIdentifier(
+                                        "habit.skip.scheduled.\(habit.id.uuidString.lowercased())"
+                                    )
+                            }
+                        } else {
+                            Button("Complete") { store.complete(habit.id) }
+                                .disabled(!store.canMutate(habit))
+                            Button("Skipped") { store.skip(habit.id) }
+                                .disabled(!store.canMutate(habit))
+                            WillDoLaterButton(
+                                block: habit,
+                                title: "Will do later",
+                                accessibilityScope: "habits-card-local"
+                            )
+                        }
                     }
                 }
             }
         }
         .navigationTitle("Habits")
+    }
+
+    private func canResolveScheduledCanonicalOccurrence(_ habit: ScheduleBlock) -> Bool {
+        guard habit.status == .scheduled,
+              let itemID = habit.sourceItemID,
+              habit.occurrenceID != nil,
+              let item = store.canonicalItem(id: itemID) else { return false }
+        return item.recurrence != nil
+            && item.revision == habit.sourceItemRevision
+            && store.canonicalAuthoringMutation(itemID: itemID) == nil
+            && store.executionState.pendingCommand == nil
     }
 }
 

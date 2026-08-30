@@ -210,6 +210,9 @@ final class CanonicalSyncStore: ObservableObject {
                 canonicalConfigurationIdentifier: planner.canonicalConfigurationIdentifier,
                 completedOccurrenceIDs: planner.completedOccurrenceIDs,
                 recurrenceSessionOutcomes: planner.recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: planner.recurrenceOccurrenceMoves,
+                deferredExecutionPublicationSessionIDs:
+                    planner.deferredExecutionPublicationSessionIDs,
                 blocks: planner.blocks,
                 scheduleProfile: planner.scheduleProfile,
                 freezeHours: planner.freezeHours,
@@ -281,7 +284,11 @@ final class CanonicalSyncStore: ObservableObject {
                 throw LocalCompositionCoordinatorError.invalidHelperResponse
             }
             let renderWarningCount = warnings.count
-            let rendered = render(plan: composition.plan, origin: .localComposition)
+            let rendered = render(
+                plan: composition.plan,
+                sourceItemRevisions: composition.sourceItemRevisions,
+                origin: .localComposition
+            )
             let renderWarnings = Array(warnings.dropFirst(renderWarningCount))
             if warnings.count > renderWarningCount {
                 warnings.removeLast(warnings.count - renderWarningCount)
@@ -331,6 +338,116 @@ final class CanonicalSyncStore: ObservableObject {
 
     func sync() async {
         _ = await syncReportingSuccess()
+    }
+
+    /// Persists the user's move as a canonical constraint replacement before
+    /// any network write, then publishes a fresh schedule from that revision.
+    /// This is the authoritative path for work that has not started yet; an
+    /// open execution lease uses ExecutionSyncStore.defer instead.
+    @discardableResult
+    func moveCanonicalWorkLater(
+        _ blockID: UUID,
+        earliestStart: Date,
+        reviewedRisk: DayWeaveMoveRiskEnvelope? = nil,
+        allowDeadlineConflict: Bool = false,
+        allowFixedConflicts: Bool = false
+    ) async -> Bool {
+        do {
+            guard let block = planner.blocks.first(where: { $0.id == blockID }),
+                  let currentRisk = moveLaterRisk(
+                    for: block,
+                    earliestStart: earliestStart
+                  ) else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            if let reviewedRisk {
+                guard reviewedRisk.hasValidShape,
+                      reviewedRisk.moveStart == currentRisk.moveStart,
+                      reviewedRisk.moveEnd == currentRisk.moveEnd,
+                      reviewedRisk.deadlines == currentRisk.deadlines,
+                      currentRisk.fixedConflicts.isSubset(
+                        of: reviewedRisk.fixedConflicts
+                      ) else {
+                    throw PlannerCanonicalAuthoringError.invalidDraft
+                }
+            } else {
+                guard currentRisk.fixedConflicts.isEmpty else {
+                    throw PlannerCanonicalAuthoringError.invalidDraft
+                }
+            }
+            guard let currentWindow = WillDoLaterTiming.proposedWindow(
+                for: block,
+                moveStart: earliestStart,
+                allBlocks: planner.blocks,
+                accumulatedSeconds: nil
+            ) else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            let crossedDeadlines = WillDoLaterTiming.crossedDeadlines(
+                currentRisk.deadlines,
+                window: currentWindow
+            )
+            let crossesDeadline = !crossedDeadlines.isEmpty
+            guard allowDeadlineConflict == crossesDeadline,
+                  allowFixedConflicts == !currentRisk.fixedConflicts.isEmpty else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            let crossedHardDeadlines = crossedDeadlines.filter(\.boundary.isHard)
+            if !crossedHardDeadlines.isEmpty,
+               !(block.occurrenceID == nil
+                    && crossedHardDeadlines.allSatisfy(\.boundary.isCanonicalField)) {
+                throw PlannerCanonicalAuthoringError.unsupportedReplacement
+            }
+            if block.occurrenceID != nil {
+                _ = try planner.enqueueCanonicalOccurrenceMove(
+                    blockID: blockID,
+                    moveStart: earliestStart
+                )
+            } else {
+                _ = try planner.enqueueCanonicalMoveLater(
+                    blockID: blockID,
+                    earliestStart: earliestStart,
+                    relaxCanonicalDeadlineTo: crossedDeadlines.contains(where: {
+                        $0.boundary.isCanonicalField
+                    })
+                        ? currentRisk.moveEnd
+                        : nil
+                )
+            }
+        } catch {
+            status = .failed(error.localizedDescription)
+            return false
+        }
+        return await syncThroughFreshComposition()
+    }
+
+    private func moveLaterRisk(
+        for block: ScheduleBlock,
+        earliestStart: Date
+    ) -> DayWeaveMoveRiskEnvelope? {
+        guard let window = WillDoLaterTiming.proposedWindow(
+            for: block,
+            moveStart: earliestStart,
+            allBlocks: planner.blocks,
+            accumulatedSeconds: nil
+        ) else { return nil }
+        guard let deadlines = DayWeaveMoveDeadlinePolicy.identities(
+            for: block,
+            movingWholeOccurrence: block.occurrenceID != nil,
+            allBlocks: planner.blocks,
+            canonicalItems: planner.canonicalItems
+        ) else { return nil }
+        let risk = DayWeaveMoveRiskEnvelope(
+            moveStart: window.start,
+            moveEnd: window.end,
+            deadlines: deadlines,
+            // Scheduled work is recomposed by the authoritative preview. Its
+            // current outer window is not an exact placement and therefore
+            // cannot support a truthful fixed-overlap approval.
+            fixedConflicts: [],
+            sourceRequiresOverride: false
+        )
+        return risk.hasValidShape ? risk : nil
     }
 
     private func syncReportingSuccess() async -> Bool {
@@ -959,6 +1076,27 @@ final class CanonicalSyncStore: ObservableObject {
         var sessionIdentities = Set<PreviewSessionIdentity>()
         var externalBlockIDs = Set<UUID>()
         var scheduledMinutes: UInt32 = 0
+        var occurrenceByID: [UUID: DayWeaveSchedulePreview.Plan.Occurrence] = [:]
+        for occurrence in plan.occurrences {
+            let source = RecurrenceMoveSource(
+                itemRevision: sourceItemRevisions[occurrence.seriesItemID] ?? 0,
+                identity: occurrence.identity,
+                nominalStart: occurrence.nominalStart,
+                nominalEnd: occurrence.nominalEnd,
+                localDate: occurrence.localDate,
+                ordinal: occurrence.ordinal
+            )
+            guard occurrenceByID.updateValue(occurrence, forKey: occurrence.id) == nil,
+                  (occurrence.id.uuid.6 >> 4) == 5,
+                  itemByID[occurrence.seriesItemID]?.recurrence != nil,
+                  source.hasValidShape,
+                  Self.validOccurrenceWindow(occurrence),
+                  ["generated", "completed", "paused", "skipped"].contains(occurrence.state) else {
+                throw CanonicalSyncError.invalidPreview(
+                    "The response contains invalid or duplicate recurrence occurrence metadata."
+                )
+            }
+        }
         let orderedBlocks = plan.blocks.sorted {
             if $0.start != $1.start { return $0.start < $1.start }
             if $0.end != $1.end { return $0.end < $1.end }
@@ -983,6 +1121,18 @@ final class CanonicalSyncStore: ObservableObject {
                     throw CanonicalSyncError.invalidPreview(
                         "A canonical block has inconsistent effective sensitivity."
                     )
+                }
+                if let occurrenceID = block.occurrenceID {
+                    guard let seriesItemID = occurrenceByID[occurrenceID]?.seriesItemID,
+                          Self.item(
+                            itemID,
+                            belongsToSeries: seriesItemID,
+                            itemByID: itemByID
+                          ) else {
+                        throw CanonicalSyncError.invalidPreview(
+                            "A recurring block has no exact source occurrence envelope."
+                        )
+                    }
                 }
             }
             switch block.kind {
@@ -1113,6 +1263,18 @@ final class CanonicalSyncStore: ObservableObject {
                 "The response score does not match its scheduled and unscheduled work."
             )
         }
+    }
+
+    private static func validOccurrenceWindow(
+        _ occurrence: DayWeaveSchedulePreview.Plan.Occurrence
+    ) -> Bool {
+        guard occurrence.windowStart.utf8.count <= 64,
+              occurrence.windowEnd.utf8.count <= 64,
+              let start = RecurrenceMoveSource.parseRFC3339(occurrence.windowStart),
+              let end = RecurrenceMoveSource.parseRFC3339(occurrence.windowEnd) else {
+            return false
+        }
+        return start < end
     }
 
     static func validateFixedBlockCoverage(
@@ -1895,11 +2057,19 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     private func makePreviewRequest() throws -> DayWeaveSchedulePreviewRequest {
+        struct ExceptionRecord {
+            let occurredAt: Date
+            let occurrenceID: UUID
+            let value: JSONValue
+        }
         let expandedProfile = try planner.scheduleProfile.expanded(asOf: now())
         let asOf = expandedProfile.asOf
         let start = expandedProfile.horizonStart
         let end = expandedProfile.horizonEnd
         let activeItemIDs = Set(planner.canonicalItems.map(\.id))
+        let currentRevisionByItem = Dictionary(
+            uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
+        )
         let activeOutcomes = planner.recurrenceSessionOutcomes.filter {
             activeItemIDs.contains($0.itemID)
         }
@@ -1942,17 +2112,71 @@ final class CanonicalSyncStore: ObservableObject {
                 if $0.occurredAt != $1.occurredAt { return $0.occurredAt > $1.occurredAt }
                 return $0.occurrenceID.uuidString < $1.occurrenceID.uuidString
             }
-            .prefix(3_000)
             .map { outcome in
-                JSONValue.object([
-                    "item_id": .string(outcome.itemID.uuidString.lowercased()),
-                    "selector": .object([
-                        "type": .string("occurrence"),
-                        "id": .string(outcome.occurrenceID.uuidString.lowercased()),
-                    ]),
-                    "action": .object(["type": .string("skip")]),
-                ])
+                ExceptionRecord(
+                    occurredAt: outcome.occurredAt,
+                    occurrenceID: outcome.occurrenceID,
+                    value: .object([
+                        "item_id": .string(outcome.itemID.uuidString.lowercased()),
+                        "selector": .object([
+                            "type": .string("occurrence"),
+                            "id": .string(outcome.occurrenceID.uuidString.lowercased()),
+                        ]),
+                        "action": .object(["type": .string("skip")]),
+                    ])
+                )
             }
+        let storedMoves = planner.recurrenceOccurrenceMoves
+        guard storedMoves.allSatisfy({ move in
+            move.hasValidShape
+                && currentRevisionByItem[move.itemID] == move.source?.itemRevision
+        }) else {
+            throw CanonicalSyncError.staleOccurrenceMove
+        }
+        let moveExceptions = storedMoves
+            .map { move in
+                let source = move.source!
+                return ExceptionRecord(
+                    occurredAt: move.movedAt,
+                    occurrenceID: move.occurrenceID,
+                    value: .object([
+                        "item_id": .string(move.itemID.uuidString.lowercased()),
+                        "selector": .object([
+                            "type": .string("occurrence"),
+                            "id": .string(move.occurrenceID.uuidString.lowercased()),
+                        ]),
+                        "action": .object([
+                            "type": .string("move"),
+                            "start": .string(format(move.startAt)),
+                            "end": .string(format(move.endAt)),
+                            "source": .object([
+                                "item_revision": .number(.init(source.itemRevision)),
+                                "identity": source.identity.jsonValue,
+                                "nominal_start": .string(source.nominalStart),
+                                "nominal_end": .string(source.nominalEnd),
+                                "local_date": source.localDate.map(JSONValue.string) ?? .null,
+                                "ordinal": .number(.init(UInt64(source.ordinal))),
+                            ]),
+                        ]),
+                    ])
+                )
+            }
+        let exceptionCapacity = max(
+            0,
+            9_000 - completedOccurrenceIDs.count - completionAnchors.count
+        )
+        guard skipExceptions.count + moveExceptions.count <= exceptionCapacity else {
+            throw CanonicalSyncError.recurrenceContextCapacity
+        }
+        let recurrenceExceptions = (skipExceptions + moveExceptions)
+            .sorted {
+                if $0.occurredAt != $1.occurredAt {
+                    return $0.occurredAt > $1.occurredAt
+                }
+                return $0.occurrenceID.uuidString < $1.occurrenceID.uuidString
+            }
+            .prefix(exceptionCapacity)
+            .map(\.value)
         return .init(
             asOf: asOf,
             horizonStart: start,
@@ -1965,7 +2189,7 @@ final class CanonicalSyncStore: ObservableObject {
             recurrenceContext: [
                 "completed_occurrence_ids": .array(completedOccurrenceIDs),
                 "completion_anchors": .object(completionAnchors),
-                "exceptions": .array(skipExceptions),
+                "exceptions": .array(recurrenceExceptions),
             ]
         )
     }
@@ -2065,11 +2289,16 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     private func render(_ preview: DayWeaveSchedulePreview) -> [ScheduleBlock] {
-        render(plan: preview.plan, origin: nil)
+        render(
+            plan: preview.plan,
+            sourceItemRevisions: preview.sourceItemRevisions,
+            origin: nil
+        )
     }
 
     private func render(
         plan: DayWeaveSchedulePreview.Plan,
+        sourceItemRevisions: [UUID: UInt64],
         origin: ScheduleBlockOrigin?
     ) -> [ScheduleBlock] {
         let itemByID = Dictionary(
@@ -2099,6 +2328,10 @@ final class CanonicalSyncStore: ObservableObject {
         let unscheduledOccurrences = Set(plan.unscheduled.map {
             PreviewOccurrenceIdentity(itemID: $0.itemID, occurrenceID: $0.occurrenceID)
         })
+        let occurrenceByID = Dictionary(
+            plan.occurrences.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         return plan.blocks.map { block in
             let item = block.itemID.flatMap { itemByID[$0] }
             let previous = block.itemID.flatMap { itemID -> ScheduleBlock? in
@@ -2117,6 +2350,26 @@ final class CanonicalSyncStore: ObservableObject {
                 ))
             } ?? true
             let isPlannable = block.kind == "planned" || block.kind == "pinned"
+            let recurrenceMoveSource = block.occurrenceID
+                .flatMap { occurrenceByID[$0] }
+                .flatMap { occurrence -> RecurrenceMoveSource? in
+                    guard let revision = sourceItemRevisions[occurrence.seriesItemID],
+                          let blockItemID = block.itemID,
+                          Self.item(
+                            blockItemID,
+                            belongsToSeries: occurrence.seriesItemID,
+                            itemByID: itemByID
+                          ) else { return nil }
+                    let source = RecurrenceMoveSource(
+                        itemRevision: revision,
+                        identity: occurrence.identity,
+                        nominalStart: occurrence.nominalStart,
+                        nominalEnd: occurrence.nominalEnd,
+                        localDate: occurrence.localDate,
+                        ordinal: occurrence.ordinal
+                    )
+                    return source.hasValidShape ? source : nil
+                }
             return ScheduleBlock(
                 id: block.id,
                 isSensitive: block.isSensitive,
@@ -2134,11 +2387,14 @@ final class CanonicalSyncStore: ObservableObject {
                 sourceItemID: block.itemID,
                 sourceItemRevision: item?.revision,
                 occurrenceID: block.occurrenceID,
+                recurrenceSeriesItemID: block.occurrenceID
+                    .flatMap { occurrenceByID[$0]?.seriesItemID },
                 sessionIndex: block.sessionIndex,
                 syncOrigin: origin ?? (item == nil ? .externalPreview : .canonicalPreview),
                 placementReason: explanation.isEmpty ? nil : explanation,
                 previewKind: block.kind,
-                occurrenceFullyScheduled: occurrenceFullyScheduled
+                occurrenceFullyScheduled: occurrenceFullyScheduled,
+                recurrenceMoveSource: recurrenceMoveSource
             )
         }
     }
@@ -2159,6 +2415,25 @@ final class CanonicalSyncStore: ObservableObject {
         if !preview.rejectedItems.isEmpty { parts.append("\(preview.rejectedItems.count) need review") }
         if !warnings.isEmpty { parts.append("\(warnings.count) sync warning\(warnings.count == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")
+    }
+
+    /// Recurrence ownership follows the canonical hierarchy: a recurring
+    /// routine owns every executable descendant leaf emitted for its
+    /// occurrence. Cycles and missing ancestors fail closed.
+    private static func item(
+        _ itemID: UUID,
+        belongsToSeries seriesItemID: UUID,
+        itemByID: [UUID: DayWeaveCanonicalItem]
+    ) -> Bool {
+        var currentID: UUID? = itemID
+        var visited = Set<UUID>()
+        while let identifier = currentID {
+            guard visited.insert(identifier).inserted,
+                  let item = itemByID[identifier] else { return false }
+            if identifier == seriesItemID { return true }
+            currentID = item.parentID
+        }
+        return false
     }
 
     private static func composedBlockSummary(
@@ -2381,6 +2656,8 @@ private struct LocalCompositionMutationFence: Sendable {
     let canonicalConfigurationIdentifier: String?
     let completedOccurrenceIDs: Set<UUID>
     let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]
+    let recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]
+    let deferredExecutionPublicationSessionIDs: Set<UUID>
     let blocks: [ScheduleBlock]
     let scheduleProfile: ScheduleProfile
     let freezeHours: Int
@@ -2393,6 +2670,9 @@ private struct LocalCompositionMutationFence: Sendable {
             && canonicalConfigurationIdentifier == planner.canonicalConfigurationIdentifier
             && completedOccurrenceIDs == planner.completedOccurrenceIDs
             && recurrenceSessionOutcomes == planner.recurrenceSessionOutcomes
+            && recurrenceOccurrenceMoves == planner.recurrenceOccurrenceMoves
+            && deferredExecutionPublicationSessionIDs
+                == planner.deferredExecutionPublicationSessionIDs
             && blocks == planner.blocks
             && scheduleProfile == planner.scheduleProfile
             && freezeHours == planner.freezeHours
@@ -2473,6 +2753,8 @@ private enum CanonicalSyncError: LocalizedError {
     case schedulePublicationReplayNeedsFreshComposition
     case deltaResourceLimit
     case invalidMutationResponse
+    case staleOccurrenceMove
+    case recurrenceContextCapacity
 
     var errorDescription: String? {
         switch self {
@@ -2487,6 +2769,8 @@ private enum CanonicalSyncError: LocalizedError {
         case .schedulePublicationReplayNeedsFreshComposition: "The bounded fresh publication also returned an older exact receipt. No candidate was applied or left pending; sync again to recompose."
         case .deltaResourceLimit: "Canonical sync exceeded the safe 20,000-change or 32 MiB retained-delta limit."
         case .invalidMutationResponse: "The canonical API returned a mutation result with the wrong identity, status, or revision. Local state was not changed."
+        case .staleOccurrenceMove: "A saved occurrence move no longer matches the canonical item revision. Review the refreshed occurrence before moving it again."
+        case .recurrenceContextCapacity: "The recurrence completion, skip, and move ledger exceeds the scheduler's safe request capacity. No recurrence exception was omitted."
         }
     }
 }

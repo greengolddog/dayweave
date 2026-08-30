@@ -238,8 +238,9 @@ private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
         self.events = events
     }
 
-    func sync() async {
+    func syncThroughFreshComposition() async -> Bool {
         events.values.append("canonical.sync")
+        return true
     }
 }
 #endif

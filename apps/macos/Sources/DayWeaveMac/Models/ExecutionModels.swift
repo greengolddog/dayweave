@@ -267,6 +267,7 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
     case resume(sessionID: UUID)
     case complete(sessionID: UUID, actualSeconds: UInt64?)
     case skip(sessionID: UUID, actualSeconds: UInt64?)
+    case deferWork(sessionID: UUID, moveStart: Date, moveEnd: Date, actualSeconds: UInt64?)
 
     private enum CodingKeys: String, CodingKey {
         case type
@@ -281,6 +282,8 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case pauseUntil = "pause_until"
         case reason
         case actualSeconds = "actual_seconds"
+        case moveStart = "move_start"
+        case moveEnd = "move_end"
     }
 
     var sessionID: UUID {
@@ -289,7 +292,8 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
              let .pause(sessionID, _, _, _),
              let .resume(sessionID),
              let .complete(sessionID, _),
-             let .skip(sessionID, _):
+             let .skip(sessionID, _),
+             let .deferWork(sessionID, _, _, _):
             sessionID
         }
     }
@@ -329,6 +333,12 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
         case let .skip(_, actualSeconds):
             return session.status == .skipped
                 && actualSeconds.map { session.actualSeconds == $0 } ?? true
+        case let .deferWork(_, moveStart, moveEnd, actualSeconds):
+            return session.status == .deferred
+                && session.moveStart == moveStart
+                && session.moveEnd == moveEnd
+                && (actualSeconds.map { session.actualSeconds == $0 }
+                    ?? (session.actualSeconds == session.accumulatedSeconds))
         }
     }
 
@@ -388,6 +398,38 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
             self = type == "complete"
                 ? .complete(sessionID: sessionID, actualSeconds: actualSeconds)
                 : .skip(sessionID: sessionID, actualSeconds: actualSeconds)
+        case "defer":
+            try requireExecutionKeyShape(
+                required: ["type", "session_id", "move_start", "move_end"],
+                optional: ["actual_seconds"],
+                from: decoder
+            )
+            let rawMoveStart = try? container.decode(String.self, forKey: .moveStart)
+            let rawMoveEnd = try? container.decode(String.self, forKey: .moveEnd)
+            let rawTimestampsAreValid = switch (rawMoveStart, rawMoveEnd) {
+            case let (.some(start), .some(end)):
+                executionWireTimestampHasPostgresPrecision(start)
+                    && executionWireTimestampHasPostgresPrecision(end)
+            case (.none, .none):
+                // Encrypted snapshots use the snapshot decoder's numeric Date
+                // strategy. The exact wire bytes are independently decoded and
+                // compared by PlannerStore's pending-command invariant.
+                true
+            case (.some, .none), (.none, .some):
+                false
+            }
+            guard rawTimestampsAreValid else {
+                throw executionDecodingError(
+                    codingPath: decoder.codingPath,
+                    "Defer timestamps exceed PostgreSQL microsecond precision"
+                )
+            }
+            self = .deferWork(
+                sessionID: try container.decode(UUID.self, forKey: .sessionID),
+                moveStart: try container.decode(Date.self, forKey: .moveStart),
+                moveEnd: try container.decode(Date.self, forKey: .moveEnd),
+                actualSeconds: try container.decodeIfPresent(UInt64.self, forKey: .actualSeconds)
+            )
         default:
             throw executionDecodingError(
                 codingPath: decoder.codingPath,
@@ -435,6 +477,12 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
             try container.encode("skip", forKey: .type)
             try container.encode(sessionID, forKey: .sessionID)
             try container.encodeIfPresent(actualSeconds, forKey: .actualSeconds)
+        case let .deferWork(sessionID, moveStart, moveEnd, actualSeconds):
+            try container.encode("defer", forKey: .type)
+            try container.encode(sessionID, forKey: .sessionID)
+            try container.encode(moveStart, forKey: .moveStart)
+            try container.encode(moveEnd, forKey: .moveEnd)
+            try container.encodeIfPresent(actualSeconds, forKey: .actualSeconds)
         }
     }
 
@@ -479,6 +527,16 @@ enum DayWeaveExecutionCommand: Codable, Equatable, Sendable {
             valid = !sessionID.isDayWeaveNil
         case let .complete(sessionID, actualSeconds), let .skip(sessionID, actualSeconds):
             valid = !sessionID.isDayWeaveNil
+                && actualSeconds.map { $0 <= UInt64(Int64.max) } ?? true
+        case let .deferWork(sessionID, moveStart, moveEnd, actualSeconds):
+            let exactDuration = dayWeaveExactWholeSecondDelta(from: moveStart, to: moveEnd)
+            valid = !sessionID.isDayWeaveNil
+                && moveStart.timeIntervalSinceReferenceDate.isFinite
+                && moveEnd.timeIntervalSinceReferenceDate.isFinite
+                && executionHasPostgresTimestampPrecision(moveStart)
+                && executionHasPostgresTimestampPrecision(moveEnd)
+                && (replayingPersistedBytes || moveStart > Date())
+                && exactDuration.map { $0 <= 86_400 } == true
                 && actualSeconds.map { $0 <= UInt64(Int64.max) } ?? true
         }
         guard valid else {
@@ -576,6 +634,16 @@ struct DayWeaveExecutionIdentity: Codable, Equatable, Hashable, Sendable {
     func matches(_ session: DayWeaveExecutionSession) -> Bool {
         self == Self(session: session)
     }
+
+    var hasValidShape: Bool {
+        !sessionID.isDayWeaveNil
+            && !itemID.isDayWeaveNil
+            && itemRevision > 0
+            && itemRevision <= UInt64(Int64.max)
+            && !(occurrenceID?.isDayWeaveNil ?? false)
+            && !(plannedBlockID?.isDayWeaveNil ?? false)
+            && !sourceDeviceID.isDayWeaveNil
+    }
 }
 
 struct DayWeavePendingExecutionCommand: Codable, Equatable, Sendable {
@@ -589,6 +657,248 @@ struct DayWeavePendingExecutionCommand: Codable, Equatable, Sendable {
     let focusedBlockID: UUID
     let canonicalProjectionEligibleAtLeaseStart: Bool
     let stagedAt: Date
+}
+
+/// High-level crash-recovery intent spanning the Pause -> Defer command pair.
+/// Each individual server request still owns its exact idempotency journal;
+/// this record preserves the user's selected placement between those commands.
+struct DayWeaveMoveConflictIdentity: Codable, Equatable, Hashable, Sendable {
+    let id: UUID
+    let sourceItemRevision: UInt64?
+    let start: Date
+    let end: Date
+    let kind: PlannerItemKind
+    let previewKind: String?
+    let isFlexible: Bool
+    let isHardConstraint: Bool
+
+    init(block: ScheduleBlock) {
+        id = block.id
+        sourceItemRevision = block.sourceItemRevision
+        start = block.start
+        end = block.end
+        kind = block.kind
+        previewKind = block.previewKind
+        isFlexible = block.isFlexible
+        isHardConstraint = block.isHardConstraint
+    }
+
+    var hasValidShape: Bool {
+        !id.isDayWeaveNil
+            && sourceItemRevision.map({ $0 > 0 && $0 <= UInt64(Int64.max) }) ?? true
+            && dayWeavePostgresEpochMicroseconds(start) != nil
+            && dayWeavePostgresEpochMicroseconds(end) != nil
+            && start < end
+            && previewKind.map({ !$0.isEmpty && $0.utf8.count <= 64 }) ?? true
+            && (isHardConstraint
+                || !isFlexible
+                || kind == .event
+                || ["pinned", "calendar_event", "external_fixed"]
+                    .contains(previewKind ?? ""))
+    }
+}
+
+struct DayWeaveMoveDeadlineIdentity: Codable, Equatable, Hashable, Sendable {
+    let itemID: UUID
+    let itemRevision: UInt64
+    let boundary: DayWeaveMoveDeadlineBoundary
+
+    var hasValidShape: Bool {
+        !itemID.isDayWeaveNil
+            && itemRevision > 0
+            && itemRevision <= UInt64(Int64.max)
+            && boundary.hasValidShape
+    }
+}
+
+/// Exact risk snapshot shown by the move sheet. Approval is valid only while
+/// the target window, parsed deadline, and protected-block identities still
+/// match this value.
+struct DayWeaveMoveRiskEnvelope: Equatable, Sendable {
+    let moveStart: Date
+    let moveEnd: Date
+    let deadlines: Set<DayWeaveMoveDeadlineIdentity>
+    let fixedConflicts: Set<DayWeaveMoveConflictIdentity>
+    let sourceRequiresOverride: Bool
+
+    var hasValidShape: Bool {
+        guard let startMicros = dayWeavePostgresEpochMicroseconds(moveStart),
+              let endMicros = dayWeavePostgresEpochMicroseconds(moveEnd),
+              startMicros < endMicros,
+              deadlines.count <= DayWeavePendingExecutionDeferIntent.maximumDeadlineCount,
+              deadlines.allSatisfy(\.hasValidShape),
+              Set(deadlines.map(\.itemID)).count == deadlines.count,
+              fixedConflicts.count <= DayWeavePendingExecutionDeferIntent.maximumConflictCount,
+              fixedConflicts.allSatisfy(\.hasValidShape),
+              Set(fixedConflicts.map(\.id)).count == fixedConflicts.count else { return false }
+        return true
+    }
+}
+
+struct DayWeavePendingExecutionDeferIntent: Codable, Equatable, Sendable {
+    static let currentVersion = 5
+    static let maximumConflictCount = 10_000
+    static let maximumDeadlineCount = 10_000
+
+    let version: Int
+    let identity: DayWeaveExecutionIdentity
+    let focusedBlockID: UUID
+    let sourceStart: Date
+    let sourceEnd: Date
+    let moveStart: Date
+    /// The longest target window the user reviewed before a running session
+    /// was paused. The exact server-authoritative remainder may be shorter.
+    let approvedMoveEnd: Date
+    let approvedDeadlines: Set<DayWeaveMoveDeadlineIdentity>
+    let deadlineConflictApproved: Bool
+    let approvedFixedConflicts: Set<DayWeaveMoveConflictIdentity>
+    let fixedConflictApproved: Bool
+    let sourceOverrideApproved: Bool
+    let createdAt: Date
+    let expiresAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case version
+        case identity
+        case focusedBlockID
+        case sourceStart
+        case sourceEnd
+        case moveStart
+        case approvedMoveEnd
+        case approvedDeadlines
+        case deadlineConflictApproved
+        case approvedFixedConflicts
+        case fixedConflictApproved
+        case sourceOverrideApproved
+        case createdAt
+        case expiresAt
+    }
+
+    init(
+        version: Int = Self.currentVersion,
+        identity: DayWeaveExecutionIdentity,
+        focusedBlockID: UUID,
+        sourceStart: Date,
+        sourceEnd: Date,
+        moveStart: Date,
+        approvedMoveEnd: Date,
+        approvedDeadlines: Set<DayWeaveMoveDeadlineIdentity>,
+        deadlineConflictApproved: Bool,
+        approvedFixedConflicts: Set<DayWeaveMoveConflictIdentity>,
+        fixedConflictApproved: Bool,
+        sourceOverrideApproved: Bool,
+        createdAt: Date,
+        expiresAt: Date
+    ) {
+        self.version = version
+        self.identity = identity
+        self.focusedBlockID = focusedBlockID
+        self.sourceStart = sourceStart
+        self.sourceEnd = sourceEnd
+        self.moveStart = moveStart
+        self.approvedMoveEnd = approvedMoveEnd
+        self.approvedDeadlines = approvedDeadlines
+        self.deadlineConflictApproved = deadlineConflictApproved
+        self.approvedFixedConflicts = approvedFixedConflicts
+        self.fixedConflictApproved = fixedConflictApproved
+        self.sourceOverrideApproved = sourceOverrideApproved
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+    }
+
+    /// Earlier versions predated the complete durable approval envelope. They
+    /// remain decodable so
+    /// an encrypted planner snapshot cannot be quarantined during an upgrade,
+    /// but its deliberately empty envelope can never authorize a Defer.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decode(Int.self, forKey: .version)
+        identity = try container.decode(DayWeaveExecutionIdentity.self, forKey: .identity)
+        focusedBlockID = try container.decode(UUID.self, forKey: .focusedBlockID)
+        moveStart = try container.decode(Date.self, forKey: .moveStart)
+        sourceStart = try container.decodeIfPresent(Date.self, forKey: .sourceStart) ?? moveStart
+        sourceEnd = try container.decodeIfPresent(Date.self, forKey: .sourceEnd) ?? moveStart
+        approvedMoveEnd = try container.decodeIfPresent(
+            Date.self,
+            forKey: .approvedMoveEnd
+        ) ?? moveStart
+        approvedDeadlines = try container.decodeIfPresent(
+            Set<DayWeaveMoveDeadlineIdentity>.self,
+            forKey: .approvedDeadlines
+        ) ?? []
+        deadlineConflictApproved = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .deadlineConflictApproved
+        ) ?? false
+        approvedFixedConflicts = try container.decodeIfPresent(
+            Set<DayWeaveMoveConflictIdentity>.self,
+            forKey: .approvedFixedConflicts
+        ) ?? []
+        fixedConflictApproved = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .fixedConflictApproved
+        ) ?? false
+        sourceOverrideApproved = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .sourceOverrideApproved
+        ) ?? false
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+    }
+
+    var hasPersistableShape: Bool {
+        guard identity.hasValidShape,
+              identity.plannedBlockID == focusedBlockID,
+              !focusedBlockID.isDayWeaveNil,
+              let moveMicros = dayWeavePostgresEpochMicroseconds(moveStart),
+              moveMicros % 1_000_000 == 0,
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              expiresAt.timeIntervalSinceReferenceDate.isFinite,
+              createdAt < expiresAt,
+              expiresAt <= moveStart,
+              expiresAt <= createdAt.addingTimeInterval(86_400) else { return false }
+        if version < Self.currentVersion { return (1...4).contains(version) }
+        return hasValidShape
+    }
+
+    var hasValidShape: Bool {
+        guard version == Self.currentVersion,
+              identity.hasValidShape,
+              identity.plannedBlockID == focusedBlockID,
+              dayWeavePostgresEpochMicroseconds(sourceStart) != nil,
+              dayWeavePostgresEpochMicroseconds(sourceEnd) != nil,
+              dayWeaveExactWholeSecondDelta(from: sourceStart, to: sourceEnd)
+                .map({ $0 <= 86_400 }) == true,
+              let moveMicros = dayWeavePostgresEpochMicroseconds(moveStart),
+              moveMicros % 1_000_000 == 0,
+              let approvedEndMicros = dayWeavePostgresEpochMicroseconds(approvedMoveEnd),
+              approvedEndMicros % 1_000_000 == 0,
+              moveStart < approvedMoveEnd,
+              dayWeaveExactWholeSecondDelta(from: moveStart, to: approvedMoveEnd)
+                .map({ $0 <= 86_400 }) == true,
+              approvedDeadlines.count <= Self.maximumDeadlineCount,
+              approvedDeadlines.allSatisfy(\.hasValidShape),
+              Set(approvedDeadlines.map(\.itemID)).count == approvedDeadlines.count,
+              deadlineConflictApproved
+                == approvedDeadlines.contains(where: {
+                    approvedMoveEnd > $0.boundary.date
+                }),
+              !deadlineConflictApproved || !approvedDeadlines.contains(where: {
+                  approvedMoveEnd > $0.boundary.date && $0.boundary.isHard
+              }),
+              approvedFixedConflicts.count <= Self.maximumConflictCount,
+              approvedFixedConflicts.allSatisfy({
+                  $0.hasValidShape && $0.id != focusedBlockID
+              }),
+              Set(approvedFixedConflicts.map(\.id)).count == approvedFixedConflicts.count,
+              fixedConflictApproved == !approvedFixedConflicts.isEmpty,
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              expiresAt.timeIntervalSinceReferenceDate.isFinite,
+              createdAt < expiresAt,
+              expiresAt <= moveStart,
+              expiresAt <= createdAt.addingTimeInterval(86_400) else { return false }
+        return true
+    }
 }
 
 enum DayWeaveTerminalProjectionState: Codable, Equatable, Sendable {
@@ -833,8 +1143,10 @@ private func validateExecutionSession(
             && session.updatedAt == session.startedAt)
     let deferredMoveIsValid = if let start = session.moveStart, let end = session.moveEnd {
         start > session.updatedAt
-            && end > start
-            && end <= start.addingTimeInterval(86_400)
+            && executionHasPostgresTimestampPrecision(start)
+            && executionHasPostgresTimestampPrecision(end)
+            && dayWeaveExactWholeSecondDelta(from: start, to: end)
+                .map { $0 <= 86_400 } == true
     } else {
         false
     }
@@ -893,6 +1205,62 @@ private func validateExecutionSession(
         }
         throw executionDecodingError(codingPath: codingPath, description)
     }
+}
+
+private func executionHasPostgresTimestampPrecision(_ date: Date) -> Bool {
+    dayWeavePostgresEpochMicroseconds(date) != nil
+}
+
+/// JSONDecoder necessarily rounds RFC 3339 strings into `Date`. Inspect the
+/// original token as well so a persisted seven-plus-digit instant cannot look
+/// microsecond-exact only because Foundation discarded its final digits.
+private func executionWireTimestampHasPostgresPrecision(_ value: String) -> Bool {
+    let bytes = Array(value.utf8)
+    guard bytes.count >= 20 else { return false }
+    var cursor = 19
+    guard cursor < bytes.count else { return false }
+    if bytes[cursor] == 46 {
+        cursor += 1
+        let fractionStart = cursor
+        while cursor < bytes.count, (48...57).contains(bytes[cursor]) {
+            cursor += 1
+        }
+        guard cursor > fractionStart else { return false }
+        let fraction = bytes[fractionStart..<cursor]
+        if fraction.count > 6,
+           fraction.dropFirst(6).contains(where: { $0 != 48 }) {
+            return false
+        }
+    }
+    // Full RFC 3339 syntax/calendar validation remains owned by the configured
+    // Date decoder; this check binds only the raw precision it cannot retain.
+    return cursor < bytes.count
+}
+
+/// Normalizes one Foundation instant to PostgreSQL's stored microsecond epoch
+/// representation without letting Double duration tolerances hide a real
+/// microsecond remainder.
+func dayWeavePostgresEpochMicroseconds(_ date: Date) -> Int64? {
+    let seconds = date.timeIntervalSince1970
+    guard seconds.isFinite else { return nil }
+    let scaled = seconds * 1_000_000
+    guard scaled.isFinite else { return nil }
+    let rounded = scaled.rounded()
+    let normalized = rounded / 1_000_000
+    guard abs(seconds - normalized) <= max(seconds.ulp, normalized.ulp) else {
+        return nil
+    }
+    return Int64(exactly: rounded)
+}
+
+func dayWeaveExactWholeSecondDelta(from start: Date, to end: Date) -> UInt64? {
+    guard let startMicros = dayWeavePostgresEpochMicroseconds(start),
+          let endMicros = dayWeavePostgresEpochMicroseconds(end) else { return nil }
+    let delta = endMicros.subtractingReportingOverflow(startMicros)
+    guard !delta.overflow,
+          delta.partialValue > 0,
+          delta.partialValue % 1_000_000 == 0 else { return nil }
+    return UInt64(delta.partialValue / 1_000_000)
 }
 
 private func executionEncodingError(

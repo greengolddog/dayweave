@@ -90,6 +90,7 @@ final class ExecutionSyncStore: ObservableObject {
     private var operationID: UUID?
     private var configurationGeneration: UInt64 = 0
     private var foregroundPollingTask: Task<Void, Never>?
+    private var deferredPublicationCoordinator: (@MainActor @Sendable () async -> Bool)?
 
     init(
         planner: PlannerStore,
@@ -171,6 +172,12 @@ final class ExecutionSyncStore: ObservableObject {
         planner.hasExecutionCredentialReplacementBlocker
     }
 
+    func installDeferredPublicationCoordinator(
+        _ coordinator: @escaping @MainActor @Sendable () async -> Bool
+    ) {
+        deferredPublicationCoordinator = coordinator
+    }
+
     func configurationDidChange() {
         configurationGeneration &+= 1
         stopForegroundPolling()
@@ -191,6 +198,24 @@ final class ExecutionSyncStore: ObservableObject {
     }
 
     func refresh() async -> ExecutionSyncOutcome {
+        let recoveredPending = planner.executionState.pendingCommand
+        let outcome = await refreshExecutionOnly()
+        guard outcome == .success else { return outcome }
+        if let recoveredPending, case .deferWork = recoveredPending.command {
+            let recovered = planner.executionState.terminalOutcomes[
+                recoveredPending.identity.sessionID
+            ]?.session
+            guard recovered.map({
+                recoveredDeferIsExact(recoveredPending, session: $0)
+            }) == true else {
+                _ = await resumePendingDeferIntentIfNeeded()
+                return .conflict
+            }
+        }
+        return await resumePendingDeferIntentIfNeeded()
+    }
+
+    private func refreshExecutionOnly() async -> ExecutionSyncOutcome {
         await runExclusive { [self] operationID, generation in
             let connection = try configuredConnection()
             try prepareLocalState(for: connection)
@@ -337,6 +362,272 @@ final class ExecutionSyncStore: ObservableObject {
         await finish(blockID, status: .skipped, actualSeconds: actualSeconds)
     }
 
+    /// Moves the unfinished part of an authoritative lease. Running work is
+    /// paused first so the server gives us one exact accumulated-second value;
+    /// that same value is then fenced into both the corrected actual and the
+    /// replacement-window duration.
+    func deferWork(
+        _ blockID: UUID,
+        moveStart requestedMoveStart: Date,
+        approvedMoveEnd requestedApprovedMoveEnd: Date? = nil,
+        latestFinish: Date? = nil,
+        deadlineBoundary: DayWeaveMoveDeadlineBoundary? = nil,
+        deadlineIdentities requestedDeadlineIdentities: Set<DayWeaveMoveDeadlineIdentity>? = nil,
+        allowDeadlineConflict: Bool = false,
+        approvedFixedConflicts: Set<DayWeaveMoveConflictIdentity>? = nil,
+        allowFixedConflicts: Bool = false,
+        allowSourceOverride: Bool = false
+    ) async -> ExecutionSyncOutcome {
+        if let recoveredPending = planner.executionState.pendingCommand {
+            let recovery = await refreshExecutionOnly()
+            guard recovery == .success else { return recovery }
+            if case let .deferWork(_, recoveredMoveStart, _, _) = recoveredPending.command {
+                guard recoveredPending.focusedBlockID == blockID,
+                      recoveredMoveStart == requestedMoveStart,
+                      let recovered = planner.executionState.terminalOutcomes[
+                        recoveredPending.identity.sessionID
+                      ]?.session,
+                      recoveredDeferIsExact(
+                        recoveredPending,
+                        session: recovered
+                      ) else {
+                    return .conflict
+                }
+                if let intent = planner.pendingExecutionDeferIntent,
+                   intent.identity == recoveredPending.identity {
+                    guard exactDeferredClosure(intent: intent, session: recovered) else {
+                        return clearChangedRiskIntent(intent)
+                    }
+                    do {
+                        try planner.clearExecutionDeferIntent(
+                            intent,
+                            message: "Recovered the exact move; publishing its replacement placement"
+                        )
+                    } catch {
+                        return report(error)
+                    }
+                }
+                return .success
+            }
+        }
+        guard let block = planner.blocks.first(where: { $0.id == blockID }),
+              let open = planner.executionState.activeSession,
+              executionSession(open, matches: block) else { return .invalidLocalState }
+        let existingIntent = planner.pendingExecutionDeferIntent
+        let resumesSavedIntent = planner.pendingExecutionDeferIntent.map { intent in
+            intent.identity.matches(open)
+                && intent.focusedBlockID == blockID
+                && intent.moveStart == requestedMoveStart
+        } == true
+        guard block.isFlexible,
+              !block.isHardConstraint,
+              block.occurrenceID == nil
+                || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true,
+              planner.canonicalScheduleBlockActionabilityIssue(block) == nil
+                || resumesSavedIntent,
+              let requestedMoveMicros = dayWeavePostgresEpochMicroseconds(requestedMoveStart),
+              requestedMoveMicros % 1_000_000 == 0,
+              requestedMoveStart > now(),
+              let plannedSeconds = try? exactPlannedSeconds(for: block),
+              open.accumulatedSeconds < plannedSeconds else {
+            return .invalidLocalState
+        }
+        let preflightMoveEnd = requestedMoveStart.addingTimeInterval(
+            TimeInterval(plannedSeconds - open.accumulatedSeconds)
+        )
+        guard planner.exactMoveWindowCoverageIssue(
+            for: block,
+            start: requestedMoveStart,
+            end: preflightMoveEnd
+        ) == nil else {
+            return .invalidLocalState
+        }
+        let intent: DayWeavePendingExecutionDeferIntent
+        if let existing = existingIntent {
+            guard existing.hasValidShape else {
+                return clearChangedRiskIntent(existing)
+            }
+            guard existing.identity.matches(open),
+                  existing.focusedBlockID == blockID,
+                  existing.moveStart == requestedMoveStart,
+                  riskEnvelopeStillAuthorizes(
+                      existing,
+                      block: block,
+                      exactMoveEnd: preflightMoveEnd
+                  ),
+                  existing.expiresAt > now() else { return .conflict }
+            intent = existing
+        } else {
+            let approvedMoveEnd = requestedApprovedMoveEnd ?? preflightMoveEnd
+            guard let currentDeadlines = executionDeadlineIdentities(for: block)
+            else { return .invalidLocalState }
+            let legacyBoundary = deadlineBoundary ?? latestFinish.map {
+                DayWeaveMoveDeadlineBoundary(date: $0, isHard: true, isCanonicalField: true)
+            }
+            let legacyDeadlines: Set<DayWeaveMoveDeadlineIdentity>? = legacyBoundary.flatMap {
+                guard let itemID = block.sourceItemID,
+                      let revision = block.sourceItemRevision else { return nil }
+                return [.init(itemID: itemID, itemRevision: revision, boundary: $0)]
+            }
+            let reviewedDeadlines = requestedDeadlineIdentities
+                ?? legacyDeadlines
+                ?? currentDeadlines
+            let conflicts = fixedConflicts(
+                for: block,
+                moveStart: requestedMoveStart,
+                moveEnd: preflightMoveEnd
+            )
+            let reviewedConflicts = approvedFixedConflicts ?? []
+            let sourceRequiresOverride = block.previewKind == "pinned"
+            guard approvedMoveEnd == preflightMoveEnd,
+                  currentDeadlines == reviewedDeadlines,
+                  allowDeadlineConflict
+                    == reviewedDeadlines.contains(where: {
+                        preflightMoveEnd > $0.boundary.date
+                    }),
+                  !allowDeadlineConflict || !reviewedDeadlines.contains(where: {
+                      preflightMoveEnd > $0.boundary.date && $0.boundary.isHard
+                  }),
+                  reviewedConflicts == conflicts,
+                  allowFixedConflicts == !conflicts.isEmpty,
+                  allowSourceOverride == sourceRequiresOverride else {
+                return .invalidLocalState
+            }
+            let createdAt = now()
+            let staged = DayWeavePendingExecutionDeferIntent(
+                identity: .init(session: open),
+                focusedBlockID: blockID,
+                sourceStart: block.start,
+                sourceEnd: block.end,
+                moveStart: requestedMoveStart,
+                approvedMoveEnd: approvedMoveEnd,
+                approvedDeadlines: reviewedDeadlines,
+                deadlineConflictApproved: allowDeadlineConflict,
+                approvedFixedConflicts: conflicts,
+                fixedConflictApproved: allowFixedConflicts,
+                sourceOverrideApproved: allowSourceOverride,
+                createdAt: createdAt,
+                expiresAt: min(
+                    requestedMoveStart,
+                    createdAt.addingTimeInterval(86_400)
+                )
+            )
+            do {
+                try planner.persistExecutionDeferIntent(staged)
+            } catch {
+                return report(error)
+            }
+            intent = staged
+        }
+
+        if open.status == .active {
+            for attempt in 0..<2 {
+                let pauseOutcome = await pause(blockID)
+                guard pauseOutcome == .success else { return pauseOutcome }
+                if planner.executionState.activeSession?.status == .paused { break }
+                guard attempt == 0,
+                      let stillActive = planner.executionState.activeSession,
+                      stillActive.status == .active,
+                      let currentBlock = planner.blocks.first(where: { $0.id == blockID }),
+                      executionSession(stillActive, matches: currentBlock) else {
+                    return .conflict
+                }
+            }
+        }
+        guard let paused = planner.executionState.activeSession,
+              paused.status == .paused,
+              let currentBlock = planner.blocks.first(where: { $0.id == blockID }),
+              executionSession(paused, matches: currentBlock) else { return .conflict }
+        guard let currentPlannedSeconds = try? exactPlannedSeconds(for: currentBlock),
+              paused.accumulatedSeconds < currentPlannedSeconds,
+              riskEnvelopeStillAuthorizes(
+                  intent,
+                  block: currentBlock,
+                  exactMoveEnd: requestedMoveStart.addingTimeInterval(
+                      TimeInterval(currentPlannedSeconds - paused.accumulatedSeconds)
+                  )
+              ) else {
+            return clearChangedRiskIntent(intent)
+        }
+
+        var expectedCommand: DayWeaveExecutionCommand?
+        let outcome = await command(blockID: blockID) { snapshot, block, _ in
+            let source = try self.requireActiveSession(snapshot, matching: block)
+            guard source.status == .paused,
+                  block.isFlexible,
+                  !block.isHardConstraint,
+                  block.occurrenceID == nil
+                    || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true,
+                  self.planner.canonicalScheduleBlockActionabilityIssue(block) == nil
+                    || (self.planner.pendingExecutionDeferIntent.map { intent in
+                        intent.identity.matches(source)
+                            && intent.focusedBlockID == block.id
+                            && intent.moveStart == requestedMoveStart
+                    } == true) else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "Only flexible work from the exact published schedule can be moved."
+                )
+            }
+            let plannedSeconds = try self.exactPlannedSeconds(for: block)
+            guard source.accumulatedSeconds < plannedSeconds else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "The published block has no unfinished planned time to move."
+                )
+            }
+            let moveStart = requestedMoveStart
+            guard moveStart > self.now() else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "Choose a future time for the remaining work."
+                )
+            }
+            let remainingSeconds = plannedSeconds - source.accumulatedSeconds
+            let moveEnd = moveStart.addingTimeInterval(TimeInterval(remainingSeconds))
+            guard self.riskEnvelopeStillAuthorizes(
+                intent,
+                block: block,
+                exactMoveEnd: moveEnd
+            ) else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "The exact remaining work no longer matches the approved deadline and overlap risks."
+                )
+            }
+            let command = DayWeaveExecutionCommand.deferWork(
+                sessionID: source.id,
+                moveStart: moveStart,
+                moveEnd: moveEnd,
+                actualSeconds: source.accumulatedSeconds
+            )
+            expectedCommand = command
+            return .init(
+                command: command,
+                identity: .init(session: source),
+                priorSession: source,
+                focusedBlockID: block.id,
+                projectionEligibleAtStart: false
+            )
+        }
+        guard outcome == .success,
+              let expectedCommand,
+              let deferred = planner.executionState.terminalOutcomes[paused.id]?.session,
+              expectedCommand.matchesChangedSession(deferred) else {
+            if outcome == .invalidLocalState,
+               planner.executionState.pendingCommand == nil,
+               planner.pendingExecutionDeferIntent == intent {
+                return clearChangedRiskIntent(intent)
+            }
+            return outcome == .success ? .protocolFailure : outcome
+        }
+        do {
+            try planner.clearExecutionDeferIntent(
+                intent,
+                message: "Move saved · publishing the exact remaining-work placement"
+            )
+        } catch {
+            return report(error)
+        }
+        return .success
+    }
+
     func keepPausedAfterExpiredBreak() -> ExecutionSyncOutcome {
         guard expiredBreakChoiceRequired,
               let active = planner.executionState.activeSession else { return .invalidLocalState }
@@ -358,7 +649,7 @@ final class ExecutionSyncStore: ObservableObject {
         foregroundPollingTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                _ = await self.refresh()
+                _ = await self.refreshAndCoordinateDeferredPublication()
                 do {
                     try await Task.sleep(for: interval)
                 } catch {
@@ -371,6 +662,200 @@ final class ExecutionSyncStore: ObservableObject {
     func stopForegroundPolling() {
         foregroundPollingTask?.cancel()
         foregroundPollingTask = nil
+    }
+
+    @discardableResult
+    func refreshAndCoordinateDeferredPublication() async -> ExecutionSyncOutcome {
+        let outcome = await refresh()
+        guard outcome == .success,
+              planner.hasDeferredExecutionPublicationWork,
+              let deferredPublicationCoordinator else { return outcome }
+        _ = await deferredPublicationCoordinator()
+        return outcome
+    }
+
+    private func resumePendingDeferIntentIfNeeded() async -> ExecutionSyncOutcome {
+        guard let intent = planner.pendingExecutionDeferIntent else { return .success }
+        guard intent.hasValidShape else {
+            return clearChangedRiskIntent(intent)
+        }
+        if intent.expiresAt <= now() || intent.moveStart <= now() {
+            do {
+                try planner.clearExecutionDeferIntent(
+                    intent,
+                    message: "The saved move time expired; the exact session remains paused for review"
+                )
+                return .success
+            } catch {
+                return report(error)
+            }
+        }
+        if let closed = planner.executionState.terminalOutcomes[intent.identity.sessionID]?.session {
+            let exact = exactDeferredClosure(intent: intent, session: closed)
+            do {
+                try planner.clearExecutionDeferIntent(
+                    intent,
+                    message: exact
+                        ? "Recovered the exact move; publishing its replacement placement"
+                        : "Execution changed before the saved move could finish; review its terminal state"
+                )
+            } catch {
+                return report(error)
+            }
+            return exact ? .success : .conflict
+        }
+        guard planner.executionState.activeSession.map(intent.identity.matches) == true else {
+            return .conflict
+        }
+        guard let block = planner.blocks.first(where: { $0.id == intent.focusedBlockID }),
+              let active = planner.executionState.activeSession,
+              executionSession(active, matches: block),
+              let planned = try? exactPlannedSeconds(for: block),
+              active.accumulatedSeconds < planned,
+              riskEnvelopeStillAuthorizes(
+                  intent,
+                  block: block,
+                  exactMoveEnd: intent.moveStart.addingTimeInterval(
+                      TimeInterval(planned - active.accumulatedSeconds)
+                  )
+              ) else {
+            return clearChangedRiskIntent(intent)
+        }
+        return await deferWork(intent.focusedBlockID, moveStart: intent.moveStart)
+    }
+
+    private func clearChangedRiskIntent(
+        _ intent: DayWeavePendingExecutionDeferIntent
+    ) -> ExecutionSyncOutcome {
+        do {
+            try planner.clearExecutionDeferIntent(
+                intent,
+                message: "The saved move's deadline or fixed-time conflicts changed; the exact session remains paused for fresh approval"
+            )
+            return .conflict
+        } catch {
+            return report(error)
+        }
+    }
+
+    private func executionDeadlineIdentities(
+        for block: ScheduleBlock
+    ) -> Set<DayWeaveMoveDeadlineIdentity>? {
+        DayWeaveMoveDeadlinePolicy.identities(
+            for: block,
+            movingWholeOccurrence: false,
+            allBlocks: planner.blocks,
+            canonicalItems: planner.canonicalItems
+        )
+    }
+
+    private func fixedConflicts(
+        for block: ScheduleBlock,
+        moveStart: Date,
+        moveEnd: Date
+    ) -> Set<DayWeaveMoveConflictIdentity> {
+        Set(planner.blocks.compactMap { candidate in
+            guard candidate.id != block.id,
+                  candidate.status != .completed,
+                  candidate.status != .skipped,
+                  candidate.status != .canceled,
+                  (candidate.isHardConstraint
+                    || !candidate.isFlexible
+                    || candidate.kind == .event
+                    || ["pinned", "calendar_event", "external_fixed"]
+                        .contains(candidate.previewKind ?? "")),
+                  moveStart < candidate.end,
+                  moveEnd > candidate.start else { return nil }
+            return DayWeaveMoveConflictIdentity(block: candidate)
+        })
+    }
+
+    private func riskEnvelopeStillAuthorizes(
+        _ intent: DayWeavePendingExecutionDeferIntent,
+        block: ScheduleBlock,
+        exactMoveEnd: Date
+    ) -> Bool {
+        guard intent.hasValidShape,
+              sourceBlockMatchesIntent(block, intent: intent),
+              sourceBlockIsDurablyAttested(block),
+              planner.exactMoveWindowCoverageIssue(
+                for: block,
+                start: intent.moveStart,
+                end: exactMoveEnd
+              ) == nil,
+              exactMoveEnd <= intent.approvedMoveEnd,
+              exactMoveEnd > intent.moveStart,
+              (block.previewKind == "pinned") == intent.sourceOverrideApproved,
+              executionDeadlineIdentities(for: block) == intent.approvedDeadlines,
+              intent.deadlineConflictApproved
+                || !intent.approvedDeadlines.contains(where: {
+                    exactMoveEnd > $0.boundary.date
+                }) else {
+            return false
+        }
+        let currentConflicts = fixedConflicts(
+            for: block,
+            moveStart: intent.moveStart,
+            moveEnd: exactMoveEnd
+        )
+        return currentConflicts.isEmpty
+            || (intent.fixedConflictApproved
+                && currentConflicts.isSubset(of: intent.approvedFixedConflicts))
+    }
+
+    private func exactDeferredClosure(
+        intent: DayWeavePendingExecutionDeferIntent,
+        session: DayWeaveExecutionSession
+    ) -> Bool {
+        guard session.status == .deferred,
+              intent.identity.matches(session),
+              session.moveStart == intent.moveStart,
+              let block = planner.blocks.first(where: { $0.id == intent.focusedBlockID }),
+              sourceBlockMatchesIntent(block, intent: intent),
+              let planned = try? exactPlannedSeconds(for: block),
+              let actual = session.actualSeconds,
+              actual == session.accumulatedSeconds,
+              actual < planned,
+              session.moveEnd == intent.moveStart.addingTimeInterval(
+                TimeInterval(planned - actual)
+              ) else { return false }
+        return true
+    }
+
+    private func sourceBlockMatchesIntent(
+        _ block: ScheduleBlock,
+        intent: DayWeavePendingExecutionDeferIntent
+    ) -> Bool {
+        block.id == intent.focusedBlockID
+            && block.sourceItemID == intent.identity.itemID
+            && block.sourceItemRevision == intent.identity.itemRevision
+            && block.occurrenceID == intent.identity.occurrenceID
+            && (block.sessionIndex ?? 0) == intent.identity.sessionIndex
+            && dayWeavePostgresEpochMicroseconds(block.start)
+                == dayWeavePostgresEpochMicroseconds(intent.sourceStart)
+            && dayWeavePostgresEpochMicroseconds(block.end)
+                == dayWeavePostgresEpochMicroseconds(intent.sourceEnd)
+    }
+
+    private func recoveredDeferIsExact(
+        _ pending: DayWeavePendingExecutionCommand,
+        session: DayWeaveExecutionSession
+    ) -> Bool {
+        guard case let .deferWork(_, moveStart, moveEnd, correctedActual) = pending.command,
+              let prior = pending.priorSession,
+              prior.status == .paused,
+              pending.identity.matches(prior),
+              pending.identity.matches(session),
+              pending.command.matchesChangedSession(session),
+              correctedActual == prior.accumulatedSeconds,
+              session.accumulatedSeconds == prior.accumulatedSeconds,
+              let block = planner.blocks.first(where: { $0.id == pending.focusedBlockID }),
+              executionSession(prior, matches: block),
+              let planned = try? exactPlannedSeconds(for: block),
+              prior.accumulatedSeconds < planned,
+              dayWeaveExactWholeSecondDelta(from: moveStart, to: moveEnd)
+                == planned - prior.accumulatedSeconds else { return false }
+        return true
     }
 
     private func finish(
@@ -535,7 +1020,9 @@ final class ExecutionSyncStore: ObservableObject {
                     pending.canonicalProjectionEligibleAtLeaseStart
             } else {
                 let projection: DayWeaveTerminalProjectionState =
-                    pending.canonicalProjectionEligibleAtLeaseStart ? .pending : .notRequired
+                    mutation.changedSession.status.isCanonicalTerminal
+                        && pending.canonicalProjectionEligibleAtLeaseStart
+                        ? .pending : .notRequired
                 next.terminalOutcomes[mutation.changedSession.id] = .init(
                     session: mutation.changedSession,
                     recordedAt: now(),
@@ -791,6 +1278,7 @@ final class ExecutionSyncStore: ObservableObject {
         case .pause: .paused
         case .complete: .completed
         case .skip: .skipped
+        case .deferWork: .deferred
         }
         guard changed.status == expectedStatus,
               expectedStatus.isOpen ? mutation.activeSession == changed : mutation.activeSession == nil
@@ -825,9 +1313,28 @@ final class ExecutionSyncStore: ObservableObject {
             return actualIsValid
                 && changed.pausedAt == (prior.pausedAt
                     ?? (prior.status == .paused ? changed.updatedAt : nil))
+        case let .deferWork(_, moveStart, moveEnd, corrected):
+            let actualIsValid = corrected.map { changed.actualSeconds == $0 }
+                ?? (changed.actualSeconds == changed.accumulatedSeconds)
+            return prior.status == .paused
+                && changed.accumulatedSeconds == prior.accumulatedSeconds
+                && actualIsValid
+                && changed.moveStart == moveStart
+                && changed.moveEnd == moveEnd
+                && changed.pausedAt == (prior.pausedAt ?? changed.updatedAt)
         case .start:
             return false
         }
+    }
+
+    private func exactPlannedSeconds(for block: ScheduleBlock) throws -> UInt64 {
+        guard let exact = dayWeaveExactWholeSecondDelta(from: block.start, to: block.end),
+              exact <= 86_400 else {
+            throw ExecutionSyncControllerError.invalidLocalState(
+                "The published block does not have an exact supported duration."
+            )
+        }
+        return exact
     }
 
     private func accumulatedTransitionIsValid(
@@ -862,6 +1369,27 @@ final class ExecutionSyncStore: ObservableObject {
             )
         }
         return active
+    }
+
+    private func executionSession(
+        _ session: DayWeaveExecutionSession,
+        matches block: ScheduleBlock
+    ) -> Bool {
+        session.itemID == block.sourceItemID
+            && session.itemRevision == block.sourceItemRevision
+            && session.occurrenceID == block.occurrenceID
+            && session.sessionIndex == (block.sessionIndex ?? 0)
+    }
+
+    private func sourceBlockIsDurablyAttested(_ block: ScheduleBlock) -> Bool {
+        guard planner.deferredExecutionPublicationSessionIDs.isEmpty,
+              planner.pendingSchedulePublication == nil,
+              let provenance = planner.schedulePreviewProvenance,
+              let proof = planner.publishedScheduleProof,
+              proof.configurationIdentifier == planner.canonicalConfigurationIdentifier,
+              proof.matches(provenance),
+              proof.matches(block) else { return false }
+        return true
     }
 
     private func executionStartIsBlocked(for block: ScheduleBlock) -> Bool {
@@ -930,7 +1458,7 @@ final class ExecutionSyncStore: ObservableObject {
         guard planner.canPersistPlan, planner.hasEncryptedPersistence else {
             return report(PlannerExecutionStateError.encryptedPersistenceRequired)
         }
-        while !planner.beginCanonicalSync() {
+        while !planner.beginExecutionSync() {
             guard !Task.isCancelled else { return .configurationChanged }
             guard operationID == nil else { return .invalidLocalState }
             guard planner.pendingProposalApplicationMutation == nil else {

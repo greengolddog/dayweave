@@ -81,6 +81,9 @@ struct DayWeaveMacApp: App {
             planner: store,
             authCoordinator: authCoordinator
         )
+        executionSync.installDeferredPublicationCoordinator {
+            await canonicalSync.syncThroughFreshComposition()
+        }
         _executionSync = StateObject(wrappedValue: executionSync)
         let googleIntegration = GoogleIntegrationStore(
             authCoordinator: authCoordinator

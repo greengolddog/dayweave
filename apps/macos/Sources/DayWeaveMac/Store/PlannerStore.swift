@@ -182,6 +182,29 @@ enum PlannerCanonicalAuthoringError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerRecurrenceMoveError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case recoveryInProgress
+    case invalidOccurrence
+    case partiallyResolvedOccurrence
+    case capacityReached
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Healthy encrypted planner persistence is required before moving a recurring occurrence."
+        case .recoveryInProgress:
+            "Recover the active canonical, publication, or execution operation before moving this occurrence."
+        case .invalidOccurrence:
+            "Only a current, flexible recurring occurrence can be moved to a later whole-second time."
+        case .partiallyResolvedOccurrence:
+            "This occurrence already has finished sessions and cannot be moved as a whole."
+        case .capacityReached:
+            "The encrypted occurrence-move ledger is full. Finish or skip an older moved occurrence before adding another."
+        }
+    }
+}
+
 enum CanonicalSensitivityPresentation: Equatable, Sendable {
     case standard
     case own
@@ -263,6 +286,19 @@ final class PlannerStore: ObservableObject {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var recurrenceSessionOutcomes: [RecurrenceSessionOutcome] {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove] {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var pendingExecutionDeferIntent:
+        DayWeavePendingExecutionDeferIntent? {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var deferredExecutionPublicationSessionIDs: Set<UUID> {
+        didSet { scheduleAutosave() }
+    }
+    @Published private(set) var pendingPublicationDeferredSessionIDs: Set<UUID> {
         didSet { scheduleAutosave() }
     }
     @Published private(set) var canonicalConfigurationIdentifier: String? {
@@ -348,6 +384,10 @@ final class PlannerStore: ObservableObject {
         pendingCanonicalMutations: [PendingCanonicalMutation] = [],
         pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation] = [],
         recurrenceSessionOutcomes: [RecurrenceSessionOutcome] = [],
+        recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove] = [],
+        pendingExecutionDeferIntent: DayWeavePendingExecutionDeferIntent? = nil,
+        deferredExecutionPublicationSessionIDs: Set<UUID> = [],
+        pendingPublicationDeferredSessionIDs: Set<UUID> = [],
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
@@ -402,6 +442,20 @@ final class PlannerStore: ObservableObject {
         self.pendingCanonicalSensitivityMutations = restoredSnapshot?.pendingCanonicalSensitivityMutations
             ?? pendingCanonicalSensitivityMutations
         self.recurrenceSessionOutcomes = restoredSnapshot?.recurrenceSessionOutcomes ?? recurrenceSessionOutcomes
+        let initialRecurrenceOccurrenceMoves = restoredSnapshot?.recurrenceOccurrenceMoves
+            ?? recurrenceOccurrenceMoves
+        self.recurrenceOccurrenceMoves = initialRecurrenceOccurrenceMoves
+        let initialPendingExecutionDeferIntent = restoredSnapshot?.pendingExecutionDeferIntent
+            ?? pendingExecutionDeferIntent
+        self.pendingExecutionDeferIntent = initialPendingExecutionDeferIntent
+        let initialDeferredExecutionPublicationSessionIDs =
+            restoredSnapshot?.deferredExecutionPublicationSessionIDs
+                ?? deferredExecutionPublicationSessionIDs
+        self.deferredExecutionPublicationSessionIDs = initialDeferredExecutionPublicationSessionIDs
+        let initialPendingPublicationDeferredSessionIDs =
+            restoredSnapshot?.pendingPublicationDeferredSessionIDs
+                ?? pendingPublicationDeferredSessionIDs
+        self.pendingPublicationDeferredSessionIDs = initialPendingPublicationDeferredSessionIDs
         self.canonicalConfigurationIdentifier = initialCanonicalConfigurationIdentifier
         let initialSchedulePreviewProvenance = restoredSnapshot?.schedulePreviewProvenance
             ?? schedulePreviewProvenance
@@ -503,6 +557,29 @@ final class PlannerStore: ObservableObject {
         if !Self.validateExecutionState(initialExecutionState) {
             restorationError = .snapshotDecodingFailed
         }
+        if !RecurrenceOccurrenceMove.collectionIsValid(
+            initialRecurrenceOccurrenceMoves,
+            canonicalItemIDs: Set(initialCanonicalItems.map(\.id))
+        )
+            || initialPendingExecutionDeferIntent?.hasPersistableShape == false
+            || (initialPendingExecutionDeferIntent.map { intent in
+                initialExecutionState.activeSession.map(intent.identity.matches) == true
+                    || initialExecutionState.terminalOutcomes[intent.identity.sessionID]
+                        .map { intent.identity.matches($0.session) } == true
+                    || initialExecutionState.pendingCommand
+                        .map { $0.identity == intent.identity } == true
+            } == false)
+            || initialDeferredExecutionPublicationSessionIDs.count > 10_000
+            || !initialDeferredExecutionPublicationSessionIDs.allSatisfy({
+                initialExecutionState.terminalOutcomes[$0]?.session.status == .deferred
+            })
+            || !initialPendingPublicationDeferredSessionIDs.isSubset(
+                of: initialDeferredExecutionPublicationSessionIDs
+            )
+            || (initialPendingSchedulePublication == nil
+                && !initialPendingPublicationDeferredSessionIDs.isEmpty) {
+            restorationError = .snapshotDecodingFailed
+        }
         let restoredProtectedFreeMinutes = restoredSnapshot?.protectedFreeMinutes
         let initialScheduleProfile = restoredSnapshot?.scheduleProfile
             ?? scheduleProfile
@@ -547,13 +624,13 @@ final class PlannerStore: ObservableObject {
         loadState = restorationError == nil ? .ready : .persistenceFailed
         persistenceRevision = restoredRevision
 
-        pruneRecurrenceHistory()
+        let recurrenceHistoryNeedsRewrite = pruneRecurrenceHistory()
         hardenPendingSensitivityPresentation()
 
         if persistence != nil, restorationError == nil {
             if restoreFromPersistence, restoredSnapshot == nil {
                 scheduleAutosave()
-            } else if restoredCanonicalRetentionNeedsRewrite {
+            } else if restoredCanonicalRetentionNeedsRewrite || recurrenceHistoryNeedsRewrite {
                 // Retention is a durable privacy boundary. Rewrite an old
                 // snapshot before exposing an indefinitely quiet restored app.
                 flushPersistence()
@@ -616,7 +693,9 @@ final class PlannerStore: ObservableObject {
     }
 
     var canMutatePlan: Bool {
-        canPersistPlan && !isCanonicalSyncLocked
+        canPersistPlan
+            && !isCanonicalSyncLocked
+            && pendingExecutionDeferIntent == nil
     }
 
     var hasEncryptedPersistence: Bool {
@@ -718,6 +797,20 @@ final class PlannerStore: ObservableObject {
     func beginCanonicalSync() -> Bool {
         guard canPersistPlan,
               !isCanonicalSyncLocked,
+              pendingExecutionDeferIntent == nil,
+              pendingProposalApplicationMutation == nil,
+              googleOutboundRecoveryJournal == nil else { return false }
+        isCanonicalSyncLocked = true
+        return true
+    }
+
+    /// Execution recovery shares the same exclusive mutation lock but must be
+    /// able to acquire it while the saved Pause -> Defer intent is precisely
+    /// the state it is reconciling.
+    @discardableResult
+    func beginExecutionSync() -> Bool {
+        guard canPersistPlan,
+              !isCanonicalSyncLocked,
               pendingProposalApplicationMutation == nil,
               googleOutboundRecoveryJournal == nil else { return false }
         isCanonicalSyncLocked = true
@@ -814,6 +907,10 @@ final class PlannerStore: ObservableObject {
         pendingCanonicalMutations = []
         pendingCanonicalSensitivityMutations = []
         recurrenceSessionOutcomes = []
+        recurrenceOccurrenceMoves = []
+        pendingExecutionDeferIntent = nil
+        deferredExecutionPublicationSessionIDs = []
+        pendingPublicationDeferredSessionIDs = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         publishedScheduleProof = nil
@@ -938,6 +1035,9 @@ final class PlannerStore: ObservableObject {
         guard pendingSchedulePublication == nil else {
             return "Finish recovering the pending schedule publication before starting work."
         }
+        guard deferredExecutionPublicationSessionIDs.isEmpty else {
+            return "Publish the deferred work's replacement placement before starting another session."
+        }
         guard let provenance = schedulePreviewProvenance,
               let proof = publishedScheduleProof,
               proof.configurationIdentifier == canonicalConfigurationIdentifier,
@@ -958,6 +1058,58 @@ final class PlannerStore: ObservableObject {
         return nil
     }
 
+    /// Exact placement warnings are only complete for the local day whose
+    /// published schedule is currently loaded. A future-day target may contain
+    /// calendar or protected blocks that this process has not attested, so an
+    /// active lease must stay paused for a fresh day-specific review instead of
+    /// silently accepting that placement.
+    func exactMoveWindowCoverageIssue(
+        for block: ScheduleBlock,
+        start: Date,
+        end: Date
+    ) -> String? {
+        guard start.timeIntervalSinceReferenceDate.isFinite,
+              end.timeIntervalSinceReferenceDate.isFinite,
+              start < end,
+              let timezone = TimeZone(identifier: scheduleProfile.timezoneName) else {
+            return "The exact target window is invalid."
+        }
+
+        let loadedDayReference: Date
+        if block.sourceItemID != nil {
+            guard let provenance = schedulePreviewProvenance,
+                  let proof = publishedScheduleProof,
+                  block.syncOrigin == .canonicalPreview,
+                  pendingSchedulePublication == nil,
+                  deferredExecutionPublicationSessionIDs.isEmpty,
+                  proof.configurationIdentifier == canonicalConfigurationIdentifier,
+                  proof.matches(provenance),
+                  proof.matches(block),
+                  proof.matchesPublishedPlan(blocks),
+                  start >= provenance.horizonStart,
+                  end <= provenance.horizonEnd else {
+                return "The exact target is outside the fully verified published schedule. Sync and review it again."
+            }
+            loadedDayReference = provenance.asOf
+        } else {
+            loadedDayReference = now()
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+        let loadedDayStart = calendar.startOfDay(for: loadedDayReference)
+        guard let loadedDayEnd = calendar.date(
+            byAdding: .day,
+            value: 1,
+            to: loadedDayStart
+        ),
+        start >= loadedDayStart,
+        end <= loadedDayEnd else {
+            return "Exact moves are limited to the currently loaded schedule day. Sync on the target day before moving active or local work there."
+        }
+        return nil
+    }
+
     private var hasCanonicalRemoteState: Bool {
         !canonicalItems.isEmpty
             || !canonicalTrash.isEmpty
@@ -967,6 +1119,10 @@ final class PlannerStore: ObservableObject {
             || !pendingCanonicalMutations.isEmpty
             || !pendingCanonicalSensitivityMutations.isEmpty
             || !recurrenceSessionOutcomes.isEmpty
+            || !recurrenceOccurrenceMoves.isEmpty
+            || pendingExecutionDeferIntent != nil
+            || !deferredExecutionPublicationSessionIDs.isEmpty
+            || !pendingPublicationDeferredSessionIDs.isEmpty
             || schedulePreviewProvenance != nil
             || publishedScheduleProof != nil
             || localScheduleCompositionProvenance != nil
@@ -1104,20 +1260,39 @@ final class PlannerStore: ObservableObject {
     }
 
     func doLater(_ id: UUID) {
+        guard let block = blocks.first(where: { $0.id == id }) else { return }
+        doLater(id, moveStart: block.start.addingTimeInterval(60 * 60))
+    }
+
+    func doLater(_ id: UUID, moveStart: Date) {
         guard let index = blocks.firstIndex(where: { $0.id == id }),
               canMutate(blocks[index]),
+              blocks[index].sourceItemID == nil,
               blocks[index].isFlexible,
-              !blocks[index].isHardConstraint else { return }
-        let shiftedPublishedBlock = blocks[index].syncOrigin == .canonicalPreview
-        let delta: TimeInterval = 60 * 60
-        blocks[index].start.addTimeInterval(delta)
-        blocks[index].end.addTimeInterval(delta)
-        blocks.sort { $0.start < $1.start }
-        if shiftedPublishedBlock {
-            publishedScheduleProof = nil
-            isCanonicalPreviewValidatedForCurrentLaunch = false
+              !blocks[index].isHardConstraint,
+              moveStart.timeIntervalSinceReferenceDate.isFinite,
+              moveStart > now() else { return }
+        let duration = blocks[index].end.timeIntervalSince(blocks[index].start)
+        guard duration > 0, duration.isFinite else { return }
+        let moveEnd = moveStart.addingTimeInterval(duration)
+        guard exactMoveWindowCoverageIssue(
+            for: blocks[index],
+            start: moveStart,
+            end: moveEnd
+        ) == nil else {
+            lastScheduleMessage = "Exact local moves are limited to the currently loaded schedule day"
+            return
         }
-        lastScheduleMessage = "Moved one hour later locally; constraints will be validated on sync"
+        blocks[index].start = moveStart
+        blocks[index].end = moveEnd
+        if blocks[index].status == .active || blocks[index].status == .paused {
+            blocks[index].status = .scheduled
+            blocks[index].actualMinutes = nil
+        }
+        blocks.sort { $0.start < $1.start }
+        selectedBlockID = id
+        lastScheduleMessage = "Moved local work to \(PlannerTimeZone.dateTimeLabel(moveStart, timezoneName: scheduleProfile.timezoneName))"
+        flushPersistence()
     }
 
     func recomposeSchedule() {
@@ -1239,7 +1414,9 @@ final class PlannerStore: ObservableObject {
         canonicalDeltaCursor = nextCursor
         reconcileSelectedCanonicalItem()
         hardenPendingSensitivityPresentation()
-        pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys))
+        if pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys)) {
+            flushPersistence()
+        }
     }
 
     /// A newer active upsert is cross-device evidence for a queued restore.
@@ -1475,6 +1652,167 @@ final class PlannerStore: ObservableObject {
             createdAt: now()
         )
         return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    @discardableResult
+    func enqueueCanonicalMoveLater(
+        blockID: UUID,
+        earliestStart: Date,
+        relaxCanonicalDeadlineTo: Date? = nil
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        guard earliestStart.timeIntervalSinceReferenceDate.isFinite,
+              earliestStart > now(),
+              let block = blocks.first(where: { $0.id == blockID }),
+              block.status == .scheduled,
+              block.isFlexible,
+              !block.isHardConstraint,
+              block.occurrenceID == nil,
+              earliestStart > block.start,
+              block.previewKind != "pinned",
+              block.previewKind != "external_fixed",
+              let itemID = block.sourceItemID,
+              let itemRevision = block.sourceItemRevision,
+              let item = canonicalItem(id: itemID),
+              item.revision == itemRevision else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        var draft = DayWeaveCanonicalItemDraft(item: item)
+        draft.earliestStartAt = max(draft.earliestStartAt ?? earliestStart, earliestStart)
+        if let relaxCanonicalDeadlineTo {
+            guard case let .valid(.some(boundary)) = item.moveLaterDeadlineAssessment,
+                  boundary.isCanonicalField,
+                  boundary.isHard,
+                  boundary.date == item.deadlineAt,
+                  relaxCanonicalDeadlineTo > boundary.date,
+                  relaxCanonicalDeadlineTo > draft.earliestStartAt! else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            draft.deadlineAt = relaxCanonicalDeadlineTo
+        }
+        return try enqueueCanonicalReplace(itemID: itemID, draft: draft.normalized)
+    }
+
+    /// Durably records one recurring occurrence's shifted outer window. The
+    /// visible blocks stay in place until the server validates, composes, and
+    /// publishes the exception; no series-level item field is changed.
+    @discardableResult
+    func enqueueCanonicalOccurrenceMove(
+        blockID: UUID,
+        moveStart: Date
+    ) throws -> RecurrenceOccurrenceMove {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerRecurrenceMoveError.encryptedPersistenceRequired
+        }
+        guard canMutatePlan,
+              pendingSchedulePublication == nil,
+              pendingProposalApplicationMutation == nil,
+              googleOutboundRecoveryJournal == nil,
+              executionState.activeSession == nil,
+              executionState.pendingCommand == nil else {
+            throw PlannerRecurrenceMoveError.recoveryInProgress
+        }
+        guard let focused = blocks.first(where: { $0.id == blockID }),
+              focused.status == .scheduled,
+              focused.isFlexible,
+              !focused.isHardConstraint,
+              focused.previewKind != "pinned",
+              focused.previewKind != "external_fixed",
+              let itemID = focused.sourceItemID,
+              let itemRevision = focused.sourceItemRevision,
+              let occurrenceID = focused.occurrenceID,
+              let seriesItemID = focused.recurrenceSeriesItemID ?? focused.sourceItemID,
+              let source = focused.recurrenceMoveSource,
+              let seriesItem = canonicalItem(id: seriesItemID),
+              seriesItem.revision == source.itemRevision,
+              source.canAuthorizeOccurrenceMove,
+              let item = canonicalItem(id: itemID),
+              item.revision == itemRevision,
+              seriesItem.recurrence != nil,
+              canonicalItem(itemID, belongsToSeries: seriesItemID),
+              canonicalAuthoringMutation(itemID: seriesItemID) == nil,
+              canMutate(focused),
+              moveStart.timeIntervalSinceReferenceDate.isFinite,
+              moveStart > now(),
+              let shiftSeconds = Self.exactPositiveWholeSeconds(
+                  from: focused.start,
+                  to: moveStart
+              ) else {
+            throw PlannerRecurrenceMoveError.invalidOccurrence
+        }
+        let occurrenceBlocks = blocks.filter { $0.occurrenceID == occurrenceID }
+        guard !occurrenceBlocks.isEmpty,
+              occurrenceBlocks.allSatisfy({ block in
+                  guard let blockItemID = block.sourceItemID,
+                        let blockRevision = block.sourceItemRevision,
+                        canonicalItem(id: blockItemID)?.revision == blockRevision else {
+                      return false
+                  }
+                  return (block.recurrenceSeriesItemID ?? blockItemID) == seriesItemID
+                      && block.recurrenceMoveSource == source
+                      && canonicalItem(blockItemID, belongsToSeries: seriesItemID)
+                      && canonicalAuthoringMutation(itemID: blockItemID) == nil
+                      && block.status != .completed
+                      && block.status != .skipped
+                      && block.status != .canceled
+              }) else {
+            throw PlannerRecurrenceMoveError.partiallyResolvedOccurrence
+        }
+        guard occurrenceBlocks.allSatisfy({
+            $0.status == .scheduled
+                && $0.isFlexible
+                && !$0.isHardConstraint
+                && $0.previewKind != "pinned"
+                && $0.previewKind != "external_fixed"
+                && $0.occurrenceFullyScheduled
+        }), let earliest = occurrenceBlocks.map(\.start).min(),
+           let latest = occurrenceBlocks.map(\.end).max() else {
+            throw PlannerRecurrenceMoveError.invalidOccurrence
+        }
+        let delta = TimeInterval(shiftSeconds)
+        let move = RecurrenceOccurrenceMove(
+            itemID: seriesItemID,
+            occurrenceID: occurrenceID,
+            startAt: earliest.addingTimeInterval(delta),
+            endAt: latest.addingTimeInterval(delta),
+            movedAt: Date(timeIntervalSince1970: now().timeIntervalSince1970.rounded(.down)),
+            source: source
+        )
+        guard move.hasValidShape,
+              let targetHorizon = try? scheduleProfile.expanded(asOf: move.startAt),
+              move.startAt >= targetHorizon.horizonStart,
+              move.endAt <= targetHorizon.horizonEnd else {
+            throw PlannerRecurrenceMoveError.invalidOccurrence
+        }
+        guard recurrenceOccurrenceMoves.contains(where: {
+            $0.occurrenceID == occurrenceID
+        }) || recurrenceOccurrenceMoves.count < RecurrenceOccurrenceMove.maximumStoredCount else {
+            throw PlannerRecurrenceMoveError.capacityReached
+        }
+
+        let priorMoves = recurrenceOccurrenceMoves
+        let priorProof = publishedScheduleProof
+        let priorValidation = isCanonicalPreviewValidatedForCurrentLaunch
+        let priorMessage = lastScheduleMessage
+        recurrenceOccurrenceMoves.removeAll { $0.occurrenceID == occurrenceID }
+        recurrenceOccurrenceMoves.append(move)
+        pruneRecurrenceHistory()
+        guard recurrenceOccurrenceMoves.contains(move) else {
+            recurrenceOccurrenceMoves = priorMoves
+            throw PlannerRecurrenceMoveError.capacityReached
+        }
+        publishedScheduleProof = nil
+        isCanonicalPreviewValidatedForCurrentLaunch = false
+        lastScheduleMessage =
+            "Move requested · the previous occurrence remains visible until server validation"
+        flushPersistence()
+        if let persistenceError {
+            recurrenceOccurrenceMoves = priorMoves
+            publishedScheduleProof = priorProof
+            isCanonicalPreviewValidatedForCurrentLaunch = priorValidation
+            lastScheduleMessage = priorMessage
+            throw persistenceError
+        }
+        return move
     }
 
     @discardableResult
@@ -1858,7 +2196,8 @@ final class PlannerStore: ObservableObject {
             throw PlannerCanonicalAuthoringError.encryptedPersistenceRequired
         }
         guard pendingProposalApplicationMutation == nil,
-              pendingSchedulePublication == nil else {
+              pendingSchedulePublication == nil,
+              pendingExecutionDeferIntent == nil else {
             throw PlannerCanonicalAuthoringError.mutationFenceActive
         }
         if !allowDuringExecution {
@@ -2199,6 +2538,7 @@ final class PlannerStore: ObservableObject {
             throw PlannerSchedulePublicationError.publicationAlreadyPending
         }
         pendingSchedulePublication = publication
+        pendingPublicationDeferredSessionIDs = deferredExecutionPublicationSessionIDs
         flushPersistence()
         if let persistenceError { throw persistenceError }
     }
@@ -2227,6 +2567,8 @@ final class PlannerStore: ObservableObject {
         let priorPublishedScheduleProof = publishedScheduleProof
         let priorLocalProvenance = localScheduleCompositionProvenance
         let priorExecutionState = executionState
+        let priorDeferredPublicationSessionIDs = deferredExecutionPublicationSessionIDs
+        let priorPendingDeferredSessionIDs = pendingPublicationDeferredSessionIDs
         let priorMessage = lastScheduleMessage
 
         applySchedulePreviewInMemory(
@@ -2235,6 +2577,10 @@ final class PlannerStore: ObservableObject {
             provenance: publication.provenance
         )
         publishedScheduleProof = publicationProof
+        reconcileOutstandingDeferredPublicationProof(
+            authorizedSessionIDs: pendingPublicationDeferredSessionIDs
+        )
+        pendingPublicationDeferredSessionIDs = []
         pendingSchedulePublication = nil
         flushPersistence()
         if let persistenceError {
@@ -2244,6 +2590,8 @@ final class PlannerStore: ObservableObject {
             publishedScheduleProof = priorPublishedScheduleProof
             localScheduleCompositionProvenance = priorLocalProvenance
             executionState = priorExecutionState
+            deferredExecutionPublicationSessionIDs = priorDeferredPublicationSessionIDs
+            pendingPublicationDeferredSessionIDs = priorPendingDeferredSessionIDs
             lastScheduleMessage = priorMessage
             pendingSchedulePublication = publication
             // A failed atomic local commit must never leave either the prior
@@ -2320,12 +2668,15 @@ final class PlannerStore: ObservableObject {
             throw PlannerSchedulePublicationError.publicationDoesNotMatchJournal
         }
         let priorPublishedScheduleProof = publishedScheduleProof
+        let priorPendingDeferredSessionIDs = pendingPublicationDeferredSessionIDs
         pendingSchedulePublication = nil
+        pendingPublicationDeferredSessionIDs = []
         publishedScheduleProof = nil
         isCanonicalPreviewValidatedForCurrentLaunch = false
         flushPersistence()
         if let persistenceError {
             pendingSchedulePublication = publication
+            pendingPublicationDeferredSessionIDs = priorPendingDeferredSessionIDs
             publishedScheduleProof = priorPublishedScheduleProof
             // Never make the prior or candidate projection actionable when the
             // atomic acknowledgement could not be persisted.
@@ -3392,6 +3743,39 @@ final class PlannerStore: ObservableObject {
         if let persistenceError { throw persistenceError }
     }
 
+    func persistExecutionDeferIntent(
+        _ intent: DayWeavePendingExecutionDeferIntent
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan,
+              intent.hasValidShape,
+              pendingExecutionDeferIntent == nil || pendingExecutionDeferIntent == intent,
+              executionState.activeSession.map(intent.identity.matches) == true
+                || executionState.pendingCommand.map({ $0.identity == intent.identity }) == true
+                || executionState.terminalOutcomes[intent.identity.sessionID]
+                    .map({ intent.identity.matches($0.session) }) == true else {
+            throw PlannerExecutionStateError.invalidDurableState
+        }
+        pendingExecutionDeferIntent = intent
+        flushPersistence()
+        if let persistenceError { throw persistenceError }
+    }
+
+    func clearExecutionDeferIntent(
+        _ intent: DayWeavePendingExecutionDeferIntent,
+        message: String? = nil
+    ) throws {
+        guard pendingExecutionDeferIntent == intent else {
+            throw PlannerExecutionStateError.invalidDurableState
+        }
+        pendingExecutionDeferIntent = nil
+        if let message { lastScheduleMessage = message }
+        flushPersistence()
+        if let persistenceError {
+            pendingExecutionDeferIntent = intent
+            throw persistenceError
+        }
+    }
+
     func persistExecutionState(
         _ state: DayWeaveExecutionDurableState,
         message: String? = nil,
@@ -3407,6 +3791,26 @@ final class PlannerStore: ObservableObject {
         if reconcilePresentation { applyExecutionPresentation(to: &next) }
         guard Self.validateExecutionState(next) else {
             throw PlannerExecutionStateError.invalidDurableState
+        }
+        deferredExecutionPublicationSessionIDs = deferredExecutionPublicationSessionIDs.filter {
+            next.terminalOutcomes[$0]?.session.status == .deferred
+        }
+        pendingPublicationDeferredSessionIDs.formIntersection(
+            deferredExecutionPublicationSessionIDs
+        )
+        let newlyObservedDeferred: [DayWeaveExecutionSession] = next.terminalOutcomes.values.compactMap { outcome in
+            guard outcome.session.status == .deferred,
+                  executionState.terminalOutcomes[outcome.session.id]?.session
+                    != outcome.session else { return nil }
+            return outcome.session
+        }
+        for deferred in newlyObservedDeferred {
+            deferredExecutionPublicationSessionIDs.insert(deferred.id)
+            // A proof that predates observation of this terminal Defer cannot
+            // attest its replacement, even if an unrelated pinned sibling
+            // happens to share the same window and a higher session index.
+            publishedScheduleProof = nil
+            isCanonicalPreviewValidatedForCurrentLaunch = false
         }
         executionState = next
         if let message { lastScheduleMessage = message }
@@ -3429,6 +3833,10 @@ final class PlannerStore: ObservableObject {
         return blocks.count(where: {
             $0.sourceItemID == itemID && $0.occurrenceID == nil
         }) == 1
+    }
+
+    var hasDeferredExecutionPublicationWork: Bool {
+        !deferredExecutionPublicationSessionIDs.isEmpty
     }
 
     func keepLatestCanonicalItem(forExecutionSession sessionID: UUID) throws {
@@ -3485,6 +3893,10 @@ final class PlannerStore: ObservableObject {
         pendingCanonicalMutations = []
         pendingCanonicalSensitivityMutations = []
         recurrenceSessionOutcomes = []
+        recurrenceOccurrenceMoves = []
+        pendingExecutionDeferIntent = nil
+        deferredExecutionPublicationSessionIDs = []
+        pendingPublicationDeferredSessionIDs = []
         canonicalConfigurationIdentifier = nil
         schedulePreviewProvenance = nil
         publishedScheduleProof = nil
@@ -3920,7 +4332,7 @@ final class PlannerStore: ObservableObject {
                           plannedBlockID: blockID,
                           sourceDeviceID: deviceID
                       ) else { return false }
-            case .pause, .resume, .complete, .skip:
+            case .pause, .resume, .complete, .skip, .deferWork:
                 guard let prior = pending.priorSession,
                       prior.status.isOpen,
                       pending.identity.matches(prior) else { return false }
@@ -4064,7 +4476,11 @@ final class PlannerStore: ObservableObject {
 
     /// Keeps complete occurrence groups, newest first, so pruning cannot turn
     /// a partially retained split occurrence into a false completion anchor.
-    private func pruneRecurrenceHistory(retainingItemIDs: Set<UUID>? = nil) {
+    @discardableResult
+    private func pruneRecurrenceHistory(retainingItemIDs: Set<UUID>? = nil) -> Bool {
+        let originalOutcomes = recurrenceSessionOutcomes
+        let originalCompleted = completedOccurrenceIDs
+        let originalMoves = recurrenceOccurrenceMoves
         var latestBySession: [CanonicalSessionKey: RecurrenceSessionOutcome] = [:]
         for outcome in recurrenceSessionOutcomes
             where retainingItemIDs?.contains(outcome.itemID) ?? true {
@@ -4124,6 +4540,97 @@ final class PlannerStore: ObservableObject {
             .union(legacyCompletedIDs)
         if completedOccurrenceIDs != prunedCompleted {
             completedOccurrenceIDs = prunedCompleted
+        }
+
+        let terminalOccurrenceIDs = Set(recurrenceSessionOutcomes.map(\.occurrenceID))
+        let currentHorizonStart = (try? scheduleProfile.expanded(asOf: now()))?.horizonStart
+        let latestMoves = recurrenceOccurrenceMoves
+            .filter { move in
+                (retainingItemIDs?.contains(move.itemID) ?? true)
+                    && !terminalOccurrenceIDs.contains(move.occurrenceID)
+                    && move.hasValidShape
+                    && canonicalItem(id: move.itemID)?.revision == move.source?.itemRevision
+                    && currentHorizonStart.map({ move.endAt > $0 }) ?? true
+            }
+            .sorted {
+                if $0.movedAt != $1.movedAt { return $0.movedAt > $1.movedAt }
+                return $0.occurrenceID.uuidString < $1.occurrenceID.uuidString
+            }
+        var seenMoveOccurrences = Set<UUID>()
+        let retainedMoves = Array(latestMoves.filter {
+            seenMoveOccurrences.insert($0.occurrenceID).inserted
+        }.prefix(RecurrenceOccurrenceMove.maximumStoredCount))
+        if recurrenceOccurrenceMoves != retainedMoves {
+            recurrenceOccurrenceMoves = retainedMoves
+        }
+        let movesChanged = originalMoves != recurrenceOccurrenceMoves
+        if movesChanged {
+            publishedScheduleProof = nil
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            lastScheduleMessage =
+                "An obsolete recurring move was removed; sync will publish a fresh schedule"
+        }
+        return movesChanged
+            || originalOutcomes != recurrenceSessionOutcomes
+            || originalCompleted != completedOccurrenceIDs
+    }
+
+    private static func exactPositiveWholeSeconds(from start: Date, to end: Date) -> Int64? {
+        guard let seconds = dayWeaveExactWholeSecondDelta(from: start, to: end),
+              seconds <= UInt64(Int64.max) else { return nil }
+        return Int64(seconds)
+    }
+
+    private func canonicalItem(
+        _ itemID: UUID,
+        belongsToSeries seriesItemID: UUID
+    ) -> Bool {
+        var currentID: UUID? = itemID
+        var visited = Set<UUID>()
+        while let identifier = currentID {
+            guard visited.insert(identifier).inserted,
+                  let item = canonicalItem(id: identifier) else { return false }
+            if identifier == seriesItemID { return true }
+            currentID = item.parentID
+        }
+        return false
+    }
+
+    private static func proofContainsReplacement(
+        after deferred: DayWeaveExecutionSession,
+        proof: DayWeavePublishedScheduleProof
+    ) -> Bool {
+        guard let moveStart = deferred.moveStart,
+              let moveEnd = deferred.moveEnd,
+              let moveStartMicros = dayWeavePostgresEpochMicroseconds(moveStart),
+              let moveEndMicros = dayWeavePostgresEpochMicroseconds(moveEnd) else {
+            return false
+        }
+        return proof.publishedBlocks.contains { block in
+            block.itemID == deferred.itemID
+                && block.itemRevision == deferred.itemRevision
+                && block.occurrenceID == deferred.occurrenceID
+                && block.sessionIndex > deferred.sessionIndex
+                && block.kind == "pinned"
+                && dayWeavePostgresEpochMicroseconds(block.start) == moveStartMicros
+                && dayWeavePostgresEpochMicroseconds(block.end) == moveEndMicros
+        }
+    }
+
+    private func reconcileOutstandingDeferredPublicationProof(
+        authorizedSessionIDs: Set<UUID>
+    ) {
+        guard let proof = publishedScheduleProof else { return }
+        deferredExecutionPublicationSessionIDs = deferredExecutionPublicationSessionIDs.filter {
+            guard let deferred = executionState.terminalOutcomes[$0]?.session else {
+                return false
+            }
+            return !authorizedSessionIDs.contains($0)
+                || !Self.proofContainsReplacement(after: deferred, proof: proof)
+        }
+        if !deferredExecutionPublicationSessionIDs.isEmpty {
+            publishedScheduleProof = nil
+            isCanonicalPreviewValidatedForCurrentLaunch = false
         }
     }
 
@@ -4251,6 +4758,11 @@ final class PlannerStore: ObservableObject {
             pendingCanonicalMutations: pendingCanonicalMutations,
             pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
             recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+            recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+            pendingExecutionDeferIntent: pendingExecutionDeferIntent,
+            deferredExecutionPublicationSessionIDs:
+                deferredExecutionPublicationSessionIDs,
+            pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
             publishedScheduleProof: publishedScheduleProof,

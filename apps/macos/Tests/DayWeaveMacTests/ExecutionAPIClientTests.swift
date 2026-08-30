@@ -480,7 +480,9 @@ struct ExecutionAPIClientTests {
     @Test("all command variants encode and absolute pauses are bounded before first send")
     func allCommandVariantsEncode() throws {
         let client = Self.client()
-        let future = Date().addingTimeInterval(600)
+        let future = Date(
+            timeIntervalSince1970: Date().addingTimeInterval(600).timeIntervalSince1970.rounded(.up)
+        )
         let commands: [(String, DayWeaveExecutionCommand)] = [
             ("pause", .pause(
                 sessionID: Self.sessionID,
@@ -491,6 +493,12 @@ struct ExecutionAPIClientTests {
             ("resume", .resume(sessionID: Self.sessionID)),
             ("complete", .complete(sessionID: Self.sessionID, actualSeconds: 42)),
             ("skip", .skip(sessionID: Self.sessionID, actualSeconds: 7)),
+            ("defer", .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200),
+                actualSeconds: 300
+            )),
         ]
         for (type, command) in commands {
             let body = try client.encodedExecutionCommand(
@@ -517,6 +525,41 @@ struct ExecutionAPIClientTests {
                 Issue.record("Expected an invalid absolute pause to fail locally")
             } catch let error as DayWeaveAPIError {
                 #expect(error == .requestEncodingFailed)
+            }
+        }
+
+        let invalidDefers: [DayWeaveExecutionCommand] = [
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future,
+                moveEnd: future.addingTimeInterval(1_200.5),
+                actualSeconds: 300
+            ),
+            .deferWork(
+                sessionID: Self.sessionID,
+                moveStart: future.addingTimeInterval(0.000_000_5),
+                moveEnd: future.addingTimeInterval(1_200.000_000_5),
+                actualSeconds: 300
+            ),
+        ]
+        for command in invalidDefers {
+            do {
+                _ = try client.encodedExecutionCommand(
+                    .init(expectedRevision: 4, command: command)
+                )
+                Issue.record("Expected an inexact defer window to fail locally")
+            } catch let error as DayWeaveAPIError {
+                #expect(error == .requestEncodingFailed)
+            }
+        }
+
+        let invalidPersistedDefers = [
+            #"{"expected_revision":4,"command":{"type":"defer","session_id":"a1000000-0000-4000-8000-000000000001","move_start":"2001-01-01T00:00:00.000000Z","move_end":"2001-01-01T00:20:00.500000Z","actual_seconds":300}}"#,
+            #"{"expected_revision":4,"command":{"type":"defer","session_id":"a1000000-0000-4000-8000-000000000001","move_start":"2001-01-01T00:00:00.0000005Z","move_end":"2001-01-01T00:20:00.0000005Z","actual_seconds":300}}"#,
+        ]
+        for persisted in invalidPersistedDefers {
+            #expect(throws: (any Error).self) {
+                try DayWeaveExecutionWireCodec.decode(Data(persisted.utf8))
             }
         }
     }

@@ -25,7 +25,8 @@ extension GoogleOutboundStore: GoogleOutboundRecovering {}
 protocol CanonicalServiceSynchronizing: AnyObject {
     var isConfigured: Bool { get }
 
-    func sync() async
+    @discardableResult
+    func syncThroughFreshComposition() async -> Bool
 }
 
 extension CanonicalSyncStore: CanonicalServiceSynchronizing {}
@@ -153,7 +154,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         let executionOutcome = await executionSync.refresh()
         guard operationIsCurrent(generation) else { return false }
         if executionOutcome == .success, canonicalSync.isConfigured {
-            await canonicalSync.sync()
+            _ = await canonicalSync.syncThroughFreshComposition()
         }
         guard operationIsCurrent(generation) else { return false }
         executionSync.startForegroundPolling(every: .seconds(30))

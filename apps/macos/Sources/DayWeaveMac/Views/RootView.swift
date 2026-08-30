@@ -64,11 +64,176 @@ private func scheduleDayLabel(_ date: Date, timezoneName: String) -> String {
     return date.formatted(style)
 }
 
+struct WillDoLaterMoveWindow: Equatable, Sendable {
+    let start: Date
+    let end: Date
+    let movedBlockIDs: Set<UUID>
+}
+
+enum WillDoLaterTiming {
+    static func roundedUpToMinute(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 60).rounded(.up) * 60)
+    }
+
+    static func tomorrowMorning(
+        after referenceDate: Date,
+        minimum: Date,
+        timezoneName: String
+    ) -> Date {
+        var calendar = PlannerPresentation.calendar(timezoneName: timezoneName)
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: referenceDate)
+            ?? referenceDate
+        let morning = calendar.date(
+            bySettingHour: 9,
+            minute: 0,
+            second: 0,
+            of: tomorrow
+        ) ?? tomorrow
+        return max(morning, roundedUpToMinute(minimum))
+    }
+
+    static func proposedWindow(
+        for block: ScheduleBlock,
+        moveStart: Date,
+        allBlocks: [ScheduleBlock],
+        accumulatedSeconds: UInt64?
+    ) -> WillDoLaterMoveWindow? {
+        guard moveStart.timeIntervalSinceReferenceDate.isFinite else { return nil }
+
+        if block.status == .active || block.status == .paused {
+            let planned = block.end.timeIntervalSince(block.start)
+            guard planned > 0, planned.isFinite else { return nil }
+            let remaining = max(0, planned - TimeInterval(accumulatedSeconds ?? 0))
+            guard remaining > 0 else { return nil }
+            return .init(
+                start: moveStart,
+                end: moveStart.addingTimeInterval(remaining),
+                movedBlockIDs: [block.id]
+            )
+        }
+
+        if let occurrenceID = block.occurrenceID,
+           let focusedItemID = block.sourceItemID,
+           block.sourceItemRevision != nil,
+           let source = block.recurrenceMoveSource {
+            let seriesItemID = block.recurrenceSeriesItemID ?? focusedItemID
+            let siblings = allBlocks.filter { $0.occurrenceID == occurrenceID }
+            guard !siblings.isEmpty,
+                  siblings.allSatisfy({ sibling in
+                      sibling.sourceItemID != nil
+                          && sibling.sourceItemRevision != nil
+                          && (sibling.recurrenceSeriesItemID ?? sibling.sourceItemID)
+                            == seriesItemID
+                          && sibling.recurrenceMoveSource == source
+                          && sibling.status == .scheduled
+                          && sibling.isFlexible
+                          && !sibling.isHardConstraint
+                          && sibling.previewKind != "pinned"
+                          && sibling.previewKind != "external_fixed"
+                          && sibling.occurrenceFullyScheduled
+                  }),
+                  let earliest = siblings.map(\.start).min(),
+                  let latest = siblings.map(\.end).max() else { return nil }
+            let shift = moveStart.timeIntervalSince(block.start)
+            let shiftedStart = earliest.addingTimeInterval(shift)
+            let shiftedEnd = latest.addingTimeInterval(shift)
+            guard shiftedEnd > shiftedStart else { return nil }
+            return .init(
+                start: shiftedStart,
+                end: shiftedEnd,
+                movedBlockIDs: Set(siblings.map(\.id))
+            )
+        }
+
+        let duration = block.end.timeIntervalSince(block.start)
+        guard duration > 0, duration.isFinite else { return nil }
+        return .init(
+            start: moveStart,
+            end: moveStart.addingTimeInterval(duration),
+            movedBlockIDs: [block.id]
+        )
+    }
+
+    static func fixedConflicts(
+        with window: WillDoLaterMoveWindow,
+        in blocks: [ScheduleBlock]
+    ) -> [ScheduleBlock] {
+        blocks.filter { candidate in
+            !window.movedBlockIDs.contains(candidate.id)
+                && candidate.status != .completed
+                && candidate.status != .skipped
+                && candidate.status != .canceled
+                && DayWeaveMoveConflictIdentity(block: candidate).hasValidShape
+                && window.start < candidate.end
+                && window.end > candidate.start
+        }
+        .sorted { $0.start < $1.start }
+    }
+
+    static func finishesAfterLatestFinish(
+        _ window: WillDoLaterMoveWindow,
+        latestFinish: Date
+    ) -> Bool {
+        window.end > latestFinish
+    }
+
+    static func crossedDeadlines(
+        _ deadlines: Set<DayWeaveMoveDeadlineIdentity>,
+        window: WillDoLaterMoveWindow
+    ) -> Set<DayWeaveMoveDeadlineIdentity> {
+        // A recurrence exception provides an outer window rather than exact
+        // leaf placements. Its end is therefore a conservative "may be as late
+        // as" bound for every moved leaf, while exact/local work uses its real
+        // replacement end.
+        return deadlines.filter { window.end > $0.boundary.date }
+    }
+
+    static func usesExactPlacement(for block: ScheduleBlock) -> Bool {
+        block.sourceItemID == nil
+            || block.status == .active
+            || block.status == .paused
+    }
+
+    static func conflictLabel(
+        _ block: ScheduleBlock,
+        timezoneName: String
+    ) -> String {
+        let title = block.isSensitive ? "Sensitive busy time" : block.title
+        return "\(title) (\(scheduleTimeRange(block, timezoneName: timezoneName)))"
+    }
+}
+
+@MainActor
+final class WillDoLaterPresenter: ObservableObject {
+    struct Request: Identifiable, Equatable {
+        let id: UUID
+        let blockID: UUID
+        let initialMoveStart: Date
+    }
+
+    @Published var request: Request?
+
+    func present(blockID: UUID, initialMoveStart: Date) {
+        request = .init(
+            id: UUID(),
+            blockID: blockID,
+            initialMoveStart: initialMoveStart
+        )
+    }
+
+    func dismiss(_ requestID: UUID) {
+        guard request?.id == requestID else { return }
+        request = nil
+    }
+}
+
 struct RootView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @StateObject private var willDoLaterPresenter = WillDoLaterPresenter()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isResolvingExpiredBreak = false
 
@@ -83,9 +248,17 @@ struct RootView: View {
             InspectorView()
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
         }
+        .environmentObject(willDoLaterPresenter)
         .sheet(isPresented: $store.isQuickAddPresented) {
             QuickCaptureView(profileTimezoneName: store.scheduleProfile.timezoneName)
                 .environmentObject(store)
+        }
+        .sheet(item: $willDoLaterPresenter.request) { request in
+            WillDoLaterSheet(request: request)
+                .environmentObject(store)
+                .environmentObject(canonicalSync)
+                .environmentObject(executionSync)
+                .environmentObject(willDoLaterPresenter)
         }
         .onAppear {
             codex.startIfNeeded()
@@ -400,7 +573,11 @@ private struct ActiveMiniPlayer: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if block.sourceItemID != nil {
-                    AuthoritativeExecutionControls(block: block, includesCustomPause: false)
+                    AuthoritativeExecutionControls(
+                        block: block,
+                        includesCustomPause: false,
+                        accessibilityScope: "active-strip"
+                    )
                         .controlSize(.mini)
                 } else {
                     Button {
@@ -991,7 +1168,10 @@ private struct ScheduleBlockView: View {
 
                 if !isExternalFixed {
                     if block.sourceItemID != nil {
-                        AuthoritativeExecutionControls(block: block)
+                        AuthoritativeExecutionControls(
+                            block: block,
+                            accessibilityScope: "timeline-inline"
+                        )
                             .controlSize(.small)
                     } else if block.status == .active || block.status == .paused {
                         HStack {
@@ -1000,8 +1180,11 @@ private struct ScheduleBlockView: View {
                             }
                             .buttonStyle(.borderedProminent)
                             Button("Complete") { store.complete(block.id) }
-                            Button("Later") { store.doLater(block.id) }
-                                .disabled(!block.isFlexible || block.isHardConstraint)
+                            WillDoLaterButton(
+                                block: block,
+                                title: "Will do later",
+                                accessibilityScope: "timeline-inline-local"
+                            )
                         }
                         .controlSize(.small)
                         .disabled(!store.canMutate(block))
@@ -1028,8 +1211,11 @@ private struct ScheduleBlockView: View {
                     Button("Start") { store.start(block.id) }.disabled(!store.canMutate(block))
                     Button("Mark Complete") { store.complete(block.id) }.disabled(!store.canMutate(block))
                     Divider()
-                    Button("Do Later") { store.doLater(block.id) }
-                        .disabled(!store.canMutate(block) || !block.isFlexible || block.isHardConstraint)
+                    WillDoLaterButton(
+                        block: block,
+                        title: "Will do later",
+                        accessibilityScope: "timeline-context-local"
+                    )
                     Button("Skip") { store.skip(block.id) }.disabled(!store.canMutate(block))
                 }
             }
@@ -1070,11 +1256,12 @@ private enum ExecutionPauseEditorMode: String, CaseIterable, Identifiable {
     var title: String { self == .duration ? "Duration" : "Until" }
 }
 
-private struct AuthoritativeExecutionControls: View {
+struct AuthoritativeExecutionControls: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
     let block: ScheduleBlock
     var includesCustomPause = true
+    let accessibilityScope: String
 
     @State private var isPauseEditorPresented = false
     @State private var pauseMode = ExecutionPauseEditorMode.duration
@@ -1093,9 +1280,11 @@ private struct AuthoritativeExecutionControls: View {
                 .disabled(!canStart)
                 .accessibilityIdentifier("execution.start.\(block.id.uuidString.lowercased())")
                 Menu("More") {
-                    Button("Do later") { store.doLater(block.id) }
-                        .disabled(!canEditScheduledBlock
-                            || !block.isFlexible || block.isHardConstraint)
+                    WillDoLaterButton(
+                        block: block,
+                        title: "Will do later",
+                        accessibilityScope: "\(accessibilityScope)-scheduled-more"
+                    )
                     Button("Skip without starting") { store.skip(block.id) }
                         .disabled(!canEditScheduledBlock)
                 }
@@ -1106,6 +1295,11 @@ private struct AuthoritativeExecutionControls: View {
                     .accessibilityIdentifier("execution.pause.\(block.id.uuidString.lowercased())")
                 terminalMenu
                     .disabled(!canControlOpenLease)
+                WillDoLaterButton(
+                    block: block,
+                    title: "Will do later",
+                    accessibilityScope: "\(accessibilityScope)-active"
+                )
             case .paused:
                 Button("Resume") {
                     Task { await executionSync.resume(block.id) }
@@ -1115,6 +1309,11 @@ private struct AuthoritativeExecutionControls: View {
                 .accessibilityIdentifier("execution.resume.\(block.id.uuidString.lowercased())")
                 terminalMenu
                     .disabled(!canControlOpenLease)
+                WillDoLaterButton(
+                    block: block,
+                    title: "Will do later",
+                    accessibilityScope: "\(accessibilityScope)-paused"
+                )
             default:
                 EmptyView()
             }
@@ -1231,6 +1430,553 @@ private struct AuthoritativeExecutionControls: View {
     }
 }
 
+struct WillDoLaterButton: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var presenter: WillDoLaterPresenter
+    let block: ScheduleBlock
+    let title: String
+    let accessibilityScope: String
+
+    var body: some View {
+        Button(title) {
+            presenter.present(blockID: block.id, initialMoveStart: preset(hours: 1))
+        }
+        .disabled(!isEligible)
+        .accessibilityIdentifier(
+            "execution.defer.\(accessibilityScope).\(block.id.uuidString.lowercased())"
+        )
+    }
+
+    private var isEligible: Bool {
+        guard store.canMutatePlan,
+              !executionSync.isSyncing,
+              !canonicalSync.isSyncing,
+              store.executionState.pendingCommand == nil,
+              block.isFlexible,
+              !block.isHardConstraint,
+              block.occurrenceID == nil
+                || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true,
+              block.previewKind != "external_fixed" else { return false }
+        if block.sourceItemID == nil {
+            return [.scheduled, .active, .paused].contains(block.status)
+                && store.canMutate(block)
+        }
+        switch block.status {
+        case .scheduled:
+            guard executionSync.activeSession == nil,
+                  canonicalSync.isConfigured,
+                  block.previewKind != "pinned",
+                  store.canMutate(block),
+                  let itemID = block.sourceItemID,
+                  let item = store.canonicalItem(id: itemID) else { return false }
+            let seriesItemID = block.recurrenceSeriesItemID ?? itemID
+            let seriesItem = store.canonicalItem(id: seriesItemID)
+            return item.revision == block.sourceItemRevision
+                && (block.occurrenceID == nil
+                    ? item.supportsCanonicalAuthoringReplacement
+                    : seriesItem?.recurrence != nil
+                        && block.recurrenceMoveSource?.itemRevision == seriesItem?.revision
+                        && block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true
+                        && WillDoLaterTiming.proposedWindow(
+                            for: block,
+                            moveStart: preset(hours: 1),
+                            allBlocks: store.blocks,
+                            accumulatedSeconds: nil
+                        ) != nil)
+                && store.canonicalAuthoringMutation(itemID: itemID) == nil
+                && store.canonicalAuthoringMutation(itemID: seriesItemID) == nil
+        case .active, .paused:
+            guard canonicalSync.isConfigured,
+                  let active = executionSync.activeSession else { return false }
+            return executionSession(active, matches: block)
+                && store.canonicalScheduleBlockActionabilityIssue(block) == nil
+        default:
+            return false
+        }
+    }
+
+    private var referenceDate: Date {
+        block.status == .scheduled ? max(Date.now, block.start) : Date.now
+    }
+
+    private var minimumMoveStart: Date {
+        referenceDate.addingTimeInterval(60)
+    }
+
+    private func preset(hours: Int) -> Date {
+        WillDoLaterTiming.roundedUpToMinute(
+            referenceDate.addingTimeInterval(TimeInterval(hours * 3_600))
+        )
+    }
+}
+
+private struct WillDoLaterSheet: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var presenter: WillDoLaterPresenter
+    let request: WillDoLaterPresenter.Request
+
+    @State private var moveStart: Date
+    @State private var approvedOverlapRisk: DayWeaveMoveRiskEnvelope?
+    @State private var approvedDeadlineRisk: DayWeaveMoveRiskEnvelope?
+    @State private var approvedSourceRisk: DayWeaveMoveRiskEnvelope?
+    @State private var isSubmitting = false
+    @State private var submissionError: String?
+
+    init(request: WillDoLaterPresenter.Request) {
+        self.request = request
+        _moveStart = State(initialValue: request.initialMoveStart)
+    }
+
+    var body: some View {
+        Group {
+            if let block {
+                VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Will do later").font(.title2.weight(.semibold))
+                        Text(explanation(for: block))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        Button("In 1 hour") { moveStart = preset(hours: 1, for: block) }
+                        Button("In 3 hours") { moveStart = preset(hours: 3, for: block) }
+                        Button("Tomorrow morning") {
+                            moveStart = tomorrowMorning(for: block)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    DatePicker(
+                        block.sourceItemID == nil || block.status != .scheduled
+                            ? "Move remaining work to" : "Allow scheduling from",
+                        selection: $moveStart,
+                        in: minimumMoveStart(for: block)...,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .environment(\.timeZone, profileTimeZone)
+
+                    deadlineNotice(for: block)
+                    if let coverageIssue = exactMoveCoverageIssue(for: block) {
+                        Label(
+                            coverageIssue,
+                            systemImage: "calendar.badge.exclamationmark"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    }
+                    if !fixedConflicts(for: block).isEmpty {
+                        overlapNotice(for: block)
+                    }
+                    if sourceRequiresOverride(block) {
+                        sourceOverrideNotice(for: block)
+                    }
+                    if let submissionError {
+                        Label(submissionError, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { presenter.dismiss(request.id) }
+                            .keyboardShortcut(.cancelAction)
+                        Button("Move work") { submit(block) }
+                            .buttonStyle(.borderedProminent)
+                            .keyboardShortcut(.defaultAction)
+                            .disabled(!isValid(for: block) || isSubmitting)
+                    }
+                }
+                .padding(24)
+                .frame(width: 520)
+                .privacySensitive(block.isSensitive)
+                .onChange(of: moveStart) {
+                    approvedOverlapRisk = nil
+                    approvedDeadlineRisk = nil
+                    approvedSourceRisk = nil
+                    submissionError = nil
+                }
+            } else {
+                VStack(spacing: 14) {
+                    Text("This schedule block is no longer available.")
+                    Button("Close") { presenter.dismiss(request.id) }
+                        .keyboardShortcut(.cancelAction)
+                }
+                .padding(24)
+            }
+        }
+    }
+
+    private var block: ScheduleBlock? {
+        store.blocks.first(where: { $0.id == request.blockID })
+    }
+
+    private var profileTimeZone: TimeZone {
+        scheduleTimeZone(store.scheduleProfile.timezoneName)
+    }
+
+    private func referenceDate(for block: ScheduleBlock) -> Date {
+        block.status == .scheduled ? max(Date.now, block.start) : Date.now
+    }
+
+    private func minimumMoveStart(for block: ScheduleBlock) -> Date {
+        referenceDate(for: block).addingTimeInterval(60)
+    }
+
+    private func preset(hours: Int, for block: ScheduleBlock) -> Date {
+        WillDoLaterTiming.roundedUpToMinute(
+            referenceDate(for: block).addingTimeInterval(TimeInterval(hours * 3_600))
+        )
+    }
+
+    private func tomorrowMorning(for block: ScheduleBlock) -> Date {
+        WillDoLaterTiming.tomorrowMorning(
+            after: referenceDate(for: block),
+            minimum: minimumMoveStart(for: block),
+            timezoneName: store.scheduleProfile.timezoneName
+        )
+    }
+
+    private func explanation(for block: ScheduleBlock) -> String {
+        if block.sourceItemID == nil {
+            return "Choose the new start for this local block."
+        }
+        if block.status == .scheduled {
+            if block.occurrenceID != nil {
+                return "DayWeave will move only this recurring occurrence, recompose it within the shifted window, then publish a fresh schedule."
+            }
+            return "DayWeave will save this as the canonical earliest start, then compose and publish a fresh schedule."
+        }
+        return "DayWeave will pause the authoritative timer, preserve its exact unfinished seconds, and publish the replacement before it can be started again."
+    }
+
+    private func proposedWindow(for block: ScheduleBlock) -> WillDoLaterMoveWindow? {
+        let accumulated: UInt64?
+        if let active = executionSync.activeSession,
+           executionSession(active, matches: block) {
+            accumulated = active.accumulatedSeconds
+        } else {
+            accumulated = nil
+        }
+        return WillDoLaterTiming.proposedWindow(
+            for: block,
+            moveStart: moveStart,
+            allBlocks: store.blocks,
+            accumulatedSeconds: accumulated
+        )
+    }
+
+    private func reviewedDeadlines(
+        for block: ScheduleBlock
+    ) -> Set<DayWeaveMoveDeadlineIdentity>? {
+        guard block.sourceItemID != nil else { return [] }
+        return DayWeaveMoveDeadlinePolicy.identities(
+            for: block,
+            movingWholeOccurrence: block.status == .scheduled
+                && block.occurrenceID != nil,
+            allBlocks: store.blocks,
+            canonicalItems: store.canonicalItems
+        )
+    }
+
+    private func hasDeadlineConflict(
+        _ deadline: DayWeaveMoveDeadlineIdentity,
+        block: ScheduleBlock
+    ) -> Bool {
+        guard let window = proposedWindow(for: block) else { return true }
+        return WillDoLaterTiming.crossedDeadlines(
+            [deadline],
+            window: window
+        ).contains(deadline)
+    }
+
+    @ViewBuilder
+    private func deadlineNotice(for block: ScheduleBlock) -> some View {
+        if let deadlines = reviewedDeadlines(for: block) {
+            let ordered = deadlines.sorted {
+                if $0.boundary.date != $1.boundary.date {
+                    return $0.boundary.date < $1.boundary.date
+                }
+                return $0.itemID.uuidString < $1.itemID.uuidString
+            }
+            let crossed = ordered.filter { hasDeadlineConflict($0, block: block) }
+            if let deadline = crossed.first ?? ordered.first {
+                let label = scheduleDateTimeLabel(
+                    deadline.boundary.date,
+                    timezoneName: store.scheduleProfile.timezoneName
+                )
+                let conflict = !crossed.isEmpty
+                let suffix = (conflict ? crossed.count : ordered.count) > 1
+                    ? " and \((conflict ? crossed.count : ordered.count) - 1) other constraint(s)"
+                    : ""
+                if conflict {
+                Label(
+                        canOverrideDeadlines(Set(crossed), for: block)
+                            ? deadlineConflictText(
+                                for: block,
+                                label: label,
+                                suffix: suffix,
+                                cannotOverride: false
+                              )
+                            : deadlineConflictText(
+                                for: block,
+                                label: label,
+                                suffix: suffix,
+                                cannotOverride: true
+                              ),
+                        systemImage: "calendar.badge.exclamationmark"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    if canOverrideDeadlines(Set(crossed), for: block) {
+                        Toggle(
+                            block.occurrenceID == nil
+                                && crossed.contains(where: { $0.boundary.isCanonicalField })
+                                ? "Move anyway and extend the latest finish"
+                                : block.occurrenceID == nil
+                                    ? "Move anyway despite the latest finish"
+                                    : "Move anyway despite the possible latest-finish violation",
+                            isOn: deadlineApprovalBinding(for: block)
+                        )
+                        .font(.caption)
+                    }
+                } else {
+                    Label(
+                        "Latest finish: \(label)\(suffix)",
+                        systemImage: "calendar.badge.clock"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            Label(
+                "This item's latest-finish constraint is malformed or ambiguous. Fix it before moving the work.",
+                systemImage: "calendar.badge.exclamationmark"
+            )
+            .font(.caption)
+            .foregroundStyle(.red)
+        }
+    }
+
+    private func fixedConflicts(for block: ScheduleBlock) -> [ScheduleBlock] {
+        guard moveIsExact(for: block), let window = proposedWindow(for: block) else {
+            return []
+        }
+        return WillDoLaterTiming.fixedConflicts(with: window, in: store.blocks)
+    }
+
+    private func moveIsExact(for block: ScheduleBlock) -> Bool {
+        WillDoLaterTiming.usesExactPlacement(for: block)
+    }
+
+    private func exactMoveCoverageIssue(for block: ScheduleBlock) -> String? {
+        guard moveIsExact(for: block), let window = proposedWindow(for: block) else {
+            return nil
+        }
+        return store.exactMoveWindowCoverageIssue(
+            for: block,
+            start: window.start,
+            end: window.end
+        )
+    }
+
+    @ViewBuilder
+    private func overlapNotice(for block: ScheduleBlock) -> some View {
+        let conflicts = fixedConflicts(for: block)
+        let names = conflicts.prefix(3).map { conflict in
+            WillDoLaterTiming.conflictLabel(
+                conflict,
+                timezoneName: store.scheduleProfile.timezoneName
+            )
+        }.joined(separator: ", ")
+        Label(
+            block.occurrenceID == nil
+                ? "This exact move overlaps fixed or protected time: \(names)."
+                : "The shifted occurrence window intersects fixed or protected time: \(names). The occurrence will be recomposed within that window.",
+            systemImage: "exclamationmark.triangle.fill"
+        )
+        .font(.caption)
+        .foregroundStyle(.orange)
+        .privacySensitive(conflicts.contains(where: \.isSensitive))
+        Toggle("Move anyway despite the overlap", isOn: overlapApprovalBinding(for: block))
+            .font(.caption)
+    }
+
+    @ViewBuilder
+    private func sourceOverrideNotice(for block: ScheduleBlock) -> some View {
+        Label(
+            "This session came from an explicitly pinned placement. Moving its unfinished work will replace that placement.",
+            systemImage: "pin.slash"
+        )
+        .font(.caption)
+        .foregroundStyle(.orange)
+        Toggle(
+            "Move anyway despite the pinned placement",
+            isOn: sourceApprovalBinding(for: block)
+        )
+        .font(.caption)
+    }
+
+    private func isValid(for block: ScheduleBlock) -> Bool {
+        guard moveStart >= minimumMoveStart(for: block),
+              moveStart.timeIntervalSinceReferenceDate.isFinite,
+              block.occurrenceID == nil
+                || block.recurrenceMoveSource?.canAuthorizeOccurrenceMove == true,
+              proposedWindow(for: block) != nil,
+              exactMoveCoverageIssue(for: block) == nil else { return false }
+        guard let risk = currentRisk(for: block) else { return false }
+        guard let window = proposedWindow(for: block) else { return false }
+        let crossedDeadlines = WillDoLaterTiming.crossedDeadlines(
+            risk.deadlines,
+            window: window
+        )
+        if !crossedDeadlines.isEmpty {
+            guard canOverrideDeadlines(Set(crossedDeadlines), for: block),
+                  approvedDeadlineRisk == risk else { return false }
+        }
+        if !risk.fixedConflicts.isEmpty && approvedOverlapRisk != risk { return false }
+        if risk.sourceRequiresOverride && approvedSourceRisk != risk { return false }
+        return true
+    }
+
+    private func submit(_ block: ScheduleBlock) {
+        guard isValid(for: block) else { return }
+        let selectedStart = moveStart
+        let reviewedWindow = proposedWindow(for: block)
+        guard let reviewedRisk = currentRisk(for: block) else { return }
+        let approvedDeadlineConflict = approvedDeadlineRisk == reviewedRisk
+        let approvedFixedConflicts = approvedOverlapRisk == reviewedRisk
+        let approvedSourceOverride = approvedSourceRisk == reviewedRisk
+        submissionError = nil
+        if block.sourceItemID == nil {
+            store.doLater(block.id, moveStart: selectedStart)
+            presenter.dismiss(request.id)
+            return
+        }
+        isSubmitting = true
+        Task {
+            if block.status == .active || block.status == .paused {
+                guard let reviewedWindow else {
+                    submissionError = "The exact remaining-work window is no longer available."
+                    isSubmitting = false
+                    return
+                }
+                let outcome = await executionSync.deferWork(
+                    block.id,
+                    moveStart: selectedStart,
+                    approvedMoveEnd: reviewedWindow.end,
+                    deadlineIdentities: reviewedRisk.deadlines,
+                    allowDeadlineConflict: approvedDeadlineConflict,
+                    approvedFixedConflicts: reviewedRisk.fixedConflicts,
+                    allowFixedConflicts: approvedFixedConflicts,
+                    allowSourceOverride: approvedSourceOverride
+                )
+                if outcome == .success {
+                    presenter.dismiss(request.id)
+                    _ = await canonicalSync.syncThroughFreshComposition()
+                } else {
+                    submissionError = "The exact move was not accepted (\(String(describing: outcome))). Review the current session and try again."
+                }
+            } else {
+                let succeeded = await canonicalSync.moveCanonicalWorkLater(
+                    block.id,
+                    earliestStart: selectedStart,
+                    reviewedRisk: reviewedRisk,
+                    allowDeadlineConflict: approvedDeadlineConflict,
+                    allowFixedConflicts: approvedFixedConflicts
+                )
+                if succeeded {
+                    presenter.dismiss(request.id)
+                } else {
+                    submissionError = "The canonical move was not published. The previous schedule remains authoritative."
+                }
+            }
+            isSubmitting = false
+        }
+    }
+
+    private func currentRisk(for block: ScheduleBlock) -> DayWeaveMoveRiskEnvelope? {
+        guard let window = proposedWindow(for: block),
+              let deadlines = reviewedDeadlines(for: block) else { return nil }
+        let envelope = DayWeaveMoveRiskEnvelope(
+            moveStart: window.start,
+            moveEnd: window.end,
+            deadlines: deadlines,
+            fixedConflicts: Set(
+                fixedConflicts(for: block).map(DayWeaveMoveConflictIdentity.init)
+            ),
+            sourceRequiresOverride: sourceRequiresOverride(block)
+        )
+        return envelope.hasValidShape ? envelope : nil
+    }
+
+    private func canOverrideDeadlines(
+        _ deadlines: Set<DayWeaveMoveDeadlineIdentity>,
+        for block: ScheduleBlock
+    ) -> Bool {
+        let hard = deadlines.filter(\.boundary.isHard)
+        if hard.isEmpty { return true }
+        return block.status == .scheduled && block.occurrenceID == nil
+            && hard.allSatisfy(\.boundary.isCanonicalField)
+    }
+
+    private func deadlineConflictText(
+        for block: ScheduleBlock,
+        label: String,
+        suffix: String,
+        cannotOverride: Bool
+    ) -> String {
+        let subject = block.occurrenceID == nil
+            ? "The moved work would finish"
+            : "Fresh composition could place moved work"
+        let tail = cannotOverride ? "; this move cannot safely override it." : "."
+        return "\(subject) after a\(cannotOverride ? " hard" : "") latest finish (\(label))\(suffix)\(tail)"
+    }
+
+    private func deadlineApprovalBinding(for block: ScheduleBlock) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard let risk = currentRisk(for: block) else { return false }
+                return approvedDeadlineRisk == risk
+            },
+            set: { approved in
+                approvedDeadlineRisk = approved ? currentRisk(for: block) : nil
+            }
+        )
+    }
+
+    private func overlapApprovalBinding(for block: ScheduleBlock) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard let risk = currentRisk(for: block) else { return false }
+                return approvedOverlapRisk == risk
+            },
+            set: { approved in
+                approvedOverlapRisk = approved ? currentRisk(for: block) : nil
+            }
+        )
+    }
+
+    private func sourceRequiresOverride(_ block: ScheduleBlock) -> Bool {
+        (block.status == .active || block.status == .paused)
+            && block.previewKind == "pinned"
+    }
+
+    private func sourceApprovalBinding(for block: ScheduleBlock) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard let risk = currentRisk(for: block) else { return false }
+                return approvedSourceRisk == risk
+            },
+            set: { approved in
+                approvedSourceRisk = approved ? currentRisk(for: block) : nil
+            }
+        )
+    }
+}
+
 private struct ExecutionPauseEditor: View {
     @Binding var mode: ExecutionPauseEditorMode
     @Binding var minutes: Int
@@ -1295,9 +2041,11 @@ private struct AuthoritativeExecutionContextMenu: View {
             if block.status == .scheduled {
                 Button("Start") { Task { await executionSync.start(block.id) } }
                     .disabled(!canStart)
-                Button("Do later") { store.doLater(block.id) }
-                    .disabled(!contextIsUnlocked || !store.canMutate(block)
-                        || !block.isFlexible || block.isHardConstraint)
+                WillDoLaterButton(
+                    block: block,
+                    title: "Will do later",
+                    accessibilityScope: "execution-context-scheduled"
+                )
                 Button("Skip without starting") { store.skip(block.id) }
                     .disabled(!contextIsUnlocked || !store.canMutate(block))
             } else if block.status == .active {
@@ -1327,6 +2075,11 @@ private struct AuthoritativeExecutionContextMenu: View {
                     .disabled(!canControlOpenLease)
                 Button("Skip") { Task { await executionSync.skip(block.id) } }
                     .disabled(!canControlOpenLease)
+                WillDoLaterButton(
+                    block: block,
+                    title: "Will do later",
+                    accessibilityScope: "execution-context-open"
+                )
             }
         }
     }
@@ -2387,15 +3140,21 @@ private struct BlockInspector: View {
 
                 if !isExternalFixed {
                     if block.sourceItemID != nil {
-                        AuthoritativeExecutionControls(block: block)
+                        AuthoritativeExecutionControls(
+                            block: block,
+                            accessibilityScope: "inspector"
+                        )
                     } else {
                         HStack {
                             Button("Start") { store.start(block.id) }
                                 .buttonStyle(.borderedProminent)
                             Button("Complete") { store.complete(block.id) }
                             Menu("More") {
-                                Button("Do Later") { store.doLater(block.id) }
-                                    .disabled(!block.isFlexible || block.isHardConstraint)
+                                WillDoLaterButton(
+                                    block: block,
+                                    title: "Will do later",
+                                    accessibilityScope: "inspector-more-local"
+                                )
                                 Button("Skip") { store.skip(block.id) }
                             }
                         }
@@ -3977,6 +4736,7 @@ struct MenuBarView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @StateObject private var willDoLaterPresenter = WillDoLaterPresenter()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -3995,7 +4755,8 @@ struct MenuBarView: View {
                     if active.sourceItemID != nil {
                         AuthoritativeExecutionControls(
                             block: active,
-                            includesCustomPause: false
+                            includesCustomPause: false,
+                            accessibilityScope: "menu-bar-active"
                         )
                         if executionSync.expiredBreakChoiceRequired {
                             Button("Keep paused") {
@@ -4054,6 +4815,14 @@ struct MenuBarView: View {
                 Task { await executionSync.refresh() }
             }
             .disabled(executionSync.isSyncing || !store.canMutatePlan)
+        }
+        .environmentObject(willDoLaterPresenter)
+        .sheet(item: $willDoLaterPresenter.request) { request in
+            WillDoLaterSheet(request: request)
+                .environmentObject(store)
+                .environmentObject(canonicalSync)
+                .environmentObject(executionSync)
+                .environmentObject(willDoLaterPresenter)
         }
         .padding(14)
         .frame(width: 300)

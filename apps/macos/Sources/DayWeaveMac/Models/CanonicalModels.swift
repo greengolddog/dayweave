@@ -650,6 +650,33 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
     }
 
     struct Plan: Codable, Equatable, Sendable {
+        /// Exact occurrence metadata returned by the scheduler. The timestamp
+        /// strings deliberately remain strings instead of being round-tripped
+        /// through `Date`: a later cross-horizon move must send the exact
+        /// server-issued nominal envelope back to the scheduler.
+        struct Occurrence: Codable, Equatable, Sendable {
+            let id: UUID
+            let seriesItemID: UUID
+            let identity: RecurrenceOccurrenceIdentity
+            let nominalStart: String
+            let nominalEnd: String
+            let windowStart: String
+            let windowEnd: String
+            let localDate: String?
+            let ordinal: UInt32
+            let state: String
+
+            private enum CodingKeys: String, CodingKey {
+                case id, identity, ordinal, state
+                case seriesItemID = "series_item_id"
+                case nominalStart = "nominal_start"
+                case nominalEnd = "nominal_end"
+                case windowStart = "window_start"
+                case windowEnd = "window_end"
+                case localDate = "local_date"
+            }
+        }
+
         struct Block: Codable, Equatable, Identifiable, Sendable {
             struct Explanation: Codable, Equatable, Sendable {
                 let code: String
@@ -710,7 +737,7 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
         let decisions: [JSONValue]
         let violations: [JSONValue]
         let score: Score
-        let occurrences: [JSONValue]
+        let occurrences: [Occurrence]
 
         private enum CodingKeys: String, CodingKey {
             case blocks, unscheduled, decisions, violations, score, occurrences
