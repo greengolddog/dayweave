@@ -645,7 +645,7 @@ struct ExecutionSyncStoreTests {
             asOf: compositionNow,
             horizonStart: compositionNow.addingTimeInterval(-60),
             horizonEnd: compositionNow.addingTimeInterval(7 * 24 * 60 * 60),
-            timezoneName: "Europe/Madrid",
+            timezoneName: firstLaunch.scheduleProfile.timezoneName,
             sourceItemRevisions: [Self.itemID: 1]
         )
         #expect(firstLaunch.beginCanonicalSync())
