@@ -22,39 +22,12 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
         guard let timeoutNanoseconds = Self.nanoseconds(timeout), timeoutNanoseconds > 0 else {
             throw SchedulerHelperClientError.timedOut
         }
-        let child = try Self.spawn(executable)
-        let lifecycle = SchedulerHelperChildLifecycle(pid: child.pid)
+        let cancellation = SchedulerHelperCancellationRelay()
         return try await withTaskCancellationHandler {
-            let monitor = Task.detached {
-                Self.monitor(
-                    lifecycle,
-                    timeoutNanoseconds: timeoutNanoseconds,
-                    graceNanoseconds: terminationGraceNanoseconds
-                )
-            }
-            let input = Task.detached {
-                Self.write(
-                    standardInput,
-                    descriptor: child.standardInput,
-                    lifecycle: lifecycle
-                )
-            }
-            let output = Task.detached {
-                Self.read(
-                    descriptor: child.standardOutput,
-                    limit: SchedulerHelperClient.maximumStandardOutputBytes,
-                    overflowReason: .standardOutputTooLarge,
-                    lifecycle: lifecycle
-                )
-            }
-            let error = Task.detached {
-                Self.read(
-                    descriptor: child.standardError,
-                    limit: SchedulerHelperClient.maximumStandardErrorBytes,
-                    overflowReason: .standardErrorTooLarge,
-                    lifecycle: lifecycle
-                )
-            }
+            try Task.checkCancellation()
+            let child = try Self.spawn(executable)
+            let lifecycle = SchedulerHelperChildLifecycle(pid: child.pid)
+            cancellation.install(lifecycle)
 
             do {
                 try SchedulerHelperExecutableValidator.revalidate(executable)
@@ -62,14 +35,22 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
                 lifecycle.requestStop(.executableChanged)
             }
 
-            let monitored = await monitor.value
-            let inputResult = await input.value
-            let outputResult = await output.value
-            let errorResult = await error.value
+            // POSIX polling, reads, writes, and waitpid are intentionally kept
+            // off Swift's cooperative executor. A strict/single-lane executor
+            // can otherwise run the monitor first and starve the three stream
+            // workers forever. Dedicated native threads also bound this helper
+            // invocation independently of unrelated application tasks.
+            let blockingResult = await SchedulerHelperBlockingWorkers.run(
+                child: child,
+                lifecycle: lifecycle,
+                standardInput: standardInput,
+                timeoutNanoseconds: timeoutNanoseconds,
+                graceNanoseconds: terminationGraceNanoseconds
+            )
 
             if Task.isCancelled { throw CancellationError() }
-            if monitored.stopReason == .cancelled { throw CancellationError() }
-            switch monitored.stopReason {
+            if blockingResult.monitor.stopReason == .cancelled { throw CancellationError() }
+            switch blockingResult.monitor.stopReason {
             case .timedOut:
                 throw SchedulerHelperClientError.timedOut
             case .standardOutputTooLarge, .standardErrorTooLarge:
@@ -81,14 +62,14 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
             case .cancelled, .none:
                 break
             }
-            if case let .failure(error) = inputResult { throw error }
-            if case let .failure(error) = outputResult { throw error }
-            if case let .failure(error) = errorResult { throw error }
-            guard case let .success(standardOutput) = outputResult,
-                  case let .success(standardError) = errorResult else {
+            if case let .failure(error) = blockingResult.input { throw error }
+            if case let .failure(error) = blockingResult.output { throw error }
+            if case let .failure(error) = blockingResult.error { throw error }
+            guard case let .success(standardOutput) = blockingResult.output,
+                  case let .success(standardError) = blockingResult.error else {
                 throw SchedulerHelperClientError.inputOutputFailure
             }
-            guard let termination = monitored.termination else {
+            guard let termination = blockingResult.monitor.termination else {
                 throw SchedulerHelperClientError.unexpectedTermination
             }
             return SchedulerHelperProcessResult(
@@ -97,7 +78,7 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
                 termination: termination
             )
         } onCancel: {
-            lifecycle.requestStop(.cancelled)
+            cancellation.cancel()
         }
     }
 
@@ -232,7 +213,7 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
         }
     }
 
-    private static func write(
+    fileprivate static func write(
         _ data: Data,
         descriptor: Int32,
         lifecycle: SchedulerHelperChildLifecycle
@@ -272,7 +253,7 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
         return .success(())
     }
 
-    private static func read(
+    fileprivate static func read(
         descriptor: Int32,
         limit: Int,
         overflowReason: SchedulerHelperStopReason,
@@ -310,7 +291,7 @@ struct SchedulerHelperProcessRunner: SchedulerHelperProcessRunning, Sendable {
         while Darwin.poll(&descriptor, 1, 10) < 0, errno == EINTR {}
     }
 
-    private static func monitor(
+    fileprivate static func monitor(
         _ lifecycle: SchedulerHelperChildLifecycle,
         timeoutNanoseconds: UInt64,
         graceNanoseconds: UInt64
@@ -393,6 +374,182 @@ private enum SchedulerHelperStopReason: Equatable, Sendable {
 private struct SchedulerHelperMonitorResult: Sendable {
     let termination: SchedulerHelperTermination?
     let stopReason: SchedulerHelperStopReason?
+}
+
+private struct SchedulerHelperBlockingResult: Sendable {
+    let monitor: SchedulerHelperMonitorResult
+    let input: Result<Void, SchedulerHelperClientError>
+    let output: Result<Data, SchedulerHelperClientError>
+    let error: Result<Data, SchedulerHelperClientError>
+}
+
+/// Runs the four blocking POSIX loops on dedicated native threads. Swift
+/// detached tasks are not suitable here: they still occupy cooperative
+/// executor lanes and can starve one another when the global executor is
+/// constrained to a single lane.
+private final class SchedulerHelperBlockingWorkers: @unchecked Sendable {
+    private let child: SchedulerHelperSpawnedChild
+    private let lifecycle: SchedulerHelperChildLifecycle
+    private let standardInput: Data
+    private let timeoutNanoseconds: UInt64
+    private let graceNanoseconds: UInt64
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<SchedulerHelperBlockingResult, Never>?
+    private var completedWorkerCount = 0
+    private var monitorResult: SchedulerHelperMonitorResult?
+    private var inputResult: Result<Void, SchedulerHelperClientError>?
+    private var outputResult: Result<Data, SchedulerHelperClientError>?
+    private var errorResult: Result<Data, SchedulerHelperClientError>?
+
+    private init(
+        child: SchedulerHelperSpawnedChild,
+        lifecycle: SchedulerHelperChildLifecycle,
+        standardInput: Data,
+        timeoutNanoseconds: UInt64,
+        graceNanoseconds: UInt64,
+        continuation: CheckedContinuation<SchedulerHelperBlockingResult, Never>
+    ) {
+        self.child = child
+        self.lifecycle = lifecycle
+        self.standardInput = standardInput
+        self.timeoutNanoseconds = timeoutNanoseconds
+        self.graceNanoseconds = graceNanoseconds
+        self.continuation = continuation
+    }
+
+    static func run(
+        child: SchedulerHelperSpawnedChild,
+        lifecycle: SchedulerHelperChildLifecycle,
+        standardInput: Data,
+        timeoutNanoseconds: UInt64,
+        graceNanoseconds: UInt64
+    ) async -> SchedulerHelperBlockingResult {
+        await withCheckedContinuation { continuation in
+            let workers = SchedulerHelperBlockingWorkers(
+                child: child,
+                lifecycle: lifecycle,
+                standardInput: standardInput,
+                timeoutNanoseconds: timeoutNanoseconds,
+                graceNanoseconds: graceNanoseconds,
+                continuation: continuation
+            )
+            workers.start()
+        }
+    }
+
+    private func start() {
+        startThread(named: "dayweave.scheduler.monitor") { [self] in
+            completeMonitor(SchedulerHelperProcessRunner.monitor(
+                lifecycle,
+                timeoutNanoseconds: timeoutNanoseconds,
+                graceNanoseconds: graceNanoseconds
+            ))
+        }
+        startThread(named: "dayweave.scheduler.stdin") { [self] in
+            completeInput(SchedulerHelperProcessRunner.write(
+                standardInput,
+                descriptor: child.standardInput,
+                lifecycle: lifecycle
+            ))
+        }
+        startThread(named: "dayweave.scheduler.stdout") { [self] in
+            completeOutput(SchedulerHelperProcessRunner.read(
+                descriptor: child.standardOutput,
+                limit: SchedulerHelperClient.maximumStandardOutputBytes,
+                overflowReason: .standardOutputTooLarge,
+                lifecycle: lifecycle
+            ))
+        }
+        startThread(named: "dayweave.scheduler.stderr") { [self] in
+            completeError(SchedulerHelperProcessRunner.read(
+                descriptor: child.standardError,
+                limit: SchedulerHelperClient.maximumStandardErrorBytes,
+                overflowReason: .standardErrorTooLarge,
+                lifecycle: lifecycle
+            ))
+        }
+    }
+
+    private func startThread(named name: String, body: @escaping @Sendable () -> Void) {
+        let thread = Thread {
+            autoreleasepool(invoking: body)
+        }
+        thread.name = name
+        thread.qualityOfService = .userInitiated
+        thread.start()
+    }
+
+    private func completeMonitor(_ result: SchedulerHelperMonitorResult) {
+        complete { monitorResult = result }
+    }
+
+    private func completeInput(_ result: Result<Void, SchedulerHelperClientError>) {
+        complete { inputResult = result }
+    }
+
+    private func completeOutput(_ result: Result<Data, SchedulerHelperClientError>) {
+        complete { outputResult = result }
+    }
+
+    private func completeError(_ result: Result<Data, SchedulerHelperClientError>) {
+        complete { errorResult = result }
+    }
+
+    private func complete(_ record: () -> Void) {
+        let completion: (
+            CheckedContinuation<SchedulerHelperBlockingResult, Never>,
+            SchedulerHelperBlockingResult
+        )? = lock.withLock {
+            record()
+            completedWorkerCount += 1
+            guard completedWorkerCount == 4,
+                  let continuation,
+                  let monitorResult,
+                  let inputResult,
+                  let outputResult,
+                  let errorResult else {
+                return nil
+            }
+            self.continuation = nil
+            return (
+                continuation,
+                SchedulerHelperBlockingResult(
+                    monitor: monitorResult,
+                    input: inputResult,
+                    output: outputResult,
+                    error: errorResult
+                )
+            )
+        }
+        if let completion {
+            completion.0.resume(returning: completion.1)
+        }
+    }
+}
+
+/// Bridges cancellation across the small interval in which the child is
+/// spawned and its lifecycle becomes available to the cancellation handler.
+private final class SchedulerHelperCancellationRelay: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lifecycle: SchedulerHelperChildLifecycle?
+    private var isCancelled = false
+
+    func install(_ lifecycle: SchedulerHelperChildLifecycle) {
+        let shouldCancel = lock.withLock {
+            self.lifecycle = lifecycle
+            return isCancelled
+        }
+        if shouldCancel { lifecycle.requestStop(.cancelled) }
+    }
+
+    func cancel() {
+        let lifecycle = lock.withLock {
+            isCancelled = true
+            return self.lifecycle
+        }
+        lifecycle?.requestStop(.cancelled)
+    }
 }
 
 private final class SchedulerHelperChildLifecycle: @unchecked Sendable {

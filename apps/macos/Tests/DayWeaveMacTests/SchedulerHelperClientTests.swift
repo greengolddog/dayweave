@@ -221,7 +221,7 @@ struct SchedulerHelperClientTests {
         }
     }
 
-    @Test("runner uses no arguments or inherited environment and drains both outputs")
+    @Test("dedicated workers use no inherited environment and drain both outputs")
     func runnerInvocationAndConcurrentDrain() async throws {
         let fixture = try HelperBundleFixture(script: """
         #!/bin/sh
@@ -238,12 +238,51 @@ struct SchedulerHelperClientTests {
         let result = try await SchedulerHelperProcessRunner().run(
             executable: executable,
             standardInput: Data(repeating: 0x41, count: 1_024 * 1_024),
-            timeout: .seconds(60)
+            timeout: .seconds(5)
         )
 
         #expect(result.termination == .exited(0))
         #expect(result.standardOutput.count == 4 * 65_536)
         #expect(result.standardError.count == 4 * 65_536)
+    }
+
+    @Test("parallel runners complete without cooperative executor capacity")
+    func parallelRunnersDoNotDependOnCooperativeExecutorCapacity() async throws {
+        let fixture = try HelperBundleFixture(script: """
+        #!/bin/sh
+        /bin/cat >/dev/null
+        printf 'stdout'
+        printf 'stderr' >&2
+        """)
+        defer { fixture.cleanUp() }
+        let executable = try SchedulerHelperExecutableValidator.validate(fixture.location)
+        let runner = SchedulerHelperProcessRunner()
+        let input = Data(repeating: 0x41, count: 256 * 1_024)
+
+        let results = try await withThrowingTaskGroup(
+            of: SchedulerHelperProcessResult.self,
+            returning: [SchedulerHelperProcessResult].self
+        ) { group in
+            for _ in 0..<2 {
+                group.addTask {
+                    try await runner.run(
+                        executable: executable,
+                        standardInput: input,
+                        timeout: .seconds(5)
+                    )
+                }
+            }
+            var results: [SchedulerHelperProcessResult] = []
+            for try await result in group {
+                results.append(result)
+            }
+            return results
+        }
+
+        #expect(results.count == 2)
+        #expect(results.allSatisfy { $0.termination == .exited(0) })
+        #expect(results.allSatisfy { $0.standardOutput == Data("stdout".utf8) })
+        #expect(results.allSatisfy { $0.standardError == Data("stderr".utf8) })
     }
 
     @Test("early stdin close leaves bounded rejection authoritative")
