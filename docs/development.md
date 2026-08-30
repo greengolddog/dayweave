@@ -16,6 +16,9 @@
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+# Apple Silicon macOS only:
+cargo test --locked --package dayweave-scheduler-helper --all-targets --all-features --target aarch64-apple-darwin
+scripts/build-macos-scheduler-helper.sh
 swift build --package-path apps/macos
 ./scripts/test-macos.sh -Xswiftc -warnings-as-errors
 apps/android/gradlew --project-dir apps/android test lint assembleDebug
@@ -48,6 +51,20 @@ The script verifies the pinned Codex runtime and final signatures, then writes
 both `dist/macos/DayWeave.app` and an integrity-tested
 `dist/macos/DayWeave-macOS.zip` with a SHA-256 checksum. Both outputs are
 ignored by Git.
+
+Build and verify the dormant local scheduler process bridge with:
+
+```sh
+scripts/build-macos-scheduler-helper.sh
+```
+
+The script requires an Apple Silicon Mac, Rust 1.95.0, and the
+`aarch64-apple-darwin` target. It emits an ad-hoc-signed, macOS 15-compatible
+Mach-O under ignored `target/` output and rejects non-system dynamic-library
+links. The helper is not copied into `DayWeave.app` or invoked by Swift yet;
+this gate establishes the bounded process contract without presenting local
+composition as a shipped feature. See the
+[scheduler helper process contract](scheduler-helper.md).
 
 The outer app uses an ad-hoc signature because no Apple Developer membership is
 in scope. It is suitable for a trusted build made and launched by the same Mac

@@ -4,6 +4,7 @@ members = [
     "crates/dayweave-codex",
     "crates/dayweave-core",
     "crates/dayweave-google",
+    "crates/dayweave-scheduler-helper",
     "server/dayweave-api",
 ]
 

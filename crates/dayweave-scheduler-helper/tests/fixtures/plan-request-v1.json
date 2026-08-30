@@ -1,0 +1,55 @@
+{
+  "protocol": "dayweave.scheduler.helper",
+  "version": 1,
+  "operation": "plan",
+  "request": {
+    "as_of": "2026-09-01T07:00:00Z",
+    "horizon_start": "2026-09-01T00:00:00Z",
+    "horizon_end": "2026-09-02T00:00:00Z",
+    "items": [
+      {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "is_sensitive": false,
+        "revision": 1,
+        "title": "Golden task",
+        "kind": { "type": "task" },
+        "status": "not_started",
+        "parent_id": null,
+        "sibling_order": null,
+        "has_own_effort": false,
+        "goal_ids": [],
+        "priority": { "importance": 5, "urgency": 5 },
+        "duration": {
+          "minimum": 30,
+          "expected": 30,
+          "maximum": 30,
+          "remaining": null,
+          "source": "user"
+        },
+        "constraints": {},
+        "split_policy": { "type": "indivisible" },
+        "energy": null,
+        "tags": [],
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z"
+      }
+    ],
+    "availability": [
+      {
+        "start": "2026-09-01T08:00:00Z",
+        "end": "2026-09-01T09:00:00Z",
+        "contexts": [],
+        "location": null,
+        "energy": "deep"
+      }
+    ],
+    "fixed_blocks": [],
+    "previous_assignments": [],
+    "config": {
+      "slot_granularity": 5,
+      "stability_weight": 4,
+      "default_soft_weight": 100
+    },
+    "recurrence_context": {}
+  }
+}

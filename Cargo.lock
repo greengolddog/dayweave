@@ -577,6 +577,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "dayweave-scheduler-helper"
+version = "0.1.0"
+dependencies = [
+ "dayweave-core",
+ "serde",
+ "serde_json",
+ "time",
+]
+
+[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

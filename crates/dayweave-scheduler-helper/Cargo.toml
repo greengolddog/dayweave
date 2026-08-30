@@ -1,0 +1,18 @@
+[package]
+name = "dayweave-scheduler-helper"
+description = "Bounded local process bridge to the deterministic DayWeave scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+dayweave-core = { path = "../dayweave-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting"] }
+
+[lints]
+workspace = true
