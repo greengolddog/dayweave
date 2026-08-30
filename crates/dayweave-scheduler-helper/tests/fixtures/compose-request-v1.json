@@ -1,0 +1,57 @@
+{
+  "protocol": "dayweave.scheduler.helper",
+  "version": 1,
+  "operation": "compose",
+  "request": {
+    "canonical_items": [
+      {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "is_sensitive": false,
+        "kind": "task",
+        "status": "planned",
+        "title": "Golden task",
+        "notes": null,
+        "timezone_name": "UTC",
+        "duration_seconds": 1800,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" },
+        "importance": 50,
+        "urgency": 50,
+        "parent_id": null,
+        "sibling_order": 0,
+        "is_executable": true,
+        "revision": 1,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z",
+        "completed_at": null,
+        "deleted_at": null
+      }
+    ],
+    "schedule": {
+      "as_of": "2026-09-01T07:00:00Z",
+      "horizon_start": "2026-09-01T00:00:00Z",
+      "horizon_end": "2026-09-02T00:00:00Z",
+      "timezone_name": "UTC",
+      "availability": [
+        {
+          "start": "2026-09-01T08:00:00Z",
+          "end": "2026-09-01T09:00:00Z",
+          "contexts": [],
+          "location": null,
+          "energy": "deep"
+        }
+      ],
+      "fixed_blocks": [],
+      "previous_assignments": [],
+      "config": {
+        "slot_granularity_minutes": 5,
+        "stability_weight": 4,
+        "default_soft_weight": 100
+      },
+      "recurrence_context": {}
+    }
+  }
+}

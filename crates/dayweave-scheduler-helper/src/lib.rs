@@ -8,12 +8,20 @@ mod shape;
 mod strict_json;
 mod wire;
 
+use dayweave_compose::{
+    CanonicalItem, ComposeScheduleRequest, IgnoredPreviousAssignment, PrepareScheduleError,
+    PreparedSchedule, RejectedScheduleItem, prepare_canonical_schedule,
+};
 use dayweave_core::{PlanRequest, ScheduleError, Scheduler};
 use limits::PreflightError;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use strict_json::StrictJsonError;
+use uuid::Uuid;
 use wire::PlanOutput;
 
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
@@ -24,7 +32,10 @@ pub const INTERNAL_EXIT_CODE: u8 = 70;
 
 const PROTOCOL: &str = "dayweave.scheduler.helper";
 const VERSION: u16 = 1;
-const OPERATION: &str = "plan";
+const PLAN_OPERATION: &str = "plan";
+const COMPOSE_OPERATION: &str = "compose";
+const LOCAL_FINGERPRINT_DOMAIN: &str = "dayweave.scheduler-helper.local-composition.v1";
+const LOCAL_FINGERPRINT_PREFIX: &str = "local-sha256:";
 const INTERNAL_RESPONSE: &[u8] = b"{\"protocol\":\"dayweave.scheduler.helper\",\"version\":1,\"result\":{\"type\":\"error\",\"error\":{\"code\":\"internal_failure\",\"message\":\"The scheduler helper could not complete the request.\"}}}\n";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,7 +55,31 @@ struct ResponseEnvelope {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ResponseResult {
     Plan { plan: PlanOutput },
+    Composition { composition: CompositionOutput },
     Error { error: ErrorOutput },
+}
+
+#[derive(Debug, Serialize)]
+struct CompositionOutput {
+    local_input_fingerprint: String,
+    source_item_count: usize,
+    source_item_revisions: BTreeMap<Uuid, u64>,
+    accepted_item_count: usize,
+    rejected_items: Vec<RejectedScheduleItem>,
+    ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
+    plan: PlanOutput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeOperationRequest {
+    canonical_items: Vec<CanonicalItem>,
+    schedule: ComposeScheduleRequest,
+}
+
+enum OperationRequest<'a> {
+    Plan(&'a serde_json::Value),
+    Compose(&'a serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -53,7 +88,7 @@ struct ErrorOutput {
     message: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ErrorCode {
     RequestTooLarge,
@@ -116,7 +151,7 @@ impl ErrorCode {
 #[must_use]
 pub fn process_bytes(input: &[u8]) -> ProcessOutput {
     match process(input) {
-        Ok(plan) => encode_plan(plan),
+        Ok(result) => encode_success(result),
         Err(code) => error_output(code),
     }
 }
@@ -136,7 +171,7 @@ pub fn internal_failure_output() -> ProcessOutput {
     }
 }
 
-fn process(input: &[u8]) -> Result<PlanOutput, ErrorCode> {
+fn process(input: &[u8]) -> Result<ResponseResult, ErrorCode> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(ErrorCode::RequestTooLarge);
     }
@@ -149,17 +184,61 @@ fn process(input: &[u8]) -> Result<PlanOutput, ErrorCode> {
         StrictJsonError::DepthExceeded => ErrorCode::JsonDepthExceeded,
         StrictJsonError::ResourceLimit => ErrorCode::ResourceLimitExceeded,
     })?;
-    let request_value = decode_envelope(&value)?;
+    match decode_envelope(&value)? {
+        OperationRequest::Plan(request_value) => process_plan(request_value),
+        OperationRequest::Compose(request_value) => process_composition(request_value),
+    }
+}
+
+fn process_plan(request_value: &serde_json::Value) -> Result<ResponseResult, ErrorCode> {
     shape::validate(request_value).map_err(|()| ErrorCode::InvalidRequest)?;
     let request = PlanRequest::deserialize(request_value).map_err(|_| ErrorCode::InvalidRequest)?;
     limits::validate(&request).map_err(map_preflight_error)?;
     let plan = catch_unwind(AssertUnwindSafe(|| Scheduler.plan(&request)))
         .map_err(|_| ErrorCode::InternalFailure)?
         .map_err(|error| map_schedule_error(&error))?;
-    PlanOutput::try_from(plan).map_err(|_| ErrorCode::InternalFailure)
+    let plan = PlanOutput::try_from(plan).map_err(|_| ErrorCode::InternalFailure)?;
+    Ok(ResponseResult::Plan { plan })
 }
 
-fn decode_envelope(value: &serde_json::Value) -> Result<&serde_json::Value, ErrorCode> {
+fn process_composition(request_value: &serde_json::Value) -> Result<ResponseResult, ErrorCode> {
+    let request = ComposeOperationRequest::deserialize(request_value)
+        .map_err(|_| ErrorCode::InvalidRequest)?;
+    let prepared = catch_unwind(AssertUnwindSafe(|| {
+        prepare_canonical_schedule(request.canonical_items, request.schedule)
+    }))
+    .map_err(|_| ErrorCode::InternalFailure)?
+    .map_err(|error| map_prepare_error(&error))?;
+    limits::validate(&prepared.plan_request).map_err(map_preflight_error)?;
+    let local_input_fingerprint = local_input_fingerprint(&prepared)?;
+    let plan = catch_unwind(AssertUnwindSafe(|| Scheduler.plan(&prepared.plan_request)))
+        .map_err(|_| ErrorCode::InternalFailure)?
+        .map_err(|error| map_schedule_error(&error))?;
+    let plan = PlanOutput::try_from(plan).map_err(|_| ErrorCode::InternalFailure)?;
+    let PreparedSchedule {
+        source_item_count,
+        source_item_revisions,
+        accepted_item_count,
+        rejected_items,
+        ignored_previous_assignments,
+        timezone_name: _,
+        effective_sensitivity: _,
+        plan_request: _,
+    } = prepared;
+    Ok(ResponseResult::Composition {
+        composition: CompositionOutput {
+            local_input_fingerprint,
+            source_item_count,
+            source_item_revisions,
+            accepted_item_count,
+            rejected_items,
+            ignored_previous_assignments,
+            plan,
+        },
+    })
+}
+
+fn decode_envelope(value: &serde_json::Value) -> Result<OperationRequest<'_>, ErrorCode> {
     let object = value.as_object().ok_or(ErrorCode::InvalidRequest)?;
     let expected = ["protocol", "version", "operation", "request"];
     if object.len() != expected.len() || expected.iter().any(|field| !object.contains_key(*field)) {
@@ -180,17 +259,18 @@ fn decode_envelope(value: &serde_json::Value) -> Result<&serde_json::Value, Erro
     let operation = object["operation"]
         .as_str()
         .ok_or(ErrorCode::InvalidRequest)?;
-    if operation != OPERATION {
-        return Err(ErrorCode::UnsupportedOperation);
+    match operation {
+        PLAN_OPERATION => Ok(OperationRequest::Plan(&object["request"])),
+        COMPOSE_OPERATION => Ok(OperationRequest::Compose(&object["request"])),
+        _ => Err(ErrorCode::UnsupportedOperation),
     }
-    Ok(&object["request"])
 }
 
-fn encode_plan(plan: PlanOutput) -> ProcessOutput {
+fn encode_success(result: ResponseResult) -> ProcessOutput {
     let response = ResponseEnvelope {
         protocol: PROTOCOL,
         version: VERSION,
-        result: ResponseResult::Plan { plan },
+        result,
     };
     match encode(&response) {
         Ok(stdout) => ProcessOutput {
@@ -269,6 +349,58 @@ fn encode(response: &ResponseEnvelope) -> Result<Vec<u8>, EncodeError> {
     Ok(output.bytes)
 }
 
+fn local_input_fingerprint(prepared: &PreparedSchedule) -> Result<String, ErrorCode> {
+    #[derive(Serialize)]
+    struct FingerprintInput<'a> {
+        domain: &'static str,
+        timezone_name: &'a str,
+        source_item_revisions: &'a BTreeMap<Uuid, u64>,
+        plan_request: &'a PlanRequest,
+    }
+
+    let mut hasher = Sha256::new();
+    serde_json::to_writer(
+        DigestWriter(&mut hasher),
+        &FingerprintInput {
+            domain: LOCAL_FINGERPRINT_DOMAIN,
+            timezone_name: &prepared.timezone_name,
+            source_item_revisions: &prepared.source_item_revisions,
+            plan_request: &prepared.plan_request,
+        },
+    )
+    .map_err(|_| ErrorCode::InternalFailure)?;
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(LOCAL_FINGERPRINT_PREFIX.len() + digest.len() * 2);
+    encoded.push_str(LOCAL_FINGERPRINT_PREFIX);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").map_err(|_| ErrorCode::InternalFailure)?;
+    }
+    Ok(encoded)
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl io::Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+const fn map_prepare_error(error: &PrepareScheduleError) -> ErrorCode {
+    match error {
+        PrepareScheduleError::InvalidRequest(_) => ErrorCode::InvalidRequest,
+        PrepareScheduleError::TooManyItems => ErrorCode::ResourceLimitExceeded,
+        PrepareScheduleError::DuplicateCanonicalItem(_) => ErrorCode::DuplicateItem,
+        PrepareScheduleError::InvalidCanonicalItem(_) => ErrorCode::InvalidItem,
+        PrepareScheduleError::AccountingOverflow => ErrorCode::InternalFailure,
+    }
+}
+
 fn map_preflight_error(error: PreflightError) -> ErrorCode {
     match error {
         PreflightError::Schedule(error) => map_schedule_error(&error),
@@ -295,6 +427,10 @@ mod tests {
     use super::*;
 
     const GOLDEN_REQUEST: &[u8] = include_bytes!("../tests/fixtures/plan-request-v1.json");
+    const COMPOSE_GOLDEN_REQUEST: &[u8] =
+        include_bytes!("../tests/fixtures/compose-request-v1.json");
+    const COMPOSE_GOLDEN_SUCCESS: &[u8] =
+        include_bytes!("../tests/fixtures/compose-success-v1.json");
 
     fn error_code(output: &ProcessOutput) -> String {
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
@@ -317,12 +453,282 @@ mod tests {
         );
     }
 
+    fn composition_fingerprint(output: &ProcessOutput) -> String {
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        value["result"]["composition"]["local_input_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
     #[test]
     fn golden_request_is_deterministic() {
         let first = process_bytes(GOLDEN_REQUEST);
         let second = process_bytes(GOLDEN_REQUEST);
         assert_eq!(first, second);
         assert_eq!(first.exit_code, SUCCESS_EXIT_CODE);
+    }
+
+    #[test]
+    fn compose_golden_request_is_deterministic_and_exact() {
+        let first = process_bytes(COMPOSE_GOLDEN_REQUEST);
+        let second = process_bytes(COMPOSE_GOLDEN_REQUEST);
+        assert_eq!(first, second);
+        assert_eq!(first.exit_code, SUCCESS_EXIT_CODE);
+        assert_eq!(first.stdout, COMPOSE_GOLDEN_SUCCESS);
+
+        let value: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+        let composition = &value["result"]["composition"];
+        assert!(composition.get("input_digest").is_none());
+        assert!(composition.get("effective_sensitivity").is_none());
+        let fingerprint = composition["local_input_fingerprint"].as_str().unwrap();
+        assert!(fingerprint.starts_with(LOCAL_FINGERPRINT_PREFIX));
+        assert_eq!(fingerprint.len(), LOCAL_FINGERPRINT_PREFIX.len() + 64);
+        assert!(
+            fingerprint[LOCAL_FINGERPRINT_PREFIX.len()..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+    }
+
+    #[test]
+    fn plan_and_compose_do_not_accept_each_others_request_shape() {
+        let mut plan: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+        plan["operation"] = serde_json::json!(COMPOSE_OPERATION);
+        assert_eq!(
+            error_code(&process_bytes(&serde_json::to_vec(&plan).unwrap())),
+            "invalid_request"
+        );
+
+        let mut composition: serde_json::Value =
+            serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        composition["operation"] = serde_json::json!(PLAN_OPERATION);
+        assert_eq!(
+            error_code(&process_bytes(&serde_json::to_vec(&composition).unwrap())),
+            "invalid_request"
+        );
+    }
+
+    #[test]
+    fn compose_rejects_unknown_and_cache_only_fields_without_echoing_them() {
+        for mutate in [
+            |value: &mut serde_json::Value| {
+                value["request"]["boundary secret"] = serde_json::json!(true);
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["schedule"]["boundary secret"] = serde_json::json!(true);
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["schedule"]["availability"][0]["boundary secret"] =
+                    serde_json::json!(true);
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["schedule"]["config"]["boundary secret"] = serde_json::json!(true);
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["canonical_items"][0]["boundary secret"] = serde_json::json!(true);
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["canonical_items"][0]["_dayweave_non_roundtrippable_json_number"] =
+                    serde_json::json!("boundary secret");
+            },
+            |value: &mut serde_json::Value| {
+                value["request"]["canonical_items"][0]["split_policy"]["boundary secret"] =
+                    serde_json::json!(true);
+            },
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+            mutate(&mut value);
+            let output = process_bytes(&serde_json::to_vec(&value).unwrap());
+            assert_eq!(error_code(&output), "invalid_request");
+            assert!(
+                !output
+                    .stdout
+                    .windows(15)
+                    .any(|window| window == b"boundary secret")
+            );
+        }
+    }
+
+    #[test]
+    fn compose_duplicate_keys_inside_canonical_json_use_the_global_strict_code() {
+        let input = br#"{"protocol":"dayweave.scheduler.helper","version":1,"operation":"compose","request":{"canonical_items":[{"flexible_constraints":{"secret":1,"secret":2}}],"schedule":{}}}"#;
+        let output = process_bytes(input);
+        assert_eq!(error_code(&output), "duplicate_json_key");
+        assert!(!output.stdout.windows(6).any(|window| window == b"secret"));
+    }
+
+    #[test]
+    fn preparation_errors_map_by_variant_without_echoing_payloads() {
+        let private_id = Uuid::parse_str("feedface-feed-4ace-8eed-facefeedface").unwrap();
+        let cases = [
+            (
+                PrepareScheduleError::InvalidRequest("boundary secret".into()),
+                ErrorCode::InvalidRequest,
+            ),
+            (
+                PrepareScheduleError::TooManyItems,
+                ErrorCode::ResourceLimitExceeded,
+            ),
+            (
+                PrepareScheduleError::DuplicateCanonicalItem(private_id),
+                ErrorCode::DuplicateItem,
+            ),
+            (
+                PrepareScheduleError::InvalidCanonicalItem(private_id),
+                ErrorCode::InvalidItem,
+            ),
+            (
+                PrepareScheduleError::AccountingOverflow,
+                ErrorCode::InternalFailure,
+            ),
+        ];
+        for (error, expected) in cases {
+            let code = map_prepare_error(&error);
+            assert_eq!(code, expected);
+            let output = error_output(code);
+            assert_eq!(output.exit_code, expected.exit_code());
+            assert!(
+                !output
+                    .stdout
+                    .windows(15)
+                    .any(|value| value == b"boundary secret")
+            );
+            assert!(!output.stdout.windows(8).any(|value| value == b"feedface"));
+        }
+    }
+
+    #[test]
+    fn compose_preparation_precedes_core_preflight_with_stable_error_precedence() {
+        let mut invalid_schedule: serde_json::Value =
+            serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let duplicate = invalid_schedule["request"]["canonical_items"][0].clone();
+        invalid_schedule["request"]["canonical_items"] =
+            serde_json::json!([duplicate.clone(), duplicate]);
+        invalid_schedule["request"]["schedule"]["horizon_end"] =
+            invalid_schedule["request"]["schedule"]["horizon_start"].clone();
+        assert_eq!(
+            error_code(&process_bytes(
+                &serde_json::to_vec(&invalid_schedule).unwrap()
+            )),
+            "invalid_request"
+        );
+
+        let mut duplicate_invalid: serde_json::Value =
+            serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let mut invalid_item = duplicate_invalid["request"]["canonical_items"][0].clone();
+        invalid_item["title"] = serde_json::json!(" boundary secret ");
+        duplicate_invalid["request"]["canonical_items"] =
+            serde_json::json!([invalid_item.clone(), invalid_item]);
+        let output = process_bytes(&serde_json::to_vec(&duplicate_invalid).unwrap());
+        assert_eq!(error_code(&output), "duplicate_item");
+        assert!(
+            !output
+                .stdout
+                .windows(15)
+                .any(|window| window == b"boundary secret")
+        );
+    }
+
+    #[test]
+    fn compose_runs_the_existing_hierarchy_budget_after_preparation() {
+        let mut value: serde_json::Value = serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let template = value["request"]["canonical_items"][0].clone();
+        let mut items = Vec::new();
+        for index in 1_u16..=257 {
+            let mut item = template.clone();
+            item["id"] = serde_json::json!(format!("00000000-0000-0000-0000-{index:012x}"));
+            item["parent_id"] = if index == 1 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(format!("00000000-0000-0000-0000-{:012x}", index - 1))
+            };
+            items.push(item);
+        }
+        value["request"]["canonical_items"] = serde_json::Value::Array(items);
+        let output = process_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_eq!(error_code(&output), "resource_limit_exceeded");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(response["result"].get("composition").is_none());
+    }
+
+    #[test]
+    fn local_fingerprint_is_normalized_and_binds_revisions_timezone_and_plan_input() {
+        let baseline = process_bytes(COMPOSE_GOLDEN_REQUEST);
+        let baseline_fingerprint = composition_fingerprint(&baseline);
+
+        let reparsed: serde_json::Value = serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let normalized = process_bytes(&serde_json::to_vec_pretty(&reparsed).unwrap());
+        assert_eq!(composition_fingerprint(&normalized), baseline_fingerprint);
+
+        let mut two_items = reparsed.clone();
+        let first = two_items["request"]["canonical_items"][0].clone();
+        let mut second = first.clone();
+        second["id"] = serde_json::json!("00000000-0000-0000-0000-000000000002");
+        second["title"] = serde_json::json!("Second golden task");
+        two_items["request"]["canonical_items"] =
+            serde_json::json!([second.clone(), first.clone()]);
+        let reverse = process_bytes(&serde_json::to_vec(&two_items).unwrap());
+        two_items["request"]["canonical_items"] = serde_json::json!([first, second]);
+        let forward = process_bytes(&serde_json::to_vec(&two_items).unwrap());
+        assert_eq!(
+            composition_fingerprint(&forward),
+            composition_fingerprint(&reverse)
+        );
+
+        let mut revised = reparsed.clone();
+        revised["request"]["canonical_items"][0]["revision"] = serde_json::json!(2);
+        assert_ne!(
+            composition_fingerprint(&process_bytes(&serde_json::to_vec(&revised).unwrap())),
+            baseline_fingerprint
+        );
+
+        let mut timezone = reparsed;
+        timezone["request"]["schedule"]["timezone_name"] = serde_json::json!("Etc/UTC");
+        assert_ne!(
+            composition_fingerprint(&process_bytes(&serde_json::to_vec(&timezone).unwrap())),
+            baseline_fingerprint
+        );
+
+        let mut plan_input: serde_json::Value =
+            serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        plan_input["request"]["schedule"]["availability"][0]["energy"] = serde_json::json!("low");
+        assert_ne!(
+            composition_fingerprint(&process_bytes(&serde_json::to_vec(&plan_input).unwrap())),
+            baseline_fingerprint
+        );
+    }
+
+    #[test]
+    fn local_fingerprint_binds_revisions_for_items_excluded_from_the_plan() {
+        let mut value: serde_json::Value = serde_json::from_slice(COMPOSE_GOLDEN_REQUEST).unwrap();
+        value["request"]["canonical_items"][0]["status"] = serde_json::json!("inbox");
+        let first = process_bytes(&serde_json::to_vec(&value).unwrap());
+        value["request"]["canonical_items"][0]["revision"] = serde_json::json!(2);
+        let second = process_bytes(&serde_json::to_vec(&value).unwrap());
+        assert_ne!(
+            composition_fingerprint(&first),
+            composition_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn oversized_composition_output_fails_closed_with_the_existing_hard_cap() {
+        let mut result = process(COMPOSE_GOLDEN_REQUEST).unwrap();
+        let ResponseResult::Composition { composition } = &mut result else {
+            panic!("golden compose request must return a composition");
+        };
+        composition.rejected_items.push(RejectedScheduleItem {
+            item_id: Uuid::from_u128(9),
+            is_sensitive: true,
+            title: "x".repeat(MAX_OUTPUT_BYTES),
+            reason: "synthetic oversized result".into(),
+        });
+        let output = encode_success(result);
+        assert_eq!(output.exit_code, REJECTED_EXIT_CODE);
+        assert_eq!(error_code(&output), "response_too_large");
+        assert!(output.stdout.len() <= MAX_OUTPUT_BYTES);
     }
 
     #[test]

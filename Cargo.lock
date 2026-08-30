@@ -596,10 +596,13 @@ dependencies = [
 name = "dayweave-scheduler-helper"
 version = "0.1.0"
 dependencies = [
+ "dayweave-compose",
  "dayweave-core",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "time",
+ "uuid",
 ]
 
 [[package]]
