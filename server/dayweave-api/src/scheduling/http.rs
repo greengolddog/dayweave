@@ -1,7 +1,7 @@
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
-    routing::post,
+    routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,9 +11,10 @@ use uuid::Uuid;
 use crate::{AppState, auth::Principal, error::ApiError};
 
 use super::{
-    ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult, PublishScheduleSpec,
-    ScheduleAccess, SchedulePublication, SchedulePublicationError, compose_canonical_schedule,
-    compose_canonical_schedule_unfenced, postgres::decode_prefixed_sha256,
+    ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult, ManualPlacementApproval,
+    PublishScheduleSpec, RetainedManualPlacementCatalog, ScheduleAccess, SchedulePublication,
+    SchedulePublicationError, compose_canonical_schedule, compose_canonical_schedule_unfenced,
+    postgres::decode_prefixed_sha256,
 };
 
 pub const SCHEDULE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
@@ -22,6 +23,10 @@ pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/schedule/preview", post(preview_schedule))
         .route("/schedule/publish", post(publish_schedule))
+        .route(
+            "/schedule/manual-placements",
+            get(list_retained_manual_placements),
+        )
         .layer(DefaultBodyLimit::max(SCHEDULE_BODY_LIMIT_BYTES))
 }
 
@@ -31,6 +36,8 @@ pub struct PublishScheduleRequest {
     pub idempotency_key: Uuid,
     pub expected_input_digest: String,
     pub schedule: ComposeScheduleRequest,
+    #[serde(default)]
+    pub manual_placement_approvals: Vec<ManualPlacementApproval>,
 }
 
 #[utoipa::path(
@@ -62,6 +69,39 @@ pub(crate) async fn preview_schedule(
     }
     .map_err(|error| map_compose_error(&error))?;
     Ok(Json(result))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/schedule/manual-placements",
+    tag = "schedule",
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Owner-only content-free retained manual placement recovery catalog", body = RetainedManualPlacementCatalog),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Missing schedule_read or principal scope mismatch", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable schedule evidence is not configured or temporarily unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn list_retained_manual_placements(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<RetainedManualPlacementCatalog>, ApiError> {
+    let repository = state
+        .scheduling
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Durable schedule evidence is not configured"))?;
+    let access = ScheduleAccess {
+        subject: principal.subject,
+        include_sensitive: false,
+        workspace_id: principal.workspace_id,
+        user_id: principal.user_id,
+    };
+    repository
+        .retained_manual_placement_catalog(&access)
+        .await
+        .map(Json)
+        .map_err(map_publication_error)
 }
 
 #[utoipa::path(
@@ -114,6 +154,7 @@ pub(crate) async fn publish_schedule(
     }
 
     let timezone_name = request.schedule.timezone_name.clone();
+    let manual_placement_approvals = request.manual_placement_approvals;
     let result = compose_canonical_schedule(&state.items, repository, request.schedule)
         .await
         .map_err(|error| map_publish_compose_error(&error))?;
@@ -122,6 +163,7 @@ pub(crate) async fn publish_schedule(
             "Schedule preview is stale; preview again before publishing",
         ));
     }
+    validate_manual_placement_approvals(&result, &manual_placement_approvals)?;
     let publication = repository
         .publish(
             &access,
@@ -130,6 +172,7 @@ pub(crate) async fn publish_schedule(
                 request_hash,
                 input_digest: expected_input_digest,
                 timezone_name,
+                manual_placement_approvals,
                 result,
                 published_at: state.clock.now(),
             },
@@ -137,6 +180,42 @@ pub(crate) async fn publish_schedule(
         .await
         .map_err(map_publication_error)?;
     Ok(Json(publication))
+}
+
+fn validate_manual_placement_approvals(
+    result: &ComposeScheduleResult,
+    approvals: &[ManualPlacementApproval],
+) -> Result<(), ApiError> {
+    if approvals.len() > dayweave_compose::MAX_MANUAL_PLACEMENTS {
+        return Err(ApiError::validation(
+            "manual placement approval count exceeds the supported limit",
+        ));
+    }
+    let mut supplied = std::collections::BTreeMap::new();
+    for approval in approvals {
+        if approval.placement_id.is_nil()
+            || decode_prefixed_sha256(&approval.approval_digest).is_none()
+            || supplied
+                .insert(approval.placement_id, approval.approval_digest.as_str())
+                .is_some()
+        {
+            return Err(ApiError::validation(
+                "manual placement approvals must have unique ids and canonical sha256 digests",
+            ));
+        }
+    }
+    let required: std::collections::BTreeMap<_, _> = result
+        .manual_placement_assessments
+        .iter()
+        .filter(|assessment| assessment.approval_required)
+        .map(|assessment| (assessment.placement_id, assessment.approval_digest.as_str()))
+        .collect();
+    if supplied != required {
+        return Err(ApiError::schedule_publication_stale(
+            "Manual placement conflicts changed or were not approved; review the latest preview",
+        ));
+    }
+    Ok(())
 }
 
 fn publication_request_hash(
@@ -147,11 +226,13 @@ fn publication_request_hash(
         domain: &'static str,
         expected_input_digest: &'a str,
         schedule: &'a ComposeScheduleRequest,
+        manual_placement_approvals: &'a [ManualPlacementApproval],
     }
     let bytes = serde_json::to_vec(&Fingerprint {
         domain: "dayweave.schedule-publication-request.v1",
         expected_input_digest: &request.expected_input_digest,
         schedule: &request.schedule,
+        manual_placement_approvals: &request.manual_placement_approvals,
     })?;
     Ok(Sha256::digest(bytes).into())
 }
@@ -205,6 +286,7 @@ fn map_publish_compose_error(error: &ComposeScheduleError) -> ApiError {
         error,
         ComposeScheduleError::CalendarProjectionIncomplete
             | ComposeScheduleError::ExecutionEvidenceChanged
+            | ComposeScheduleError::AuthoritativeManualPlacementChanged(_)
     ) {
         return ApiError::schedule_publication_stale(
             "Schedule inputs changed after preview; preview again before publishing",

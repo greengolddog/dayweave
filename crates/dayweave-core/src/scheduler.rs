@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -10,9 +11,14 @@ use crate::{
     AvailabilityWindow, ConstraintStrength, DayOfWeek, Dependency, DependencyRelation,
     ExecutionDisposition, ExecutionPlanningContext, ExecutionReservation, ExecutionReservationKind,
     ExecutionWorkUnit, FixedBlockSource, ItemId, ItemKind, MaterializedIdentity, Minutes,
-    Occurrence, OccurrenceId, PlanRequest, PreviousBlock, SchedulingConstraints, SplitPolicy,
-    WorkItem, materialize_recurrences, roll_up_expected_durations,
+    Occurrence, OccurrenceId, PlanRequest, PreviousAssignment, PreviousBlock,
+    SchedulingConstraints, SplitPolicy, WorkItem, materialize_recurrences,
+    roll_up_expected_durations,
 };
+
+const MAX_MANUAL_ASSESSMENT_VIOLATIONS: usize = 4_096;
+const MAX_MANUAL_ASSESSMENT_CONFLICT_FACTS: usize = 4_096;
+const MAX_IMMUTABLE_OVERLAP_VIOLATIONS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchedulePlan {
@@ -26,6 +32,11 @@ pub struct SchedulePlan {
     pub score: PlanScore,
     #[serde(default)]
     pub occurrences: Vec<Occurrence>,
+    /// Exact hard-rule and immutable-block conflicts caused by explicit
+    /// caller-requested pinned placements. Automatic scheduling never creates
+    /// entries here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_placement_assessments: Vec<ManualPlacementAssessment>,
 }
 
 impl SchedulePlan {
@@ -141,6 +152,74 @@ pub struct PlanViolation {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualPlacementAssessment {
+    pub placement_id: Uuid,
+    pub environment_digest: [u8; 32],
+    pub violations: Vec<ManualPlacementViolation>,
+}
+
+/// Stable, content-free evidence the UI can show and bind to an approval.
+///
+/// Titles and notes are intentionally excluded. Clients may resolve visible
+/// labels from their sensitivity-aware cache while the server hashes these
+/// machine facts into a content-bound publication approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualPlacementViolation {
+    pub code: ManualPlacementViolationCode,
+    pub item_ids: Vec<ItemId>,
+    #[serde(default)]
+    pub occurrence_ids: Vec<OccurrenceId>,
+    #[serde(default)]
+    pub conflicting_block_ids: Vec<Uuid>,
+    #[serde(default)]
+    pub conflicting_blocks: Vec<ManualPlacementConflict>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub boundary_start: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub boundary_end: Option<OffsetDateTime>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualPlacementConflict {
+    pub block_id: Uuid,
+    pub item_id: Option<ItemId>,
+    pub occurrence_id: Option<OccurrenceId>,
+    pub external_block_id: Option<Uuid>,
+    pub kind: ScheduleBlockKind,
+    #[serde(with = "time::serde::rfc3339")]
+    pub start: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub end: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualPlacementViolationCode {
+    OutsideAvailability,
+    EarliestStart,
+    LatestFinish,
+    MinimumNotice,
+    AllowedWeekday,
+    PreferredDailyWindow,
+    PreferredAbsoluteWindow,
+    ForbiddenWindow,
+    RequiredContext,
+    RequiredLocation,
+    RequiredCapabilities,
+    Energy,
+    Dependency,
+    MaximumDailyWork,
+    MaximumWeeklyWork,
+    BufferCompressed,
+    ImmutableOverlap,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViolationKind {
@@ -186,6 +265,8 @@ pub enum ScheduleError {
     InvalidHierarchy(String),
     #[error("invalid recurrence: {0}")]
     InvalidRecurrence(String),
+    #[error("schedule conflict evidence exceeds the supported limit")]
+    ConflictEvidenceLimit,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -222,6 +303,14 @@ impl Scheduler {
         let (materialized_request, materialized_execution) =
             apply_execution_context(&materialized.request, &materialized.identities, execution)?;
         let mut plan = Self::plan_materialized(&materialized_request, &materialized_execution)?;
+        plan.manual_placement_assessments = assess_manual_placements(&materialized_request, &plan)?;
+        for violation in plan
+            .manual_placement_assessments
+            .iter()
+            .flat_map(|assessment| &assessment.violations)
+        {
+            plan.violations.push(violation.as_plan_violation());
+        }
         remap_occurrence_outputs(&mut plan, &materialized.identities);
         plan.occurrences = materialized.occurrences;
         Ok(plan)
@@ -232,6 +321,7 @@ impl Scheduler {
         execution: &MaterializedExecutionContext,
     ) -> Result<SchedulePlan, ScheduleError> {
         validate_request(request)?;
+        validate_manual_placement_demand(request, execution)?;
 
         let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
         let children = child_map(&request.items);
@@ -241,7 +331,7 @@ impl Scheduler {
         state.add_calendar_events(request);
         state.add_execution_reservations(request, &items, execution)?;
         state.add_pinned_assignments(request, &items);
-        state.detect_immutable_overlaps();
+        state.detect_immutable_overlaps()?;
 
         let mut eligible = Vec::new();
         for item in &request.items {
@@ -368,6 +458,29 @@ fn remap_occurrence_outputs(
         violation.item_ids.dedup();
         violation.occurrence_ids.sort_unstable();
         violation.occurrence_ids.dedup();
+    }
+    for assessment in &mut plan.manual_placement_assessments {
+        for violation in &mut assessment.violations {
+            for item_id in &mut violation.item_ids {
+                if let Some(identity) = identities.get(item_id) {
+                    *item_id = identity.series_item_id;
+                    violation.occurrence_ids.push(identity.occurrence_id);
+                }
+            }
+            for conflict in &mut violation.conflicting_blocks {
+                let Some(item_id) = conflict.item_id else {
+                    continue;
+                };
+                if let Some(identity) = identities.get(&item_id) {
+                    conflict.item_id = Some(identity.series_item_id);
+                    conflict.occurrence_id = Some(identity.occurrence_id);
+                }
+            }
+            violation.item_ids.sort_unstable();
+            violation.item_ids.dedup();
+            violation.occurrence_ids.sort_unstable();
+            violation.occurrence_ids.dedup();
+        }
     }
 }
 
@@ -651,11 +764,668 @@ impl Interval {
     }
 }
 
+impl ManualPlacementViolation {
+    fn as_plan_violation(&self) -> PlanViolation {
+        let kind = match self.code {
+            ManualPlacementViolationCode::LatestFinish => ViolationKind::DeadlineRisk,
+            ManualPlacementViolationCode::Dependency => ViolationKind::Dependency,
+            ManualPlacementViolationCode::BufferCompressed => ViolationKind::BufferCompressed,
+            ManualPlacementViolationCode::OutsideAvailability
+            | ManualPlacementViolationCode::MaximumDailyWork
+            | ManualPlacementViolationCode::MaximumWeeklyWork => ViolationKind::Capacity,
+            ManualPlacementViolationCode::ImmutableOverlap => ViolationKind::PinnedConflict,
+            ManualPlacementViolationCode::EarliestStart
+            | ManualPlacementViolationCode::MinimumNotice
+            | ManualPlacementViolationCode::AllowedWeekday
+            | ManualPlacementViolationCode::PreferredDailyWindow
+            | ManualPlacementViolationCode::PreferredAbsoluteWindow
+            | ManualPlacementViolationCode::ForbiddenWindow
+            | ManualPlacementViolationCode::RequiredContext
+            | ManualPlacementViolationCode::RequiredLocation
+            | ManualPlacementViolationCode::RequiredCapabilities
+            | ManualPlacementViolationCode::Energy => ViolationKind::SoftConstraint,
+        };
+        let mut item_ids = self.item_ids.clone();
+        item_ids.extend(
+            self.conflicting_blocks
+                .iter()
+                .filter_map(|block| block.item_id),
+        );
+        item_ids.sort_unstable();
+        item_ids.dedup();
+        let mut occurrence_ids = self.occurrence_ids.clone();
+        occurrence_ids.extend(
+            self.conflicting_blocks
+                .iter()
+                .filter_map(|block| block.occurrence_id),
+        );
+        occurrence_ids.sort_unstable();
+        occurrence_ids.dedup();
+        PlanViolation {
+            kind,
+            severity: ViolationSeverity::Error,
+            item_ids,
+            occurrence_ids,
+            start: Some(self.start),
+            end: Some(self.end),
+            penalty: 0,
+            message: self.message.clone(),
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assess_manual_placements(
+    request: &PlanRequest,
+    plan: &SchedulePlan,
+) -> Result<Vec<ManualPlacementAssessment>, ScheduleError> {
+    let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
+    let children = child_map(&request.items);
+    let dependencies = dependencies_with_routine_order(&request.items, &children);
+    let mut assessments = BTreeMap::<Uuid, Vec<ManualPlacementViolation>>::new();
+    let mut violation_count = 0_usize;
+    let mut conflict_fact_count = 0_usize;
+    let mut overflow_item_id = None;
+
+    for assignment in request
+        .previous_assignments
+        .iter()
+        .filter(|assignment| assignment.pinned && assignment.manual_placement_id.is_some())
+    {
+        let placement_id = assignment
+            .manual_placement_id
+            .expect("filtered manual placement identifier");
+        assessments.entry(placement_id).or_default();
+        let Some(item) = items.get(&assignment.item_id).copied() else {
+            continue;
+        };
+        let item_dependencies = dependencies.get(&item.id).map_or(&[][..], Vec::as_slice);
+
+        for source_block in &assignment.blocks {
+            if overflow_item_id.is_some() {
+                break;
+            }
+            let interval = Interval {
+                start: source_block.start,
+                end: source_block.end,
+            };
+            let occurrence_ids = assignment.occurrence_id.into_iter().collect::<Vec<_>>();
+            let mut push = |code: ManualPlacementViolationCode,
+                            conflicting_blocks: Vec<&ScheduleBlock>,
+                            boundary_start: Option<OffsetDateTime>,
+                            boundary_end: Option<OffsetDateTime>,
+                            message: &'static str| {
+                if overflow_item_id.is_some()
+                    || violation_count >= MAX_MANUAL_ASSESSMENT_VIOLATIONS
+                    || conflict_fact_count
+                        .checked_add(conflicting_blocks.len())
+                        .is_none_or(|count| count > MAX_MANUAL_ASSESSMENT_CONFLICT_FACTS)
+                {
+                    overflow_item_id = Some(item.id);
+                    return;
+                }
+                violation_count += 1;
+                conflict_fact_count += conflicting_blocks.len();
+                let mut conflicting_blocks = conflicting_blocks
+                    .into_iter()
+                    .map(manual_placement_conflict)
+                    .collect::<Vec<_>>();
+                conflicting_blocks.sort_by_key(|block| (block.start, block.end, block.block_id));
+                conflicting_blocks.dedup();
+                let conflicting_block_ids = conflicting_blocks
+                    .iter()
+                    .map(|block| block.block_id)
+                    .collect();
+                assessments
+                    .entry(placement_id)
+                    .or_default()
+                    .push(ManualPlacementViolation {
+                        code,
+                        item_ids: vec![item.id],
+                        occurrence_ids: occurrence_ids.clone(),
+                        conflicting_block_ids,
+                        conflicting_blocks,
+                        start: interval.start,
+                        end: interval.end,
+                        boundary_start,
+                        boundary_end,
+                        message: message.to_owned(),
+                    });
+            };
+
+            let containing_availability: Vec<_> = request
+                .availability
+                .iter()
+                .filter(|availability| {
+                    Interval {
+                        start: availability.start,
+                        end: availability.end,
+                    }
+                    .contains(interval)
+                })
+                .collect();
+            if containing_availability.is_empty() {
+                push(
+                    ManualPlacementViolationCode::OutsideAvailability,
+                    Vec::new(),
+                    None,
+                    None,
+                    "Manual placement is outside configured availability.",
+                );
+            }
+
+            let constraints = &item.constraints;
+            if let Some(boundary) = &constraints.earliest_start
+                && boundary.strength.is_hard()
+                && interval.start < boundary.value
+            {
+                push(
+                    ManualPlacementViolationCode::EarliestStart,
+                    Vec::new(),
+                    Some(boundary.value),
+                    None,
+                    "Manual placement starts before a hard earliest-start boundary.",
+                );
+            }
+            if let Some(boundary) = &constraints.latest_finish
+                && boundary.strength.is_hard()
+                && interval.end > boundary.value
+            {
+                push(
+                    ManualPlacementViolationCode::LatestFinish,
+                    Vec::new(),
+                    None,
+                    Some(boundary.value),
+                    "Manual placement ends after a hard latest-finish boundary.",
+                );
+            }
+            if let Some(notice) = &constraints.minimum_notice
+                && notice.strength.is_hard()
+            {
+                let required = request.as_of + Duration::minutes(i64::from(notice.value.get()));
+                if interval.start < required {
+                    push(
+                        ManualPlacementViolationCode::MinimumNotice,
+                        Vec::new(),
+                        Some(required),
+                        None,
+                        "Manual placement compresses a hard minimum-notice boundary.",
+                    );
+                }
+            }
+            if let Some(weekdays) = &constraints.allowed_weekdays
+                && weekdays.strength.is_hard()
+                && !weekdays
+                    .value
+                    .contains(&DayOfWeek::from_time(interval.start.weekday()))
+            {
+                push(
+                    ManualPlacementViolationCode::AllowedWeekday,
+                    Vec::new(),
+                    None,
+                    None,
+                    "Manual placement is on a disallowed weekday.",
+                );
+            }
+
+            let hard_daily: Vec<_> = constraints
+                .preferred_daily_windows
+                .iter()
+                .filter(|window| window.strength.is_hard())
+                .collect();
+            if !hard_daily.is_empty()
+                && !hard_daily
+                    .iter()
+                    .any(|window| window.value.contains(interval.start, interval.end))
+            {
+                push(
+                    ManualPlacementViolationCode::PreferredDailyWindow,
+                    Vec::new(),
+                    None,
+                    None,
+                    "Manual placement is outside every allowed daily window.",
+                );
+            }
+            let hard_absolute: Vec<_> = constraints
+                .preferred_absolute_windows
+                .iter()
+                .filter(|window| window.strength.is_hard())
+                .collect();
+            if !hard_absolute.is_empty()
+                && !hard_absolute.iter().any(|window| {
+                    Interval {
+                        start: window.value.start,
+                        end: window.value.end,
+                    }
+                    .contains(interval)
+                })
+            {
+                push(
+                    ManualPlacementViolationCode::PreferredAbsoluteWindow,
+                    Vec::new(),
+                    hard_absolute.iter().map(|window| window.value.start).min(),
+                    hard_absolute.iter().map(|window| window.value.end).max(),
+                    "Manual placement is outside every allowed absolute window.",
+                );
+            }
+            for forbidden in constraints
+                .forbidden_windows
+                .iter()
+                .filter(|window| window.strength.is_hard())
+            {
+                let forbidden_interval = Interval {
+                    start: forbidden.value.start,
+                    end: forbidden.value.end,
+                };
+                if interval.overlaps(forbidden_interval) {
+                    push(
+                        ManualPlacementViolationCode::ForbiddenWindow,
+                        Vec::new(),
+                        Some(forbidden.value.start),
+                        Some(forbidden.value.end),
+                        "Manual placement overlaps a hard forbidden window.",
+                    );
+                }
+            }
+
+            for required in constraints
+                .required_contexts
+                .iter()
+                .filter(|required| required.strength.is_hard())
+            {
+                if !containing_availability
+                    .iter()
+                    .any(|availability| availability.contexts.contains(&required.value))
+                {
+                    push(
+                        ManualPlacementViolationCode::RequiredContext,
+                        Vec::new(),
+                        None,
+                        None,
+                        "Manual placement lacks a required context.",
+                    );
+                }
+            }
+            if let Some(required) = &constraints.required_location
+                && required.strength.is_hard()
+                && !containing_availability
+                    .iter()
+                    .any(|availability| availability.location.as_ref() == Some(&required.value))
+            {
+                push(
+                    ManualPlacementViolationCode::RequiredLocation,
+                    Vec::new(),
+                    None,
+                    None,
+                    "Manual placement lacks the required location.",
+                );
+            }
+            if let Some(required) = &item.energy
+                && required.strength.is_hard()
+                && !containing_availability
+                    .iter()
+                    .any(|availability| availability.energy.satisfies(required.value))
+            {
+                push(
+                    ManualPlacementViolationCode::Energy,
+                    Vec::new(),
+                    None,
+                    None,
+                    "Manual placement exceeds the available energy level.",
+                );
+            }
+            let hard_contexts = constraints
+                .required_contexts
+                .iter()
+                .filter(|required| required.strength.is_hard())
+                .map(|required| &required.value)
+                .collect::<Vec<_>>();
+            let hard_location = constraints
+                .required_location
+                .as_ref()
+                .filter(|required| required.strength.is_hard())
+                .map(|required| &required.value);
+            let hard_energy = item
+                .energy
+                .as_ref()
+                .filter(|required| required.strength.is_hard())
+                .map(|required| required.value);
+            let has_hard_capabilities =
+                !hard_contexts.is_empty() || hard_location.is_some() || hard_energy.is_some();
+            if has_hard_capabilities
+                && !containing_availability.iter().any(|availability| {
+                    hard_contexts
+                        .iter()
+                        .all(|context| availability.contexts.contains(*context))
+                        && hard_location
+                            .is_none_or(|location| availability.location.as_ref() == Some(location))
+                        && hard_energy.is_none_or(|energy| availability.energy.satisfies(energy))
+                })
+            {
+                push(
+                    ManualPlacementViolationCode::RequiredCapabilities,
+                    Vec::new(),
+                    None,
+                    None,
+                    "No single availability window satisfies every required work capability.",
+                );
+            }
+
+            for dependency in item_dependencies
+                .iter()
+                .filter(|dependency| dependency.strength.is_hard())
+            {
+                if items
+                    .get(&dependency.item_id)
+                    .is_some_and(|predecessor| predecessor.status.is_terminal())
+                {
+                    continue;
+                }
+                let predecessor_blocks: Vec<_> = plan
+                    .blocks
+                    .iter()
+                    .filter(|block| block.item_id == Some(dependency.item_id))
+                    .collect();
+                let predecessor_has_remaining_work = plan
+                    .unscheduled
+                    .iter()
+                    .any(|work| work.item_id == dependency.item_id && !work.remaining.is_zero());
+                let satisfied = if predecessor_blocks.is_empty() || predecessor_has_remaining_work {
+                    false
+                } else {
+                    let predecessor_start = predecessor_blocks
+                        .iter()
+                        .map(|block| block.start)
+                        .min()
+                        .expect("non-empty predecessor blocks");
+                    let predecessor_end = predecessor_blocks
+                        .iter()
+                        .map(|block| block.end)
+                        .max()
+                        .expect("non-empty predecessor blocks");
+                    let lag = Duration::minutes(i64::from(dependency.minimum_lag.get()));
+                    match dependency.relation {
+                        DependencyRelation::FinishToStart => {
+                            interval.start >= predecessor_end + lag
+                        }
+                        DependencyRelation::StartToStart => {
+                            interval.start >= predecessor_start + lag
+                        }
+                        DependencyRelation::FinishToFinish => interval.end >= predecessor_end + lag,
+                        DependencyRelation::StartToFinish => {
+                            interval.end >= predecessor_start + lag
+                        }
+                    }
+                };
+                if !satisfied {
+                    push(
+                        ManualPlacementViolationCode::Dependency,
+                        predecessor_blocks.clone(),
+                        None,
+                        None,
+                        "Manual placement violates a hard dependency.",
+                    );
+                }
+            }
+
+            if let Some(limit) = &constraints.maximum_daily_work
+                && limit.strength.is_hard()
+            {
+                let relevant_blocks = plan
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.item_id == Some(item.id)
+                            && block.start.date() == interval.start.date()
+                    })
+                    .collect::<Vec<_>>();
+                let total = relevant_blocks.iter().fold(0_u32, |total, block| {
+                    total.saturating_add(
+                        Interval {
+                            start: block.start,
+                            end: block.end,
+                        }
+                        .minutes(),
+                    )
+                });
+                if total > limit.value.get() {
+                    push(
+                        ManualPlacementViolationCode::MaximumDailyWork,
+                        relevant_blocks,
+                        None,
+                        None,
+                        "Manual placement exceeds a hard daily work limit.",
+                    );
+                }
+            }
+            if let Some(limit) = &constraints.maximum_weekly_work
+                && limit.strength.is_hard()
+            {
+                let week = monday_of(interval.start);
+                let relevant_blocks = plan
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block.item_id == Some(item.id) && monday_of(block.start) == week
+                    })
+                    .collect::<Vec<_>>();
+                let total = relevant_blocks.iter().fold(0_u32, |total, block| {
+                    total.saturating_add(
+                        Interval {
+                            start: block.start,
+                            end: block.end,
+                        }
+                        .minutes(),
+                    )
+                });
+                if total > limit.value.get() {
+                    push(
+                        ManualPlacementViolationCode::MaximumWeeklyWork,
+                        relevant_blocks,
+                        None,
+                        None,
+                        "Manual placement exceeds a hard weekly work limit.",
+                    );
+                }
+            }
+
+            if constraints
+                .buffers
+                .strength
+                .is_some_and(ConstraintStrength::is_hard)
+            {
+                let expanded = Interval {
+                    start: interval.start
+                        - Duration::minutes(i64::from(constraints.buffers.before.get())),
+                    end: interval.end
+                        + Duration::minutes(i64::from(constraints.buffers.after.get())),
+                };
+                let conflicting: Vec<_> = plan
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        !manual_block_matches(block, item.id, source_block)
+                            && expanded.overlaps(Interval {
+                                start: block.start,
+                                end: block.end,
+                            })
+                    })
+                    .collect();
+                let fits_availability = request.availability.iter().any(|availability| {
+                    Interval {
+                        start: availability.start,
+                        end: availability.end,
+                    }
+                    .contains(expanded)
+                });
+                if !fits_availability || !conflicting.is_empty() {
+                    push(
+                        ManualPlacementViolationCode::BufferCompressed,
+                        conflicting,
+                        Some(expanded.start),
+                        Some(expanded.end),
+                        "Manual placement compresses a hard preparation or decompression buffer.",
+                    );
+                }
+            }
+
+            let conflicting: Vec<_> = plan
+                .blocks
+                .iter()
+                .filter(|block| {
+                    matches!(
+                        block.kind,
+                        ScheduleBlockKind::Pinned
+                            | ScheduleBlockKind::CalendarEvent
+                            | ScheduleBlockKind::ExternalFixed
+                    ) && !manual_block_matches(block, item.id, source_block)
+                        && interval.overlaps(Interval {
+                            start: block.start,
+                            end: block.end,
+                        })
+                })
+                .collect();
+            if !conflicting.is_empty() {
+                push(
+                    ManualPlacementViolationCode::ImmutableOverlap,
+                    conflicting,
+                    None,
+                    None,
+                    "Manual placement overlaps immutable scheduled time.",
+                );
+            }
+        }
+    }
+
+    if let Some(item_id) = overflow_item_id {
+        return Err(invalid_item(
+            item_id,
+            "manual placement assessment exceeds the supported evidence limit",
+        ));
+    }
+    if assessments.is_empty() {
+        return Ok(Vec::new());
+    }
+    let environment_base_digest = manual_placement_environment_base_digest(request);
+    Ok(assessments
+        .into_iter()
+        .map(|(placement_id, mut violations)| {
+            for violation in &mut violations {
+                violation.conflicting_block_ids.sort_unstable();
+                violation.conflicting_block_ids.dedup();
+                violation
+                    .conflicting_blocks
+                    .sort_by_key(|block| (block.start, block.end, block.block_id));
+                violation.conflicting_blocks.dedup();
+            }
+            violations.sort_by_key(|violation| {
+                (
+                    violation.start,
+                    violation.end,
+                    violation.code,
+                    violation.item_ids.clone(),
+                    violation.conflicting_block_ids.clone(),
+                )
+            });
+            violations.dedup();
+            ManualPlacementAssessment {
+                placement_id,
+                environment_digest: manual_placement_environment_digest(
+                    placement_id,
+                    &environment_base_digest,
+                ),
+                violations,
+            }
+        })
+        .collect())
+}
+
+fn manual_placement_conflict(block: &ScheduleBlock) -> ManualPlacementConflict {
+    ManualPlacementConflict {
+        block_id: block.id,
+        item_id: block.item_id,
+        occurrence_id: block.occurrence_id,
+        external_block_id: block.external_block_id,
+        kind: block.kind,
+        start: block.start,
+        end: block.end,
+    }
+}
+
+fn manual_placement_environment_base_digest(request: &PlanRequest) -> [u8; 32] {
+    #[derive(Serialize)]
+    struct ItemEnvironment<'a> {
+        id: ItemId,
+        revision: u64,
+        kind: &'a ItemKind,
+        status: crate::WorkStatus,
+        parent_id: Option<ItemId>,
+        sibling_order: Option<u32>,
+        has_own_effort: bool,
+        duration: Option<crate::DurationEstimate>,
+        constraints: &'a SchedulingConstraints,
+        split_policy: &'a SplitPolicy,
+        energy: &'a Option<crate::Qualified<crate::EnergyLevel>>,
+    }
+    #[derive(Serialize)]
+    struct Environment<'a> {
+        schema: &'static str,
+        items: Vec<ItemEnvironment<'a>>,
+        availability: &'a [AvailabilityWindow],
+    }
+
+    let mut items = request
+        .items
+        .iter()
+        .map(|item| ItemEnvironment {
+            id: item.id,
+            revision: item.revision,
+            kind: &item.kind,
+            status: item.status,
+            parent_id: item.parent_id,
+            sibling_order: item.sibling_order,
+            has_own_effort: item.has_own_effort,
+            duration: item.duration,
+            constraints: &item.constraints,
+            split_policy: &item.split_policy,
+            energy: &item.energy,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by_key(|item| item.id);
+    let encoded = serde_json::to_vec(&Environment {
+        schema: "dayweave-manual-placement-environment-base/2",
+        items,
+        availability: &request.availability,
+    })
+    .expect("manual placement environment contains only serializable domain values");
+    Sha256::digest(encoded).into()
+}
+
+fn manual_placement_environment_digest(
+    placement_id: Uuid,
+    environment_base_digest: &[u8; 32],
+) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"dayweave-manual-placement-environment/2\0");
+    digest.update(environment_base_digest);
+    digest.update(placement_id.as_bytes());
+    digest.finalize().into()
+}
+
+fn manual_block_matches(block: &ScheduleBlock, item_id: ItemId, source: &PreviousBlock) -> bool {
+    block.kind == ScheduleBlockKind::Pinned
+        && block.item_id == Some(item_id)
+        && block.session_index == source.session_index
+        && block.start == source.start
+        && block.end == source.end
+}
+
 #[derive(Debug, Clone)]
 struct BusyBlock {
     interval: Interval,
     item_id: Option<ItemId>,
     pinned: bool,
+    manual_placement: bool,
 }
 
 #[derive(Debug)]
@@ -731,6 +1501,7 @@ impl PlanningState {
                 interval,
                 item_id: None,
                 pinned: true,
+                manual_placement: false,
             });
             self.blocks.push(ScheduleBlock {
                 id: fixed.id,
@@ -774,6 +1545,7 @@ impl PlanningState {
                 interval,
                 item_id: Some(item.id),
                 pinned: event.immutable,
+                manual_placement: false,
             });
             self.blocks.push(ScheduleBlock {
                 id: block_id(item.id, 0, event.start),
@@ -847,6 +1619,7 @@ impl PlanningState {
                     interval,
                     item_id: Some(*item_id),
                     pinned: true,
+                    manual_placement: false,
                 });
                 self.blocks.push(ScheduleBlock {
                     id: block_id(*item_id, reservation.session_index, reservation.start),
@@ -917,6 +1690,7 @@ impl PlanningState {
                     interval,
                     item_id: Some(item.id),
                     pinned: true,
+                    manual_placement: assignment.manual_placement_id.is_some(),
                 });
                 self.blocks.push(ScheduleBlock {
                     id: block_id(item.id, block.session_index, block.start),
@@ -944,7 +1718,7 @@ impl PlanningState {
         }
     }
 
-    fn detect_immutable_overlaps(&mut self) {
+    fn detect_immutable_overlaps(&mut self) -> Result<(), ScheduleError> {
         self.busy.sort_by_key(|busy| {
             (
                 busy.interval.start,
@@ -961,6 +1735,12 @@ impl PlanningState {
                     break;
                 }
                 if left.interval.overlaps(right.interval) {
+                    if left.manual_placement || right.manual_placement {
+                        continue;
+                    }
+                    if self.violations.len() >= MAX_IMMUTABLE_OVERLAP_VIOLATIONS {
+                        return Err(ScheduleError::ConflictEvidenceLimit);
+                    }
                     let mut item_ids: Vec<_> = [left.item_id, right.item_id]
                         .into_iter()
                         .flatten()
@@ -985,6 +1765,7 @@ impl PlanningState {
                 }
             }
         }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1796,6 +2577,7 @@ impl PlanningState {
             interval: candidate.interval,
             item_id: Some(item.id),
             pinned: false,
+            manual_placement: false,
         });
         self.blocks.push(ScheduleBlock {
             id: block_id(item.id, session_index, candidate.interval.start),
@@ -1846,6 +2628,7 @@ impl PlanningState {
             violations: self.violations,
             score: self.score,
             occurrences: Vec::new(),
+            manual_placement_assessments: Vec::new(),
         }
     }
 }
@@ -1904,17 +2687,245 @@ fn validate_request(request: &PlanRequest) -> Result<(), ScheduleError> {
             });
         }
     }
+    validate_previous_assignments(request, &ids)?;
+    Ok(())
+}
+
+fn validate_previous_assignments(
+    request: &PlanRequest,
+    item_ids: &BTreeSet<ItemId>,
+) -> Result<(), ScheduleError> {
+    let by_id: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
+    let children = child_map(&request.items);
+    let mut assignment_identities = BTreeSet::new();
     for assignment in &request.previous_assignments {
-        if !ids.contains(&assignment.item_id) {
+        if !item_ids.contains(&assignment.item_id) {
             return Err(ScheduleError::MissingPreviousItem(assignment.item_id));
         }
+        if !assignment_identities.insert((assignment.item_id, assignment.occurrence_id)) {
+            return Err(invalid_item(
+                assignment.item_id,
+                "previous assignment identity is duplicated",
+            ));
+        }
+        if let Some(placement_id) = assignment.manual_placement_id {
+            let item = by_id[&assignment.item_id];
+            let has_children = children
+                .get(&item.id)
+                .is_some_and(|children| !children.is_empty());
+            if placement_id.is_nil()
+                || !assignment.pinned
+                || assignment.blocks.is_empty()
+                || matches!(item.kind, ItemKind::CalendarEvent(_))
+                || item.status.is_terminal()
+                || !item.occupies_time(has_children)
+            {
+                return Err(invalid_item(
+                    assignment.item_id,
+                    "manual placement must pin non-empty executable work",
+                ));
+            }
+        }
+        let mut session_indices = BTreeSet::new();
         for block in &assignment.blocks {
             if block.start >= block.end {
                 return Err(ScheduleError::InvalidWindow {
                     owner: format!("previous assignment for {}", assignment.item_id),
                 });
             }
+            if !session_indices.insert(block.session_index) {
+                return Err(invalid_item(
+                    assignment.item_id,
+                    "previous assignment repeats a session index",
+                ));
+            }
+            if assignment.manual_placement_id.is_some()
+                && (block.start < request.as_of
+                    || block.start < request.horizon_start
+                    || block.end > request.horizon_end
+                    || by_id[&assignment.item_id]
+                        .constraints
+                        .occurrence_window
+                        .is_some_and(|window| block.start < window.start || block.end > window.end))
+            {
+                return Err(invalid_item(
+                    assignment.item_id,
+                    "manual placement is outside its planning or occurrence window",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_manual_placement_demand(
+    request: &PlanRequest,
+    execution: &MaterializedExecutionContext,
+) -> Result<(), ScheduleError> {
+    let items: BTreeMap<_, _> = request.items.iter().map(|item| (item.id, item)).collect();
+    for assignment in request
+        .previous_assignments
+        .iter()
+        .filter(|assignment| assignment.manual_placement_id.is_some())
+    {
+        let item = items[&assignment.item_id];
+        validate_manual_assignment_demand(request, execution, item, assignment)?;
+    }
+    Ok(())
+}
+
+fn validate_manual_assignment_demand(
+    request: &PlanRequest,
+    execution: &MaterializedExecutionContext,
+    item: &WorkItem,
+    assignment: &PreviousAssignment,
+) -> Result<(), ScheduleError> {
+    let expected = item.duration.ok_or_else(|| {
+        invalid_item(
+            item.id,
+            "manual placement requires an authoritative duration",
+        )
+    })?;
+    if execution
+        .work_units
+        .get(&item.id)
+        .is_some_and(|unit| !unit.reservations.is_empty())
+    {
+        return Err(invalid_item(
+            item.id,
+            "manual placement cannot replace an active execution reservation",
+        ));
+    }
+    let (chronological, total_minutes) =
+        validate_manual_block_sequence(request, execution, item, assignment)?;
+    if total_minutes != expected.planning_minutes().get() {
+        return Err(invalid_item(
+            item.id,
+            "manual placement must bind the exact remaining work duration",
+        ));
+    }
+    validate_manual_split_policy(item, &chronological, total_minutes)
+}
+
+fn validate_manual_block_sequence(
+    request: &PlanRequest,
+    execution: &MaterializedExecutionContext,
+    item: &WorkItem,
+    assignment: &PreviousAssignment,
+) -> Result<(Vec<PreviousBlock>, u32), ScheduleError> {
+    let mut total_minutes = 0_u32;
+    let mut chronological = assignment.blocks.clone();
+    chronological.sort_by_key(|block| (block.start, block.end, block.session_index));
+    for block in &chronological {
+        let seconds = (block.end - block.start).whole_seconds();
+        let granularity_seconds = i64::from(request.config.slot_granularity.get()) * 60;
+        if seconds <= 0
+            || seconds % 60 != 0
+            || block.start.nanosecond() != 0
+            || block.end.nanosecond() != 0
+            || block.start.unix_timestamp().rem_euclid(granularity_seconds) != 0
+            || block.end.unix_timestamp().rem_euclid(granularity_seconds) != 0
+        {
+            return Err(invalid_item(
+                item.id,
+                "manual placement blocks must use whole-minute scheduler slots",
+            ));
+        }
+        let minutes = u32::try_from(seconds / 60).map_err(|_| {
+            invalid_item(
+                item.id,
+                "manual placement duration exceeds supported bounds",
+            )
+        })?;
+        total_minutes = total_minutes.checked_add(minutes).ok_or_else(|| {
+            invalid_item(
+                item.id,
+                "manual placement duration exceeds supported bounds",
+            )
+        })?;
+    }
+    let expected_first_index = execution
+        .work_units
+        .get(&item.id)
+        .and_then(MaterializedExecutionWorkUnit::high_water)
+        .map_or(Some(0), |index| index.checked_add(1))
+        .ok_or_else(|| {
+            invalid_item(item.id, "manual placement session index space is exhausted")
+        })?;
+    if chronological.first().map(|block| block.session_index) != Some(expected_first_index)
+        || chronological
+            .windows(2)
+            .any(|pair| pair[0].session_index.checked_add(1) != Some(pair[1].session_index))
+    {
+        return Err(invalid_item(
+            item.id,
+            "manual placement session indices must be fresh, consecutive, and chronological",
+        ));
+    }
+    Ok((chronological, total_minutes))
+}
+
+fn validate_manual_split_policy(
+    item: &WorkItem,
+    chronological: &[PreviousBlock],
+    total_minutes: u32,
+) -> Result<(), ScheduleError> {
+    let SplitPolicy::Splittable {
+        minimum_session,
+        maximum_session,
+        maximum_sessions,
+        minimum_gap,
+        maximum_days,
+    } = item.split_policy
+    else {
+        if chronological.len() != 1 {
+            return Err(invalid_item(
+                item.id,
+                "an indivisible manual placement must contain exactly one block",
+            ));
+        }
+        return Ok(());
+    };
+    if chronological.len() > usize::from(maximum_sessions) {
+        return Err(invalid_item(
+            item.id,
+            "manual placement exceeds the configured session limit",
+        ));
+    }
+    let mut days = BTreeSet::new();
+    for (index, block) in chronological.iter().enumerate() {
+        let minutes = u32::try_from((block.end - block.start).whole_minutes()).map_err(|_| {
+            invalid_item(
+                item.id,
+                "manual placement duration exceeds supported bounds",
+            )
+        })?;
+        let only_subminimum_remainder = chronological.len() == 1
+            && total_minutes < minimum_session.get()
+            && minutes == total_minutes;
+        if (!only_subminimum_remainder && minutes < minimum_session.get())
+            || minutes > maximum_session.get()
+        {
+            return Err(invalid_item(
+                item.id,
+                "manual placement block violates configured session bounds",
+            ));
+        }
+        days.insert(block.start.date());
+        if let Some(previous) = index.checked_sub(1).map(|value| chronological[value])
+            && block.start < previous.end + Duration::minutes(i64::from(minimum_gap.get()))
+        {
+            return Err(invalid_item(
+                item.id,
+                "manual placement blocks violate the configured minimum gap",
+            ));
+        }
+    }
+    if maximum_days.is_some_and(|limit| days.len() > usize::from(limit)) {
+        return Err(invalid_item(
+            item.id,
+            "manual placement exceeds the configured day limit",
+        ));
     }
     Ok(())
 }

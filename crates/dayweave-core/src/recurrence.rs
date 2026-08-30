@@ -32,6 +32,8 @@ pub enum RecurrenceError {
     MoveCrossesHorizon(ItemId),
     #[error("occurrence id {0} is claimed by more than one recurrence")]
     DuplicateOccurrence(OccurrenceId),
+    #[error("manual placement {0} does not bind to an exact materialized occurrence")]
+    InvalidManualPlacement(Uuid),
     #[error("calendar date arithmetic exceeded supported range")]
     DateOutOfRange,
 }
@@ -228,11 +230,35 @@ pub(crate) fn materialize_recurrences(
     materialized_request.items = items;
     materialized_request.previous_assignments =
         materialize_previous_assignments(request, &occurrences, &identities, &removed);
+    let requested_manual_counts = manual_placement_counts(&request.previous_assignments);
+    let materialized_manual_counts =
+        manual_placement_counts(&materialized_request.previous_assignments);
+    if let Some(placement_id) = requested_manual_counts
+        .iter()
+        .find_map(|(placement_id, count)| {
+            (materialized_manual_counts.get(placement_id) != Some(count)).then_some(*placement_id)
+        })
+    {
+        return Err(RecurrenceError::InvalidManualPlacement(placement_id));
+    }
     Ok(MaterializedPlan {
         request: materialized_request,
         occurrences,
         identities,
     })
+}
+
+fn manual_placement_counts(assignments: &[PreviousAssignment]) -> BTreeMap<Uuid, (usize, usize)> {
+    let mut result = BTreeMap::new();
+    for assignment in assignments {
+        let Some(placement_id) = assignment.manual_placement_id else {
+            continue;
+        };
+        let entry = result.entry(placement_id).or_insert((0_usize, 0_usize));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(assignment.blocks.len());
+    }
+    result
 }
 
 fn recurrence_of(item: &WorkItem) -> Option<&Recurrence> {
@@ -1490,16 +1516,19 @@ fn materialize_previous_assignments(
             }
             continue;
         }
-        let matched = assignment
-            .occurrence_id
-            .and_then(|id| {
-                candidates
-                    .iter()
-                    .find(|(_, identity)| identity.occurrence_id == id)
-                    .copied()
-            })
-            .or_else(|| {
-                assignment.blocks.first().and_then(|block| {
+        let matched = if let Some(id) = assignment.occurrence_id {
+            // An explicit occurrence identity is authoritative. Falling back
+            // to a time-window or first-series match can pin a different
+            // occurrence after a stale or forged manual placement request.
+            candidates
+                .iter()
+                .find(|(_, identity)| identity.occurrence_id == id)
+                .copied()
+        } else {
+            assignment
+                .blocks
+                .first()
+                .and_then(|block| {
                     candidates.iter().find_map(|candidate @ (_, identity)| {
                         let occurrence = occurrences
                             .iter()
@@ -1509,8 +1538,8 @@ fn materialize_previous_assignments(
                         contains.then_some(*candidate)
                     })
                 })
-            })
-            .or_else(|| candidates.first().copied());
+                .or_else(|| candidates.first().copied())
+        };
         if let Some((clone_id, identity)) = matched {
             let mut value = assignment.clone();
             value.item_id = *clone_id;

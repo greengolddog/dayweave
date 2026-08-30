@@ -12,10 +12,12 @@ mod prepare;
 pub use model::{
     AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
     ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    IgnoredPreviousAssignment, PreparedSchedule, PreviousAssignmentInput, PreviousBlockInput,
+    IgnoredPreviousAssignment, ManualPlacementAssignmentInput, ManualPlacementInput,
+    ManualPlacementReleaseInput, PreparedSchedule, PreviousAssignmentInput, PreviousBlockInput,
     RejectedScheduleItem, SchedulerConfigInput,
 };
 pub use prepare::{
-    MAX_CANONICAL_ITEMS, PrepareScheduleError, prepare_canonical_schedule,
+    MAX_CANONICAL_ITEMS, MAX_MANUAL_ASSIGNMENTS, MAX_MANUAL_BLOCKS, MAX_MANUAL_PLACEMENT_RELEASES,
+    MAX_MANUAL_PLACEMENTS, PrepareScheduleError, prepare_canonical_schedule,
     validate_schedule_request,
 };

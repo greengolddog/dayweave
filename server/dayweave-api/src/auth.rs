@@ -374,6 +374,7 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             &Method::POST | &Method::PUT | &Method::DELETE,
             "/items" | "/items/{id}" | "/items/{id}/restore",
         ) => Some(Scope::ItemsWrite),
+        (&Method::GET, "/schedule/manual-placements") => Some(Scope::ScheduleRead),
         (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
         (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history") => Some(Scope::ExecutionRead),
@@ -600,6 +601,10 @@ mod tests {
         assert_eq!(
             required_rest_scope(&Method::GET, Some("/v1/auth/mcp-clients")),
             Some(Scope::AuthMcpClientsRead)
+        );
+        assert_eq!(
+            required_rest_scope(&Method::GET, Some("/v1/schedule/manual-placements")),
+            Some(Scope::ScheduleRead)
         );
         assert_eq!(
             required_rest_scope(&Method::POST, Some("/v1/unclassified")),

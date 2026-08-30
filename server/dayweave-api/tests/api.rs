@@ -216,6 +216,28 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
     }
     assert!(document["paths"]["/v1/schedule/preview"].is_object());
     assert!(document["paths"]["/v1/schedule/publish"].is_object());
+    assert!(document["paths"]["/v1/schedule/manual-placements"]["get"].is_object());
+    for schema_name in [
+        "ManualPlacementInput",
+        "ManualPlacementAssignmentInput",
+        "ManualPlacementReleaseInput",
+        "ManualPlacementApproval",
+        "ManualPlacementAssessmentOutput",
+        "ManualPlacementViolationOutput",
+        "ManualPlacementConflictOutput",
+        "RetainedManualPlacementCatalog",
+        "RetainedManualPlacementSummary",
+        "RetainedManualPlacementAssignmentSummary",
+    ] {
+        assert!(
+            document["components"]["schemas"][schema_name].is_object(),
+            "OpenAPI must register {schema_name}"
+        );
+        assert_eq!(
+            document["components"]["schemas"][schema_name]["additionalProperties"], false,
+            "{schema_name} must remain a closed object contract"
+        );
+    }
     assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["200"].is_object());
     assert!(document["paths"]["/v1/schedule/publish"]["post"]["responses"]["201"].is_null());
     assert!(document["paths"]["/v1/schedule/preview"]["post"]["responses"]["413"].is_object());

@@ -972,6 +972,98 @@ fn execution_evidence_maps_only_to_its_exact_recurring_occurrence() {
 }
 
 #[test]
+fn manual_placement_never_falls_back_from_an_unknown_occurrence_identity() {
+    let item = recurring_item(811, Recurrence::Daily { times_per_day: 1 });
+    let mut input = request(item.clone(), START, START + Duration::days(2));
+    input.availability = all_day_availability(START, 2);
+    let unknown = OccurrenceId(Uuid::new_v5(
+        &Uuid::NAMESPACE_OID,
+        b"different recurrence occurrence",
+    ));
+    let placement_id = Uuid::from_u128(812);
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: item.id,
+        occurrence_id: Some(unknown),
+        blocks: vec![PreviousBlock {
+            start: START + Duration::hours(9),
+            end: START + Duration::hours(9) + Duration::minutes(30),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(placement_id),
+    }];
+
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidRecurrence(message))
+            if message.contains(&placement_id.to_string())
+    ));
+}
+
+#[test]
+fn manual_conflict_facts_remap_nested_recurring_block_identity() {
+    let target = recurring_item(821, Recurrence::Daily { times_per_day: 1 });
+    let obstacle = recurring_item(822, Recurrence::Daily { times_per_day: 1 });
+    let mut input = request(target.clone(), START, START + Duration::days(1));
+    input.items.push(obstacle.clone());
+    input.availability = all_day_availability(START, 1);
+    let occurrences = expand_occurrences(&input).unwrap();
+    let target_occurrence = occurrences
+        .iter()
+        .find(|occurrence| occurrence.series_item_id == target.id)
+        .expect("target occurrence");
+    let obstacle_occurrence = occurrences
+        .iter()
+        .find(|occurrence| occurrence.series_item_id == obstacle.id)
+        .expect("obstacle occurrence");
+    let start = START + Duration::hours(9);
+    let end = start + Duration::minutes(30);
+    input.previous_assignments = vec![
+        PreviousAssignment {
+            item_id: target.id,
+            occurrence_id: Some(target_occurrence.id),
+            blocks: vec![PreviousBlock {
+                start,
+                end,
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id: Some(Uuid::from_u128(823)),
+        },
+        PreviousAssignment {
+            item_id: obstacle.id,
+            occurrence_id: Some(obstacle_occurrence.id),
+            blocks: vec![PreviousBlock {
+                start,
+                end,
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id: None,
+        },
+    ];
+
+    let plan = Scheduler.plan(&input).unwrap();
+    let overlap = plan.manual_placement_assessments[0]
+        .violations
+        .iter()
+        .find(|violation| violation.code == ManualPlacementViolationCode::ImmutableOverlap)
+        .expect("recurring pinned overlap");
+    let conflict = overlap
+        .conflicting_blocks
+        .iter()
+        .find(|conflict| conflict.item_id == Some(obstacle.id))
+        .expect("canonical recurring obstacle identity");
+    assert_eq!(conflict.occurrence_id, Some(obstacle_occurrence.id));
+    assert!(overlap.conflicting_block_ids.contains(&conflict.block_id));
+    assert!(plan.blocks.iter().any(|block| {
+        block.id == conflict.block_id
+            && block.item_id == Some(obstacle.id)
+            && block.occurrence_id == Some(obstacle_occurrence.id)
+    }));
+}
+
+#[test]
 fn overlapping_reservation_for_unmaterialized_occurrence_fails_closed() {
     let item = recurring_item(802, Recurrence::Daily { times_per_day: 1 });
     let input = request(item.clone(), START, START + Duration::days(1));

@@ -326,6 +326,7 @@ fn stability_hint_is_preserved_when_still_valid() {
             session_index: 0,
         }],
         pinned: false,
+        manual_placement_id: None,
     }];
 
     let first = Scheduler.plan(&input).unwrap();
@@ -431,6 +432,7 @@ fn pinned_and_fixed_overlap_stays_visible_as_an_error() {
             session_index: 0,
         }],
         pinned: true,
+        manual_placement_id: None,
     }];
     input.fixed_blocks = vec![FixedBlock {
         id: Uuid::from_u128(81),
@@ -463,6 +465,336 @@ fn pinned_and_fixed_overlap_stays_visible_as_an_error() {
             .expect("external fixed block")
             .is_sensitive
     );
+}
+
+#[test]
+fn immutable_overlap_evidence_is_bounded_before_quadratic_growth() {
+    let mut input = request(Vec::new());
+    input.fixed_blocks = (0_u128..92)
+        .map(|offset| FixedBlock {
+            id: Uuid::from_u128(10_000 + offset),
+            is_sensitive: false,
+            title: format!("Overlapping fixed block {offset}"),
+            start: DAY + Duration::hours(9),
+            end: DAY + Duration::hours(10),
+            source: FixedBlockSource::ProtectedTime,
+        })
+        .collect();
+
+    assert_eq!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::ConflictEvidenceLimit)
+    );
+}
+
+#[test]
+fn manual_placement_is_exact_and_reports_digestible_hard_conflicts() {
+    let mut task = item(82, "Manual placement", 60);
+    task.constraints.latest_finish = Some(Qualified::hard(DAY + Duration::hours(9)));
+    let placement_id = Uuid::from_u128(83);
+    let fixed_id = Uuid::from_u128(84);
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(11),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(placement_id),
+    }];
+    input.fixed_blocks = vec![FixedBlock {
+        id: fixed_id,
+        is_sensitive: false,
+        title: "Immutable context".to_owned(),
+        start: DAY + Duration::hours(10) + Duration::minutes(30),
+        end: DAY + Duration::hours(11) + Duration::minutes(30),
+        source: FixedBlockSource::ProtectedTime,
+    }];
+
+    let plan = Scheduler.plan(&input).unwrap();
+    let pinned = plan
+        .blocks
+        .iter()
+        .find(|block| block.item_id == Some(task.id))
+        .expect("manual pinned block");
+    assert_eq!(pinned.kind, ScheduleBlockKind::Pinned);
+    assert_eq!(pinned.start, DAY + Duration::hours(10));
+    assert_eq!(pinned.end, DAY + Duration::hours(11));
+
+    let [assessment] = plan.manual_placement_assessments.as_slice() else {
+        panic!("one manual assessment");
+    };
+    assert_eq!(assessment.placement_id, placement_id);
+    assert!(assessment.violations.iter().any(|violation| {
+        violation.code == ManualPlacementViolationCode::LatestFinish
+            && violation.boundary_end == Some(DAY + Duration::hours(9))
+    }));
+    assert!(assessment.violations.iter().any(|violation| {
+        violation.code == ManualPlacementViolationCode::ImmutableOverlap
+            && violation.conflicting_block_ids == vec![fixed_id]
+            && violation.conflicting_blocks.len() == 1
+            && violation.conflicting_blocks[0].block_id == fixed_id
+            && violation.conflicting_blocks[0].start
+                == DAY + Duration::hours(10) + Duration::minutes(30)
+    }));
+    assert!(plan.violations.iter().any(|violation| {
+        violation.kind == ViolationKind::DeadlineRisk
+            && violation.severity == ViolationSeverity::Error
+            && violation.item_ids == vec![task.id]
+    }));
+    assert!(plan.violations.iter().any(|violation| {
+        violation.kind == ViolationKind::PinnedConflict
+            && violation.severity == ViolationSeverity::Error
+            && violation.item_ids == vec![task.id]
+    }));
+
+    let original_environment = assessment.environment_digest;
+    input.items.push(item(840, "Dependency environment", 30));
+    let changed = Scheduler.plan(&input).unwrap();
+    assert_ne!(
+        changed.manual_placement_assessments[0].environment_digest,
+        original_environment
+    );
+}
+
+#[test]
+fn malformed_manual_placement_cannot_be_treated_as_a_stability_hint() {
+    let task = item(85, "Manual placement", 60);
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(11),
+            session_index: 0,
+        }],
+        pinned: false,
+        manual_placement_id: Some(Uuid::from_u128(86)),
+    }];
+
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidItem { item_id, .. }) if item_id == task.id
+    ));
+}
+
+#[test]
+fn manual_placement_requires_exact_minute_grid_without_subseconds() {
+    let task = item(861, "Manual placement", 60);
+    let mut input = request(vec![task.clone()]);
+    let fractional_offset = Duration::microseconds(123_456);
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10) + fractional_offset,
+            end: DAY + Duration::hours(11) + fractional_offset,
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(Uuid::from_u128(862)),
+    }];
+
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == task.id && message.contains("whole-minute scheduler slots")
+    ));
+
+    input.previous_assignments[0].blocks[0].start = DAY + Duration::hours(10);
+    input.previous_assignments[0].blocks[0].end = DAY + Duration::hours(11);
+    Scheduler
+        .plan(&input)
+        .expect("whole-second endpoints on the scheduler minute grid are valid");
+}
+
+#[test]
+fn manual_placement_cannot_change_duration_or_indivisible_shape() {
+    let task = item(87, "Manual placement", 60);
+    let placement_id = Uuid::from_u128(88);
+    let mut input = request(vec![task.clone()]);
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(12),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(placement_id),
+    }];
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == task.id && message.contains("exact remaining work duration")
+    ));
+
+    input.previous_assignments[0].blocks = vec![
+        PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(10) + Duration::minutes(30),
+            session_index: 0,
+        },
+        PreviousBlock {
+            start: DAY + Duration::hours(11),
+            end: DAY + Duration::hours(11) + Duration::minutes(30),
+            session_index: 1,
+        },
+    ];
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == task.id && message.contains("indivisible")
+    ));
+}
+
+#[test]
+fn manual_placement_requires_one_availability_window_with_all_capabilities() {
+    let mut task = item(89, "Manual placement", 60);
+    task.constraints.required_contexts = vec![Qualified::hard("computer".to_owned())];
+    task.constraints.required_location = Some(Qualified::hard("home".to_owned()));
+    task.energy = Some(Qualified::hard(EnergyLevel::Deep));
+    let mut input = request(vec![task.clone()]);
+    input.availability = vec![
+        AvailabilityWindow {
+            start: DAY + Duration::hours(8),
+            end: DAY + Duration::hours(18),
+            contexts: BTreeSet::from(["computer".to_owned()]),
+            location: Some("office".to_owned()),
+            energy: EnergyLevel::Deep,
+        },
+        AvailabilityWindow {
+            start: DAY + Duration::hours(8),
+            end: DAY + Duration::hours(18),
+            contexts: BTreeSet::new(),
+            location: Some("home".to_owned()),
+            energy: EnergyLevel::Deep,
+        },
+    ];
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: task.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(10),
+            end: DAY + Duration::hours(11),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(Uuid::from_u128(90)),
+    }];
+
+    let plan = Scheduler.plan(&input).unwrap();
+    assert!(
+        plan.manual_placement_assessments[0]
+            .violations
+            .iter()
+            .any(|violation| {
+                violation.code == ManualPlacementViolationCode::RequiredCapabilities
+            })
+    );
+}
+
+#[test]
+fn manual_successor_reports_dependency_when_predecessor_is_only_partly_scheduled() {
+    let mut predecessor = item(91, "Partly scheduled predecessor", 120);
+    predecessor.split_policy = SplitPolicy::Splittable {
+        minimum_session: Minutes(30),
+        maximum_session: Minutes(60),
+        maximum_sessions: 2,
+        minimum_gap: Minutes::ZERO,
+        maximum_days: Some(1),
+    };
+    let mut successor = item(92, "Manually placed successor", 30);
+    successor.constraints.dependencies = vec![Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    }];
+    let placement_id = Uuid::from_u128(93);
+    let mut input = request(vec![predecessor.clone(), successor.clone()]);
+    input.availability = vec![availability(8, 9)];
+    input.previous_assignments = vec![PreviousAssignment {
+        item_id: successor.id,
+        occurrence_id: None,
+        blocks: vec![PreviousBlock {
+            start: DAY + Duration::hours(9),
+            end: DAY + Duration::hours(9) + Duration::minutes(30),
+            session_index: 0,
+        }],
+        pinned: true,
+        manual_placement_id: Some(placement_id),
+    }];
+
+    let plan = Scheduler.plan(&input).unwrap();
+    assert!(
+        plan.unscheduled
+            .iter()
+            .any(|work| { work.item_id == predecessor.id && work.remaining == Minutes(60) })
+    );
+    let assessment = plan
+        .manual_placement_assessments
+        .iter()
+        .find(|assessment| assessment.placement_id == placement_id)
+        .expect("manual placement assessment");
+    assert!(assessment.violations.iter().any(|violation| {
+        violation.code == ManualPlacementViolationCode::Dependency
+            && !violation.conflicting_blocks.is_empty()
+    }));
+}
+
+#[test]
+fn manual_assessment_rejects_conflict_fact_amplification_before_cloning() {
+    const PREDECESSOR_BLOCKS: u16 = 4_097;
+    let predecessor_minutes = u32::from(PREDECESSOR_BLOCKS);
+    let predecessor = item(94, "Many source sessions", predecessor_minutes);
+    let mut successor = item(95, "Bounded manual successor", 30);
+    successor.constraints.dependencies = vec![Dependency {
+        item_id: predecessor.id,
+        relation: DependencyRelation::FinishToStart,
+        minimum_lag: Minutes::ZERO,
+        strength: ConstraintStrength::Hard,
+    }];
+    let mut input = request(vec![predecessor.clone(), successor.clone()]);
+    input.horizon_end = DAY + Duration::days(4);
+    let source_start = DAY + Duration::hours(8);
+    input.previous_assignments = vec![
+        PreviousAssignment {
+            item_id: predecessor.id,
+            occurrence_id: None,
+            blocks: (0..PREDECESSOR_BLOCKS)
+                .map(|session_index| PreviousBlock {
+                    start: source_start + Duration::minutes(i64::from(session_index)),
+                    end: source_start + Duration::minutes(i64::from(session_index) + 1),
+                    session_index,
+                })
+                .collect(),
+            pinned: true,
+            manual_placement_id: None,
+        },
+        PreviousAssignment {
+            item_id: successor.id,
+            occurrence_id: None,
+            blocks: vec![PreviousBlock {
+                start: source_start,
+                end: source_start + Duration::minutes(30),
+                session_index: 0,
+            }],
+            pinned: true,
+            manual_placement_id: Some(Uuid::from_u128(96)),
+        },
+    ];
+
+    assert!(matches!(
+        Scheduler.plan(&input),
+        Err(ScheduleError::InvalidItem { item_id, message })
+            if item_id == successor.id && message.contains("supported evidence limit")
+    ));
 }
 
 #[test]
@@ -562,6 +894,7 @@ fn skipped_execution_unit_does_not_suppress_other_work() {
             session_index: 5,
         }],
         pinned: true,
+        manual_placement_id: None,
     });
     let mut skipped_work = execution_work(skipped.id, 0, vec![0]);
     skipped_work.disposition = Some(ExecutionDisposition::Skipped);
@@ -670,6 +1003,7 @@ fn caller_blocks_at_or_below_execution_high_water_are_removed() {
             session_index: 1,
         }],
         pinned: true,
+        manual_placement_id: None,
     });
     let execution = execution_context(vec![execution_work(task.id, 0, vec![0, 2])]);
 

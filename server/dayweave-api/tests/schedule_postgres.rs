@@ -32,7 +32,8 @@ use dayweave_api::{
     },
     readiness::Readiness,
     scheduling::{
-        ComposeScheduleRequest, ConflictQuery, ItemSearchQuery, PlanOperation, PlanOperationKind,
+        ComposeScheduleRequest, ConflictQuery, ItemSearchQuery, ManualPlacementAssignmentInput,
+        ManualPlacementInput, ManualPlacementReleaseInput, PlanOperation, PlanOperationKind,
         PlanningSimulationPort, PostgresSchedulingRepository, PreviousAssignmentInput,
         PreviousBlockInput, ProposalSubmissionError, ProposalSubmissionPort,
         ProposalSubmissionSpec, PublishScheduleSpec, ScheduleAccess, ScheduleDetail,
@@ -361,6 +362,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 request_hash,
                 input_digest,
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: preview.clone(),
                 published_at: Utc::now(),
             },
@@ -1049,6 +1051,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 request_hash: [31; 32],
                 input_digest,
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: preview,
                 published_at: Utc::now(),
             },
@@ -1126,6 +1129,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 request_hash: [41; 32],
                 input_digest: digest_bytes(&next_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: next_preview.clone(),
                 published_at: Utc::now(),
             },
@@ -1169,6 +1173,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         request_hash: [91; 32],
         input_digest: digest_bytes(&exact_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: exact_preview,
         published_at: Utc::now(),
     };
@@ -1198,6 +1203,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         request_hash: [92; 32],
         input_digest: digest_bytes(&conflict_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: conflict_preview,
         published_at: Utc::now(),
     };
@@ -1230,6 +1236,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         request_hash: [94; 32],
         input_digest: digest_bytes(&same_content_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: same_content_preview,
         published_at: Utc::now(),
     };
@@ -1270,6 +1277,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         request_hash: [96; 32],
         input_digest: digest_bytes(&different_left_result.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: different_left_result,
         published_at: "2099-01-01T00:00:00Z".parse().unwrap(),
     };
@@ -1278,6 +1286,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         request_hash: [97; 32],
         input_digest: digest_bytes(&different_right_result.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: different_right_result,
         published_at: "2000-01-01T00:00:00Z".parse().unwrap(),
     };
@@ -1317,6 +1326,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 request_hash: [205; 32],
                 input_digest: digest_bytes(&future_caller_result.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: future_caller_result,
                 published_at: "2099-01-01T00:00:00Z".parse().unwrap(),
             },
@@ -1336,6 +1346,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                 request_hash: [206; 32],
                 input_digest: digest_bytes(&past_caller_result.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: past_caller_result,
                 published_at: "2000-01-01T00:00:00Z".parse().unwrap(),
             },
@@ -2057,6 +2068,7 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
                     request_hash: [51; 32],
                     input_digest: race_digest,
                     timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
                     result: race_preview,
                     published_at: Utc::now(),
                 },
@@ -2073,6 +2085,493 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
     assert_publication_failure_rollbacks(&test_database.pool, scope, &items, &restarted, &access)
         .await;
     assert_content_insert_seal_race(&test_database.pool, scope).await;
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn manual_placement_approval_and_carry_forward_are_durable() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; manual placement test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
+    let schedules = Arc::new(PostgresSchedulingRepository::new(
+        test_database.pool.clone(),
+        scope,
+    ));
+    let access = owner_access(scope, "auth0|manual-placement-owner");
+    let item_id = Uuid::new_v4();
+    let created = items
+        .create(
+            task(
+                item_id,
+                "SYNTHETIC-SENSITIVE-MANUAL-PG-TARGET",
+                true,
+                None,
+                json!({}),
+            ),
+            idempotency(221),
+        )
+        .await
+        .expect("create manual placement target");
+
+    let mut baseline_request = compose_request();
+    baseline_request.fixed_blocks.clear();
+    let baseline_preview = compose_canonical_schedule(&items, &schedules, baseline_request.clone())
+        .await
+        .expect("baseline preview");
+    let baseline_block = baseline_preview
+        .plan
+        .blocks
+        .iter()
+        .find(|block| block.item_id.is_some_and(|id| id.0 == item_id))
+        .expect("baseline source block")
+        .clone();
+    let baseline_publication = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [221; 32],
+                input_digest: digest_bytes(&baseline_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
+                result: baseline_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("publish baseline");
+
+    let placement_id = Uuid::new_v4();
+    let fixed_id = Uuid::new_v4();
+    let mut manual_request = baseline_request.clone();
+    let mut conflict = compose_request().fixed_blocks.remove(0);
+    conflict.id = fixed_id;
+    conflict.is_sensitive = true;
+    conflict.title = "SYNTHETIC-SENSITIVE-MANUAL-PG-CONFLICT".to_owned();
+    conflict.start = "2026-09-01T09:30:00Z".parse().unwrap();
+    conflict.end = "2026-09-01T10:30:00Z".parse().unwrap();
+    manual_request.fixed_blocks = vec![conflict];
+    manual_request.manual_placements = vec![ManualPlacementInput {
+        id: placement_id,
+        source_schedule_revision_id: Some(baseline_publication.revision.id),
+        assignments: vec![ManualPlacementAssignmentInput {
+            item_id,
+            item_revision: created.item.revision,
+            occurrence_id: None,
+            blocks: vec![PreviousBlockInput {
+                start: "2026-09-01T09:00:00Z".parse().unwrap(),
+                end: "2026-09-01T10:00:00Z".parse().unwrap(),
+                session_index: baseline_block.session_index,
+            }],
+        }],
+    }];
+    let preview = compose_canonical_schedule(&items, &schedules, manual_request.clone())
+        .await
+        .expect("manual placement preview");
+    let [assessment] = preview.manual_placement_assessments.as_slice() else {
+        panic!("one manual placement assessment");
+    };
+    assert!(assessment.approval_required);
+    assert!(
+        assessment
+            .violations
+            .iter()
+            .any(|violation| violation.conflicting_block_ids == vec![fixed_id])
+    );
+    assert!(
+        !serde_json::to_string(assessment)
+            .unwrap()
+            .contains("SYNTHETIC-SENSITIVE")
+    );
+
+    let (app, device_access_token) =
+        credential_publish_app(&test_database.pool, scope, items.clone(), schedules.clone()).await;
+    let missing = schedule_publish_body(Uuid::new_v4(), &preview.input_digest, &manual_request);
+    assert_stale_schedule_publication(&app, &device_access_token, &missing).await;
+    let mut wrong = schedule_publish_body(Uuid::new_v4(), &preview.input_digest, &manual_request);
+    wrong["manual_placement_approvals"] = json!([{
+        "placement_id": placement_id,
+        "approval_digest": format!("sha256:{}", "0".repeat(64)),
+    }]);
+    assert_stale_schedule_publication(&app, &device_access_token, &wrong).await;
+
+    let mut exact = schedule_publish_body(Uuid::new_v4(), &preview.input_digest, &manual_request);
+    exact["manual_placement_approvals"] = json!([{
+        "placement_id": placement_id,
+        "approval_digest": assessment.approval_digest,
+    }]);
+    let published = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &exact,
+            &device_access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    let published = body_json(published).await;
+    let revision_id = Uuid::parse_str(published["revision"]["id"].as_str().unwrap()).unwrap();
+    let state: Value = sqlx::query_scalar(
+        "SELECT result_snapshot -> 'manual_placement_state' \
+         FROM schedule_revision_details WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(state[0]["placement"]["id"], placement_id.to_string());
+    assert_eq!(state[0]["authorization"], "explicit_approval");
+    assert!(!state.to_string().contains("SYNTHETIC-SENSITIVE"));
+    let block_evidence: Value = sqlx::query_scalar(
+        "SELECT constraint_snapshot -> 'manual_placement' FROM schedule_blocks \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2 AND item_id = $3",
+    )
+    .bind(scope.workspace_id)
+    .bind(revision_id)
+    .bind(item_id)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(block_evidence["placement_id"], placement_id.to_string());
+    assert_eq!(block_evidence["authorization"], "explicit_approval");
+
+    let mut carried_request = manual_request.clone();
+    carried_request.manual_placements.clear();
+    let carried_preview = compose_canonical_schedule(&items, &schedules, carried_request.clone())
+        .await
+        .expect("retained manual placement preview");
+    assert!(!carried_preview.manual_placement_assessments[0].approval_required);
+    let carried_body = schedule_publish_body(
+        Uuid::new_v4(),
+        &carried_preview.input_digest,
+        &carried_request,
+    );
+    let carried_publish = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &carried_body,
+            &device_access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(carried_publish.status(), StatusCode::OK);
+    let carried_publish = body_json(carried_publish).await;
+    let carried_revision =
+        Uuid::parse_str(carried_publish["revision"]["id"].as_str().unwrap()).unwrap();
+    let carried_authorization: String = sqlx::query_scalar(
+        "SELECT result_snapshot -> 'manual_placement_state' -> 0 ->> 'authorization' \
+         FROM schedule_revision_details WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(carried_revision)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(carried_authorization, "carried_forward");
+
+    let mut changed_obstacle_request = carried_request.clone();
+    changed_obstacle_request.fixed_blocks[0].start = "2026-09-01T09:15:00Z".parse().unwrap();
+    changed_obstacle_request.fixed_blocks[0].end = "2026-09-01T10:15:00Z".parse().unwrap();
+    let changed = compose_canonical_schedule(&items, &schedules, changed_obstacle_request)
+        .await
+        .expect("changed obstacle re-assessment");
+    assert!(changed.manual_placement_assessments[0].approval_required);
+
+    // A fresh client can recover the exact complete group without possessing
+    // the private publication snapshot or the original local placement journal.
+    let catalog_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/schedule/manual-placements")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {device_access_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let catalog = body_json(catalog_response).await;
+    assert_eq!(
+        catalog["current_schedule_revision_id"],
+        carried_revision.to_string()
+    );
+    assert_eq!(catalog["placements"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        catalog["placements"][0]["placement_id"],
+        placement_id.to_string()
+    );
+    assert_eq!(
+        catalog["placements"][0]["assignments"][0]["item_id"],
+        item_id.to_string()
+    );
+    assert_eq!(
+        catalog["placements"][0]["assignments"][0]["published_item_revision"],
+        created.item.revision
+    );
+    assert_eq!(
+        catalog["placements"][0]["assignments"][0]["blocks"][0]["session_index"],
+        baseline_block.session_index
+    );
+    assert!(!catalog.to_string().contains("SYNTHETIC-SENSITIVE"));
+
+    let discovered_placement_id =
+        Uuid::parse_str(catalog["placements"][0]["placement_id"].as_str().unwrap()).unwrap();
+    let discovered_revision =
+        Uuid::parse_str(catalog["current_schedule_revision_id"].as_str().unwrap()).unwrap();
+    let mut stale_release_request = carried_request.clone();
+    stale_release_request.manual_placement_releases = vec![ManualPlacementReleaseInput {
+        id: Uuid::new_v4(),
+        placement_id: discovered_placement_id,
+        source_schedule_revision_id: discovered_revision,
+    }];
+    let stale_release_preview =
+        compose_canonical_schedule(&items, &schedules, stale_release_request.clone())
+            .await
+            .expect("release preview before intervening publication");
+
+    let mut intervening_request = carried_request.clone();
+    intervening_request.config.stability_weight = intervening_request
+        .config
+        .stability_weight
+        .saturating_add(1);
+    let intervening_preview =
+        compose_canonical_schedule(&items, &schedules, intervening_request.clone())
+            .await
+            .expect("intervening retained-placement preview");
+    let intervening = schedules
+        .publish(
+            &access,
+            PublishScheduleSpec {
+                idempotency_key: Uuid::new_v4(),
+                request_hash: [223; 32],
+                input_digest: digest_bytes(&intervening_preview.input_digest),
+                timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
+                result: intervening_preview,
+                published_at: Utc::now(),
+            },
+        )
+        .await
+        .expect("intervening publication");
+    assert_ne!(intervening.revision.id, discovered_revision);
+    let revisions_before_stale: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(&test_database.pool)
+            .await
+            .unwrap();
+    let stale_release_body = schedule_publish_body(
+        Uuid::new_v4(),
+        &stale_release_preview.input_digest,
+        &stale_release_request,
+    );
+    let stale_release = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &stale_release_body,
+            &device_access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(stale_release.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(stale_release).await["error"]["code"],
+        "schedule_publication_stale"
+    );
+    let revisions_after_stale: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(&test_database.pool)
+            .await
+            .unwrap();
+    assert_eq!(revisions_after_stale, revisions_before_stale);
+
+    let refreshed_catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/schedule/manual-placements")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {device_access_token}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(refreshed_catalog.status(), StatusCode::OK);
+    let refreshed_catalog = body_json(refreshed_catalog).await;
+    let refreshed_revision = Uuid::parse_str(
+        refreshed_catalog["current_schedule_revision_id"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(refreshed_revision, intervening.revision.id);
+
+    let pre_edit_carried_request = intervening_request.clone();
+    let pre_edit_carried_preview =
+        compose_canonical_schedule(&items, &schedules, pre_edit_carried_request.clone())
+            .await
+            .expect("fresh retained-placement preview before item edit");
+    assert!(
+        pre_edit_carried_preview
+            .manual_placement_assessments
+            .iter()
+            .all(|assessment| !assessment.approval_required)
+    );
+    let pre_edit_carried_body = schedule_publish_body(
+        Uuid::new_v4(),
+        &pre_edit_carried_preview.input_digest,
+        &pre_edit_carried_request,
+    );
+
+    let current = items.get(item_id).await.expect("current placement item");
+    let changed_item = items
+        .replace(
+            item_id,
+            current.revision,
+            ReplaceItem {
+                is_sensitive: current.is_sensitive,
+                kind: current.kind,
+                status: current.status,
+                title: current.title,
+                notes: current.notes,
+                timezone_name: current.timezone_name,
+                duration_seconds: Some(5_400),
+                deadline_at: current.deadline_at,
+                earliest_start_at: current.earliest_start_at,
+                recurrence: current.recurrence,
+                flexible_constraints: current.flexible_constraints,
+                split_policy: current.split_policy,
+                importance: current.importance,
+                urgency: current.urgency,
+                parent_id: current.parent_id,
+                sibling_order: current.sibling_order,
+            },
+            idempotency(222),
+        )
+        .await
+        .expect("change retained item duration");
+    assert_eq!(changed_item.item.duration_seconds, Some(5_400));
+
+    let revisions_before_changed_item_publish: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(&test_database.pool)
+            .await
+            .unwrap();
+    assert_stale_schedule_publication(&app, &device_access_token, &pre_edit_carried_body).await;
+    let revisions_after_changed_item_publish: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM schedule_revisions WHERE workspace_id = $1")
+            .bind(scope.workspace_id)
+            .fetch_one(&test_database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        revisions_after_changed_item_publish, revisions_before_changed_item_publish,
+        "stale carried placement must not write a schedule revision"
+    );
+    assert!(
+        compose_canonical_schedule(&items, &schedules, carried_request.clone())
+            .await
+            .is_err(),
+        "an incompatible retained shape must not be silently normalized"
+    );
+
+    let release_id = Uuid::new_v4();
+    let mut release_request = carried_request;
+    release_request.manual_placement_releases = vec![ManualPlacementReleaseInput {
+        id: release_id,
+        placement_id: discovered_placement_id,
+        source_schedule_revision_id: refreshed_revision,
+    }];
+    let release_preview = compose_canonical_schedule(&items, &schedules, release_request.clone())
+        .await
+        .expect("discovered pure release preview");
+    assert!(release_preview.manual_placement_assessments.is_empty());
+    assert!(
+        release_preview
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| block.item_id.is_some_and(|id| id.0 == item_id))
+            .all(|block| block.kind != dayweave_core::ScheduleBlockKind::Pinned)
+    );
+    let release_body = schedule_publish_body(
+        Uuid::new_v4(),
+        &release_preview.input_digest,
+        &release_request,
+    );
+    let release_publish = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &release_body,
+            &device_access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(release_publish.status(), StatusCode::OK);
+    let release_publish = body_json(release_publish).await;
+    let release_revision =
+        Uuid::parse_str(release_publish["revision"]["id"].as_str().unwrap()).unwrap();
+    let release_snapshot: Value = sqlx::query_scalar(
+        "SELECT result_snapshot FROM schedule_revision_details \
+         WHERE workspace_id = $1 AND schedule_revision_id = $2",
+    )
+    .bind(scope.workspace_id)
+    .bind(release_revision)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        release_snapshot["manual_placement_releases"][0]["id"],
+        release_id.to_string()
+    );
+    assert_eq!(
+        release_snapshot["manual_placement_releases"][0]["placement_id"],
+        placement_id.to_string()
+    );
+    assert_eq!(release_snapshot["manual_placement_state"], json!([]));
+    let audit_release_id: String = sqlx::query_scalar(
+        "SELECT metadata -> 'manual_placement_releases' -> 0 ->> 'id' \
+         FROM audit_operations WHERE workspace_id = $1 AND entity_id = $2 \
+           AND operation_type = 'schedule.published'",
+    )
+    .bind(scope.workspace_id)
+    .bind(release_revision)
+    .fetch_one(&test_database.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_release_id, release_id.to_string());
 
     test_database.destroy().await;
 }
@@ -2156,6 +2655,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         request_hash: [141; 32],
         input_digest: digest_bytes(&pre_defer_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: pre_defer_preview.clone(),
         published_at: Utc::now(),
     };
@@ -2251,6 +2751,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                     request_hash: [142; 32],
                     input_digest: digest_bytes(&omission.input_digest),
                     timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
                     result: omission.clone(),
                     published_at: Utc::now(),
                 },
@@ -2271,6 +2772,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
         request_hash: [143; 32],
         input_digest: digest_bytes(&exact_preview.input_digest),
         timezone_name: "Europe/Madrid".to_owned(),
+        manual_placement_approvals: Vec::new(),
         result: exact_preview.clone(),
         published_at: Utc::now(),
     };
@@ -2376,6 +2878,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 request_hash: [145; 32],
                 input_digest: digest_bytes(&disjoint.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: disjoint,
                 published_at: Utc::now(),
             },
@@ -2400,6 +2903,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                     request_hash: [148; 32],
                     input_digest: digest_bytes(&omission.input_digest),
                     timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
                     result: omission,
                     published_at: Utc::now(),
                 },
@@ -2456,6 +2960,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 request_hash: [149; 32],
                 input_digest: digest_bytes(&restart_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: restart_preview,
                 published_at: Utc::now(),
             },
@@ -2519,6 +3024,7 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
                 request_hash: [150; 32],
                 input_digest: digest_bytes(&active_replacement_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: active_replacement_preview,
                 published_at: Utc::now(),
             },
@@ -2668,6 +3174,7 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
                 request_hash: [146; 32],
                 input_digest: digest_bytes(&initial_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: initial_preview,
                 published_at: Utc::now(),
             },
@@ -2704,6 +3211,7 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
                 request_hash: [147; 32],
                 input_digest: digest_bytes(&active_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: active_preview,
                 published_at: Utc::now(),
             },
@@ -2740,6 +3248,7 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
                     request_hash: [148; 32],
                     input_digest: digest_bytes(&race_preview.input_digest),
                     timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
                     result: race_preview,
                     published_at: Utc::now(),
                 },
@@ -2841,6 +3350,7 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
                 request_hash: [150; 32],
                 input_digest: digest_bytes(&claim_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: claim_preview,
                 published_at: Utc::now(),
             },
@@ -2979,6 +3489,7 @@ async fn non_executable_claims_retire_without_blocking_publication() {
                 request_hash: [205; 32],
                 input_digest: digest_bytes(&preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: preview,
                 published_at: Utc::now(),
             },
@@ -3129,6 +3640,7 @@ async fn migrated_passive_replacement_index_is_never_reallocated() {
                 request_hash: [209; 32],
                 input_digest: digest_bytes(&preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: preview,
                 published_at: Utc::now(),
             },
@@ -3396,6 +3908,7 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
                 request_hash: [211; 32],
                 input_digest: digest_bytes(&fresh_preview.input_digest),
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: fresh_preview,
                 published_at: "2000-01-01T00:00:00Z".parse().unwrap(),
             },
@@ -3566,6 +4079,7 @@ async fn calendar_projection_fences_preview_publication_and_exact_replay() {
                 request_hash: [202; 32],
                 input_digest: digest_bytes(&transaction_preview.input_digest),
                 timezone_name: request.timezone_name.clone(),
+                manual_placement_approvals: Vec::new(),
                 result: transaction_preview,
                 published_at: Utc::now(),
             },
@@ -4799,6 +5313,7 @@ async fn assert_publication_failure_rollbacks(
                     request_hash: [110 + u8::try_from(index).unwrap(); 32],
                     input_digest: digest_bytes(&preview.input_digest),
                     timezone_name: "Europe/Madrid".to_owned(),
+                    manual_placement_approvals: Vec::new(),
                     result: preview,
                     published_at: Utc::now(),
                 },

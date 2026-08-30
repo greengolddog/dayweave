@@ -223,6 +223,8 @@ fn process_composition(request_value: &serde_json::Value) -> Result<ResponseResu
         ignored_previous_assignments,
         timezone_name: _,
         effective_sensitivity: _,
+        manual_placements: _,
+        manual_placement_releases: _,
         plan_request: _,
     } = prepared;
     Ok(ResponseResult::Composition {
@@ -419,6 +421,7 @@ const fn map_schedule_error(error: &ScheduleError) -> ErrorCode {
         ScheduleError::MissingPreviousItem(_) => ErrorCode::MissingPreviousItem,
         ScheduleError::InvalidHierarchy(_) => ErrorCode::InvalidHierarchy,
         ScheduleError::InvalidRecurrence(_) => ErrorCode::InvalidRecurrence,
+        ScheduleError::ConflictEvidenceLimit => ErrorCode::ResourceLimitExceeded,
     }
 }
 

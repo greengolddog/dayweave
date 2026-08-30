@@ -6,7 +6,7 @@ mod postgres;
 mod projection;
 mod proposal_bridge;
 
-pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/3";
+pub(crate) const SCHEDULER_PUBLICATION_SCHEMA: &str = "dayweave-scheduler-publication/4";
 
 /// `PostgreSQL` `timestamptz` stores microseconds. Query boundaries must already
 /// use that precision so a read cannot silently change meaning when bound.
@@ -21,13 +21,17 @@ pub(crate) fn truncate_to_postgres_timestamp_precision(
         .expect("a valid DateTime must remain representable at microsecond precision")
 }
 
-pub(crate) use compose::compose_canonical_schedule_unfenced;
 pub use compose::{
-    ComposeScheduleError, ComposeScheduleResult, Rfc3339SchedulePlan, compose_canonical_schedule,
+    ComposeScheduleError, ComposeScheduleResult, ManualPlacementApproval,
+    ManualPlacementAssessmentOutput, ManualPlacementConflictOutput, ManualPlacementViolationOutput,
+    RetainedManualPlacementAssignmentSummary, RetainedManualPlacementCatalog,
+    RetainedManualPlacementSummary, Rfc3339SchedulePlan, compose_canonical_schedule,
 };
+pub(crate) use compose::{compose_canonical_schedule_unfenced, retained_manual_placement_catalog};
 pub use dayweave_compose::{
     AvailabilityInput, ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    IgnoredPreviousAssignment, PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem,
+    IgnoredPreviousAssignment, ManualPlacementAssignmentInput, ManualPlacementInput,
+    ManualPlacementReleaseInput, PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem,
     SchedulerConfigInput,
 };
 pub use memory::{

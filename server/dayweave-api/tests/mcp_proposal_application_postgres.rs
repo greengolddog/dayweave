@@ -72,6 +72,7 @@ async fn mcp_typed_proposal_requires_a_fresh_device_preview_before_canonical_app
                 request_hash: [2; 32],
                 input_digest,
                 timezone_name: "Europe/Madrid".to_owned(),
+                manual_placement_approvals: Vec::new(),
                 result: composition,
                 published_at: Utc::now(),
             },

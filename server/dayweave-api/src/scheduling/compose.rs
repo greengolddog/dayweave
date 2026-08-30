@@ -4,17 +4,19 @@ use std::{
     ops::Deref,
 };
 
+use chrono::{DateTime, Utc};
 use dayweave_compose::{
     CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
     ComposeScheduleRequest, FixedBlockSourceInput, IgnoredPreviousAssignment, MAX_CANONICAL_ITEMS,
-    PrepareScheduleError, PreparedSchedule, RejectedScheduleItem, prepare_canonical_schedule,
+    ManualPlacementInput, ManualPlacementReleaseInput, PrepareScheduleError, PreparedSchedule,
+    PreviousAssignmentInput, RejectedScheduleItem, prepare_canonical_schedule,
     validate_schedule_request,
 };
 use dayweave_core::{
-    ExecutionPlanningContext, ItemId, OccurrenceId, PlanRequest, ScheduleError, SchedulePlan,
-    Scheduler,
+    ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId, PlanRequest,
+    ScheduleBlockKind, ScheduleError, SchedulePlan, Scheduler,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -32,6 +34,10 @@ use super::{
         AuthoritativePlanningEvidence, ExecutionPlanningEvidenceError, PostgresSchedulingRepository,
     },
 };
+
+type AssignmentIdentity = (Uuid, Option<Uuid>);
+type ManualBlockIdentity = (Uuid, Option<Uuid>, u16, i128, i128);
+const MAX_MANUAL_ASSESSMENT_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ComposeScheduleResult {
@@ -62,14 +68,108 @@ pub struct ComposeScheduleResult {
     #[serde(skip)]
     #[schema(ignore)]
     pub(crate) planning_evidence: AuthoritativePlanningEvidence,
+    /// Exact manual proposal inputs retained only for durable publication
+    /// evidence and per-block audit binding.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) manual_placements: Vec<ManualPlacementInput>,
+    /// Exact explicit retained-pin releases retained for the private durable
+    /// publication and audit boundary.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) manual_placement_releases: Vec<ManualPlacementReleaseInput>,
     /// Canonical items accepted by this scheduler schema. This includes Inbox
     /// subtrees and retained nonblocking calendar context even though neither
     /// emits a work item or schedule block.
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub manual_placement_assessments: Vec<ManualPlacementAssessmentOutput>,
     #[schema(value_type = Object)]
     pub plan: Rfc3339SchedulePlan,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementAssessmentOutput {
+    pub placement_id: Uuid,
+    pub environment_digest: String,
+    pub approval_digest: String,
+    pub approval_required: bool,
+    pub violations: Vec<ManualPlacementViolationOutput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementApproval {
+    pub placement_id: Uuid,
+    pub approval_digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementViolationOutput {
+    #[schema(value_type = String)]
+    pub code: ManualPlacementViolationCode,
+    pub item_ids: Vec<Uuid>,
+    pub occurrence_ids: Vec<Uuid>,
+    pub conflicting_block_ids: Vec<Uuid>,
+    pub conflicting_blocks: Vec<ManualPlacementConflictOutput>,
+    pub start: String,
+    pub end: String,
+    pub boundary_start: Option<String>,
+    pub boundary_end: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementConflictOutput {
+    pub block_id: Uuid,
+    pub item_id: Option<Uuid>,
+    pub occurrence_id: Option<Uuid>,
+    pub external_block_id: Option<Uuid>,
+    #[schema(value_type = String)]
+    pub kind: ScheduleBlockKind,
+    pub start: String,
+    pub end: String,
+}
+
+/// Owner-only, content-free recovery view for durable user placements.
+/// Grouping is preserved so a client can release or replace exactly one
+/// complete retained placement after losing its local journal.
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedManualPlacementCatalog {
+    pub current_schedule_revision_id: Option<Uuid>,
+    pub placements: Vec<RetainedManualPlacementSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedManualPlacementSummary {
+    pub placement_id: Uuid,
+    pub source_schedule_revision_id: Option<Uuid>,
+    pub assignments: Vec<RetainedManualPlacementAssignmentSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedManualPlacementAssignmentSummary {
+    pub item_id: Uuid,
+    pub published_item_revision: u64,
+    pub occurrence_id: Option<Uuid>,
+    pub blocks: Vec<dayweave_compose::PreviousBlockInput>,
+}
+
+#[derive(Serialize)]
+struct ManualPlacementApprovalEvidence<'a> {
+    schema: &'static str,
+    input_digest: &'a str,
+    environment_digest: &'a str,
+    placement: &'a ManualPlacementInput,
+    violations: &'a [dayweave_core::ManualPlacementViolation],
 }
 
 /// JSON-facing schedule plan with every instant encoded as RFC 3339.
@@ -259,6 +359,8 @@ pub enum ComposeScheduleError {
     ExecutionEvidenceChanged,
     #[error("execution planning evidence is temporarily unavailable")]
     ExecutionEvidenceUnavailable,
+    #[error("authoritative manual placement evidence changed: {0}")]
+    AuthoritativeManualPlacementChanged(String),
 }
 
 impl ComposeScheduleError {
@@ -266,7 +368,10 @@ impl ComposeScheduleError {
     pub const fn is_client_error(&self) -> bool {
         matches!(
             self,
-            Self::InvalidRequest(_) | Self::TooManyItems | Self::Scheduler(_)
+            Self::InvalidRequest(_)
+                | Self::TooManyItems
+                | Self::Scheduler(_)
+                | Self::AuthoritativeManualPlacementChanged(_)
         )
     }
 }
@@ -353,8 +458,26 @@ async fn compose_canonical_schedule_inner(
     if planning_before != planning_after {
         return Err(ComposeScheduleError::ExecutionEvidenceChanged);
     }
+    normalize_manual_placements_for_execution(&mut request, &planning_before.execution)?;
+    validate_manual_placement_item_revisions(&request, &items)?;
+    validate_manual_placement_sources(&request, &planning_before)?;
+    let pruned_assignment_identities =
+        merge_retained_manual_placements(&mut request, &planning_before, &items)?;
+    let (retained_placement_was_injected, manual_execution_evidence_was_applied) =
+        manual_placement_staleness_flags(&request, &planning_before);
     let untrusted_assignments =
         replace_with_authoritative_assignments(&mut request, &planning_before)?;
+    request.previous_assignments.retain(|assignment| {
+        !pruned_assignment_identities.contains(&(assignment.item_id, assignment.occurrence_id))
+    });
+    if let Err(error) = validate_schedule_request(&request) {
+        if retained_placement_was_injected {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                "retained placement evidence no longer satisfies the compose request".to_owned(),
+            ));
+        }
+        return Err(map_prepare_error(error));
+    }
     compose_items_with_projection_for_schema(
         items,
         request,
@@ -363,6 +486,579 @@ async fn compose_canonical_schedule_inner(
         planning_before,
         untrusted_assignments,
     )
+    .map_err(|error| {
+        if (retained_placement_was_injected || manual_execution_evidence_was_applied)
+            && matches!(
+                error,
+                ComposeScheduleError::InvalidRequest(_) | ComposeScheduleError::Scheduler(_)
+            )
+        {
+            ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                "a retained placement no longer composes against current scheduling evidence"
+                    .to_owned(),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+fn manual_placement_staleness_flags(
+    request: &ComposeScheduleRequest,
+    evidence: &AuthoritativePlanningEvidence,
+) -> (bool, bool) {
+    let retained_was_injected = request.manual_placements.iter().any(|placement| {
+        evidence
+            .retained_manual_placements
+            .iter()
+            .any(|state| state.placement.id == placement.id)
+    });
+    let execution_was_applied = request
+        .manual_placements
+        .iter()
+        .flat_map(|placement| &placement.assignments)
+        .any(|assignment| {
+            evidence.execution.work_units.iter().any(|unit| {
+                unit.item_id.0 == assignment.item_id
+                    && unit.occurrence_id.map(|occurrence| occurrence.0) == assignment.occurrence_id
+            })
+        });
+    (retained_was_injected, execution_was_applied)
+}
+
+fn validate_manual_placement_sources(
+    request: &ComposeScheduleRequest,
+    evidence: &AuthoritativePlanningEvidence,
+) -> Result<(), ComposeScheduleError> {
+    let (retained_ids, retained_by_identity) = retained_manual_placement_indexes(evidence)?;
+    let released_placement_ids = request
+        .manual_placement_releases
+        .iter()
+        .map(|release| release.placement_id)
+        .collect::<BTreeSet<_>>();
+    for release in &request.manual_placement_releases {
+        if Some(release.source_schedule_revision_id) != evidence.published_revision_id
+            || !retained_ids.contains(&release.placement_id)
+        {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!(
+                    "manual placement release {} is stale or does not target a retained placement",
+                    release.id
+                ),
+            ));
+        }
+    }
+    let published_by_identity: BTreeMap<_, _> = evidence
+        .previous_assignments
+        .iter()
+        .map(|assignment| ((assignment.item_id, assignment.occurrence_id), assignment))
+        .collect();
+    for placement in &request.manual_placements {
+        if placement.source_schedule_revision_id != evidence.published_revision_id {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!(
+                    "manual placement {} is based on a stale published schedule",
+                    placement.id
+                ),
+            ));
+        }
+        for assignment in &placement.assignments {
+            let Some(source) =
+                published_by_identity.get(&(assignment.item_id, assignment.occurrence_id))
+            else {
+                continue;
+            };
+            let high_water = execution_high_water_for_identity(
+                &evidence.execution,
+                assignment.item_id,
+                assignment.occurrence_id,
+            );
+            let source_shape: BTreeMap<_, _> = source
+                .blocks
+                .iter()
+                .filter(|block| high_water.is_none_or(|high| block.session_index > high))
+                .map(|block| {
+                    (
+                        block.session_index,
+                        block.end.signed_duration_since(block.start),
+                    )
+                })
+                .collect();
+            let requested_shape: BTreeMap<_, _> = assignment
+                .blocks
+                .iter()
+                .map(|block| {
+                    (
+                        block.session_index,
+                        block.end.signed_duration_since(block.start),
+                    )
+                })
+                .collect();
+            let remaining_source_count = source
+                .blocks
+                .iter()
+                .filter(|block| high_water.is_none_or(|high| block.session_index > high))
+                .count();
+            let source_is_unique = source_shape.len() == remaining_source_count;
+            let request_is_unique = requested_shape.len() == assignment.blocks.len();
+            let preserves_every_source_session = source_shape
+                .iter()
+                .all(|(index, duration)| requested_shape.get(index) == Some(duration));
+            let retained_source =
+                retained_by_identity.get(&(assignment.item_id, assignment.occurrence_id));
+            let shape_is_authorized = retained_source.map_or_else(
+                || {
+                    source_is_unique
+                        && request_is_unique
+                        && (preserves_every_source_session
+                            || source.item_revision != assignment.item_revision
+                            || execution_credit_changes_source_shape(&evidence.execution, source))
+                },
+                |placement_id| {
+                    released_placement_ids.contains(placement_id)
+                        || (source_is_unique
+                            && request_is_unique
+                            && source_shape == requested_shape)
+                },
+            );
+            if !shape_is_authorized {
+                return Err(ComposeScheduleError::InvalidRequest(format!(
+                    "manual placement {} must preserve every remaining source session and duration",
+                    placement.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execution_credit_changes_source_shape(
+    execution: &ExecutionPlanningContext,
+    source: &PreviousAssignmentInput,
+) -> bool {
+    let Some(unit) = execution.work_units.iter().find(|unit| {
+        unit.item_id.0 == source.item_id
+            && unit.occurrence_id.map(|occurrence| occurrence.0) == source.occurrence_id
+    }) else {
+        return false;
+    };
+    let Some(high_water) = execution_unit_high_water(unit) else {
+        return false;
+    };
+    let consumed_source_minutes = source
+        .blocks
+        .iter()
+        .filter(|block| block.session_index <= high_water)
+        .try_fold(0_u64, |total, block| {
+            let seconds = block.end.signed_duration_since(block.start).num_seconds();
+            u64::try_from(seconds)
+                .ok()
+                .map(|seconds| total.saturating_add(seconds.saturating_add(59) / 60))
+        });
+    let credited_minutes = unit.credited_seconds.saturating_add(59) / 60;
+    consumed_source_minutes != Some(credited_minutes)
+}
+
+fn normalize_manual_placements_for_execution(
+    request: &mut ComposeScheduleRequest,
+    execution: &ExecutionPlanningContext,
+) -> Result<(), ComposeScheduleError> {
+    for assignment in request
+        .manual_placements
+        .iter_mut()
+        .flat_map(|placement| &mut placement.assignments)
+    {
+        let Some(unit) = execution.work_units.iter().find(|unit| {
+            unit.item_id.0 == assignment.item_id
+                && unit.occurrence_id.map(|occurrence| occurrence.0) == assignment.occurrence_id
+        }) else {
+            continue;
+        };
+        if !unit.reservations.is_empty() {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!(
+                    "item {} now has an active execution reservation",
+                    assignment.item_id
+                ),
+            ));
+        }
+        if unit.disposition.is_some() {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!("item {} is no longer actionable", assignment.item_id),
+            ));
+        }
+        if let Some(high_water) = execution_unit_high_water(unit) {
+            assignment
+                .blocks
+                .retain(|block| block.session_index > high_water);
+            if assignment.blocks.is_empty() {
+                return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                    format!(
+                        "item {} has no remaining requested sessions after execution",
+                        assignment.item_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn execution_high_water_for_identity(
+    execution: &ExecutionPlanningContext,
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+) -> Option<u16> {
+    execution
+        .work_units
+        .iter()
+        .find(|unit| {
+            unit.item_id.0 == item_id
+                && unit.occurrence_id.map(|occurrence| occurrence.0) == occurrence_id
+        })
+        .and_then(execution_unit_high_water)
+}
+
+fn execution_unit_high_water(unit: &dayweave_core::ExecutionWorkUnit) -> Option<u16> {
+    unit.used_session_indices
+        .iter()
+        .copied()
+        .chain(
+            unit.reservations
+                .iter()
+                .map(|reservation| reservation.session_index),
+        )
+        .max()
+}
+
+fn validate_manual_placement_item_revisions(
+    request: &ComposeScheduleRequest,
+    items: &[Item],
+) -> Result<(), ComposeScheduleError> {
+    let revisions = items
+        .iter()
+        .map(|item| (item.id, item.revision))
+        .collect::<BTreeMap<_, _>>();
+    for assignment in request
+        .manual_placements
+        .iter()
+        .flat_map(|placement| &placement.assignments)
+    {
+        if revisions.get(&assignment.item_id) != Some(&assignment.item_revision) {
+            return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+                format!(
+                    "item {} no longer has revision {}",
+                    assignment.item_id, assignment.item_revision
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn retained_manual_placement_indexes(
+    evidence: &AuthoritativePlanningEvidence,
+) -> Result<(BTreeSet<Uuid>, BTreeMap<AssignmentIdentity, Uuid>), ComposeScheduleError> {
+    let retained_ids = evidence
+        .retained_manual_placements
+        .iter()
+        .map(|state| state.placement.id)
+        .collect::<BTreeSet<_>>();
+    if retained_ids.len() != evidence.retained_manual_placements.len() {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "retained manual placement evidence is inconsistent".to_owned(),
+        ));
+    }
+    let retained_by_identity = evidence
+        .retained_manual_placements
+        .iter()
+        .flat_map(|state| {
+            state.placement.assignments.iter().map(move |assignment| {
+                (
+                    (assignment.item_id, assignment.occurrence_id),
+                    state.placement.id,
+                )
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let assignment_count = evidence
+        .retained_manual_placements
+        .iter()
+        .map(|state| state.placement.assignments.len())
+        .sum::<usize>();
+    if retained_by_identity.len() != assignment_count {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "retained manual placement assignments are inconsistent".to_owned(),
+        ));
+    }
+    Ok((retained_ids, retained_by_identity))
+}
+
+fn merge_retained_manual_placements(
+    request: &mut ComposeScheduleRequest,
+    evidence: &AuthoritativePlanningEvidence,
+    items: &[Item],
+) -> Result<BTreeSet<AssignmentIdentity>, ComposeScheduleError> {
+    if evidence.retained_manual_placements.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let current_items: BTreeMap<_, _> = items.iter().map(|item| (item.id, item)).collect();
+    let plannable_item_ids = canonical_plannable_item_ids(request, items)?;
+    let retained_ids: BTreeSet<_> = evidence
+        .retained_manual_placements
+        .iter()
+        .map(|state| state.placement.id)
+        .collect();
+    if request
+        .manual_placements
+        .iter()
+        .any(|placement| retained_ids.contains(&placement.id))
+    {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "a replacement manual placement must use a fresh id".to_owned(),
+        ));
+    }
+    let released_ids = request
+        .manual_placement_releases
+        .iter()
+        .map(|release| release.placement_id)
+        .collect::<BTreeSet<_>>();
+
+    let requested_identities = request
+        .manual_placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.id,
+                placement
+                    .assignments
+                    .iter()
+                    .map(|assignment| (assignment.item_id, assignment.occurrence_id))
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let earliest = request.as_of.max(request.horizon_start);
+    let mut pruned_identities = BTreeSet::new();
+    for state in &evidence.retained_manual_placements {
+        let retained_identities = state
+            .placement
+            .assignments
+            .iter()
+            .map(|assignment| (assignment.item_id, assignment.occurrence_id))
+            .collect::<BTreeSet<_>>();
+        let replacements = requested_identities
+            .iter()
+            .filter(|(_, identities)| !identities.is_disjoint(&retained_identities))
+            .collect::<Vec<_>>();
+        if !replacements.is_empty() {
+            if replacements.len() != 1 || replacements[0].1 != retained_identities {
+                return Err(ComposeScheduleError::InvalidRequest(format!(
+                    "manual placement {} must be replaced as one complete assignment group",
+                    state.placement.id
+                )));
+            }
+            pruned_identities.extend(retained_identities);
+            continue;
+        }
+        if released_ids.contains(&state.placement.id) {
+            pruned_identities.extend(retained_identities);
+            continue;
+        }
+
+        if !retained_placement_is_actionable(&state.placement, &current_items, &plannable_item_ids)
+        {
+            pruned_identities.extend(retained_identities);
+            continue;
+        }
+        if retained_placement_has_new_execution_claim(&state.placement, &evidence.execution) {
+            pruned_identities.extend(retained_identities);
+            continue;
+        }
+
+        let mut carried = state.placement.clone();
+        if !retained_placement_is_inside_horizon(&carried, request, earliest)? {
+            pruned_identities.extend(retained_identities);
+            continue;
+        }
+        for assignment in &mut carried.assignments {
+            assignment.item_revision = current_items[&assignment.item_id].revision;
+        }
+        request.manual_placements.push(carried);
+    }
+    Ok(pruned_identities)
+}
+
+fn retained_placement_is_inside_horizon(
+    placement: &ManualPlacementInput,
+    request: &ComposeScheduleRequest,
+    earliest: DateTime<Utc>,
+) -> Result<bool, ComposeScheduleError> {
+    let overlaps_horizon = placement.assignments.iter().any(|assignment| {
+        assignment
+            .blocks
+            .iter()
+            .any(|block| block.end > earliest && block.start < request.horizon_end)
+    });
+    if !overlaps_horizon {
+        let wholly_expired = placement.assignments.iter().all(|assignment| {
+            assignment
+                .blocks
+                .iter()
+                .all(|block| block.end <= request.as_of)
+        });
+        if wholly_expired {
+            return Ok(false);
+        }
+        return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+            format!(
+                "retained manual placement {} is outside the current planning horizon; expand the horizon or explicitly release it",
+                placement.id
+            ),
+        ));
+    }
+    if placement.assignments.iter().any(|assignment| {
+        assignment
+            .blocks
+            .iter()
+            .any(|block| block.start < earliest || block.end > request.horizon_end)
+    }) {
+        return Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(
+            format!(
+                "retained manual placement {} crosses the current planning boundary",
+                placement.id
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn retained_placement_is_actionable(
+    placement: &ManualPlacementInput,
+    current_items: &BTreeMap<Uuid, &Item>,
+    plannable_item_ids: &BTreeSet<Uuid>,
+) -> bool {
+    placement.assignments.iter().all(|assignment| {
+        current_items.get(&assignment.item_id).is_some_and(|item| {
+            plannable_item_ids.contains(&item.id)
+                && !item_is_suppressed_by_hierarchy(item.id, current_items)
+                && !item.status.is_terminal()
+                && item.status != ItemStatus::InProgress
+                && item.is_executable
+                && item.duration_seconds.is_some()
+        })
+    })
+}
+
+fn canonical_plannable_item_ids(
+    request: &ComposeScheduleRequest,
+    items: &[Item],
+) -> Result<BTreeSet<Uuid>, ComposeScheduleError> {
+    let mut eligibility_request = request.clone();
+    eligibility_request.previous_assignments.clear();
+    eligibility_request.manual_placements.clear();
+    eligibility_request.manual_placement_releases.clear();
+    let prepared = prepare_canonical_schedule(
+        items.iter().cloned().map(into_canonical_item).collect(),
+        eligibility_request,
+    )
+    .map_err(map_prepare_error)?;
+    Ok(prepared
+        .plan_request
+        .items
+        .into_iter()
+        .map(|item| item.id.0)
+        .collect())
+}
+
+fn item_is_suppressed_by_hierarchy(item_id: Uuid, current_items: &BTreeMap<Uuid, &Item>) -> bool {
+    let mut cursor = Some(item_id);
+    let mut visited = BTreeSet::new();
+    while let Some(current_id) = cursor {
+        if !visited.insert(current_id) {
+            return true;
+        }
+        let Some(item) = current_items.get(&current_id) else {
+            return true;
+        };
+        if item.status == ItemStatus::Inbox {
+            return true;
+        }
+        cursor = item.parent_id;
+    }
+    false
+}
+
+fn retained_placement_has_new_execution_claim(
+    placement: &ManualPlacementInput,
+    execution: &ExecutionPlanningContext,
+) -> bool {
+    placement.assignments.iter().any(|assignment| {
+        execution
+            .work_units
+            .iter()
+            .find(|unit| {
+                unit.item_id.0 == assignment.item_id
+                    && unit.occurrence_id.map(|occurrence| occurrence.0) == assignment.occurrence_id
+            })
+            .is_some_and(|unit| {
+                !unit.reservations.is_empty()
+                    || unit.disposition.is_some()
+                    || unit
+                        .used_session_indices
+                        .iter()
+                        .max()
+                        .is_some_and(|high_water| {
+                            assignment
+                                .blocks
+                                .iter()
+                                .any(|block| block.session_index <= *high_water)
+                        })
+            })
+    })
+}
+
+pub(crate) fn retained_manual_placement_catalog(
+    evidence: &AuthoritativePlanningEvidence,
+) -> RetainedManualPlacementCatalog {
+    let mut placements = evidence
+        .retained_manual_placements
+        .iter()
+        .map(|state| {
+            let mut assignments = state
+                .placement
+                .assignments
+                .iter()
+                .map(|assignment| {
+                    let mut blocks = assignment.blocks.clone();
+                    blocks.sort_by_key(|block| (block.session_index, block.start, block.end));
+                    RetainedManualPlacementAssignmentSummary {
+                        item_id: assignment.item_id,
+                        published_item_revision: assignment.item_revision,
+                        occurrence_id: assignment.occurrence_id,
+                        blocks,
+                    }
+                })
+                .collect::<Vec<_>>();
+            assignments.sort_by_key(|assignment| {
+                (
+                    assignment.item_id,
+                    assignment.occurrence_id,
+                    assignment.published_item_revision,
+                )
+            });
+            RetainedManualPlacementSummary {
+                placement_id: state.placement.id,
+                source_schedule_revision_id: state.placement.source_schedule_revision_id,
+                assignments,
+            }
+        })
+        .collect::<Vec<_>>();
+    placements.sort_by_key(|placement| placement.placement_id);
+    RetainedManualPlacementCatalog {
+        current_schedule_revision_id: evidence.published_revision_id,
+        placements,
+    }
 }
 
 const fn map_projection_fence_error(error: CalendarProjectionFenceError) -> ComposeScheduleError {
@@ -400,6 +1096,7 @@ fn compose_items_for_schema(
         execution: ExecutionPlanningContext::default(),
         published_revision_id: None,
         previous_assignments: request.previous_assignments.clone(),
+        retained_manual_placements: Vec::new(),
     };
     let ignored = replace_with_authoritative_assignments(&mut request, &planning_evidence)?;
     compose_items_with_projection_for_schema(
@@ -457,6 +1154,8 @@ fn compose_prepared_for_schema(
         accepted_item_count,
         rejected_items,
         mut ignored_previous_assignments,
+        manual_placements,
+        manual_placement_releases,
         plan_request,
     } = prepared;
     ignored_previous_assignments.extend(untrusted_assignments);
@@ -469,6 +1168,12 @@ fn compose_prepared_for_schema(
         &plan_request,
     )?;
     let plan = Scheduler.plan_with_execution(&plan_request, &planning_evidence.execution)?;
+    let manual_placement_assessments = build_manual_placement_assessments(
+        &input_digest,
+        &manual_placements,
+        &plan,
+        &planning_evidence.retained_manual_placements,
+    )?;
     let result = ComposeScheduleResult {
         input_digest,
         source_item_count,
@@ -476,9 +1181,12 @@ fn compose_prepared_for_schema(
         source_item_sensitivity: effective_sensitivity,
         calendar_projection_stamps,
         planning_evidence,
+        manual_placements,
+        manual_placement_releases,
         accepted_item_count,
         rejected_items,
         ignored_previous_assignments,
+        manual_placement_assessments,
         plan: Rfc3339SchedulePlan(plan),
     };
     super::postgres::validate_publishable_compose_result(&timezone_name, &result).map_err(
@@ -594,6 +1302,192 @@ fn replace_with_authoritative_assignments(
     Ok(ignored)
 }
 
+pub(super) fn build_manual_placement_assessments(
+    input_digest: &str,
+    placements: &[ManualPlacementInput],
+    plan: &SchedulePlan,
+    retained: &[super::postgres::PersistedManualPlacementState],
+) -> Result<Vec<ManualPlacementAssessmentOutput>, ComposeScheduleError> {
+    let exact_blocks = plan
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            (block.kind == ScheduleBlockKind::Pinned).then_some((
+                block.item_id?.0,
+                block.occurrence_id.map(|occurrence| occurrence.0),
+                block.session_index,
+                block.start.unix_timestamp_nanos(),
+                block.end.unix_timestamp_nanos(),
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    let core_by_id: BTreeMap<_, _> = plan
+        .manual_placement_assessments
+        .iter()
+        .map(|assessment| (assessment.placement_id, assessment))
+        .collect();
+    if core_by_id.len() != placements.len() {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "manual placements did not materialize exactly".to_owned(),
+        ));
+    }
+    let mut result = Vec::with_capacity(placements.len());
+    for placement in placements {
+        let assessment = core_by_id.get(&placement.id).copied().ok_or_else(|| {
+            ComposeScheduleError::InvalidRequest(
+                "manual placement did not bind to scheduled work".to_owned(),
+            )
+        })?;
+        validate_exact_manual_placement(placement, &exact_blocks)?;
+        let (environment_digest, approval_digest) =
+            manual_placement_digests(input_digest, placement, assessment)?;
+        let violations = map_manual_placement_violations(&assessment.violations)?;
+        let was_authorized = retained
+            .iter()
+            .find(|state| retained_placement_covers(placement, &state.placement))
+            .is_some_and(|state| {
+                state.environment_digest == environment_digest
+                    && violations
+                        .iter()
+                        .all(|violation| state.authorized_violations.contains(violation))
+            });
+        result.push(ManualPlacementAssessmentOutput {
+            placement_id: placement.id,
+            environment_digest,
+            approval_digest,
+            approval_required: !violations.is_empty() && !was_authorized,
+            violations,
+        });
+    }
+    result.sort_by_key(|assessment| assessment.placement_id);
+    let encoded_size = serde_json::to_vec(&result)
+        .map_err(|_| ComposeScheduleError::Encoding)?
+        .len();
+    if encoded_size > MAX_MANUAL_ASSESSMENT_BYTES {
+        return Err(ComposeScheduleError::InvalidRequest(
+            "manual placement assessment exceeds the supported evidence size".to_owned(),
+        ));
+    }
+    Ok(result)
+}
+
+fn validate_exact_manual_placement(
+    placement: &ManualPlacementInput,
+    exact_blocks: &BTreeSet<ManualBlockIdentity>,
+) -> Result<(), ComposeScheduleError> {
+    for assignment in &placement.assignments {
+        for source in &assignment.blocks {
+            let start_nanos = i128::from(source.start.timestamp_micros()) * 1_000;
+            let end_nanos = i128::from(source.end.timestamp_micros()) * 1_000;
+            let exact = exact_blocks.contains(&(
+                assignment.item_id,
+                assignment.occurrence_id,
+                source.session_index,
+                start_nanos,
+                end_nanos,
+            ));
+            if !exact {
+                return Err(ComposeScheduleError::InvalidRequest(
+                    "manual placement was not retained as exact pinned demand".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn manual_placement_digests(
+    input_digest: &str,
+    placement: &ManualPlacementInput,
+    assessment: &dayweave_core::ManualPlacementAssessment,
+) -> Result<(String, String), ComposeScheduleError> {
+    let environment_digest = prefixed_sha256(&assessment.environment_digest)?;
+    let evidence = serde_json::to_vec(&ManualPlacementApprovalEvidence {
+        schema: "dayweave-manual-placement-approval/1",
+        input_digest,
+        environment_digest: &environment_digest,
+        placement,
+        violations: &assessment.violations,
+    })
+    .map_err(|_| ComposeScheduleError::Encoding)?;
+    let approval_digest = prefixed_sha256(&Sha256::digest(evidence))?;
+    Ok((environment_digest, approval_digest))
+}
+
+fn prefixed_sha256(bytes: &[u8]) -> Result<String, ComposeScheduleError> {
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256:");
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").map_err(|_| ComposeScheduleError::Encoding)?;
+    }
+    Ok(encoded)
+}
+
+fn map_manual_placement_violations(
+    violations: &[dayweave_core::ManualPlacementViolation],
+) -> Result<Vec<ManualPlacementViolationOutput>, ComposeScheduleError> {
+    violations
+        .iter()
+        .map(|violation| {
+            Ok(ManualPlacementViolationOutput {
+                code: violation.code,
+                item_ids: violation.item_ids.iter().map(|item| item.0).collect(),
+                occurrence_ids: violation
+                    .occurrence_ids
+                    .iter()
+                    .map(|occurrence| occurrence.0)
+                    .collect(),
+                conflicting_block_ids: violation.conflicting_block_ids.clone(),
+                conflicting_blocks: violation
+                    .conflicting_blocks
+                    .iter()
+                    .map(|block| {
+                        Ok(ManualPlacementConflictOutput {
+                            block_id: block.block_id,
+                            item_id: block.item_id.map(|item| item.0),
+                            occurrence_id: block.occurrence_id.map(|occurrence| occurrence.0),
+                            external_block_id: block.external_block_id,
+                            kind: block.kind,
+                            start: rfc3339(block.start)?,
+                            end: rfc3339(block.end)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, time::error::Format>>()?,
+                start: rfc3339(violation.start)?,
+                end: rfc3339(violation.end)?,
+                boundary_start: violation.boundary_start.map(rfc3339).transpose()?,
+                boundary_end: violation.boundary_end.map(rfc3339).transpose()?,
+                message: violation.message.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, time::error::Format>>()
+        .map_err(|_| ComposeScheduleError::Encoding)
+}
+
+fn retained_placement_covers(
+    current: &ManualPlacementInput,
+    retained: &ManualPlacementInput,
+) -> bool {
+    if current.id != retained.id
+        || current.source_schedule_revision_id != retained.source_schedule_revision_id
+        || current.assignments.is_empty()
+    {
+        return false;
+    }
+    current.assignments.iter().all(|assignment| {
+        retained.assignments.iter().any(|source| {
+            assignment.item_id == source.item_id
+                && assignment.occurrence_id == source.occurrence_id
+                && assignment.item_revision == source.item_revision
+                && !assignment.blocks.is_empty()
+                && assignment
+                    .blocks
+                    .iter()
+                    .all(|block| source.blocks.contains(block))
+        })
+    })
+}
+
 fn rfc3339(value: OffsetDateTime) -> Result<String, time::error::Format> {
     value.format(&Rfc3339)
 }
@@ -641,7 +1535,8 @@ mod tests {
 
     use chrono::{TimeZone as _, Utc};
     use dayweave_compose::{
-        AvailabilityInput, EnergyInput, FixedBlockInput, PreviousAssignmentInput,
+        AvailabilityInput, EnergyInput, FixedBlockInput, ManualPlacementAssignmentInput,
+        ManualPlacementReleaseInput, PreviousAssignmentInput, PreviousBlockInput,
         SchedulerConfigInput,
     };
     use dayweave_core::{ItemKind as PlanningItemKind, RecurrenceContext, WorkItem};
@@ -690,6 +1585,8 @@ mod tests {
             }],
             fixed_blocks: Vec::new(),
             previous_assignments: Vec::new(),
+            manual_placements: Vec::new(),
+            manual_placement_releases: Vec::new(),
             config: SchedulerConfigInput::default(),
             recurrence_context: RecurrenceContext::default(),
         }
@@ -708,19 +1605,48 @@ mod tests {
             .expect("expected plannable item")
     }
 
+    fn retained_manual_state(
+        placement: ManualPlacementInput,
+    ) -> super::super::postgres::PersistedManualPlacementState {
+        super::super::postgres::PersistedManualPlacementState {
+            placement,
+            environment_digest: format!("sha256:{}", "11".repeat(32)),
+            assessment_digest: format!("sha256:{}", "22".repeat(32)),
+            authorized_violations: Vec::new(),
+            authorization: super::super::postgres::ManualPlacementAuthorization::ConflictFree,
+        }
+    }
+
+    fn apply_manual_placement_lifecycle(
+        request: &mut ComposeScheduleRequest,
+        evidence: &AuthoritativePlanningEvidence,
+        items: &[Item],
+    ) -> Result<(), ComposeScheduleError> {
+        normalize_manual_placements_for_execution(request, &evidence.execution)?;
+        validate_manual_placement_item_revisions(request, items)?;
+        validate_manual_placement_sources(request, evidence)?;
+        let pruned = merge_retained_manual_placements(request, evidence, items)?;
+        replace_with_authoritative_assignments(request, evidence)?;
+        request
+            .previous_assignments
+            .retain(|assignment| !pruned.contains(&(assignment.item_id, assignment.occurrence_id)));
+        validate_schedule_request(request).map_err(map_prepare_error)?;
+        Ok(())
+    }
+
     #[test]
     fn composes_canonical_item_and_is_digest_stable() {
-        const V3_DIGEST: &str =
-            "sha256:78c2926e7b139818ec7250be97f8033314358a43d7781fe5f475f4e019ade8f6";
-        const V3_RESPONSE: &str = r#"{"input_digest":"sha256:78c2926e7b139818ec7250be97f8033314358a43d7781fe5f475f4e019ade8f6","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
+        const V4_DIGEST: &str =
+            "sha256:cda24bc7077b64f0a9227ae1ffd76321d693dc3dd9c0ffd05980d8fc77d8a046";
+        const V4_RESPONSE: &str = r#"{"input_digest":"sha256:cda24bc7077b64f0a9227ae1ffd76321d693dc3dd9c0ffd05980d8fc77d8a046","source_item_count":1,"source_item_revisions":{"00000000-0000-0000-0000-000000000001":3},"accepted_item_count":1,"rejected_items":[],"ignored_previous_assignments":[],"plan":{"as_of":"2026-09-01T09:00:00+02:00","horizon_start":"2026-09-01T02:00:00+02:00","horizon_end":"2026-09-02T02:00:00+02:00","blocks":[{"id":"829359ec-6709-54db-a3f2-4428470e1ae6","is_sensitive":false,"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"external_block_id":null,"title":"Write schedule bridge","start":"2026-09-01T09:00:00+02:00","end":"2026-09-01T10:00:00+02:00","session_index":0,"kind":"planned","explanations":[{"code":"hard_deadline","message":"Placed within its hard deadline."},{"code":"priority","message":"Priority score is 48."},{"code":"preferred_window","message":"Matches a preferred work window."},{"code":"energy_match","message":"Matches the available energy level."},{"code":"earliest_available","message":"Uses the earliest best-scoring valid capacity."}]}],"unscheduled":[],"decisions":[{"item_id":"00000000-0000-0000-0000-000000000001","occurrence_id":null,"kind":"scheduled","message":"Reserved 60 minutes."}],"violations":[],"score":{"scheduled_minutes":60,"unscheduled_minutes":0,"soft_penalty":0,"moved_minutes":0},"occurrences":[]}}"#;
         let item = canonical_item(Uuid::from_u128(1));
         let first = compose_items(vec![item.clone()], preview_request()).unwrap();
         let second = compose_items(vec![item], preview_request()).unwrap();
         assert_eq!(first.input_digest, second.input_digest);
-        assert_eq!(first.input_digest, V3_DIGEST);
+        assert_eq!(first.input_digest, V4_DIGEST);
         assert_eq!(
             serde_json::to_string(&first).expect("migrated response encoding"),
-            V3_RESPONSE
+            V4_RESPONSE
         );
         assert_eq!(first.accepted_item_count, 1);
         assert_eq!(
@@ -729,6 +1655,799 @@ mod tests {
         );
         assert_eq!(first.plan.blocks.len(), 1);
         assert!(first.input_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn manual_preview_binds_exact_content_free_conflicts_and_carry_forward() {
+        let placement_id = Uuid::from_u128(30);
+        let fixed_id = Uuid::from_u128(31);
+        let mut item = canonical_item(Uuid::from_u128(32));
+        item.is_sensitive = true;
+        item.title = "SYNTHETIC-SENSITIVE-MANUAL-TARGET".to_owned();
+        let mut request = preview_request();
+        request.fixed_blocks = vec![FixedBlockInput {
+            id: fixed_id,
+            is_sensitive: true,
+            title: "SYNTHETIC-SENSITIVE-MANUAL-CONFLICT".to_owned(),
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 13, 30, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 14, 30, 0).unwrap(),
+            source: FixedBlockSourceInput::ProtectedTime,
+        }];
+        request.manual_placements = vec![ManualPlacementInput {
+            id: placement_id,
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 14, 0, 0).unwrap(),
+                    session_index: 0,
+                }],
+            }],
+        }];
+
+        let first = compose_items(vec![item.clone()], request.clone()).unwrap();
+        let [assessment] = first.manual_placement_assessments.as_slice() else {
+            panic!("one manual assessment");
+        };
+        assert!(assessment.approval_required);
+        assert!(assessment.environment_digest.starts_with("sha256:"));
+        assert!(assessment.approval_digest.starts_with("sha256:"));
+        assert!(
+            assessment
+                .violations
+                .iter()
+                .any(|violation| { violation.code == ManualPlacementViolationCode::LatestFinish })
+        );
+        let overlap = assessment
+            .violations
+            .iter()
+            .find(|violation| violation.code == ManualPlacementViolationCode::ImmutableOverlap)
+            .expect("immutable conflict");
+        assert_eq!(overlap.conflicting_block_ids, vec![fixed_id]);
+        assert_eq!(overlap.conflicting_blocks[0].block_id, fixed_id);
+        assert_eq!(
+            overlap.conflicting_blocks[0].start,
+            "2026-09-01T15:30:00+02:00"
+        );
+        let public_assessment = serde_json::to_string(&first.manual_placement_assessments).unwrap();
+        assert!(!public_assessment.contains("SYNTHETIC-SENSITIVE"));
+
+        let retained = super::super::postgres::PersistedManualPlacementState {
+            placement: request.manual_placements[0].clone(),
+            environment_digest: assessment.environment_digest.clone(),
+            assessment_digest: assessment.approval_digest.clone(),
+            authorized_violations: assessment.violations.clone(),
+            authorization: super::super::postgres::ManualPlacementAuthorization::ExplicitApproval,
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            retained_manual_placements: vec![retained.clone()],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let carried = compose_items_with_projection_for_schema(
+            vec![item.clone()],
+            request.clone(),
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(!carried.manual_placement_assessments[0].approval_required);
+
+        request.availability[0].location = Some("changed environment".to_owned());
+        let changed = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            AuthoritativePlanningEvidence {
+                retained_manual_placements: vec![retained],
+                ..AuthoritativePlanningEvidence::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        assert!(changed.manual_placement_assessments[0].approval_required);
+        assert_ne!(
+            carried.manual_placement_assessments[0].environment_digest,
+            changed.manual_placement_assessments[0].environment_digest
+        );
+    }
+
+    #[test]
+    fn manual_assessment_and_approval_dtos_reject_unknown_nested_fields() {
+        let assessment = json!({
+            "placement_id": Uuid::from_u128(330),
+            "environment_digest": format!("sha256:{}", "11".repeat(32)),
+            "approval_digest": format!("sha256:{}", "22".repeat(32)),
+            "approval_required": true,
+            "violations": [{
+                "code": "immutable_overlap",
+                "item_ids": [Uuid::from_u128(331)],
+                "occurrence_ids": [],
+                "conflicting_block_ids": [Uuid::from_u128(332)],
+                "conflicting_blocks": [{
+                    "block_id": Uuid::from_u128(332),
+                    "item_id": null,
+                    "occurrence_id": null,
+                    "external_block_id": Uuid::from_u128(333),
+                    "kind": "external_fixed",
+                    "start": "2026-09-01T09:00:00Z",
+                    "end": "2026-09-01T10:00:00Z"
+                }],
+                "start": "2026-09-01T09:00:00Z",
+                "end": "2026-09-01T10:00:00Z",
+                "boundary_start": null,
+                "boundary_end": null,
+                "message": "Immutable overlap."
+            }]
+        });
+        assert!(
+            serde_json::from_value::<ManualPlacementAssessmentOutput>(assessment.clone()).is_ok()
+        );
+        for pointer in ["", "/violations/0", "/violations/0/conflicting_blocks/0"] {
+            let mut hostile = assessment.clone();
+            hostile
+                .pointer_mut(pointer)
+                .expect("assessment fixture path")["future"] = json!(true);
+            assert!(
+                serde_json::from_value::<ManualPlacementAssessmentOutput>(hostile).is_err(),
+                "unknown field at {pointer} must be rejected"
+            );
+        }
+
+        let mut approval = json!({
+            "placement_id": Uuid::from_u128(330),
+            "approval_digest": format!("sha256:{}", "22".repeat(32))
+        });
+        approval["future"] = json!(true);
+        assert!(serde_json::from_value::<ManualPlacementApproval>(approval).is_err());
+    }
+
+    #[test]
+    fn explicit_release_removes_the_complete_retained_pin() {
+        let item = canonical_item(Uuid::from_u128(40));
+        let published_revision_id = Uuid::from_u128(41);
+        let placement_id = Uuid::from_u128(42);
+        let block = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: placement_id,
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![block.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            published_revision_id: Some(published_revision_id),
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![block],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+        request.manual_placement_releases = vec![ManualPlacementReleaseInput {
+            id: Uuid::from_u128(43),
+            placement_id,
+            source_schedule_revision_id: published_revision_id,
+        }];
+
+        apply_manual_placement_lifecycle(&mut request, &evidence, std::slice::from_ref(&item))
+            .expect("exact release");
+        assert!(request.manual_placements.is_empty());
+        assert!(request.previous_assignments.is_empty());
+
+        let result = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("released pin recomposes normally");
+        assert!(result.manual_placement_assessments.is_empty());
+        assert!(
+            result
+                .plan
+                .blocks
+                .iter()
+                .all(|block| block.kind != ScheduleBlockKind::Pinned)
+        );
+    }
+
+    #[test]
+    fn changed_shape_requires_release_and_can_be_replaced_atomically() {
+        let mut item = canonical_item(Uuid::from_u128(50));
+        item.duration_seconds = Some(5_400);
+        item.revision = 4;
+        let published_revision_id = Uuid::from_u128(51);
+        let retained_placement_id = Uuid::from_u128(52);
+        let source = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: retained_placement_id,
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![source.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            published_revision_id: Some(published_revision_id),
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![source],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let replacement = ManualPlacementInput {
+            id: Uuid::from_u128(53),
+            source_schedule_revision_id: Some(published_revision_id),
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 12, 30, 0).unwrap(),
+                    session_index: 0,
+                }],
+            }],
+        };
+        let mut without_release = preview_request();
+        without_release.manual_placements = vec![replacement.clone()];
+        let mut non_manual_source = evidence.clone();
+        non_manual_source.retained_manual_placements.clear();
+        validate_manual_placement_sources(&without_release, &non_manual_source)
+            .expect("a superseded ordinary assignment uses the current canonical shape");
+        assert!(matches!(
+            validate_manual_placement_sources(&without_release, &evidence),
+            Err(ComposeScheduleError::InvalidRequest(message))
+                if message.contains("preserve every remaining source session")
+        ));
+
+        let mut request = preview_request();
+        request.manual_placements = vec![replacement.clone()];
+        request.manual_placement_releases = vec![ManualPlacementReleaseInput {
+            id: Uuid::from_u128(54),
+            placement_id: retained_placement_id,
+            source_schedule_revision_id: published_revision_id,
+        }];
+        apply_manual_placement_lifecycle(&mut request, &evidence, std::slice::from_ref(&item))
+            .expect("released complete group may use the current shape");
+        assert!(request.previous_assignments.is_empty());
+        assert_eq!(request.manual_placements, vec![replacement]);
+
+        let result = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("atomic release and replacement");
+        assert_eq!(result.manual_placement_assessments.len(), 1);
+        assert_eq!(
+            result
+                .plan
+                .blocks
+                .iter()
+                .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+                .map(|block| (
+                    rfc3339(block.start).expect("start format"),
+                    rfc3339(block.end).expect("end format"),
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                "2026-09-01T13:00:00+02:00".to_owned(),
+                "2026-09-01T14:30:00+02:00".to_owned(),
+            )]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One scenario covers both under- and over-credit normalization.
+    fn manual_move_normalizes_an_executed_split_session_to_remaining_demand() {
+        let mut item = canonical_item(Uuid::from_u128(55));
+        item.duration_seconds = Some(7_200);
+        item.split_policy = SplitPolicy::Splittable {
+            minimum_chunk_seconds: 1_800,
+            maximum_chunk_seconds: 3_600,
+        };
+        let published_revision_id = Uuid::from_u128(56);
+        let source_blocks = vec![
+            PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+                session_index: 0,
+            },
+            PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+                session_index: 1,
+            },
+        ];
+        let evidence = AuthoritativePlanningEvidence {
+            execution: ExecutionPlanningContext {
+                snapshot_revision: 1,
+                work_units: vec![dayweave_core::ExecutionWorkUnit {
+                    item_id: ItemId(item.id),
+                    occurrence_id: None,
+                    progress_epoch: 1,
+                    credited_seconds: 1_800,
+                    disposition: None,
+                    used_session_indices: vec![0],
+                    reservations: Vec::new(),
+                }],
+            },
+            published_revision_id: Some(published_revision_id),
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: source_blocks,
+                pinned: false,
+            }],
+            retained_manual_placements: Vec::new(),
+        };
+        let mut request = preview_request();
+        request.manual_placements = vec![ManualPlacementInput {
+            id: Uuid::from_u128(57),
+            source_schedule_revision_id: Some(published_revision_id),
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![
+                    PreviousBlockInput {
+                        start: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                        end: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+                        session_index: 0,
+                    },
+                    PreviousBlockInput {
+                        start: Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap(),
+                        end: Utc.with_ymd_and_hms(2026, 9, 1, 14, 0, 0).unwrap(),
+                        session_index: 1,
+                    },
+                    PreviousBlockInput {
+                        start: Utc.with_ymd_and_hms(2026, 9, 1, 14, 0, 0).unwrap(),
+                        end: Utc.with_ymd_and_hms(2026, 9, 1, 14, 30, 0).unwrap(),
+                        session_index: 2,
+                    },
+                ],
+            }],
+        }];
+        validate_schedule_request(&request).expect("pre-normalization request shape");
+
+        apply_manual_placement_lifecycle(&mut request, &evidence, std::slice::from_ref(&item))
+            .expect("executed source session is removed authoritatively");
+        assert_eq!(request.manual_placements[0].assignments[0].blocks.len(), 2);
+        assert_eq!(
+            request.manual_placements[0].assignments[0].blocks[0].session_index,
+            1
+        );
+
+        let result = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("remaining published session can be moved");
+        let pinned = result
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|block| block.session_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|block| (block.end - block.start).whole_minutes())
+                .sum::<i64>(),
+            90
+        );
+
+        let mut over_credit_evidence = result.planning_evidence.clone();
+        over_credit_evidence.execution.work_units[0].credited_seconds = 5_400;
+        let mut over_credit_request = preview_request();
+        over_credit_request.manual_placements = vec![ManualPlacementInput {
+            id: Uuid::from_u128(58),
+            source_schedule_revision_id: Some(published_revision_id),
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: Uuid::from_u128(55),
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 15, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 15, 30, 0).unwrap(),
+                    session_index: 1,
+                }],
+            }],
+        }];
+        let over_credit_item = canonical_item(Uuid::from_u128(55));
+        let mut over_credit_item = over_credit_item;
+        over_credit_item.duration_seconds = Some(7_200);
+        over_credit_item.split_policy = SplitPolicy::Splittable {
+            minimum_chunk_seconds: 1_800,
+            maximum_chunk_seconds: 3_600,
+        };
+        apply_manual_placement_lifecycle(
+            &mut over_credit_request,
+            &over_credit_evidence,
+            std::slice::from_ref(&over_credit_item),
+        )
+        .expect("over-credit may reshape the exact remaining demand");
+        let over_credit = compose_items_with_projection_for_schema(
+            vec![over_credit_item],
+            over_credit_request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            over_credit_evidence,
+            Vec::new(),
+        )
+        .expect("over-credit remaining session composes");
+        let over_credit_minutes = over_credit
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+            .map(|block| (block.end - block.start).whole_minutes())
+            .sum::<i64>();
+        assert_eq!(over_credit_minutes, 30);
+    }
+
+    #[test]
+    fn manual_move_can_preserve_a_partial_published_split_and_add_fresh_capacity() {
+        let mut item = canonical_item(Uuid::from_u128(551));
+        item.duration_seconds = Some(7_200);
+        item.split_policy = SplitPolicy::Splittable {
+            minimum_chunk_seconds: 1_800,
+            maximum_chunk_seconds: 3_600,
+        };
+        let published_revision_id = Uuid::from_u128(552);
+        let evidence = AuthoritativePlanningEvidence {
+            published_revision_id: Some(published_revision_id),
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+                    session_index: 0,
+                }],
+                pinned: false,
+            }],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+        request.manual_placements = vec![ManualPlacementInput {
+            id: Uuid::from_u128(553),
+            source_schedule_revision_id: Some(published_revision_id),
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![
+                    PreviousBlockInput {
+                        start: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                        end: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+                        session_index: 0,
+                    },
+                    PreviousBlockInput {
+                        start: Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap(),
+                        end: Utc.with_ymd_and_hms(2026, 9, 1, 14, 0, 0).unwrap(),
+                        session_index: 1,
+                    },
+                ],
+            }],
+        }];
+
+        apply_manual_placement_lifecycle(&mut request, &evidence, std::slice::from_ref(&item))
+            .expect("the published source is a subset of the complete requested demand");
+        let result = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("partial published capacity may be moved while fresh capacity is added");
+        let pinned = result
+            .plan
+            .blocks
+            .iter()
+            .filter(|block| block.kind == ScheduleBlockKind::Pinned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|block| block.session_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            pinned
+                .iter()
+                .map(|block| (block.end - block.start).whole_minutes())
+                .sum::<i64>(),
+            120
+        );
+    }
+
+    #[test]
+    fn new_execution_reservation_makes_a_manual_move_authoritatively_stale() {
+        let item_id = Uuid::from_u128(59);
+        let mut request = preview_request();
+        request.manual_placements = vec![ManualPlacementInput {
+            id: Uuid::from_u128(590),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id,
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![PreviousBlockInput {
+                    start: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                    end: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+                    session_index: 1,
+                }],
+            }],
+        }];
+        let execution = ExecutionPlanningContext {
+            snapshot_revision: 2,
+            work_units: vec![dayweave_core::ExecutionWorkUnit {
+                item_id: ItemId(item_id),
+                occurrence_id: None,
+                progress_epoch: 1,
+                credited_seconds: 1_800,
+                disposition: None,
+                used_session_indices: vec![0],
+                reservations: vec![dayweave_core::ExecutionReservation {
+                    session_index: 0,
+                    start: time::macros::datetime!(2026-09-01 10:00 UTC),
+                    end: time::macros::datetime!(2026-09-01 10:30 UTC),
+                    kind: dayweave_core::ExecutionReservationKind::InFlight,
+                }],
+            }],
+        };
+
+        assert!(matches!(
+            normalize_manual_placements_for_execution(&mut request, &execution),
+            Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(message))
+                if message.contains("active execution reservation")
+        ));
+    }
+
+    #[test]
+    fn completed_item_prunes_retained_pin_without_a_release_command() {
+        let mut item = canonical_item(Uuid::from_u128(60));
+        item.status = ItemStatus::Completed;
+        item.revision = 4;
+        item.completed_at = Some(Utc.with_ymd_and_hms(2026, 9, 1, 7, 30, 0).unwrap());
+        let source = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: Uuid::from_u128(61),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![source.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            published_revision_id: Some(Uuid::from_u128(62)),
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: 3,
+                occurrence_id: None,
+                blocks: vec![source],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+        apply_manual_placement_lifecycle(&mut request, &evidence, std::slice::from_ref(&item))
+            .expect("terminal work automatically releases retained placement");
+        assert!(request.previous_assignments.is_empty());
+        assert!(request.manual_placements.is_empty());
+
+        let result = compose_items_with_projection_for_schema(
+            vec![item],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("terminal item no longer bricks composition");
+        assert!(result.plan.blocks.is_empty());
+        assert!(result.manual_placement_assessments.is_empty());
+    }
+
+    #[test]
+    fn inbox_ancestor_prunes_a_retained_leaf_pin() {
+        let mut parent = canonical_item(Uuid::from_u128(70));
+        parent.status = ItemStatus::Inbox;
+        parent.duration_seconds = None;
+        parent.is_executable = false;
+        let mut leaf = canonical_item(Uuid::from_u128(71));
+        leaf.parent_id = Some(parent.id);
+        let block = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: Uuid::from_u128(72),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: leaf.id,
+                item_revision: leaf.revision,
+                occurrence_id: None,
+                blocks: vec![block.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: leaf.id,
+                item_revision: leaf.revision,
+                occurrence_id: None,
+                blocks: vec![block],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+
+        apply_manual_placement_lifecycle(&mut request, &evidence, &[parent.clone(), leaf.clone()])
+            .expect("Inbox subtree automatically releases retained placement");
+        assert!(request.previous_assignments.is_empty());
+        assert!(request.manual_placements.is_empty());
+
+        let result = compose_items_with_projection_for_schema(
+            vec![parent, leaf],
+            request,
+            super::super::SCHEDULER_PUBLICATION_SCHEMA,
+            Vec::new(),
+            evidence,
+            Vec::new(),
+        )
+        .expect("Inbox subtree does not retain stale pinned demand");
+        assert!(result.plan.blocks.is_empty());
+    }
+
+    #[test]
+    fn future_retained_pin_outside_a_narrower_horizon_requires_release() {
+        let item = canonical_item(Uuid::from_u128(73));
+        let block = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 3, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 3, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: Uuid::from_u128(74),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![block.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: item.id,
+                item_revision: item.revision,
+                occurrence_id: None,
+                blocks: vec![block],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+
+        assert!(matches!(
+            apply_manual_placement_lifecycle(
+                &mut request,
+                &evidence,
+                std::slice::from_ref(&item)
+            ),
+            Err(ComposeScheduleError::AuthoritativeManualPlacementChanged(message))
+                if message.contains("expand the horizon or explicitly release")
+        ));
+    }
+
+    #[test]
+    fn rejected_ancestor_prunes_a_retained_leaf_pin() {
+        let mut parent = canonical_item(Uuid::from_u128(75));
+        parent.flexible_constraints = json!({"unsupported_parent_metadata": true});
+        let mut leaf = canonical_item(Uuid::from_u128(76));
+        leaf.parent_id = Some(parent.id);
+        let block = PreviousBlockInput {
+            start: Utc.with_ymd_and_hms(2026, 9, 1, 9, 0, 0).unwrap(),
+            end: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+            session_index: 0,
+        };
+        let retained = ManualPlacementInput {
+            id: Uuid::from_u128(77),
+            source_schedule_revision_id: None,
+            assignments: vec![ManualPlacementAssignmentInput {
+                item_id: leaf.id,
+                item_revision: leaf.revision,
+                occurrence_id: None,
+                blocks: vec![block.clone()],
+            }],
+        };
+        let evidence = AuthoritativePlanningEvidence {
+            previous_assignments: vec![PreviousAssignmentInput {
+                item_id: leaf.id,
+                item_revision: leaf.revision,
+                occurrence_id: None,
+                blocks: vec![block],
+                pinned: true,
+            }],
+            retained_manual_placements: vec![retained_manual_state(retained)],
+            ..AuthoritativePlanningEvidence::default()
+        };
+        let mut request = preview_request();
+
+        apply_manual_placement_lifecycle(&mut request, &evidence, &[parent, leaf])
+            .expect("rejected hierarchy automatically releases retained placement");
+        assert!(request.previous_assignments.is_empty());
+        assert!(request.manual_placements.is_empty());
+
+        let mut orphan = canonical_item(Uuid::from_u128(78));
+        orphan.parent_id = Some(Uuid::from_u128(79));
+        assert!(
+            canonical_plannable_item_ids(&preview_request(), std::slice::from_ref(&orphan))
+                .expect("orphaned canonical snapshot remains isolatable")
+                .is_empty(),
+            "a leaf with a missing ancestor cannot retain pinned work"
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use chrono::{TimeZone as _, Utc};
 use dayweave_compose::{
     AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
     ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
+    ManualPlacementAssignmentInput, ManualPlacementInput, ManualPlacementReleaseInput,
     PrepareScheduleError, PreviousAssignmentInput, PreviousBlockInput, SchedulerConfigInput,
     prepare_canonical_schedule, validate_schedule_request,
 };
@@ -59,8 +60,44 @@ fn preview_request() -> ComposeScheduleRequest {
         }],
         fixed_blocks: Vec::new(),
         previous_assignments: Vec::new(),
+        manual_placements: Vec::new(),
+        manual_placement_releases: Vec::new(),
         config: SchedulerConfigInput::default(),
         recurrence_context: dayweave_core::RecurrenceContext::default(),
+    }
+}
+
+fn manual_blocks(count: usize) -> Vec<PreviousBlockInput> {
+    let base = Utc.with_ymd_and_hms(2026, 9, 1, 8, 0, 0).unwrap();
+    (0..count)
+        .map(|index| {
+            let start = base + chrono::Duration::minutes(i64::try_from(index).unwrap());
+            PreviousBlockInput {
+                start,
+                end: start + chrono::Duration::minutes(1),
+                session_index: u16::try_from(index).unwrap(),
+            }
+        })
+        .collect()
+}
+
+fn manual_assignment(item_id: u128, block_count: usize) -> ManualPlacementAssignmentInput {
+    ManualPlacementAssignmentInput {
+        item_id: Uuid::from_u128(item_id),
+        item_revision: 1,
+        occurrence_id: None,
+        blocks: manual_blocks(block_count),
+    }
+}
+
+fn manual_placement(
+    placement_id: u128,
+    assignments: Vec<ManualPlacementAssignmentInput>,
+) -> ManualPlacementInput {
+    ManualPlacementInput {
+        id: Uuid::from_u128(placement_id),
+        source_schedule_revision_id: None,
+        assignments,
     }
 }
 
@@ -452,6 +489,42 @@ fn request_and_snapshot_dtos_reject_unknown_fields_strictly() {
     let mut availability_json = serde_json::to_value(request).unwrap();
     availability_json["availability"][0]["future"] = json!(true);
     assert!(serde_json::from_value::<ComposeScheduleRequest>(availability_json).is_err());
+
+    let mut manual_request_json = serde_json::to_value(preview_request()).unwrap();
+    manual_request_json["manual_placements"] = json!([{
+        "id": Uuid::from_u128(710),
+        "source_schedule_revision_id": null,
+        "assignments": [{
+            "item_id": Uuid::from_u128(711),
+            "item_revision": 3,
+            "occurrence_id": null,
+            "blocks": [{
+                "start": "2026-09-01T09:00:00Z",
+                "end": "2026-09-01T10:00:00Z",
+                "session_index": 0
+            }]
+        }]
+    }]);
+    for pointer in [
+        "/manual_placements/0",
+        "/manual_placements/0/assignments/0",
+        "/manual_placements/0/assignments/0/blocks/0",
+    ] {
+        let mut hostile = manual_request_json.clone();
+        hostile
+            .pointer_mut(pointer)
+            .expect("manual placement fixture path")["future"] = json!(true);
+        assert!(serde_json::from_value::<ComposeScheduleRequest>(hostile).is_err());
+    }
+
+    let mut release_json = serde_json::to_value(preview_request()).unwrap();
+    release_json["manual_placement_releases"] = json!([{
+        "id": Uuid::from_u128(712),
+        "placement_id": Uuid::from_u128(710),
+        "source_schedule_revision_id": Uuid::from_u128(713),
+        "future": true
+    }]);
+    assert!(serde_json::from_value::<ComposeScheduleRequest>(release_json).is_err());
 }
 
 #[test]
@@ -536,5 +609,220 @@ fn recurrence_identity_anchor_obeys_microsecond_precision() {
     assert!(matches!(
         validate_schedule_request(&request),
         Err(PrepareScheduleError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn manual_placement_becomes_exact_trusted_pinned_demand() {
+    let item = canonical_item(910);
+    let placement_id = Uuid::from_u128(911);
+    let mut request = preview_request();
+    request.manual_placements = vec![ManualPlacementInput {
+        id: placement_id,
+        source_schedule_revision_id: None,
+        assignments: vec![ManualPlacementAssignmentInput {
+            item_id: item.id,
+            item_revision: item.revision,
+            occurrence_id: None,
+            blocks: vec![PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                session_index: 0,
+            }],
+        }],
+    }];
+
+    let prepared = prepare_canonical_schedule(vec![item], request).unwrap();
+    let [assignment] = prepared.plan_request.previous_assignments.as_slice() else {
+        panic!("one manual assignment");
+    };
+    assert!(assignment.pinned);
+    assert_eq!(assignment.manual_placement_id, Some(placement_id));
+    assert_eq!(assignment.blocks[0].start.hour(), 12);
+    assert_eq!(prepared.manual_placements[0].id, placement_id);
+}
+
+#[test]
+fn manual_placement_rejects_stale_revision_and_malformed_identity() {
+    let item = canonical_item(912);
+    let mut request = preview_request();
+    request.manual_placements = vec![ManualPlacementInput {
+        id: Uuid::from_u128(913),
+        source_schedule_revision_id: None,
+        assignments: vec![ManualPlacementAssignmentInput {
+            item_id: item.id,
+            item_revision: item.revision - 1,
+            occurrence_id: None,
+            blocks: vec![PreviousBlockInput {
+                start: Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+                end: Utc.with_ymd_and_hms(2026, 9, 1, 11, 0, 0).unwrap(),
+                session_index: 0,
+            }],
+        }],
+    }];
+    assert!(matches!(
+        prepare_canonical_schedule(vec![item], request),
+        Err(PrepareScheduleError::InvalidRequest(message)) if message.contains("stale")
+    ));
+
+    let mut malformed = preview_request();
+    malformed.manual_placements = vec![ManualPlacementInput {
+        id: Uuid::nil(),
+        source_schedule_revision_id: None,
+        assignments: Vec::new(),
+    }];
+    assert!(matches!(
+        validate_schedule_request(&malformed),
+        Err(PrepareScheduleError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn manual_placement_releases_require_unique_nonempty_exact_ids() {
+    let mut request = preview_request();
+    let release = ManualPlacementReleaseInput {
+        id: Uuid::from_u128(920),
+        placement_id: Uuid::from_u128(921),
+        source_schedule_revision_id: Uuid::from_u128(922),
+    };
+    request.manual_placement_releases = vec![release.clone()];
+    validate_schedule_request(&request).expect("valid release shape");
+
+    request.manual_placement_releases.push(release);
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(message)) if message.contains("unique")
+    ));
+
+    request.manual_placement_releases = vec![ManualPlacementReleaseInput {
+        id: Uuid::from_u128(923),
+        placement_id: Uuid::nil(),
+        source_schedule_revision_id: Uuid::from_u128(924),
+    }];
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn manual_placement_group_limit_accepts_boundary_and_rejects_next() {
+    let mut request = preview_request();
+    request.manual_placements = (0_u128..64)
+        .map(|index| manual_placement(10_000 + index, vec![manual_assignment(20_000 + index, 1)]))
+        .collect();
+    validate_schedule_request(&request).expect("64 manual placements are supported");
+
+    request
+        .manual_placements
+        .push(manual_placement(10_064, vec![manual_assignment(20_064, 1)]));
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("at most 64 entries")
+    ));
+}
+
+#[test]
+fn manual_assignment_limit_accepts_boundary_and_rejects_next() {
+    let mut request = preview_request();
+    let assignments = (0_u128..128)
+        .map(|index| manual_assignment(30_000 + index, 1))
+        .collect();
+    request.manual_placements = vec![manual_placement(31_000, assignments)];
+    validate_schedule_request(&request).expect("128 manual assignments are supported");
+
+    request.manual_placements[0]
+        .assignments
+        .push(manual_assignment(30_128, 1));
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("at most 128 entries")
+    ));
+}
+
+#[test]
+fn manual_block_limit_accepts_boundary_and_rejects_next() {
+    let mut request = preview_request();
+    request.manual_placements = vec![manual_placement(
+        40_000,
+        vec![manual_assignment(40_001, 256)],
+    )];
+    validate_schedule_request(&request).expect("256 manual blocks are supported");
+
+    request.manual_placements[0].assignments[0]
+        .blocks
+        .push(manual_blocks(257).pop().unwrap());
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("at most 256 blocks")
+    ));
+}
+
+#[test]
+fn manual_release_limit_accepts_boundary_and_rejects_next() {
+    let mut request = preview_request();
+    request.manual_placement_releases = (0_u128..64)
+        .map(|index| ManualPlacementReleaseInput {
+            id: Uuid::from_u128(50_000 + index),
+            placement_id: Uuid::from_u128(51_000 + index),
+            source_schedule_revision_id: Uuid::from_u128(52_000),
+        })
+        .collect();
+    validate_schedule_request(&request).expect("64 manual releases are supported");
+
+    request
+        .manual_placement_releases
+        .push(ManualPlacementReleaseInput {
+            id: Uuid::from_u128(50_064),
+            placement_id: Uuid::from_u128(51_064),
+            source_schedule_revision_id: Uuid::from_u128(52_000),
+        });
+    assert!(matches!(
+        validate_schedule_request(&request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("at most 64 entries")
+    ));
+}
+
+#[test]
+fn manual_counts_still_share_generic_scheduler_capacity() {
+    let mut assignment_request = preview_request();
+    assignment_request.previous_assignments = (0_u128..10_000)
+        .map(|index| PreviousAssignmentInput {
+            item_id: Uuid::from_u128(60_000 + index),
+            item_revision: 1,
+            occurrence_id: None,
+            blocks: Vec::new(),
+            pinned: false,
+        })
+        .collect();
+    assignment_request.manual_placements =
+        vec![manual_placement(70_000, vec![manual_assignment(70_001, 1)])];
+    assert!(matches!(
+        validate_schedule_request(&assignment_request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("assignment count exceeds")
+    ));
+
+    let mut block_request = preview_request();
+    let repeated_block = manual_blocks(1).pop().unwrap();
+    block_request.previous_assignments = vec![PreviousAssignmentInput {
+        item_id: Uuid::from_u128(80_000),
+        item_revision: 1,
+        occurrence_id: None,
+        blocks: vec![repeated_block; 49_745],
+        pinned: false,
+    }];
+    block_request.manual_placements = vec![manual_placement(
+        80_001,
+        vec![manual_assignment(80_002, 256)],
+    )];
+    assert!(matches!(
+        validate_schedule_request(&block_request),
+        Err(PrepareScheduleError::InvalidRequest(message))
+            if message.contains("block count exceeds")
     ));
 }

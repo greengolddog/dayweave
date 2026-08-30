@@ -19,7 +19,8 @@ use uuid::Uuid;
 use crate::model::{
     AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
     ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
-    IgnoredPreviousAssignment, PreparedSchedule, PreviousAssignmentInput, RejectedScheduleItem,
+    IgnoredPreviousAssignment, ManualPlacementInput, PreparedSchedule, PreviousAssignmentInput,
+    RejectedScheduleItem,
 };
 
 pub const MAX_CANONICAL_ITEMS: usize = 10_000;
@@ -27,6 +28,14 @@ pub const MAX_AVAILABILITY_WINDOWS: usize = 10_000;
 pub const MAX_FIXED_BLOCKS: usize = 10_000;
 pub const MAX_PREVIOUS_ASSIGNMENTS: usize = 10_000;
 pub const MAX_PREVIOUS_BLOCKS: usize = 50_000;
+/// Maximum number of exact placement groups accepted in one interactive compose request.
+pub const MAX_MANUAL_PLACEMENTS: usize = 64;
+/// Maximum number of work assignments across all manual placement groups.
+pub const MAX_MANUAL_ASSIGNMENTS: usize = 128;
+/// Maximum number of exact time blocks across all manual placement assignments.
+pub const MAX_MANUAL_BLOCKS: usize = 256;
+/// Maximum number of retained-placement release commands accepted in one request.
+pub const MAX_MANUAL_PLACEMENT_RELEASES: usize = 64;
 pub const MAX_RECURRENCE_CONTEXT_ENTRIES: usize = 10_000;
 pub const MAX_HORIZON_DAYS: i64 = 90;
 pub const MAX_CALENDAR_DAYS: usize = 92;
@@ -126,6 +135,13 @@ pub fn validate_schedule_request(
                     };
                     selector && action
                 });
+    let manual_instants_are_precise = request.manual_placements.iter().all(|placement| {
+        placement.assignments.iter().all(|assignment| {
+            assignment.blocks.iter().all(|block| {
+                chrono_instant_is_precise(block.start) && chrono_instant_is_precise(block.end)
+            })
+        })
+    });
     if !chrono_instant_is_precise(request.as_of)
         || !chrono_instant_is_precise(request.horizon_start)
         || !chrono_instant_is_precise(request.horizon_end)
@@ -141,6 +157,7 @@ pub fn validate_schedule_request(
             })
         })
         || !recurrence_instants_are_precise
+        || !manual_instants_are_precise
     {
         return invalid("schedule instants must use PostgreSQL microsecond precision");
     }
@@ -191,6 +208,7 @@ pub fn validate_schedule_request(
             "previous assignments support at most {MAX_PREVIOUS_BLOCKS} blocks"
         ));
     }
+    validate_manual_placement_shape(request)?;
     if !(1..=60).contains(&request.config.slot_granularity_minutes) {
         return invalid("slot_granularity_minutes must be in 1..=60");
     }
@@ -215,6 +233,148 @@ pub fn validate_schedule_request(
     }
     if request.recurrence_context.calendar.days.len() > MAX_CALENDAR_DAYS {
         return invalid("recurrence calendar contains more days than the maximum horizon");
+    }
+    Ok(())
+}
+
+fn validate_manual_placement_shape(
+    request: &ComposeScheduleRequest,
+) -> Result<(), PrepareScheduleError> {
+    if request.manual_placements.len() > MAX_MANUAL_PLACEMENTS {
+        return invalid(format!(
+            "manual_placements supports at most {MAX_MANUAL_PLACEMENTS} entries"
+        ));
+    }
+    if request.manual_placement_releases.len() > MAX_MANUAL_PLACEMENT_RELEASES {
+        return invalid(format!(
+            "manual_placement_releases supports at most {MAX_MANUAL_PLACEMENT_RELEASES} entries"
+        ));
+    }
+    validate_manual_placement_releases(request)?;
+    let mut placement_ids = BTreeSet::new();
+    let mut assignment_identities = BTreeSet::new();
+    let mut assignment_count = 0_usize;
+    let mut block_count = 0_usize;
+    let earliest = request.as_of.max(request.horizon_start);
+    for placement in &request.manual_placements {
+        if placement.id.is_nil()
+            || placement
+                .source_schedule_revision_id
+                .is_some_and(|revision| revision.is_nil())
+            || !placement_ids.insert(placement.id)
+            || placement.assignments.is_empty()
+        {
+            return invalid(
+                "manual placement ids and assignment groups must be unique and non-empty",
+            );
+        }
+        assignment_count = assignment_count
+            .checked_add(placement.assignments.len())
+            .ok_or_else(|| {
+                PrepareScheduleError::InvalidRequest("too many manual assignments".into())
+            })?;
+        if assignment_count > MAX_MANUAL_ASSIGNMENTS {
+            return invalid(format!(
+                "manual placement assignments support at most {MAX_MANUAL_ASSIGNMENTS} entries"
+            ));
+        }
+        let mut occurrence_identity = None;
+        for assignment in &placement.assignments {
+            if assignment.item_id.is_nil()
+                || assignment.item_revision == 0
+                || assignment.blocks.is_empty()
+                || !assignment_identities.insert((assignment.item_id, assignment.occurrence_id))
+            {
+                return invalid(
+                    "manual placement assignments must have unique current work identities and non-empty blocks",
+                );
+            }
+            if let Some(occurrence_id) = assignment.occurrence_id
+                && occurrence_id.get_version_num() != 5
+            {
+                return invalid(
+                    "manual recurrence placements require a scheduler-issued v5 occurrence id",
+                );
+            }
+            match (occurrence_identity, assignment.occurrence_id) {
+                (None, value) => occurrence_identity = Some(value),
+                (Some(expected), value) if expected != value => {
+                    return invalid(
+                        "one manual placement cannot mix recurrence occurrence identities",
+                    );
+                }
+                _ => {}
+            }
+            block_count = block_count
+                .checked_add(assignment.blocks.len())
+                .ok_or_else(|| {
+                    PrepareScheduleError::InvalidRequest("too many manual placement blocks".into())
+                })?;
+            if block_count > MAX_MANUAL_BLOCKS {
+                return invalid(format!(
+                    "manual placement assignments support at most {MAX_MANUAL_BLOCKS} blocks"
+                ));
+            }
+            let mut session_indices = BTreeSet::new();
+            for block in &assignment.blocks {
+                if block.start >= block.end
+                    || block.start < earliest
+                    || block.end > request.horizon_end
+                    || !session_indices.insert(block.session_index)
+                {
+                    return invalid(
+                        "manual placement blocks must be unique, future, positive, and fully inside the horizon",
+                    );
+                }
+            }
+        }
+    }
+    validate_manual_placement_capacity(request, assignment_count, block_count)
+}
+
+fn validate_manual_placement_capacity(
+    request: &ComposeScheduleRequest,
+    assignment_count: usize,
+    block_count: usize,
+) -> Result<(), PrepareScheduleError> {
+    if request
+        .previous_assignments
+        .len()
+        .checked_add(assignment_count)
+        .is_none_or(|count| count > MAX_PREVIOUS_ASSIGNMENTS)
+    {
+        return invalid("manual placement assignment count exceeds the scheduling limit");
+    }
+    let previous_block_count = request
+        .previous_assignments
+        .iter()
+        .map(|assignment| assignment.blocks.len())
+        .sum::<usize>();
+    if previous_block_count
+        .checked_add(block_count)
+        .is_none_or(|count| count > MAX_PREVIOUS_BLOCKS)
+    {
+        return invalid("manual placement block count exceeds the scheduling limit");
+    }
+    Ok(())
+}
+
+fn validate_manual_placement_releases(
+    request: &ComposeScheduleRequest,
+) -> Result<(), PrepareScheduleError> {
+    let mut release_ids = BTreeSet::new();
+    let mut released_placement_ids = BTreeSet::new();
+    for release in &request.manual_placement_releases {
+        if release.id.is_nil()
+            || release.placement_id.is_nil()
+            || release.source_schedule_revision_id.is_nil()
+            || !release_ids.insert(release.id)
+            || !released_placement_ids.insert(release.placement_id)
+        {
+            return invalid(
+                "manual placement releases require unique non-empty command and placement ids",
+            );
+        }
     }
     Ok(())
 }
@@ -291,6 +451,8 @@ pub fn prepare_canonical_schedule(
         .iter()
         .map(|item| (item.id, item.revision))
         .collect();
+    let manual_placements = request.manual_placements;
+    let manual_placement_releases = request.manual_placement_releases;
     let mut recurrence_context = request.recurrence_context;
     remove_inbox_subtree_recurrence_references(&mut recurrence_context, &inbox_subtree_item_ids);
     validate_recurrence_context_references(&recurrence_context, &revisions)?;
@@ -298,8 +460,14 @@ pub fn prepare_canonical_schedule(
         .timezone_name
         .parse()
         .map_err(|_| PrepareScheduleError::InvalidRequest("invalid timezone_name".into()))?;
-    let (previous_assignments, ignored_previous_assignments) =
+    let (mut previous_assignments, ignored_previous_assignments) =
         map_previous_assignments(&request.previous_assignments, &revisions, planning_timezone)?;
+    map_manual_placements(
+        &manual_placements,
+        &revisions,
+        planning_timezone,
+        &mut previous_assignments,
+    )?;
 
     let horizon_start = to_time_in_timezone(request.horizon_start, planning_timezone)?;
     let horizon_end = to_time_in_timezone(request.horizon_end, planning_timezone)?;
@@ -350,6 +518,8 @@ pub fn prepare_canonical_schedule(
         accepted_item_count,
         rejected_items,
         ignored_previous_assignments,
+        manual_placements,
+        manual_placement_releases,
         plan_request,
     })
 }
@@ -931,9 +1101,52 @@ fn map_previous_assignments(
                 })
                 .collect::<Result<_, PrepareScheduleError>>()?,
             pinned: assignment.pinned,
+            manual_placement_id: None,
         });
     }
     Ok((accepted, ignored))
+}
+
+fn map_manual_placements(
+    placements: &[ManualPlacementInput],
+    revisions: &BTreeMap<ItemId, u64>,
+    timezone: Tz,
+    assignments: &mut Vec<PreviousAssignment>,
+) -> Result<(), PrepareScheduleError> {
+    for placement in placements {
+        for requested in &placement.assignments {
+            let item_id = ItemId(requested.item_id);
+            let current_revision = revisions.get(&item_id).copied();
+            if current_revision != Some(requested.item_revision) {
+                return invalid(format!(
+                    "manual placement {} references a stale or unavailable item {}",
+                    placement.id, requested.item_id
+                ));
+            }
+            let occurrence_id = requested.occurrence_id.map(OccurrenceId);
+            assignments.retain(|assignment| {
+                (assignment.item_id, assignment.occurrence_id) != (item_id, occurrence_id)
+            });
+            assignments.push(PreviousAssignment {
+                item_id,
+                occurrence_id,
+                blocks: requested
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        Ok(PreviousBlock {
+                            start: to_time_in_timezone(block.start, timezone)?,
+                            end: to_time_in_timezone(block.end, timezone)?,
+                            session_index: block.session_index,
+                        })
+                    })
+                    .collect::<Result<_, PrepareScheduleError>>()?,
+                pinned: true,
+                manual_placement_id: Some(placement.id),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn map_availability(

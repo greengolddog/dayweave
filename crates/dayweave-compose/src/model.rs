@@ -119,6 +119,15 @@ pub struct ComposeScheduleRequest {
     pub fixed_blocks: Vec<FixedBlockInput>,
     #[serde(default)]
     pub previous_assignments: Vec<PreviousAssignmentInput>,
+    /// Explicit exact placements evaluated as pinned demand. Unlike
+    /// `previous_assignments`, these are user proposals rather than caller
+    /// claims about already-published state.
+    #[serde(default)]
+    pub manual_placements: Vec<ManualPlacementInput>,
+    /// Explicitly removes a retained manual pin. Releases are bound to the
+    /// current published revision and are distinct from placement proposals.
+    #[serde(default)]
+    pub manual_placement_releases: Vec<ManualPlacementReleaseInput>,
     #[serde(default)]
     pub config: SchedulerConfigInput,
     #[serde(default)]
@@ -180,12 +189,39 @@ pub struct PreviousAssignmentInput {
     pub pinned: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Serialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PreviousBlockInput {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub session_index: u16,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementInput {
+    pub id: Uuid,
+    /// Optional exact published revision the UI moved from. A configured
+    /// server validates this against its authoritative planning snapshot.
+    pub source_schedule_revision_id: Option<Uuid>,
+    pub assignments: Vec<ManualPlacementAssignmentInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementAssignmentInput {
+    pub item_id: Uuid,
+    pub item_revision: u64,
+    pub occurrence_id: Option<Uuid>,
+    pub blocks: Vec<PreviousBlockInput>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManualPlacementReleaseInput {
+    pub id: Uuid,
+    pub placement_id: Uuid,
+    pub source_schedule_revision_id: Uuid,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -233,5 +269,7 @@ pub struct PreparedSchedule {
     pub accepted_item_count: usize,
     pub rejected_items: Vec<RejectedScheduleItem>,
     pub ignored_previous_assignments: Vec<IgnoredPreviousAssignment>,
+    pub manual_placements: Vec<ManualPlacementInput>,
+    pub manual_placement_releases: Vec<ManualPlacementReleaseInput>,
     pub plan_request: PlanRequest,
 }

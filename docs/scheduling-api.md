@@ -46,6 +46,72 @@ and exact active, paused, or deferred reservations. It is bound into the digest
 and durable publication snapshot but is not exposed in the public preview
 schema.
 
+Caller-requested exact positioning uses `manual_placements`, never
+`previous_assignments`. Each proposal has a fresh UUID, the exact current
+published schedule revision (or `null` only before the first publication), and
+current item-revision assignments with exact occurrence, session, start, and
+end identities. Moving published work must preserve every source session index
+and duration while that published assignment still describes the same
+canonical revision. When execution has consumed part of an ordinary published
+split assignment, the server removes every session at or below the
+authoritative execution high-water mark before comparing and scheduling the
+remaining move. An ordinary non-manual assignment superseded by a canonical
+duration/split edit may instead use the complete new shape; a retained manual
+pin still requires its explicit release. The core also requires the complete
+remaining duration, whole-minute target endpoints aligned to the configured
+slot grid, chronological fresh indices, and the item's indivisible or split
+session, gap, and day limits. One request supports at most 64 placement groups,
+128 assignments, 256 exact blocks, and 64 release commands. Invalid proposals
+are rejected instead of becoming stability hints.
+
+Preview retains every accepted manual block as `pinned` and returns one
+`manual_placement_assessments` entry. Its content-free descriptors bind the
+exact hard rule, target interval, boundaries, item and occurrence identities,
+and each conflicting block's identity, kind, and timestamps.
+`environment_digest` additionally binds the content-free item
+revision/structure/constraint graph and availability used for assessment.
+`approval_digest` binds those facts, the exact proposal, and the complete
+preview input digest. If `approval_required` is true, the user must explicitly
+approve that digest; titles and notes are never copied into this evidence.
+
+Published manual provenance survives later composition. The server reloads the
+exact placement and last authorized facts from the immutable private snapshot,
+re-assesses the pin, and carries authorization forward only when the placement,
+item revisions, environment digest, and current violation set are an exact
+authorized subset. A changed rule, availability, dependency, hierarchy,
+obstacle interval, or new violation therefore requires a new approval.
+Disappearing violations need no approval and are not silently pre-authorized if
+they later return.
+
+Removing retained provenance is explicit. `manual_placement_releases` contains
+a fresh command UUID, the retained placement UUID, and the exact currently
+published schedule revision. A stale, unknown, duplicate, or partial-group
+release fails closed. A release may stand alone or accompany one fresh
+replacement that covers the retained assignment-identity group exactly; this
+is the only way a replacement may change the old session shape after the
+canonical duration or split policy changes. The server removes the released
+identities from authoritative stability input before solving, binds the release
+into publication and idempotency hashes, and records it in the private snapshot
+and content-free audit metadata. Retained pins are also pruned automatically
+when their work becomes missing, Inbox, terminal, non-executable, durationless,
+rejected with its hierarchy, actively executing, consumed by newer execution
+evidence, or wholly expired at composition time. A retained future pin outside
+a narrower replacement horizon is never discarded: the client must expand the
+horizon or explicitly release it. A partially covered retained group is also
+rejected so a narrow preview cannot silently discard only part of a user
+placement.
+
+`GET /v1/schedule/manual-placements` is the recovery/discovery boundary for a
+fresh installation or second trusted device. It requires the REST
+`schedule_read` scope and exact configured owner identity. The response carries
+no titles or notes: it returns the current published revision and each complete
+retained group with its placement ID, original source revision, published item
+revision, occurrence identity, session index, and exact start/end instants.
+Clients fetch current canonical items separately, then bind a release to the
+catalog's current revision. Compose and publish re-read the authoritative
+catalog under their normal fences, so a concurrent publication makes that
+release stale rather than applying it to different work.
+
 An active canonical item with `status: "inbox"`, and every descendant below an
 Inbox ancestor, remains accepted and included in `source_item_revisions` and the
 digest but is omitted from the scheduler `PlanRequest`. An Inbox subtree emits
@@ -87,13 +153,16 @@ never receive that scope. The request wraps the exact typed preview input:
     "availability": [],
     "fixed_blocks": [],
     "previous_assignments": [],
+    "manual_placements": [],
+    "manual_placement_releases": [],
     "config": {
       "slot_granularity_minutes": 5,
       "stability_weight": 4,
       "default_soft_weight": 100
     },
     "recurrence_context": {}
-  }
+  },
+  "manual_placement_approvals": []
 }
 ```
 
@@ -117,7 +186,7 @@ exactly one detail; supersedes the old current revision; seals the draft as
 published; and writes the receipt and audit row, all in one transaction.
 Content insertion is allowed only while the parent is draft, and blocks/details
 become immutable after the seal. A fresh key whose solver-versioned publication
-content and private v3 evidence are identical to the current revision binds to
+content and private v4 evidence are identical to the current revision binds to
 that existing revision without revision churn.
 An expected-digest mismatch or canonical item change during the transaction is
 `409 schedule_publication_stale`. That stable code proves no publication was
@@ -160,6 +229,15 @@ revision. Active and paused work is carried into later plans as the same exact
 pinned origin; all other used indices remain closed. The in-memory fallback
 cannot prove durable publication or claim consumption and therefore fails
 closed when that proof is required.
+
+`manual_placement_approvals` must be the exact set of
+`{placement_id, approval_digest}` pairs whose latest preview says
+`approval_required: true`. Missing, stale, duplicate, malformed, or extra
+approvals return `409 schedule_publication_stale` (or `422` for malformed
+shape) and commit nothing. Conflict-free and safely carried-forward placements
+must not be echoed as approvals. Accepted facts, authorization origin, and
+digests are stored in private v4 revision evidence, on every affected block,
+and in content-free publication audit metadata.
 
 Both first publication and exact idempotent replay return `200`; `replayed` is
 the sole distinction:

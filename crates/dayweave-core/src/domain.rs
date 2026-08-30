@@ -721,6 +721,14 @@ pub struct PreviousAssignment {
     pub blocks: Vec<PreviousBlock>,
     /// Pinned blocks are immutable inputs. Unpinned blocks are stability hints.
     pub pinned: bool,
+    /// Internal provenance for a caller-requested manual placement preview.
+    ///
+    /// Public API callers cannot set this through `previous_assignments`; the
+    /// canonical compose boundary only assigns it after validating a bounded
+    /// `manual_placements` proposal. Local trusted callers may use the same
+    /// marker to obtain identical offline assessment behavior.
+    #[serde(default)]
+    pub manual_placement_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
