@@ -5,6 +5,7 @@ import SwiftUI
 private struct DayWeaveCommands: Commands {
     @Environment(\.openWindow) private var openWindow
     @ObservedObject var store: PlannerStore
+    @ObservedObject var canonicalSync: CanonicalSyncStore
     @ObservedObject var appLock: AppLockController
 
     var body: some Commands {
@@ -15,11 +16,18 @@ private struct DayWeaveCommands: Commands {
             .keyboardShortcut("n", modifiers: [.command, .shift])
             .disabled(!appLock.isContentAvailable || !store.canMutatePlan)
 
-            Button("Recompose Schedule") {
-                store.recomposeSchedule()
+            Button("Compose on This Mac") {
+                Task { await canonicalSync.recomposeLocally() }
             }
             .keyboardShortcut("r", modifiers: [.command, .option])
-            .disabled(!appLock.isContentAvailable || !store.canRecomposeSchedule)
+            .disabled(
+                !appLock.isContentAvailable
+                    || !store.canMutatePlan
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !canonicalSync.canRecomposeLocally
+            )
+            .accessibilityIdentifier("schedule.compose-local.command")
         }
     }
 }
@@ -190,7 +198,11 @@ struct DayWeaveMacApp: App {
         }
         .defaultSize(width: 1_420, height: 900)
         .commands {
-            DayWeaveCommands(store: store, appLock: appLock)
+            DayWeaveCommands(
+                store: store,
+                canonicalSync: canonicalSync,
+                appLock: appLock
+            )
         }
 
         Window("Quick Capture", id: "quick-capture") {
@@ -274,6 +286,7 @@ struct DayWeaveMacApp: App {
                 if appLock.isContentAvailable {
                     MenuBarView()
                         .environmentObject(store)
+                        .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
                         .environmentObject(durableAuth)
                 } else {

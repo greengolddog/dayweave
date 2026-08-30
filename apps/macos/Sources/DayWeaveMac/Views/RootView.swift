@@ -92,7 +92,12 @@ struct RootView: View {
                     Label("Sync & compose", systemImage: "arrow.triangle.2.circlepath")
                 }
                 .help("Pull canonical items, publish safe local changes, and compose a preview")
-                .disabled(!canonicalSync.isConfigured || canonicalSync.isSyncing || !store.canMutatePlan)
+                .disabled(
+                    !canonicalSync.isConfigured
+                        || canonicalSync.isSyncing
+                        || canonicalSync.isLocallyComposing
+                        || !store.canMutatePlan
+                )
 
                 Button {
                     Task { await executionSync.refresh() }
@@ -104,12 +109,18 @@ struct RootView: View {
                 .accessibilityIdentifier("execution.refresh")
 
                 Button {
-                    store.recomposeSchedule()
+                    Task { await canonicalSync.recomposeLocally() }
                 } label: {
-                    Label("Recompose", systemImage: "wand.and.stars")
+                    Label("Compose on Mac", systemImage: "wand.and.stars")
                 }
-                .help("Reorder local flexible blocks; sync validates server constraints")
-                .disabled(!store.canRecomposeSchedule)
+                .help("Compose seven days from the encrypted cache on this Mac without publishing to Google Calendar")
+                .disabled(
+                    !store.canMutatePlan
+                        || canonicalSync.isSyncing
+                        || canonicalSync.isLocallyComposing
+                        || !canonicalSync.canRecomposeLocally
+                )
+                .accessibilityIdentifier("schedule.compose-local.toolbar")
 
                 if store.destination != .inbox {
                     Button {
@@ -381,6 +392,7 @@ private struct TodayView: View {
         VStack(spacing: 0) {
             TodayHeader()
             CanonicalSyncBanner()
+            LocalCompositionBanner()
             ExecutionSyncBanner()
             PreviewDiagnosticsStrip()
             Divider()
@@ -498,10 +510,13 @@ private struct PreviewDiagnosticsStrip: View {
 
     private var diagnosticMessages: [String] {
         var result = canonicalSync.warnings
+        appendUnique(canonicalSync.localCompositionWarnings, to: &result)
         if store.blocks.contains(where: {
-            $0.syncOrigin == .canonicalPreview || $0.syncOrigin == .externalPreview
+            $0.syncOrigin == .canonicalPreview
+                || $0.syncOrigin == .externalPreview
+                || $0.syncOrigin == .localComposition
         }), let issue = store.canonicalPreviewFreshnessIssue {
-            result.append("Canonical preview actions are locked: \(issue)")
+            result.append("Schedule actions are locked: \(issue)")
         }
         result.append(contentsOf: store.pendingCanonicalMutations.map { mutation in
             let title = store.canonicalItem(id: mutation.itemID)?.title ?? mutation.itemID.uuidString
@@ -524,6 +539,24 @@ private struct PreviewDiagnosticsStrip: View {
                 let title = store.blocks.first(where: { $0.id == id })?.title ?? "Local capture"
                 return "\(title): \(diagnostic)"
             })
+        if let composition = canonicalSync.lastLocalComposition {
+            appendUnique(composition.plan.unscheduled.map {
+                "\(title(for: $0.itemID)): \($0.remaining)m unscheduled on this Mac (\($0.reason)). \($0.message)"
+            }, to: &result)
+            appendUnique(composition.rejectedItems.map {
+                "“\($0.title)” was excluded on this device: \($0.reason)"
+            }, to: &result)
+            appendUnique(composition.ignoredPreviousAssignments.map {
+                "A previous assignment for \($0.itemID.uuidString.lowercased()) was ignored on this device: \($0.reason)"
+            }, to: &result)
+            appendUnique(composition.plan.decisions.map {
+                "On-device decision: \($0.displayDescription)"
+            }, to: &result)
+            appendUnique(composition.plan.violations.map {
+                "On-device violation: \($0.displayDescription)"
+            }, to: &result)
+            return result
+        }
         guard let preview = canonicalSync.lastPreview else { return result }
         result.append(contentsOf: preview.plan.unscheduled.map {
             "\(title(for: $0.itemID)): \($0.remaining)m unscheduled (\($0.reason)). \($0.message)"
@@ -543,6 +576,12 @@ private struct PreviewDiagnosticsStrip: View {
         return result
     }
 
+    private func appendUnique(_ messages: [String], to result: inout [String]) {
+        for message in messages where !result.contains(message) {
+            result.append(message)
+        }
+    }
+
     private func title(for itemID: UUID) -> String {
         store.canonicalItem(id: itemID)?.title ?? "Item"
     }
@@ -557,6 +596,7 @@ private struct PreviewDiagnosticsStrip: View {
 }
 
 private struct CanonicalSyncBanner: View {
+    @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
 
     var body: some View {
@@ -583,7 +623,12 @@ private struct CanonicalSyncBanner: View {
                 Task { await canonicalSync.sync() }
             }
             .controlSize(.small)
-            .disabled(!canonicalSync.isConfigured || canonicalSync.isSyncing)
+            .disabled(
+                !canonicalSync.isConfigured
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !store.canMutatePlan
+            )
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 9)
@@ -598,6 +643,109 @@ private struct CanonicalSyncBanner: View {
         case .online: .green
         case .failed: .red
         }
+    }
+}
+
+private struct LocalCompositionBanner: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+
+    var body: some View {
+        HStack(spacing: 9) {
+            if canonicalSync.isLocallyComposing {
+                ProgressView().controlSize(.small)
+            } else {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(statusMessage)
+                    .font(.caption)
+                    .foregroundStyle(statusIsFailure ? .red : .secondary)
+                    .lineLimit(2)
+                Text(provenanceSummary ?? "Uses the encrypted cache; stays on this Mac and is not published to Google Calendar.")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+                    .help(provenanceSummary ?? "Uses the encrypted cache; stays on this Mac and is not published to Google Calendar.")
+                if provenanceSummary != nil {
+                    Text("This schedule stays on this Mac and is not published to Google Calendar.")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+            if !canonicalSync.localCompositionWarnings.isEmpty {
+                Label(
+                    "\(canonicalSync.localCompositionWarnings.count) to review",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.orange)
+                .help(canonicalSync.localCompositionWarnings.joined(separator: "\n"))
+            }
+            Button("Compose on this Mac") {
+                Task { await canonicalSync.recomposeLocally() }
+            }
+            .controlSize(.small)
+            .disabled(
+                !store.canMutatePlan
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !canonicalSync.canRecomposeLocally
+            )
+            .accessibilityIdentifier("schedule.compose-local.banner")
+            Button("Sync instead") {
+                Task { await canonicalSync.sync() }
+            }
+            .controlSize(.small)
+            .disabled(
+                !canonicalSync.isConfigured
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !store.canMutatePlan
+            )
+            .help("Pull canonical changes, publish safe edits, and compose through the server")
+            .accessibilityIdentifier("schedule.sync-fallback.banner")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 9)
+        .background(Color.accentColor.opacity(0.055))
+    }
+
+    private var statusMessage: String {
+        if case .ready = canonicalSync.localCompositionStatus,
+           store.localScheduleCompositionProvenance != nil {
+            return "An on-device schedule is installed from the encrypted cache."
+        }
+        if case .ready = canonicalSync.localCompositionStatus,
+           !canonicalSync.canRecomposeLocally {
+            return "Sync once and resolve pending planner changes before composing on this Mac."
+        }
+        return canonicalSync.localCompositionStatus.message
+    }
+
+    private var provenanceSummary: String? {
+        guard let provenance = store.localScheduleCompositionProvenance else { return nil }
+        let sourceCount = provenance.sourceItemRevisions.count
+        return "Composed \(provenance.generatedAt.formatted(date: .abbreviated, time: .shortened)) · through \(provenance.horizonEnd.formatted(date: .abbreviated, time: .shortened)) · \(sourceCount) source revision\(sourceCount == 1 ? "" : "s") · \(provenance.timezoneName)"
+    }
+
+    private var statusColor: Color {
+        switch canonicalSync.localCompositionStatus {
+        case .ready:
+            store.localScheduleCompositionProvenance == nil ? .secondary : .green
+        case .composing: .blue
+        case .composed: .green
+        case .failed: .red
+        }
+    }
+
+    private var statusIsFailure: Bool {
+        if case .failed = canonicalSync.localCompositionStatus { return true }
+        return false
     }
 }
 
@@ -677,13 +825,14 @@ private struct TodayHeader: View {
                 symbol: "checkmark"
             )
             MetricChip(value: "\(store.protectedFreeMinutes)m", label: "protected", symbol: "shield")
-            MetricChip(value: previewCoverage, label: "preview coverage", symbol: "chart.pie")
+            MetricChip(value: scheduleCoverage, label: "schedule coverage", symbol: "chart.pie")
         }
         .padding(20)
     }
 
-    private var previewCoverage: String {
-        guard let score = canonicalSync.lastPreview?.plan.score else { return "—" }
+    private var scheduleCoverage: String {
+        guard let score = canonicalSync.lastLocalCompositionScore
+                ?? canonicalSync.lastPreview?.plan.score else { return "—" }
         let total = score.scheduledMinutes + score.unscheduledMinutes
         guard total > 0 else { return "100%" }
         return "\(Int((Double(score.scheduledMinutes) / Double(total) * 100).rounded()))%"
@@ -3706,6 +3855,7 @@ struct AppLockMenuBarView: View {
 struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
 
     var body: some View {
@@ -3743,9 +3893,31 @@ struct MenuBarView: View {
             Button("Quick Capture…") { openWindow(id: "quick-capture") }
                 .disabled(!store.canMutatePlan)
                 .accessibilityIdentifier("menu-bar.quick-capture")
-            Button("Recompose") { store.recomposeSchedule() }
-                .disabled(!store.canRecomposeSchedule)
+            Button("Compose on this Mac") {
+                Task { await canonicalSync.recomposeLocally() }
+            }
+            .disabled(
+                !store.canMutatePlan
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !canonicalSync.canRecomposeLocally
+            )
+            .accessibilityIdentifier("menu-bar.compose-local")
+            Button("Sync & compose") {
+                Task { await canonicalSync.sync() }
+            }
+            .disabled(
+                !canonicalSync.isConfigured
+                    || canonicalSync.isSyncing
+                    || canonicalSync.isLocallyComposing
+                    || !store.canMutatePlan
+            )
+            .accessibilityIdentifier("menu-bar.sync-compose")
             Divider()
+            Text(localCompositionStatusMessage)
+                .font(.caption)
+                .foregroundStyle(localCompositionStatusIsFailure ? .red : .secondary)
+                .lineLimit(2)
             Text(executionSync.status.message)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -3765,6 +3937,19 @@ struct MenuBarView: View {
             return block
         }
         return store.activeItem
+    }
+
+    private var localCompositionStatusIsFailure: Bool {
+        if case .failed = canonicalSync.localCompositionStatus { return true }
+        return false
+    }
+
+    private var localCompositionStatusMessage: String {
+        if case .ready = canonicalSync.localCompositionStatus,
+           store.localScheduleCompositionProvenance != nil {
+            return "On-device schedule installed · not published to Google Calendar"
+        }
+        return canonicalSync.localCompositionStatus.message
     }
 }
 
