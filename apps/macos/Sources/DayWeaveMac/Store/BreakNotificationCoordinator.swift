@@ -222,12 +222,33 @@ protocol DayWeaveBreakNotificationCoordinating: Sendable {
         session: DayWeaveExecutionSession?,
         acknowledged: DayWeaveExecutionSessionVersion?
     ) async -> DayWeaveBreakNotificationReconcileResult
+    func cancelExact(
+        identifier: String,
+        session: DayWeaveExecutionSession,
+        acknowledged: DayWeaveExecutionSessionVersion
+    ) async -> DayWeaveBreakNotificationReconcileResult
+}
+
+extension DayWeaveBreakNotificationCoordinating {
+    /// Unknown coordinator implementations fail closed rather than treating an
+    /// ordinary empty snapshot as proof that this captured request was removed.
+    func cancelExact(
+        identifier: String,
+        session: DayWeaveExecutionSession,
+        acknowledged: DayWeaveExecutionSessionVersion
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        _ = identifier
+        _ = session
+        _ = acknowledged
+        return .cancellationUnavailable
+    }
 }
 
 actor DayWeaveBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinating {
     private struct Input: Sendable {
         let session: DayWeaveExecutionSession?
         let acknowledged: DayWeaveExecutionSessionVersion?
+        let requiredRemovalIdentifier: String?
 
         var desiredIdentifier: String? {
             guard let descriptor = DayWeaveBreakNotificationContract.descriptor(for: session),
@@ -243,7 +264,11 @@ actor DayWeaveBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinatin
     private let sleep: @Sendable (Duration) async -> Void
     private let onReconcileAccepted: (@Sendable (UInt64) -> Void)?
     private var generation: UInt64 = 0
-    private var latestInput = Input(session: nil, acknowledged: nil)
+    private var latestInput = Input(
+        session: nil,
+        acknowledged: nil,
+        requiredRemovalIdentifier: nil
+    )
     private var knownOwnedIdentifiers: Set<String> = []
     private var isDraining = false
     private var waiters: [
@@ -292,9 +317,37 @@ actor DayWeaveBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinatin
         session: DayWeaveExecutionSession?,
         acknowledged: DayWeaveExecutionSessionVersion?
     ) async -> DayWeaveBreakNotificationReconcileResult {
+        await enqueue(.init(
+            session: session,
+            acknowledged: acknowledged,
+            requiredRemovalIdentifier: nil
+        ))
+    }
+
+    func cancelExact(
+        identifier: String,
+        session: DayWeaveExecutionSession,
+        acknowledged: DayWeaveExecutionSessionVersion
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        guard DayWeaveBreakNotificationContract.owns(identifier: identifier),
+              let descriptor = DayWeaveBreakNotificationContract.descriptor(for: session),
+              descriptor.identifier == identifier,
+              descriptor.version == acknowledged else {
+            return .cancellationUnavailable
+        }
+        return await enqueue(.init(
+            session: session,
+            acknowledged: acknowledged,
+            requiredRemovalIdentifier: identifier
+        ))
+    }
+
+    private func enqueue(
+        _ input: Input
+    ) async -> DayWeaveBreakNotificationReconcileResult {
         generation &+= 1
         let operation = generation
-        latestInput = Input(session: session, acknowledged: acknowledged)
+        latestInput = input
         return await withCheckedContinuation { continuation in
             waiters[operation, default: []].append(continuation)
             onReconcileAccepted?(operation)
@@ -353,7 +406,13 @@ actor DayWeaveBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinatin
         // may transiently miss the request; the known digest still gives the
         // cancellation barrier an exact, privacy-safe target.
         let knownStale = knownOwnedIdentifiers.filter { $0 != retainedIdentifier }
-        let staleIdentifiers = stalePending.union(staleDelivered).union(knownStale)
+        let requiredRemoval = input.requiredRemovalIdentifier.map {
+            Set([$0])
+        } ?? []
+        let staleIdentifiers = stalePending
+            .union(staleDelivered)
+            .union(knownStale)
+            .union(requiredRemoval)
         if !staleIdentifiers.isEmpty {
             guard await removeEverywhere(staleIdentifiers) else {
                 return operation == generation ? .cancellationUnavailable : .superseded
@@ -478,6 +537,19 @@ struct DayWeaveNoopBreakNotificationCoordinator: DayWeaveBreakNotificationCoordi
         acknowledged: DayWeaveExecutionSessionVersion?
     ) async -> DayWeaveBreakNotificationReconcileResult {
         .unchanged
+    }
+
+    func cancelExact(
+        identifier: String,
+        session: DayWeaveExecutionSession,
+        acknowledged: DayWeaveExecutionSessionVersion
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        guard let descriptor = DayWeaveBreakNotificationContract.descriptor(for: session),
+              descriptor.identifier == identifier,
+              descriptor.version == acknowledged else {
+            return .cancellationUnavailable
+        }
+        return .unchanged
     }
 }
 

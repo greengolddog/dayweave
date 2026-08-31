@@ -3843,6 +3843,35 @@ final class PlannerStore: ObservableObject {
         if let persistenceError { throw persistenceError }
     }
 
+    /// Records only the exact still-current expired-pause acknowledgment. The
+    /// caller removes and verifies the corresponding notification first, while
+    /// this method makes the final local transition atomic. A failed write
+    /// restores the unresolved in-memory state so the resolver cannot vanish
+    /// on the strength of bytes that never reached encrypted storage.
+    func persistExpiredPauseAcknowledgment(
+        _ version: DayWeaveExecutionSessionVersion,
+        message: String
+    ) throws {
+        guard let active = executionState.activeSession,
+              active.status == .paused,
+              active.id == version.sessionID,
+              active.revision == version.revision,
+              executionState.acknowledgedExpiredPause != version else {
+            throw PlannerExecutionStateError.invalidDurableState
+        }
+        let priorState = executionState
+        let priorMessage = lastScheduleMessage
+        var next = priorState
+        next.acknowledgedExpiredPause = version
+        do {
+            try persistExecutionState(next, message: message)
+        } catch {
+            executionState = priorState
+            lastScheduleMessage = priorMessage
+            throw error
+        }
+    }
+
     func canonicalProjectionEligibleAtExecutionStart(_ block: ScheduleBlock) -> Bool {
         guard canonicalScheduleBlockActionabilityIssue(block) == nil,
               block.sourceItemID != nil,

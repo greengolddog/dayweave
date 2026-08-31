@@ -134,6 +134,9 @@ final class ExecutionSyncStore: ObservableObject {
         DayWeaveBreakNotificationTapIssue? = nil
     @Published private(set) var isRequestingBreakNotificationAuthorization = false
     @Published private(set) var breakResolutionWakeGeneration: UInt64 = 0
+    @Published private var breakAlternativeHandoffSource:
+        BreakAlternativeHandoffSource? = nil
+    @Published private var selectedBreakAlternativeBlockID: UUID? = nil
 
     private let planner: PlannerStore
     private let connectionProvider: @MainActor @Sendable () throws -> DayWeaveExecutionConnection
@@ -231,6 +234,15 @@ final class ExecutionSyncStore: ObservableObject {
     }
 
     var activeSession: DayWeaveExecutionSession? { planner.executionState.activeSession }
+
+    var breakAlternativePresentation: BreakAlternativePresentation? {
+        guard let source = breakAlternativeHandoffSource else { return nil }
+        return BreakAlternativePolicy.presentation(
+            source: source,
+            selectedCandidateID: selectedBreakAlternativeBlockID,
+            planner: planner
+        )
+    }
 
     var expiredBreakChoiceRequired: Bool {
         guard let active = planner.executionState.activeSession,
@@ -402,6 +414,52 @@ final class ExecutionSyncStore: ObservableObject {
         breakNotificationTapIssue = nil
         breakResolutionWakeGeneration &+= 1
         scheduleBreakDeadlineWakeIfNeeded()
+    }
+
+    /// Recomputes the presentation from current proof rather than retaining a
+    /// schedule snapshot. A disappeared candidate also clears the ordinary
+    /// Today selection when that selection came from this handoff.
+    func reconcileBreakAlternativeSelection() {
+        guard let source = breakAlternativeHandoffSource else {
+            selectedBreakAlternativeBlockID = nil
+            return
+        }
+        guard let presentation = BreakAlternativePolicy.presentation(
+            source: source,
+            selectedCandidateID: selectedBreakAlternativeBlockID,
+            planner: planner
+        ) else {
+            let priorSelection = selectedBreakAlternativeBlockID
+            breakAlternativeHandoffSource = nil
+            selectedBreakAlternativeBlockID = nil
+            if planner.selectedBlockID == priorSelection {
+                planner.selectedBlockID = nil
+            }
+            return
+        }
+        guard selectedBreakAlternativeBlockID != presentation.selectedCandidateID else {
+            return
+        }
+        let priorSelection = selectedBreakAlternativeBlockID
+        selectedBreakAlternativeBlockID = presentation.selectedCandidateID
+        if planner.selectedBlockID == priorSelection {
+            planner.selectedBlockID = nil
+        }
+    }
+
+    /// Presentation-only selection. This never enters the execution command
+    /// path and therefore cannot start, resume, finish, skip, defer, or publish
+    /// anything.
+    func selectBreakAlternative(_ blockID: UUID) {
+        guard let presentation = breakAlternativePresentation,
+              presentation.candidates.contains(where: { $0.id == blockID }),
+              let block = planner.blocks.first(where: { $0.id == blockID }) else {
+            reconcileBreakAlternativeSelection()
+            return
+        }
+        selectedBreakAlternativeBlockID = blockID
+        planner.destination = .today
+        planner.select(block)
     }
 
     /// Called from the privacy-safe process-local foreground-delivery pulse.
@@ -1190,22 +1248,15 @@ final class ExecutionSyncStore: ObservableObject {
     }
 
     func keepPausedAfterExpiredBreak() async -> ExecutionSyncOutcome {
-        guard expiredBreakChoiceRequired,
-              let active = planner.executionState.activeSession else { return .invalidLocalState }
-        var next = planner.executionState
-        next.acknowledgedExpiredPause = .init(sessionID: active.id, revision: active.revision)
-        do {
-            try planner.persistExecutionState(
-                next,
-                message: "Break ended; the session remains paused until you resume or finish it"
-            )
-            breakResolutionPresentation = nil
-            breakNotificationTapIssue = nil
-            _ = await reconcileBreakNotification()
-            return .success
-        } catch {
-            return report(error)
-        }
+        await acknowledgeExpiredBreakKeepingPaused(presentAlternatives: false)
+    }
+
+    func chooseAnotherAfterExpiredBreak() async -> ExecutionSyncOutcome {
+        let outcome = await acknowledgeExpiredBreakKeepingPaused(
+            presentAlternatives: true
+        )
+        if outcome == .success { planner.destination = .today }
+        return outcome
     }
 
     func startForegroundPolling(every interval: Duration = .seconds(30)) {
@@ -1944,6 +1995,7 @@ final class ExecutionSyncStore: ObservableObject {
     }
 
     private func runExclusive(
+        reconcilesBreakNotificationAfterward: Bool = true,
         _ operation: @escaping (UUID, UInt64) async throws -> ExecutionSyncOutcome
     ) async -> ExecutionSyncOutcome {
         guard operationID == nil else { return .invalidLocalState }
@@ -1988,13 +2040,84 @@ final class ExecutionSyncStore: ObservableObject {
         // already-authorized notification center. A not-determined state is
         // returned without prompting and therefore cannot delay the server
         // command behind a system permission sheet.
-        _ = await reconcileBreakNotification()
+        if reconcilesBreakNotificationAfterward {
+            _ = await reconcileBreakNotification()
+        }
         if operationID == id {
             operationID = nil
             isSyncing = false
         }
         planner.endCanonicalSync()
+        reconcileBreakAlternativeSelection()
         return outcome
+    }
+
+    private func acknowledgeExpiredBreakKeepingPaused(
+        presentAlternatives: Bool
+    ) async -> ExecutionSyncOutcome {
+        await runExclusive(reconcilesBreakNotificationAfterward: false) {
+            [self] _, _ in
+            guard expiredBreakChoiceRequired,
+                  let capturedSession = planner.executionState.activeSession,
+                  let capturedDescriptor = DayWeaveBreakNotificationContract.descriptor(
+                      for: capturedSession
+                  ),
+                  capturedDescriptor.deadline <= now() else {
+                throw ExecutionSyncControllerError.invalidLocalState(
+                    "The expired break changed before it could be acknowledged."
+                )
+            }
+            let source = BreakAlternativeHandoffSource(session: capturedSession)
+            setBusy("Verifying removal of the exact break reminder…")
+            breakNotificationReconciliationIsSuppressed = true
+            let cancellation = await breakNotificationCoordinator.cancelExact(
+                identifier: capturedDescriptor.identifier,
+                session: capturedSession,
+                acknowledged: source.version
+            )
+            breakNotificationAuthorizationState =
+                await breakNotificationCoordinator.authorizationState()
+            applyBreakNotificationResult(cancellation)
+
+            guard cancellation.isVerifiedCancellation else {
+                breakNotificationReconciliationIsSuppressed = false
+                _ = await reconcileBreakNotification()
+                throw PlannerExecutionStateError.breakNotificationCancellationUnavailable
+            }
+
+            guard expiredBreakChoiceRequired,
+                  let current = planner.executionState.activeSession,
+                  source.matches(current),
+                  DayWeaveBreakNotificationContract.descriptor(for: current)?.identifier
+                    == capturedDescriptor.identifier else {
+                breakNotificationReconciliationIsSuppressed = false
+                _ = await reconcileBreakNotification()
+                throw ExecutionSyncControllerError.unstableRead
+            }
+
+            do {
+                try planner.persistExpiredPauseAcknowledgment(
+                    source.version,
+                    message:
+                        "Break ended; the session remains paused until you move, resume, or finish it"
+                )
+            } catch {
+                breakNotificationReconciliationIsSuppressed = false
+                _ = await reconcileBreakNotification()
+                throw error
+            }
+
+            breakResolutionPresentation = nil
+            breakNotificationTapIssue = nil
+            breakNotificationReconciliationIsSuppressed = false
+            scheduleBreakDeadlineWakeIfNeeded()
+            if presentAlternatives {
+                breakAlternativeHandoffSource = source
+                selectedBreakAlternativeBlockID = nil
+            }
+            setConnected("Break acknowledged; the authoritative session remains paused")
+            return .success
+        }
     }
 
     private func clearBreakResolutionPresentationIfStale() {
@@ -2162,6 +2285,11 @@ final class ExecutionSyncStore: ObservableObject {
             phase = .failed
             message = reason
             outcome = .invalidLocalState
+        case PlannerExecutionStateError.breakNotificationCancellationUnavailable:
+            phase = .failed
+            message = PlannerExecutionStateError
+                .breakNotificationCancellationUnavailable.localizedDescription
+            outcome = .unexpectedFailure
         case is PlannerPersistenceError,
              PlannerExecutionStateError.encryptedPersistenceRequired:
             phase = .failed

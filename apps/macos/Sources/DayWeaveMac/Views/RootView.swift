@@ -286,6 +286,9 @@ struct RootView: View {
         .onChange(of: breakNotificationDeliveryPulse.generation) { _, _ in
             executionSync.breakNotificationForegroundDeliveryDidOccur()
         }
+        .onChange(of: breakAlternativeCandidateIDs) { _, _ in
+            executionSync.reconcileBreakAlternativeSelection()
+        }
         .alert("Your break has ended", isPresented: expiredBreakAlertBinding) {
             Button("Resume") {
                 if let blockID = activeExecutionBlockID {
@@ -313,6 +316,17 @@ struct RootView: View {
                 }
             }
             .accessibilityIdentifier("execution.expired-break.extend-10-minutes")
+            .disabled(executionSync.isSyncing
+                || store.executionState.pendingCommand != nil
+                || !store.canMutatePlan)
+            Button("Choose another item") {
+                isResolvingExpiredBreak = true
+                Task {
+                    _ = await executionSync.chooseAnotherAfterExpiredBreak()
+                    isResolvingExpiredBreak = false
+                }
+            }
+            .accessibilityIdentifier("execution.expired-break.choose-another")
             .disabled(executionSync.isSyncing
                 || store.executionState.pendingCommand != nil
                 || !store.canMutatePlan)
@@ -398,6 +412,10 @@ struct RootView: View {
     private var activeExecutionBlockID: UUID? {
         guard let active = executionSync.activeSession else { return nil }
         return executionBlock(matching: active, in: store.blocks)?.id
+    }
+
+    private var breakAlternativeCandidateIDs: [UUID]? {
+        executionSync.breakAlternativePresentation?.candidates.map(\.id)
     }
 
     @ViewBuilder
@@ -717,6 +735,7 @@ private struct ActiveMiniPlayer: View {
 private struct TodayView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
 
     var body: some View {
         VStack(spacing: 0) {
@@ -725,6 +744,9 @@ private struct TodayView: View {
             LocalCompositionBanner()
             ExecutionSyncBanner()
             PreviewDiagnosticsStrip()
+            if let presentation = executionSync.breakAlternativePresentation {
+                BreakAlternativeHandoffView(presentation: presentation)
+            }
             Divider()
             if store.visibleBlocks.isEmpty {
                 ContentUnavailableView {
@@ -796,6 +818,115 @@ private struct TodayView: View {
         Button("Quick Capture") { store.isQuickAddPresented = true }
             .disabled(!store.canMutatePlan)
             .accessibilityIdentifier("today.quick-capture")
+    }
+}
+
+private struct BreakAlternativeHandoffView: View {
+    @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var executionSync: ExecutionSyncStore
+    let presentation: BreakAlternativePresentation
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline) {
+                Label("Choose another item", systemImage: "arrow.triangle.branch")
+                    .font(.headline)
+                Spacer()
+                Text("Current session paused")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.orange)
+            }
+
+            Text(BreakAlternativePresentation.selectionGuidance)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if presentation.candidates.isEmpty {
+                Label(
+                    BreakAlternativePresentation.emptyGuidance,
+                    systemImage: "pause.circle"
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("execution.break-alternatives.empty")
+            } else {
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: 10) {
+                        ForEach(presentation.candidates) { candidate in
+                            candidateButton(candidate)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+                .scrollIndicators(.hidden)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(Color.accentColor.opacity(0.07))
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("execution.break-alternatives")
+    }
+
+    private func candidateButton(_ candidate: BreakAlternativeCandidate) -> some View {
+        let isSelected = presentation.selectedCandidateID == candidate.id
+        return Button {
+            executionSync.selectBreakAlternative(candidate.id)
+        } label: {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 6) {
+                    if candidate.isNextInPlan {
+                        Text("Next in plan")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.tint)
+                    }
+                    if isSelected {
+                        Label("Selected", systemImage: "checkmark.circle.fill")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.tint)
+                    }
+                }
+                Text(candidate.block.title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+                Text(scheduleTimeRange(
+                    candidate.block,
+                    timezoneName: store.scheduleProfile.timezoneName
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                if let reason = candidate.placementReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+            .frame(width: 220, alignment: .leading)
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isSelected
+                        ? Color.accentColor.opacity(0.12)
+                        : Color(nsColor: .controlBackgroundColor))
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(
+                        isSelected ? Color.accentColor : Color(nsColor: .separatorColor),
+                        lineWidth: 1
+                    )
+            }
+            .contentShape(RoundedRectangle(cornerRadius: 10))
+        }
+        .buttonStyle(.plain)
+        .privacySensitive(candidate.block.isSensitive)
+        .accessibilityIdentifier(
+            "execution.break-alternative.\(candidate.id.uuidString.lowercased())"
+        )
     }
 }
 
@@ -5030,6 +5161,21 @@ struct MenuBarView: View {
                             .disabled(executionSync.isSyncing
                                 || store.executionState.pendingCommand != nil
                                 || !store.canMutatePlan)
+                            Button("Choose another item") {
+                                Task {
+                                    let outcome = await executionSync
+                                        .chooseAnotherAfterExpiredBreak()
+                                    if outcome == .success {
+                                        openWindow(id: "main")
+                                    }
+                                }
+                            }
+                            .disabled(executionSync.isSyncing
+                                || store.executionState.pendingCommand != nil
+                                || !store.canMutatePlan)
+                            .accessibilityIdentifier(
+                                "menu-bar.execution.expired-break.choose-another"
+                            )
                             Button("Keep paused") {
                                 Task {
                                     _ = await executionSync.keepPausedAfterExpiredBreak()

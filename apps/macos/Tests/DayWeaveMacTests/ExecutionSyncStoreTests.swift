@@ -2614,7 +2614,9 @@ struct ExecutionSyncStoreTests {
         }
         await notificationCoordinator.waitUntilEntered()
         #expect(!(await completion.isComplete))
-        #expect(!sync.expiredBreakChoiceRequired)
+        // Notification removal is proved before the encrypted acknowledgment,
+        // so a crash at this barrier still restores the explicit resolver.
+        #expect(sync.expiredBreakChoiceRequired)
         #expect(planner.executionState.activeSession?.status == .paused)
         await notificationCoordinator.release()
         #expect(await keepPaused.value == .success)
@@ -4103,7 +4105,6 @@ private actor GatedBreakNotificationCoordinator: DayWeaveBreakNotificationCoordi
         acknowledged: DayWeaveExecutionSessionVersion?
     ) async -> DayWeaveBreakNotificationReconcileResult {
         observedSession = session
-        _ = acknowledged
         entered = true
         let waiters = entryWaiters
         entryWaiters.removeAll()
@@ -4111,8 +4112,22 @@ private actor GatedBreakNotificationCoordinator: DayWeaveBreakNotificationCoordi
         await withCheckedContinuation { continuation in
             releaseContinuation = continuation
         }
-        return DayWeaveBreakNotificationContract.descriptor(for: session) == nil
-            ? .canceled : .scheduled
+        guard let descriptor = DayWeaveBreakNotificationContract.descriptor(
+            for: session
+        ) else { return .canceled }
+        return descriptor.version == acknowledged ? .canceled : .scheduled
+    }
+
+    func cancelExact(
+        identifier: String,
+        session: DayWeaveExecutionSession,
+        acknowledged: DayWeaveExecutionSessionVersion
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        guard DayWeaveBreakNotificationContract.descriptor(for: session)?.identifier
+                == identifier else {
+            return .cancellationUnavailable
+        }
+        return await reconcile(session: session, acknowledged: acknowledged)
     }
 
     func waitUntilEntered() async {

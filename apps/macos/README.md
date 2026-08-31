@@ -34,9 +34,15 @@ is treated as enabled so it can be recovered only after authentication.
 Canonical focus sessions use the server-authoritative execution lease and are
 reconciled before every start, pause, resume, completion, skip, or defer. A
 timed pause never resumes automatically. At its deadline the in-app resolution
-offers **Resume**, **Extend 10 minutes**, or **Keep paused**; extension is a new
-revision-guarded pause command and keeping the session paused is recorded in
-the encrypted execution snapshot without inventing a server mutation.
+offers **Resume**, **Extend 10 minutes**, **Choose another item**, or **Keep
+paused**; extension is a new revision-guarded pause command. The two
+keep-paused choices first capture the exact paused revision and opaque reminder
+digest, verify Notification Center removal while the encrypted lease is still
+intact, revalidate that exact lease after the await, and only then record the
+acknowledgment in the encrypted execution snapshot. Cancellation failure,
+lease drift, or a storage failure leaves the resolver open, restores
+reconciliation for whichever authoritative reminder remains, and never routes
+or invents a server mutation.
 
 For a future timed-pause deadline, macOS schedules one local Notification
 Center request only after validating the encrypted session shape. The request
@@ -45,7 +51,8 @@ deadline. Its fixed title and body contain no task title, notes, raw item or
 session identifier, `userInfo`, or direct mutation action. Reconciliation after
 launch and each execution transition replaces or removes stale pending and
 delivered requests; resume, completion, skip, defer, replacement, and an
-explicit **Keep paused** acknowledgment therefore cancel the old reminder.
+explicit **Keep paused** or **Choose another item** acknowledgment therefore
+cancel the old reminder.
 Each stale opaque identifier is removed from both Notification Center
 collections so a request firing during cancellation cannot escape by moving
 from pending to delivered. Concurrent reconciliations coalesce to the newest
@@ -92,6 +99,30 @@ background execution updates remain part of the separate push-sync requirement.
 Final acceptance still needs one bundled-app smoke test for permission UI,
 background delivery, lock/unlock routing, background banner/sound appearance,
 and Notification Center click behavior.
+
+After a successful **Choose another item** acknowledgment, the main window
+routes to Today and shows a dedicated handoff panel. It derives candidates
+freshly from the complete current publication proof and lists only scheduled,
+executable canonical leaves backed by exact `planned` blocks. It excludes the
+paused item, events, breaks, local or helper-only blocks, unpublished or stale
+placements, pinned/fixed/hard blocks, hierarchy parents, pending or conflicted
+items, terminal sessions, and anything that would otherwise fail the canonical
+Start checks. Missing hierarchy, freshness, revision, or whole-plan evidence
+fails closed. Candidates remain in schedule order, the first is labeled **Next
+in plan**, and bounded control-free scheduler placement reasoning is shown when
+available.
+
+Choosing a candidate only selects and highlights its existing Today block; it
+does not start, resume, complete, skip, defer, or publish anything. The
+authoritative paused lease continues to disable the ordinary Start controls
+until the owner moves that session later, completes it, or skips it. Schedule
+refreshes recompute the panel from current proof and clear a selection that is
+no longer eligible. With no safe candidates, the panel explains that the
+current item remains paused and must be resolved before another item can start.
+The handoff state is intentionally process-local, while its exact expired-break
+acknowledgment is durable, so restart does not reopen the resolved dialog. The
+panel lives inside `RootView`; the existing external app-lock boundary hides it
+along with all other schedule content.
 
 ## DayWeave API
 
