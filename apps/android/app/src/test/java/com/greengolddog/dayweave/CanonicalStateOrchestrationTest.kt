@@ -12,7 +12,7 @@ class CanonicalStateOrchestrationTest {
         val calls = mutableListOf<String>()
         var executionReads = 0
 
-        refreshCanonicalStateSequence(
+        val outcome = refreshCanonicalStateSequence(
             executionRefresh = {
                 executionReads += 1
                 calls += "execution-$executionReads"
@@ -28,13 +28,14 @@ class CanonicalStateOrchestrationTest {
             listOf("execution-1", "canonical-projection-compose", "execution-2"),
             calls,
         )
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
     }
 
     @Test
     fun failedInitialExecutionReadNeverComposesOverUnknownTruth() = runBlocking {
         val calls = mutableListOf<String>()
 
-        refreshCanonicalStateSequence(
+        val outcome = refreshCanonicalStateSequence(
             executionRefresh = {
                 calls += "execution"
                 ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE
@@ -46,6 +47,7 @@ class CanonicalStateOrchestrationTest {
         )
 
         assertEquals(listOf("execution"), calls)
+        assertEquals(null, outcome)
     }
 
     @Test

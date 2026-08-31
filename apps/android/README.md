@@ -96,6 +96,18 @@ The encrypted snapshot keeps a rolling 100-session history window for display pl
 terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after
 enough newer sessions.
 
+Canonical items use the same unlocked, lifecycle-bound invalidation boundary. Android opens
+`/v1/items/stream` with only the exact opaque delta cursor from the last SQLCipher-confirmed
+planner generation; an unbound first sync omits `Last-Event-ID`, and event cursors are never saved
+or ordered by the client. Opaque events are coalesced by a local generation and enter the existing
+execution reconciliation → complete item delta → composition → idempotent schedule publication
+path through the process action gate. A successful own item write whose emitted cursor is already
+covered by that durable commit is cleared without a second composition. Independently, a
+`limit=1` delta probe runs once on foreground activation and at most every 30 seconds, so a missing
+stream endpoint or missed wakeup still converges without periodically composing an unchanged day.
+Item streaming and probing stop on background, app lock, or credential replacement; replacement
+drains their exact calls before the encrypted canonical cache is quarantined.
+
 All authenticated Android APIs share one process-wide device-auth coordinator. Contract version 2
 adds the REST-only `schedule_publish` scope to the Android enrollment tuple; it is not an MCP scope.
 An older active or pending contract cannot gain that authority through refresh and therefore fails

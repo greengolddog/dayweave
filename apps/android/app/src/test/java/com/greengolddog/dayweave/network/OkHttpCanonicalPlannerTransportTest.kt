@@ -55,6 +55,25 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun foregroundDeltaProbeRequestsOnlyOneChangeWithoutChangingNormalDeltaLimit() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                """{"changes":[],"next_cursor":"opaque_probe","has_more":false}""",
+            ),
+        )
+
+        val page = transport.itemDeltaProbe(configuration(), "opaque_previous")
+
+        assertEquals("opaque_probe", page.nextCursor)
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/tenant/v1/items/delta", request.url.encodedPath)
+        assertEquals("limit=1&cursor=opaque_previous", request.url.encodedQuery)
+        assertEquals("application/json", request.headers["Accept"])
+        assertEquals("Bearer unit-test-secret", request.headers["Authorization"])
+    }
+
+    @Test
     fun previewSendsStrictRfc3339RequestAndDecodesSchedule() = runBlocking {
         server.enqueue(jsonResponse(previewJson()))
         val request = SchedulePreviewRequest(

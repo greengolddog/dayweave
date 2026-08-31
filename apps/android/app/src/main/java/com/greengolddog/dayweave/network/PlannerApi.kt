@@ -387,6 +387,15 @@ interface CanonicalPlannerTransport {
         cursor: String?,
     ): RemoteItemDeltaPage
 
+    /**
+     * Cheap foreground invalidation probe. Existing transports remain source-compatible while the
+     * production transport asks for one change instead of materializing a normal delta page.
+     */
+    suspend fun itemDeltaProbe(
+        configuration: AuthenticatedApiConfiguration,
+        cursor: String?,
+    ): RemoteItemDeltaPage = itemDelta(configuration, cursor)
+
     suspend fun preview(
         configuration: AuthenticatedApiConfiguration,
         request: SchedulePreviewRequest,
@@ -432,10 +441,22 @@ class OkHttpCanonicalPlannerTransport(
     override suspend fun itemDelta(
         configuration: AuthenticatedApiConfiguration,
         cursor: String?,
+    ): RemoteItemDeltaPage = itemDelta(configuration, cursor, MAX_DELTA_PAGE_SIZE)
+
+    override suspend fun itemDeltaProbe(
+        configuration: AuthenticatedApiConfiguration,
+        cursor: String?,
+    ): RemoteItemDeltaPage = itemDelta(configuration, cursor, FOREGROUND_PROBE_PAGE_SIZE)
+
+    private suspend fun itemDelta(
+        configuration: AuthenticatedApiConfiguration,
+        cursor: String?,
+        limit: Int,
     ): RemoteItemDeltaPage {
+        require(limit in 1..MAX_DELTA_PAGE_SIZE)
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/items/delta")
-            .addQueryParameter("limit", MAX_DELTA_PAGE_SIZE.toString())
+            .addQueryParameter("limit", limit.toString())
             .apply { if (cursor != null) addQueryParameter("cursor", cursor) }
             .build()
         return execute(requestBuilder(configuration, url.toString()).get().build())
@@ -771,6 +792,7 @@ class OkHttpCanonicalPlannerTransport(
 
     companion object {
         const val MAX_DELTA_PAGE_SIZE = 50
+        private const val FOREGROUND_PROBE_PAGE_SIZE = 1
         // One page can legitimately contain large notes plus bounded recurrence/constraint JSON.
         private const val MAX_RESPONSE_CHARS = 12 * 1024 * 1024
         private const val MAX_ERROR_RESPONSE_CHARS = 8 * 1024

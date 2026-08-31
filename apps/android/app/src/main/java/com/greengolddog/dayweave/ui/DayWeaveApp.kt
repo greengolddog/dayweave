@@ -347,9 +347,14 @@ private fun DayWeaveRoot(
             viewModel.refreshExecution()
             viewModel.refreshGoogleAccounts()
             viewModel.refreshEnergySignal()
-            runForegroundExecutionWorkers(
-                invalidationStream = if (deviceAuthState.isConfigured) {
+            runForegroundInvalidationWorkers(
+                executionInvalidationStream = if (deviceAuthState.isConfigured) {
                     viewModel::collectForegroundExecutionInvalidations
+                } else {
+                    null
+                },
+                canonicalItemInvalidations = if (deviceAuthState.isConfigured) {
+                    viewModel::collectForegroundCanonicalItemInvalidations
                 } else {
                     null
                 },
@@ -1071,11 +1076,13 @@ private fun DayWeaveRoot(
 private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L
 
 /** A stream bug or protocol failure can never cancel the independent polling fallback. */
-internal suspend fun runForegroundExecutionWorkers(
-    invalidationStream: (suspend () -> Unit)?,
+internal suspend fun runForegroundInvalidationWorkers(
+    executionInvalidationStream: (suspend () -> Unit)?,
+    canonicalItemInvalidations: (suspend () -> Unit)?,
     polling: suspend () -> Unit,
 ) = supervisorScope {
-    invalidationStream?.let { collectInvalidations ->
+    listOfNotNull(executionInvalidationStream, canonicalItemInvalidations).forEach {
+        collectInvalidations ->
         launch {
             try {
                 collectInvalidations()

@@ -14,6 +14,7 @@ import com.greengolddog.dayweave.network.ApiBindingOperationGate
 import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
 import com.greengolddog.dayweave.network.KeystoreDeviceAuthEnvelopeStore
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
+import com.greengolddog.dayweave.network.OkHttpCanonicalItemInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
@@ -35,10 +36,12 @@ import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
+import com.greengolddog.dayweave.sync.DurableCanonicalItemInvalidationCursor
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
+import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -120,6 +123,9 @@ class DayWeaveApplication : Application() {
                         return false
                     }
                     if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
+                    if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
+                        canonicalItemInvalidationManager.cancelAndDrainActiveSession()
+                    }
                     if (executionInvalidationManagerDelegate.isInitialized()) {
                         executionInvalidationManager.cancelAndDrainActiveSession()
                     }
@@ -186,11 +192,13 @@ class DayWeaveApplication : Application() {
     val proposalApplicationManager: ProposalApplicationManager
         get() = proposalApplicationManagerDelegate.value
 
+    private val canonicalPlannerTransport by lazy { OkHttpCanonicalPlannerTransport() }
+
     private val canonicalSyncManagerDelegate = lazy {
         CanonicalSyncManager(
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
-            transport = OkHttpCanonicalPlannerTransport(),
+            transport = canonicalPlannerTransport,
             cancelTimedBreakNotification =
                 ::cancelTimedBreakNotificationForAuthoritativeTransition,
             reconcileTimedBreakNotification =
@@ -198,6 +206,28 @@ class DayWeaveApplication : Application() {
         )
     }
     val canonicalSyncManager: CanonicalSyncManager get() = canonicalSyncManagerDelegate.value
+
+    private val canonicalItemInvalidationManagerDelegate = lazy {
+        ForegroundCanonicalItemInvalidationManager(
+            credentialStore = apiCredentialStore,
+            plannerTransport = canonicalPlannerTransport,
+            streamTransport = OkHttpCanonicalItemInvalidationStreamTransport(),
+            durableCursor = {
+                val durable = plannerStore.durableState.value
+                DurableCanonicalItemInvalidationCursor(
+                    syncOrigin = durable?.canonicalSyncOrigin,
+                    configurationId = durable?.canonicalConfigurationId,
+                    cursor = durable?.canonicalDeltaCursor,
+                )
+            },
+            tryLaunchAuthoritativeRefresh = ::launchCanonicalAction,
+            authoritativeRefresh = {
+                refreshCanonicalState() == CanonicalRefreshOutcome.SUCCESS
+            },
+        )
+    }
+    private val canonicalItemInvalidationManager: ForegroundCanonicalItemInvalidationManager
+        get() = canonicalItemInvalidationManagerDelegate.value
 
     private val executionSyncManagerDelegate = lazy {
         ExecutionSyncManager(
@@ -316,6 +346,9 @@ class DayWeaveApplication : Application() {
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
+            canonicalItemInvalidationManager.cancelActiveSession()
+        }
         if (executionInvalidationManagerDelegate.isInitialized()) {
             executionInvalidationManager.cancelActiveSession()
         }
@@ -329,11 +362,16 @@ class DayWeaveApplication : Application() {
         executionInvalidationManager.runForegroundActivation()
     }
 
+    /** Includes the 30-second delta fallback and runs only in the unlocked STARTED UI. */
+    suspend fun runForegroundCanonicalItemInvalidations() {
+        canonicalItemInvalidationManager.runForegroundActivation()
+    }
+
     /** Reconciles an old/remote lease both before and after replacing today's composition. */
-    suspend fun refreshCanonicalState() {
+    suspend fun refreshCanonicalState(): CanonicalRefreshOutcome? {
         proposalApplicationManager.recoverPending()
-        if (plannerStore.state.value.pendingProposalApplicationMutation != null) return
-        refreshCanonicalStateSequence(
+        if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
+        return refreshCanonicalStateSequence(
             executionRefresh = executionSyncManager::refresh,
             canonicalRefresh = canonicalSyncManager::refreshAndCompose,
         )
@@ -373,10 +411,11 @@ class DayWeaveApplication : Application() {
 internal suspend fun refreshCanonicalStateSequence(
     executionRefresh: suspend () -> ExecutionSyncOutcome,
     canonicalRefresh: suspend () -> CanonicalRefreshOutcome,
-) {
-    if (executionRefresh() !in EXECUTION_REFRESH_SUCCESSES) return
-    canonicalRefresh()
+): CanonicalRefreshOutcome? {
+    if (executionRefresh() !in EXECUTION_REFRESH_SUCCESSES) return null
+    val canonicalOutcome = canonicalRefresh()
     executionRefresh()
+    return canonicalOutcome
 }
 
 /** Runs the expensive compose/projection pass only when the execution poll discovered work. */

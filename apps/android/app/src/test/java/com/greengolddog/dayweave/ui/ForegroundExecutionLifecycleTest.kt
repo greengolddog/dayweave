@@ -15,11 +15,12 @@ class ForegroundExecutionLifecycleTest {
         val pollingStarted = CompletableDeferred<Unit>()
         val streamFailed = CompletableDeferred<Unit>()
         val workers = async {
-            runForegroundExecutionWorkers(
-                invalidationStream = {
+            runForegroundInvalidationWorkers(
+                executionInvalidationStream = {
                     streamFailed.complete(Unit)
                     error("synthetic stream defect")
                 },
+                canonicalItemInvalidations = null,
                 polling = {
                     pollingStarted.complete(Unit)
                     awaitCancellation()
@@ -29,6 +30,36 @@ class ForegroundExecutionLifecycleTest {
 
         withTimeout(2_000) { pollingStarted.await() }
         withTimeout(2_000) { streamFailed.await() }
+
+        assertTrue(workers.isActive)
+        workers.cancelAndJoin()
+    }
+
+    @Test
+    fun unexpectedCanonicalItemWorkerFailureCannotCancelExecutionPollingFallback() = runBlocking {
+        val pollingStarted = CompletableDeferred<Unit>()
+        val itemWorkerFailed = CompletableDeferred<Unit>()
+        val executionStreamStarted = CompletableDeferred<Unit>()
+        val workers = async {
+            runForegroundInvalidationWorkers(
+                executionInvalidationStream = {
+                    executionStreamStarted.complete(Unit)
+                    awaitCancellation()
+                },
+                canonicalItemInvalidations = {
+                    itemWorkerFailed.complete(Unit)
+                    error("synthetic item stream defect")
+                },
+                polling = {
+                    pollingStarted.complete(Unit)
+                    awaitCancellation()
+                },
+            )
+        }
+
+        withTimeout(2_000) { pollingStarted.await() }
+        withTimeout(2_000) { executionStreamStarted.await() }
+        withTimeout(2_000) { itemWorkerFailed.await() }
 
         assertTrue(workers.isActive)
         workers.cancelAndJoin()

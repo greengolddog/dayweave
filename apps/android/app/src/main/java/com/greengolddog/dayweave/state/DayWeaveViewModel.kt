@@ -485,6 +485,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.runForegroundExecutionInvalidations()
     }
 
+    /** The caller owns the unlocked STARTED lifecycle and therefore every item/probe socket. */
+    suspend fun collectForegroundCanonicalItemInvalidations() {
+        dayWeaveApplication.runForegroundCanonicalItemInvalidations()
+    }
+
     fun keepLatestItemAfterTerminalConflict(sessionId: String) {
         if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
         dayWeaveApplication.launchCanonicalAction {
