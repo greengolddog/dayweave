@@ -27,6 +27,8 @@ protocol CanonicalServiceSynchronizing: AnyObject {
 
     @discardableResult
     func syncThroughFreshComposition() async -> Bool
+    func startForegroundItemInvalidations(every interval: Duration)
+    func stopForegroundItemInvalidations()
 }
 
 extension CanonicalSyncStore: CanonicalServiceSynchronizing {}
@@ -82,6 +84,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         servicesAreActive = false
         activationTask?.cancel()
         activationTask = nil
+        canonicalSync.stopForegroundItemInvalidations()
         executionSync.stopForegroundPolling()
     }
 
@@ -155,6 +158,14 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         guard operationIsCurrent(generation) else { return false }
         if executionOutcome == .success, canonicalSync.isConfigured {
             _ = await canonicalSync.syncThroughFreshComposition()
+            guard operationIsCurrent(generation) else { return false }
+            // Start the guarded delivery manager even when the activation sync
+            // failed transiently. CanonicalSyncStore admits neither the stream
+            // nor its fallback probe until the encrypted durable binding and
+            // cursor match the current connection, so a failed persistence or
+            // configuration transition remains fail-closed while an existing
+            // exact binding can recover during this foreground activation.
+            canonicalSync.startForegroundItemInvalidations(every: .seconds(30))
         }
         guard operationIsCurrent(generation) else { return false }
         executionSync.startForegroundPolling(every: .seconds(30))

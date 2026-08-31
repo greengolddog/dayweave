@@ -849,6 +849,156 @@ struct DurableAuthCoordinatorTests {
         #expect(await transport.records().count == 1)
     }
 
+    @Test("item stream 401 recovery reopens the exact opaque cursor request once")
+    @MainActor
+    func itemStreamUnauthorizedRecoveryReplaysExactly() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 205, refreshMarker: 206)
+        let state = TestDurableAuthStateStore(initial: envelope(active: active, revision: 22))
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .session(
+                    issuedAt: instant.addingTimeInterval(60),
+                    statusCode: 200,
+                    replayed: false
+                ),
+            ]
+        )
+        let nextAccess = syntheticCredential(prefix: "dw_da1_", marker: 207)
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [207, 208]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        URLProtocolStub.storage.reset(key: active.credentials.accessToken)
+        URLProtocolStub.storage.reset(key: nextAccess)
+        URLProtocolStub.storage.enqueue(
+            key: active.credentials.accessToken,
+            .init(
+                statusCode: 401,
+                headers: trustedUnauthorizedHeaders,
+                body: trustedUnauthorizedBody
+            )
+        )
+        let nextCursor = "opaque-cursor-after-auth"
+        URLProtocolStub.storage.enqueue(
+            key: nextAccess,
+            .init(
+                statusCode: 200,
+                headers: ["Content-Type": "text/event-stream"],
+                body: Data(
+                    "id: \(nextCursor)\nevent: item-invalidation\n"
+                        .appending("data: {\"cursor\":\"\(nextCursor)\"}\n\n")
+                        .utf8
+                )
+            )
+        )
+        let client = DayWeaveAPIClient(
+            baseURL: baseURL,
+            session: URLProtocolStub.makeSession(),
+            authCoordinator: coordinator
+        )
+        let cursors = DurableAuthItemCursorRecorder()
+
+        let completion = try await client.consumeItemInvalidations(
+            after: "opaque-cursor-before-auth"
+        ) {
+            await cursors.append($0)
+        }
+
+        #expect(completion == .liveEndOfStream)
+        #expect(await cursors.values() == [nextCursor])
+        let first = try #require(
+            URLProtocolStub.storage.requests(for: active.credentials.accessToken).first
+        )
+        let replay = try #require(URLProtocolStub.storage.requests(for: nextAccess).first)
+        #expect(first.method == replay.method)
+        #expect(first.url == replay.url)
+        #expect(first.body == nil && replay.body == nil)
+        var firstHeaders = first.headers
+        var replayHeaders = replay.headers
+        firstHeaders.removeValue(forKey: "Authorization")
+        replayHeaders.removeValue(forKey: "Authorization")
+        #expect(firstHeaders == replayHeaders)
+        #expect(first.headers["Last-Event-ID"] == "opaque-cursor-before-auth")
+        #expect(await transport.records().count == 1)
+    }
+
+    @Test("item stream 401 recovery remains inside one absolute lifetime")
+    @MainActor
+    func itemStreamUnauthorizedRecoverySharesLifetimeWatchdog() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 209, refreshMarker: 210)
+        let state = TestDurableAuthStateStore(initial: envelope(active: active, revision: 23))
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .session(
+                    issuedAt: instant.addingTimeInterval(60),
+                    statusCode: 200,
+                    replayed: false
+                ),
+            ]
+        )
+        let nextAccess = syntheticCredential(prefix: "dw_da1_", marker: 211)
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [211, 212]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        URLProtocolStub.storage.reset(key: active.credentials.accessToken)
+        URLProtocolStub.storage.reset(key: nextAccess)
+        URLProtocolStub.storage.enqueue(
+            key: active.credentials.accessToken,
+            .init(
+                statusCode: 401,
+                headers: trustedUnauthorizedHeaders,
+                body: trustedUnauthorizedBody
+            )
+        )
+        URLProtocolStub.storage.enqueue(
+            key: nextAccess,
+            .init(
+                statusCode: 200,
+                headers: ["Content-Type": "text/event-stream"],
+                body: Data(),
+                delay: 5
+            )
+        )
+        let lifetime = DurableAuthStreamLifetimeGate()
+        let client = DayWeaveAPIClient(
+            baseURL: baseURL,
+            session: URLProtocolStub.makeSession(),
+            authCoordinator: coordinator,
+            executionStreamLifetimeSleep: {
+                try await lifetime.wait()
+            }
+        )
+        let task = Task {
+            try await client.consumeItemInvalidations(after: "opaque-cursor") { _ in }
+        }
+
+        let replayDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while URLProtocolStub.storage.requests(for: nextAccess).isEmpty,
+              ContinuousClock.now < replayDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(URLProtocolStub.storage.requests(for: nextAccess).count == 1)
+        #expect(lifetime.waitCount == 1)
+
+        lifetime.fire()
+        do {
+            _ = try await task.value
+            Issue.record("Expected the shared absolute lifetime to expire")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .transport(.timedOut))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(lifetime.waitCount == 1)
+    }
+
     @Test("execution stream 401 recovery remains inside one absolute lifetime")
     @MainActor
     func executionStreamUnauthorizedRecoverySharesLifetimeWatchdog() async throws {
@@ -3732,6 +3882,16 @@ private actor DurableAuthStreamRevisionRecorder {
     }
 
     func values() -> [UInt64] { revisions }
+}
+
+private actor DurableAuthItemCursorRecorder {
+    private var cursors: [String] = []
+
+    func append(_ cursor: String) {
+        cursors.append(cursor)
+    }
+
+    func values() -> [String] { cursors }
 }
 
 private final class DurableAuthStreamLifetimeGate: @unchecked Sendable {

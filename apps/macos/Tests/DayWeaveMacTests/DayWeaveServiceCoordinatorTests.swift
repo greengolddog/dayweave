@@ -43,6 +43,7 @@ struct DayWeaveServiceCoordinatorTests {
             "google-outbound.recover",
             "execution.refresh",
             "canonical.sync",
+            "canonical.poll",
             "execution.poll",
         ])
     }
@@ -80,6 +81,7 @@ struct DayWeaveServiceCoordinatorTests {
             "google-outbound.recover",
             "execution.refresh",
             "canonical.sync",
+            "canonical.poll",
             "execution.poll",
         ])
     }
@@ -107,6 +109,7 @@ struct DayWeaveServiceCoordinatorTests {
             "proposal.recover",
             "execution.refresh",
             "canonical.sync",
+            "canonical.poll",
             "execution.poll",
         ])
     }
@@ -141,6 +144,7 @@ struct DayWeaveServiceCoordinatorTests {
             "proposal.recover",
             "execution.refresh",
             "canonical.sync",
+            "canonical.poll",
             "execution.poll",
         ])
     }
@@ -170,8 +174,38 @@ struct DayWeaveServiceCoordinatorTests {
         #expect(events.values == [
             "execution.refresh",
             "canonical.sync",
+            "canonical.poll",
             "execution.poll",
+            "canonical.stop",
             "execution.stop",
+        ])
+    }
+
+    @Test("failed initial canonical sync starts the binding-guarded recovery manager")
+    func failedCanonicalSyncStartsGuardedItemDelivery() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(
+            hasPendingRecovery: false,
+            resolvesRecovery: false,
+            reportedResult: false,
+            events: events
+        )
+        let execution = ExecutionServiceDouble(events: events)
+        let canonical = CanonicalServiceDouble(events: events, syncSucceeds: false)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: proposals,
+            executionSync: execution,
+            canonicalSync: canonical
+        )
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+
+        #expect(events.values == [
+            "execution.refresh",
+            "canonical.sync",
+            "canonical.poll",
+            "execution.poll",
         ])
     }
 }
@@ -263,14 +297,24 @@ private final class ExecutionServiceDouble: ExecutionServiceSynchronizing {
 private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
     let isConfigured = true
     private let events: ServiceEventLog
+    private let syncSucceeds: Bool
 
-    init(events: ServiceEventLog) {
+    init(events: ServiceEventLog, syncSucceeds: Bool = true) {
         self.events = events
+        self.syncSucceeds = syncSucceeds
     }
 
     func syncThroughFreshComposition() async -> Bool {
         events.values.append("canonical.sync")
-        return true
+        return syncSucceeds
+    }
+
+    func startForegroundItemInvalidations(every _: Duration) {
+        events.values.append("canonical.poll")
+    }
+
+    func stopForegroundItemInvalidations() {
+        events.values.append("canonical.stop")
     }
 }
 #endif

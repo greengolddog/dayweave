@@ -244,6 +244,25 @@ private struct ExecutionProjectionKey: Hashable {
     let sessionIndex: UInt16
 }
 
+struct CanonicalDeltaCommitResult: Equatable, Sendable {
+    let schedulingInputsChanged: Bool
+    let cursorChanged: Bool
+}
+
+enum PlannerCanonicalDeltaCommitError: Error, LocalizedError {
+    case encryptedPersistenceRequired
+    case mutationFenceUnavailable
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Canonical item catch-up requires healthy encrypted persistence."
+        case .mutationFenceUnavailable:
+            "Canonical item catch-up could not acquire the shared mutation fence."
+        }
+    }
+}
+
 @MainActor
 final class PlannerStore: ObservableObject {
     static let maximumCanonicalTitleScalars = 500
@@ -375,6 +394,32 @@ final class PlannerStore: ObservableObject {
     private var scheduleProfileCommitObservers: [@MainActor () -> Void] = []
     private var isCanonicalPreviewValidatedForCurrentLaunch = false
     private var persistenceRevision: PlannerPersistenceRevision = .missing
+
+    /// Complete in-memory transaction preimage for authoritative item delta
+    /// application. Several reconciliation helpers deliberately touch more
+    /// than the item array and cursor (privacy presentation, recovery journals,
+    /// recurrence history and execution projection diagnostics), so rollback
+    /// must restore their whole mutation surface after a failed encrypted save.
+    private struct CanonicalDeltaMutationPreimage {
+        let blocks: [ScheduleBlock]
+        let canonicalItems: [DayWeaveCanonicalItem]
+        let canonicalDeltaCursor: String?
+        let canonicalTombstoneRevisions: [UUID: UInt64]
+        let completedOccurrenceIDs: Set<UUID>
+        let pendingCanonicalMutations: [PendingCanonicalMutation]
+        let pendingCanonicalSensitivityMutations: [PendingCanonicalSensitivityMutation]
+        let recurrenceSessionOutcomes: [RecurrenceSessionOutcome]
+        let recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]
+        let schedulePreviewProvenance: SchedulePreviewProvenance?
+        let publishedScheduleProof: DayWeavePublishedScheduleProof?
+        let localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
+        let pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]
+        let canonicalTrash: [DayWeaveCanonicalTrashEntry]
+        let executionState: DayWeaveExecutionDurableState
+        let selectedCanonicalItemID: UUID?
+        let lastScheduleMessage: String
+        let previewValidatedForCurrentLaunch: Bool
+    }
 
     init(
         blocks: [ScheduleBlock] = [],
@@ -1325,7 +1370,8 @@ final class PlannerStore: ObservableObject {
 
     func applyCanonicalDelta(
         _ changes: [DayWeaveItemDeltaChange],
-        nextCursor: String
+        nextCursor: String,
+        flushPrunedRecurrenceHistory: Bool = true
     ) {
         guard canPersistPlan else { return }
         var indexed: [UUID: DayWeaveCanonicalItem] = [:]
@@ -1417,9 +1463,49 @@ final class PlannerStore: ObservableObject {
         canonicalDeltaCursor = nextCursor
         reconcileSelectedCanonicalItem()
         hardenPendingSensitivityPresentation()
-        if pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys)) {
+        if pruneRecurrenceHistory(retainingItemIDs: Set(indexed.keys)),
+           flushPrunedRecurrenceHistory {
             flushPersistence()
         }
+    }
+
+    /// Applies a fully buffered authoritative delta and its opaque cursor as
+    /// one encrypted boundary. A semantic canonical change invalidates the
+    /// current schedule before this synchronous MainActor method returns;
+    /// cursor-only own echoes preserve an otherwise exact publication proof.
+    func applyCanonicalDeltaDurably(
+        _ changes: [DayWeaveItemDeltaChange],
+        nextCursor: String
+    ) throws -> CanonicalDeltaCommitResult {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerCanonicalDeltaCommitError.encryptedPersistenceRequired
+        }
+        guard isCanonicalSyncLocked else {
+            throw PlannerCanonicalDeltaCommitError.mutationFenceUnavailable
+        }
+        let preimage = canonicalDeltaMutationPreimage()
+        applyCanonicalDelta(
+            changes,
+            nextCursor: nextCursor,
+            flushPrunedRecurrenceHistory: false
+        )
+        let result = CanonicalDeltaCommitResult(
+            schedulingInputsChanged: canonicalItems != preimage.canonicalItems
+                || completedOccurrenceIDs != preimage.completedOccurrenceIDs
+                || recurrenceSessionOutcomes != preimage.recurrenceSessionOutcomes
+                || recurrenceOccurrenceMoves != preimage.recurrenceOccurrenceMoves,
+            cursorChanged: canonicalDeltaCursor != preimage.canonicalDeltaCursor
+        )
+        if result.schedulingInputsChanged {
+            invalidateCanonicalPreview()
+            publishedScheduleProof = nil
+        }
+        flushPersistence()
+        if let persistenceError {
+            restoreCanonicalDeltaMutationPreimage(preimage)
+            throw persistenceError
+        }
+        return result
     }
 
     /// A newer active upsert is cross-device evidence for a queued restore.
@@ -1449,7 +1535,8 @@ final class PlannerStore: ObservableObject {
 
     func replaceCanonicalState(
         changes: [DayWeaveItemDeltaChange],
-        nextCursor: String
+        nextCursor: String,
+        flushPrunedRecurrenceHistory: Bool = true
     ) {
         guard canPersistPlan else { return }
         let recoveryItemIDs = pendingCanonicalRecoveryItemIDs
@@ -1490,7 +1577,11 @@ final class PlannerStore: ObservableObject {
         // final stream supplies a newer active item or tombstone.
         canonicalTombstoneRevisions = retainedRestoreTombstones
         canonicalTrash = Array(retainedRestoreTrashByID.values)
-        applyCanonicalDelta(changes, nextCursor: nextCursor)
+        applyCanonicalDelta(
+            changes,
+            nextCursor: nextCursor,
+            flushPrunedRecurrenceHistory: flushPrunedRecurrenceHistory
+        )
 
         let finalActiveByID = Dictionary(
             canonicalItems.map { ($0.id, $0) },
@@ -1546,6 +1637,91 @@ final class PlannerStore: ObservableObject {
         )
         reconcileSelectedCanonicalItem()
         hardenPendingSensitivityPresentation()
+    }
+
+    /// Durable cursor-scope recovery counterpart to
+    /// `applyCanonicalDeltaDurably`. The complete replacement is built by the
+    /// caller before the encrypted cache is changed.
+    func replaceCanonicalStateDurably(
+        changes: [DayWeaveItemDeltaChange],
+        nextCursor: String
+    ) throws -> CanonicalDeltaCommitResult {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerCanonicalDeltaCommitError.encryptedPersistenceRequired
+        }
+        guard isCanonicalSyncLocked else {
+            throw PlannerCanonicalDeltaCommitError.mutationFenceUnavailable
+        }
+        let preimage = canonicalDeltaMutationPreimage()
+        replaceCanonicalState(
+            changes: changes,
+            nextCursor: nextCursor,
+            flushPrunedRecurrenceHistory: false
+        )
+        let result = CanonicalDeltaCommitResult(
+            schedulingInputsChanged: canonicalItems != preimage.canonicalItems
+                || completedOccurrenceIDs != preimage.completedOccurrenceIDs
+                || recurrenceSessionOutcomes != preimage.recurrenceSessionOutcomes
+                || recurrenceOccurrenceMoves != preimage.recurrenceOccurrenceMoves,
+            cursorChanged: canonicalDeltaCursor != preimage.canonicalDeltaCursor
+        )
+        if result.schedulingInputsChanged {
+            invalidateCanonicalPreview()
+            publishedScheduleProof = nil
+        }
+        flushPersistence()
+        if let persistenceError {
+            restoreCanonicalDeltaMutationPreimage(preimage)
+            throw persistenceError
+        }
+        return result
+    }
+
+    private func canonicalDeltaMutationPreimage() -> CanonicalDeltaMutationPreimage {
+        CanonicalDeltaMutationPreimage(
+            blocks: blocks,
+            canonicalItems: canonicalItems,
+            canonicalDeltaCursor: canonicalDeltaCursor,
+            canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+            completedOccurrenceIDs: completedOccurrenceIDs,
+            pendingCanonicalMutations: pendingCanonicalMutations,
+            pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+            recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+            recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+            schedulePreviewProvenance: schedulePreviewProvenance,
+            publishedScheduleProof: publishedScheduleProof,
+            localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+            pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+            canonicalTrash: canonicalTrash,
+            executionState: executionState,
+            selectedCanonicalItemID: selectedCanonicalItemID,
+            lastScheduleMessage: lastScheduleMessage,
+            previewValidatedForCurrentLaunch: isCanonicalPreviewValidatedForCurrentLaunch
+        )
+    }
+
+    private func restoreCanonicalDeltaMutationPreimage(
+        _ preimage: CanonicalDeltaMutationPreimage
+    ) {
+        blocks = preimage.blocks
+        canonicalItems = preimage.canonicalItems
+        canonicalDeltaCursor = preimage.canonicalDeltaCursor
+        canonicalTombstoneRevisions = preimage.canonicalTombstoneRevisions
+        completedOccurrenceIDs = preimage.completedOccurrenceIDs
+        pendingCanonicalMutations = preimage.pendingCanonicalMutations
+        pendingCanonicalSensitivityMutations = preimage.pendingCanonicalSensitivityMutations
+        recurrenceSessionOutcomes = preimage.recurrenceSessionOutcomes
+        recurrenceOccurrenceMoves = preimage.recurrenceOccurrenceMoves
+        schedulePreviewProvenance = preimage.schedulePreviewProvenance
+        publishedScheduleProof = preimage.publishedScheduleProof
+        localScheduleCompositionProvenance = preimage.localScheduleCompositionProvenance
+        pendingCanonicalAuthoringMutations = preimage.pendingCanonicalAuthoringMutations
+        canonicalTrash = preimage.canonicalTrash
+        executionState = preimage.executionState
+        selectedCanonicalItemID = preimage.selectedCanonicalItemID
+        lastScheduleMessage = preimage.lastScheduleMessage
+        isCanonicalPreviewValidatedForCurrentLaunch =
+            preimage.previewValidatedForCurrentLaunch
     }
 
     func upsertCanonicalItem(_ item: DayWeaveCanonicalItem) {

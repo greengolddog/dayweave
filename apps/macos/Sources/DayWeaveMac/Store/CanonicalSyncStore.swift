@@ -72,6 +72,9 @@ final class CanonicalSyncStore: ObservableObject {
     private let statusPushLimit: Int
     private let previousAssignmentLimit: Int
     private let previousAssignmentBlockLimit: Int
+    private let itemStreamTransportProvider:
+        @MainActor @Sendable (DayWeaveAPIClient) -> (any DayWeaveItemStreamTransport)?
+    private let itemStreamSleep: @Sendable (Duration) async throws -> Void
     private var configurationGeneration: UInt64 = 0
     private var activeSyncID: UUID?
     private var activeSyncTask: Task<Void, Never>?
@@ -81,6 +84,18 @@ final class CanonicalSyncStore: ObservableObject {
     private var activeLocalCompositionID: UUID?
     private var activeLocalCompositionTask: Task<LocalScheduleComposition, Error>?
     private var activeLocalCompositionScheduleProfile: ScheduleProfile?
+    private var foregroundItemPollTask: Task<Void, Never>?
+    private var foregroundItemStreamTask: Task<Void, Never>?
+    private var foregroundItemDrainTask: Task<Void, Never>?
+    private var foregroundItemOperationID: UUID?
+    private var lastSuccessfulForegroundItemOperationID: UUID?
+    private var foregroundItemGeneration: UInt64 = 0
+    private var foregroundItemObservationGeneration: UInt64 = 0
+    private var foregroundItemReconciledGeneration: UInt64 = 0
+    private var foregroundItemLatestHintCursor: String?
+    private var foregroundItemStreamUnavailableForActivation = false
+    private var foregroundItemImmediateAttempts = 0
+    private var foregroundPublicationRepairRequired = false
 
     init(
         planner: PlannerStore,
@@ -94,6 +109,11 @@ final class CanonicalSyncStore: ObservableObject {
         statusPushLimit: Int = CanonicalSyncStore.maximumStatusPushesPerSync,
         previousAssignmentLimit: Int = CanonicalSyncStore.maximumPreviousAssignments,
         previousAssignmentBlockLimit: Int = CanonicalSyncStore.maximumPreviousAssignmentBlocks,
+        itemStreamTransportProvider: @escaping @MainActor @Sendable
+            (DayWeaveAPIClient) -> (any DayWeaveItemStreamTransport)? = { $0 },
+        itemStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        },
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.planner = planner
@@ -107,6 +127,8 @@ final class CanonicalSyncStore: ObservableObject {
         self.statusPushLimit = max(0, statusPushLimit)
         self.previousAssignmentLimit = max(0, previousAssignmentLimit)
         self.previousAssignmentBlockLimit = max(0, previousAssignmentBlockLimit)
+        self.itemStreamTransportProvider = itemStreamTransportProvider
+        self.itemStreamSleep = itemStreamSleep
         self.now = now
         status = .ready
         reloadConfigurationStatus()
@@ -132,6 +154,7 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     func configurationDidChange() {
+        stopForegroundItemInvalidations()
         configurationGeneration &+= 1
         activeSyncTask?.cancel()
         activeLocalCompositionTask?.cancel()
@@ -144,6 +167,288 @@ final class CanonicalSyncStore: ObservableObject {
             status = .failed(
                 "A schedule publication is awaiting exact recovery. Restore its original API configuration and authentication, then sync before replacing or resetting this connection."
             )
+        }
+    }
+
+    /// Starts content-free foreground item delivery beside a lightweight
+    /// delta probe. The coordinator calls this only after one full activation
+    /// sync has durably installed the current URL/auth binding and cursor.
+    func startForegroundItemInvalidations(every interval: Duration = .seconds(30)) {
+        guard foregroundItemPollTask == nil else { return }
+        foregroundItemStreamUnavailableForActivation = false
+        foregroundItemGeneration &+= 1
+        let generation = foregroundItemGeneration
+        foregroundItemPollTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.startForegroundItemStreamIfReady()
+            while self.foregroundItemIsCurrent(generation) {
+                do {
+                    try await self.itemStreamSleep(interval)
+                } catch {
+                    return
+                }
+                guard self.foregroundItemIsCurrent(generation) else { return }
+                await self.probeForegroundItemDelta(generation: generation)
+                self.startForegroundItemStreamIfReady()
+            }
+        }
+    }
+
+    func stopForegroundItemInvalidations() {
+        foregroundItemPollTask?.cancel()
+        foregroundItemPollTask = nil
+        foregroundItemGeneration &+= 1
+        foregroundItemStreamTask?.cancel()
+        foregroundItemStreamTask = nil
+        foregroundItemDrainTask?.cancel()
+        foregroundItemDrainTask = nil
+        if let foregroundItemOperationID, activeSyncID == foregroundItemOperationID {
+            activeSyncTask?.cancel()
+        }
+        foregroundItemOperationID = nil
+        foregroundItemObservationGeneration = 0
+        foregroundItemReconciledGeneration = 0
+        foregroundItemLatestHintCursor = nil
+        foregroundItemStreamUnavailableForActivation = false
+        foregroundItemImmediateAttempts = 0
+        foregroundPublicationRepairRequired = false
+    }
+
+    private func startForegroundItemStreamIfReady() {
+        guard foregroundItemPollTask != nil,
+              foregroundItemStreamTask == nil,
+              !foregroundItemStreamUnavailableForActivation,
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              let durableCursor = planner.canonicalDeltaCursor,
+              DayWeaveItemCursorContract.isValidTransportToken(durableCursor),
+              let client = makeClient(reportFailure: false),
+              planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+              let transport = itemStreamTransportProvider(client),
+              canonicalClientIsCurrent(client) else { return }
+        let generation = foregroundItemGeneration
+        foregroundItemStreamTask = Task { @MainActor [weak self] in
+            await self?.runForegroundItemStream(
+                initialTransport: transport,
+                generation: generation
+            )
+        }
+    }
+
+    private func runForegroundItemStream(
+        initialTransport: any DayWeaveItemStreamTransport,
+        generation: UInt64
+    ) async {
+        var retrySeconds = 1
+        var nextTransport: (any DayWeaveItemStreamTransport)? = initialTransport
+        defer {
+            if generation == foregroundItemGeneration {
+                foregroundItemStreamTask = nil
+            }
+        }
+        while foregroundItemIsCurrent(generation) {
+            let client: DayWeaveAPIClient
+            if let current = makeClient(reportFailure: false) {
+                client = current
+            } else {
+                return
+            }
+            guard planner.hasEncryptedPersistence,
+                  planner.canPersistPlan,
+                  planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  canonicalClientIsCurrent(client),
+                  let durableCursor = planner.canonicalDeltaCursor,
+                  DayWeaveItemCursorContract.isValidTransportToken(durableCursor),
+                  let transport = nextTransport ?? itemStreamTransportProvider(client) else {
+                return
+            }
+            nextTransport = nil
+            foregroundItemImmediateAttempts = 0
+            var reconnectDelaySeconds = 1
+            do {
+                let completion = try await transport.consumeItemInvalidations(
+                    after: durableCursor
+                ) { [weak self] cursor in
+                    await self?.acceptForegroundItemHint(
+                        cursor,
+                        configurationIdentifier: client.configurationIdentifier,
+                        generation: generation
+                    )
+                }
+                guard foregroundItemIsCurrent(generation) else { return }
+                switch completion {
+                case .unsupported:
+                    foregroundItemStreamUnavailableForActivation = true
+                    return
+                case .endOfStream:
+                    reconnectDelaySeconds = retrySeconds
+                    retrySeconds = min(retrySeconds * 2, 30)
+                case .liveEndOfStream:
+                    retrySeconds = 1
+                    reconnectDelaySeconds = 1
+                }
+            } catch {
+                guard foregroundItemIsCurrent(generation) else { return }
+                guard itemStreamFailureIsTransient(error) else {
+                    foregroundItemStreamUnavailableForActivation = true
+                    return
+                }
+                reconnectDelaySeconds = retrySeconds
+                retrySeconds = min(retrySeconds * 2, 30)
+            }
+            do {
+                try await itemStreamSleep(.seconds(reconnectDelaySeconds))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func acceptForegroundItemHint(
+        _ cursor: String,
+        configurationIdentifier: String,
+        generation: UInt64
+    ) {
+        guard foregroundItemIsCurrent(generation),
+              DayWeaveItemCursorContract.isValidTransportToken(cursor),
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.canonicalConfigurationIdentifier == configurationIdentifier,
+              makeClient(reportFailure: false)?.configurationIdentifier
+                == configurationIdentifier else { return }
+        if cursor == planner.canonicalDeltaCursor {
+            return
+        }
+        foregroundItemObservationGeneration &+= 1
+        foregroundItemLatestHintCursor = cursor
+        enqueueForegroundItemDrain(generation: generation)
+    }
+
+    private func enqueueForegroundItemDrain(generation: UInt64) {
+        guard foregroundItemIsCurrent(generation), foregroundItemDrainTask == nil else { return }
+        foregroundItemDrainTask = Task { @MainActor [weak self] in
+            await self?.drainForegroundItemObservations(generation: generation)
+        }
+    }
+
+    private func drainForegroundItemObservations(generation: UInt64) async {
+        var drainImmediateAttempts = 0
+        defer {
+            if generation == foregroundItemGeneration {
+                foregroundItemDrainTask = nil
+            }
+        }
+        while foregroundItemIsCurrent(generation) {
+            let targetGeneration = foregroundItemObservationGeneration
+            guard targetGeneration > foregroundItemReconciledGeneration
+                    || foregroundPublicationRepairRequired else { return }
+            guard planner.hasEncryptedPersistence, planner.canPersistPlan else { return }
+
+            if !foregroundPublicationRepairRequired,
+               let hintedCursor = foregroundItemLatestHintCursor,
+               hintedCursor == planner.canonicalDeltaCursor {
+                foregroundItemReconciledGeneration = targetGeneration
+                foregroundItemLatestHintCursor = nil
+                continue
+            }
+            // Keep a per-drain ceiling as well as the activation admission
+            // counter. A stream reconnect may replenish later admission while
+            // this task is suspended in URLSession, but cannot extend this
+            // drain beyond its initial attempt plus one immediate follow-up.
+            guard drainImmediateAttempts < 2,
+                  foregroundItemImmediateAttempts < 2 else { return }
+            drainImmediateAttempts += 1
+            foregroundItemImmediateAttempts += 1
+            let succeeded = await reconcileForegroundItemChanges(
+                generation: generation
+            )
+            guard succeeded, foregroundItemIsCurrent(generation) else { return }
+            if foregroundItemLatestHintCursor == planner.canonicalDeltaCursor {
+                // Equality with the authoritative delta cursor proves that
+                // every observation through the latest opaque hint was
+                // covered, including hints received while this drain was in
+                // flight. Opaque cursors are never compared or ordered.
+                foregroundItemReconciledGeneration = foregroundItemObservationGeneration
+                foregroundItemLatestHintCursor = nil
+            } else {
+                foregroundItemReconciledGeneration = targetGeneration
+            }
+            if foregroundItemObservationGeneration == targetGeneration,
+               !foregroundPublicationRepairRequired {
+                return
+            }
+        }
+    }
+
+    private func probeForegroundItemDelta(generation: UInt64) async {
+        guard foregroundItemIsCurrent(generation),
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              activeSyncID == nil,
+              let durableCursor = planner.canonicalDeltaCursor,
+              DayWeaveItemCursorContract.isValidTransportToken(durableCursor),
+              let client = makeClient(reportFailure: false),
+              planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+              canonicalClientIsCurrent(client) else { return }
+        do {
+            let page = try await client.itemDelta(cursor: durableCursor, limit: 1)
+            guard foregroundItemIsCurrent(generation),
+                  canonicalClientIsCurrent(client),
+                  planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  planner.canonicalDeltaCursor == durableCursor,
+                  DayWeaveItemCursorContract.isValidTransportToken(page.nextCursor) else { return }
+            let changed = !page.changes.isEmpty
+                || page.hasMore
+                || page.nextCursor != durableCursor
+            if changed {
+                foregroundItemObservationGeneration &+= 1
+                foregroundItemLatestHintCursor = page.changes.isEmpty && !page.hasMore
+                    ? page.nextCursor
+                    : nil
+            }
+        } catch let error as DayWeaveAPIError {
+            guard foregroundItemIsCurrent(generation),
+                  canonicalClientIsCurrent(client),
+                  planner.canonicalDeltaCursor == durableCursor else { return }
+            if case let .server(statusCode, _, _, _) = error, statusCode == 422 {
+                foregroundItemObservationGeneration &+= 1
+                foregroundItemLatestHintCursor = nil
+            }
+        } catch {
+            return
+        }
+        foregroundItemImmediateAttempts = 0
+        if foregroundItemObservationGeneration > foregroundItemReconciledGeneration
+            || foregroundPublicationRepairRequired {
+            enqueueForegroundItemDrain(generation: generation)
+        }
+    }
+
+    private func foregroundItemIsCurrent(_ generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && foregroundItemPollTask != nil
+            && generation == foregroundItemGeneration
+    }
+
+    private func canonicalClientIsCurrent(_ client: DayWeaveAPIClient) -> Bool {
+        makeClient(reportFailure: false)?.configurationIdentifier
+            == client.configurationIdentifier
+            && planner.canonicalConfigurationIdentifier == client.configurationIdentifier
+    }
+
+    private func itemStreamFailureIsTransient(_ error: Error) -> Bool {
+        switch error {
+        case let DayWeaveAPIError.transport(code):
+            return code != .cancelled
+        case let DayWeaveAPIError.server(statusCode, _, _, _):
+            return statusCode == 408 || statusCode == 429 || statusCode >= 500
+        case let DayWeaveAPIError.durableAuthentication(error):
+            switch error {
+            case .transport, .retryableServer: return true
+            default: return false
+            }
+        default:
+            return false
         }
     }
 
@@ -522,12 +827,14 @@ final class CanonicalSyncStore: ObservableObject {
     /// fence for a moment. Existing canonical work is also awaited and followed
     /// by this request, so every caller is either cancelled explicitly or gets a
     /// synchronization attempt after the work that caused contention.
-    private func waitForCanonicalMutationFence() async -> Bool {
+    private func waitForCanonicalMutationFence(reportFailure: Bool = true) async -> Bool {
         while !Task.isCancelled {
             guard planner.pendingProposalApplicationMutation == nil else {
-                status = .failed(
-                    "Recover the exact pending proposal application or undo before synchronizing canonical items."
-                )
+                if reportFailure {
+                    status = .failed(
+                        "Recover the exact pending proposal application or undo before synchronizing canonical items."
+                    )
+                }
                 return false
             }
             guard planner.canPersistPlan else { return false }
@@ -546,6 +853,189 @@ final class CanonicalSyncStore: ObservableObject {
             }
         }
         return false
+    }
+
+    private func reconcileForegroundItemChanges(generation: UInt64) async -> Bool {
+        guard foregroundItemIsCurrent(generation),
+              await waitForCanonicalMutationFence(reportFailure: false) else { return false }
+        guard foregroundItemIsCurrent(generation),
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              let client = makeClient(reportFailure: false),
+              planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+              canonicalClientIsCurrent(client),
+              let durableCursor = planner.canonicalDeltaCursor,
+              DayWeaveItemCursorContract.isValidTransportToken(durableCursor) else {
+            planner.endCanonicalSync()
+            return false
+        }
+
+        let requiresFullSync = hasPendingForegroundCanonicalWrites
+        if requiresFullSync {
+            clearTransientLocalComposition()
+            planner.invalidateCanonicalPreview()
+            lastPreview = nil
+            warnings = []
+            do {
+                try planner.prepareCanonicalSync(
+                    configurationIdentifier: client.configurationIdentifier
+                )
+            } catch {
+                planner.endCanonicalSync()
+                return false
+            }
+        }
+
+        let operationID = UUID()
+        let operationGeneration = configurationGeneration
+        activeSyncID = operationID
+        activeSyncScheduleProfile = planner.scheduleProfile
+        foregroundItemOperationID = operationID
+        lastSuccessfulForegroundItemOperationID = nil
+        isSyncing = true
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            if requiresFullSync {
+                self.status = .syncing("Pulling canonical item revisions…")
+                await self.performSync(
+                    client: client,
+                    operationID: operationID,
+                    generation: operationGeneration
+                )
+                if self.lastFreshCompositionSyncID == operationID {
+                    self.lastSuccessfulForegroundItemOperationID = operationID
+                }
+            } else {
+                await self.performForegroundItemReconciliation(
+                    client: client,
+                    operationID: operationID,
+                    generation: operationGeneration
+                )
+            }
+        }
+        activeSyncTask = task
+        await task.value
+        if foregroundItemOperationID == operationID {
+            foregroundItemOperationID = nil
+        }
+        return lastSuccessfulForegroundItemOperationID == operationID
+    }
+
+    private var hasPendingForegroundCanonicalWrites: Bool {
+        planner.pendingSchedulePublication != nil
+            || !planner.pendingCanonicalMutations.isEmpty
+            || !planner.pendingCanonicalSensitivityMutations.isEmpty
+            || !planner.pendingCanonicalAuthoringMutations.isEmpty
+            || planner.hasDeferredExecutionPublicationWork
+            || planner.blocks.contains {
+                $0.isLocallyAuthored && $0.sourceItemID == nil
+            }
+    }
+
+    private func performForegroundItemReconciliation(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async {
+        defer {
+            if activeSyncID == operationID {
+                activeSyncTask = nil
+                activeSyncID = nil
+                activeSyncScheduleProfile = nil
+                isSyncing = false
+                planner.endCanonicalSync()
+            }
+        }
+
+        do {
+            let commit = try await pullCanonicalItemsDurably(
+                client: client,
+                operationID: operationID,
+                generation: generation
+            )
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            if commit.schedulingInputsChanged {
+                foregroundPublicationRepairRequired = true
+                lastPreview = nil
+                clearTransientLocalComposition()
+            }
+            guard commit.schedulingInputsChanged || foregroundPublicationRepairRequired else {
+                lastSuccessfulForegroundItemOperationID = operationID
+                return
+            }
+
+            status = .syncing("Canonical items changed; composing a fresh schedule…")
+            let installed = try await composeAndPublishFreshSchedule(
+                client: client,
+                operationID: operationID,
+                generation: generation,
+                created: 0,
+                privacyUpdated: 0,
+                updated: 0,
+                retryBudget: 1
+            )
+            lastPreview = installed.preview
+            foregroundPublicationRepairRequired = false
+            lastSuccessfulSyncID = operationID
+            lastFreshCompositionSyncID = operationID
+            lastSuccessfulForegroundItemOperationID = operationID
+            status = .online(
+                updatedAt: now(),
+                message: "Synced \(planner.canonicalItems.count) items; composed \(installed.blockSummary)"
+            )
+        } catch {
+            planner.flushPersistence()
+            guard activeSyncID == operationID,
+                  generation == configurationGeneration,
+                  !Task.isCancelled else { return }
+            if foregroundPublicationRepairRequired || planner.persistenceError != nil {
+                status = .failed((planner.persistenceError ?? error).localizedDescription)
+            }
+        }
+    }
+
+    private func pullCanonicalItemsDurably(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async throws -> CanonicalDeltaCommitResult {
+        do {
+            let result = try await loadDelta(
+                client: client,
+                from: planner.canonicalDeltaCursor,
+                enforceItemCursorContract: true
+            )
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            guard DayWeaveItemCursorContract.isValidTransportToken(result.cursor) else {
+                throw CanonicalSyncError.invalidDeltaSequence
+            }
+            return try planner.applyCanonicalDeltaDurably(
+                result.changes,
+                nextCursor: result.cursor
+            )
+        } catch let error as DayWeaveAPIError {
+            guard case let .server(statusCode, _, _, _) = error,
+                  statusCode == 422,
+                  planner.canonicalDeltaCursor != nil else {
+                throw error
+            }
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            let result = try await loadDelta(
+                client: client,
+                from: nil,
+                enforceItemCursorContract: true
+            )
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            guard DayWeaveItemCursorContract.isValidTransportToken(result.cursor) else {
+                throw CanonicalSyncError.invalidDeltaSequence
+            }
+            let commit = try planner.replaceCanonicalStateDurably(
+                changes: result.changes,
+                nextCursor: result.cursor
+            )
+            warnings.append("The server item stream changed; the encrypted cache was rebuilt safely.")
+            return commit
+        }
     }
 
     private func performSync(
@@ -701,7 +1191,8 @@ final class CanonicalSyncStore: ObservableObject {
 
     private func loadDelta(
         client: DayWeaveAPIClient,
-        from initialCursor: String?
+        from initialCursor: String?,
+        enforceItemCursorContract: Bool = false
     ) async throws -> (changes: [DayWeaveItemDeltaChange], cursor: String) {
         var cursor = initialCursor
         var changes: [DayWeaveItemDeltaChange] = []
@@ -713,6 +1204,10 @@ final class CanonicalSyncStore: ObservableObject {
                 throw CanonicalSyncError.deltaResourceLimit
             }
             let page = try await client.itemDelta(cursor: cursor, limit: 200)
+            if enforceItemCursorContract,
+               !DayWeaveItemCursorContract.isValidTransportToken(page.nextCursor) {
+                throw CanonicalSyncError.invalidDeltaSequence
+            }
             guard page.changes.count <= Self.maximumDeltaChanges - changes.count else {
                 throw CanonicalSyncError.deltaResourceLimit
             }

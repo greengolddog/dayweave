@@ -347,6 +347,43 @@ The same authenticated configuration powers canonical planner sync. A sync:
    that preview current locally. Publication accepts exactly HTTP `200` for
    both the first result and an idempotent replay.
 
+After each foreground activation sync attempt, the Mac starts a guarded
+delivery manager for the optional
+`GET /v1/items/stream` invalidation channel with `Accept: text/event-stream`,
+`Accept-Encoding: identity`, and the exact encrypted opaque delta cursor copied
+unchanged into `Last-Event-ID`. The cursor is never decoded, numerically or
+lexicographically ordered, or persisted from SSE. The parser accepts only a
+standalone `: heartbeat` or one `item-invalidation` frame whose transport-safe
+ASCII `id` exactly equals the sole `{"cursor":"…"}` JSON value. It applies the
+same strict UTF-8, control-byte, line/frame/event bounds, redirect rejection,
+content-type/content-encoding checks, bounded error body, binding checks,
+single durable-auth retry, cancellation, and whole-call 330-second watchdog as
+the execution stream. A 404 disables only this optional stream for the current
+foreground activation; transient closes reconnect with bounded 1-to-30-second
+backoff. The manager opens neither SSE nor its probe until the encrypted cursor
+and binding exactly match the current connection and persistence is healthy;
+this lets an already valid binding recover from a transient activation-sync
+failure without exposing an in-memory-only or stale cursor.
+
+Item events are process-local observation generations, not ordered cursor
+values. A generation is settled only by a complete authoritative delta drain
+that began after it was observed, or when an in-flight drain returns the exact
+latest opaque hint and thereby proves that observation was covered. Scheduler
+input changes are followed immediately by validated preview, durable
+publication journaling, publication, and atomic proof installation. Events
+arriving during that work retain a later generation for one bounded follow-up
+unless that exact-cursor equality proves coverage. Cursor-only own echoes are
+flushed to the encrypted snapshot without invalidating or republishing an
+otherwise exact schedule. Real canonical or recurrence-input changes
+synchronously revoke the durable publication proof before their single
+encrypted delta commit; a failed save restores the complete in-memory preimage,
+and a failed preview/publication remains queued for repair. Independently, a foreground
+30-second `items/delta?limit=1` probe detects missed events. An unchanged page
+does nothing and never recomposes; evidence of change starts one full bounded
+delta drain from the still-durable cursor. App lock/background, configuration
+or credential replacement, and foreground-service shutdown cancel item stream,
+poll, drain, and any stream-originated reconciliation.
+
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
 live in the schema-v10 AES-GCM encrypted planner snapshot. Schema-v1 through v4
