@@ -50,6 +50,7 @@ import com.greengolddog.dayweave.model.requireCanonicalAuthoringShape
 import com.greengolddog.dayweave.model.nextCanonicalTrashRetentionExpiryEpochMillis
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.model.withInvalidTimedBreakNotificationAttemptAbandoned
 import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.hasValidRecurrenceSourceFor
@@ -58,6 +59,8 @@ import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
+import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
@@ -161,6 +164,7 @@ class PlannerStore(
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
+            .withInvalidTimedBreakNotificationAttemptAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) },
     )
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
@@ -168,6 +172,11 @@ class PlannerStore(
         if (repository == null) PlannerLoadState.READY else PlannerLoadState.LOADING,
     )
     val loadState: StateFlow<PlannerLoadState> = mutableLoadState.asStateFlow()
+    /** Last generation confirmed written to SQLCipher; null until encrypted restore/save succeeds. */
+    private val mutableDurableState = MutableStateFlow<DayWeaveUiState?>(
+        if (repository == null) mutableState.value else null,
+    )
+    val durableState: StateFlow<DayWeaveUiState?> = mutableDurableState.asStateFlow()
 
     private val persistenceLock = Any()
     private val saveRequests = Channel<Unit>(Channel.CONFLATED)
@@ -305,15 +314,25 @@ class PlannerStore(
 
     /** Advances the visible timer without writing more than once per displayed minute. */
     fun tickActiveSession(): Boolean {
-        val active = mutableState.value.activeSession ?: return false
+        val observed = mutableState.value
+        val active = observed.activeSession ?: return false
         if (active.isPaused) {
             val deadline = active.pauseUntilEpochMillis ?: return false
-            if (nowEpochMillis() < deadline || active.timedBreakEnded) return false
+            val identity = observed.authoritativeTimedBreakNotificationIdentity()
+            if (
+                nowEpochMillis() < deadline || active.timedBreakEnded ||
+                identity != null && identity.digest == observed.acknowledgedBreakEndDigest
+            ) {
+                return false
+            }
             return mutate { current ->
                 val latest = current.activeSession
+                val latestIdentity = current.authoritativeTimedBreakNotificationIdentity()
                 if (
                     latest == null || !latest.isPaused ||
-                    latest.pauseUntilEpochMillis != deadline || latest.timedBreakEnded
+                    latest.pauseUntilEpochMillis != deadline || latest.timedBreakEnded ||
+                    latestIdentity != null &&
+                    latestIdentity.digest == current.acknowledgedBreakEndDigest
                 ) {
                     current
                 } else {
@@ -339,6 +358,130 @@ class PlannerStore(
         val active = mutableState.value.activeSession ?: return false
         val deadline = active.pauseUntilEpochMillis ?: return false
         return active.isPaused && nowEpochMillis() >= deadline
+    }
+
+    /**
+     * Durably claims the exact delivery before any OS alert is attempted. This intentionally
+     * favors at-most-once alerts: process death after this receipt may lose a banner, but can never
+     * replay one whose external side effect was ambiguous. The in-app resolver is exposed in the
+     * same encrypted generation and remains the reliable fallback.
+     */
+    fun claimTimedBreakEndNotificationDelivery(
+        expectedDigest: String,
+    ): PlannerPersistenceReceipt? {
+        require(isTimedBreakNotificationDigest(expectedDigest))
+        var matched = false
+        val receipt = mutateDurably { current ->
+            val identity = current.authoritativeTimedBreakNotificationIdentity()
+            val active = current.activeSession
+            if (
+                identity?.digest != expectedDigest ||
+                active == null ||
+                nowEpochMillis() < identity.deadlineEpochMillis ||
+                current.lastBreakEndNotificationAttemptDigest == expectedDigest ||
+                current.acknowledgedBreakEndDigest == expectedDigest
+            ) {
+                current
+            } else {
+                matched = true
+                current.copy(
+                    activeSession = active.copy(
+                        timedBreakEnded = true,
+                        pauseLabel = "Break ended · choose what to do next",
+                    ),
+                    lastBreakEndNotificationAttemptDigest = expectedDigest,
+                )
+            }
+        }
+        return receipt.takeIf { matched }
+    }
+
+    /** Durably consumes one exact opaque tap without changing the authoritative execution lease. */
+    fun recordTimedBreakNotificationRouteConsumption(
+        expectedDigest: String,
+    ): PlannerPersistenceReceipt? {
+        require(isTimedBreakNotificationDigest(expectedDigest))
+        var matched = false
+        val receipt = mutateDurably { current ->
+            val identity = current.authoritativeTimedBreakNotificationIdentity()
+            val active = current.activeSession
+            if (
+                identity?.digest != expectedDigest || active?.timedBreakEnded != true ||
+                nowEpochMillis() < identity.deadlineEpochMillis ||
+                current.acknowledgedBreakEndDigest == expectedDigest ||
+                current.lastConsumedBreakEndNotificationDigest == expectedDigest
+            ) {
+                current
+            } else {
+                matched = true
+                current.copy(lastConsumedBreakEndNotificationDigest = expectedDigest)
+            }
+        }
+        return receipt.takeIf { matched }
+    }
+
+    /**
+     * Durably marks one stale opaque tap as processed without changing execution. The shared tap
+     * receipt is separate from exact consumption, so a stale intent can never erase proof that
+     * the current break was already handled.
+     */
+    fun recordTimedBreakNotificationRouteRejection(
+        expectedDigest: String,
+    ): PlannerPersistenceReceipt? {
+        require(isTimedBreakNotificationDigest(expectedDigest))
+        var matched = false
+        val receipt = mutateDurably { current ->
+            val identity = current.authoritativeTimedBreakNotificationIdentity()
+            val active = current.activeSession
+            val isExactEndedRoute = identity?.digest == expectedDigest &&
+                active?.timedBreakEnded == true &&
+                nowEpochMillis() >= identity.deadlineEpochMillis &&
+                current.acknowledgedBreakEndDigest != expectedDigest
+            if (
+                isExactEndedRoute ||
+                current.lastRejectedBreakEndNotificationDigest == expectedDigest
+            ) {
+                current
+            } else {
+                matched = true
+                current.copy(lastRejectedBreakEndNotificationDigest = expectedDigest)
+            }
+        }
+        return receipt.takeIf { matched }
+    }
+
+    /**
+     * Acknowledges only the exact ended break. The server lease remains paused, while durable
+     * notification/tap receipts prevent delayed work or process recreation from reopening it.
+     */
+    fun acknowledgeTimedBreakEnded(
+        expectedDigest: String,
+    ): PlannerPersistenceReceipt? {
+        require(isTimedBreakNotificationDigest(expectedDigest))
+        var matched = false
+        val receipt = mutateDurably { current ->
+            val identity = current.authoritativeTimedBreakNotificationIdentity()
+            val active = current.activeSession
+            if (
+                identity?.digest != expectedDigest || active?.timedBreakEnded != true ||
+                nowEpochMillis() < identity.deadlineEpochMillis ||
+                current.acknowledgedBreakEndDigest == expectedDigest
+            ) {
+                current
+            } else {
+                matched = true
+                current.copy(
+                    activeSession = active.copy(
+                        timedBreakEnded = false,
+                        pauseLabel = "Paused · break ended",
+                    ),
+                    lastBreakEndNotificationAttemptDigest = expectedDigest,
+                    lastConsumedBreakEndNotificationDigest = expectedDigest,
+                    acknowledgedBreakEndDigest = expectedDigest,
+                )
+            }
+        }
+        return receipt.takeIf { matched }
     }
 
     fun quickCapture(title: String, kind: ItemKind, isSensitive: Boolean = false): Boolean {
@@ -3541,6 +3684,10 @@ class PlannerStore(
             terminalExecutionOutcomes = emptyMap(),
             pendingExecutionCommand = null,
             pendingExecutionDeferIntent = null,
+            lastBreakEndNotificationAttemptDigest = null,
+            lastConsumedBreakEndNotificationDigest = null,
+            lastRejectedBreakEndNotificationDigest = null,
+            acknowledgedBreakEndDigest = null,
             unscheduledWork = emptyList(),
             occurrenceSeriesItemIds = emptyMap(),
             recurrenceOccurrenceSources = emptyMap(),
@@ -4968,12 +5115,14 @@ class PlannerStore(
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
+            .withInvalidTimedBreakNotificationAttemptAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot
         currentGeneration += 1
         scheduleCanonicalTrashCleanupLocked(snapshot)
 
         if (persistenceStatus != PersistenceStatus.READY) {
+            mutableDurableState.value = snapshot
             val receipt = if (requireExactSave) {
                 PlannerPersistenceReceipt(
                     generation = currentGeneration,
@@ -5025,6 +5174,7 @@ class PlannerStore(
                 .withPendingSensitivityHardened()
                 .withInvalidRecurrenceMoveSourcesAbandoned()
                 .withInvalidExecutionDeferIntentAbandoned()
+                .withInvalidTimedBreakNotificationAttemptAbandoned()
                 .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
             mutableState.value = snapshot
             currentGeneration += 1
@@ -5035,6 +5185,7 @@ class PlannerStore(
                 true
             } else {
                 persistedGeneration = currentGeneration
+                mutableDurableState.value = snapshot
                 false
             }
         }
@@ -5062,6 +5213,7 @@ class PlannerStore(
                 }
                 synchronized(persistenceLock) {
                     persistedGeneration = maxOf(persistedGeneration, request.generation)
+                    mutableDurableState.value = request.snapshot
                     request.completion?.complete(true)
                     if (
                         latestNormalSaveRequest?.generation?.let { it <= persistedGeneration } == true

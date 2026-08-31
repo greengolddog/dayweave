@@ -10,12 +10,28 @@ import com.greengolddog.dayweave.data.PlannerDatabaseFactory
 import com.greengolddog.dayweave.data.PlannerDatabaseMigrations
 import com.greengolddog.dayweave.data.PlannerSnapshotFormats
 import com.greengolddog.dayweave.data.RoomPlannerStateRepository
+import com.greengolddog.dayweave.model.ActiveSession
+import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.SuggestionDisposition
+import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
+import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationStateAccess
+import com.greengolddog.dayweave.notifications.TimedBreakDeliveryCompletion
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationDelivery
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationGateway
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationPostResult
+import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.security.KeyStore
+import java.time.Instant
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
@@ -101,6 +117,88 @@ class PlannerPersistenceTest {
         )
         val proposal = restored.inbox.first { it.source == InboxSource.EXTERNAL_PROPOSAL }
         assertTrue(proposal.requiresReview)
+    }
+
+    @Test
+    fun encryptedTimedBreakClaimSurvivesCloseAndReopenAndCannotPostAgain() = runBlocking {
+        cleanUp()
+        val passphrase = "dayweave-timed-break-claim-test".encodeToByteArray()
+        val deadline = Instant.now().minusSeconds(60).toEpochMilli()
+        val initial = timedBreakState(deadline)
+        var database = PlannerDatabaseFactory.create(
+            context,
+            RESTORE_DATABASE,
+            passphrase.copyOf(),
+        )
+        RoomPlannerStateRepository(database.plannerSnapshotDao()).save(initial)
+        val firstScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val digest: String
+        try {
+            val firstStore = PlannerStore(
+                initialState = DayWeaveUiState(),
+                repository = RoomPlannerStateRepository(database.plannerSnapshotDao()),
+                scope = firstScope,
+                nowEpochMillis = { deadline + 1L },
+            )
+            assertEquals(
+                PlannerLoadState.READY,
+                withTimeout(5_000) {
+                    firstStore.loadState.first { it != PlannerLoadState.LOADING }
+                },
+            )
+            digest = firstStore.state.value
+                .authoritativeTimedBreakNotificationIdentity()!!.digest
+            assertEquals(
+                com.greengolddog.dayweave.notifications.TimedBreakPreparation.READY,
+                PlannerTimedBreakNotificationStateAccess(firstStore) { deadline + 1L }
+                    .prepare(digest),
+            )
+            assertEquals(digest, firstStore.durableState.value
+                ?.lastBreakEndNotificationAttemptDigest)
+        } finally {
+            firstScope.cancel()
+            database.close()
+        }
+
+        database = PlannerDatabaseFactory.create(
+            context,
+            RESTORE_DATABASE,
+            passphrase.copyOf(),
+        )
+        val restartedScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        try {
+            val restartedStore = PlannerStore(
+                initialState = DayWeaveUiState(),
+                repository = RoomPlannerStateRepository(database.plannerSnapshotDao()),
+                scope = restartedScope,
+                nowEpochMillis = { deadline + 1L },
+            )
+            assertEquals(
+                PlannerLoadState.READY,
+                withTimeout(5_000) {
+                    restartedStore.loadState.first { it != PlannerLoadState.LOADING }
+                },
+            )
+            val gateway = CountingTimedBreakGateway()
+            assertEquals(
+                TimedBreakDeliveryCompletion.SUCCESS,
+                TimedBreakNotificationDelivery(
+                    stateAccess = PlannerTimedBreakNotificationStateAccess(restartedStore) {
+                        deadline + 1L
+                    },
+                    gateway = gateway,
+                ).deliver(digest),
+            )
+            assertEquals(0, gateway.posts)
+            assertEquals(digest, restartedStore.durableState.value
+                ?.lastBreakEndNotificationAttemptDigest)
+            assertTrue(restartedStore.state.value.activeSession!!.isPaused)
+            assertTrue(restartedStore.state.value.activeSession!!.timedBreakEnded)
+        } finally {
+            restartedScope.cancel()
+            database.close()
+            passphrase.fill(0)
+        }
     }
 
     @Test
@@ -369,4 +467,46 @@ class PlannerPersistenceTest {
         const val ANDROID_KEY_STORE = "AndroidKeyStore"
         val SQLITE_HEADER = "SQLite format 3\u0000".encodeToByteArray()
     }
+}
+
+private class CountingTimedBreakGateway : TimedBreakNotificationGateway {
+    var posts = 0
+
+    override fun post(identityDigest: String): TimedBreakNotificationPostResult {
+        posts += 1
+        return TimedBreakNotificationPostResult.POSTED
+    }
+
+    override fun cancel() = Unit
+}
+
+private fun timedBreakState(deadlineEpochMillis: Long): DayWeaveUiState {
+    val deadline = Instant.ofEpochMilli(deadlineEpochMillis).toString()
+    return DayWeaveUiState(
+        canonicalExecutionRevision = 7,
+        canonicalExecutionSession = CanonicalExecutionSessionSnapshot(
+            id = "11111111-1111-4111-8111-111111111111",
+            itemId = "22222222-2222-4222-8222-222222222222",
+            itemRevision = 2,
+            sessionIndex = 0,
+            plannedBlockId = "33333333-3333-4333-8333-333333333333",
+            sourceDeviceId = "44444444-4444-4444-8444-444444444444",
+            status = "paused",
+            revision = 3,
+            accumulatedSeconds = 300,
+            startedAt = Instant.ofEpochMilli(deadlineEpochMillis - 600_000L).toString(),
+            pausedAt = Instant.ofEpochMilli(deadlineEpochMillis - 300_000L).toString(),
+            pauseUntil = deadline,
+            createdAt = Instant.ofEpochMilli(deadlineEpochMillis - 600_000L).toString(),
+            updatedAt = Instant.ofEpochMilli(deadlineEpochMillis - 300_000L).toString(),
+        ),
+        activeSession = ActiveSession(
+            itemId = "33333333-3333-4333-8333-333333333333",
+            elapsedMinutes = 5,
+            isPaused = true,
+            accumulatedSeconds = 300,
+            pauseUntilEpochMillis = deadlineEpochMillis,
+            canonicalExecutionSessionId = "11111111-1111-4111-8111-111111111111",
+        ),
+    )
 }

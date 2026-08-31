@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">DayWeave</string>
+    <string name="timed_break_notification_channel_name">Break reminders</string>
+    <string name="timed_break_notification_channel_description">Reminders when a timed break has ended</string>
+    <string name="timed_break_notification_title">Break ended</string>
+    <string name="timed_break_notification_body">Open DayWeave to choose what happens next.</string>
 </resources>

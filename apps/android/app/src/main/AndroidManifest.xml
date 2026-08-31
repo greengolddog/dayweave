@@ -24,8 +24,15 @@
         android:theme="@style/Theme.DayWeave">
         <activity
             android:name=".MainActivity"
+            android:exported="false"
+            android:launchMode="singleTask" />
+
+        <!-- Public launch surface deliberately forwards no caller-controlled route metadata. -->
+        <activity
+            android:name=".DayWeaveLauncherActivity"
             android:exported="true"
-            android:launchMode="singleTask">
+            android:noHistory="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

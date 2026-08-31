@@ -19,6 +19,12 @@ import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationCoordinator
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteMailbox
+import com.greengolddog.dayweave.notifications.WorkManagerTimedBreakNotificationBackend
+import com.greengolddog.dayweave.notifications.cancelTimedBreakNotificationAndRestoreOnFailure
+import com.greengolddog.dayweave.notifications.ensureTimedBreakNotificationChannel
+import com.greengolddog.dayweave.notifications.reconcileTimedBreakNotificationStates
 import com.greengolddog.dayweave.security.AppAuthenticationProcessFence
 import com.greengolddog.dayweave.security.AppLockController
 import com.greengolddog.dayweave.security.AtomicFileAppLockSettingsStore
@@ -39,13 +45,22 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.mapNotNull
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.flow.MutableSharedFlow
 
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val canonicalActionGate = CanonicalActionGate()
 
     val appAuthenticationProcessFence = AppAuthenticationProcessFence()
+
+    /** Trusted notification routes survive lock/task/process boundaries without public extras. */
+    internal val timedBreakNotificationRoutes: TimedBreakNotificationRouteMailbox by lazy {
+        TimedBreakNotificationRouteMailbox(this)
+    }
 
     val appLockController: AppLockController by lazy {
         AppLockController(
@@ -101,8 +116,14 @@ class DayWeaveApplication : Application() {
                     ) {
                         return false
                     }
-                    val quarantined =
+                    if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
+                    val quarantined = try {
                         plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+                    } finally {
+                        // A failed quarantine restores the old durable lease's reminder; a
+                        // successful one confirms the cancellation against empty canonical state.
+                        reconcileTimedBreakNotificationAfterAuthoritativeTransition()
+                    }
                     if (quarantined) {
                         if (suggestionSyncManagerDelegate.isInitialized()) {
                             suggestionSyncManager.quarantineBindingState()
@@ -164,6 +185,10 @@ class DayWeaveApplication : Application() {
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpCanonicalPlannerTransport(),
+            cancelTimedBreakNotification =
+                ::cancelTimedBreakNotificationForAuthoritativeTransition,
+            reconcileTimedBreakNotification =
+                ::reconcileTimedBreakNotificationAfterAuthoritativeTransition,
         )
     }
     val canonicalSyncManager: CanonicalSyncManager get() = canonicalSyncManagerDelegate.value
@@ -173,6 +198,10 @@ class DayWeaveApplication : Application() {
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = OkHttpExecutionTransport(),
+            cancelTimedBreakNotification =
+                ::cancelTimedBreakNotificationForAuthoritativeTransition,
+            reconcileTimedBreakNotification =
+                ::reconcileTimedBreakNotificationAfterAuthoritativeTransition,
         )
     }
     val executionSyncManager: ExecutionSyncManager get() = executionSyncManagerDelegate.value
@@ -199,8 +228,45 @@ class DayWeaveApplication : Application() {
         )
     }
 
+    private val timedBreakNotificationCoordinator: TimedBreakNotificationCoordinator by lazy {
+        TimedBreakNotificationCoordinator(
+            backend = WorkManagerTimedBreakNotificationBackend(this),
+        )
+    }
+    private val timedBreakNotificationReconcileRequests = MutableSharedFlow<Unit>(
+        extraBufferCapacity = 1,
+    )
+
+    internal suspend fun cancelTimedBreakNotificationForAuthoritativeTransition(): Boolean =
+        cancelTimedBreakNotificationAndRestoreOnFailure(
+            coordinator = timedBreakNotificationCoordinator,
+            unchangedDurableState = plannerStore.durableState.value,
+            queueReconciliationRetry = {
+                timedBreakNotificationReconcileRequests.emit(Unit)
+            },
+        )
+
+    internal suspend fun reconcileTimedBreakNotificationAfterAuthoritativeTransition() {
+        val durable = plannerStore.durableState.value ?: return
+        if (!timedBreakNotificationCoordinator.reconcile(durable)) {
+            timedBreakNotificationReconcileRequests.emit(Unit)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
+        ensureTimedBreakNotificationChannel(this)
+        persistenceScope.launch {
+            reconcileTimedBreakNotificationStates(
+                durableStates = merge(
+                    plannerStore.durableState.filterNotNull(),
+                    timedBreakNotificationReconcileRequests.mapNotNull {
+                        plannerStore.durableState.value
+                    },
+                ),
+                coordinator = timedBreakNotificationCoordinator,
+            )
+        }
         persistenceScope.launch {
             deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
             suggestionSyncSchedulingCoordinator.onAppStart()

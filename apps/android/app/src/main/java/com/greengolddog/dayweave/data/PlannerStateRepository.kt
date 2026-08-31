@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.model.canonicalTrashItemBytes
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
 import com.greengolddog.dayweave.model.withPendingSensitivityHardened
+import com.greengolddog.dayweave.model.withInvalidTimedBreakNotificationAttemptAbandoned
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
@@ -54,17 +55,26 @@ class RoomPlannerStateRepository(
     private val nowEpochMillis: () -> Long = System::currentTimeMillis,
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
-        when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V8 -> {
+        val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V9 -> {
                 val decoded = decodeCurrentSnapshot(snapshot.payload)
                 if (SNAPSHOT_JSON.encodeToString(decoded) != snapshot.payload) save(decoded)
                 decoded
+            }
+            PlannerSnapshotFormats.JSON_V8 -> {
+                val migrated = decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requireTimedBreakNotificationFields = false,
+                ).withoutTimedBreakNotificationReceipts()
+                save(migrated)
+                migrated
             }
             PlannerSnapshotFormats.JSON_V7 -> {
                 val migrated = decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requirePublicationProofField = false,
-                ).copy(publishedScheduleProof = null)
+                    requireTimedBreakNotificationFields = false,
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -73,7 +83,8 @@ class RoomPlannerStateRepository(
                     payload = snapshot.payload,
                     requireCanonicalAuthoringFields = false,
                     requirePublicationProofField = false,
-                ).copy(publishedScheduleProof = null)
+                    requireTimedBreakNotificationFields = false,
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -83,12 +94,14 @@ class RoomPlannerStateRepository(
                     requireProposalApplicationFields = false,
                     requireCanonicalAuthoringFields = false,
                     requirePublicationProofField = false,
-                ).copy(publishedScheduleProof = null)
+                    requireTimedBreakNotificationFields = false,
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
             PlannerSnapshotFormats.JSON_V4 -> {
                 val migrated = decodeVersionFourSnapshot(snapshot.payload)
+                    .withoutTimedBreakNotificationReceipts()
                     .copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
@@ -97,7 +110,7 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     requireExistingSensitivity = true,
-                ).copy(publishedScheduleProof = null)
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -105,7 +118,7 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                ).copy(publishedScheduleProof = null)
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
@@ -113,17 +126,21 @@ class RoomPlannerStateRepository(
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                ).copy(publishedScheduleProof = null)
+                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
                 save(migrated)
                 migrated
             }
             else -> error("Unsupported planner snapshot format")
         }
+        val hardened = decoded.withInvalidTimedBreakNotificationAttemptAbandoned()
+        if (hardened != decoded) save(hardened)
+        hardened
     }
 
     override suspend fun save(state: DayWeaveUiState) {
         val referenceEpochMillis = nowEpochMillis()
         val retainedState = state.withCanonicalTrashRetention(referenceEpochMillis)
+            .withInvalidTimedBreakNotificationAttemptAbandoned()
         validateSchedulePublicationState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
@@ -132,7 +149,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V8,
+                payloadFormat = PlannerSnapshotFormats.JSON_V9,
             ),
         )
     }
@@ -142,13 +159,21 @@ class RoomPlannerStateRepository(
         requireProposalApplicationFields: Boolean = true,
         requireCanonicalAuthoringFields: Boolean = true,
         requirePublicationProofField: Boolean = true,
+        requireTimedBreakNotificationFields: Boolean = true,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
-        val root = if (requirePublicationProofField) {
+        val publicationSafeRoot = if (requirePublicationProofField) {
             parsedRoot
         } else {
             // Older format labels can never gain authority from an injected newer field.
             JsonObject(parsedRoot - "publishedScheduleProof")
+        }
+        val root = if (requireTimedBreakNotificationFields) {
+            publicationSafeRoot
+        } else {
+            // V8 and predecessors cannot acquire alert suppression or tap authority from fields
+            // introduced only by V9, even if a payload is relabeled or fields were injected.
+            JsonObject(publicationSafeRoot - TIMED_BREAK_NOTIFICATION_RECEIPT_FIELDS)
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -156,6 +181,12 @@ class RoomPlannerStateRepository(
         }
         if (requirePublicationProofField && !root.containsKey("publishedScheduleProof")) {
             throw SerializationException("Current exact schedule publication proof is required")
+        }
+        if (
+            requireTimedBreakNotificationFields &&
+            !root.keys.containsAll(TIMED_BREAK_NOTIFICATION_RECEIPT_FIELDS)
+        ) {
+            throw SerializationException("Current timed-break notification receipts are required")
         }
         if (
             requireProposalApplicationFields &&
@@ -205,6 +236,13 @@ class RoomPlannerStateRepository(
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
             }
     }
+
+    private fun DayWeaveUiState.withoutTimedBreakNotificationReceipts(): DayWeaveUiState = copy(
+        lastBreakEndNotificationAttemptDigest = null,
+        lastConsumedBreakEndNotificationDigest = null,
+        lastRejectedBreakEndNotificationDigest = null,
+        acknowledgedBreakEndDigest = null,
+    )
 
     /** V4 already required explicit sensitivity and an exact pending replacement target. */
     private fun decodeVersionFourSnapshot(payload: String): DayWeaveUiState {
@@ -723,6 +761,12 @@ class RoomPlannerStateRepository(
         const val PROPOSAL_APPLICATION_RECEIPT_VERSION = 1
         const val MAX_CANONICAL_AUTHORING_MUTATIONS = 100
         const val MAX_RECENTLY_DELETED = CanonicalTrashRetentionPolicy.MAX_ENTRIES
+        val TIMED_BREAK_NOTIFICATION_RECEIPT_FIELDS = setOf(
+            "lastBreakEndNotificationAttemptDigest",
+            "lastConsumedBreakEndNotificationDigest",
+            "lastRejectedBreakEndNotificationDigest",
+            "acknowledgedBreakEndDigest",
+        )
         val SNAPSHOT_JSON = Json {
             encodeDefaults = true
             ignoreUnknownKeys = false

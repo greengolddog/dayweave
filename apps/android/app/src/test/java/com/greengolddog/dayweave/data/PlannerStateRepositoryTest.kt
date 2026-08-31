@@ -53,7 +53,128 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV8() = runBlocking {
+    fun v8SnapshotWithoutNotificationReceiptsUpgradesToV9WithNoSuppressionAuthority() =
+        runBlocking {
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { 4 }
+            repository.save(DayWeaveUiState())
+            val current = requireNotNull(dao.snapshot)
+            val root = Json.parseToJsonElement(current.payload) as JsonObject
+            val legacyRoot = JsonObject(
+                root - setOf(
+                    "lastBreakEndNotificationAttemptDigest",
+                    "lastConsumedBreakEndNotificationDigest",
+                    "lastRejectedBreakEndNotificationDigest",
+                    "acknowledgedBreakEndDigest",
+                ),
+            )
+            dao.snapshot = current.copy(
+                payload = Json.encodeToString(JsonObject.serializer(), legacyRoot),
+                payloadFormat = PlannerSnapshotFormats.JSON_V8,
+                updatedAtEpochMillis = 3,
+            )
+
+            val restored = requireNotNull(repository.load())
+
+            assertEquals(null, restored.lastBreakEndNotificationAttemptDigest)
+            assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
+            assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
+            assertEquals(null, restored.acknowledgedBreakEndDigest)
+            assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
+            assertTrue(requireNotNull(dao.snapshot).payload.contains(
+                "\"lastBreakEndNotificationAttemptDigest\":null",
+            ))
+        }
+
+    @Test
+    fun v8AndPredecessorLabelsDiscardInjectedNotificationReceipts() = runBlocking {
+        val injectedDigest = "sha256:${"d".repeat(64)}"
+        listOf(
+            PlannerSnapshotFormats.JSON_V8,
+            PlannerSnapshotFormats.JSON_V7,
+        ).forEach { predecessorFormat ->
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { 6 }
+            repository.save(
+                DayWeaveUiState(
+                    lastBreakEndNotificationAttemptDigest = injectedDigest,
+                    lastConsumedBreakEndNotificationDigest = injectedDigest,
+                    lastRejectedBreakEndNotificationDigest = injectedDigest,
+                    acknowledgedBreakEndDigest = injectedDigest,
+                ),
+            )
+            dao.snapshot = requireNotNull(dao.snapshot).copy(payloadFormat = predecessorFormat)
+
+            val restored = requireNotNull(repository.load())
+
+            assertEquals(null, restored.lastBreakEndNotificationAttemptDigest)
+            assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
+            assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
+            assertEquals(null, restored.acknowledgedBreakEndDigest)
+            assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
+        }
+    }
+
+    @Test
+    fun v9MissingAnySafetyReceiptFailsClosedWithoutRewritingRollbackFixture() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 8 }
+        repository.save(DayWeaveUiState())
+        val current = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(current.payload) as JsonObject
+        val missingReceipt = current.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(root - "lastConsumedBreakEndNotificationDigest"),
+            ),
+            updatedAtEpochMillis = 7,
+        )
+        dao.snapshot = missingReceipt
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        assertEquals(missingReceipt, dao.snapshot)
+    }
+
+    @Test
+    fun malformedTimedBreakNotificationReceiptsAreDroppedIndependentlyAndRewritten() = runBlocking {
+        val validAttemptDigest = "sha256:${"a".repeat(64)}"
+        val validConsumedDigest = "sha256:${"b".repeat(64)}"
+        val validAcknowledgedDigest = "sha256:${"c".repeat(64)}"
+        val validRejectedDigest = "sha256:${"e".repeat(64)}"
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 5 }
+        repository.save(
+            DayWeaveUiState(
+                lastBreakEndNotificationAttemptDigest = validAttemptDigest,
+                lastConsumedBreakEndNotificationDigest = validConsumedDigest,
+                lastRejectedBreakEndNotificationDigest = validRejectedDigest,
+                acknowledgedBreakEndDigest = validAcknowledgedDigest,
+            ),
+        )
+        val stored = requireNotNull(dao.snapshot)
+        dao.snapshot = stored.copy(
+            payload = stored.payload
+                .replace(validAttemptDigest, "malformed-notification-attempt")
+                .replace(validRejectedDigest, "malformed-notification-rejection")
+                .replace(validAcknowledgedDigest, "malformed-notification-acknowledgement"),
+            updatedAtEpochMillis = 6,
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(null, restored.lastBreakEndNotificationAttemptDigest)
+        assertEquals(validConsumedDigest, restored.lastConsumedBreakEndNotificationDigest)
+        assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
+        assertEquals(null, restored.acknowledgedBreakEndDigest)
+        assertFalse(requireNotNull(dao.snapshot).payload.contains("malformed-notification"))
+        assertTrue(requireNotNull(dao.snapshot).payload.contains(validConsumedDigest))
+        assertEquals(5L, dao.snapshot?.updatedAtEpochMillis)
+    }
+
+    @Test
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV9() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -68,7 +189,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -106,7 +227,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -159,7 +280,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -372,7 +493,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -401,7 +522,7 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matches(restored.schedule.single()),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
 
         dao.snapshot = requireNotNull(dao.snapshot).copy(
             payload = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -470,7 +591,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(null, restored.publishedScheduleProof)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
@@ -540,7 +661,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -648,7 +769,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -672,7 +793,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V8, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 

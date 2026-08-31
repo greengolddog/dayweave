@@ -11,9 +11,13 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
+import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
+import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
+import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationRouteAccess
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteConsumption
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
@@ -25,6 +29,8 @@ import java.time.Instant
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -40,8 +46,14 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val energySignalManager = dayWeaveApplication.energySignalManager
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
     private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
+    private val timedBreakNotificationRouteAccess =
+        PlannerTimedBreakNotificationRouteAccess(plannerStore)
+    private val timedBreakNotificationPermissionRequestState =
+        TimedBreakNotificationPermissionRequestState()
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
+    val durableState: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState?> =
+        plannerStore.durableState
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
     val proposalApplicationState: StateFlow<ProposalApplicationState> =
@@ -52,6 +64,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
     val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
+    val timedBreakNotificationPermissionRequestDigest: StateFlow<String?> =
+        timedBreakNotificationPermissionRequestState.requestDigest
 
     init {
         viewModelScope.launch {
@@ -90,7 +104,14 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun pauseActive(minutes: Int? = null) {
         withActiveBlock(
             canonicalAction = { id ->
-                executionSyncManager.pause(id, minutes?.let { it * 60 })
+                val before = plannerStore.durableState.value
+                val outcome = executionSyncManager.pause(id, minutes?.let { it * 60 })
+                requestNotificationPermissionAfterDurableTimedPause(
+                    before = before,
+                    outcome = outcome,
+                    timedPauseRequested = minutes != null,
+                )
+                outcome
             },
             localAction = { plannerStore.pauseActive(minutes) },
         )
@@ -98,7 +119,16 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     fun pauseActiveUntil(until: Instant) {
         withActiveBlock(
-            canonicalAction = { id -> executionSyncManager.pause(id, pauseUntil = until) },
+            canonicalAction = { id ->
+                val before = plannerStore.durableState.value
+                val outcome = executionSyncManager.pause(id, pauseUntil = until)
+                requestNotificationPermissionAfterDurableTimedPause(
+                    before = before,
+                    outcome = outcome,
+                    timedPauseRequested = true,
+                )
+                outcome
+            },
             localAction = {
                 val minutes = java.time.Duration.between(Instant.now(), until).toMinutes()
                     .coerceIn(1L, 24L * 60L)
@@ -111,6 +141,31 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun resumeActive() {
         resumeActiveIfAvailable()
     }
+
+    internal suspend fun consumeTimedBreakNotificationRoute(
+        digest: String,
+    ): TimedBreakNotificationRouteConsumption = timedBreakNotificationRouteAccess.consume(digest)
+
+    suspend fun keepTimedBreakPaused(digest: String): Boolean {
+        if (!dayWeaveApplication.cancelTimedBreakNotificationForAuthoritativeTransition()) {
+            return false
+        }
+        return try {
+            val receipt = plannerStore.acknowledgeTimedBreakEnded(digest)
+            if (receipt != null && !receipt.awaitDurable()) return false
+            val durable = plannerStore.durableState.value ?: return false
+            durable.authoritativeTimedBreakNotificationIdentity()?.digest == digest &&
+                durable.acknowledgedBreakEndDigest == digest
+        } finally {
+            dayWeaveApplication.reconcileTimedBreakNotificationAfterAuthoritativeTransition()
+        }
+    }
+
+    fun takeTimedBreakNotificationPermissionRequest(digest: String): Boolean =
+        timedBreakNotificationPermissionRequestState.takeIfCurrent(
+            expectedDigest = digest,
+            durableState = plannerStore.durableState.value,
+        )
 
     private fun resumeActiveIfAvailable(): Boolean =
         withActiveBlock(
@@ -487,6 +542,25 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             plannerStore.state.value.pendingExecutionDeferIntent != null ||
             plannerStore.state.value.pendingProposalApplicationMutation != null
 
+    private suspend fun requestNotificationPermissionAfterDurableTimedPause(
+        before: DayWeaveUiState?,
+        outcome: ExecutionSyncOutcome,
+        timedPauseRequested: Boolean,
+    ) {
+        if (
+            shouldRequestPermissionAfterDurableTimedPause(
+                before = before,
+                after = plannerStore.durableState.value,
+                outcome = outcome,
+                timedPauseRequested = timedPauseRequested,
+            )
+        ) {
+            plannerStore.durableState.value?.authoritativeTimedBreakNotificationIdentity()
+                ?.digest
+                ?.let(timedBreakNotificationPermissionRequestState::offer)
+        }
+    }
+
     private suspend inline fun canonicalAuthoringAction(
         crossinline action: suspend () -> Boolean,
     ): Boolean {
@@ -505,6 +579,39 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             false
         }
     }
+}
+
+/** Activity-safe contextual one-shot state retained by the ViewModel across stop/lock/recreation. */
+internal class TimedBreakNotificationPermissionRequestState {
+    private val mutableRequestDigest = MutableStateFlow<String?>(null)
+    val requestDigest: StateFlow<String?> = mutableRequestDigest.asStateFlow()
+
+    fun offer(digest: String) {
+        require(isTimedBreakNotificationDigest(digest))
+        mutableRequestDigest.value = digest
+    }
+
+    fun takeIfCurrent(expectedDigest: String, durableState: DayWeaveUiState?): Boolean {
+        require(isTimedBreakNotificationDigest(expectedDigest))
+        if (!mutableRequestDigest.compareAndSet(expectedDigest, null)) return false
+        return durableState?.authoritativeTimedBreakNotificationIdentity()?.digest == expectedDigest
+    }
+}
+
+internal fun shouldRequestPermissionAfterDurableTimedPause(
+    before: DayWeaveUiState?,
+    after: DayWeaveUiState?,
+    outcome: ExecutionSyncOutcome,
+    timedPauseRequested: Boolean,
+): Boolean {
+    if (
+        !timedPauseRequested ||
+        outcome !in setOf(ExecutionSyncOutcome.SUCCESS, ExecutionSyncOutcome.RECOVERED_COMMAND)
+    ) {
+        return false
+    }
+    val afterIdentity = after?.authoritativeTimedBreakNotificationIdentity() ?: return false
+    return before?.authoritativeTimedBreakNotificationIdentity()?.digest != afterIdentity.digest
 }
 
 /** Local durability is success; synchronization is best-effort and remains manually retryable. */

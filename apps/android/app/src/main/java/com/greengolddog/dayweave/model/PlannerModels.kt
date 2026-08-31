@@ -933,6 +933,20 @@ data class DayWeaveUiState(
     val pendingExecutionCommand: PendingExecutionCommand? = null,
     /** User-level move request retained while Pause and Defer reconcile across process death. */
     val pendingExecutionDeferIntent: PendingExecutionDeferIntent? = null,
+    /**
+     * Opaque at-most-once claim for the most recent timed-break notification delivery.
+     *
+     * The digest binds only redacted execution identity/revision/deadline fields. Keeping it in
+     * the encrypted planner snapshot prevents a restored WorkManager job from repeatedly
+     * resurfacing the same break after delivery, an ambiguous platform failure, or process death.
+     */
+    val lastBreakEndNotificationAttemptDigest: String? = null,
+    /** Opaque encrypted consume-once receipt for the last exact notification tap handled. */
+    val lastConsumedBreakEndNotificationDigest: String? = null,
+    /** Separate opaque receipt for the last stale tap rejected without retargeting execution. */
+    val lastRejectedBreakEndNotificationDigest: String? = null,
+    /** Exact encrypted acknowledgement that this ended break should remain paused without nagging. */
+    val acknowledgedBreakEndDigest: String? = null,
     /** Random device identity generated once and retained only inside encrypted planner state. */
     val executionDeviceId: String? = null,
     val unscheduledWork: List<UnscheduledWorkSnapshot> = emptyList(),

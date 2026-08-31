@@ -1023,7 +1023,16 @@ class CanonicalSyncManagerTest {
             )
             previewResult = preview()
         }
-        val manager = manager(plannerStore, transport)
+        val barrierEvents = mutableListOf<String>()
+        val manager = manager(
+            plannerStore = plannerStore,
+            transport = transport,
+            cancelTimedBreakNotification = {
+                barrierEvents += "cancel"
+                true
+            },
+            reconcileTimedBreakNotification = { barrierEvents += "reconcile" },
+        )
         assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
         assertTrue(plannerStore.state.value.canonicalItems.isNotEmpty())
 
@@ -1034,10 +1043,49 @@ class CanonicalSyncManagerTest {
         ) { changed = true }
 
         assertTrue(changed)
+        assertEquals(listOf("cancel", "reconcile"), barrierEvents)
         assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
         assertTrue(plannerStore.state.value.schedule.isEmpty())
         assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
         assertEquals(null, plannerStore.state.value.canonicalExecutionSyncOrigin)
+    }
+
+    @Test
+    fun failedNotificationCancellationBlocksCredentialRotationBeforeQuarantine() = runBlocking {
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                changes = listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                nextCursor = "cursor-1",
+                hasMore = false,
+            )
+            previewResult = preview()
+        }
+        val barrierEvents = mutableListOf<String>()
+        val manager = manager(
+            plannerStore = plannerStore,
+            transport = transport,
+            cancelTimedBreakNotification = {
+                barrierEvents += "cancel-failed"
+                false
+            },
+            reconcileTimedBreakNotification = { barrierEvents += "reconcile" },
+        )
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+        val before = plannerStore.state.value
+        var changed = false
+
+        val failure = runCatching {
+            manager.withConfigurationUpdateLock(
+                requestedBaseUrl = "https://api.example.test/",
+                bearerToken = "replacement-secret",
+            ) { changed = true }
+        }.exceptionOrNull()
+
+        assertTrue(failure != null)
+        assertFalse(changed)
+        assertEquals(before, plannerStore.state.value)
+        assertEquals(listOf("cancel-failed"), barrierEvents)
     }
 
     @Test
@@ -3636,12 +3684,16 @@ class CanonicalSyncManagerTest {
         transport: FakeCanonicalTransport,
         credentialStore: ApiCredentialStore = CanonicalCredentialStore(),
         currentInstant: Instant = clock,
+        cancelTimedBreakNotification: suspend () -> Boolean = { true },
+        reconcileTimedBreakNotification: suspend () -> Unit = {},
     ) = CanonicalSyncManager(
         plannerStore = plannerStore,
         credentialStore = credentialStore,
         transport = transport,
         now = { currentInstant },
         zoneId = { ZoneId.of("Europe/Madrid") },
+        cancelTimedBreakNotification = cancelTimedBreakNotification,
+        reconcileTimedBreakNotification = reconcileTimedBreakNotification,
     )
 
     private suspend fun assertTerminalExecutionProjects(

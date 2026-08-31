@@ -44,6 +44,8 @@ object PlannerSnapshotFormats {
     const val JSON_V6 = "json-v6-proposal-application-journal"
     const val JSON_V7 = "json-v7-canonical-authoring"
     const val JSON_V8 = "json-v8-exact-schedule-publication-proof"
+    /** Encrypted-payload-only fence for exact timed-break delivery/tap/acknowledgement receipts. */
+    const val JSON_V9 = "json-v9-timed-break-notification-receipts"
 }
 
 @Database(

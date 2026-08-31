@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingExecutionCommand
 import com.greengolddog.dayweave.model.PendingExecutionDeferIntent
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
@@ -26,12 +27,14 @@ import java.time.Instant
 import java.time.temporal.ChronoUnit
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -73,6 +76,8 @@ class ExecutionSyncManager(
     private val transport: ExecutionTransport,
     private val now: () -> Instant = Instant::now,
     private val newUuid: () -> UUID = UUID::randomUUID,
+    private val cancelTimedBreakNotification: suspend () -> Boolean = { true },
+    private val reconcileTimedBreakNotification: suspend () -> Unit = {},
 ) {
     private val operationMutex = Mutex()
     private val mutableState = MutableStateFlow(initialState())
@@ -111,14 +116,20 @@ class ExecutionSyncManager(
                 configuration.withBindingOperation {
                     ensureDeviceIdentity()
                     beginHistoryVerification(configuration)
-                    if (plannerStore.state.value.pendingExecutionCommand != null) {
-                        reconcilePending(configuration)
+                    val pending = plannerStore.state.value.pendingExecutionCommand
+                    val pendingNeedsNotificationBarrier =
+                        pending != null && pending.commandType != "start"
+                    withTimedBreakNotificationBarrier(
+                        required = pendingNeedsNotificationBarrier,
+                    ) {
+                        if (pending != null) reconcilePending(configuration)
+                        reconcileSnapshot(
+                            configuration,
+                            transport.snapshot(configuration),
+                            "Execution is synchronized across devices",
+                            notificationBarrierAlreadyHeld = pendingNeedsNotificationBarrier,
+                        )
                     }
-                    reconcileSnapshot(
-                        configuration,
-                        transport.snapshot(configuration),
-                        "Execution is synchronized across devices",
-                    )
                     updateConnected("Execution is synchronized across devices")
                     ExecutionSyncOutcome.SUCCESS
                 }
@@ -582,14 +593,20 @@ class ExecutionSyncManager(
                 configuration.withBindingOperation {
                     ensureDeviceIdentity()
                     beginHistoryVerification(configuration)
-                    if (plannerStore.state.value.pendingExecutionCommand != null) {
-                        reconcilePending(configuration)
+                    val pending = plannerStore.state.value.pendingExecutionCommand
+                    val pendingNeedsNotificationBarrier =
+                        pending != null && pending.commandType != "start"
+                    val snapshot = withTimedBreakNotificationBarrier(
+                        required = pendingNeedsNotificationBarrier,
+                    ) {
+                        if (pending != null) reconcilePending(configuration)
+                        reconcileSnapshot(
+                            configuration,
+                            transport.snapshot(configuration),
+                            "Paused execution lease checked before move assessment",
+                            notificationBarrierAlreadyHeld = pendingNeedsNotificationBarrier,
+                        )
                     }
-                    val snapshot = reconcileSnapshot(
-                        configuration,
-                        transport.snapshot(configuration),
-                        "Paused execution lease checked before move assessment",
-                    )
                     val paused = snapshot.activeSession
                         ?: throw InvalidExecutionStateException(
                             "The paused execution lease is no longer active.",
@@ -855,6 +872,21 @@ class ExecutionSyncManager(
         )
     }
 
+    private suspend fun <T> withTimedBreakNotificationBarrier(
+        required: Boolean,
+        transition: suspend () -> T,
+    ): T {
+        if (!required) return transition()
+        if (!cancelTimedBreakNotification()) throw LocalExecutionStorageException()
+        return try {
+            transition()
+        } finally {
+            // A failed or rejected transition must restore the unchanged durable reminder; a
+            // successful one reconciles cancellation against the replacement/closed lease.
+            withContext(NonCancellable) { reconcileTimedBreakNotification() }
+        }
+    }
+
     private suspend fun command(
         blockId: String,
         build: (CommandContext) -> CommandSpec,
@@ -866,13 +898,20 @@ class ExecutionSyncManager(
                 configuration.withBindingOperation {
                 ensureDeviceIdentity()
                 beginHistoryVerification(configuration)
-                if (plannerStore.state.value.pendingExecutionCommand != null) {
-                    reconcilePending(configuration)
-                    reconcileSnapshot(
-                        configuration,
-                        transport.snapshot(configuration),
-                        "Previous execution command reconciled",
-                    )
+                val existingPending = plannerStore.state.value.pendingExecutionCommand
+                if (existingPending != null) {
+                    val pendingNeedsNotificationBarrier = existingPending.commandType != "start"
+                    withTimedBreakNotificationBarrier(
+                        required = pendingNeedsNotificationBarrier,
+                    ) {
+                        reconcilePending(configuration)
+                        reconcileSnapshot(
+                            configuration,
+                            transport.snapshot(configuration),
+                            "Previous execution command reconciled",
+                            notificationBarrierAlreadyHeld = pendingNeedsNotificationBarrier,
+                        )
+                    }
                     updateConnected("Previous execution command reconciled; review state before retrying")
                     return@withBindingOperation ExecutionSyncOutcome.SUCCESS
                 }
@@ -908,32 +947,36 @@ class ExecutionSyncManager(
                     focusedBlockId = spec.focusedBlockId,
                     startedAt = now().toString(),
                 )
-                val staged = plannerStore.stageExecutionCommand(pending)
-                if (staged == null || !staged.awaitDurable()) throw LocalExecutionStorageException()
-                updateBusy("Applying ${spec.type} across devices…")
-                try {
-                    applyPending(configuration, pending)
-                } catch (error: ExecutionApiException.Conflict) {
-                    reconcileRejectedCommand(
-                        configuration,
-                        pending,
-                        ExecutionSyncOutcome.CONFLICT,
-                        "Execution changed on another device; authoritative state was restored.",
-                    )
-                } catch (error: ExecutionApiException.NotFound) {
-                    reconcileRejectedCommand(
-                        configuration,
-                        pending,
-                        ExecutionSyncOutcome.NOT_FOUND,
-                        "The item or session no longer exists; authoritative state was restored.",
-                    )
-                } catch (error: ExecutionApiException.Validation) {
-                    reconcileRejectedCommand(
-                        configuration,
-                        pending,
-                        ExecutionSyncOutcome.VALIDATION_FAILURE,
-                        "The command was rejected; authoritative execution state was restored.",
-                    )
+                withTimedBreakNotificationBarrier(required = spec.type != "start") {
+                    val staged = plannerStore.stageExecutionCommand(pending)
+                    if (staged == null || !staged.awaitDurable()) {
+                        throw LocalExecutionStorageException()
+                    }
+                    updateBusy("Applying ${spec.type} across devices…")
+                    try {
+                        applyPending(configuration, pending)
+                    } catch (error: ExecutionApiException.Conflict) {
+                        reconcileRejectedCommand(
+                            configuration,
+                            pending,
+                            ExecutionSyncOutcome.CONFLICT,
+                            "Execution changed on another device; authoritative state was restored.",
+                        )
+                    } catch (error: ExecutionApiException.NotFound) {
+                        reconcileRejectedCommand(
+                            configuration,
+                            pending,
+                            ExecutionSyncOutcome.NOT_FOUND,
+                            "The item or session no longer exists; authoritative state was restored.",
+                        )
+                    } catch (error: ExecutionApiException.Validation) {
+                        reconcileRejectedCommand(
+                            configuration,
+                            pending,
+                            ExecutionSyncOutcome.VALIDATION_FAILURE,
+                            "The command was rejected; authoritative execution state was restored.",
+                        )
+                    }
                 }
                 updateConnected("Execution updated across devices")
                 ExecutionSyncOutcome.SUCCESS
@@ -1064,21 +1107,39 @@ class ExecutionSyncManager(
         configuration: AuthenticatedApiConfiguration,
         initialSnapshot: RemoteExecutionSnapshot,
         message: String,
+        notificationBarrierAlreadyHeld: Boolean = false,
     ): RemoteExecutionSnapshot {
         val stable = readStableHistory(configuration, initialSnapshot)
         val continuityVerified = validateHistoryAgainstDurableState(configuration, stable)
-        reconcileClosedHistoryRows(configuration, stable, excludedSessionId = null, message)
-        val receipt = plannerStore.reconcileCanonicalExecution(
-            syncOrigin = configuration.baseUrl.toString(),
-            configurationId = configuration.configurationId,
-            revision = stable.snapshot.revision,
-            activeSession = stable.snapshot.activeSession?.toSnapshot(),
-            message = message,
-        )
-        if (receipt == null || !receipt.awaitDurable()) throw LocalExecutionStorageException()
-        persistHistoryWindow(configuration, stable, continuityVerified, message)
-        if (!continuityVerified) throw ExecutionHistoryContinuityException()
-        return stable.snapshot
+        val currentTimedBreak = plannerStore.durableState.value
+            ?.authoritativeTimedBreakNotificationIdentity()
+        val remote = stable.snapshot.activeSession
+        val exactTimedBreakSurvives = currentTimedBreak != null &&
+            stable.snapshot.revision == currentTimedBreak.executionRevision &&
+            remote?.status == "paused" && remote.id == currentTimedBreak.sessionId &&
+            remote.revision == currentTimedBreak.sessionRevision &&
+            remote.pauseUntil?.let { raw ->
+                runCatching { Instant.parse(raw).toEpochMilli() }.getOrNull()
+            } == currentTimedBreak.deadlineEpochMillis
+        return withTimedBreakNotificationBarrier(
+            required = !notificationBarrierAlreadyHeld &&
+                currentTimedBreak != null && !exactTimedBreakSurvives,
+        ) {
+            reconcileClosedHistoryRows(configuration, stable, excludedSessionId = null, message)
+            val receipt = plannerStore.reconcileCanonicalExecution(
+                syncOrigin = configuration.baseUrl.toString(),
+                configurationId = configuration.configurationId,
+                revision = stable.snapshot.revision,
+                activeSession = remote?.toSnapshot(),
+                message = message,
+            )
+            if (receipt == null || !receipt.awaitDurable()) {
+                throw LocalExecutionStorageException()
+            }
+            persistHistoryWindow(configuration, stable, continuityVerified, message)
+            if (!continuityVerified) throw ExecutionHistoryContinuityException()
+            stable.snapshot
+        }
     }
 
     private suspend fun reconcileClosedHistoryRows(
@@ -1502,9 +1563,11 @@ class ExecutionSyncManager(
             if (plannerStore.hasCredentialReplacementBlocker()) {
                 throw ConfigurationChangedException()
             }
-            val quarantine = plannerStore.abandonCanonicalConnection()
-            if (quarantine == null || !quarantine.awaitDurable()) {
-                throw LocalExecutionStorageException()
+            withTimedBreakNotificationBarrier(required = true) {
+                val quarantine = plannerStore.abandonCanonicalConnection()
+                if (quarantine == null || !quarantine.awaitDurable()) {
+                    throw LocalExecutionStorageException()
+                }
             }
         }
         val receipt = plannerStore.markCanonicalExecutionHistoryUnverified(

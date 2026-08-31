@@ -65,12 +65,14 @@ import java.time.format.DateTimeFormatter
 import java.util.UUID
 import kotlin.math.ceil
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonNull
@@ -134,6 +136,8 @@ class CanonicalSyncManager(
     private val dayStartMinute: Int = DEFAULT_DAY_START_MINUTE,
     private val dayEndMinute: Int = DEFAULT_DAY_END_MINUTE,
     private val newPublicationIdempotencyKey: () -> String = { UUID.randomUUID().toString() },
+    private val cancelTimedBreakNotification: suspend () -> Boolean = { true },
+    private val reconcileTimedBreakNotification: suspend () -> Unit = {},
 ) {
     private val operationMutex = Mutex()
     private val focusTransitionMutex = Mutex()
@@ -144,6 +148,17 @@ class CanonicalSyncManager(
         ignoreUnknownKeys = false
     }
     val state: StateFlow<CanonicalSyncState> = mutableState.asStateFlow()
+
+    private suspend fun <T> withTimedBreakNotificationBarrier(
+        transition: suspend () -> T,
+    ): T {
+        if (!cancelTimedBreakNotification()) throw LocalPlannerStorageException()
+        return try {
+            transition()
+        } finally {
+            withContext(NonCancellable) { reconcileTimedBreakNotification() }
+        }
+    }
 
     /** Called only while the process-wide binding writer excludes every old response mutation. */
     internal fun quarantineBindingState() {
@@ -175,7 +190,9 @@ class CanonicalSyncManager(
         clearCredentials: suspend () -> Boolean,
     ): Boolean = operationMutex.withLock {
         if (!cancelBackgroundWork()) return@withLock false
-        val quarantined = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+        val quarantined = withTimedBreakNotificationBarrier {
+            plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+        }
         if (!quarantined) {
             updateError("Encrypted canonical state could not be quarantined; credentials were kept.")
             throw CanonicalAbandonmentPersistenceException()
@@ -243,7 +260,9 @@ class CanonicalSyncManager(
             connection.baseUrl != null || connection.hasBearerToken ||
             hasCredentialBoundPlannerState
         ) {
-            val durable = plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+            val durable = withTimedBreakNotificationBarrier {
+                plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
+            }
             if (!durable) {
                 updateError(
                     "Encrypted canonical state could not be quarantined; the old bearer token was kept.",
@@ -3208,8 +3227,10 @@ class CanonicalSyncManager(
         if (plannerStore.hasCredentialReplacementBlocker()) {
             throw CanonicalConfigurationChangedException()
         }
-        val receipt = plannerStore.abandonCanonicalConnection()
-        if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+        withTimedBreakNotificationBarrier {
+            val receipt = plannerStore.abandonCanonicalConnection()
+            if (receipt == null || !receipt.awaitDurable()) throw LocalPlannerStorageException()
+        }
     }
 
     private fun parseJsonObject(raw: String): JsonObject = JsonObjectParser.parse(raw)

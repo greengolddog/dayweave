@@ -1,16 +1,30 @@
 package com.greengolddog.dayweave
 
 import android.content.ActivityNotFoundException
+import android.app.NotificationManager
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import android.view.Window
 import android.view.WindowManager
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteMailbox
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationSystemState
+import com.greengolddog.dayweave.notifications.TimedBreakReminderEnableAction
+import com.greengolddog.dayweave.notifications.TIMED_BREAK_NOTIFICATION_CHANNEL_ID
+import com.greengolddog.dayweave.notifications.timedBreakReminderSystemEnableAction
+import com.greengolddog.dayweave.notifications.admitTrustedTimedBreakRouteAndSanitizeMainIntent
 import com.greengolddog.dayweave.security.AndroidBiometricAppUnlockAuthenticator
 import com.greengolddog.dayweave.security.AppLockController
 import com.greengolddog.dayweave.security.AppLockIntents
@@ -21,6 +35,8 @@ import com.greengolddog.dayweave.ui.DayWeaveApp
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
@@ -28,6 +44,18 @@ class MainActivity : FragmentActivity() {
     private lateinit var appUnlockCoordinator: AppUnlockCoordinator
     private var backgroundLockJob: Job? = null
     private var autoPromptPending = false
+    private val timedBreakNotificationRoutes: TimedBreakNotificationRouteMailbox
+        get() = (application as DayWeaveApplication).timedBreakNotificationRoutes
+    private val mutableTimedBreakNotificationSystemState =
+        MutableStateFlow(TimedBreakNotificationSystemState.ENABLED)
+    private val timedBreakNotificationSystemState =
+        mutableTimedBreakNotificationSystemState.asStateFlow()
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        // Denial intentionally leaves the in-app break-ended resolution path unchanged.
+        refreshTimedBreakNotificationSystemState()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +65,16 @@ class MainActivity : FragmentActivity() {
             authenticator = AndroidBiometricAppUnlockAuthenticator(this),
             processFence = (application as DayWeaveApplication).appAuthenticationProcessFence,
         )
+        // MainActivity is non-exported. The launcher never forwards extras, so a valid route here
+        // is the app-created immutable notification PendingIntent capability.
+        setIntent(
+            admitTrustedTimedBreakRouteAndSanitizeMainIntent(
+                context = this,
+                candidate = intent,
+                mailbox = timedBreakNotificationRoutes,
+            ),
+        )
+        refreshTimedBreakNotificationSystemState()
         AppLockWindowSecurity.apply(window, appLockController.state.value)
         lifecycleScope.launch {
             appLockController.state.collectLatest { state ->
@@ -48,6 +86,10 @@ class MainActivity : FragmentActivity() {
         }
         enableEdgeToEdge()
         setContent {
+            val timedBreakRouteDigest =
+                timedBreakNotificationRoutes.pendingDigest.collectAsStateWithLifecycle().value
+            val timedBreakSystemState =
+                timedBreakNotificationSystemState.collectAsStateWithLifecycle().value
             DayWeaveApp(
                 appLockController = appLockController,
                 onRequestUnlock = appUnlockCoordinator::requestUnlock,
@@ -67,8 +109,27 @@ class MainActivity : FragmentActivity() {
                     appLockController.lockNow()
                 },
                 onOpenDeviceSecuritySettings = ::openDeviceSecuritySettings,
+                timedBreakNotificationRouteDigest = timedBreakRouteDigest,
+                onTimedBreakNotificationRouteConsumed = { consumedDigest ->
+                    timedBreakNotificationRoutes.consume(consumedDigest)
+                },
+                onRequestTimedBreakNotificationPermission =
+                    ::requestTimedBreakNotificationPermission,
+                timedBreakNotificationSystemState = timedBreakSystemState,
+                onEnableTimedBreakReminders = ::enableTimedBreakReminders,
             )
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(
+            admitTrustedTimedBreakRouteAndSanitizeMainIntent(
+                context = this,
+                candidate = intent,
+                mailbox = timedBreakNotificationRoutes,
+            ),
+        )
     }
 
     override fun onStart() {
@@ -96,6 +157,12 @@ class MainActivity : FragmentActivity() {
                 appUnlockCoordinator.requestUnlock()
             }
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Permission results and settings screens can both change app/channel state while paused.
+        refreshTimedBreakNotificationSystemState()
     }
 
     override fun onStop() {
@@ -131,7 +198,102 @@ class MainActivity : FragmentActivity() {
             }
         }
     }
+
+    private fun requestTimedBreakNotificationPermission() {
+        refreshTimedBreakNotificationSystemState()
+        val systemState = timedBreakNotificationSystemState.value
+        if (
+            shouldRequestTimedBreakNotificationPermission(
+                sdkInt = Build.VERSION.SDK_INT,
+                permissionGranted = systemState.runtimePermissionGranted,
+                permissionPreviouslyRequested =
+                    systemState.runtimePermissionPreviouslyRequested,
+            )
+        ) {
+            launchTimedBreakNotificationPermissionRequest()
+        }
+    }
+
+    private fun enableTimedBreakReminders() {
+        refreshTimedBreakNotificationSystemState()
+        when (
+            timedBreakReminderSystemEnableAction(
+                sdkInt = Build.VERSION.SDK_INT,
+                systemState = timedBreakNotificationSystemState.value,
+            )
+        ) {
+            TimedBreakReminderEnableAction.REQUEST_RUNTIME_PERMISSION ->
+                launchTimedBreakNotificationPermissionRequest()
+            TimedBreakReminderEnableAction.OPEN_NOTIFICATION_SETTINGS ->
+                openTimedBreakNotificationSettings()
+            TimedBreakReminderEnableAction.NONE -> Unit
+        }
+    }
+
+    private fun launchTimedBreakNotificationPermissionRequest() {
+        getSharedPreferences(NOTIFICATION_PERMISSION_PREFERENCES, MODE_PRIVATE)
+            .edit()
+            .putBoolean(NOTIFICATION_PERMISSION_REQUESTED_KEY, true)
+            .apply()
+        mutableTimedBreakNotificationSystemState.value =
+            timedBreakNotificationSystemState.value.copy(
+                runtimePermissionPreviouslyRequested = true,
+            )
+        notificationPermissionLauncher.launch(POST_NOTIFICATIONS_PERMISSION)
+    }
+
+    private fun refreshTimedBreakNotificationSystemState() {
+        val permissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, POST_NOTIFICATIONS_PERMISSION) ==
+            PackageManager.PERMISSION_GRANTED
+        val manager = getSystemService(NotificationManager::class.java)
+        val channelEnabled = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            manager?.getNotificationChannel(TIMED_BREAK_NOTIFICATION_CHANNEL_ID)
+                ?.importance
+                ?.let { it != NotificationManager.IMPORTANCE_NONE }
+                ?: true
+        } else {
+            true
+        }
+        mutableTimedBreakNotificationSystemState.value = TimedBreakNotificationSystemState(
+            runtimePermissionGranted = permissionGranted,
+            appNotificationsEnabled = NotificationManagerCompat.from(this)
+                .areNotificationsEnabled(),
+            channelEnabled = channelEnabled,
+            runtimePermissionPreviouslyRequested = getSharedPreferences(
+                NOTIFICATION_PERMISSION_PREFERENCES,
+                MODE_PRIVATE,
+            ).getBoolean(NOTIFICATION_PERMISSION_REQUESTED_KEY, false),
+        )
+    }
+
+    private fun openTimedBreakNotificationSettings() {
+        val channelIntent = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+            .putExtra(Settings.EXTRA_CHANNEL_ID, TIMED_BREAK_NOTIFICATION_CHANNEL_ID)
+        val appIntent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+            .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        val detailsIntent = Intent(
+            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            Uri.parse("package:$packageName"),
+        )
+        listOf(channelIntent, appIntent, detailsIntent).firstOrNull { candidate ->
+            try {
+                startActivity(candidate)
+                true
+            } catch (_: ActivityNotFoundException) {
+                false
+            }
+        }
+    }
 }
+
+internal fun shouldRequestTimedBreakNotificationPermission(
+    sdkInt: Int,
+    permissionGranted: Boolean,
+    permissionPreviouslyRequested: Boolean = false,
+): Boolean = sdkInt >= Build.VERSION_CODES.TIRAMISU && !permissionGranted &&
+    !permissionPreviouslyRequested
 
 /**
  * Arms the one-shot convenience prompt only for an idle cold/timeout/recovery lock.
@@ -153,6 +315,11 @@ private val AUTO_PROMPT_SUPPRESSING_NOTICES = setOf(
     AppLockNotice.AUTHENTICATION_LOCKED_OUT,
     AppLockNotice.AUTHENTICATION_ERROR,
 )
+
+private const val POST_NOTIFICATIONS_PERMISSION = "android.permission.POST_NOTIFICATIONS"
+private const val NOTIFICATION_PERMISSION_PREFERENCES =
+    "dayweave-timed-break-notification-permission"
+private const val NOTIFICATION_PERMISSION_REQUESTED_KEY = "runtime-permission-requested"
 
 /** One production seam for both the state predicate and the actual Window mutation. */
 internal object AppLockWindowSecurity {

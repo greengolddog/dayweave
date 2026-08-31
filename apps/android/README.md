@@ -26,7 +26,59 @@ Before constructing or persisting that journal, Android caps the exact UTF-8 pub
 headroom below the server's 16 MiB request limit; 12 MiB is accepted and even one additional byte
 is rejected locally without staging durable publication state.
 
-A timed break never resumes automatically. When its server deadline passes, the explicit Resume / Extend 10m / Keep paused choice appears. Keep paused closes the message without inventing a server mutation, and extending sends another revision-guarded pause command while the lease stays paused.
+A timed break never resumes automatically. When its server deadline passes, the explicit Resume / Extend 10m / Keep paused choice appears. Keep paused durably acknowledges that exact break in the encrypted planner state without inventing a server mutation, cancels its delayed reminder, and survives restart; a later lease revision or deadline is a new break. Extending sends another revision-guarded pause command while the lease stays paused.
+
+Canonical timed pauses also schedule one background WorkManager reminder from
+the last planner generation confirmed written to SQLCipher. Work input, tags,
+notification metadata, and the immutable one-shot tap intent contain only a
+domain-separated SHA-256 identity; the title and body are fixed generic text
+with no task title, notes, raw item/session identifier, or mutation action. At
+delivery, the worker reopens the encrypted store, requires the exact still-
+paused lease/revision/deadline, and atomically persists both the existing
+resolution UI and an at-most-once delivery claim before calling Android's
+notification service. Process death after that claim can lose the convenience
+banner, but never replays an ambiguous alert; the in-app resolver remains the
+reliable fallback. Permanent or ambiguous platform post failures are terminal,
+and the pre-claim early-clock retry is bounded. Resume, completion, skip, defer,
+Keep paused, lease replacement, and credential quarantine use an awaited
+cancellation barrier before their destructive transition, then reconcile the
+durable reminder again on success or failure. Enqueue and cancellation
+operations are awaited, and a process-wide side-effect gate joins any already-
+running post before the final fixed-ID cancellation returns; a cold process
+retains an already active exact job, while a transient scheduler failure leaves
+the same encrypted generation eligible for reconciliation retry. Android 13
+and newer request notification permission only after the server has confirmed
+and durably persisted a new canonical timed pause (including Extend), never for
+a device-local/noncanonical pause. The contextual one-shot request remains in
+ViewModel state across stop, app lock, and Activity recreation until a resumed,
+unlocked UI revalidates it. If the process dies first, the same encrypted future-
+break truth produces a visible **Enable reminders** affordance; a prior denial
+or disabled channel routes explicitly to Android notification settings and is
+never auto-prompted on launch. Denial or a disabled channel never blocks the
+pause or causes a retry loop.
+
+The notification service synchronously commits an app-private, opaque issued-
+route capability before posting the banner. Its immutable one-shot PendingIntent
+targets the non-exported `MainActivity` directly. The only exported launcher is
+a no-history boundary that constructs a fresh `ACTION_MAIN` intent and forwards
+none of a caller's action, data, categories, clip data, flags, or extras. On a
+real tap, `MainActivity` atomically moves the issued digest into a private durable
+mailbox before composition and immediately replaces its own stored intent with a
+route-free value. This retains the tap across process restore and app lock while
+preventing another installed app, Activity recreation, or an old task-base intent
+from forging/replaying it. The encrypted planner receipt then revalidates both
+durable and live exact lease truth before the mailbox is cleared. A stale alert
+cannot surface a newer break: it leaves a generic changed-reminder fence until
+the user explicitly chooses **Review current break** or **Not now**, and a failed
+mailbox clear leaves that choice retryable. Resume and Extend keep the resolver
+visible until authoritative state actually changes, and no path auto-resumes.
+
+WorkManager timing is OS best-effort and may be delayed by Doze. Final
+acceptance on the target Pixel must cover permission grant/denial, process
+death, reboot, Doze delivery, lock/unlock tap routing, launcher/Recents behavior,
+and real banner/sound appearance. A resume performed on another device can cancel this reminder only
+after Android receives that newer lease; near-real-time background execution
+updates remain part of the separate push-sync requirement.
 
 While the UI is visible, one lifecycle-bound job refreshes the execution lease immediately and every 30 seconds. The process action gate coalesces that work with taps, settings changes, and composition so foreground polling cannot create duplicate command jobs. If a cached lease disappears, Android pages the complete execution history between two equal execution snapshots before applying its terminal outcome; a racing, incomplete, or malformed history read retains any command fence and leaves execution locked instead of guessing. The encrypted snapshot keeps a rolling 100-session history window for display plus a lifetime terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after enough newer sessions.
 
@@ -254,6 +306,12 @@ Execution completion is durably block-scoped first: the exact terminal lease ide
 Application backup and device transfer are disabled in the manifest; the encrypted database, its WAL files, and the wrapped passphrase are also named in exclusion rules as defense in depth because Android Keystore keys are device-bound. If the wrapping key is unavailable or the snapshot format cannot be decoded, persistence fails closed instead of silently replacing the existing database.
 
 Room schema history is exported under `app/schemas`, and explicit migrations are required—there is no destructive migration fallback.
+
+Timed-break delivery, exact-tap, stale-tap, and Keep-paused receipts add no table
+or column: they live inside the existing encrypted singleton JSON payload. That
+payload advances explicitly to `JSON_V9` while the Room schema remains version
+9. V8 and every predecessor discard any injected V9 receipt authority during
+upgrade, and a V9 payload missing a required receipt field fails closed.
 
 ## Next integration gates
 

@@ -157,7 +157,13 @@ class ExecutionSyncManagerTest {
         assertEquals(ItemStatus.SCHEDULED, store.state.value.schedule.single().status)
         assertNull(store.state.value.activeSession)
 
-        val relaunched = manager(store, transport)
+        val relaunched = manager(
+            store = store,
+            transport = transport,
+            cancelTimedBreakNotification = {
+                error("a restored start command must not enter the timed-break barrier")
+            },
+        )
         assertEquals(ExecutionSyncOutcome.SUCCESS, relaunched.refresh())
 
         assertEquals(2, transport.commandBodies.size)
@@ -166,6 +172,55 @@ class ExecutionSyncManagerTest {
         assertNull(store.state.value.pendingExecutionCommand)
         assertEquals(ItemStatus.ACTIVE, store.state.value.schedule.single().status)
         assertEquals(SESSION_ID, store.state.value.activeSession?.canonicalExecutionSessionId)
+    }
+
+    @Test
+    fun restoredResumeCancelsReminderBeforeExactReplayAndReconcilesAfterward() = runBlocking {
+        val store = plannerStore()
+        val paused = pausedSession(
+            pauseUntil = "2026-09-01T06:59:00Z",
+            revision = 2,
+        )
+        val resumed = paused.copy(
+            status = "active",
+            revision = 3,
+            pausedAt = null,
+            pauseUntil = null,
+            runningSince = NOW.toString(),
+            updatedAt = NOW.toString(),
+        )
+        var attempts = 0
+        val events = mutableListOf<String>()
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, paused)
+            commandHandler = { _, _ ->
+                attempts += 1
+                events += "network"
+                if (attempts == 1) throw IOException("response lost")
+                snapshotResult = RemoteExecutionSnapshot(3, resumed)
+                RemoteExecutionMutation(3, resumed, resumed, replayed = true)
+            }
+        }
+        val first = manager(store, transport)
+        assertEquals(ExecutionSyncOutcome.SUCCESS, first.refresh())
+        assertEquals(ExecutionSyncOutcome.TRANSIENT_NETWORK_FAILURE, first.resume(BLOCK_ID))
+        assertEquals("resume", store.state.value.pendingExecutionCommand?.commandType)
+        events.clear()
+
+        val relaunched = manager(
+            store = store,
+            transport = transport,
+            cancelTimedBreakNotification = {
+                events += "cancel"
+                true
+            },
+            reconcileTimedBreakNotification = { events += "reconcile" },
+        )
+
+        assertEquals(ExecutionSyncOutcome.SUCCESS, relaunched.refresh())
+        assertEquals(listOf("cancel", "network", "reconcile"), events)
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertEquals("active", store.state.value.canonicalExecutionSession?.status)
     }
 
     @Test
@@ -364,6 +419,67 @@ class ExecutionSyncManagerTest {
         assertFalse(active.timedBreakEnded)
         assertEquals(Instant.parse("2026-09-01T07:10:00Z").toEpochMilli(), active.pauseUntilEpochMillis)
     }
+
+    @Test
+    fun timedBreakTransitionAwaitsCancellationAndReconcilesAfterDefinitiveFailure() = runBlocking {
+        val store = plannerStore()
+        val expired = pausedSession(
+            pauseUntil = "2026-09-01T06:59:00Z",
+            revision = 2,
+        )
+        val transport = FakeExecutionTransport().apply {
+            snapshotResult = RemoteExecutionSnapshot(2, expired)
+        }
+        val events = mutableListOf<String>()
+        val manager = manager(
+            store = store,
+            transport = transport,
+            cancelTimedBreakNotification = {
+                events += "cancel"
+                true
+            },
+            reconcileTimedBreakNotification = { events += "reconcile" },
+        )
+        assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+        transport.commandHandler = { _, _ -> throw ExecutionApiException.Validation(422) }
+
+        assertEquals(ExecutionSyncOutcome.VALIDATION_FAILURE, manager.pause(BLOCK_ID, 600))
+
+        assertEquals(listOf("cancel", "reconcile"), events)
+        assertNull(store.state.value.pendingExecutionCommand)
+        assertTrue(store.state.value.activeSession?.timedBreakEnded == true)
+        assertTrue(store.state.value.activeSession?.isPaused == true)
+    }
+
+    @Test
+    fun failedNotificationCancellationBlocksTimedBreakTransitionBeforeJournalOrNetwork() =
+        runBlocking {
+            val store = plannerStore()
+            val expired = pausedSession(
+                pauseUntil = "2026-09-01T06:59:00Z",
+                revision = 2,
+            )
+            val transport = FakeExecutionTransport().apply {
+                snapshotResult = RemoteExecutionSnapshot(2, expired)
+            }
+            var cancellations = 0
+            val manager = manager(
+                store = store,
+                transport = transport,
+                cancelTimedBreakNotification = {
+                    cancellations += 1
+                    false
+                },
+            )
+            assertEquals(ExecutionSyncOutcome.SUCCESS, manager.refresh())
+
+            assertEquals(ExecutionSyncOutcome.LOCAL_STORAGE_FAILURE, manager.resume(BLOCK_ID))
+
+            assertEquals(1, cancellations)
+            assertTrue(transport.commandBodies.isEmpty())
+            assertNull(store.state.value.pendingExecutionCommand)
+            assertTrue(store.state.value.activeSession?.timedBreakEnded == true)
+        }
 
     @Test
     fun completingOneSplitSessionDoesNotCompleteItsSiblingOrParent() = runBlocking {
@@ -2904,12 +3020,16 @@ class ExecutionSyncManagerTest {
         transport: FakeExecutionTransport,
         credentialStore: ApiCredentialStore = ExecutionCredentialStore(),
         currentNow: () -> Instant = { NOW },
+        cancelTimedBreakNotification: suspend () -> Boolean = { true },
+        reconcileTimedBreakNotification: suspend () -> Unit = {},
     ) = ExecutionSyncManager(
         plannerStore = store,
         credentialStore = credentialStore,
         transport = transport,
         now = currentNow,
         newUuid = UUIDS.iterator().let { iterator -> { iterator.next() } },
+        cancelTimedBreakNotification = cancelTimedBreakNotification,
+        reconcileTimedBreakNotification = reconcileTimedBreakNotification,
     )
 
     private fun plannerStore(

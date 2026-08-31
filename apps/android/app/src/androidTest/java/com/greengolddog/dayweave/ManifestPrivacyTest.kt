@@ -2,6 +2,7 @@ package com.greengolddog.dayweave
 
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
 import androidx.test.core.app.ApplicationProvider
@@ -70,6 +71,36 @@ class ManifestPrivacyTest {
         )
 
         assertEquals(ActivityInfo.LAUNCH_SINGLE_TASK, activityInfo.launchMode)
+    }
+
+    @Test
+    fun notificationRouteCapabilityActivityIsNotExportedAndLauncherIsRouteFreeBoundary() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        @Suppress("DEPRECATION")
+        val plannerInfo = context.packageManager.getActivityInfo(
+            ComponentName(context, MainActivity::class.java),
+            0,
+        )
+        @Suppress("DEPRECATION")
+        val launcherInfo = context.packageManager.getActivityInfo(
+            ComponentName(context, DayWeaveLauncherActivity::class.java),
+            0,
+        )
+
+        assertEquals(false, plannerInfo.exported)
+        assertEquals(true, launcherInfo.exported)
+        assertEquals(0, launcherInfo.flags and ActivityInfo.FLAG_EXCLUDE_FROM_RECENTS)
+        @Suppress("DEPRECATION")
+        val launchers = context.packageManager.queryIntentActivities(
+            Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setPackage(context.packageName),
+            0,
+        )
+        assertEquals(
+            listOf(DayWeaveLauncherActivity::class.java.name),
+            launchers.map { it.activityInfo.name }.sorted(),
+        )
     }
 
     private fun excludedPathCount(context: Context, resourceId: Int, path: String): Int {

@@ -3,12 +3,15 @@ package com.greengolddog.dayweave.ui
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import androidx.compose.animation.AnimatedVisibility
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -23,6 +26,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -32,6 +36,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -50,6 +55,18 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationPresentationDecision
+import com.greengolddog.dayweave.notifications.TimedBreakNotificationSystemState
+import com.greengolddog.dayweave.notifications.TimedBreakReminderEnableAction
+import com.greengolddog.dayweave.notifications.clearValidatedRejectedNotificationRoute
+import com.greengolddog.dayweave.notifications.shouldOfferCurrentTimedBreakReview
+import com.greengolddog.dayweave.notifications.isExactTimedBreakResolutionCurrent
+import com.greengolddog.dayweave.notifications.shouldPresentTimedBreakResolution
+import com.greengolddog.dayweave.notifications.timedBreakNotificationPresentationDecision
+import com.greengolddog.dayweave.notifications.timedBreakNotificationRouteStateAvailable
+import com.greengolddog.dayweave.notifications.timedBreakReminderEnableAction
+import com.greengolddog.dayweave.notifications.reconcileTimedBreakNotificationAuthorization
 import com.greengolddog.dayweave.health.EnergyProviderAvailability
 import com.greengolddog.dayweave.health.HealthConnectIntents
 import com.greengolddog.dayweave.security.AppLockController
@@ -85,6 +102,7 @@ import com.greengolddog.dayweave.sync.GoogleAccountSummary
 import java.time.ZoneId
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 @Composable
 fun DayWeaveApp(
@@ -94,6 +112,12 @@ fun DayWeaveApp(
     onSetAppLockTimeout: (AppLockTimeout) -> Unit,
     onLockNow: () -> Unit,
     onOpenDeviceSecuritySettings: () -> Unit,
+    timedBreakNotificationRouteDigest: String? = null,
+    onTimedBreakNotificationRouteConsumed: (String) -> Boolean = { true },
+    onRequestTimedBreakNotificationPermission: () -> Unit = {},
+    timedBreakNotificationSystemState: TimedBreakNotificationSystemState =
+        TimedBreakNotificationSystemState.ENABLED,
+    onEnableTimedBreakReminders: () -> Unit = {},
 ) {
     val appLockState by appLockController.state.collectAsStateWithLifecycle()
     AppLockPresentationGate(
@@ -114,6 +138,12 @@ fun DayWeaveApp(
                 onSetAppLockTimeout = onSetAppLockTimeout,
                 onLockNow = onLockNow,
                 onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+                timedBreakNotificationRouteDigest = timedBreakNotificationRouteDigest,
+                onTimedBreakNotificationRouteConsumed = onTimedBreakNotificationRouteConsumed,
+                onRequestTimedBreakNotificationPermission =
+                    onRequestTimedBreakNotificationPermission,
+                timedBreakNotificationSystemState = timedBreakNotificationSystemState,
+                onEnableTimedBreakReminders = onEnableTimedBreakReminders,
             )
         },
     )
@@ -136,6 +166,11 @@ private fun UnlockedDayWeaveApp(
     onSetAppLockTimeout: (AppLockTimeout) -> Unit,
     onLockNow: () -> Unit,
     onOpenDeviceSecuritySettings: () -> Unit,
+    timedBreakNotificationRouteDigest: String?,
+    onTimedBreakNotificationRouteConsumed: (String) -> Boolean,
+    onRequestTimedBreakNotificationPermission: () -> Unit,
+    timedBreakNotificationSystemState: TimedBreakNotificationSystemState,
+    onEnableTimedBreakReminders: () -> Unit,
     viewModel: DayWeaveViewModel = viewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -150,6 +185,13 @@ private fun UnlockedDayWeaveApp(
                 onSetAppLockTimeout = onSetAppLockTimeout,
                 onLockNow = onLockNow,
                 onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+                timedBreakNotificationRouteDigest = timedBreakNotificationRouteDigest,
+                onTimedBreakNotificationRouteConsumed =
+                    onTimedBreakNotificationRouteConsumed,
+                onRequestTimedBreakNotificationPermission =
+                    onRequestTimedBreakNotificationPermission,
+                timedBreakNotificationSystemState = timedBreakNotificationSystemState,
+                onEnableTimedBreakReminders = onEnableTimedBreakReminders,
             )
             PlannerLoadState.PERSISTENCE_FAILED -> PlannerPersistenceFailureScreen()
         }
@@ -199,9 +241,15 @@ private fun DayWeaveRoot(
     onSetAppLockTimeout: (AppLockTimeout) -> Unit,
     onLockNow: () -> Unit,
     onOpenDeviceSecuritySettings: () -> Unit,
+    timedBreakNotificationRouteDigest: String?,
+    onTimedBreakNotificationRouteConsumed: (String) -> Boolean,
+    onRequestTimedBreakNotificationPermission: () -> Unit,
+    timedBreakNotificationSystemState: TimedBreakNotificationSystemState,
+    onEnableTimedBreakReminders: () -> Unit,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val durableState by viewModel.durableState.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
     val proposalApplicationState by viewModel.proposalApplicationState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
@@ -209,7 +257,10 @@ private fun DayWeaveRoot(
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
+    val timedBreakNotificationPermissionRequestDigest by
+        viewModel.timedBreakNotificationPermissionRequestDigest.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
     val healthPermissionLauncher = rememberLauncherForActivityResult(
         contract = PermissionController.createRequestPermissionResultContract(),
@@ -251,6 +302,37 @@ private fun DayWeaveRoot(
     var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
     var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var authorizedNotificationBreakDigest by rememberSaveable {
+        mutableStateOf<String?>(null)
+    }
+    var rejectedNotificationLaunchBreakKey by rememberSaveable {
+        mutableStateOf<String?>(null)
+    }
+    var replayedRejectedNotificationBreakKey by rememberSaveable {
+        mutableStateOf<String?>(null)
+    }
+    var pendingRejectedNotificationRouteDigest by rememberSaveable {
+        mutableStateOf<String?>(null)
+    }
+    val timedBreakReminderEnableAction = timedBreakReminderEnableAction(
+        durableState = durableState,
+        nowEpochMillis = System.currentTimeMillis(),
+        sdkInt = Build.VERSION.SDK_INT,
+        systemState = timedBreakNotificationSystemState,
+    )
+    LaunchedEffect(
+        lifecycleOwner,
+        viewModel,
+        timedBreakNotificationPermissionRequestDigest,
+    ) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            val digest = timedBreakNotificationPermissionRequestDigest
+                ?: return@repeatOnLifecycle
+            if (viewModel.takeTimedBreakNotificationPermissionRequest(digest)) {
+                onRequestTimedBreakNotificationPermission()
+            }
+        }
+    }
 
     LaunchedEffect(lifecycleOwner, viewModel) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -324,6 +406,94 @@ private fun DayWeaveRoot(
         },
         bottomBar = {
             Column {
+                if (timedBreakReminderEnableAction != TimedBreakReminderEnableAction.NONE) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Break reminders are off",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    if (
+                                        timedBreakReminderEnableAction ==
+                                        TimedBreakReminderEnableAction.OPEN_NOTIFICATION_SETTINGS
+                                    ) {
+                                        "Enable them in Android settings for this future break."
+                                    } else {
+                                        "Enable notifications for this future break."
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            TextButton(onClick = onEnableTimedBreakReminders) {
+                                Text("Enable reminders")
+                            }
+                        }
+                    }
+                }
+                if (replayedRejectedNotificationBreakKey != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Reminder changed",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    "A different break can be reviewed separately.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            TextButton(
+                                onClick = {
+                                    if (
+                                        clearValidatedRejectedNotificationRoute(
+                                            pendingRejectedNotificationRouteDigest,
+                                            onTimedBreakNotificationRouteConsumed,
+                                        )
+                                    ) {
+                                        dismissedBreakKey = null
+                                        authorizedNotificationBreakDigest = null
+                                        replayedRejectedNotificationBreakKey = null
+                                        pendingRejectedNotificationRouteDigest = null
+                                    }
+                                },
+                            ) { Text("Review current break") }
+                            TextButton(
+                                onClick = {
+                                    if (
+                                        clearValidatedRejectedNotificationRoute(
+                                            pendingRejectedNotificationRouteDigest,
+                                            onTimedBreakNotificationRouteConsumed,
+                                        )
+                                    ) {
+                                        dismissedBreakKey = replayedRejectedNotificationBreakKey
+                                        authorizedNotificationBreakDigest = null
+                                        replayedRejectedNotificationBreakKey = null
+                                        pendingRejectedNotificationRouteDigest = null
+                                    }
+                                },
+                            ) { Text("Not now") }
+                        }
+                    }
+                }
                 val active = state.activeItem
                 val session = state.activeSession
                 AnimatedVisibility(visible = active != null && session != null) {
@@ -620,21 +790,194 @@ private fun DayWeaveRoot(
         }
     }
 
-    val endedBreak = state.activeSession?.takeIf { it.timedBreakEnded }
-    val endedBreakKey = endedBreak?.let { session ->
-        "${session.canonicalExecutionSessionId ?: session.itemId}:${session.pauseUntilEpochMillis}"
+    val endedBreakIdentity = state.authoritativeTimedBreakNotificationIdentity()
+    val endedBreak = state.activeSession?.takeIf {
+        it.timedBreakEnded && (
+            endedBreakIdentity == null ||
+                endedBreakIdentity.digest != state.acknowledgedBreakEndDigest
+            )
     }
-    if (endedBreak != null && endedBreakKey != dismissedBreakKey) {
+    val endedBreakKey = endedBreak?.let { session ->
+        endedBreakIdentity?.digest
+            ?: "local:${session.itemId}:${session.pauseUntilEpochMillis}"
+    }
+    val liveBreakRouteKey = listOf(
+        endedBreakIdentity?.digest,
+        state.activeSession?.timedBreakEnded?.toString(),
+        state.acknowledgedBreakEndDigest,
+    ).joinToString(separator = ":")
+    val durableBreakIdentity = durableState?.authoritativeTimedBreakNotificationIdentity()
+    val durableBreakRouteKey = listOf(
+        durableBreakIdentity?.digest,
+        durableState?.activeSession?.timedBreakEnded?.toString(),
+        durableState?.acknowledgedBreakEndDigest,
+    ).joinToString(separator = ":")
+    val durableBreakStateAvailable = timedBreakNotificationRouteStateAvailable(durableState)
+    LaunchedEffect(
+        timedBreakNotificationRouteDigest,
+        durableBreakStateAvailable,
+        durableBreakRouteKey,
+        liveBreakRouteKey,
+        endedBreakKey,
+    ) {
+        val encryptedState = durableState
+        if (encryptedState != null) {
+            timedBreakNotificationRouteDigest?.let { digest ->
+                val initiallyMatches = isExactTimedBreakResolutionCurrent(
+                    durableState = encryptedState,
+                    liveState = state,
+                    identityDigest = digest,
+                )
+                when (
+                    timedBreakNotificationPresentationDecision(
+                        consumption = viewModel.consumeTimedBreakNotificationRoute(digest),
+                        initiallyMatchedExactBreak = initiallyMatches,
+                        currentEndedBreakKey = endedBreakKey,
+                    )
+                ) {
+                    TimedBreakNotificationPresentationDecision.PRESENT_EXACT_BREAK -> {
+                        dismissedBreakKey = null
+                        authorizedNotificationBreakDigest = digest
+                        rejectedNotificationLaunchBreakKey = null
+                        replayedRejectedNotificationBreakKey = null
+                        pendingRejectedNotificationRouteDigest = null
+                        onTimedBreakNotificationRouteConsumed(digest)
+                    }
+                    TimedBreakNotificationPresentationDecision.OFFER_CURRENT_BREAK_REVIEW -> {
+                        authorizedNotificationBreakDigest = null
+                        rejectedNotificationLaunchBreakKey = endedBreakKey
+                        replayedRejectedNotificationBreakKey = null
+                        // Keep stale A durable until the user explicitly reviews or dismisses B.
+                        // A crash before that choice reconstructs this generic fence instead of
+                        // letting A indirectly retarget the ordinary B resolver.
+                        pendingRejectedNotificationRouteDigest = digest
+                    }
+                    TimedBreakNotificationPresentationDecision
+                        .OFFER_CURRENT_BREAK_REVIEW_NON_MODAL -> {
+                        authorizedNotificationBreakDigest = null
+                        rejectedNotificationLaunchBreakKey = null
+                        replayedRejectedNotificationBreakKey = endedBreakKey
+                        pendingRejectedNotificationRouteDigest = digest
+                    }
+                    TimedBreakNotificationPresentationDecision.SUPPRESS_CURRENT_BREAK -> {
+                        authorizedNotificationBreakDigest = null
+                        rejectedNotificationLaunchBreakKey = null
+                        replayedRejectedNotificationBreakKey = null
+                        pendingRejectedNotificationRouteDigest = null
+                        if (endedBreakKey != null) dismissedBreakKey = endedBreakKey
+                        onTimedBreakNotificationRouteConsumed(digest)
+                    }
+                    TimedBreakNotificationPresentationDecision.RETRY_AFTER_STATE_SETTLES -> Unit
+                }
+            }
+        }
+    }
+    LaunchedEffect(endedBreakKey) {
+        val transition = reconcileTimedBreakNotificationAuthorization(
+            authorizedDigest = authorizedNotificationBreakDigest,
+            endedBreakKey = endedBreakKey,
+        )
+        if (transition.authorizedDigest != authorizedNotificationBreakDigest) {
+            authorizedNotificationBreakDigest = transition.authorizedDigest
+            rejectedNotificationLaunchBreakKey = transition.changedBreakReviewKey
+        }
+        if (
+            replayedRejectedNotificationBreakKey != null &&
+            replayedRejectedNotificationBreakKey != endedBreakKey
+        ) {
+            replayedRejectedNotificationBreakKey = null
+        }
+    }
+    val presentationSuppressionKey = rejectedNotificationLaunchBreakKey
+        ?: replayedRejectedNotificationBreakKey
+    val showCurrentBreakReview = shouldOfferCurrentTimedBreakReview(
+        endedBreakKey = endedBreakKey,
+        pendingNotificationDigest = timedBreakNotificationRouteDigest,
+        rejectedNotificationLaunchBreakKey = rejectedNotificationLaunchBreakKey,
+        validatedRejectedRouteDigest = pendingRejectedNotificationRouteDigest,
+    )
+    if (showCurrentBreakReview) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("Reminder changed") },
+            text = {
+                Text(
+                    "That reminder is no longer current. Review the current break separately.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        if (
+                            clearValidatedRejectedNotificationRoute(
+                                pendingRejectedNotificationRouteDigest,
+                                onTimedBreakNotificationRouteConsumed,
+                            )
+                        ) {
+                            // This explicit second step authorizes the normal resolver for B; the
+                            // stale notification A itself never receives presentation authority.
+                            dismissedBreakKey = null
+                            authorizedNotificationBreakDigest = null
+                            rejectedNotificationLaunchBreakKey = null
+                            pendingRejectedNotificationRouteDigest = null
+                        }
+                    },
+                ) { Text("Review current break") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        if (
+                            clearValidatedRejectedNotificationRoute(
+                                pendingRejectedNotificationRouteDigest,
+                                onTimedBreakNotificationRouteConsumed,
+                            )
+                        ) {
+                            dismissedBreakKey = endedBreakKey
+                            authorizedNotificationBreakDigest = null
+                            rejectedNotificationLaunchBreakKey = null
+                            pendingRejectedNotificationRouteDigest = null
+                        }
+                    },
+                ) { Text("Not now") }
+            },
+        )
+    }
+    if (
+        !showCurrentBreakReview &&
+        endedBreak != null && shouldPresentTimedBreakResolution(
+            endedBreakKey = endedBreakKey,
+            dismissedBreakKey = dismissedBreakKey,
+            pendingNotificationDigest = timedBreakNotificationRouteDigest,
+            authorizedNotificationDigest = authorizedNotificationBreakDigest,
+            rejectedNotificationLaunchBreakKey = presentationSuppressionKey,
+        )
+    ) {
         BreakEndedDialog(
             onResume = {
-                dismissedBreakKey = endedBreakKey
                 viewModel.resumeActive()
             },
             onExtend = {
-                dismissedBreakKey = endedBreakKey
                 viewModel.pauseActive(10)
             },
-            onKeepPaused = { dismissedBreakKey = endedBreakKey },
+            onKeepPaused = {
+                val canonicalDigest = endedBreakIdentity?.digest
+                if (canonicalDigest == null) {
+                    if (endedBreak.canonicalExecutionSessionId == null) {
+                        // Device-local timers have no server lease or notification receipt.
+                        dismissedBreakKey = endedBreakKey
+                    } else {
+                        // A canonical projection mismatch cannot authorize a local-only dismissal.
+                        viewModel.refreshExecution()
+                    }
+                } else {
+                    coroutineScope.launch {
+                        if (viewModel.keepTimedBreakPaused(canonicalDigest)) {
+                            dismissedBreakKey = canonicalDigest
+                        }
+                    }
+                }
+            },
         )
     }
 
