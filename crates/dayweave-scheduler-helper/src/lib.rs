@@ -171,6 +171,16 @@ pub fn internal_failure_output() -> ProcessOutput {
     }
 }
 
+/// Returns the bounded rejection used when a caller can determine the input
+/// size before copying the input into this process boundary.
+///
+/// Native bridges use this to reject oversized foreign arrays without first
+/// allocating and copying more than [`MAX_INPUT_BYTES`].
+#[must_use]
+pub fn request_too_large_output() -> ProcessOutput {
+    error_output(ErrorCode::RequestTooLarge)
+}
+
 fn process(input: &[u8]) -> Result<ResponseResult, ErrorCode> {
     if input.len() > MAX_INPUT_BYTES {
         return Err(ErrorCode::RequestTooLarge);

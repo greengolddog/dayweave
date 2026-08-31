@@ -22,7 +22,7 @@ import org.junit.Test
 
 class CanonicalAuthoringPersistenceTest {
     @Test
-    fun v6SnapshotMigratesToEmptyAuthoringCollectionsAndIsRewrittenAsV9() = runBlocking {
+    fun v6SnapshotMigratesToEmptyAuthoringCollectionsAndIsRewrittenAsV10() = runBlocking {
         val dao = FakeDao()
         val repository = RoomPlannerStateRepository(dao) { 41 }
         repository.save(DayWeaveUiState())
@@ -42,7 +42,7 @@ class CanonicalAuthoringPersistenceTest {
 
         assertTrue(restored.pendingCanonicalAuthoringMutations.isEmpty())
         assertTrue(restored.canonicalRecentlyDeleted.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
         assertEquals(41L, dao.snapshot?.updatedAtEpochMillis)
     }
 
@@ -87,7 +87,7 @@ class CanonicalAuthoringPersistenceTest {
         assertEquals(mutation, restored.pendingCanonicalAuthoringMutations.single())
         assertEquals(deleted, restored.canonicalRecentlyDeleted.single())
         assertTrue(requireNotNull(dao.snapshot).payload.contains("Canonical Android draft"))
-        assertEquals(PlannerSnapshotFormats.JSON_V9, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
     }
 
     @Test

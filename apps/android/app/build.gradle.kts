@@ -4,6 +4,34 @@ import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermission
 import java.util.Properties
 
+val repositoryRoot = rootProject.projectDir.parentFile.parentFile
+val schedulerBuildScript = repositoryRoot.resolve("scripts/build-android-scheduler-library.sh")
+val schedulerNativeInputs = files(
+    repositoryRoot.resolve("Cargo.toml"),
+    repositoryRoot.resolve("Cargo.lock"),
+    repositoryRoot.resolve("rust-toolchain.toml"),
+    repositoryRoot.resolve("crates/dayweave-android-ffi"),
+    repositoryRoot.resolve("crates/dayweave-scheduler-helper"),
+    repositoryRoot.resolve("crates/dayweave-compose"),
+    repositoryRoot.resolve("crates/dayweave-core"),
+    schedulerBuildScript,
+    repositoryRoot.resolve("scripts/tests/test-android-scheduler-library-native-security.sh"),
+)
+
+fun registerSchedulerNativeBuild(variant: String) = tasks.register<Exec>(
+    "build${variant.replaceFirstChar(Char::uppercaseChar)}SchedulerNative",
+) {
+    group = "build"
+    description = "Cross-compiles and verifies the bundled scheduler JNI libraries for $variant"
+    workingDir(repositoryRoot)
+    commandLine(schedulerBuildScript.absolutePath, variant)
+    inputs.files(schedulerNativeInputs)
+    outputs.dir(layout.buildDirectory.dir("generated/jniLibs/$variant"))
+}
+
+val buildDebugSchedulerNative = registerSchedulerNativeBuild("debug")
+val buildReleaseSchedulerNative = registerSchedulerNativeBuild("release")
+
 fun String.asBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
@@ -68,6 +96,7 @@ plugins {
 android {
     namespace = "com.greengolddog.dayweave"
     compileSdk = 36
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         applicationId = "com.greengolddog.dayweave"
@@ -84,6 +113,7 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
+        ndk.abiFilters += setOf("arm64-v8a", "x86_64")
     }
 
     signingConfigs {
@@ -136,6 +166,22 @@ android {
     }
 
     sourceSets.getByName("androidTest").assets.srcDir("$projectDir/schemas")
+    sourceSets.getByName("debug").jniLibs.srcDir(
+        layout.buildDirectory.dir("generated/jniLibs/debug"),
+    )
+    sourceSets.getByName("release").jniLibs.srcDir(
+        layout.buildDirectory.dir("generated/jniLibs/release"),
+    )
+}
+
+// Unit tests inject a byte-array fake and do not need an ELF build. Packaging tasks do.
+tasks.configureEach {
+    when (name) {
+        "mergeDebugJniLibFolders", "mergeDebugNativeLibs" ->
+            dependsOn(buildDebugSchedulerNative)
+        "mergeReleaseJniLibFolders", "mergeReleaseNativeLibs" ->
+            dependsOn(buildReleaseSchedulerNative)
+    }
 }
 
 kotlin {

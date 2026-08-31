@@ -46,11 +46,13 @@ object PlannerSnapshotFormats {
     const val JSON_V8 = "json-v8-exact-schedule-publication-proof"
     /** Encrypted-payload-only fence for exact timed-break delivery/tap/acknowledgement receipts. */
     const val JSON_V9 = "json-v9-timed-break-notification-receipts"
+    /** Local provenance plus scheduling profile; older binaries must not ignore either safety gap. */
+    const val JSON_V10 = "json-v10-local-schedule-composition-provenance"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 9,
+    version = 10,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -122,6 +124,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_8_9 = object : Migration(8, 9) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains explicit display-only provenance;
+     * the Room version prevents rollback to code that could mistake that plan for server output.
+     */
+    val MIGRATION_9_10 = object : Migration(9, 10) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -170,6 +180,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_6_7,
                 PlannerDatabaseMigrations.MIGRATION_7_8,
                 PlannerDatabaseMigrations.MIGRATION_8_9,
+                PlannerDatabaseMigrations.MIGRATION_9_10,
             )
             .build()
     }

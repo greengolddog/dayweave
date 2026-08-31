@@ -22,6 +22,7 @@ import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.LocalScheduleCompositionProvenanceSnapshot
 import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PlanningSuggestion
@@ -41,6 +42,7 @@ import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
@@ -63,6 +65,7 @@ import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdenti
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
+import com.greengolddog.dayweave.model.localScheduleCompositionStateFingerprint
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
@@ -105,6 +108,11 @@ class PlannerPersistenceReceipt internal constructor(
 ) {
     suspend fun awaitDurable(): Boolean = completion.await()
 }
+
+class LocalScheduleCompositionTransition internal constructor(
+    val provenance: LocalScheduleCompositionProvenanceSnapshot,
+    val persistence: PlannerPersistenceReceipt,
+)
 
 /** The exact authoring journal generation a caller must durably acknowledge before network I/O. */
 class CanonicalAuthoringTransition internal constructor(
@@ -165,6 +173,7 @@ class PlannerStore(
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
             .withInvalidTimedBreakNotificationAttemptAbandoned()
+            .withInvalidLocalScheduleCompositionAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) },
     )
     val state: StateFlow<DayWeaveUiState> = mutableState.asStateFlow()
@@ -640,8 +649,126 @@ class PlannerStore(
         }
     }
 
-    private fun validateCanonicalPlanUpdate(update: CanonicalPlanUpdate) {
-        requireScheduleInputDigest(update.inputDigest)
+    /**
+     * Atomically installs one bundled-core composition only if every input generation is unchanged.
+     *
+     * The local fingerprint is retained as encrypted display provenance. Server publication
+     * evidence is intentionally removed, so this schedule remains non-actionable until an
+     * authoritative preview is published and reconciled.
+     */
+    fun installLocalScheduleComposition(
+        expectedState: DayWeaveUiState,
+        update: CanonicalPlanUpdate,
+        provenance: LocalScheduleCompositionProvenanceSnapshot,
+    ): LocalScheduleCompositionTransition? {
+        validateCanonicalPlanUpdate(update, requireServerDigest = false)
+        require(provenance.hasValidShape()) { "Local schedule provenance is invalid" }
+        require(
+            update.inputDigest == provenance.localInputFingerprint &&
+                update.syncOrigin == provenance.syncOrigin &&
+                update.configurationId == provenance.configurationId &&
+                update.deltaCursor == provenance.deltaCursor &&
+                update.generatedAt == provenance.generatedAt &&
+                update.planningZoneId == provenance.timezoneName &&
+                update.items.associate { it.id to it.revision } == provenance.sourceItemRevisions,
+        ) { "Local schedule provenance does not match its composition" }
+        var installedProvenance: LocalScheduleCompositionProvenanceSnapshot? = null
+        val mutation = mutateDurablyWithSnapshot { current ->
+            require(current == expectedState && mutableDurableState.value == expectedState) {
+                "Planner state changed while the local composition was in flight"
+            }
+            requireLocalScheduleCompositionPreflight(current, provenance)
+            val installedWithoutProvenance = canonicalPlanState(current, update).copy(
+                pendingSchedulePublication = null,
+                publishedScheduleRevision = null,
+                publishedScheduleProof = null,
+                scheduleInputDigest = null,
+                localScheduleCompositionProvenance = null,
+                scheduleMessage =
+                    "Composed on this device · sync before starting or changing canonical work",
+            )
+            val exactProvenance = provenance.copy(
+                stateInputFingerprint =
+                    installedWithoutProvenance.localScheduleCompositionStateFingerprint(),
+            )
+            val installed = installedWithoutProvenance.copy(
+                localScheduleCompositionProvenance = exactProvenance,
+            )
+            require(exactProvenance.matchesState(installed)) {
+                "Local schedule composition did not retain its exact source generation"
+            }
+            installedProvenance = exactProvenance
+            installed
+        } ?: return null
+        return LocalScheduleCompositionTransition(
+            provenance = requireNotNull(installedProvenance),
+            persistence = requireNotNull(mutation.receipt),
+        )
+    }
+
+    private fun requireLocalScheduleCompositionPreflight(
+        current: DayWeaveUiState,
+        provenance: LocalScheduleCompositionProvenanceSnapshot,
+    ) {
+        require(
+            current.canonicalSyncOrigin == provenance.syncOrigin &&
+                current.canonicalConfigurationId == provenance.configurationId &&
+                current.canonicalDeltaCursor == provenance.deltaCursor &&
+                current.canonicalItems.associate { it.id to it.revision } ==
+                provenance.sourceItemRevisions,
+        ) { "Local composition needs one exact durable canonical binding" }
+        require(
+            current.canonicalExecutionSyncOrigin == provenance.syncOrigin &&
+                current.canonicalExecutionConfigurationId == provenance.configurationId &&
+                current.canonicalExecutionHistoryVerified &&
+                current.canonicalExecutionHistoryContinuityEstablished &&
+                current.canonicalExecutionHistoryWindowRevision ==
+                current.canonicalExecutionRevision &&
+                (current.canonicalExecutionRevision == 0L) ==
+                current.canonicalExecutionHistoryWindow.isEmpty() &&
+                current.canonicalExecutionHistoryWindow.all {
+                    it.revision <= current.canonicalExecutionRevision
+                },
+        ) { "Verified execution history does not match the canonical binding" }
+        require(
+            current.pendingSchedulePublication == null &&
+                current.pendingProposalApplicationMutation == null &&
+                current.pendingCanonicalMutation == null &&
+                current.pendingCanonicalAuthoringMutations.isEmpty() &&
+                current.pendingExecutionCommand == null &&
+                current.pendingExecutionDeferIntent == null &&
+                current.canonicalExecutionSession == null &&
+                current.activeSession == null &&
+                current.schedule.none {
+                    it.canonicalItemId != null &&
+                        it.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
+                },
+        ) { "A pending or active canonical operation blocks local composition" }
+        require(
+            current.terminalExecutionOutcomes.values.none { outcome ->
+                outcome.requiresCanonicalItemProjection &&
+                    outcome.canonicalProjectionRevision == null &&
+                    outcome.canonicalProjectionResolution == null &&
+                    current.isNewestExecutionForProjection(outcome.session)
+            },
+        ) { "An authoritative terminal projection must finish before local composition" }
+    }
+
+    private fun validateCanonicalPlanUpdate(
+        update: CanonicalPlanUpdate,
+        requireServerDigest: Boolean = true,
+    ) {
+        if (requireServerDigest) {
+            requireScheduleInputDigest(update.inputDigest)
+        } else {
+            require(
+                update.inputDigest.length == LOCAL_SCHEDULE_FINGERPRINT_PREFIX.length + 64 &&
+                    update.inputDigest.startsWith(LOCAL_SCHEDULE_FINGERPRINT_PREFIX) &&
+                    update.inputDigest.drop(LOCAL_SCHEDULE_FINGERPRINT_PREFIX.length).all {
+                        it in '0'..'9' || it in 'a'..'f'
+                    },
+            ) { "Local composition fingerprint is invalid" }
+        }
         require(update.syncOrigin.isNotBlank() && update.deltaCursor.isNotBlank()) {
             "Canonical synchronization metadata is invalid"
         }
@@ -876,6 +1003,7 @@ class PlannerStore(
                     authoringProofInvalidated
                 },
                 scheduleInputDigest = update.inputDigest.takeUnless { authoringProofInvalidated },
+                localScheduleCompositionProvenance = null,
                 scheduleGeneratedAt = update.generatedAt,
                 schedulePlanningZoneId = update.planningZoneId,
                 recurrenceOutcomes = if (sameBinding) {
@@ -4194,6 +4322,50 @@ class PlannerStore(
         mutate { it.copy(useDynamicColor = !it.useDynamicColor) }
     }
 
+    /**
+     * Persists work-window/weight changes and revokes old authority. Future UI callers must hold
+     * the process canonical-action gate; this remains internal until profile settings ship.
+     */
+    internal fun updateScheduleCompositionProfile(
+        profile: ScheduleCompositionProfileSnapshot,
+    ): Boolean {
+        require(profile.hasValidShape())
+        return mutate { current ->
+            if (current.scheduleCompositionProfile == profile) {
+                current
+            } else {
+                require(
+                    current.pendingSchedulePublication == null &&
+                        current.pendingProposalApplicationMutation == null &&
+                        current.pendingCanonicalMutation == null &&
+                        current.pendingCanonicalAuthoringMutations.isEmpty() &&
+                        current.pendingExecutionCommand == null &&
+                        current.pendingExecutionDeferIntent == null &&
+                        current.canonicalExecutionSession == null &&
+                        current.activeSession == null &&
+                        current.schedule.none { block ->
+                            block.canonicalItemId != null &&
+                                block.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
+                        } &&
+                        current.terminalExecutionOutcomes.values.none { outcome ->
+                            outcome.requiresCanonicalItemProjection &&
+                                outcome.canonicalProjectionRevision == null &&
+                                outcome.canonicalProjectionResolution == null &&
+                                current.isNewestExecutionForProjection(outcome.session)
+                        },
+                ) { "A canonical action must reconcile before changing the scheduling profile" }
+                current.copy(
+                    scheduleCompositionProfile = profile,
+                    publishedScheduleRevision = null,
+                    publishedScheduleProof = null,
+                    scheduleInputDigest = null,
+                    localScheduleCompositionProvenance = null,
+                    scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
+                )
+            }
+        }
+    }
+
     fun enableHealthConnectSync(): Boolean = mutate { current ->
         current.copy(healthConnectSyncEnabled = true)
     }
@@ -5100,6 +5272,15 @@ class PlannerStore(
         )
     }
 
+    /** Corrupt, stale, or server-authorized local provenance is never allowed to survive restore. */
+    private fun DayWeaveUiState.withInvalidLocalScheduleCompositionAbandoned(): DayWeaveUiState {
+        val provenance = localScheduleCompositionProvenance ?: return this
+        return if (provenance.matchesState(this)) this else copy(
+            localScheduleCompositionProvenance = null,
+            scheduleMessage = "Saved on-device composition became stale and was discarded safely",
+        )
+    }
+
     private fun mutateInternal(
         requireExactSave: Boolean,
         transform: (DayWeaveUiState) -> DayWeaveUiState,
@@ -5110,12 +5291,17 @@ class PlannerStore(
         ) {
             return@synchronized null
         }
-        val snapshot = transform(mutableState.value)
+        val previous = mutableState.value
+        val transformed = transform(previous)
             .withCanonicalTrashRetention(nowEpochMillis())
             .withPendingSensitivityHardened()
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
             .withInvalidTimedBreakNotificationAttemptAbandoned()
+        // Kotlin data-class copy preserves unchanged input references but not body-property memos.
+        // Transfer a verified digest/result only across an O(1) exact structural identity fence.
+        transformed.inheritLocalScheduleCompositionMemo(previous)
+        val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot
         currentGeneration += 1
@@ -5175,6 +5361,7 @@ class PlannerStore(
                 .withInvalidRecurrenceMoveSourcesAbandoned()
                 .withInvalidExecutionDeferIntentAbandoned()
                 .withInvalidTimedBreakNotificationAttemptAbandoned()
+                .withInvalidLocalScheduleCompositionAbandoned()
                 .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
             mutableState.value = snapshot
             currentGeneration += 1
@@ -5313,6 +5500,7 @@ class PlannerStore(
             "skip",
             "defer",
         )
+        const val LOCAL_SCHEDULE_FINGERPRINT_PREFIX = "local-sha256:"
         const val MAX_PENDING_EXECUTION_REQUEST_CHARS = 64 * 1024
         const val MAX_EXECUTION_HISTORY_WINDOW = 100
         const val MAX_EXECUTION_PAUSE_SECONDS = 24 * 60 * 60

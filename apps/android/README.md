@@ -177,6 +177,39 @@ This authoring surface does not itself grant disclosure. Sensitive values remain
 default from assistant/MCP and future locked notification, widget, indexing, attachment, and export
 surfaces; those surfaces require their own tested policy gate before they can be enabled.
 
+## On-device schedule composition
+
+**Compose on this device** creates one deterministic local-day composition from the exact
+encrypted canonical cache. It invokes the bounded Rust scheduler through a byte-array JNI boundary
+and never sends a composition request, advances a delta cursor, publishes a schedule, or changes an
+execution lease. The displayed composition is explicitly local-only: Start, skip, and move-later
+remain fail-closed until the day is synced and a server-published execution-authoritative plan is
+installed.
+
+The encrypted Room snapshot persists an exact local provenance record: the credential binding and
+cursor, source item revisions, local input fingerprint, request fingerprint, day/time zone, and
+the resulting block revisions. The app displays a local plan only while every one of those inputs
+still matches. Item, recurrence, availability, execution, binding, or time-zone changes invalidate
+it rather than reusing stale blocks. It also cancels local composition and discards a late native
+result whenever the UI stops, the app locks, or credential/binding state changes.
+
+The JNI library is generated at build time and is not checked in. Android builds only
+`arm64-v8a` and `x86_64` scheduler libraries, with Android NDK `28.2.13676358`, Rust `1.95.0`, and
+the `aarch64-linux-android` and `x86_64-linux-android` Rust targets. With `ANDROID_HOME` (or
+`ANDROID_SDK_ROOT`) pointing at an SDK containing that NDK, build either variant directly:
+
+```sh
+rustup target add --toolchain 1.95.0 aarch64-linux-android x86_64-linux-android
+scripts/build-android-scheduler-library.sh debug
+scripts/build-android-scheduler-library.sh release
+scripts/tests/test-build-android-scheduler-library-hostile-environment.sh debug
+```
+
+Gradle runs the corresponding generated-library build before debug or release JNI packaging, so
+the normal `assembleDebug`, `assembleRelease`, and signed
+`scripts/build-android-apk.sh` paths require the same NDK and Rust targets. Generated `.so` files
+remain under `app/build/generated/jniLibs/`; never commit them or any signing/credential material.
+
 ## Build
 
 Requirements:
@@ -184,12 +217,15 @@ Requirements:
 - JDK 17
 - Android SDK Platform 36
 - Android SDK Build Tools and Platform Tools
+- Android NDK 28.2.13676358
+- Rust 1.95.0 with `aarch64-linux-android` and `x86_64-linux-android` targets
 
 On this Mac, the Homebrew SDK is at `/opt/homebrew/share/android-commandlinetools`. Build with:
 
 ```sh
 export JAVA_HOME="/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
 export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
+rustup target add --toolchain 1.95.0 aarch64-linux-android x86_64-linux-android
 ./gradlew testDebugUnitTest lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
 ```
 
@@ -335,9 +371,11 @@ Room schema history is exported under `app/schemas`, and explicit migrations are
 
 Timed-break delivery, exact-tap, stale-tap, and Keep-paused receipts add no table
 or column: they live inside the existing encrypted singleton JSON payload. That
-payload advances explicitly to `JSON_V9` while the Room schema remains version
-9. V8 and every predecessor discard any injected V9 receipt authority during
-upgrade, and a V9 payload missing a required receipt field fails closed.
+receipt history advanced the payload to `JSON_V9`. The encrypted local-composition
+provenance and scheduling profile advance both the payload and Room schema to
+version 10 without adding a table or column. V1–V9 discard injected V10 provenance
+or profile authority during upgrade; a V10 payload missing either required field,
+or any receipt field introduced by V9, fails closed.
 
 ## Next integration gates
 

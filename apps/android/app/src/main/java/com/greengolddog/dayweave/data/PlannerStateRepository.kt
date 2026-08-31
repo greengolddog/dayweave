@@ -7,6 +7,7 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalTrashRetentionPolicy
 import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.canonicalTrashItemBytes
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
@@ -56,84 +57,109 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V10 -> decodeCurrentSnapshot(snapshot.payload)
             PlannerSnapshotFormats.JSON_V9 -> {
-                val decoded = decodeCurrentSnapshot(snapshot.payload)
-                if (SNAPSHOT_JSON.encodeToString(decoded) != snapshot.payload) save(decoded)
-                decoded
+                decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requireLocalScheduleCompositionField = false,
+                    requireScheduleCompositionProfileField = false,
+                ).withoutLocalScheduleCompositionState()
             }
             PlannerSnapshotFormats.JSON_V8 -> {
-                val migrated = decodeCurrentSnapshot(
+                decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireTimedBreakNotificationFields = false,
+                    requireLocalScheduleCompositionField = false,
+                    requireScheduleCompositionProfileField = false,
                 ).withoutTimedBreakNotificationReceipts()
-                save(migrated)
-                migrated
+                    .withoutLocalScheduleCompositionState()
             }
             PlannerSnapshotFormats.JSON_V7 -> {
-                val migrated = decodeCurrentSnapshot(
+                decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requirePublicationProofField = false,
                     requireTimedBreakNotificationFields = false,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
-                migrated
+                    requireLocalScheduleCompositionField = false,
+                    requireScheduleCompositionProfileField = false,
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
             }
             PlannerSnapshotFormats.JSON_V6 -> {
-                val migrated = decodeCurrentSnapshot(
+                decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireCanonicalAuthoringFields = false,
                     requirePublicationProofField = false,
                     requireTimedBreakNotificationFields = false,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
-                migrated
+                    requireLocalScheduleCompositionField = false,
+                    requireScheduleCompositionProfileField = false,
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
             }
             PlannerSnapshotFormats.JSON_V5 -> {
-                val migrated = decodeCurrentSnapshot(
+                decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireProposalApplicationFields = false,
                     requireCanonicalAuthoringFields = false,
                     requirePublicationProofField = false,
                     requireTimedBreakNotificationFields = false,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
-                migrated
+                    requireLocalScheduleCompositionField = false,
+                    requireScheduleCompositionProfileField = false,
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
             }
             PlannerSnapshotFormats.JSON_V4 -> {
                 val migrated = decodeVersionFourSnapshot(snapshot.payload)
                     .withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
                     .copy(publishedScheduleProof = null)
-                save(migrated)
                 migrated
             }
             PlannerSnapshotFormats.JSON_V3 -> {
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     requireExistingSensitivity = true,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
                 migrated
             }
             PlannerSnapshotFormats.JSON_V2 -> {
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
                 migrated
             }
             PlannerSnapshotFormats.JSON_V1 -> {
                 val migrated = decodeLegacySnapshot(
                     payload = snapshot.payload,
                     allowPreSensitivityJournal = true,
-                ).withoutTimedBreakNotificationReceipts().copy(publishedScheduleProof = null)
-                save(migrated)
+                ).withoutTimedBreakNotificationReceipts()
+                    .withoutLocalScheduleCompositionState()
+                    .copy(publishedScheduleProof = null)
                 migrated
             }
             else -> error("Unsupported planner snapshot format")
         }
-        val hardened = decoded.withInvalidTimedBreakNotificationAttemptAbandoned()
-        if (hardened != decoded) save(hardened)
+        val notificationHardened = decoded.withInvalidTimedBreakNotificationAttemptAbandoned()
+        val hardened = notificationHardened.localScheduleCompositionProvenance?.let { provenance ->
+            if (provenance.matchesState(notificationHardened)) {
+                notificationHardened
+            } else {
+                notificationHardened.copy(localScheduleCompositionProvenance = null)
+            }
+        } ?: notificationHardened
+        if (
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V10 ||
+            SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
+        ) {
+            save(hardened)
+        }
         hardened
     }
 
@@ -141,6 +167,12 @@ class RoomPlannerStateRepository(
         val referenceEpochMillis = nowEpochMillis()
         val retainedState = state.withCanonicalTrashRetention(referenceEpochMillis)
             .withInvalidTimedBreakNotificationAttemptAbandoned()
+        require(retainedState.scheduleCompositionProfile.hasValidShape()) {
+            "Schedule composition profile is invalid"
+        }
+        require(
+            retainedState.localScheduleCompositionProvenance?.matchesState(retainedState) != false,
+        ) { "Local schedule composition provenance does not match the encrypted snapshot" }
         validateSchedulePublicationState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
@@ -149,7 +181,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V9,
+                payloadFormat = PlannerSnapshotFormats.JSON_V10,
             ),
         )
     }
@@ -160,6 +192,8 @@ class RoomPlannerStateRepository(
         requireCanonicalAuthoringFields: Boolean = true,
         requirePublicationProofField: Boolean = true,
         requireTimedBreakNotificationFields: Boolean = true,
+        requireLocalScheduleCompositionField: Boolean = true,
+        requireScheduleCompositionProfileField: Boolean = true,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -168,12 +202,24 @@ class RoomPlannerStateRepository(
             // Older format labels can never gain authority from an injected newer field.
             JsonObject(parsedRoot - "publishedScheduleProof")
         }
-        val root = if (requireTimedBreakNotificationFields) {
+        val timedBreakSafeRoot = if (requireTimedBreakNotificationFields) {
             publicationSafeRoot
         } else {
             // V8 and predecessors cannot acquire alert suppression or tap authority from fields
             // introduced only by V9, even if a payload is relabeled or fields were injected.
             JsonObject(publicationSafeRoot - TIMED_BREAK_NOTIFICATION_RECEIPT_FIELDS)
+        }
+        val localCompositionSafeRoot = if (requireLocalScheduleCompositionField) {
+            timedBreakSafeRoot
+        } else {
+            // V9 and predecessors cannot gain local-plan provenance from an injected newer field.
+            JsonObject(timedBreakSafeRoot - "localScheduleCompositionProvenance")
+        }
+        val root = if (requireScheduleCompositionProfileField) {
+            localCompositionSafeRoot
+        } else {
+            // An older label cannot opt into a newer scheduling policy by injecting a known field.
+            JsonObject(localCompositionSafeRoot - "scheduleCompositionProfile")
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -187,6 +233,18 @@ class RoomPlannerStateRepository(
             !root.keys.containsAll(TIMED_BREAK_NOTIFICATION_RECEIPT_FIELDS)
         ) {
             throw SerializationException("Current timed-break notification receipts are required")
+        }
+        if (
+            requireLocalScheduleCompositionField &&
+            !root.containsKey("localScheduleCompositionProvenance")
+        ) {
+            throw SerializationException("Current local schedule provenance is required")
+        }
+        if (
+            requireScheduleCompositionProfileField &&
+            !root.containsKey("scheduleCompositionProfile")
+        ) {
+            throw SerializationException("Current schedule composition profile is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -231,6 +289,9 @@ class RoomPlannerStateRepository(
             .withCanonicalTrashRetention(referenceEpochMillis)
             .withPendingSensitivityHardened()
             .also {
+                if (!it.scheduleCompositionProfile.hasValidShape()) {
+                    throw SerializationException("Schedule composition profile is invalid")
+                }
                 validateSchedulePublicationState(it)
                 validateProposalApplicationState(it)
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
@@ -244,10 +305,19 @@ class RoomPlannerStateRepository(
         acknowledgedBreakEndDigest = null,
     )
 
+    private fun DayWeaveUiState.withoutLocalScheduleCompositionState(): DayWeaveUiState = copy(
+        localScheduleCompositionProvenance = null,
+        scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(),
+    )
+
     /** V4 already required explicit sensitivity and an exact pending replacement target. */
     private fun decodeVersionFourSnapshot(payload: String): DayWeaveUiState {
         val root = JsonObject(
-            SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject - "publishedScheduleProof",
+            SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject - setOf(
+                "publishedScheduleProof",
+                "localScheduleCompositionProvenance",
+                "scheduleCompositionProfile",
+            ),
         )
         requireExplicitSensitivity(root, "schedule")
         requireExplicitSensitivity(root, "canonicalItems")
@@ -292,7 +362,11 @@ class RoomPlannerStateRepository(
     ): DayWeaveUiState {
         val legacyRoot = JsonObject(
             LEGACY_SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject -
-                "publishedScheduleProof",
+                setOf(
+                    "publishedScheduleProof",
+                    "localScheduleCompositionProvenance",
+                    "scheduleCompositionProfile",
+                ),
         )
         if (requireExistingSensitivity) {
             requireExplicitSensitivity(legacyRoot, "schedule")

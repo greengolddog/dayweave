@@ -59,7 +59,9 @@ fun TodayScreen(
     modifier: Modifier = Modifier,
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
-    val visibleTimeline = if (isCurrentPlan) state.visibleSchedule else emptyList()
+    val isDisplayCurrent = state.isScheduleDisplayCurrent()
+    val isLocalPlan = isDisplayCurrent && !isCurrentPlan
+    val visibleTimeline = if (isDisplayCurrent) state.visibleSchedule else emptyList()
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
@@ -73,7 +75,7 @@ fun TodayScreen(
                 )
                 Text(
                     if (
-                        !isCurrentPlan || syncState.phase in setOf(
+                        !isDisplayCurrent || !isLocalPlan && syncState.phase in setOf(
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.AUTH_REQUIRED,
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.OFFLINE,
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.ERROR,
@@ -89,7 +91,7 @@ fun TodayScreen(
             }
         }
 
-        if (!isCurrentPlan) {
+        if (!isDisplayCurrent) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(
@@ -107,6 +109,27 @@ fun TodayScreen(
                             } ?: "No canonical plan has been composed for today yet.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                    }
+                }
+            }
+        }
+
+        if (isLocalPlan) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text("Composed on this device", style = MaterialTheme.typography.titleMedium)
+                        Text(
+                            "This encrypted plan is visible offline. Sync and publish before starting, skipping, or moving canonical work.",
+                            style = MaterialTheme.typography.bodySmall,
                         )
                     }
                 }
@@ -370,13 +393,19 @@ fun TodayScreen(
                     null
                 },
                 canStart = !terminalStartBlocked && (
-                    item.canonicalItemId == null || canonicalExecutionActionsEnabled
+                    item.canonicalItemId == null ||
+                        canonicalExecutionActionsEnabled && state.hasPublishedExecutionAuthority(item)
                 ),
-                unavailableLabel = if (terminalStartBlocked) "Needs review" else "Syncing…",
+                unavailableLabel = when {
+                    terminalStartBlocked -> "Needs review"
+                    item.canonicalItemId != null && !state.hasPublishedExecutionAuthority(item) ->
+                        "Sync to start"
+                    else -> "Syncing…"
+                },
             )
         }
 
-        if (visibleTimeline.isEmpty() && isCurrentPlan) {
+        if (visibleTimeline.isEmpty() && isDisplayCurrent) {
             item {
                 Card {
                     Row(
@@ -405,7 +434,7 @@ internal fun ScheduleItem.isMoveLaterEligible(): Boolean {
 
 internal fun DayWeaveUiState.canSafelySkipScheduled(item: ScheduleItem): Boolean {
     val itemId = item.canonicalItemId ?: return false
-    return item.status == ItemStatus.SCHEDULED &&
+    return hasPublishedExecutionAuthority(item) && item.status == ItemStatus.SCHEDULED &&
         item.isMoveLaterEligible() && item.occurrenceId == null && !item.isSplittable &&
         schedule.count { block ->
             block.canonicalItemId == itemId && block.occurrenceId == null
@@ -416,7 +445,10 @@ internal fun DayWeaveUiState.canSafelySkipScheduled(item: ScheduleItem): Boolean
 
 internal fun DayWeaveUiState.canMoveScheduledLater(item: ScheduleItem): Boolean {
     val itemId = item.canonicalItemId ?: return false
-    if (item.status != ItemStatus.SCHEDULED || !item.isMoveLaterEligible()) return false
+    if (
+        !hasPublishedExecutionAuthority(item) ||
+        item.status != ItemStatus.SCHEDULED || !item.isMoveLaterEligible()
+    ) return false
     item.occurrenceId?.let { occurrenceId ->
         if (hasOpenOrPendingExecutionForOccurrence(occurrenceId)) return false
         val occurrenceBlocks = schedule.filter { block -> block.occurrenceId == occurrenceId }

@@ -31,6 +31,7 @@ import com.greengolddog.dayweave.security.AppAuthenticationProcessFence
 import com.greengolddog.dayweave.security.AppLockController
 import com.greengolddog.dayweave.security.AtomicFileAppLockSettingsStore
 import com.greengolddog.dayweave.security.MonotonicClock
+import com.greengolddog.dayweave.scheduler.RustScheduleComposer
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.sync.CanonicalActionGate
@@ -43,6 +44,7 @@ import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
 import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
+import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
@@ -60,6 +62,11 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val canonicalActionGate = CanonicalActionGate()
+    private val localScheduleCompositionLauncher = LocalScheduleCompositionLauncher(
+        scope = persistenceScope,
+        actionGate = canonicalActionGate,
+        compose = { generation -> canonicalSyncManager.composeLocally(generation) },
+    )
 
     val appAuthenticationProcessFence = AppAuthenticationProcessFence()
 
@@ -123,6 +130,7 @@ class DayWeaveApplication : Application() {
                         return false
                     }
                     if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
+                    cancelAndDrainLocalScheduleComposition()
                     if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
                         canonicalItemInvalidationManager.cancelAndDrainActiveSession()
                     }
@@ -199,6 +207,8 @@ class DayWeaveApplication : Application() {
             plannerStore = plannerStore,
             credentialStore = apiCredentialStore,
             transport = canonicalPlannerTransport,
+            localScheduleComposer = RustScheduleComposer(),
+            localCompositionLifecycleFence = localScheduleCompositionLauncher,
             cancelTimedBreakNotification =
                 ::cancelTimedBreakNotificationForAuthoritativeTransition,
             reconcileTimedBreakNotification =
@@ -344,8 +354,21 @@ class DayWeaveApplication : Application() {
         return true
     }
 
+    /** Starts the only device-local composition and retains it across transient recomposition. */
+    fun launchLocalScheduleComposition(): Boolean = localScheduleCompositionLauncher.launch()
+
+    /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
+    fun cancelLocalScheduleComposition() = localScheduleCompositionLauncher.cancel()
+
+    fun setLocalScheduleCompositionForegroundActive(active: Boolean) =
+        localScheduleCompositionLauncher.setForegroundActive(active)
+
+    internal suspend fun cancelAndDrainLocalScheduleComposition() =
+        localScheduleCompositionLauncher.cancelAndDrain()
+
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        setLocalScheduleCompositionForegroundActive(false)
         if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
             canonicalItemInvalidationManager.cancelActiveSession()
         }

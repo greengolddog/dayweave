@@ -469,6 +469,19 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.launchCanonicalAction { dayWeaveApplication.refreshCanonicalState() }
     }
 
+    fun composeOnDevice() {
+        if (isCanonicalBusy()) return
+        dayWeaveApplication.launchLocalScheduleComposition()
+    }
+
+    fun cancelLocalScheduleComposition() {
+        dayWeaveApplication.cancelLocalScheduleComposition()
+    }
+
+    fun setLocalScheduleCompositionForegroundActive(active: Boolean) {
+        dayWeaveApplication.setLocalScheduleCompositionForegroundActive(active)
+    }
+
     /** Called only while the application UI is STARTED; the process action gate coalesces races. */
     fun refreshExecution() {
         if (

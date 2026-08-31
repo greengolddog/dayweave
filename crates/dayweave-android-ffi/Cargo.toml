@@ -1,0 +1,19 @@
+[package]
+name = "dayweave-android-ffi"
+description = "Privacy-preserving Android JNI bridge to the deterministic DayWeave scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+dayweave-scheduler-helper = { path = "../dayweave-scheduler-helper" }
+jni = "=0.22.4"
+
+[lints]
+workspace = true

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/dayweave-android-ffi",
     "crates/dayweave-codex",
     "crates/dayweave-compose",
     "crates/dayweave-core",

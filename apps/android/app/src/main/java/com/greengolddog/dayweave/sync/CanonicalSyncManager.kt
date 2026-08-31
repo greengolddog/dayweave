@@ -8,6 +8,7 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
+import com.greengolddog.dayweave.model.LocalScheduleCompositionProvenanceSnapshot
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
@@ -44,12 +45,18 @@ import com.greengolddog.dayweave.network.RemoteScheduleBlock
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
 import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
+import com.greengolddog.dayweave.network.ScheduleConfigRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.network.SecureCredentialException
 import com.greengolddog.dayweave.network.buildSchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.normalizedHttpsApiBaseUrl
 import com.greengolddog.dayweave.network.validateBearerToken
+import com.greengolddog.dayweave.scheduler.LocalScheduleComposer
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionProtocolException
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRejectedException
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestException
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestTooLargeException
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.io.IOException
@@ -126,6 +133,16 @@ class CanonicalAbandonmentPersistenceException : IllegalStateException(
     "Canonical cache quarantine was not durable; existing credentials were kept",
 )
 
+interface LocalCompositionLifecycleFence {
+    fun captureGeneration(): Long
+    fun isCurrent(generation: Long): Boolean
+}
+
+object UnfencedLocalCompositionLifecycle : LocalCompositionLifecycleFence {
+    override fun captureGeneration(): Long = 0
+    override fun isCurrent(generation: Long): Boolean = generation == 0L
+}
+
 /** Pulls canonical deltas, composes one local day server-side, then commits both atomically. */
 class CanonicalSyncManager(
     private val plannerStore: PlannerStore,
@@ -133,8 +150,10 @@ class CanonicalSyncManager(
     private val transport: CanonicalPlannerTransport,
     private val now: () -> Instant = Instant::now,
     private val zoneId: () -> ZoneId = ZoneId::systemDefault,
-    private val dayStartMinute: Int = DEFAULT_DAY_START_MINUTE,
-    private val dayEndMinute: Int = DEFAULT_DAY_END_MINUTE,
+    /** Optional so existing tests/fakes and older embedders remain source-compatible. */
+    private val localScheduleComposer: LocalScheduleComposer? = null,
+    private val localCompositionLifecycleFence: LocalCompositionLifecycleFence =
+        UnfencedLocalCompositionLifecycle,
     private val newPublicationIdempotencyKey: () -> String = { UUID.randomUUID().toString() },
     private val cancelTimedBreakNotification: suspend () -> Boolean = { true },
     private val reconcileTimedBreakNotification: suspend () -> Unit = {},
@@ -163,11 +182,6 @@ class CanonicalSyncManager(
     /** Called only while the process-wide binding writer excludes every old response mutation. */
     internal fun quarantineBindingState() {
         mutableState.value = stateFrom(ApiConnectionSnapshot(null, false, null, null))
-    }
-
-    init {
-        require(dayStartMinute in 0 until MINUTES_PER_DAY)
-        require(dayEndMinute in 1..MINUTES_PER_DAY && dayEndMinute > dayStartMinute)
     }
 
     /** Serializes credential replacement/forget with every canonical request and reconciliation. */
@@ -350,6 +364,247 @@ class CanonicalSyncManager(
         }
     }
 
+    /**
+     * Explicitly composes one current local day without any HTTP, cursor, publication, or proof
+     * mutation. The result is an encrypted display-only generation and remains execution-locked.
+     */
+    suspend fun composeLocally(
+        admittedLifecycleGeneration: Long? = null,
+    ): CanonicalRefreshOutcome {
+        val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+        if (loadState != PlannerLoadState.READY) {
+            updateError("Encrypted planner storage is unavailable; the cached plan was kept.")
+            return CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        return operationMutex.withLock {
+            val composer = localScheduleComposer ?: run {
+                updateError("The bundled on-device scheduler is unavailable in this build.")
+                return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+            }
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            try {
+                configuration.withBindingOperation {
+                    val lifecycleGeneration = admittedLifecycleGeneration
+                        ?: localCompositionLifecycleFence.captureGeneration()
+                    if (!localCompositionLifecycleFence.isCurrent(lifecycleGeneration)) {
+                        throw LocalCompositionGenerationChangedException()
+                    }
+                    val expected = plannerStore.state.value
+                    val durable = plannerStore.durableState.value
+                    val origin = configuration.baseUrl.toString()
+                    val configurationId = configuration.configurationId
+                        ?: throw LocalCompositionUnavailableException(
+                            "Sync once with device authentication before composing on this device.",
+                        )
+                    val cursor = expected.canonicalDeltaCursor
+                        ?: throw LocalCompositionUnavailableException(
+                            "Sync canonical items once before composing on this device.",
+                        )
+                    requireLocalCompositionPreflight(
+                        expected = expected,
+                        durable = durable,
+                        origin = origin,
+                        configurationId = configurationId,
+                    )
+                    val instant = now()
+                    val planningZone = zoneId()
+                    val planningDate = instant.atZone(planningZone).toLocalDate()
+                    val request = previewRequest(
+                        instant = instant,
+                        planningZone = planningZone,
+                        canonicalItems = expected.canonicalItems,
+                        syncOrigin = origin,
+                        configurationId = configurationId,
+                        cachedState = expected,
+                    )
+                    mutableState.value = CanonicalSyncState(
+                        phase = CanonicalSyncPhase.SYNCING,
+                        message = "Composing today with the bundled scheduler…",
+                        lastInputDigest = null,
+                        sourceItemCount = expected.canonicalItems.size,
+                        scheduledBlockCount = expected.schedule.size,
+                    )
+                    if (!localCompositionLifecycleFence.isCurrent(lifecycleGeneration)) {
+                        throw LocalCompositionGenerationChangedException()
+                    }
+                    val composition = composer.compose(expected.canonicalItems, request)
+                    requireLocalCompositionCommitFence(
+                        configuration = configuration,
+                        lifecycleGeneration = lifecycleGeneration,
+                        expected = expected,
+                        capturedAt = instant,
+                        planningZone = planningZone,
+                        planningDate = planningDate,
+                    )
+                    val update = mapPreview(
+                        preview = composition.asRemotePreview(),
+                        canonicalItems = expected.canonicalItems,
+                        syncOrigin = origin,
+                        deltaCursor = cursor,
+                        generatedAt = instant,
+                        planningDate = planningDate,
+                        planningZone = planningZone,
+                        availabilityStart = localMinute(
+                            planningDate,
+                            planningZone,
+                            expected.scheduleCompositionProfile.dayStartMinute,
+                        ),
+                        availabilityEnd = localMinute(
+                            planningDate,
+                            planningZone,
+                            expected.scheduleCompositionProfile.dayEndMinute,
+                        ),
+                        inputDigestPattern = LOCAL_FINGERPRINT_PATTERN,
+                        preservationState = expected,
+                    ).copy(configurationId = configurationId)
+                    val provenance = LocalScheduleCompositionProvenanceSnapshot(
+                        syncOrigin = origin,
+                        configurationId = configurationId,
+                        deltaCursor = cursor,
+                        localInputFingerprint = composition.localInputFingerprint,
+                        scheduleRequestFingerprint = composition.scheduleRequestFingerprint,
+                        // Replaced by the store with the exact installed-state digest inside the
+                        // same encrypted generation.
+                        stateInputFingerprint = EMPTY_SHA256_FINGERPRINT,
+                        generatedAt = instant.toString(),
+                        asOf = request.asOf,
+                        horizonStart = request.horizonStart,
+                        horizonEnd = request.horizonEnd,
+                        timezoneName = request.timezoneName,
+                        sourceItemRevisions = composition.sourceItemRevisions,
+                    )
+                    // Mapping can be large and JNI is not preemptible. Revalidate the complete
+                    // admission/binding/time/state fence at the last point before durable install.
+                    requireLocalCompositionCommitFence(
+                        configuration = configuration,
+                        lifecycleGeneration = lifecycleGeneration,
+                        expected = expected,
+                        capturedAt = instant,
+                        planningZone = planningZone,
+                        planningDate = planningDate,
+                    )
+                    val transition = plannerStore.installLocalScheduleComposition(
+                        expectedState = expected,
+                        update = update,
+                        provenance = provenance,
+                    ) ?: throw LocalPlannerStorageException()
+                    if (!transition.persistence.awaitDurable()) throw LocalPlannerStorageException()
+                    val installed = plannerStore.durableState.value
+                    if (
+                        installed?.localScheduleCompositionProvenance != transition.provenance ||
+                        !transition.provenance.matchesState(installed)
+                    ) {
+                        throw LocalPlannerStorageException()
+                    }
+                    mutableState.value = CanonicalSyncState(
+                        phase = CanonicalSyncPhase.READY,
+                        message = installed.scheduleMessage,
+                        lastInputDigest = null,
+                        sourceItemCount = update.items.size,
+                        scheduledBlockCount = update.schedule.size,
+                    )
+                    CanonicalRefreshOutcome.SUCCESS
+                }
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
+    private suspend fun requireLocalCompositionCommitFence(
+        configuration: AuthenticatedApiConfiguration,
+        lifecycleGeneration: Long,
+        expected: com.greengolddog.dayweave.model.DayWeaveUiState,
+        capturedAt: Instant,
+        planningZone: ZoneId,
+        planningDate: LocalDate,
+    ) {
+        ensureConfigurationCurrent(configuration)
+        val currentTime = now()
+        if (
+            !localCompositionLifecycleFence.isCurrent(lifecycleGeneration) ||
+            zoneId() != planningZone ||
+            currentTime < capturedAt ||
+            currentTime.atZone(planningZone).toLocalDate() != planningDate ||
+            plannerStore.state.value != expected ||
+            plannerStore.durableState.value != expected
+        ) {
+            throw LocalCompositionGenerationChangedException()
+        }
+    }
+
+    private fun requireLocalCompositionPreflight(
+        expected: com.greengolddog.dayweave.model.DayWeaveUiState,
+        durable: com.greengolddog.dayweave.model.DayWeaveUiState?,
+        origin: String,
+        configurationId: String,
+    ) {
+        if (durable == null || durable != expected) {
+            throw LocalCompositionUnavailableException(
+                "Wait for encrypted planner changes to finish saving, then compose again.",
+            )
+        }
+        if (!expected.scheduleCompositionProfile.hasValidShape()) {
+            throw LocalCompositionUnavailableException(
+                "Review the saved scheduling profile before composing on this device.",
+            )
+        }
+        if (
+            expected.canonicalSyncOrigin != origin ||
+            expected.canonicalConfigurationId != configurationId ||
+            expected.canonicalDeltaCursor.isNullOrBlank()
+        ) {
+            throw LocalCompositionUnavailableException(
+                "The encrypted canonical cache does not match the current API connection.",
+            )
+        }
+        if (
+            expected.pendingSchedulePublication != null ||
+            expected.pendingProposalApplicationMutation != null ||
+            expected.pendingCanonicalMutation != null ||
+            expected.pendingCanonicalAuthoringMutations.isNotEmpty() ||
+            expected.pendingExecutionCommand != null ||
+            expected.pendingExecutionDeferIntent != null ||
+            expected.canonicalExecutionSession != null ||
+            expected.activeSession != null ||
+            unresolvedLocalExecutionMessage(expected) != null
+        ) {
+            throw LocalCompositionUnavailableException(
+                "Finish or reconcile the pending canonical work before composing on this device.",
+            )
+        }
+        if (
+            expected.canonicalExecutionSyncOrigin != origin ||
+            expected.canonicalExecutionConfigurationId != configurationId ||
+            !expected.canonicalExecutionHistoryVerified ||
+            !expected.canonicalExecutionHistoryContinuityEstablished ||
+            expected.canonicalExecutionHistoryWindowRevision !=
+            expected.canonicalExecutionRevision ||
+            (expected.canonicalExecutionRevision == 0L) !=
+            expected.canonicalExecutionHistoryWindow.isEmpty() ||
+            expected.canonicalExecutionHistoryWindow.any {
+                it.revision > expected.canonicalExecutionRevision
+            }
+        ) {
+            throw LocalCompositionUnavailableException(
+                "Sync and verify bounded execution history before composing on this device.",
+            )
+        }
+        if (expected.terminalExecutionOutcomes.values.any { outcome ->
+                outcome.requiresCanonicalItemProjection &&
+                    outcome.canonicalProjectionRevision == null &&
+                    outcome.canonicalProjectionResolution == null &&
+                    expected.isNewestExecutionForProjection(outcome.session)
+            }
+        ) {
+            throw LocalCompositionUnavailableException(
+                "Finish the authoritative terminal projection before composing on this device.",
+            )
+        }
+    }
+
     private suspend fun loadConsistentPlan(
         configuration: AuthenticatedApiConfiguration,
         instant: Instant,
@@ -359,6 +614,8 @@ class CanonicalSyncManager(
         val planningDate = instant.atZone(planningZone).toLocalDate()
         for (attempt in 1..MAX_SNAPSHOT_ATTEMPTS) {
             val canonical = loadDelta(configuration, forceCanonicalRebuild)
+            val profile = plannerStore.state.value.scheduleCompositionProfile
+            if (!profile.hasValidShape()) throw RemotePlannerMappingException()
             val request = previewRequest(
                 instant,
                 planningZone,
@@ -380,12 +637,12 @@ class CanonicalSyncManager(
                     availabilityStart = localMinute(
                         planningDate,
                         planningZone,
-                        dayStartMinute,
+                        profile.dayStartMinute,
                     ),
                     availabilityEnd = localMinute(
                         planningDate,
                         planningZone,
-                        dayEndMinute,
+                        profile.dayEndMinute,
                     ),
                 ).copy(configurationId = configuration.configurationId)
                 return AcceptedCanonicalPreview(request, update)
@@ -1039,6 +1296,10 @@ class CanonicalSyncManager(
     suspend fun skipScheduled(blockId: String): CanonicalRefreshOutcome {
         val block = plannerStore.state.value.schedule.firstOrNull { it.id == blockId }
             ?: return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        if (!plannerStore.state.value.hasPublishedExecutionAuthority(block)) {
+            updateError("Sync and publish this on-device plan before changing canonical work.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
         if (
             block.status != ItemStatus.SCHEDULED || block.occurrenceId != null ||
             block.kind !in setOf(ItemKind.TASK, ItemKind.HABIT, ItemKind.ROUTINE, ItemKind.GOAL) ||
@@ -1074,6 +1335,10 @@ class CanonicalSyncManager(
         val planner = plannerStore.state.value
         val block = planner.schedule.firstOrNull { it.id == blockId }
             ?: return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        if (!planner.hasPublishedExecutionAuthority(block)) {
+            updateError("Sync and publish this on-device plan before changing canonical work.")
+            return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
+        }
         if (block.status != ItemStatus.SCHEDULED) {
             updateError("Active or paused synced work must use its exact execution lease to move.")
             return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
@@ -1391,8 +1656,9 @@ class CanonicalSyncManager(
         return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
     }
 
-    private fun unresolvedLocalExecutionMessage(): String? {
-        val state = plannerStore.state.value
+    private fun unresolvedLocalExecutionMessage(
+        state: com.greengolddog.dayweave.model.DayWeaveUiState = plannerStore.state.value,
+    ): String? {
         if (state.schedule.any {
                 it.canonicalItemId != null &&
                     it.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
@@ -2399,15 +2665,19 @@ class CanonicalSyncManager(
         canonicalItems: List<CanonicalItemSnapshot>,
         syncOrigin: String,
         configurationId: String?,
+        cachedState: com.greengolddog.dayweave.model.DayWeaveUiState =
+            plannerStore.state.value,
     ): SchedulePreviewRequest {
         val date = instant.atZone(planningZone).toLocalDate()
         val horizonStart = date.atStartOfDay(planningZone)
         val horizonEnd = date.plusDays(1).atStartOfDay(planningZone)
-        val availableStart = localMinute(date, planningZone, dayStartMinute)
-        val availableEnd = localMinute(date, planningZone, dayEndMinute)
+        val cached = cachedState
+        val profile = cached.scheduleCompositionProfile
+        if (!profile.hasValidShape()) throw RemotePlannerMappingException()
+        val availableStart = localMinute(date, planningZone, profile.dayStartMinute)
+        val availableEnd = localMinute(date, planningZone, profile.dayEndMinute)
         val itemsById = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         val revisions = canonicalItems.associate { it.id to it.revision }
-        val cached = plannerStore.state.value
         val sameOrigin = cached.canonicalSyncOrigin == syncOrigin &&
             cached.canonicalConfigurationId == configurationId
         val relevantOutcomeStart = horizonStart.toInstant().minusSeconds(OUTCOME_CONTEXT_MARGIN_SECONDS)
@@ -2559,6 +2829,11 @@ class CanonicalSyncManager(
                     end = availableEnd.toInstant().toString(),
                 ),
             ),
+            config = ScheduleConfigRequest(
+                slotGranularityMinutes = profile.slotGranularityMinutes,
+                stabilityWeight = profile.stabilityWeight,
+                defaultSoftWeight = profile.defaultSoftWeight,
+            ),
             previousAssignments = previous,
             recurrenceContext = buildJsonObject {
                 put(
@@ -2657,6 +2932,8 @@ class CanonicalSyncManager(
         planningZone: ZoneId,
         availabilityStart: ZonedDateTime,
         availabilityEnd: ZonedDateTime,
+        inputDigestPattern: Regex = DIGEST_PATTERN,
+        preservationState: com.greengolddog.dayweave.model.DayWeaveUiState? = null,
     ): CanonicalPlanUpdate {
         val items = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         if (
@@ -2664,7 +2941,7 @@ class CanonicalSyncManager(
             preview.sourceItemRevisions.size != preview.sourceItemCount ||
             preview.acceptedItemCount < 0 ||
             preview.acceptedItemCount + preview.rejectedItems.size != preview.sourceItemCount ||
-            !preview.inputDigest.matches(DIGEST_PATTERN) ||
+            !preview.inputDigest.matches(inputDigestPattern) ||
             preview.rejectedItems.size > MAX_CANONICAL_ITEMS ||
             preview.plan.blocks.size > MAX_SCHEDULE_BLOCKS ||
             preview.plan.unscheduled.size > MAX_CANONICAL_ITEMS ||
@@ -2788,7 +3065,14 @@ class CanonicalSyncManager(
 
         val schedule = preview.plan.blocks.map { block ->
             mapScheduleBlock(block, items, planningDate, planningZone)
-        }.let { preserveLocalSessionState(it, items, syncOrigin) }
+        }.let {
+            preserveLocalSessionState(
+                composed = it,
+                items = items,
+                syncOrigin = syncOrigin,
+                cached = preservationState ?: plannerStore.state.value,
+            )
+        }
         if (schedule.sumOf(::estimatedScheduleItemBytes) > MAX_SCHEDULE_CACHE_ESTIMATED_BYTES) {
             throw RemotePlannerMappingException()
         }
@@ -3039,8 +3323,8 @@ class CanonicalSyncManager(
         composed: List<ScheduleItem>,
         items: Map<String, CanonicalItemSnapshot>,
         syncOrigin: String,
+        cached: com.greengolddog.dayweave.model.DayWeaveUiState,
     ): List<ScheduleItem> {
-        val cached = plannerStore.state.value
         if (cached.canonicalSyncOrigin != syncOrigin) return composed
         val previous = cached.schedule
         val composedCounts = composed.groupingBy { it.canonicalItemId to it.occurrenceId }
@@ -3285,6 +3569,25 @@ class CanonicalSyncManager(
                 "The server planner contract is incompatible with this DayWeave build.",
                 CanonicalRefreshOutcome.PROTOCOL_FAILURE,
             )
+            is LocalScheduleCompositionProtocolException,
+            is LocalScheduleCompositionRejectedException,
+            is LocalScheduleCompositionRequestException,
+            is LocalScheduleCompositionRequestTooLargeException,
+            -> Triple(
+                CanonicalSyncPhase.ERROR,
+                "The bundled scheduler rejected or returned an invalid local composition.",
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            )
+            is LocalCompositionGenerationChangedException -> Triple(
+                CanonicalSyncPhase.READY,
+                "Planner inputs changed; the on-device result was discarded safely.",
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            )
+            is LocalCompositionUnavailableException -> Triple(
+                CanonicalSyncPhase.READY,
+                error.message ?: "On-device composition is not available yet.",
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            )
             is SchedulePublicationRecoveryExhaustedException -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "Canonical items kept changing during publication. Recompose again to publish a fresh schedule.",
@@ -3463,6 +3766,12 @@ class CanonicalSyncManager(
     private class RecurrenceContextCapacityException :
         IllegalStateException("Recurrence preview context capacity exceeded")
 
+    private class LocalCompositionUnavailableException(message: String) :
+        IllegalStateException(message)
+
+    private class LocalCompositionGenerationChangedException :
+        IllegalStateException("Local composition input generation changed")
+
     private object JsonObjectParser {
         private val json = Json
 
@@ -3476,8 +3785,6 @@ class CanonicalSyncManager(
     companion object {
         private val TERMINAL_DISPLAY_STATUSES = setOf(ItemStatus.COMPLETED, ItemStatus.SKIPPED)
         private const val MINUTES_PER_DAY = 24 * 60
-        private const val DEFAULT_DAY_START_MINUTE = 7 * 60
-        private const val DEFAULT_DAY_END_MINUTE = 22 * 60
         private const val MAX_BLOCK_MINUTES = 2 * MINUTES_PER_DAY
         private const val MAX_CANONICAL_ITEMS = 10_000
         private const val MAX_SCHEDULE_PUBLICATION_RECOVERY_RECOMPOSITIONS = 1
@@ -3510,6 +3817,9 @@ class CanonicalSyncManager(
         private const val PUBLICATION_CLOCK_SKEW_SECONDS = 5 * 60L
         private val NIL_UUID = UUID(0L, 0L)
         private val DIGEST_PATTERN = Regex("^sha256:[0-9a-f]{64}$")
+        private val LOCAL_FINGERPRINT_PATTERN = Regex("^local-sha256:[0-9a-f]{64}$")
+        private const val EMPTY_SHA256_FINGERPRINT =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         private val SUPPORTED_BLOCK_KINDS = setOf(
             "planned",
             "pinned",

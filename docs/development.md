@@ -5,7 +5,9 @@
 - Rust 1.95 with `rustfmt` and `clippy`
 - Swift 6.2 or newer; full Xcode for UI tests, widgets, entitlements, and
   extension targets
-- JDK 17 or newer and the Android SDK for the Android client
+- JDK 17 or newer and the Android SDK for the Android client. Android native
+  scheduler builds additionally require NDK `28.2.13676358` plus Rust `1.95.0`
+  targets `aarch64-linux-android` and `x86_64-linux-android`.
 - Docker Engine/Compose for the local backend stack
 - Codex CLI for embedded App Server development
 - Nebius CLI only for deployment work
@@ -21,7 +23,7 @@ cargo test --locked --package dayweave-scheduler-helper --all-targets --all-feat
 scripts/build-macos-scheduler-helper.sh
 swift build --package-path apps/macos
 ./scripts/test-macos.sh -Xswiftc -warnings-as-errors
-apps/android/gradlew --project-dir apps/android test lint assembleDebug
+apps/android/gradlew --project-dir apps/android test lint assembleDebug compileDebugAndroidTestKotlin
 python3 -B scripts/test-repository-credential-scanner.py
 python3 -B scripts/scan-repository-credentials.py all
 scripts/test-create-android-signing-key.sh
@@ -99,6 +101,26 @@ including linked-worktree Git and common directories; both inputs must remain
 regular, single-link, non-symlink files with mode `0600`. The signing
 containment regression uses only synthetic temporary files and refuses the
 unsafe paths before any Gradle or signing command can run.
+
+The Android client packages a bounded Rust JNI scheduler for `arm64-v8a` and
+`x86_64`; both debug and release builds generate the libraries rather than
+using checked-in binaries. Install the pinned NDK through the SDK manager and
+the two targets for the repository-pinned toolchain, then run the equivalent
+native gates locally:
+
+```sh
+sdkmanager --install "ndk;28.2.13676358"
+rustup target add --toolchain 1.95.0 aarch64-linux-android x86_64-linux-android
+scripts/build-android-scheduler-library.sh debug
+scripts/build-android-scheduler-library.sh release
+scripts/tests/test-build-android-scheduler-library-hostile-environment.sh debug
+apps/android/gradlew --project-dir apps/android test lint assembleDebug assembleRelease compileDebugAndroidTestKotlin
+```
+
+`ANDROID_HOME` (or `ANDROID_SDK_ROOT`) must identify that SDK. The native
+script writes only ignored generated `app/build/generated/jniLibs/` output and
+verifies the bounded JNI library; do not place generated libraries, credentials,
+or signing material under source control.
 
 ## Local API
 

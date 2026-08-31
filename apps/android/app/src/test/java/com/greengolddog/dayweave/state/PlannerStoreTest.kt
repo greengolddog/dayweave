@@ -24,6 +24,7 @@ import com.greengolddog.dayweave.model.PublishedScheduleProofSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.SuggestionDisposition
 import com.greengolddog.dayweave.model.SuggestionKind
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
@@ -281,6 +282,59 @@ class PlannerStoreTest {
         }
         assertTrue(stale.isFailure)
         assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
+    fun schedulingProfileChangeRevokesPublicationAuthorityAndRejectsUncertaintyOrLease() {
+        val block = canonicalBlock(ItemStatus.SCHEDULED, 7)
+        val store = PlannerStore(publishedCanonicalState(block = block))
+        val original = store.state.value
+
+        assertTrue(store.updateScheduleCompositionProfile(original.scheduleCompositionProfile))
+        assertEquals(original.publishedScheduleProof, store.state.value.publishedScheduleProof)
+
+        assertTrue(
+            store.updateScheduleCompositionProfile(
+                ScheduleCompositionProfileSnapshot(dayStartMinute = 8 * 60),
+            ),
+        )
+        assertEquals(listOf(block), store.state.value.schedule)
+        assertNull(store.state.value.publishedScheduleRevision)
+        assertNull(store.state.value.publishedScheduleProof)
+        assertNull(store.state.value.scheduleInputDigest)
+        assertTrue(store.isCanonicalExecutionStartBlocked(block.id))
+
+        val pending = publication(
+            canonicalUpdate(
+                item = canonicalItem("planned", 8),
+                block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                cursor = "cursor-profile-pending",
+            ),
+        )
+        val pendingStore = PlannerStore(DayWeaveUiState())
+        assertNotNull(pendingStore.stageSchedulePublication(pending))
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            pendingStore.updateScheduleCompositionProfile(
+                ScheduleCompositionProfileSnapshot(dayStartMinute = 8 * 60),
+            )
+        }
+        assertEquals(pending, pendingStore.state.value.pendingSchedulePublication)
+
+        val lease = executionSession("active", 1)
+        val leaseStore = PlannerStore(
+            publishedCanonicalState(block = block.copy(status = ItemStatus.ACTIVE)).copy(
+                canonicalExecutionSyncOrigin = CANONICAL_ORIGIN,
+                canonicalExecutionConfigurationId = "connection-1",
+                canonicalExecutionRevision = 1,
+                canonicalExecutionSession = lease,
+            ),
+        )
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            leaseStore.updateScheduleCompositionProfile(
+                ScheduleCompositionProfileSnapshot(dayStartMinute = 8 * 60),
+            )
+        }
+        assertNotNull(leaseStore.state.value.publishedScheduleProof)
     }
 
     @Test

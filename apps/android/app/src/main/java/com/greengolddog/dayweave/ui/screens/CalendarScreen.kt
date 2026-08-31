@@ -39,7 +39,9 @@ fun CalendarScreen(
     modifier: Modifier = Modifier,
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
-    val visibleTimeline = if (isCurrentPlan) state.visibleSchedule else emptyList()
+    val isDisplayCurrent = state.isScheduleDisplayCurrent()
+    val isLocalPlan = isDisplayCurrent && !isCurrentPlan
+    val visibleTimeline = if (isDisplayCurrent) state.visibleSchedule else emptyList()
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(16.dp),
@@ -54,7 +56,9 @@ fun CalendarScreen(
                 Column {
                     Text("This week", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        if (isCurrentPlan) {
+                        if (isLocalPlan) {
+                            "On-device plan · sync before canonical actions"
+                        } else if (isCurrentPlan) {
                             "Canonical schedule preview · Google connection is configured separately"
                         } else {
                             "Cached schedule is stale and hidden until today is recomposed"

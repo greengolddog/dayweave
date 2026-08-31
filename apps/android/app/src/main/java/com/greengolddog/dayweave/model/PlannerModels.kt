@@ -7,9 +7,15 @@ import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 @Serializable
 enum class AppDestination(val label: String) {
@@ -556,6 +562,221 @@ data class CanonicalPlanUpdate(
     val message: String,
 )
 
+/**
+ * Encrypted, device-local evidence for a schedule composed by the bundled deterministic core.
+ *
+ * This is display provenance only. It deliberately contains no server input digest, published
+ * revision, publication proof, or execution authority, and therefore can never authorize a
+ * canonical execution command or a schedule publication.
+ */
+@Serializable
+data class LocalScheduleCompositionProvenanceSnapshot(
+    val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    val syncOrigin: String,
+    val configurationId: String,
+    val deltaCursor: String,
+    val localInputFingerprint: String,
+    /** Digest of the exact helper request, including work windows/config/fixed blocks. */
+    val scheduleRequestFingerprint: String,
+    /** Digest of every mutable planner input that must invalidate display provenance. */
+    val stateInputFingerprint: String,
+    val generatedAt: String,
+    val asOf: String,
+    val horizonStart: String,
+    val horizonEnd: String,
+    val timezoneName: String,
+    val sourceItemRevisions: Map<String, Long>,
+) {
+    fun hasValidShape(): Boolean = runCatching {
+        require(schemaVersion == CURRENT_SCHEMA_VERSION)
+        requireBoundedText(syncOrigin, MAX_BINDING_CHARS)
+        requireBoundedText(configurationId, MAX_BINDING_CHARS)
+        require(
+            deltaCursor.toByteArray(Charsets.UTF_8).size in 1..MAX_CURSOR_BYTES &&
+                deltaCursor.all { character ->
+                    character.code in 0x21..0x7e && character != '"' && character != '\\'
+                },
+        )
+        require(
+            localInputFingerprint.length == LOCAL_FINGERPRINT_PREFIX.length + 64 &&
+                localInputFingerprint.startsWith(LOCAL_FINGERPRINT_PREFIX) &&
+                localInputFingerprint.drop(LOCAL_FINGERPRINT_PREFIX.length).all {
+                    it in '0'..'9' || it in 'a'..'f'
+                },
+        )
+        requireSha256(scheduleRequestFingerprint)
+        requireSha256(stateInputFingerprint)
+        val generated = requireCanonicalInstant(generatedAt)
+        val requestAsOf = requireCanonicalInstant(asOf)
+        val start = requireCanonicalInstant(horizonStart)
+        val end = requireCanonicalInstant(horizonEnd)
+        require(generated == requestAsOf && start <= requestAsOf && requestAsOf < end)
+        val zone = ZoneId.of(timezoneName)
+        val horizonDate = start.atZone(zone).toLocalDate()
+        require(
+            start == horizonDate.atStartOfDay(zone).toInstant() &&
+                end == horizonDate.plusDays(1).atStartOfDay(zone).toInstant() &&
+                requestAsOf.atZone(zone).toLocalDate() == horizonDate,
+        )
+        require(sourceItemRevisions.size <= MAX_SOURCE_ITEMS)
+        sourceItemRevisions.forEach { (id, revision) ->
+            val parsed = UUID.fromString(id)
+            require(parsed.toString() == id && revision > 0)
+        }
+    }.isSuccess
+
+    fun matchesState(state: DayWeaveUiState): Boolean {
+        if (state.hasMemoizedLocalScheduleCompositionValidation(this)) return true
+        if (!hasValidShape()) return false
+        if (!state.scheduleCompositionProfile.hasValidShape()) return false
+        if (
+            state.canonicalSyncOrigin != syncOrigin ||
+            state.canonicalConfigurationId != configurationId ||
+            state.canonicalDeltaCursor != deltaCursor ||
+            state.scheduleGeneratedAt != generatedAt ||
+            state.schedulePlanningZoneId != timezoneName ||
+            state.pendingSchedulePublication != null ||
+            state.publishedScheduleRevision != null ||
+            state.publishedScheduleProof != null ||
+            state.scheduleInputDigest != null
+        ) {
+            return false
+        }
+        val revisions = state.canonicalItems.associate { it.id to it.revision }
+        if (revisions != sourceItemRevisions) return false
+        if (state.localScheduleCompositionStateFingerprint() != stateInputFingerprint) return false
+        val matchesBlocks = state.schedule.all { block ->
+            val itemId = block.canonicalItemId ?: return@all true
+            val revision = block.canonicalRevision ?: return@all false
+            sourceItemRevisions[itemId] == revision
+        }
+        if (matchesBlocks) state.memoizeLocalScheduleCompositionValidation(this)
+        return matchesBlocks
+    }
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+        private const val MAX_BINDING_CHARS = 4_096
+        private const val MAX_CURSOR_BYTES = 256
+        private const val MAX_SOURCE_ITEMS = 10_000
+        private const val LOCAL_FINGERPRINT_PREFIX = "local-sha256:"
+        private const val SHA256_PREFIX = "sha256:"
+
+        private fun requireBoundedText(raw: String, limit: Int) {
+            require(raw.isNotBlank() && raw.length <= limit && raw.none(Char::isISOControl))
+        }
+
+        private fun requireCanonicalInstant(raw: String): Instant = Instant.parse(raw).also {
+            require(it.toString() == raw)
+        }
+
+        private fun requireSha256(raw: String) {
+            require(
+                raw.length == SHA256_PREFIX.length + 64 && raw.startsWith(SHA256_PREFIX) &&
+                    raw.drop(SHA256_PREFIX.length).all {
+                        it in '0'..'9' || it in 'a'..'f'
+                    },
+            )
+        }
+    }
+}
+
+/** Encrypted scheduling policy used by both remote and bundled deterministic composition. */
+@Serializable
+data class ScheduleCompositionProfileSnapshot(
+    val dayStartMinute: Int = 7 * 60,
+    val dayEndMinute: Int = 22 * 60,
+    val slotGranularityMinutes: Int = 5,
+    val stabilityWeight: Int = 4,
+    val defaultSoftWeight: Int = 100,
+) {
+    fun hasValidShape(): Boolean =
+        dayStartMinute in 0 until MINUTES_PER_DAY &&
+            dayEndMinute in 1..MINUTES_PER_DAY && dayEndMinute > dayStartMinute &&
+            slotGranularityMinutes in 1..60 &&
+            stabilityWeight in 0..1_000_000 &&
+            defaultSoftWeight in 0..1_000_000
+
+    private companion object {
+        const val MINUTES_PER_DAY = 24 * 60
+    }
+}
+
+@Serializable
+private data class LocalScheduleMutableInputSnapshot(
+    val scheduleCompositionProfile: ScheduleCompositionProfileSnapshot,
+    val canonicalItems: List<CanonicalItemSnapshot>,
+    val schedule: List<ScheduleItem>,
+    val recurrenceOutcomes: Map<String, RecurrenceOutcomeSnapshot>,
+    val recurrenceMoves: Map<String, RecurrenceMoveSnapshot>,
+    val recurrenceCompletionAnchors: Map<String, String>,
+    val occurrenceSeriesItemIds: Map<String, String>,
+    val recurrenceOccurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot>,
+    val canonicalExecutionSyncOrigin: String?,
+    val canonicalExecutionConfigurationId: String?,
+    val canonicalExecutionRevision: Long,
+    val canonicalExecutionSession: CanonicalExecutionSessionSnapshot?,
+    val canonicalExecutionHistoryWindow: List<CanonicalExecutionSessionSnapshot>,
+    val canonicalExecutionHistoryWindowRevision: Long?,
+    val canonicalExecutionHistoryContinuityEstablished: Boolean,
+    val terminalExecutionOutcomes: Map<String, TerminalExecutionOutcomeSnapshot>,
+    val hasPendingExecutionCommand: Boolean,
+    val hasPendingExecutionDeferIntent: Boolean,
+    val hasActiveSession: Boolean,
+    val hasPendingCanonicalMutation: Boolean,
+    val hasPendingCanonicalAuthoringMutation: Boolean,
+    val hasPendingProposalApplicationMutation: Boolean,
+)
+
+/** Content-free deterministic fence for every mutable input currently used by previewRequest. */
+fun DayWeaveUiState.localScheduleCompositionStateFingerprint(): String {
+    localScheduleCompositionFingerprintMemo.get()?.let { return it }
+    LOCAL_COMPOSITION_FINGERPRINT_COMPUTATIONS.incrementAndGet()
+    val snapshot = LocalScheduleMutableInputSnapshot(
+        scheduleCompositionProfile = scheduleCompositionProfile,
+        canonicalItems = canonicalItems.sortedBy(CanonicalItemSnapshot::id),
+        schedule = schedule,
+        recurrenceOutcomes = recurrenceOutcomes.toSortedMap(),
+        recurrenceMoves = recurrenceMoves.toSortedMap(),
+        recurrenceCompletionAnchors = recurrenceCompletionAnchors.toSortedMap(),
+        occurrenceSeriesItemIds = occurrenceSeriesItemIds.toSortedMap(),
+        recurrenceOccurrenceSources = recurrenceOccurrenceSources.toSortedMap(),
+        canonicalExecutionSyncOrigin = canonicalExecutionSyncOrigin,
+        canonicalExecutionConfigurationId = canonicalExecutionConfigurationId,
+        canonicalExecutionRevision = canonicalExecutionRevision,
+        canonicalExecutionSession = canonicalExecutionSession,
+        canonicalExecutionHistoryWindow = canonicalExecutionHistoryWindow.sortedBy { it.revision },
+        canonicalExecutionHistoryWindowRevision = canonicalExecutionHistoryWindowRevision,
+        canonicalExecutionHistoryContinuityEstablished =
+            canonicalExecutionHistoryContinuityEstablished,
+        terminalExecutionOutcomes = terminalExecutionOutcomes.toSortedMap(),
+        hasPendingExecutionCommand = pendingExecutionCommand != null,
+        hasPendingExecutionDeferIntent = pendingExecutionDeferIntent != null,
+        hasActiveSession = activeSession != null,
+        hasPendingCanonicalMutation = pendingCanonicalMutation != null,
+        hasPendingCanonicalAuthoringMutation = pendingCanonicalAuthoringMutations.isNotEmpty(),
+        hasPendingProposalApplicationMutation = pendingProposalApplicationMutation != null,
+    )
+    val bytes = LOCAL_COMPOSITION_FINGERPRINT_JSON.encodeToString(snapshot)
+        .toByteArray(Charsets.UTF_8)
+    val fingerprint = "sha256:" + MessageDigest.getInstance("SHA-256")
+        .digest(bytes).joinToString("") {
+        byte -> "%02x".format(byte.toInt() and 0xff)
+    }
+    localScheduleCompositionFingerprintMemo.compareAndSet(null, fingerprint)
+    return localScheduleCompositionFingerprintMemo.get() ?: fingerprint
+}
+
+internal fun localScheduleCompositionFingerprintComputationCount(): Long =
+    LOCAL_COMPOSITION_FINGERPRINT_COMPUTATIONS.get()
+
+private val LOCAL_COMPOSITION_FINGERPRINT_COMPUTATIONS = AtomicLong(0)
+
+private val LOCAL_COMPOSITION_FINGERPRINT_JSON = Json {
+    encodeDefaults = true
+    explicitNulls = true
+}
+
 @Serializable
 data class PublishedScheduleRevisionSnapshot(
     val id: String,
@@ -876,6 +1097,9 @@ data class DayWeaveUiState(
     val showCompleted: Boolean = true,
     val quietSuggestions: Boolean = true,
     val useDynamicColor: Boolean = false,
+    /** Durable work window and scheduler weights; changing any field invalidates local provenance. */
+    val scheduleCompositionProfile: ScheduleCompositionProfileSnapshot =
+        ScheduleCompositionProfileSnapshot(),
     /** User-controlled foreground Health Connect reads; never implies background access. */
     val healthConnectSyncEnabled: Boolean = false,
     /** Derived bands only. Raw Health Connect records are never persisted in planner state. */
@@ -898,6 +1122,8 @@ data class DayWeaveUiState(
     /** Exact, encrypted publication authority. Legacy revision receipts are not actionable. */
     val publishedScheduleProof: PublishedScheduleProofSnapshot? = null,
     val scheduleInputDigest: String? = null,
+    /** Display-only evidence for a bundled-core composition; never publication authority. */
+    val localScheduleCompositionProvenance: LocalScheduleCompositionProvenanceSnapshot? = null,
     val scheduleGeneratedAt: String? = null,
     val schedulePlanningZoneId: String? = null,
     val rejectedCanonicalItemCount: Int = 0,
@@ -955,6 +1181,82 @@ data class DayWeaveUiState(
     /** Exact source envelopes for visible occurrence-scoped actions. */
     val recurrenceOccurrenceSources: Map<String, RecurrenceOccurrenceSourceSnapshot> = emptyMap(),
 ) {
+    /** Non-serialized memo: a copied state starts untrusted unless the store transfers it safely. */
+    @Transient
+    internal val localScheduleCompositionFingerprintMemo = AtomicReference<String?>(null)
+    @Transient
+    private val localScheduleCompositionValidationMemo =
+        AtomicReference<LocalScheduleCompositionProvenanceSnapshot?>(null)
+
+    internal fun inheritLocalScheduleCompositionMemo(previous: DayWeaveUiState) {
+        if (!hasSameLocalScheduleCompositionInputsByReference(previous)) return
+        previous.localScheduleCompositionFingerprintMemo.get()?.let {
+            localScheduleCompositionFingerprintMemo.compareAndSet(null, it)
+        }
+        previous.localScheduleCompositionValidationMemo.get()?.let { provenance ->
+            if (localScheduleCompositionProvenance === provenance) {
+                localScheduleCompositionValidationMemo.compareAndSet(null, provenance)
+            }
+        }
+    }
+
+    private fun hasSameLocalScheduleCompositionInputsByReference(
+        previous: DayWeaveUiState,
+    ): Boolean =
+        scheduleCompositionProfile == previous.scheduleCompositionProfile &&
+            canonicalItems === previous.canonicalItems &&
+            schedule === previous.schedule &&
+            recurrenceOutcomes === previous.recurrenceOutcomes &&
+            recurrenceMoves === previous.recurrenceMoves &&
+            recurrenceCompletionAnchors === previous.recurrenceCompletionAnchors &&
+            occurrenceSeriesItemIds === previous.occurrenceSeriesItemIds &&
+            recurrenceOccurrenceSources === previous.recurrenceOccurrenceSources &&
+            canonicalExecutionSyncOrigin == previous.canonicalExecutionSyncOrigin &&
+            canonicalExecutionConfigurationId == previous.canonicalExecutionConfigurationId &&
+            canonicalExecutionRevision == previous.canonicalExecutionRevision &&
+            canonicalExecutionSession == previous.canonicalExecutionSession &&
+            canonicalExecutionHistoryWindow === previous.canonicalExecutionHistoryWindow &&
+            canonicalExecutionHistoryWindowRevision ==
+            previous.canonicalExecutionHistoryWindowRevision &&
+            canonicalExecutionHistoryContinuityEstablished ==
+            previous.canonicalExecutionHistoryContinuityEstablished &&
+            terminalExecutionOutcomes === previous.terminalExecutionOutcomes &&
+            (pendingExecutionCommand != null) == (previous.pendingExecutionCommand != null) &&
+            (pendingExecutionDeferIntent != null) ==
+            (previous.pendingExecutionDeferIntent != null) &&
+            (activeSession != null) == (previous.activeSession != null) &&
+            (pendingCanonicalMutation != null) ==
+            (previous.pendingCanonicalMutation != null) &&
+            pendingCanonicalAuthoringMutations.isEmpty() ==
+            previous.pendingCanonicalAuthoringMutations.isEmpty() &&
+            (pendingProposalApplicationMutation != null) ==
+            (previous.pendingProposalApplicationMutation != null) &&
+            canonicalSyncOrigin == previous.canonicalSyncOrigin &&
+            canonicalConfigurationId == previous.canonicalConfigurationId &&
+            canonicalDeltaCursor == previous.canonicalDeltaCursor &&
+            scheduleGeneratedAt == previous.scheduleGeneratedAt &&
+            schedulePlanningZoneId == previous.schedulePlanningZoneId &&
+            pendingSchedulePublication === previous.pendingSchedulePublication &&
+            publishedScheduleRevision === previous.publishedScheduleRevision &&
+            publishedScheduleProof === previous.publishedScheduleProof &&
+            scheduleInputDigest == previous.scheduleInputDigest &&
+            localScheduleCompositionProvenance ===
+            previous.localScheduleCompositionProvenance
+
+    internal fun hasMemoizedLocalScheduleCompositionValidation(
+        provenance: LocalScheduleCompositionProvenanceSnapshot,
+    ): Boolean =
+        localScheduleCompositionProvenance === provenance &&
+            localScheduleCompositionValidationMemo.get() === provenance
+
+    internal fun memoizeLocalScheduleCompositionValidation(
+        provenance: LocalScheduleCompositionProvenanceSnapshot,
+    ) {
+        if (localScheduleCompositionProvenance === provenance) {
+            localScheduleCompositionValidationMemo.compareAndSet(null, provenance)
+        }
+    }
+
     val visibleSchedule: List<ScheduleItem>
         get() = schedule
             .filter { showCompleted || it.status != ItemStatus.COMPLETED }
@@ -1042,6 +1344,21 @@ data class DayWeaveUiState(
         } ?: return false
         return proof.revision.timezoneName == zone.id && zone == currentZone &&
             canonicalPlanningDate() == reference.atZone(currentZone).toLocalDate()
+    }
+
+    /** Allows a current bundled-core plan to remain visible while all server actions stay locked. */
+    fun isScheduleDisplayCurrent(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): Boolean {
+        if (isCanonicalPlanCurrent(reference, currentZone)) return true
+        val provenance = localScheduleCompositionProvenance ?: return false
+        if (!provenance.matchesState(this)) return false
+        val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return false
+        val horizonDate = runCatching {
+            Instant.parse(provenance.horizonStart).atZone(zone).toLocalDate()
+        }.getOrNull() ?: return false
+        return zone == currentZone && horizonDate == reference.atZone(currentZone).toLocalDate()
     }
 
     /** Exact publication authority for one unchanged canonical server block. */

@@ -10,12 +10,15 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
+import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.model.localScheduleCompositionFingerprintComputationCount
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -42,6 +45,10 @@ import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
+import com.greengolddog.dayweave.scheduler.LocalScheduleComposer
+import com.greengolddog.dayweave.scheduler.LocalScheduleComposition
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestException
+import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestTooLargeException
 import java.time.Instant
 import java.time.ZoneId
 import java.io.IOException
@@ -3123,9 +3130,20 @@ class CanonicalSyncManagerTest {
             isHardConstraint = true,
             canonicalBlockKind = "pinned",
         )
+        val publishedProof = requireNotNull(initialStore.state.value.publishedScheduleProof)
+        val pinnedSiblingProof = publishedProof.blocks.single().copy(
+            id = SECOND_BLOCK_ID,
+            sessionIndex = 1,
+            start = "2026-09-01T08:00:00Z",
+            end = "2026-09-01T08:30:00Z",
+            kind = "pinned",
+        )
         val unsafeStates = listOf(
             initialStore.state.value.copy(
                 schedule = initialStore.state.value.schedule + pinnedSibling,
+                publishedScheduleProof = publishedProof.copy(
+                    blocks = publishedProof.blocks + pinnedSiblingProof,
+                ),
             ),
             initialStore.state.value.copy(
                 unscheduledWork = listOf(
@@ -3148,7 +3166,10 @@ class CanonicalSyncManagerTest {
                 unsafeManager.doLater(BLOCK_ID, clock.plusSeconds(4 * 3_600L)),
             )
             assertTrue(unsafeStore.state.value.recurrenceMoves.isEmpty())
-            assertTrue(unsafeManager.state.value.message.contains("fully scheduled and flexible"))
+            assertTrue(
+                unsafeManager.state.value.message,
+                unsafeManager.state.value.message.contains("fully scheduled and flexible"),
+            )
         }
         assertEquals(previewCount, transport.previewRequests.size)
     }
@@ -3679,19 +3700,562 @@ class CanonicalSyncManagerTest {
         assertEquals(1, transport.restoreRequests.size)
     }
 
+    @Test
+    fun localCompositionInstallsOnlyEncryptedDisplayProvenanceWithoutNetworkAuthority() =
+        runBlocking {
+            val initial = localCompositionReadyState()
+            val plannerStore = PlannerStore(initial)
+            val transport = FakeCanonicalTransport()
+            var request: SchedulePreviewRequest? = null
+            val composer = LocalScheduleComposer { _, incoming ->
+                request = incoming
+                emptyLocalComposition(incoming)
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(
+                    plannerStore,
+                    transport,
+                    localScheduleComposer = composer,
+                ).composeLocally(),
+            )
+
+            val installed = plannerStore.state.value
+            val provenance = requireNotNull(installed.localScheduleCompositionProvenance)
+            assertTrue(provenance.matchesState(installed))
+            assertTrue(installed.isScheduleDisplayCurrent(clock, ZoneId.of("Europe/Madrid")))
+            assertFalse(installed.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+            assertEquals(initial.canonicalDeltaCursor, installed.canonicalDeltaCursor)
+            assertEquals(initial.canonicalExecutionRevision, installed.canonicalExecutionRevision)
+            assertEquals(null, installed.scheduleInputDigest)
+            assertEquals(null, installed.publishedScheduleRevision)
+            assertEquals(null, installed.publishedScheduleProof)
+            assertEquals(7 * 60, installed.scheduleCompositionProfile.dayStartMinute)
+            assertEquals("2026-09-01T05:00:00Z", request?.availability?.single()?.start)
+            assertTrue(transport.deltaCursors.isEmpty())
+            assertTrue(transport.previewRequests.isEmpty())
+            assertTrue(transport.publicationRequests.isEmpty())
+        }
+
+    @Test
+    fun localAdapterRequestFailuresUseFixedProtocolOutcomeWithoutMutationOrNetwork() = runBlocking {
+        listOf<() -> RuntimeException>(
+            { LocalScheduleCompositionRequestTooLargeException() },
+            { LocalScheduleCompositionRequestException() },
+        ).forEach { failure ->
+            val initial = localCompositionReadyState()
+            val plannerStore = PlannerStore(initial)
+            val transport = FakeCanonicalTransport()
+            val manager = manager(
+                plannerStore,
+                transport,
+                localScheduleComposer = LocalScheduleComposer { _, _ -> throw failure() },
+            )
+
+            assertEquals(CanonicalRefreshOutcome.PROTOCOL_FAILURE, manager.composeLocally())
+            assertEquals(
+                "The bundled scheduler rejected or returned an invalid local composition.",
+                manager.state.value.message,
+            )
+            assertEquals(initial, plannerStore.state.value)
+            assertEquals(initial, plannerStore.durableState.value)
+            assertTrue(transport.deltaCursors.isEmpty())
+            assertTrue(transport.previewRequests.isEmpty())
+            assertTrue(transport.publicationRequests.isEmpty())
+        }
+    }
+
+    @Test
+    fun nonEmptyLocalCompositionMapsCanonicalBlockButKeepsEveryActionFailClosed() = runBlocking {
+        val item = localCanonicalItem()
+        val initial = localCompositionReadyState().copy(canonicalItems = listOf(item))
+        val plannerStore = PlannerStore(initial)
+        val manager = manager(
+            plannerStore,
+            FakeCanonicalTransport(),
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                LocalScheduleComposition(
+                    localInputFingerprint = "local-sha256:${"c".repeat(64)}",
+                    scheduleRequestFingerprint = "sha256:${"d".repeat(64)}",
+                    sourceItemCount = 1,
+                    sourceItemRevisions = mapOf(item.id to item.revision),
+                    acceptedItemCount = 1,
+                    rejectedItems = emptyList(),
+                    ignoredPreviousAssignments = emptyList(),
+                    plan = RemoteSchedulePlan(
+                        asOf = request.asOf,
+                        horizonStart = request.horizonStart,
+                        horizonEnd = request.horizonEnd,
+                        blocks = listOf(
+                            RemoteScheduleBlock(
+                                id = BLOCK_ID,
+                                isSensitive = false,
+                                itemId = item.id,
+                                title = item.title,
+                                start = "2026-09-01T08:00:00Z",
+                                end = "2026-09-01T08:30:00Z",
+                                sessionIndex = 0,
+                                kind = "planned",
+                            ),
+                        ),
+                        unscheduled = emptyList(),
+                        score = RemotePlanScore(30, 0, 0, 0),
+                    ),
+                )
+            },
+        )
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.composeLocally())
+        val block = plannerStore.state.value.schedule.single()
+        assertEquals(item.id, block.canonicalItemId)
+        assertEquals(item.revision, block.canonicalRevision)
+        assertEquals(0, block.sessionIndex)
+        assertFalse(plannerStore.state.value.hasPublishedExecutionAuthority(block))
+        assertTrue(plannerStore.isCanonicalExecutionStartBlocked(block.id))
+        assertEquals(
+            CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            manager.skipScheduled(block.id),
+        )
+        assertEquals(ItemStatus.SCHEDULED, plannerStore.state.value.schedule.single().status)
+    }
+
+    @Test
+    fun localCompositionRequiresExactVerifiedExecutionBaselineBeforeNativeCall() = runBlocking {
+        val invalidStates = listOf(
+            localCompositionReadyState().copy(canonicalExecutionSyncOrigin = null),
+            localCompositionReadyState().copy(
+                canonicalExecutionConfigurationId = "other-binding",
+            ),
+            localCompositionReadyState().copy(canonicalExecutionHistoryVerified = false),
+            localCompositionReadyState().copy(
+                canonicalExecutionHistoryContinuityEstablished = false,
+            ),
+        )
+        invalidStates.forEach { initial ->
+            val plannerStore = PlannerStore(initial)
+            var composeCalls = 0
+            val outcome = manager(
+                plannerStore,
+                FakeCanonicalTransport(),
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    composeCalls += 1
+                    emptyLocalComposition(request)
+                },
+            ).composeLocally()
+
+            assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+            assertEquals(0, composeCalls)
+            assertEquals(initial, plannerStore.state.value)
+        }
+    }
+
+    @Test
+    fun lifecycleInvalidationImmediatelyBeforeNativeCallNeverInvokesComposer() = runBlocking {
+        val plannerStore = PlannerStore(localCompositionReadyState())
+        val fence = SequencedLocalCompositionFence(listOf(true, false))
+        var composeCalls = 0
+
+        val outcome = manager(
+            plannerStore,
+            FakeCanonicalTransport(),
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                composeCalls += 1
+                emptyLocalComposition(request)
+            },
+            localCompositionLifecycleFence = fence,
+        ).composeLocally(fence.captureGeneration())
+
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+        assertEquals(0, composeCalls)
+        assertEquals(null, plannerStore.state.value.localScheduleCompositionProvenance)
+    }
+
+    @Test
+    fun finalPreinstallFenceDiscardsBackgroundedResultAfterMapping() = runBlocking {
+        val initial = localCompositionReadyState()
+        val plannerStore = PlannerStore(initial)
+        // Initial admission, immediately before JNI, and post-JNI pass. The exact final check
+        // immediately before the encrypted install observes the privacy boundary.
+        val fence = SequencedLocalCompositionFence(listOf(true, true, true, false))
+
+        val outcome = manager(
+            plannerStore,
+            FakeCanonicalTransport(),
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                emptyLocalComposition(request)
+            },
+            localCompositionLifecycleFence = fence,
+        ).composeLocally(fence.captureGeneration())
+
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+        assertEquals(initial, plannerStore.state.value)
+        assertEquals(initial, plannerStore.durableState.value)
+    }
+
+    @Test
+    fun localRequestUsesCapturedSnapshotAcrossProfileABA() = runBlocking {
+        val initial = localCompositionReadyState().copy(
+            scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
+        )
+        val originalProfile = initial.scheduleCompositionProfile
+        val plannerStore = PlannerStore(initial)
+        var zoneCalls = 0
+        var requestedAvailabilityStart: String? = null
+        val outcome = manager(
+            plannerStore,
+            FakeCanonicalTransport(),
+            zoneProvider = {
+                zoneCalls += 1
+                if (zoneCalls == 1) {
+                    assertTrue(
+                        plannerStore.updateScheduleCompositionProfile(
+                            originalProfile.copy(dayStartMinute = 8 * 60),
+                        ),
+                    )
+                }
+                ZoneId.of("Europe/Madrid")
+            },
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                requestedAvailabilityStart = request.availability.single().start
+                assertTrue(plannerStore.updateScheduleCompositionProfile(originalProfile))
+                emptyLocalComposition(request)
+            },
+        ).composeLocally()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
+        assertEquals("2026-09-01T05:00:00Z", requestedAvailabilityStart)
+        assertEquals(originalProfile, plannerStore.state.value.scheduleCompositionProfile)
+        assertTrue(
+            requireNotNull(plannerStore.state.value.localScheduleCompositionProvenance)
+                .matchesState(plannerStore.state.value),
+        )
+    }
+
+    @Test
+    fun zoneChangeAndMidnightCrossingDiscardNonPreemptibleNativeResults() = runBlocking {
+        suspend fun assertDiscarded(
+            mutateDuringNative: () -> Unit,
+            nowProvider: () -> Instant,
+            zoneProvider: () -> ZoneId,
+        ) {
+            val initial = localCompositionReadyState()
+            val plannerStore = PlannerStore(initial)
+            val outcome = manager(
+                plannerStore,
+                FakeCanonicalTransport(),
+                nowProvider = nowProvider,
+                zoneProvider = zoneProvider,
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    mutateDuringNative()
+                    emptyLocalComposition(request)
+                },
+            ).composeLocally()
+            assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+            assertEquals(initial, plannerStore.state.value)
+            assertEquals(initial, plannerStore.durableState.value)
+        }
+
+        var zone = ZoneId.of("Europe/Madrid")
+        assertDiscarded(
+            mutateDuringNative = { zone = ZoneId.of("UTC") },
+            nowProvider = { clock },
+            zoneProvider = { zone },
+        )
+        var instant = Instant.parse("2026-09-01T21:59:59Z")
+        assertDiscarded(
+            mutateDuringNative = { instant = Instant.parse("2026-09-01T22:00:00Z") },
+            nowProvider = { instant },
+            zoneProvider = { ZoneId.of("Europe/Madrid") },
+        )
+    }
+
+    @Test
+    fun credentialReplacementAndPlannerMutationDuringNativeDiscardWithoutInstall() = runBlocking {
+        val credential = MutableCanonicalCredentialStore()
+        val credentialInitial = localCompositionReadyState()
+        val credentialStore = PlannerStore(credentialInitial)
+        val credentialOutcome = manager(
+            credentialStore,
+            FakeCanonicalTransport(),
+            credentialStore = credential,
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                credential.configurationId = "replacement-binding"
+                emptyLocalComposition(request)
+            },
+        ).composeLocally()
+        assertEquals(CanonicalRefreshOutcome.CONFIGURATION_ERROR, credentialOutcome)
+        assertEquals(credentialInitial, credentialStore.state.value)
+        assertEquals(null, credentialStore.state.value.localScheduleCompositionProvenance)
+
+        val mutationInitial = localCompositionReadyState()
+        val mutationStore = PlannerStore(mutationInitial)
+        val mutationOutcome = manager(
+            mutationStore,
+            FakeCanonicalTransport(),
+            localScheduleComposer = LocalScheduleComposer { _, request ->
+                mutationStore.toggleCompleted()
+                emptyLocalComposition(request)
+            },
+        ).composeLocally()
+        assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, mutationOutcome)
+        assertFalse(mutationStore.state.value.showCompleted)
+        assertEquals(mutationInitial.canonicalDeltaCursor, mutationStore.state.value.canonicalDeltaCursor)
+        assertEquals(null, mutationStore.state.value.localScheduleCompositionProvenance)
+        assertEquals(null, mutationStore.state.value.publishedScheduleProof)
+    }
+
+    @Test
+    fun liveDurableMismatchPreventsNativeComposition() = runBlocking {
+        val initial = localCompositionReadyState()
+        val saveGate = CompletableDeferred<Unit>()
+        val repository = object : PlannerStateRepository {
+            override suspend fun load(): DayWeaveUiState = initial
+
+            override suspend fun save(state: DayWeaveUiState) {
+                saveGate.await()
+            }
+        }
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val plannerStore = PlannerStore(initial, repository, scope)
+            withTimeout(3_000) {
+                plannerStore.loadState.first { it == PlannerLoadState.READY }
+            }
+            assertTrue(
+                plannerStore.updateScheduleCompositionProfile(
+                    initial.scheduleCompositionProfile.copy(dayStartMinute = 8 * 60),
+                ),
+            )
+            var composeCalls = 0
+
+            val outcome = manager(
+                plannerStore,
+                FakeCanonicalTransport(),
+                localScheduleComposer = LocalScheduleComposer { _, request ->
+                    composeCalls += 1
+                    emptyLocalComposition(request)
+                },
+            ).composeLocally()
+
+            assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+            assertEquals(0, composeCalls)
+            assertEquals(initial, plannerStore.durableState.value)
+        } finally {
+            saveGate.complete(Unit)
+            scope.cancel()
+        }
+    }
+
+    @Test
+    fun stableExecutionVerificationRefreshKeepsLocalPlanButSemanticInputsInvalidateIt() =
+        runBlocking {
+            val plannerStore = PlannerStore(localCompositionReadyState())
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(
+                    plannerStore,
+                    FakeCanonicalTransport(),
+                    localScheduleComposer = LocalScheduleComposer { _, request ->
+                        emptyLocalComposition(request)
+                    },
+                ).composeLocally(),
+            )
+            requireNotNull(
+                plannerStore.markCanonicalExecutionHistoryUnverified(
+                    "https://api.example.test/",
+                    "connection-1",
+                ),
+            ).awaitDurable()
+            assertNotNull(plannerStore.state.value.localScheduleCompositionProvenance)
+            requireNotNull(
+                plannerStore.recordCanonicalExecutionHistoryWindow(
+                    syncOrigin = "https://api.example.test/",
+                    configurationId = "connection-1",
+                    revision = 0,
+                    history = emptyList(),
+                    continuityVerified = true,
+                    message = "Execution history verified",
+                ),
+            ).awaitDurable()
+            val installed = plannerStore.state.value
+            val provenance = requireNotNull(installed.localScheduleCompositionProvenance)
+            assertTrue(provenance.matchesState(installed))
+
+            assertFalse(provenance.matchesState(installed.copy(canonicalExecutionRevision = 1)))
+            assertFalse(
+                provenance.matchesState(
+                    installed.copy(
+                        scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(
+                            dayStartMinute = 8 * 60,
+                        ),
+                    ),
+                ),
+            )
+            assertFalse(
+                provenance.matchesState(
+                    installed.copy(
+                        recurrenceOutcomes = mapOf(
+                            "33333333-3333-5333-8333-333333333333" to
+                                RecurrenceOutcomeSnapshot(
+                                    itemId = TASK_ID,
+                                    status = ItemStatus.SKIPPED,
+                                    resolvedAt = clock.toString(),
+                                ),
+                        ),
+                    ),
+                ),
+            )
+            assertFalse(
+                provenance.matchesState(
+                    installed.copy(
+                        recurrenceMoves = mapOf(
+                            "33333333-3333-5333-8333-333333333333" to
+                                RecurrenceMoveSnapshot(
+                                    itemId = TASK_ID,
+                                    startAt = "2026-09-01T10:00:00Z",
+                                    endAt = "2026-09-01T10:30:00Z",
+                                    movedAt = clock.toString(),
+                                ),
+                        ),
+                    ),
+                ),
+            )
+            assertFalse(
+                provenance.matchesState(
+                    installed.copy(
+                        schedule = listOf(
+                            ScheduleItem(
+                                id = "external-fixed",
+                                title = "Calendar",
+                                kind = ItemKind.EVENT,
+                                startMinute = 600,
+                                durationMinutes = 30,
+                                status = ItemStatus.SCHEDULED,
+                                isFlexible = false,
+                                isHardConstraint = true,
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        }
+
+    @Test
+    fun localProvenanceMemoSurvivesUnrelatedUiCopiesAndRecomputesForExecutionChange() =
+        runBlocking {
+            val plannerStore = PlannerStore(localCompositionReadyState())
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(
+                    plannerStore,
+                    FakeCanonicalTransport(),
+                    localScheduleComposer = LocalScheduleComposer { _, request ->
+                        emptyLocalComposition(request)
+                    },
+                ).composeLocally(),
+            )
+            val before = localScheduleCompositionFingerprintComputationCount()
+            repeat(3) {
+                assertTrue(
+                    plannerStore.state.value.isScheduleDisplayCurrent(
+                        clock,
+                        ZoneId.of("Europe/Madrid"),
+                    ),
+                )
+            }
+            plannerStore.navigate(com.greengolddog.dayweave.model.AppDestination.ASSISTANT)
+            plannerStore.toggleCompleted()
+            assertTrue(plannerStore.sendAssistantMessage("Do not invalidate the local plan"))
+            assertNotNull(plannerStore.state.value.localScheduleCompositionProvenance)
+            assertEquals(before, localScheduleCompositionFingerprintComputationCount())
+
+            requireNotNull(
+                plannerStore.reconcileCanonicalExecution(
+                    syncOrigin = "https://api.example.test/",
+                    configurationId = "connection-1",
+                    revision = 1,
+                    activeSession = null,
+                    message = "Execution revision changed",
+                ),
+            ).awaitDurable()
+            assertEquals(null, plannerStore.state.value.localScheduleCompositionProvenance)
+            assertEquals(before + 1, localScheduleCompositionFingerprintComputationCount())
+        }
+
+    private fun localCompositionReadyState() = DayWeaveUiState(
+        canonicalSyncOrigin = "https://api.example.test/",
+        canonicalConfigurationId = "connection-1",
+        canonicalDeltaCursor = "cursor-1",
+        canonicalExecutionSyncOrigin = "https://api.example.test/",
+        canonicalExecutionConfigurationId = "connection-1",
+        canonicalExecutionRevision = 0,
+        canonicalExecutionHistoryWindow = emptyList(),
+        canonicalExecutionHistoryWindowRevision = 0,
+        canonicalExecutionHistoryContinuityEstablished = true,
+        canonicalExecutionHistoryVerified = true,
+    )
+
+    private fun localCanonicalItem() = com.greengolddog.dayweave.model.CanonicalItemSnapshot(
+        id = TASK_ID,
+        kind = "task",
+        status = "planned",
+        title = "Local deterministic task",
+        timezoneName = "Europe/Madrid",
+        durationSeconds = 1_800,
+        flexibleConstraintsJson = "{}",
+        splitPolicyJson = "{\"type\":\"indivisible\"}",
+        importance = 50,
+        urgency = 50,
+        siblingOrder = 0,
+        isExecutable = true,
+        revision = 7,
+        createdAt = clock.toString(),
+        updatedAt = clock.toString(),
+    )
+
+    private fun emptyLocalComposition(request: SchedulePreviewRequest) =
+        LocalScheduleComposition(
+            localInputFingerprint = "local-sha256:${"a".repeat(64)}",
+            scheduleRequestFingerprint = "sha256:${"b".repeat(64)}",
+            sourceItemCount = 0,
+            sourceItemRevisions = emptyMap(),
+            acceptedItemCount = 0,
+            rejectedItems = emptyList(),
+            ignoredPreviousAssignments = emptyList(),
+            plan = RemoteSchedulePlan(
+                asOf = request.asOf,
+                horizonStart = request.horizonStart,
+                horizonEnd = request.horizonEnd,
+                blocks = emptyList(),
+                unscheduled = emptyList(),
+                decisions = emptyList(),
+                violations = emptyList(),
+                score = RemotePlanScore(0, 0, 0, 0),
+                occurrences = emptyList(),
+            ),
+        )
+
     private fun manager(
         plannerStore: PlannerStore,
         transport: FakeCanonicalTransport,
         credentialStore: ApiCredentialStore = CanonicalCredentialStore(),
         currentInstant: Instant = clock,
+        nowProvider: () -> Instant = { currentInstant },
+        zoneProvider: () -> ZoneId = { ZoneId.of("Europe/Madrid") },
+        localScheduleComposer: LocalScheduleComposer? = null,
+        localCompositionLifecycleFence: LocalCompositionLifecycleFence =
+            UnfencedLocalCompositionLifecycle,
         cancelTimedBreakNotification: suspend () -> Boolean = { true },
         reconcileTimedBreakNotification: suspend () -> Unit = {},
     ) = CanonicalSyncManager(
         plannerStore = plannerStore,
         credentialStore = credentialStore,
         transport = transport,
-        now = { currentInstant },
-        zoneId = { ZoneId.of("Europe/Madrid") },
+        now = nowProvider,
+        zoneId = zoneProvider,
+        localScheduleComposer = localScheduleComposer,
+        localCompositionLifecycleFence = localCompositionLifecycleFence,
         cancelTimedBreakNotification = cancelTimedBreakNotification,
         reconcileTimedBreakNotification = reconcileTimedBreakNotification,
     )
@@ -4002,6 +4566,18 @@ class CanonicalSyncManagerTest {
     }
 }
 
+private class SequencedLocalCompositionFence(results: List<Boolean>) :
+    LocalCompositionLifecycleFence {
+    private val remaining = ArrayDeque(results)
+
+    override fun captureGeneration(): Long = 17L
+
+    override fun isCurrent(generation: Long): Boolean {
+        check(generation == 17L)
+        return if (remaining.size > 1) remaining.removeFirst() else remaining.first()
+    }
+}
+
 private class CanonicalCredentialStore : ApiCredentialStore {
     private var lastSync: Long? = null
 
@@ -4026,6 +4602,28 @@ private class CanonicalCredentialStore : ApiCredentialStore {
     override fun recordSuccessfulSync(epochMillis: Long) {
         lastSync = epochMillis
     }
+}
+
+private class MutableCanonicalCredentialStore : ApiCredentialStore {
+    var configurationId: String = "connection-1"
+
+    override fun snapshot() = ApiConnectionSnapshot(
+        baseUrl = "https://api.example.test/",
+        hasBearerToken = true,
+        lastSuccessfulSyncEpochMillis = null,
+        configurationId = configurationId,
+    )
+
+    override fun authenticatedConfiguration(): AuthenticatedApiConfiguration =
+        AuthenticatedApiConfiguration.createBound(
+            "https://api.example.test/",
+            "test-secret",
+            configurationId,
+        )
+
+    override fun update(baseUrl: String, bearerToken: String?) = Unit
+    override fun clear() = Unit
+    override fun recordSuccessfulSync(epochMillis: Long) = Unit
 }
 
 private class FakeCanonicalTransport : CanonicalPlannerTransport {

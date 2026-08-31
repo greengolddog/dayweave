@@ -17,6 +17,7 @@ import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
+import androidx.compose.material.icons.outlined.PhoneAndroid
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
@@ -344,28 +345,35 @@ private fun DayWeaveRoot(
         deviceAuthState.isConfigured,
     ) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            viewModel.refreshExecution()
-            viewModel.refreshGoogleAccounts()
-            viewModel.refreshEnergySignal()
-            runForegroundInvalidationWorkers(
-                executionInvalidationStream = if (deviceAuthState.isConfigured) {
-                    viewModel::collectForegroundExecutionInvalidations
-                } else {
-                    null
-                },
-                canonicalItemInvalidations = if (deviceAuthState.isConfigured) {
-                    viewModel::collectForegroundCanonicalItemInvalidations
-                } else {
-                    null
-                },
-                polling = {
-                    // Polling remains the durable fallback for old servers and missed publishes.
-                    while (isActive) {
-                        delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
-                        viewModel.refreshExecution()
-                    }
-                },
-            )
+            viewModel.setLocalScheduleCompositionForegroundActive(true)
+            try {
+                viewModel.refreshExecution()
+                viewModel.refreshGoogleAccounts()
+                viewModel.refreshEnergySignal()
+                runForegroundInvalidationWorkers(
+                    executionInvalidationStream = if (deviceAuthState.isConfigured) {
+                        viewModel::collectForegroundExecutionInvalidations
+                    } else {
+                        null
+                    },
+                    canonicalItemInvalidations = if (deviceAuthState.isConfigured) {
+                        viewModel::collectForegroundCanonicalItemInvalidations
+                    } else {
+                        null
+                    },
+                    polling = {
+                        // Polling remains the durable fallback for old servers and missed publishes.
+                        while (isActive) {
+                            delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
+                            viewModel.refreshExecution()
+                        }
+                    },
+                )
+            } finally {
+                // JNI cannot be preempted, so invalidate its generation before this lifecycle
+                // owner can become background-visible or the unlocked subtree can disappear.
+                viewModel.setLocalScheduleCompositionForegroundActive(false)
+            }
         }
     }
 
@@ -388,6 +396,16 @@ private fun DayWeaveRoot(
                 },
                 actions = {
                     if (state.destination == AppDestination.TODAY || state.destination == AppDestination.CALENDAR) {
+                        IconButton(
+                            onClick = viewModel::composeOnDevice,
+                            enabled = !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
+                                !proposalApplicationState.isBusy,
+                        ) {
+                            Icon(
+                                Icons.Outlined.PhoneAndroid,
+                                contentDescription = "Compose on this device",
+                            )
+                        }
                         IconButton(onClick = viewModel::recompose) {
                             Icon(Icons.Outlined.AutoAwesome, contentDescription = "Recompose schedule")
                         }
