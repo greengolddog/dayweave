@@ -75,6 +75,36 @@ class DeviceAuthRequestCoordinatorTest {
     }
 
     @Test
+    fun cancellableExecutionExposesBothTheInitialAndAuthenticatedRetryCalls() = runBlocking {
+        val baseUrl = server.url("/tenant/").toString()
+        val active = activeForRequests(baseUrl, accessExpiry = now.plus(Duration.ofMinutes(10)))
+        val coordinator = coordinator(
+            FakeDeviceAuthEnvelopeStore(active),
+            successfulRefreshTransport(active),
+        )
+        server.enqueue(trustedUnauthorized())
+        server.enqueue(MockResponse.Builder().code(200).body("ok").build())
+        val observedCalls = mutableListOf<okhttp3.Call>()
+        val request = Request.Builder()
+            .url(server.url("/tenant/v1/execution/stream"))
+            .header("Accept", "text/event-stream")
+            .get()
+            .build()
+
+        coordinator.executeAuthenticatedCancellable(
+            requireNotNull(coordinator.authenticatedConfiguration()),
+            OkHttpClient(),
+            request,
+            observedCalls::add,
+        ).close()
+
+        assertEquals(2, observedCalls.size)
+        assertTrue(observedCalls[0] !== observedCalls[1])
+        assertEquals(request.url, observedCalls[0].request().url)
+        assertEquals(request.url, observedCalls[1].request().url)
+    }
+
+    @Test
     fun trusted401ReplaysExactSchedulePublicationBodyAndSecurityHeaders() = runBlocking {
         val baseUrl = server.url("/tenant/").toString()
         val active = activeForRequests(baseUrl, accessExpiry = now.plus(Duration.ofMinutes(10)))

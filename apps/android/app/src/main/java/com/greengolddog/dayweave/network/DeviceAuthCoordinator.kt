@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.launch
+import okhttp3.Call
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -103,11 +104,36 @@ internal interface DeviceAuthRequestExecutor {
     ): Response
 }
 
+/** Streaming requests retain their exact Call so lifecycle cancellation can close the socket. */
+internal interface CancellableDeviceAuthRequestExecutor : DeviceAuthRequestExecutor {
+    suspend fun executeAuthenticatedCancellable(
+        configuration: AuthenticatedApiConfiguration,
+        client: OkHttpClient,
+        request: Request,
+        onCallCreated: (Call) -> Unit,
+    ): Response
+}
+
 internal suspend fun AuthenticatedApiConfiguration.executeAuthenticated(
     client: OkHttpClient,
     request: Request,
 ): Response = deviceAuthExecutor?.executeAuthenticated(this, client, request)
     ?: client.newCall(request).awaitDeviceAuthResponse()
+
+internal suspend fun AuthenticatedApiConfiguration.executeAuthenticatedCancellable(
+    client: OkHttpClient,
+    request: Request,
+    onCallCreated: (Call) -> Unit,
+): Response {
+    val executor = deviceAuthExecutor
+    return if (executor is CancellableDeviceAuthRequestExecutor) {
+        executor.executeAuthenticatedCancellable(this, client, request, onCallCreated)
+    } else if (executor != null) {
+        executor.executeAuthenticated(this, client, request)
+    } else {
+        client.newCall(request).also(onCallCreated).awaitDeviceAuthResponse()
+    }
+}
 
 /** Process-wide owner of device enrollment, credential rotation, and authenticated retries. */
 internal class DurableDeviceAuthCoordinator(
@@ -121,7 +147,7 @@ internal class DurableDeviceAuthCoordinator(
     private val generator: DeviceCredentialGenerator = SecureDeviceCredentialGenerator,
     private val allowCleartextLoopbackForTests: Boolean = false,
     private val proactiveRefreshWindow: Duration = Duration.ofMinutes(2),
-) : ApiCredentialStore, DeviceAuthRequestExecutor {
+) : ApiCredentialStore, CancellableDeviceAuthRequestExecutor {
     private val stateMutex = Mutex()
     private val operationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val inFlightOperations = mutableMapOf<AuthOperationKey, Deferred<DeviceAuthActionResult>>()
@@ -487,6 +513,13 @@ internal class DurableDeviceAuthCoordinator(
         configuration: AuthenticatedApiConfiguration,
         client: OkHttpClient,
         request: Request,
+    ): Response = executeAuthenticatedCancellable(configuration, client, request) {}
+
+    override suspend fun executeAuthenticatedCancellable(
+        configuration: AuthenticatedApiConfiguration,
+        client: OkHttpClient,
+        request: Request,
+        onCallCreated: (Call) -> Unit,
     ): Response {
         if (!isRequestBoundToConfiguration(configuration, request)) {
             throw DeviceAuthenticationChangedException()
@@ -503,7 +536,7 @@ internal class DurableDeviceAuthCoordinator(
         // different process can still replace the envelope after this read and before OkHttp
         // dispatches; the exact post-response check below fences that unavoidable TOCTOU window.
         requireCurrentLease(first)
-        val response = client.newCall(firstRequest).awaitDeviceAuthResponse()
+        val response = client.newCall(firstRequest).also(onCallCreated).awaitDeviceAuthResponse()
         if (
             response.code != 401 ||
             first.isLegacy ||
@@ -519,7 +552,12 @@ internal class DurableDeviceAuthCoordinator(
         val retry = baseRequest.newBuilder()
             .header("Authorization", "Bearer ${second.token}")
             .build()
-        val retryResponse = executeRetryWhileLeaseIsCurrent(second, client, retry)
+        val retryResponse = executeRetryWhileLeaseIsCurrent(
+            second,
+            client,
+            retry,
+            onCallCreated,
+        )
         requireCurrentLeaseOrClose(second, retryResponse)
         if (retryResponse.code == 401 && isTrustedDeviceAuthUnauthorized(retryResponse)) {
             markReauthAfterSecondUnauthorized(second)
@@ -680,11 +718,12 @@ internal class DurableDeviceAuthCoordinator(
         lease: AuthorizationLease,
         client: OkHttpClient,
         request: Request,
+        onCallCreated: (Call) -> Unit,
     ): Response {
         // Never retain the coordinator mutex while awaiting provider I/O. The preflight compares
         // the exact durable envelope identity, not only semantically equivalent session fields.
         requireCurrentLease(lease)
-        return client.newCall(request).awaitDeviceAuthResponse()
+        return client.newCall(request).also(onCallCreated).awaitDeviceAuthResponse()
     }
 
     private suspend fun requireCurrentLease(lease: AuthorizationLease) {

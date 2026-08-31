@@ -80,7 +80,21 @@ and real banner/sound appearance. A resume performed on another device can cance
 after Android receives that newer lease; near-real-time background execution
 updates remain part of the separate push-sync requirement.
 
-While the UI is visible, one lifecycle-bound job refreshes the execution lease immediately and every 30 seconds. The process action gate coalesces that work with taps, settings changes, and composition so foreground polling cannot create duplicate command jobs. If a cached lease disappears, Android pages the complete execution history between two equal execution snapshots before applying its terminal outcome; a racing, incomplete, or malformed history read retains any command fence and leaves execution locked instead of guessing. The encrypted snapshot keeps a rolling 100-session history window for display plus a lifetime terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after enough newer sessions.
+While the unlocked UI is visible, lifecycle-bound work refreshes the execution lease immediately
+and every 30 seconds. Alongside that unchanged fallback, Android opens the authenticated
+`/v1/execution/stream` and treats its content-free revision events only as memory-only wakeups for
+the same stable snapshot/history reconciliation. The resume header always comes from the last
+encrypted durable execution revision, never from an event. A missing endpoint disables streaming
+only for that foreground activation; malformed streams fail closed, transient disconnects back
+off, and background, lock, or credential replacement cancels and drains the exact OkHttp call.
+The process action gate coalesces that work with taps, settings changes, and composition so an
+invalidation observed while another action is busy remains queued instead of creating duplicate
+command jobs. If a cached lease disappears, Android pages the complete execution history between
+two equal execution snapshots before applying its terminal outcome; a racing, incomplete, or
+malformed history read retains any command fence and leaves execution locked instead of guessing.
+The encrypted snapshot keeps a rolling 100-session history window for display plus a lifetime
+terminal-outcome ledger for schedule correctness, so old completed work cannot reappear after
+enough newer sessions.
 
 All authenticated Android APIs share one process-wide device-auth coordinator. Contract version 2
 adds the REST-only `schedule_publish` scope to the Android enrollment tuple; it is not an MCP scope.

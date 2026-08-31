@@ -480,6 +480,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    /** The caller owns the unlocked STARTED lifecycle; cancellation drains the active stream. */
+    suspend fun collectForegroundExecutionInvalidations() {
+        dayWeaveApplication.runForegroundExecutionInvalidations()
+    }
+
     fun keepLatestItemAfterTerminalConflict(sessionId: String) {
         if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
         dayWeaveApplication.launchCanonicalAction {

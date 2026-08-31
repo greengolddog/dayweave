@@ -15,6 +15,7 @@ import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
 import com.greengolddog.dayweave.network.KeystoreDeviceAuthEnvelopeStore
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
+import com.greengolddog.dayweave.network.OkHttpExecutionInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
@@ -36,6 +37,8 @@ import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
+import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
+import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -117,6 +120,9 @@ class DayWeaveApplication : Application() {
                         return false
                     }
                     if (!cancelTimedBreakNotificationForAuthoritativeTransition()) return false
+                    if (executionInvalidationManagerDelegate.isInitialized()) {
+                        executionInvalidationManager.cancelAndDrainActiveSession()
+                    }
                     val quarantined = try {
                         plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
                     } finally {
@@ -206,6 +212,25 @@ class DayWeaveApplication : Application() {
     }
     val executionSyncManager: ExecutionSyncManager get() = executionSyncManagerDelegate.value
 
+    private val executionInvalidationManagerDelegate = lazy {
+        ForegroundExecutionInvalidationManager(
+            credentialStore = apiCredentialStore,
+            streamTransport = OkHttpExecutionInvalidationStreamTransport(),
+            durableCursor = {
+                val durable = plannerStore.durableState.value
+                DurableExecutionInvalidationCursor(
+                    syncOrigin = durable?.canonicalExecutionSyncOrigin,
+                    configurationId = durable?.canonicalExecutionConfigurationId,
+                    revision = durable?.canonicalExecutionRevision ?: 0,
+                )
+            },
+            tryLaunchAuthoritativeRefresh = ::launchCanonicalAction,
+            authoritativeRefresh = ::refreshForegroundExecution,
+        )
+    }
+    private val executionInvalidationManager: ForegroundExecutionInvalidationManager
+        get() = executionInvalidationManagerDelegate.value
+
     private val googleAccountManagerDelegate = lazy {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
@@ -291,9 +316,17 @@ class DayWeaveApplication : Application() {
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        if (executionInvalidationManagerDelegate.isInitialized()) {
+            executionInvalidationManager.cancelActiveSession()
+        }
         if (proposalApplicationManagerDelegate.isInitialized()) {
             proposalApplicationManager.discardReviewForPrivacyBoundary()
         }
+    }
+
+    /** Collected only by the unlocked STARTED UI; cancellation closes the response body. */
+    suspend fun runForegroundExecutionInvalidations() {
+        executionInvalidationManager.runForegroundActivation()
     }
 
     /** Reconciles an old/remote lease both before and after replacing today's composition. */

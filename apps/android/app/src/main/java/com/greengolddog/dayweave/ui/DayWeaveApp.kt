@@ -100,9 +100,11 @@ import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
 import java.time.ZoneId
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.supervisorScope
 
 @Composable
 fun DayWeaveApp(
@@ -334,15 +336,31 @@ private fun DayWeaveRoot(
         }
     }
 
-    LaunchedEffect(lifecycleOwner, viewModel) {
+    LaunchedEffect(
+        lifecycleOwner,
+        viewModel,
+        deviceAuthState.baseUrl,
+        deviceAuthState.sessionId,
+        deviceAuthState.isConfigured,
+    ) {
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             viewModel.refreshExecution()
             viewModel.refreshGoogleAccounts()
             viewModel.refreshEnergySignal()
-            while (isActive) {
-                delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
-                viewModel.refreshExecution()
-            }
+            runForegroundExecutionWorkers(
+                invalidationStream = if (deviceAuthState.isConfigured) {
+                    viewModel::collectForegroundExecutionInvalidations
+                } else {
+                    null
+                },
+                polling = {
+                    // Polling remains the durable fallback for old servers and missed publishes.
+                    while (isActive) {
+                        delay(EXECUTION_REFRESH_INTERVAL_MILLIS)
+                        viewModel.refreshExecution()
+                    }
+                },
+            )
         }
     }
 
@@ -1051,6 +1069,25 @@ private fun DayWeaveRoot(
 }
 
 private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L
+
+/** A stream bug or protocol failure can never cancel the independent polling fallback. */
+internal suspend fun runForegroundExecutionWorkers(
+    invalidationStream: (suspend () -> Unit)?,
+    polling: suspend () -> Unit,
+) = supervisorScope {
+    invalidationStream?.let { collectInvalidations ->
+        launch {
+            try {
+                collectInvalidations()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (_: Exception) {
+                // Stream status is intentionally silent; foreground polling remains authoritative.
+            }
+        }
+    }
+    polling()
+}
 
 private fun Context.startActivitySafely(primary: Intent, fallback: Intent? = null) {
     try {
