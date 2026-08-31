@@ -1,13 +1,19 @@
+use std::convert::Infallible;
+
 use axum::{
     Json, Router,
     extract::{
         Path, Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -19,22 +25,132 @@ use crate::{AppState, error::ApiError};
 use super::{
     DeltaChange, IdempotencyKey, Item, ItemQuery, ItemRepositoryError, ItemServiceError, NewItem,
     ReplaceItem,
+    invalidation::{ItemInvalidationOpenError, ItemInvalidationSignal},
 };
 
 const DEFAULT_ITEM_LIMIT: usize = 100;
 const MAX_ITEM_LIMIT: usize = 200;
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 const REPLAY_HEADER: &str = "idempotency-replayed";
+const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+const EVENT_STREAM_MEDIA_TYPE: &str = "text/event-stream";
+const INVALIDATION_EVENT: &str = "item-invalidation";
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/items", get(list_items).post(create_item))
         .route("/items/delta", get(item_delta))
+        .route("/items/stream", get(item_stream))
         .route(
             "/items/{id}",
             get(get_item).put(replace_item).delete(delete_item),
         )
         .route("/items/{id}/restore", post(restore_item))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/items/stream",
+    tag = "items",
+    security(("bearer_token" = [])),
+    params(
+        ("Accept" = String, Header, description = "Must be exactly text/event-stream"),
+        ("Last-Event-ID" = Option<String>, Header, description = "Exact opaque cursor from the last durably applied item delta page; omitted means the initial cursor")
+    ),
+    responses(
+        (status = 200, description = "Content-free opaque item cursor invalidations", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Malformed or wrong-workspace Last-Event-ID", body = crate::error::ErrorEnvelope),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Credential lacks items_read", body = crate::error::ErrorEnvelope),
+        (status = 406, description = "Accept is not exactly text/event-stream", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Last-Event-ID is ahead of the authoritative item change head", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Stream capacity or durable item change state is unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn item_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_event_stream_accept(&headers)?;
+    let cursor = parse_last_event_id(&headers)?;
+    let stream = state
+        .items
+        .invalidation_stream(cursor.as_deref())
+        .await
+        .map_err(|error| map_invalidation_open_error(&error))?
+        .into_stream()
+        .map(|signal| {
+            let event = match signal {
+                ItemInvalidationSignal::Cursor(cursor) => Event::default()
+                    .id(cursor.clone())
+                    .event(INVALIDATION_EVENT)
+                    .data(format!(r#"{{"cursor":"{cursor}"}}"#)),
+                ItemInvalidationSignal::Heartbeat => Event::default().comment("heartbeat"),
+            };
+            Ok::<Event, Infallible>(event)
+        });
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
+}
+
+fn require_event_stream_accept(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    let accepted = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(EVENT_STREAM_MEDIA_TYPE));
+    if !accepted || values.next().is_some() {
+        return Err(ApiError::not_acceptable(
+            "Accept must be exactly text/event-stream",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let name = HeaderName::from_static(LAST_EVENT_ID_HEADER);
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(invalid_last_event_id());
+    }
+    value
+        .to_str()
+        .map(str::to_owned)
+        .map(Some)
+        .map_err(|_| invalid_last_event_id())
+}
+
+fn invalid_last_event_id() -> ApiError {
+    ApiError::bad_request("Last-Event-ID must be an exact opaque item delta cursor")
+}
+
+fn map_invalidation_open_error(error: &ItemInvalidationOpenError) -> ApiError {
+    match error {
+        ItemInvalidationOpenError::InvalidCursor => invalid_last_event_id(),
+        ItemInvalidationOpenError::Capacity => {
+            ApiError::unavailable("item stream capacity is temporarily exhausted")
+        }
+        ItemInvalidationOpenError::CursorAhead => {
+            ApiError::conflict("item stream cursor is ahead of authoritative state")
+        }
+        ItemInvalidationOpenError::Repository(_) => {
+            ApiError::unavailable("item stream cannot read authoritative state")
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]

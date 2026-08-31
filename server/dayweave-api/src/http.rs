@@ -64,6 +64,7 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::items::http::create_item,
         crate::items::http::list_items,
         crate::items::http::item_delta,
+        crate::items::http::item_stream,
         crate::items::http::get_item,
         crate::items::http::replace_item,
         crate::items::http::delete_item,

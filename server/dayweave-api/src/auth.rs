@@ -369,7 +369,9 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             | "/suggestions/application-previews/{id}/apply"
             | "/suggestions/applications/{id}/undo",
         ) => Some(Scope::SuggestionsWrite),
-        (&Method::GET, "/items" | "/items/delta" | "/items/{id}") => Some(Scope::ItemsRead),
+        (&Method::GET, "/items" | "/items/delta" | "/items/stream" | "/items/{id}") => {
+            Some(Scope::ItemsRead)
+        }
         (
             &Method::POST | &Method::PUT | &Method::DELETE,
             "/items" | "/items/{id}" | "/items/{id}/restore",
@@ -589,6 +591,10 @@ mod tests {
     fn rest_scope_matrix_is_explicit_and_fail_closed() {
         assert_eq!(
             required_rest_scope(&Method::GET, Some("/v1/items/{id}")),
+            Some(Scope::ItemsRead)
+        );
+        assert_eq!(
+            required_rest_scope(&Method::GET, Some("/v1/items/stream")),
             Some(Scope::ItemsRead)
         );
         assert_eq!(

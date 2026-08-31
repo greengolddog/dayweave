@@ -11,11 +11,16 @@ use crate::proposals::Clock;
 use super::{
     IdempotencyContext, Item, ItemDomainError, ItemMutation, ItemQuery, ItemRepository,
     ItemRepositoryError, NewItem, ReplaceItem,
+    invalidation::{
+        ItemInvalidationConfig, ItemInvalidationHub, ItemInvalidationOpenError,
+        ItemInvalidationStream,
+    },
 };
 
 const IDEMPOTENCY_TTL: StdDuration = StdDuration::from_hours(24);
 const CURSOR_PREFIX: &[u8; 4] = b"DWI1";
 const CURSOR_BYTES: usize = 32;
+const MAX_CURSOR_TEXT_BYTES: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct IdempotencyKey {
@@ -26,6 +31,7 @@ pub struct IdempotencyKey {
 pub struct ItemService {
     repository: Arc<dyn ItemRepository>,
     clock: Arc<dyn Clock>,
+    invalidations: ItemInvalidationHub,
 }
 
 impl std::fmt::Debug for ItemService {
@@ -39,7 +45,33 @@ impl std::fmt::Debug for ItemService {
 impl ItemService {
     #[must_use]
     pub fn new(repository: Arc<dyn ItemRepository>, clock: Arc<dyn Clock>) -> Self {
-        Self { repository, clock }
+        Self {
+            repository,
+            clock,
+            invalidations: ItemInvalidationHub::new(ItemInvalidationConfig::default()),
+        }
+    }
+
+    /// Replaces the bounded invalidation stream configuration while assembling
+    /// a service. Primarily useful for deterministic embedded/HTTP tests.
+    #[must_use]
+    pub fn with_invalidation_config(mut self, config: ItemInvalidationConfig) -> Self {
+        self.invalidations = ItemInvalidationHub::new(config);
+        self
+    }
+
+    pub(super) async fn invalidation_stream(
+        &self,
+        cursor: Option<&str>,
+    ) -> Result<ItemInvalidationStream, ItemInvalidationOpenError> {
+        let sequence = cursor
+            .map_or(Ok(0), |cursor| {
+                decode_cursor(cursor, self.repository.cursor_scope())
+            })
+            .map_err(|_| ItemInvalidationOpenError::InvalidCursor)?;
+        self.invalidations
+            .open(self.repository.clone(), sequence)
+            .await
     }
 
     /// Creates an item and its optional hierarchy edge atomically.
@@ -55,10 +87,12 @@ impl ItemService {
         validate_idempotency_key(&idempotency.key)?;
         let now = self.clock.now();
         let item = Item::new(input, now)?;
-        Ok(self
+        let mutation = self
             .repository
             .create(item, Self::context("items.create", idempotency, now)?)
-            .await?)
+            .await?;
+        self.invalidations.poke();
+        Ok(mutation)
     }
 
     /// Gets one active item.
@@ -98,7 +132,7 @@ impl ItemService {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
         let now = self.clock.now();
-        Ok(self
+        let mutation = self
             .repository
             .replace(
                 id,
@@ -107,7 +141,9 @@ impl ItemService {
                 now,
                 Self::context("items.replace", idempotency, now)?,
             )
-            .await?)
+            .await?;
+        self.invalidations.poke();
+        Ok(mutation)
     }
 
     /// Soft-deletes a leaf and emits a sync tombstone.
@@ -124,7 +160,7 @@ impl ItemService {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
         let now = self.clock.now();
-        Ok(self
+        let mutation = self
             .repository
             .trash(
                 id,
@@ -132,7 +168,9 @@ impl ItemService {
                 now,
                 Self::context("items.delete", idempotency, now)?,
             )
-            .await?)
+            .await?;
+        self.invalidations.poke();
+        Ok(mutation)
     }
 
     /// Restores a soft-deleted item with a new optimistic revision.
@@ -149,7 +187,7 @@ impl ItemService {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
         let now = self.clock.now();
-        Ok(self
+        let mutation = self
             .repository
             .restore(
                 id,
@@ -157,7 +195,9 @@ impl ItemService {
                 now,
                 Self::context("items.restore", idempotency, now)?,
             )
-            .await?)
+            .await?;
+        self.invalidations.poke();
+        Ok(mutation)
     }
 
     /// Returns a bounded delta page after an opaque cursor.
@@ -239,7 +279,7 @@ fn validate_revision(value: u64) -> Result<(), ItemServiceError> {
     }
 }
 
-fn encode_cursor(sequence: u64, scope: Uuid) -> String {
+pub(super) fn encode_cursor(sequence: u64, scope: Uuid) -> String {
     let mut bytes = [0_u8; CURSOR_BYTES];
     bytes[..4].copy_from_slice(CURSOR_PREFIX);
     bytes[4..20].copy_from_slice(scope.as_bytes());
@@ -249,7 +289,10 @@ fn encode_cursor(sequence: u64, scope: Uuid) -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn decode_cursor(cursor: &str, expected_scope: Uuid) -> Result<u64, ItemServiceError> {
+pub(super) fn decode_cursor(cursor: &str, expected_scope: Uuid) -> Result<u64, ItemServiceError> {
+    if cursor.is_empty() || cursor.len() > MAX_CURSOR_TEXT_BYTES {
+        return Err(ItemServiceError::InvalidCursor);
+    }
     let bytes = URL_SAFE_NO_PAD
         .decode(cursor)
         .map_err(|_| ItemServiceError::InvalidCursor)?;
@@ -266,7 +309,11 @@ fn decode_cursor(cursor: &str, expected_scope: Uuid) -> Result<u64, ItemServiceE
     let sequence: [u8; 8] = bytes[20..28]
         .try_into()
         .map_err(|_| ItemServiceError::InvalidCursor)?;
-    Ok(u64::from_be_bytes(sequence))
+    let sequence = u64::from_be_bytes(sequence);
+    if encode_cursor(sequence, expected_scope) != cursor {
+        return Err(ItemServiceError::InvalidCursor);
+    }
+    Ok(sequence)
 }
 
 #[cfg(test)]

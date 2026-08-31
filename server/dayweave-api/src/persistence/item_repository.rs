@@ -413,8 +413,7 @@ impl ItemRepository for PostgresItemRepository {
         })
     }
 
-    async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError> {
-        let after = i64::try_from(after).map_err(|_| ItemRepositoryError::Internal)?;
+    async fn delta_head(&self) -> Result<u64, ItemRepositoryError> {
         let maximum: i64 = sqlx::query_scalar(
             "SELECT COALESCE(max(sequence), 0) FROM item_changes WHERE workspace_id = $1",
         )
@@ -422,6 +421,13 @@ impl ItemRepository for PostgresItemRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(internal)?;
+        u64::try_from(maximum).map_err(|_| ItemRepositoryError::Internal)
+    }
+
+    async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError> {
+        let after = i64::try_from(after).map_err(|_| ItemRepositoryError::Internal)?;
+        let maximum =
+            i64::try_from(self.delta_head().await?).map_err(|_| ItemRepositoryError::Internal)?;
         if after > maximum {
             return Err(ItemRepositoryError::InvalidCursor);
         }

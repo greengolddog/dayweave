@@ -147,6 +147,15 @@ effects must flow through an auditable proposal or outbox boundary.
   active lease, item/session/device identifiers, status, titles, or timestamps.
   Responses disable caching and proxy buffering; heartbeat, lifetime, and a
   per-process connection permit cap bound authenticated long-lived resource use.
+- The item invalidation SSE independently requires the native REST `items_read`
+  boundary. It serializes only one opaque, workspace-bound delta cursor with
+  exact SSE ID/data agreement—never item/tombstone content, IDs, revisions,
+  hierarchy, sensitivity, titles, notes, status, or timestamps. Clients cannot
+  advance durable item state from SSE: only an atomically applied delta page may
+  replace the encrypted local cursor. Strict request headers, no-store/proxy
+  controls, bounded cursor/frame expectations, heartbeats, five-minute
+  lifetimes, a connection permit cap, and a content-free durable-head probe
+  constrain the long-lived surface.
 - Defer assessment and claim triggers are database defense-in-depth for
   repository mistakes and races. Core conflict recomputation remains an API
   responsibility; a role allowed arbitrary direct table writes is inside the

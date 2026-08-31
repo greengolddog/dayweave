@@ -18,8 +18,8 @@ The architecture is optimized for five constraints:
 
 ```mermaid
 flowchart LR
-    Mac[Native macOS app] -->|HTTPS; optional execution SSE| API[DayWeave API]
-    Android[Native Android app] -->|HTTPS; optional execution SSE| API
+    Mac[Native macOS app] -->|HTTPS; optional item/execution SSE| API[DayWeave API]
+    Android[Native Android app] -->|HTTPS; optional item/execution SSE| API
     Mac --> CoreM[Embedded Rust core]
     Android --> CoreA[Embedded Rust core]
     Ext[ChatGPT / Codex clients] -->|authenticated MCP| MCP[MCP facade]
@@ -146,7 +146,7 @@ Both clients follow the same conceptual layers:
 2. application commands/queries and view-state reducers;
 3. encrypted SQLite local store, durable operation outbox, and sync inbox;
 4. generated Rust-core bindings for validation, recurrence, scheduling, and explanations; and
-5. HTTP API client, optional execution SSE, and attachment transfer manager.
+5. HTTP API client, optional item/execution SSE, and attachment transfer manager.
 
 The binding surface exchanges versioned, serialization-friendly value objects. Swift and Kotlin do not hold Rust references across UI frames. Panics and errors become typed native errors; unsafe Rust is forbidden in the workspace unless a separately reviewed FFI shim makes the minimum unavoidable exception.
 
@@ -176,6 +176,8 @@ The Rust API service provides:
 - REST-style command/query endpoints described by a versioned OpenAPI contract;
 - an authenticated, content-free execution invalidation SSE stream with
   revision-based durable catch-up;
+- an authenticated, content-free item invalidation SSE stream whose opaque
+  cursor only triggers authoritative item-delta catch-up;
 - idempotency-key enforcement;
 - attachment preflight and signed transfer URLs;
 - proposal review/apply endpoints;
@@ -187,6 +189,15 @@ Commands validate authorization and expected revision, write canonical rows and 
 Canonical planner items are exposed under `/v1/items`. Clients generate item UUIDs offline and send an `Idempotency-Key` for every create, replace, delete, and restore command. Replacements carry an expected revision and replace the full mutable item contract. The repository commits the item or tombstone, hierarchy edge, idempotency result, audit operation, outbox message, and delta-stream record atomically. Parent changes are serialized per workspace and reject cycles; only leaves may enter executable states, while `sibling_order` gives every level deterministic ordering.
 
 `GET /v1/items/delta` returns ordered upserts and tombstones behind an opaque, versioned, integrity-checked cursor bound to the authenticated deployment workspace. Hierarchy edits also revision and emit affected parent snapshots so derived leaf executability converges without same-revision replacement. Clients persist the returned cursor only in the same local transaction that applies the page. No item command directly invokes Google or another provider; workers consume the transactional outbox separately.
+
+`GET /v1/items/stream` carries only a coalesced opaque cursor invalidation and
+never item content. The cursor must be one previously returned by the delta
+endpoint, and clients do not persist it from SSE. Direct item-service commands
+poke a bounded process-local hub only after success; each stream verifies the
+durable change-log head before emitting, while a five-second shared-head probe
+converges proposal, Google, direct-database, other-instance, and lost-wakeup
+changes. The exact transport and recovery contract is in
+[`item-sync.md`](item-sync.md).
 
 ### 7.2 Worker
 
@@ -216,13 +227,14 @@ The sync model combines canonical current state with an append-only ordered oper
 
 - The client creates an operation ID and writes the local mutation plus outbox entry atomically.
 - The server deduplicates the operation ID, checks base revision, applies or returns a structured conflict, and assigns a monotonic workspace cursor.
-- The implemented execution SSE announces only a coalesced execution revision;
-  clients fetch the authoritative execution snapshot and persist its revision
-  with the applied local transaction. Its immediate wakeup hub is process-local,
-  while a shared durable-head probe gives open streams convergence within five
-  seconds after cross-instance commits or a lost local wakeup. A broader item
-  operation announcement stream remains planned; item clients continue using
-  the durable delta endpoint for catch-up.
+- The execution SSE announces only a coalesced execution revision; clients
+  fetch the authoritative execution snapshot and persist its revision with the
+  applied local transaction.
+- The item SSE announces only a coalesced opaque cursor; clients drain the
+  authoritative item delta and persist only the cursor returned with an applied
+  page. Both immediate wakeup hubs are process-local, while shared durable-head
+  probes give open streams convergence within five seconds after cross-instance
+  commits or a lost local wakeup.
 - Entity tombstones make deletion converge. Thirty-day trash is a product state; tombstone retention may be longer for sync safety.
 - Commutative field changes merge automatically. Concurrent changes to the same semantic field or structure return both values for review.
 - Single-active-item uses a short server lease/version. An offline start is accepted locally; reconnect resolves a conflict without losing either time segment.

@@ -133,6 +133,10 @@ pub trait ItemRepository: Send + Sync {
         idempotency: IdempotencyContext,
     ) -> Result<ItemMutation, ItemRepositoryError>;
 
+    /// Returns the authoritative high-water sequence of the durable item
+    /// change log without loading any item content.
+    async fn delta_head(&self) -> Result<u64, ItemRepositoryError>;
+
     async fn delta(&self, after: u64, limit: usize) -> Result<ItemDeltaPage, ItemRepositoryError>;
 }
 
@@ -469,6 +473,10 @@ impl ItemRepository for InMemoryItemRepository {
             watermark,
             has_more,
         })
+    }
+
+    async fn delta_head(&self) -> Result<u64, ItemRepositoryError> {
+        Ok(self.state.lock().await.next_sequence)
     }
 }
 

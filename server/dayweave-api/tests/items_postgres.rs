@@ -1,19 +1,31 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 
+use axum::{
+    body::Body,
+    http::{Request, Response, StatusCode, header},
+};
 use dayweave_api::{
+    AppState,
+    auth::StaticTokenAuthenticator,
+    http::router,
     items::{
-        DeltaChange, IdempotencyKey, ItemKind, ItemQuery, ItemRepositoryError, ItemService,
-        ItemServiceError, ItemStatus, NewItem, ReplaceItem, SplitPolicy,
+        DeltaChange, IdempotencyKey, ItemInvalidationConfig, ItemKind, ItemQuery, ItemRepository,
+        ItemRepositoryError, ItemService, ItemServiceError, ItemStatus, NewItem, ReplaceItem,
+        SplitPolicy,
     },
     persistence::{DatabaseScope, MIGRATOR, PostgresItemRepository},
-    proposals::SystemClock,
+    proposals::{InMemoryProposalRepository, ProposalRepository, ProposalService, SystemClock},
+    readiness::Readiness,
 };
+use http_body_util::BodyExt as _;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{
     AssertSqlSafe, ConnectOptions, Executor, PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tokio::time::timeout;
+use tower::ServiceExt as _;
 use uuid::Uuid;
 
 #[tokio::test]
@@ -238,6 +250,133 @@ async fn postgres_items_are_atomic_isolated_hierarchical_and_delta_synced() {
     assert_eq!(change_count, audit_count);
 
     test_database.destroy().await;
+}
+
+#[tokio::test]
+async fn postgres_item_stream_probes_shared_durable_head_without_leaking_content() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; PostgreSQL item stream test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    let pool = &test_database.pool;
+    MIGRATOR.run(pool).await.expect("migrations apply");
+
+    let scope = seed_scope(pool, "item-stream-owner", "item-stream-workspace").await;
+    let repository = Arc::new(PostgresItemRepository::new(pool.clone(), scope));
+    assert_eq!(repository.delta_head().await.unwrap(), 0);
+
+    let proposals: Arc<dyn ProposalRepository> = Arc::new(InMemoryProposalRepository::default());
+    let proposals = Arc::new(ProposalService::new(
+        proposals,
+        Arc::new(SystemClock),
+        Duration::from_hours(24),
+    ));
+    let token = "postgres-item-stream-token";
+    let mut state = AppState::new(
+        proposals,
+        Arc::new(StaticTokenAuthenticator::from_plaintext(&[token])),
+        Readiness::default(),
+    );
+    state.items = Arc::new(
+        ItemService::new(repository.clone(), Arc::new(SystemClock)).with_invalidation_config(
+            ItemInvalidationConfig::new(
+                Duration::from_millis(10),
+                Duration::from_millis(200),
+                Duration::from_secs(1),
+                2,
+            )
+            .unwrap(),
+        ),
+    );
+    let app = router(state);
+
+    let initial_cursor = postgres_delta_cursor(&app, token).await;
+    let mut stream = app
+        .clone()
+        .oneshot(postgres_stream_request(token, &initial_cursor))
+        .await
+        .unwrap();
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    // A distinct service has its own process-local hub but commits to the same
+    // PostgreSQL change log, modeling another API process or integration writer.
+    let external = ItemService::new(repository.clone(), Arc::new(SystemClock));
+    let item_id = Uuid::new_v4();
+    external
+        .create(
+            new_item(
+                item_id,
+                "SYNTHETIC-POSTGRES-PRIVATE-ITEM-STREAM-TITLE",
+                ItemKind::Task,
+                None,
+                0,
+            ),
+            idempotency("postgres-item-stream-create-001", 44),
+        )
+        .await
+        .unwrap();
+    assert!(repository.delta_head().await.unwrap() > 0);
+    let head_cursor = postgres_delta_cursor(&app, token).await;
+
+    let frame = timeout(Duration::from_millis(250), stream.body_mut().frame())
+        .await
+        .expect("durable probe emitted promptly")
+        .expect("stream remains open")
+        .expect("valid SSE frame")
+        .into_data()
+        .expect("SSE data frame");
+    let frame = String::from_utf8(frame.to_vec()).unwrap();
+    assert_eq!(
+        frame,
+        format!(
+            "id: {head_cursor}\nevent: item-invalidation\ndata: {{\"cursor\":\"{head_cursor}\"}}\n\n"
+        )
+    );
+    for forbidden in [
+        item_id.to_string(),
+        "SYNTHETIC-POSTGRES-PRIVATE-ITEM-STREAM-TITLE".to_owned(),
+        "PostgreSQL integration test".to_owned(),
+    ] {
+        assert!(!frame.contains(&forbidden), "SSE leaked {forbidden}");
+    }
+
+    drop(stream);
+    drop(app);
+    drop(external);
+    drop(repository);
+    test_database.destroy().await;
+}
+
+fn postgres_stream_request(token: &str, cursor: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri("/v1/items/stream")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::ACCEPT, "text/event-stream")
+        .header("last-event-id", cursor)
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn postgres_delta_cursor(app: &axum::Router, token: &str) -> String {
+    let response: Response<Body> = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/items/delta?limit=200")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["next_cursor"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[tokio::test]

@@ -250,6 +250,28 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
             "OpenAPI must declare execution stream header {name}"
         );
     }
+    let item_stream_path = &document["paths"]["/v1/items/stream"]["get"];
+    assert_eq!(
+        item_stream_path["responses"]["200"]["content"]["text/event-stream"]["schema"]["type"],
+        "string"
+    );
+    for status in ["400", "401", "403", "406", "409", "503"] {
+        assert!(
+            item_stream_path["responses"][status].is_object(),
+            "OpenAPI must declare item stream response {status}"
+        );
+    }
+    let item_stream_parameters = item_stream_path["parameters"]
+        .as_array()
+        .expect("item stream header parameters");
+    for name in ["Accept", "Last-Event-ID"] {
+        assert!(
+            item_stream_parameters
+                .iter()
+                .any(|parameter| parameter["name"] == name && parameter["in"] == "header"),
+            "OpenAPI must declare item stream header {name}"
+        );
+    }
     for field in [
         "execution_revision",
         "session_revision",
@@ -566,6 +588,58 @@ async fn execution_stream_requires_read_scope_and_native_rest_audience() {
     let wrong_audience = stream_response(principal(
         "mcp-client:execution-stream-reader",
         vec![Scope::ExecutionRead],
+        PrincipalAudience::Mcp,
+    ))
+    .await;
+    assert_eq!(wrong_audience.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        body_json(wrong_audience).await["error"]["code"],
+        "unauthorized"
+    );
+}
+
+#[tokio::test]
+async fn item_stream_requires_read_scope_and_native_rest_audience() {
+    async fn stream_response(principal: Principal) -> Response<Body> {
+        let mut stream = request("GET", "/v1/items/stream", None, true);
+        stream.headers_mut().insert(
+            header::ACCEPT,
+            "text/event-stream".parse().expect("valid Accept"),
+        );
+        app_with_principal(principal).oneshot(stream).await.unwrap()
+    }
+
+    let principal = |subject: &str, scopes, audience| Principal {
+        subject: subject.to_owned(),
+        scopes,
+        audience,
+        workspace_id: None,
+        user_id: None,
+        credential_id: None,
+        allowed_origins: Vec::new(),
+    };
+
+    let allowed = stream_response(principal(
+        "device-session:item-stream-reader",
+        vec![Scope::ItemsRead],
+        PrincipalAudience::Device,
+    ))
+    .await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    drop(allowed);
+
+    let forbidden = stream_response(principal(
+        "device-session:item-stream-writer",
+        vec![Scope::ItemsWrite],
+        PrincipalAudience::Device,
+    ))
+    .await;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(forbidden).await["error"]["code"], "forbidden");
+
+    let wrong_audience = stream_response(principal(
+        "mcp-client:item-stream-reader",
+        vec![Scope::ItemsRead],
         PrincipalAudience::Mcp,
     ))
     .await;
