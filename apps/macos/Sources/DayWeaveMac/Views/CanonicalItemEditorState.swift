@@ -265,7 +265,13 @@ struct CanonicalItemEditorState: Equatable, Sendable {
     mutating func normalizeForKindChange() {
         if !supportsRecurrence { recurrence = .none }
         if kind == .habit, recurrence == .none { recurrence = .daily }
-        if kind == .goal || kind == .routine { hasOwnEffort = true }
+        if kind == .goal || kind == .routine {
+            hasOwnEffort = true
+            hadOwnEffortConstraint = true
+        } else {
+            hasOwnEffort = false
+            hadOwnEffortConstraint = false
+        }
         if kind == .event {
             isSplittable = false
             hasDuration = true

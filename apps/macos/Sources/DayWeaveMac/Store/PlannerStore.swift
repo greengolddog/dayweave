@@ -150,6 +150,10 @@ enum PlannerCanonicalAuthoringError: LocalizedError, Equatable, Sendable {
     case invalidMutation
     case journalCapacityReached
     case invalidRemoteResponse
+    case suggestionNotFound
+    case suggestionNotPending
+    case suggestionExpired
+    case suggestionIdentityMismatch
 
     var errorDescription: String? {
         switch self {
@@ -181,6 +185,14 @@ enum PlannerCanonicalAuthoringError: LocalizedError, Equatable, Sendable {
             "The offline authoring queue is full. Sync or remove a queued item before adding more content."
         case .invalidRemoteResponse:
             "The server response does not prove the pending authoring operation was applied."
+        case .suggestionNotFound:
+            "The Codex item draft is no longer available."
+        case .suggestionNotPending:
+            "The Codex item draft has already been decided."
+        case .suggestionExpired:
+            "The Codex item draft expired before it was accepted."
+        case .suggestionIdentityMismatch:
+            "The reviewed Codex item draft does not match the durable Inbox record."
         }
     }
 }
@@ -271,6 +283,11 @@ final class PlannerStore: ObservableObject {
     static let maximumCanonicalTrashItemBytes = 256 * 1_024
     static let maximumCanonicalTrashRetainedItemBytes = 4 * 1_024 * 1_024
     static let canonicalTrashRetentionInterval: TimeInterval = 30 * 24 * 60 * 60
+    static let maximumLocalSuggestions = 500
+    static let maximumCodexSuggestionsPerTurn = 5
+    static let localSuggestionLifetime: TimeInterval = 7 * 24 * 60 * 60
+    static let localSuggestionFutureSkewTolerance: TimeInterval = 5 * 60
+    static let localSuggestionHighWaterCheckpointInterval: TimeInterval = 5 * 60
     @Published var destination: SidebarDestination? = .today {
         didSet { scheduleAutosave() }
     }
@@ -389,8 +406,22 @@ final class PlannerStore: ObservableObject {
     private let persistence: EncryptedPlannerPersistence?
     private let autosaveDelay: Duration
     private let now: @Sendable () -> Date
+    private let localSuggestionCheckpointSleep:
+        @Sendable (Duration) async throws -> Void
     private var autosaveTask: Task<Void, Never>?
     private var canonicalTrashRetentionTask: Task<Void, Never>?
+    private struct LocalSuggestionExpirationIdentity: Hashable, Sendable {
+        let id: UUID
+        let createdAt: Date
+        let expiresAt: Date
+    }
+
+    private var localSuggestionExpirationTasks:
+        [LocalSuggestionExpirationIdentity: Task<Void, Never>] = [:]
+    private var localSuggestionHighWaterCheckpointTask: Task<Void, Never>?
+    private var localSuggestionHighWaterCheckpointIdentity: Date?
+    private var localSuggestionDateHighWater: Date?
+    private var persistedLocalSuggestionDateHighWater: Date?
     private var scheduleProfileCommitObservers: [@MainActor () -> Void] = []
     private var isCanonicalPreviewValidatedForCurrentLaunch = false
     private var persistenceRevision: PlannerPersistenceRevision = .missing
@@ -455,11 +486,15 @@ final class PlannerStore: ObservableObject {
         persistence: EncryptedPlannerPersistence? = nil,
         restoreFromPersistence: Bool = true,
         autosaveDelay: Duration = .milliseconds(250),
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        localSuggestionCheckpointSleep: @escaping @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
+        }
     ) {
         self.persistence = persistence
         self.autosaveDelay = autosaveDelay
         self.now = now
+        self.localSuggestionCheckpointSleep = localSuggestionCheckpointSleep
 
         var restoredSnapshot: PlannerSnapshot?
         var restorationError: PlannerPersistenceError?
@@ -672,18 +707,34 @@ final class PlannerStore: ObservableObject {
         loadState = restorationError == nil ? .ready : .persistenceFailed
         persistenceRevision = restoredRevision
 
+        persistedLocalSuggestionDateHighWater = restoredSnapshot?
+            .localSuggestionDateHighWater
+        localSuggestionDateHighWater = persistedLocalSuggestionDateHighWater
+            ?? restoredSnapshot?.savedAt
+        let localSuggestionObservation = observeLocalSuggestionDate()
+        let localSuggestionHighWaterNeedsRewrite = restoredSnapshot != nil
+            && restoredSnapshot?.localSuggestionDateHighWater
+                != localSuggestionDateHighWater
         let recurrenceHistoryNeedsRewrite = pruneRecurrenceHistory()
+        let localSuggestionsNeedRewrite = expireLocalSuggestionsInMemory(
+            referenceDate: localSuggestionObservation.referenceDate,
+            forcePendingExpiration: localSuggestionObservation.rollbackDetected
+        )
         hardenPendingSensitivityPresentation()
 
         if persistence != nil, restorationError == nil {
             if restoreFromPersistence, restoredSnapshot == nil {
                 scheduleAutosave()
-            } else if restoredCanonicalRetentionNeedsRewrite || recurrenceHistoryNeedsRewrite {
+            } else if restoredCanonicalRetentionNeedsRewrite
+                        || recurrenceHistoryNeedsRewrite
+                        || localSuggestionsNeedRewrite
+                        || localSuggestionHighWaterNeedsRewrite {
                 // Retention is a durable privacy boundary. Rewrite an old
                 // snapshot before exposing an indefinitely quiet restored app.
                 flushPersistence()
             } else {
                 scheduleCanonicalTrashRetention()
+                scheduleLocalSuggestionExpiration()
             }
         }
     }
@@ -691,6 +742,8 @@ final class PlannerStore: ObservableObject {
     deinit {
         autosaveTask?.cancel()
         canonicalTrashRetentionTask?.cancel()
+        localSuggestionExpirationTasks.values.forEach { $0.cancel() }
+        localSuggestionHighWaterCheckpointTask?.cancel()
     }
 
     func flushPersistence() {
@@ -700,6 +753,14 @@ final class PlannerStore: ObservableObject {
         canonicalTrashRetentionTask = nil
         guard loadState == .ready, let persistence else { return }
         let retentionReferenceDate = now()
+        let localSuggestionObservation = observeLocalSuggestionDate(
+            candidate: retentionReferenceDate
+        )
+        let priorSuggestions = suggestions
+        let localSuggestionRetentionChanged = expireLocalSuggestionsInMemory(
+            referenceDate: localSuggestionObservation.referenceDate,
+            forcePendingExpiration: localSuggestionObservation.rollbackDetected
+        )
         let boundedMutations = Self.boundedCanonicalAuthoringMutations(
             pendingCanonicalAuthoringMutations,
             referenceDate: retentionReferenceDate
@@ -711,13 +772,16 @@ final class PlannerStore: ObservableObject {
         )
 
         do {
+            let snapshot = makeSnapshot(
+                canonicalTrashOverride: boundedTrash,
+                canonicalAuthoringMutationsOverride: boundedMutations
+            )
             persistenceRevision = try persistence.save(
-                makeSnapshot(
-                    canonicalTrashOverride: boundedTrash,
-                    canonicalAuthoringMutationsOverride: boundedMutations
-                ),
+                snapshot,
                 expectedRevision: persistenceRevision
             )
+            persistedLocalSuggestionDateHighWater = snapshot
+                .localSuggestionDateHighWater
             // Install retention changes only after the exact bounded snapshot
             // commits. A failed CAS/write leaves user transactions able to
             // restore their complete in-memory preimage.
@@ -730,9 +794,14 @@ final class PlannerStore: ObservableObject {
             autosaveTask = nil
             persistenceError = nil
             scheduleCanonicalTrashRetention()
+            scheduleLocalSuggestionExpiration()
         } catch {
+            if !localSuggestionRetentionChanged {
+                suggestions = priorSuggestions
+            }
             persistenceError = error
             loadState = .persistenceFailed
+            cancelLocalSuggestionHighWaterCheckpoint()
         }
     }
 
@@ -3673,16 +3742,443 @@ final class PlannerStore: ObservableObject {
         ))
     }
 
+    /// Stores a completed Codex turn as bounded, encrypted, typed review
+    /// records. Model output is still untrusted here: the parser's contract is
+    /// revalidated, item identities are minted locally, and either the whole
+    /// resulting suggestion transition is durable or none of it is exposed.
+    @discardableResult
+    func storeCodexItemDraftSuggestions(
+        _ drafts: [CodexSuggestionDraft],
+        createdAt: Date
+    ) throws -> Int {
+        guard !drafts.isEmpty else { return 0 }
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerCanonicalAuthoringError.encryptedPersistenceRequired
+        }
+        guard drafts.count <= Self.maximumCodexSuggestionsPerTurn,
+              createdAt.timeIntervalSinceReferenceDate.isFinite else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let localSuggestionObservation = observeLocalSuggestionDate()
+        if localSuggestionObservation.rollbackDetected {
+            expireLocalSuggestions()
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        guard createdAt >= localSuggestionObservation.referenceDate.addingTimeInterval(
+                  -Self.localSuggestionFutureSkewTolerance
+              ),
+              createdAt <= localSuggestionObservation.referenceDate.addingTimeInterval(
+                  Self.localSuggestionFutureSkewTolerance
+              ) else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let expiresAt = createdAt.addingTimeInterval(Self.localSuggestionLifetime)
+        guard expiresAt.timeIntervalSinceReferenceDate.isFinite else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let retentionReferenceDate = max(
+            localSuggestionObservation.referenceDate,
+            createdAt
+        )
+        if expireLocalSuggestionsInMemory(referenceDate: retentionReferenceDate) {
+            // Commit privacy retention before any later validation error can
+            // return control while an expired body is only scrubbed in RAM.
+            try flushLocalSuggestionPrivacyTransition()
+        }
+
+        var reservedItemIDs = Set(canonicalItems.map(\.id))
+            .union(canonicalTrash.map(\.id))
+            .union(canonicalTombstoneRevisions.keys)
+            .union(pendingCanonicalAuthoringMutations.map(\.itemID))
+            .union(pendingCanonicalMutations.map(\.itemID))
+            .union(pendingCanonicalSensitivityMutations.map(\.itemID))
+            .union(suggestions.compactMap(\.resultingItemID))
+        var reservedSuggestionIDs = Set(suggestions.map(\.id))
+        for suggestion in suggestions {
+            if case let .canonicalItemDraft(itemDraft) = suggestion.payload {
+                reservedItemIDs.insert(itemDraft.itemID)
+            } else if case let .canonicalItemReference(itemID) = suggestion.payload {
+                reservedItemIDs.insert(itemID)
+            }
+        }
+
+        var prepared: [(summary: String, item: PlanningSuggestionItemDraft)] = []
+        prepared.reserveCapacity(drafts.count)
+        for proposal in drafts {
+            let canonicalDraft = proposal.canonicalDraft.normalized
+            let itemID = uniqueLocalIdentifier(excluding: &reservedItemIDs)
+            guard canonicalDraft.validationIssue(itemID: itemID) == nil,
+                  canonicalAuthoringDraftHierarchyIsCurrent(
+                      canonicalDraft,
+                      itemID: itemID,
+                      requiresCommittedParent: false
+                  ) else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            guard CodexCanonicalItemDraftReviewValidator.accepts(
+                canonicalDraft,
+                itemID: itemID,
+                now: createdAt
+            ) else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            let summary = proposal.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !summary.isEmpty else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            let item = PlanningSuggestionItemDraft(
+                itemID: itemID,
+                draft: canonicalDraft
+            )
+            guard item.hasValidShape else {
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            let isDuplicate = suggestions.contains { suggestion in
+                switch suggestion.payload {
+                case let .canonicalItemDraft(existing):
+                    return suggestion.expiresAt > createdAt
+                        && suggestion.state == .pending
+                        && suggestion.summary == summary
+                        && existing.version == PlanningSuggestionItemDraft.currentVersion
+                        && existing.draft.normalized == canonicalDraft
+                case .canonicalItemReference:
+                    guard suggestion.state == .accepted,
+                          let itemID = suggestion.resultingItemID else {
+                        return false
+                    }
+                    if let mutationID = suggestion.resultingMutationID,
+                       let mutation = canonicalAuthoringMutation(id: mutationID) {
+                        return mutation.itemID == itemID
+                            && mutation.operation == .create
+                            && mutation.draft == canonicalDraft
+                    }
+                    return canonicalItem(id: itemID).map(canonicalDraft.matches) == true
+                case .advisory:
+                    return false
+                }
+            } || prepared.contains {
+                $0.summary == summary && $0.item.draft.normalized == canonicalDraft
+            }
+            guard !isDuplicate else { continue }
+            prepared.append((summary, item))
+        }
+
+        let priorSuggestions = suggestions
+        let priorLocalSuggestionDateHighWater = localSuggestionDateHighWater
+        pruneTerminalLocalSuggestionsToFit(additionalCount: prepared.count)
+        guard suggestions.count <= Self.maximumLocalSuggestions - prepared.count else {
+            restoreLocalSuggestionTransactionPreimage(
+                priorSuggestions,
+                dateHighWater: priorLocalSuggestionDateHighWater
+            )
+            throw PlannerCanonicalAuthoringError.journalCapacityReached
+        }
+
+        for proposal in prepared {
+            let suggestion = PlanningSuggestion(
+                id: uniqueLocalIdentifier(excluding: &reservedSuggestionIDs),
+                title: proposal.item.draft.title,
+                summary: proposal.summary,
+                source: PlanningSuggestion.codexSource,
+                createdAt: createdAt,
+                expiresAt: expiresAt,
+                state: .pending,
+                payload: .canonicalItemDraft(proposal.item),
+                resultingItemID: nil,
+                resultingMutationID: nil
+            )
+            guard suggestion.hasValidShape else {
+                restoreLocalSuggestionTransactionPreimage(
+                    priorSuggestions,
+                    dateHighWater: priorLocalSuggestionDateHighWater
+                )
+                throw PlannerCanonicalAuthoringError.invalidDraft
+            }
+            suggestions.append(suggestion)
+        }
+        if !prepared.isEmpty {
+            localSuggestionDateHighWater = max(
+                localSuggestionDateHighWater ?? createdAt,
+                createdAt
+            )
+        }
+        guard PlanningSuggestion.collectionIsValid(suggestions) else {
+            restoreLocalSuggestionTransactionPreimage(
+                priorSuggestions,
+                dateHighWater: priorLocalSuggestionDateHighWater
+            )
+            throw PlannerCanonicalAuthoringError.journalCapacityReached
+        }
+        guard suggestions != priorSuggestions else { return 0 }
+        do {
+            try flushLocalSuggestionTransition()
+        } catch {
+            restoreLocalSuggestionTransactionPreimage(
+                priorSuggestions,
+                dateHighWater: priorLocalSuggestionDateHighWater
+            )
+            throw error
+        }
+        return prepared.count
+    }
+
+    /// One local commit records both facts established by explicit user
+    /// approval: the suggestion was accepted and the exact canonical create is
+    /// queued. No network request is made here. CanonicalSyncStore later binds,
+    /// submits, and reconciles the immutable idempotent journal.
+    func acceptCanonicalItemSuggestion(
+        _ suggestionID: UUID,
+        itemID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    ) throws {
+        guard let suggestionIndex = suggestions.firstIndex(where: {
+            $0.id == suggestionID
+        }) else {
+            throw PlannerCanonicalAuthoringError.suggestionNotFound
+        }
+
+        let initialSuggestion = suggestions[suggestionIndex]
+        if initialSuggestion.state == .accepted {
+            guard initialSuggestion.resultingItemID == itemID,
+                  let resultingMutationID = initialSuggestion.resultingMutationID,
+                  case let .canonicalItemReference(payloadItemID) = initialSuggestion.payload,
+                  payloadItemID == itemID else {
+                throw PlannerCanonicalAuthoringError.suggestionIdentityMismatch
+            }
+            if let mutation = canonicalAuthoringMutation(id: resultingMutationID) {
+                guard mutation.itemID == itemID,
+                      mutation.operation == .create,
+                      mutation.draft == draft.normalized else {
+                    throw PlannerCanonicalAuthoringError.suggestionIdentityMismatch
+                }
+            } else {
+                let normalizedDraft = draft.normalized
+                guard canonicalItem(id: itemID).map(normalizedDraft.matches) == true else {
+                    throw PlannerCanonicalAuthoringError.suggestionIdentityMismatch
+                }
+            }
+            return
+        }
+        try requireCanonicalAuthoringUserFence(allowDuringExecution: true)
+        let localSuggestionObservation = observeLocalSuggestionDate()
+        let localSuggestionRetentionChanged = expireLocalSuggestionsInMemory(
+            referenceDate: localSuggestionObservation.referenceDate,
+            forcePendingExpiration: localSuggestionObservation.rollbackDetected
+        )
+        if localSuggestionRetentionChanged {
+            // Privacy expiry is its own durable transition. Persist it before
+            // draft validation or approval can fail for an unrelated reason.
+            try flushLocalSuggestionPrivacyTransition()
+        }
+        let suggestion = suggestions[suggestionIndex]
+        if suggestion.state == .expired {
+            throw PlannerCanonicalAuthoringError.suggestionExpired
+        }
+        guard suggestion.state == .pending else {
+            throw PlannerCanonicalAuthoringError.suggestionNotPending
+        }
+        guard case let .canonicalItemDraft(itemDraft) = suggestion.payload,
+              itemDraft.version == PlanningSuggestionItemDraft.currentVersion,
+              itemDraft.itemID == itemID,
+              itemDraft.hasValidShape else {
+            throw PlannerCanonicalAuthoringError.suggestionIdentityMismatch
+        }
+        guard canonicalItem(id: itemID) == nil,
+              canonicalTrashEntry(id: itemID) == nil,
+              canonicalTombstoneRevisions[itemID] == nil else {
+            throw PlannerCanonicalAuthoringError.duplicateItemOperation
+        }
+        guard CodexCanonicalItemDraftReviewValidator.acceptsReviewedDraft(
+            draft,
+            itemID: itemID,
+            now: localSuggestionObservation.referenceDate
+        ) else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        try validateCanonicalAuthoringDraft(draft, itemID: itemID)
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: itemID,
+            operation: .create,
+            draft: draft,
+            createdAt: now()
+        )
+        guard canonicalAuthoringMutation(itemID: itemID) == nil,
+              pendingCanonicalMutations.allSatisfy({ $0.itemID != itemID }),
+              pendingCanonicalSensitivityMutations.allSatisfy({
+                  $0.itemID != itemID
+              }) else {
+            throw PlannerCanonicalAuthoringError.duplicateItemOperation
+        }
+        guard PlannerCanonicalAuthoringJournalValidator.isValid(mutation) else {
+            throw PlannerCanonicalAuthoringError.invalidMutation
+        }
+
+        let priorSuggestions = suggestions
+        let priorLocalSuggestionDateHighWater = localSuggestionDateHighWater
+        let priorMutations = pendingCanonicalAuthoringMutations
+        let priorSelection = selectedCanonicalItemID
+        let priorBlocks = blocks
+        suggestions[suggestionIndex].state = .accepted
+        suggestions[suggestionIndex].payload = .canonicalItemReference(itemID: itemID)
+        suggestions[suggestionIndex].resultingItemID = itemID
+        suggestions[suggestionIndex].resultingMutationID = mutation.id
+        scrubTerminalLocalSuggestion(at: suggestionIndex)
+        pendingCanonicalAuthoringMutations.append(mutation)
+        selectedCanonicalItemID = itemID
+        hardenPendingSensitivityPresentation()
+
+        guard currentCanonicalAuthoringStateIsValid else {
+            restoreLocalSuggestionTransactionPreimage(
+                priorSuggestions,
+                dateHighWater: priorLocalSuggestionDateHighWater
+            )
+            pendingCanonicalAuthoringMutations = priorMutations
+            selectedCanonicalItemID = priorSelection
+            blocks = priorBlocks
+            throw PlannerCanonicalAuthoringError.journalCapacityReached
+        }
+        do {
+            try flushCanonicalAuthoringTransition()
+        } catch {
+            restoreLocalSuggestionTransactionPreimage(
+                priorSuggestions,
+                dateHighWater: priorLocalSuggestionDateHighWater
+            )
+            pendingCanonicalAuthoringMutations = priorMutations
+            selectedCanonicalItemID = priorSelection
+            blocks = priorBlocks
+            throw error
+        }
+    }
+
+    /// Advisory acceptance deliberately cannot create canonical state. This
+    /// compatibility action is retained for local, non-actionable suggestions.
     func acceptSuggestion(_ id: UUID) {
-        guard canMutatePlan else { return }
-        guard let index = suggestions.firstIndex(where: { $0.id == id }) else { return }
-        suggestions[index].state = .accepted
+        guard canMutatePlan,
+              let index = suggestions.firstIndex(where: { $0.id == id }),
+              suggestions[index].state == .pending else { return }
+        let localSuggestionObservation = observeLocalSuggestionDate()
+        let localSuggestionRetentionChanged = expireLocalSuggestionsInMemory(
+            referenceDate: localSuggestionObservation.referenceDate,
+            forcePendingExpiration: localSuggestionObservation.rollbackDetected
+        )
+        if localSuggestionRetentionChanged {
+            do {
+                try flushLocalSuggestionPrivacyTransition()
+            } catch {
+                return
+            }
+        }
+        let retentionState = suggestions
+        let retentionDateHighWater = localSuggestionDateHighWater
+        if suggestions[index].state == .pending {
+            guard case .advisory = suggestions[index].payload else { return }
+            suggestions[index].state = .accepted
+            suggestions[index].resultingItemID = nil
+            suggestions[index].resultingMutationID = nil
+        }
+        do {
+            try flushLocalSuggestionTransitionIfAvailable()
+        } catch {
+            restoreLocalSuggestionTransactionPreimage(
+                retentionState,
+                dateHighWater: retentionDateHighWater
+            )
+        }
     }
 
     func rejectSuggestion(_ id: UUID) {
-        guard canMutatePlan else { return }
-        guard let index = suggestions.firstIndex(where: { $0.id == id }) else { return }
-        suggestions[index].state = .rejected
+        guard canMutatePlan,
+              let index = suggestions.firstIndex(where: { $0.id == id }),
+              suggestions[index].state == .pending else { return }
+        let localSuggestionObservation = observeLocalSuggestionDate()
+        let localSuggestionRetentionChanged = expireLocalSuggestionsInMemory(
+            referenceDate: localSuggestionObservation.referenceDate,
+            forcePendingExpiration: localSuggestionObservation.rollbackDetected
+        )
+        if localSuggestionRetentionChanged {
+            do {
+                try flushLocalSuggestionPrivacyTransition()
+            } catch {
+                return
+            }
+        }
+        let retentionState = suggestions
+        let retentionDateHighWater = localSuggestionDateHighWater
+        if suggestions[index].state == .pending {
+            suggestions[index].state = .rejected
+            scrubTerminalLocalSuggestion(at: index)
+        }
+        do {
+            try flushLocalSuggestionTransitionIfAvailable()
+        } catch {
+            restoreLocalSuggestionTransactionPreimage(
+                retentionState,
+                dateHighWater: retentionDateHighWater
+            )
+        }
+    }
+
+    /// Expiration is a privacy transition, not a user-authored canonical
+    /// mutation. It may run while the canonical sync fence is held, but never
+    /// while encrypted persistence is unhealthy.
+    func expireLocalSuggestions() {
+        guard canPersistPlan else { return }
+        let observation = observeLocalSuggestionDate()
+        guard expireLocalSuggestionsInMemory(
+            referenceDate: observation.referenceDate,
+            forcePendingExpiration: observation.rollbackDetected
+        ) else {
+            scheduleLocalSuggestionExpiration()
+            return
+        }
+        do {
+            try flushLocalSuggestionPrivacyTransition()
+        } catch {
+            // Keep privacy-expired bodies scrubbed in memory. Persistence is
+            // now unhealthy and the planner is locked until a safe reload.
+        }
+    }
+
+    /// Called by an identity-bound monotonic sleeper. The exact still-pending
+    /// record expires even if wall time moved backwards while the process was
+    /// asleep. Internal visibility keeps the seven-day boundary testable.
+    func expireLocalSuggestionAtScheduledDeadline(
+        _ suggestionID: UUID,
+        createdAt: Date,
+        expiresAt: Date
+    ) {
+        let identity = LocalSuggestionExpirationIdentity(
+            id: suggestionID,
+            createdAt: createdAt,
+            expiresAt: expiresAt
+        )
+        localSuggestionExpirationTasks.removeValue(forKey: identity)
+        guard canPersistPlan,
+              let index = suggestions.firstIndex(where: {
+                  $0.id == suggestionID
+                      && $0.state == .pending
+                      && $0.createdAt == createdAt
+                      && $0.expiresAt == expiresAt
+              }) else {
+            scheduleLocalSuggestionExpiration()
+            return
+        }
+        let observation = observeLocalSuggestionDate()
+        let changed = expireLocalSuggestionsInMemory(
+            referenceDate: observation.referenceDate,
+            forcePendingExpiration: observation.rollbackDetected,
+            forcedSuggestionIDs: [suggestions[index].id]
+        )
+        guard changed else {
+            scheduleLocalSuggestionExpiration()
+            return
+        }
+        do {
+            try flushLocalSuggestionPrivacyTransition()
+        } catch {
+            // The process-local copy remains scrubbed on a failed privacy save.
+        }
     }
 
     /// Rebuilds durable intent for snapshots written before mutation tracking
@@ -4894,6 +5390,189 @@ final class PlannerStore: ObservableObject {
         }
     }
 
+    private func uniqueLocalIdentifier(
+        excluding reserved: inout Set<UUID>
+    ) -> UUID {
+        while true {
+            let candidate = UUID()
+            if reserved.insert(candidate).inserted { return candidate }
+        }
+    }
+
+    private func expireLocalSuggestionsInMemory(
+        referenceDate: Date,
+        forcePendingExpiration: Bool = false,
+        forcedSuggestionIDs: Set<UUID> = []
+    ) -> Bool {
+        var changed = false
+        for index in suggestions.indices
+            where suggestions[index].state == .pending
+                && (forcePendingExpiration
+                    || forcedSuggestionIDs.contains(suggestions[index].id)
+                    || suggestions[index].expiresAt <= referenceDate
+                    || suggestions[index].createdAt > referenceDate.addingTimeInterval(
+                        Self.localSuggestionFutureSkewTolerance
+                    )) {
+            expireLocalSuggestion(at: index)
+            changed = true
+        }
+        clearLocalSuggestionHighWaterIfNoBodiesRemain()
+        return changed
+    }
+
+    private func observeLocalSuggestionDate(
+        candidate: Date? = nil
+    ) -> (referenceDate: Date, rollbackDetected: Bool) {
+        let candidate = candidate ?? now()
+        let pendingCreatedAt = suggestions.compactMap { suggestion -> Date? in
+            guard suggestion.state == .pending,
+                  case .canonicalItemDraft = suggestion.payload else {
+                return nil
+            }
+            return suggestion.createdAt
+        }
+        guard let latestPendingCreatedAt = pendingCreatedAt.max() else {
+            localSuggestionDateHighWater = nil
+            return (candidate, false)
+        }
+        guard candidate.timeIntervalSinceReferenceDate.isFinite else {
+            return (localSuggestionDateHighWater ?? .distantFuture, true)
+        }
+        guard let highWater = localSuggestionDateHighWater else {
+            let initialHighWater = max(candidate, latestPendingCreatedAt)
+            localSuggestionDateHighWater = initialHighWater
+            return (initialHighWater, false)
+        }
+        let rollbackDetected = candidate.addingTimeInterval(
+            Self.localSuggestionFutureSkewTolerance
+        ) < highWater
+        if candidate > highWater { localSuggestionDateHighWater = candidate }
+        return (max(candidate, highWater), rollbackDetected)
+    }
+
+    private func clearLocalSuggestionHighWaterIfNoBodiesRemain() {
+        let hasPendingBody = suggestions.contains { suggestion in
+            guard suggestion.state == .pending,
+                  case .canonicalItemDraft = suggestion.payload else {
+                return false
+            }
+            return true
+        }
+        if !hasPendingBody { localSuggestionDateHighWater = nil }
+    }
+
+    /// Restores a failed user transaction without undoing a privacy expiry
+    /// that happened inside the attempted persistence flush. The high-water
+    /// checkpoint follows the same rule: a failed action may not lower an
+    /// authenticated clock observation while any private draft remains.
+    private func restoreLocalSuggestionTransactionPreimage(
+        _ preimage: [PlanningSuggestion],
+        dateHighWater preimageDateHighWater: Date?
+    ) {
+        let currentSuggestions = suggestions
+        let currentDateHighWater = localSuggestionDateHighWater
+        var newlyExpiredByID: [UUID: PlanningSuggestion] = [:]
+        for suggestion in currentSuggestions where suggestion.state == .expired {
+            newlyExpiredByID[suggestion.id] = suggestion
+        }
+        suggestions = preimage.map { suggestion in
+            guard suggestion.state == .pending,
+                  let expired = newlyExpiredByID[suggestion.id],
+                  expired.createdAt == suggestion.createdAt,
+                  expired.expiresAt == suggestion.expiresAt else {
+                return suggestion
+            }
+            return expired
+        }
+
+        let retainedHighWaters = [preimageDateHighWater, currentDateHighWater]
+            .compactMap { $0 }
+            .filter { $0.timeIntervalSinceReferenceDate.isFinite }
+        localSuggestionDateHighWater = retainedHighWaters.max()
+        clearLocalSuggestionHighWaterIfNoBodiesRemain()
+    }
+
+    private func expireLocalSuggestion(at index: Int) {
+        suggestions[index].state = .expired
+        scrubTerminalLocalSuggestion(at: index)
+    }
+
+    private func scrubTerminalLocalSuggestion(at index: Int) {
+        let wasCanonicalDraft: Bool
+        if case let .canonicalItemDraft(itemDraft) = suggestions[index].payload {
+            suggestions[index].payload = .canonicalItemReference(itemID: itemDraft.itemID)
+            wasCanonicalDraft = true
+        } else if case .canonicalItemReference = suggestions[index].payload {
+            wasCanonicalDraft = true
+        } else {
+            wasCanonicalDraft = false
+        }
+        if wasCanonicalDraft {
+            // Terminal rows are not presented in the Inbox. Keep only generic,
+            // content-free decision metadata and the opaque item correlation;
+            // an accepted exact body already lives in the canonical journal.
+            suggestions[index].title = PlanningSuggestion.scrubbedCanonicalTitle
+            suggestions[index].summary = PlanningSuggestion.scrubbedCanonicalSummary(
+                for: suggestions[index].state
+            ) ?? "Pending local review."
+        }
+        if suggestions[index].state != .accepted {
+            suggestions[index].resultingItemID = nil
+            suggestions[index].resultingMutationID = nil
+        }
+        clearLocalSuggestionHighWaterIfNoBodiesRemain()
+    }
+
+    private func pruneTerminalLocalSuggestionsToFit(additionalCount: Int) {
+        guard additionalCount > 0,
+              suggestions.count > Self.maximumLocalSuggestions - additionalCount else {
+            return
+        }
+        let removable = suggestions
+            .filter { $0.state != .pending }
+            .sorted {
+                if $0.createdAt != $1.createdAt { return $0.createdAt < $1.createdAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        let removalCount = min(
+            removable.count,
+            suggestions.count + additionalCount - Self.maximumLocalSuggestions
+        )
+        let removedIDs = Set(removable.prefix(removalCount).map(\.id))
+        suggestions.removeAll { removedIDs.contains($0.id) }
+    }
+
+    private func flushLocalSuggestionTransitionIfAvailable() throws {
+        guard persistence != nil else { return }
+        try flushLocalSuggestionTransition()
+    }
+
+    private func flushLocalSuggestionTransition() throws {
+        guard let persistence else {
+            throw PlannerCanonicalAuthoringError.encryptedPersistenceRequired
+        }
+        try persistence.preflightSave(makeSnapshot())
+        flushPersistence()
+        if let persistenceError { throw persistenceError }
+    }
+
+    private func flushLocalSuggestionPrivacyTransition() throws {
+        do {
+            try flushLocalSuggestionTransitionIfAvailable()
+        } catch {
+            // A preflight failure occurs before flushPersistence can install
+            // its usual fail-closed state. Privacy expiry is irreversible in
+            // memory, so lock further persistence until a clean reload rather
+            // than continuing with a scrub that exists only in RAM.
+            if loadState == .ready, let persistenceError = error as? PlannerPersistenceError {
+                self.persistenceError = persistenceError
+                loadState = .persistenceFailed
+                cancelLocalSuggestionHighWaterCheckpoint()
+            }
+            throw error
+        }
+    }
+
     private func scheduleAutosave() {
         guard loadState == .ready, persistence != nil else { return }
         autosaveTask?.cancel()
@@ -4964,6 +5643,109 @@ final class PlannerStore: ObservableObject {
         }
     }
 
+    private func cancelLocalSuggestionHighWaterCheckpoint() {
+        localSuggestionHighWaterCheckpointTask?.cancel()
+        localSuggestionHighWaterCheckpointTask = nil
+        localSuggestionHighWaterCheckpointIdentity = nil
+    }
+
+    /// A monotonic process timer periodically commits the authenticated wall
+    /// observation while private Codex bodies remain. Without this checkpoint,
+    /// a quiet app could run for days, crash, and then relaunch after a wall
+    /// rollback from the much older observation still on disk.
+    private func reconcileLocalSuggestionHighWaterCheckpoint() {
+        let hasPendingTypedBody = suggestions.contains { suggestion in
+            guard suggestion.state == .pending,
+                  case .canonicalItemDraft = suggestion.payload else {
+                return false
+            }
+            return true
+        }
+        guard loadState == .ready,
+              persistence != nil,
+              hasPendingTypedBody,
+              let identity = persistedLocalSuggestionDateHighWater else {
+            cancelLocalSuggestionHighWaterCheckpoint()
+            return
+        }
+        if localSuggestionHighWaterCheckpointTask != nil,
+           localSuggestionHighWaterCheckpointIdentity == identity {
+            return
+        }
+
+        cancelLocalSuggestionHighWaterCheckpoint()
+        localSuggestionHighWaterCheckpointIdentity = identity
+        let sleep = localSuggestionCheckpointSleep
+        let milliseconds = Int64(
+            (Self.localSuggestionHighWaterCheckpointInterval * 1_000).rounded(.up)
+        )
+        localSuggestionHighWaterCheckpointTask = Task { @MainActor [weak self] in
+            do {
+                try await sleep(.milliseconds(milliseconds))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.localSuggestionHighWaterCheckpointIdentity == identity else {
+                return
+            }
+            self.localSuggestionHighWaterCheckpointTask = nil
+            self.localSuggestionHighWaterCheckpointIdentity = nil
+            self.flushPersistence()
+        }
+    }
+
+    private func scheduleLocalSuggestionExpiration() {
+        guard loadState == .ready, persistence != nil else {
+            localSuggestionExpirationTasks.values.forEach { $0.cancel() }
+            localSuggestionExpirationTasks.removeAll()
+            cancelLocalSuggestionHighWaterCheckpoint()
+            return
+        }
+        let observation = observeLocalSuggestionDate()
+        if observation.rollbackDetected {
+            expireLocalSuggestions()
+            return
+        }
+        let identities = Set(suggestions.compactMap { suggestion ->
+            LocalSuggestionExpirationIdentity? in
+            guard suggestion.state == .pending else { return nil }
+            return .init(
+                id: suggestion.id,
+                createdAt: suggestion.createdAt,
+                expiresAt: suggestion.expiresAt
+            )
+        })
+        let staleIdentities = localSuggestionExpirationTasks.keys.filter {
+            !identities.contains($0)
+        }
+        for identity in staleIdentities {
+            localSuggestionExpirationTasks.removeValue(forKey: identity)?.cancel()
+        }
+        for identity in identities where localSuggestionExpirationTasks[identity] == nil {
+            let seconds = min(
+                Self.localSuggestionLifetime,
+                max(0, identity.expiresAt.timeIntervalSince(observation.referenceDate))
+            )
+            let milliseconds = max(Int64(1), Int64((seconds * 1_000).rounded(.up)))
+            localSuggestionExpirationTasks[identity] = Task { @MainActor [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(milliseconds))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                self?.expireLocalSuggestionAtScheduledDeadline(
+                    identity.id,
+                    createdAt: identity.createdAt,
+                    expiresAt: identity.expiresAt
+                )
+            }
+        }
+        reconcileLocalSuggestionHighWaterCheckpoint()
+    }
+
     private func makeSnapshot(
         canonicalTrashOverride: [DayWeaveCanonicalTrashEntry]? = nil,
         canonicalAuthoringMutationsOverride:
@@ -4975,6 +5757,7 @@ final class PlannerStore: ObservableObject {
             selectedCanonicalItemID: selectedCanonicalItemID,
             blocks: blocks,
             suggestions: suggestions,
+            localSuggestionDateHighWater: localSuggestionDateHighWater,
             assistantMessages: assistantMessages,
             lastScheduleMessage: lastScheduleMessage,
             protectedFreeMinutes: protectedFreeMinutes,
@@ -5140,7 +5923,8 @@ final class PlannerStore: ObservableObject {
             blocks: blocks,
             suggestions: suggestions,
             assistantMessages: messages,
-            lastScheduleMessage: "Schedule is balanced"
+            lastScheduleMessage: "Schedule is balanced",
+            now: { now }
         )
     }
 }

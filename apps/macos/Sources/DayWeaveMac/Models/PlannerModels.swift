@@ -992,8 +992,123 @@ struct AssistantMessage: Identifiable, Hashable, Codable, Sendable {
     let createdAt: Date
 }
 
-struct PlanningSuggestion: Identifiable, Hashable, Codable, Sendable {
-    enum State: String, Codable, Sendable { case pending, accepted, rejected }
+struct PlanningSuggestionItemDraft: Codable, Equatable, Sendable {
+    static let currentVersion = 1
+    static let maximumEncodedBytes = 64 * 1_024
+
+    let version: Int
+    let itemID: UUID
+    let draft: DayWeaveCanonicalItemDraft
+
+    init(
+        version: Int = Self.currentVersion,
+        itemID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    ) {
+        self.version = version
+        self.itemID = itemID
+        self.draft = draft.normalized
+    }
+
+    var hasValidShape: Bool {
+        guard version == Self.currentVersion,
+              draft == draft.normalized,
+              draft.isSensitive,
+              draft.status == .inbox,
+              draft.parentID == nil,
+              draft.siblingOrder == 0,
+              draft.validationIssue(itemID: itemID) == nil,
+              draft.deadlineAt?.timeIntervalSinceReferenceDate.isFinite != false,
+              draft.earliestStartAt?.timeIntervalSinceReferenceDate.isFinite != false,
+              !PlanningSuggestion.hasUnsafeText(draft.title, allowingLayoutControls: false),
+              !PlanningSuggestion.hasUnsafeText(draft.notes ?? "", allowingLayoutControls: true),
+              let encoded = try? JSONEncoder().encode(self),
+              encoded.count <= Self.maximumEncodedBytes else {
+            return false
+        }
+        return true
+    }
+}
+
+enum PlanningSuggestionPayload: Codable, Equatable, Sendable {
+    case advisory
+    case canonicalItemDraft(PlanningSuggestionItemDraft)
+    case canonicalItemReference(itemID: UUID)
+
+    private enum Kind: String, Codable {
+        case advisory
+        case canonicalItemDraft = "canonical_item_draft"
+        case canonicalItemReference = "canonical_item_reference"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case itemDraft = "item_draft"
+        case itemID = "item_id"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .type) {
+        case .advisory:
+            guard container.allKeys == [.type] else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .type,
+                    in: container,
+                    debugDescription: "Advisory suggestion payload has unexpected fields."
+                )
+            }
+            self = .advisory
+        case .canonicalItemDraft:
+            guard Set(container.allKeys) == [.type, .itemDraft] else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .type,
+                    in: container,
+                    debugDescription: "Canonical draft suggestion payload has unexpected fields."
+                )
+            }
+            self = .canonicalItemDraft(
+                try container.decode(PlanningSuggestionItemDraft.self, forKey: .itemDraft)
+            )
+        case .canonicalItemReference:
+            guard Set(container.allKeys) == [.type, .itemID] else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .type,
+                    in: container,
+                    debugDescription: "Canonical reference suggestion payload has unexpected fields."
+                )
+            }
+            self = .canonicalItemReference(
+                itemID: try container.decode(UUID.self, forKey: .itemID)
+            )
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .advisory:
+            try container.encode(Kind.advisory, forKey: .type)
+        case let .canonicalItemDraft(itemDraft):
+            try container.encode(Kind.canonicalItemDraft, forKey: .type)
+            try container.encode(itemDraft, forKey: .itemDraft)
+        case let .canonicalItemReference(itemID):
+            try container.encode(Kind.canonicalItemReference, forKey: .type)
+            try container.encode(itemID, forKey: .itemID)
+        }
+    }
+}
+
+struct PlanningSuggestion: Identifiable, Equatable, Codable, Sendable {
+    static let codexSource = "Codex · requires approval"
+    static let maximumStoredCount = 500
+    static let maximumSummaryUTF8Bytes = 16 * 1_024
+    static let maximumAggregateEncodedBytes = 4 * 1_048_576
+    static let scrubbedCanonicalTitle = "Codex item draft"
+
+    enum State: String, Codable, Sendable {
+        case pending, accepted, rejected, expired
+    }
 
     let id: UUID
     var title: String
@@ -1002,4 +1117,185 @@ struct PlanningSuggestion: Identifiable, Hashable, Codable, Sendable {
     var createdAt: Date
     var expiresAt: Date
     var state: State
+    var payload: PlanningSuggestionPayload
+    var resultingItemID: UUID?
+    var resultingMutationID: UUID?
+
+    init(
+        id: UUID,
+        title: String,
+        summary: String,
+        source: String,
+        createdAt: Date,
+        expiresAt: Date,
+        state: State,
+        payload: PlanningSuggestionPayload = .advisory,
+        resultingItemID: UUID? = nil,
+        resultingMutationID: UUID? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.summary = summary
+        self.source = source
+        self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.state = state
+        self.payload = payload
+        self.resultingItemID = resultingItemID
+        self.resultingMutationID = resultingMutationID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, summary, source, createdAt, expiresAt, state, payload
+        case resultingItemID, resultingMutationID
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        summary = try container.decode(String.self, forKey: .summary)
+        source = try container.decode(String.self, forKey: .source)
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        expiresAt = try container.decode(Date.self, forKey: .expiresAt)
+        state = try container.decode(State.self, forKey: .state)
+
+        let schemaVersion = decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] as? Int
+        if let schemaVersion, schemaVersion < 18 {
+            // These fields did not exist before schema 18. Ignore even valid-
+            // looking injected values so migration cannot manufacture an
+            // actionable AI draft or accepted-item linkage.
+            payload = .advisory
+            resultingItemID = nil
+            resultingMutationID = nil
+        } else if let schemaVersion, schemaVersion >= 18 {
+            payload = try container.decode(PlanningSuggestionPayload.self, forKey: .payload)
+            resultingItemID = try container.decodeIfPresent(UUID.self, forKey: .resultingItemID)
+            resultingMutationID = try container.decodeIfPresent(UUID.self, forKey: .resultingMutationID)
+        } else {
+            // Standalone decoders remain source-compatible with legacy fixtures;
+            // durable planner decoding always supplies the authenticated schema.
+            payload = try container.decodeIfPresent(
+                PlanningSuggestionPayload.self,
+                forKey: .payload
+            ) ?? .advisory
+            resultingItemID = try container.decodeIfPresent(UUID.self, forKey: .resultingItemID)
+            resultingMutationID = try container.decodeIfPresent(UUID.self, forKey: .resultingMutationID)
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(summary, forKey: .summary)
+        try container.encode(source, forKey: .source)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(expiresAt, forKey: .expiresAt)
+        try container.encode(state, forKey: .state)
+        try container.encode(payload, forKey: .payload)
+        try container.encodeIfPresent(resultingItemID, forKey: .resultingItemID)
+        try container.encodeIfPresent(resultingMutationID, forKey: .resultingMutationID)
+    }
+
+    var hasValidShape: Bool {
+        let title = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty,
+              title == self.title,
+              title.unicodeScalars.count <= DayWeaveCanonicalItemDraft.maximumTitleScalars,
+              summary.utf8.count <= Self.maximumSummaryUTF8Bytes,
+              !source.isEmpty,
+              source.utf8.count <= 1_024,
+              !Self.hasUnsafeText(title, allowingLayoutControls: false),
+              !Self.hasUnsafeText(summary, allowingLayoutControls: true),
+              !Self.hasUnsafeText(source, allowingLayoutControls: false),
+              createdAt.timeIntervalSinceReferenceDate.isFinite,
+              expiresAt.timeIntervalSinceReferenceDate.isFinite,
+              createdAt < expiresAt,
+              expiresAt.timeIntervalSince(createdAt) <= 31 * 24 * 60 * 60 else {
+            return false
+        }
+
+        switch payload {
+        case .advisory:
+            return resultingItemID == nil && resultingMutationID == nil
+        case let .canonicalItemDraft(itemDraft):
+            return source == Self.codexSource
+                && state == .pending
+                && resultingItemID == nil
+                && resultingMutationID == nil
+                && title == itemDraft.draft.title
+                && itemDraft.hasValidShape
+        case let .canonicalItemReference(itemID):
+            guard source == Self.codexSource, state != .pending else { return false }
+            guard title == Self.scrubbedCanonicalTitle,
+                  summary == Self.scrubbedCanonicalSummary(for: state) else {
+                return false
+            }
+            if state == .accepted {
+                return resultingItemID == itemID && resultingMutationID != nil
+            }
+            return resultingItemID == nil && resultingMutationID == nil
+        }
+    }
+
+    static func collectionIsValid(_ suggestions: [Self]) -> Bool {
+        guard suggestions.count <= maximumStoredCount,
+              Set(suggestions.map(\.id)).count == suggestions.count,
+              suggestions.allSatisfy(\.hasValidShape) else {
+            return false
+        }
+        var aggregateBytes = 0
+        let encoder = JSONEncoder()
+        for suggestion in suggestions {
+            guard let data = try? encoder.encode(suggestion),
+                  aggregateBytes <= maximumAggregateEncodedBytes - data.count else {
+                return false
+            }
+            aggregateBytes += data.count
+        }
+        return true
+    }
+
+    var migratedLegacyAdvisory: Self {
+        Self(
+            id: id,
+            title: title,
+            summary: summary,
+            source: source,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            state: state,
+            payload: .advisory
+        )
+    }
+
+    static func scrubbedCanonicalSummary(for state: State) -> String? {
+        switch state {
+        case .accepted: "Approved after local review."
+        case .rejected: "Rejected; retained draft content was removed."
+        case .expired: "Expired; retained draft content was removed."
+        case .pending: nil
+        }
+    }
+
+    fileprivate static func hasUnsafeText(
+        _ value: String,
+        allowingLayoutControls: Bool
+    ) -> Bool {
+        for scalar in value.unicodeScalars {
+            if (0x202A...0x202E).contains(scalar.value)
+                || (0x2066...0x2069).contains(scalar.value)
+                || scalar.value == 0x061C
+                || scalar.value == 0x200E
+                || scalar.value == 0x200F {
+                return true
+            }
+            if CharacterSet.controlCharacters.contains(scalar),
+               !(allowingLayoutControls && (scalar.value == 0x09 || scalar.value == 0x0A)) {
+                return true
+            }
+        }
+        return false
+    }
 }

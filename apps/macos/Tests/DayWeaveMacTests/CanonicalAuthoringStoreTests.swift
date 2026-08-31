@@ -5,6 +5,61 @@ import Testing
 @testable import DayWeaveMac
 
 #if canImport(Testing)
+private final class CanonicalAuthoringTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+
+    func read() -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ value: Date) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+}
+
+private actor CanonicalAuthoringCheckpointSleeper {
+    private var enteredCount = 0
+    private var order: [UUID] = []
+    private var continuations: [UUID: CheckedContinuation<Void, any Error>] = [:]
+
+    func sleep(for _: Duration) async throws {
+        let id = UUID()
+        enteredCount += 1
+        order.append(id)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                continuations[id] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    func waitUntilEntered(_ count: Int) async {
+        while enteredCount < count { await Task.yield() }
+    }
+
+    func releaseNext() {
+        guard let id = order.first else { return }
+        order.removeFirst()
+        continuations.removeValue(forKey: id)?.resume(returning: ())
+    }
+
+    private func cancel(_ id: UUID) {
+        order.removeAll { $0 == id }
+        continuations.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+}
+
 @Suite("Canonical authoring store", .serialized)
 @MainActor
 struct CanonicalAuthoringStoreTests {
@@ -1155,6 +1210,621 @@ struct CanonicalAuthoringStoreTests {
         #expect(throws: PlannerCanonicalAuthoringError.activeExecution) {
             try store.enqueueCanonicalReplace(itemID: activeItemID, draft: activeDraft)
         }
+    }
+
+    @Test("Codex acceptance durably queues the exact user-reviewed create")
+    func codexDraftAcceptanceIsAtomicAndExact() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proposedDraft = DayWeaveCanonicalItemDraft(
+            isSensitive: true,
+            title: "Model-proposed private task",
+            notes: "Untrusted model notes",
+            timezoneName: "Europe/Madrid",
+            durationSeconds: 1_800,
+            splitPolicy: .indivisible,
+            importance: 60,
+            urgency: 40
+        )
+        let proposal = CodexSuggestionDraft(
+            summary: "Review this task before it enters the Inbox.",
+            canonicalDraft: proposedDraft
+        )
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+
+        #expect(try store.storeCodexItemDraftSuggestions([proposal], createdAt: now) == 1)
+        #expect(
+            try store.storeCodexItemDraftSuggestions(
+                [proposal],
+                createdAt: now.addingTimeInterval(1)
+            ) == 0
+        )
+        #expect(store.suggestions.count == 1)
+        let suggestion = try #require(store.suggestions.first)
+        guard case let .canonicalItemDraft(itemDraft) = suggestion.payload else {
+            Issue.record("Expected a typed canonical item draft")
+            return
+        }
+        var reviewedDraft = itemDraft.draft
+        reviewedDraft.title = "User-reviewed exact title"
+        reviewedDraft.notes = "User-reviewed exact notes"
+        reviewedDraft.durationSeconds = 2_700
+        reviewedDraft.importance = 91
+
+        try store.acceptCanonicalItemSuggestion(
+            suggestion.id,
+            itemID: itemDraft.itemID,
+            draft: reviewedDraft
+        )
+
+        #expect(store.pendingCanonicalAuthoringMutations.count == 1)
+        let mutation = try #require(store.pendingCanonicalAuthoringMutations.first)
+        #expect(mutation.operation == .create)
+        #expect(mutation.itemID == itemDraft.itemID)
+        #expect(mutation.draft == reviewedDraft.normalized)
+        #expect(mutation.idempotencyKey == "mac-item-\(mutation.id.uuidString.lowercased())")
+        #expect(store.selectedCanonicalItemID == itemDraft.itemID)
+        #expect(store.blocks.isEmpty)
+        let accepted = try #require(store.suggestions.first)
+        #expect(accepted.state == .accepted)
+        #expect(accepted.resultingItemID == itemDraft.itemID)
+        #expect(accepted.resultingMutationID == mutation.id)
+        #expect(accepted.payload == .canonicalItemReference(itemID: itemDraft.itemID))
+        #expect(accepted.title == "Codex item draft")
+        #expect(!accepted.summary.contains("Review this task"))
+        var mismatchedRetryDraft = reviewedDraft
+        mismatchedRetryDraft.title = "This was never queued"
+        #expect(throws: PlannerCanonicalAuthoringError.suggestionIdentityMismatch) {
+            try store.acceptCanonicalItemSuggestion(
+                suggestion.id,
+                itemID: itemDraft.itemID,
+                draft: mismatchedRetryDraft
+            )
+        }
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "The model repeated the already accepted exact item.",
+                canonicalDraft: reviewedDraft
+            ),
+        ], createdAt: now.addingTimeInterval(2)) == 0)
+        #expect(store.suggestions == [accepted])
+
+        let restarted = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restarted.loadState == .ready)
+        #expect(restarted.pendingCanonicalAuthoringMutations == [mutation])
+        #expect(restarted.suggestions == [accepted])
+
+        try restarted.acceptCanonicalItemSuggestion(
+            suggestion.id,
+            itemID: itemDraft.itemID,
+            draft: reviewedDraft
+        )
+        #expect(restarted.pendingCanonicalAuthoringMutations == [mutation])
+        #expect(throws: PlannerCanonicalAuthoringError.suggestionIdentityMismatch) {
+            try restarted.acceptCanonicalItemSuggestion(
+                suggestion.id,
+                itemID: UUID(),
+                draft: reviewedDraft
+            )
+        }
+    }
+
+    @Test("Codex rejection and expiry durably scrub actionable draft bodies")
+    func codexDraftTerminalStatesAreDurableAndScrubbed() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let proposals = [
+            CodexSuggestionDraft(
+                summary: "Reject this one.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Rejected private draft",
+                    timezoneName: "UTC"
+                )
+            ),
+            CodexSuggestionDraft(
+                summary: "Let this one expire.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Expired private draft",
+                    timezoneName: "UTC"
+                )
+            ),
+        ]
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        #expect(try store.storeCodexItemDraftSuggestions(proposals, createdAt: now) == 2)
+        let rejectedID = try #require(
+            store.suggestions.first(where: { $0.title == "Rejected private draft" })?.id
+        )
+
+        store.rejectSuggestion(rejectedID)
+
+        let rejected = try #require(store.suggestions.first(where: { $0.id == rejectedID }))
+        #expect(rejected.state == .rejected)
+        #expect(rejected.resultingItemID == nil)
+        #expect(rejected.resultingMutationID == nil)
+        #expect(rejected.title == "Codex item draft")
+        #expect(!rejected.summary.contains("Reject this one"))
+        guard case .canonicalItemReference = rejected.payload else {
+            Issue.record("A rejected draft retained its actionable body")
+            return
+        }
+
+        let expiredNow = now.addingTimeInterval(PlannerStore.localSuggestionLifetime + 1)
+        let restarted = PlannerStore(
+            persistence: context.persistence,
+            now: { expiredNow }
+        )
+        #expect(restarted.loadState == .ready)
+        let durableRejected = try #require(
+            restarted.suggestions.first(where: { $0.id == rejectedID })
+        )
+        let expired = try #require(
+            restarted.suggestions.first(where: { $0.id != rejectedID })
+        )
+        #expect(durableRejected.state == .rejected)
+        #expect(expired.state == .expired)
+        #expect(expired.resultingItemID == nil)
+        #expect(expired.resultingMutationID == nil)
+        #expect(expired.title == "Codex item draft")
+        #expect(!expired.summary.contains("Let this one expire"))
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("An expired draft retained its actionable body")
+            return
+        }
+        #expect(restarted.pendingCanonicalAuthoringMutations.isEmpty)
+    }
+
+    @Test("Codex expiry commits before a later ingress validation error")
+    func codexDraftExpiryPrecedesIngressValidationFailure() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let clock = CanonicalAuthoringTestClock(createdAt)
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { clock.read() }
+        )
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "Expire before rejecting the next envelope.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Private body awaiting expiry",
+                    timezoneName: "UTC"
+                )
+            ),
+        ], createdAt: createdAt) == 1)
+
+        let expiredAt = createdAt.addingTimeInterval(
+            PlannerStore.localSuggestionLifetime + 1
+        )
+        clock.set(expiredAt)
+        #expect(throws: PlannerCanonicalAuthoringError.invalidDraft) {
+            try store.storeCodexItemDraftSuggestions([
+                CodexSuggestionDraft(
+                    summary: "This invalid proposal must not defer retention.",
+                    canonicalDraft: .init(
+                        isSensitive: true,
+                        title: "",
+                        timezoneName: "UTC"
+                    )
+                ),
+            ], createdAt: expiredAt)
+        }
+
+        let restarted = PlannerStore(
+            persistence: context.persistence,
+            now: { expiredAt }
+        )
+        let expired = try #require(restarted.suggestions.first)
+        #expect(expired.state == .expired)
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("Ingress validation deferred the durable privacy scrub")
+            return
+        }
+    }
+
+    @Test("Codex acceptance rolls both records back after a persistence CAS loss")
+    func codexDraftAcceptanceRollbackIsAtomic() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let seed = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let proposal = CodexSuggestionDraft(
+            summary: "This transaction must not tear.",
+            canonicalDraft: .init(
+                isSensitive: true,
+                title: "Rollback-safe Codex draft",
+                timezoneName: "UTC"
+            )
+        )
+        #expect(try seed.storeCodexItemDraftSuggestions([proposal], createdAt: now) == 1)
+        let stale = PlannerStore(persistence: context.persistence, now: { now })
+        let writer = PlannerStore(persistence: context.persistence, now: { now })
+        writer.lastScheduleMessage = "A newer writer committed first"
+        writer.flushPersistence()
+        #expect(stale.suggestions.count == 1)
+        let pending = try #require(stale.suggestions.first)
+        guard case let .canonicalItemDraft(itemDraft) = pending.payload else {
+            Issue.record("Expected a typed canonical item draft")
+            return
+        }
+
+        #expect(throws: PlannerPersistenceError.concurrentModification) {
+            try stale.acceptCanonicalItemSuggestion(
+                pending.id,
+                itemID: itemDraft.itemID,
+                draft: itemDraft.draft
+            )
+        }
+
+        #expect(stale.suggestions == [pending])
+        #expect(stale.pendingCanonicalAuthoringMutations.isEmpty)
+        #expect(stale.selectedCanonicalItemID == nil)
+        #expect(stale.blocks.isEmpty)
+        #expect(stale.loadState == .persistenceFailed)
+        let restarted = PlannerStore(persistence: context.persistence, now: { now })
+        #expect(restarted.loadState == .ready)
+        #expect(restarted.suggestions == [pending])
+        #expect(restarted.pendingCanonicalAuthoringMutations.isEmpty)
+    }
+
+    @Test("a backward wall-clock jump cannot extend a Codex draft lifetime")
+    func codexDraftFutureClockSkewExpiresContent() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { createdAt }
+        )
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "This body must not survive clock rollback.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Future-clock private draft",
+                    timezoneName: "UTC"
+                )
+            ),
+        ], createdAt: createdAt) == 1)
+
+        let rolledBackNow = createdAt.addingTimeInterval(
+            -PlannerStore.localSuggestionFutureSkewTolerance - 1
+        )
+        let restarted = PlannerStore(
+            persistence: context.persistence,
+            now: { rolledBackNow }
+        )
+        let expired = try #require(restarted.suggestions.first)
+        #expect(expired.state == .expired)
+        #expect(expired.title == "Codex item draft")
+        #expect(!expired.summary.contains("clock rollback"))
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("Clock rollback retained the actionable draft body")
+            return
+        }
+    }
+
+    @Test("Codex draft high-water and monotonic identity prevent partial rollback extension")
+    func codexDraftPartialClockRollbackExpiresContent() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let day = 24 * 60 * 60.0
+        let clock = CanonicalAuthoringTestClock(createdAt)
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { clock.read() }
+        )
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "The original monotonic deadline must survive unrelated saves.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Partial-rollback private draft",
+                    timezoneName: "UTC"
+                )
+            ),
+        ], createdAt: createdAt) == 1)
+        let pending = try #require(store.suggestions.first)
+
+        // No observation occurred between day zero and this rolled wall time.
+        // The unrelated save may advance durable high-water, but it must not
+        // cancel/re-arm the original identity-bound monotonic sleeper.
+        clock.set(createdAt.addingTimeInterval(5 * day))
+        store.lastScheduleMessage = "Unrelated save after a partial clock rollback"
+        store.flushPersistence()
+        #expect(store.suggestions.first?.state == .pending)
+
+        store.expireLocalSuggestionAtScheduledDeadline(
+            pending.id,
+            createdAt: pending.createdAt,
+            expiresAt: pending.expiresAt
+        )
+        let expired = try #require(store.suggestions.first)
+        #expect(expired.state == .expired)
+        #expect(expired.title == PlanningSuggestion.scrubbedCanonicalTitle)
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("The monotonic deadline retained a private draft body")
+            return
+        }
+    }
+
+    @Test("durable Codex clock high-water detects rollback beyond tolerance")
+    func codexDraftDurableHighWaterDetectsRollback() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let day = 24 * 60 * 60.0
+        let proposal = CodexSuggestionDraft(
+            summary: "Checkpoint this pending body.",
+            canonicalDraft: .init(
+                isSensitive: true,
+                title: "High-water private draft",
+                timezoneName: "UTC"
+            )
+        )
+        let seed = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { createdAt }
+        )
+        #expect(try seed.storeCodexItemDraftSuggestions([proposal], createdAt: createdAt) == 1)
+
+        let daySix = createdAt.addingTimeInterval(6 * day)
+        do {
+            let checkpoint = PlannerStore(
+                persistence: context.persistence,
+                now: { daySix }
+            )
+            #expect(checkpoint.suggestions.first?.state == .pending)
+        }
+        #expect(try context.persistence.load()?.localSuggestionDateHighWater == daySix)
+
+        let tolerance = PlannerStore.localSuggestionFutureSkewTolerance
+        do {
+            let toleranceBoundary = PlannerStore(
+                persistence: context.persistence,
+                now: {
+                    daySix.addingTimeInterval(-tolerance)
+                }
+            )
+            #expect(toleranceBoundary.suggestions.first?.state == .pending)
+        }
+
+        let rolledBack = PlannerStore(
+            persistence: context.persistence,
+            now: {
+                daySix.addingTimeInterval(-tolerance - 1)
+            }
+        )
+        let expired = try #require(rolledBack.suggestions.first)
+        #expect(expired.state == .expired)
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("Durable high-water retained the actionable draft body")
+            return
+        }
+        #expect(try context.persistence.load()?.localSuggestionDateHighWater == nil)
+    }
+
+    @Test("a quiet process periodically checkpoints the Codex retention clock")
+    func codexDraftQuietProcessCheckpointsHighWater() async throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let day = 24 * 60 * 60.0
+        let daySix = createdAt.addingTimeInterval(6 * day)
+        let clock = CanonicalAuthoringTestClock(createdAt)
+        let sleeper = CanonicalAuthoringCheckpointSleeper()
+
+        do {
+            let store = PlannerStore(
+                persistence: context.persistence,
+                restoreFromPersistence: false,
+                now: { clock.read() },
+                localSuggestionCheckpointSleep: { duration in
+                    try await sleeper.sleep(for: duration)
+                }
+            )
+            #expect(try store.storeCodexItemDraftSuggestions([
+                CodexSuggestionDraft(
+                    summary: "Checkpoint this quiet private body.",
+                    canonicalDraft: .init(
+                        isSensitive: true,
+                        title: "Quiet high-water draft",
+                        timezoneName: "UTC"
+                    )
+                ),
+            ], createdAt: createdAt) == 1)
+
+            await sleeper.waitUntilEntered(1)
+            clock.set(daySix)
+            await sleeper.releaseNext()
+            for _ in 0..<1_000 {
+                if try context.persistence.load()?.localSuggestionDateHighWater == daySix {
+                    break
+                }
+                await Task.yield()
+            }
+            #expect(try context.persistence.load()?.localSuggestionDateHighWater == daySix)
+        }
+
+        let rolledBackDate = daySix.addingTimeInterval(
+            -PlannerStore.localSuggestionFutureSkewTolerance - 1
+        )
+        let rolledBack = PlannerStore(
+            persistence: context.persistence,
+            now: { rolledBackDate }
+        )
+        let expired = try #require(rolledBack.suggestions.first)
+        #expect(expired.state == .expired)
+        guard case .canonicalItemReference = expired.payload else {
+            Issue.record("A quiet-process rollback resurrected the private draft body")
+            return
+        }
+    }
+
+    @Test("final Codex approval rejects hidden edited semantics")
+    func codexDraftFinalReviewBoundaryIsRevalidated() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "Start from a fully reviewable task.",
+                canonicalDraft: .init(
+                    isSensitive: true,
+                    title: "Visible task draft",
+                    timezoneName: "UTC"
+                )
+            ),
+        ], createdAt: now) == 1)
+        let suggestion = try #require(store.suggestions.first)
+        guard case let .canonicalItemDraft(itemDraft) = suggestion.payload else {
+            Issue.record("Expected a typed pending draft")
+            return
+        }
+        var hiddenConstraint = itemDraft.draft
+        hiddenConstraint.flexibleConstraints = .object(["routine_ordered": .bool(true)])
+        #expect(throws: PlannerCanonicalAuthoringError.invalidDraft) {
+            try store.acceptCanonicalItemSuggestion(
+                suggestion.id,
+                itemID: itemDraft.itemID,
+                draft: hiddenConstraint
+            )
+        }
+        #expect(store.suggestions.first?.state == .pending)
+        #expect(store.pendingCanonicalAuthoringMutations.isEmpty)
+    }
+
+    @Test("accepted Codex identity remains exact after reconciliation and expiry")
+    func acceptedCodexIdentitySurvivesReconciliationAndExpiry() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let createdAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let itemID = UUID(uuidString: "ab000000-0000-4000-8000-000000000001")!
+        let canonicalItem = try Self.item(
+            id: itemID,
+            revision: 1,
+            deleted: false,
+            title: "Reconciled private Codex item",
+            isSensitive: true
+        )
+        let exactDraft = DayWeaveCanonicalItemDraft(item: canonicalItem)
+        let accepted = PlanningSuggestion(
+            id: UUID(uuidString: "ac000000-0000-4000-8000-000000000001")!,
+            title: PlanningSuggestion.scrubbedCanonicalTitle,
+            summary: try #require(PlanningSuggestion.scrubbedCanonicalSummary(for: .accepted)),
+            source: PlanningSuggestion.codexSource,
+            createdAt: createdAt,
+            expiresAt: createdAt.addingTimeInterval(PlannerStore.localSuggestionLifetime),
+            state: .accepted,
+            payload: .canonicalItemReference(itemID: itemID),
+            resultingItemID: itemID,
+            resultingMutationID: UUID(uuidString: "ad000000-0000-4000-8000-000000000001")!
+        )
+        let later = accepted.expiresAt.addingTimeInterval(24 * 60 * 60)
+        let store = PlannerStore(
+            suggestions: [accepted],
+            canonicalItems: [canonicalItem],
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { later }
+        )
+
+        try store.acceptCanonicalItemSuggestion(
+            accepted.id,
+            itemID: itemID,
+            draft: exactDraft
+        )
+        var mismatch = exactDraft
+        mismatch.title = "Never reconciled"
+        #expect(throws: PlannerCanonicalAuthoringError.suggestionIdentityMismatch) {
+            try store.acceptCanonicalItemSuggestion(
+                accepted.id,
+                itemID: itemID,
+                draft: mismatch
+            )
+        }
+        #expect(try store.storeCodexItemDraftSuggestions([
+            CodexSuggestionDraft(
+                summary: "Do not duplicate a reconciled accepted item.",
+                canonicalDraft: exactDraft
+            ),
+        ], createdAt: later) == 0)
+        #expect(store.suggestions == [accepted])
+    }
+
+    @Test("Codex ingress rejects drafts that violate the private detached Inbox contract")
+    func codexDraftIngressRevalidatesUntrustedOutput() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        let unsafe = CodexSuggestionDraft(
+            summary: "Do not trust parser callers.",
+            canonicalDraft: .init(
+                isSensitive: false,
+                status: .planned,
+                title: "Not a private detached Inbox draft",
+                timezoneName: "UTC"
+            )
+        )
+
+        #expect(throws: PlannerCanonicalAuthoringError.invalidDraft) {
+            try store.storeCodexItemDraftSuggestions([unsafe], createdAt: now)
+        }
+        #expect(store.suggestions.isEmpty)
+        #expect(store.pendingCanonicalAuthoringMutations.isEmpty)
+
+        let editorReadOnly = CodexSuggestionDraft(
+            summary: "Canonical storage accepts this, but the required editor cannot edit it.",
+            canonicalDraft: .init(
+                isSensitive: true,
+                kind: .habit,
+                status: .inbox,
+                title: "Unsupported frequency recurrence",
+                timezoneName: "UTC",
+                recurrence: .object([
+                    "type": .string("frequency"),
+                    "target": .number(JSONNumber(UInt64(2))),
+                    "period": .string("week"),
+                    "semantics": .string("calendar"),
+                ])
+            )
+        )
+        #expect(throws: PlannerCanonicalAuthoringError.invalidDraft) {
+            try store.storeCodexItemDraftSuggestions([editorReadOnly], createdAt: now)
+        }
+        #expect(store.suggestions.isEmpty)
     }
 
     private static let configurationIdentifier =

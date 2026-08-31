@@ -5,6 +5,13 @@ extension CodingUserInfoKey {
     static let dayWeaveAllowsMissingSensitivity = CodingUserInfoKey(
         rawValue: "com.greengolddog.dayweave.allows-missing-sensitivity"
     )!
+
+    /// Lets nested durable models distinguish authenticated legacy snapshots
+    /// from the current schema. This prevents fields injected into an older
+    /// snapshot from acquiring authority during migration.
+    static let dayWeavePlannerSnapshotSchemaVersion = CodingUserInfoKey(
+        rawValue: "com.greengolddog.dayweave.planner-snapshot-schema-version"
+    )!
 }
 
 enum DayWeaveCanonicalItemKind: Codable, Equatable, Hashable, Sendable {

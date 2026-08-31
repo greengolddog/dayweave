@@ -24,6 +24,24 @@ private enum EncryptedPlannerPersistenceScenarios {
         let restored = try requireValue(context.persistence.load(), "Saved snapshot was not restored")
 
         try require(restored == snapshot, "Restored snapshot differs from the saved snapshot")
+        let attributes = try FileManager.default.attributesOfItem(
+            atPath: context.fileURL.path
+        )
+        let permissions = try requireValue(
+            attributes[.posixPermissions] as? NSNumber,
+            "Encrypted snapshot had no POSIX permissions"
+        ).intValue & 0o777
+        try require(
+            permissions == 0o600,
+            "Encrypted snapshot was committed without exact owner-only permissions"
+        )
+        let siblingNames = try FileManager.default.contentsOfDirectory(
+            atPath: context.directory.path
+        )
+        try require(
+            !siblingNames.contains(where: { $0.hasSuffix(".tmp") }),
+            "Encrypted snapshot commit left a temporary envelope sibling"
+        )
     }
 
     static func encryptedAtRest() throws {
@@ -40,6 +58,47 @@ private enum EncryptedPlannerPersistenceScenarios {
         try require(
             bytes.range(of: Data("private notes and attendee details".utf8)) == nil,
             "Encrypted file contains plaintext notes"
+        )
+    }
+
+    static func crashOrphanedTemporaryEnvelopeIsCleanedSafely() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        try context.persistence.save(makeSnapshot())
+
+        let baseName = context.fileURL.lastPathComponent
+        let orphan = context.directory.appendingPathComponent(
+            ".\(baseName).\(UUID().uuidString).tmp"
+        )
+        let nearMatch = context.directory.appendingPathComponent(
+            ".\(baseName).NOT-A-UUID.tmp"
+        )
+        let symlink = context.directory.appendingPathComponent(
+            ".\(baseName).\(UUID().uuidString).tmp"
+        )
+        try FileManager.default.copyItem(at: context.fileURL, to: orphan)
+        try FileManager.default.copyItem(at: context.fileURL, to: nearMatch)
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: context.fileURL
+        )
+
+        _ = try context.persistence.loadRevisioned()
+
+        try require(
+            !FileManager.default.fileExists(atPath: orphan.path),
+            "A crash-orphaned encrypted temporary envelope survived load"
+        )
+        try require(
+            FileManager.default.fileExists(atPath: nearMatch.path),
+            "Cleanup removed a sibling outside the exact app-owned pattern"
+        )
+        let symlinkDestination = try FileManager.default.destinationOfSymbolicLink(
+            atPath: symlink.path
+        )
+        try require(
+            !symlinkDestination.isEmpty,
+            "Cleanup followed or removed a matching symbolic link"
         )
     }
 
@@ -159,7 +218,8 @@ private enum EncryptedPlannerPersistenceScenarios {
             assistantMessages: snapshot.assistantMessages,
             persistence: context.persistence,
             restoreFromPersistence: false,
-            autosaveDelay: .seconds(60)
+            autosaveDelay: .seconds(60),
+            now: { snapshot.savedAt }
         )
         source.destination = .goals
         try source.updateScheduleProfile(
@@ -177,7 +237,8 @@ private enum EncryptedPlannerPersistenceScenarios {
         let restored = PlannerStore(
             blocks: [],
             persistence: context.persistence,
-            autosaveDelay: .seconds(60)
+            autosaveDelay: .seconds(60),
+            now: { snapshot.savedAt }
         )
 
         try require(restored.blocks == snapshot.blocks, "Store did not restore schedule blocks")
@@ -921,6 +982,182 @@ private enum EncryptedPlannerPersistenceScenarios {
         )
     }
 
+    static func typedCodexSuggestionRoundTripsEncrypted() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let suggestion = typedCodexSuggestion(createdAt: base.savedAt)
+        let snapshot = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: [suggestion],
+            localSuggestionDateHighWater: base.savedAt,
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted
+        )
+
+        try context.persistence.save(snapshot)
+        let restored = try requireValue(
+            context.persistence.load(),
+            "Typed Codex suggestion was not restored"
+        )
+        try require(
+            restored.suggestions == [suggestion],
+            "Typed Codex suggestion changed during encrypted round-trip"
+        )
+        try require(
+            restored.localSuggestionDateHighWater == base.savedAt,
+            "Typed Codex retention high-water changed during encrypted round-trip"
+        )
+        let encrypted = try Data(contentsOf: context.fileURL)
+        try require(
+            encrypted.range(of: Data("AI-DRAFT-ENCRYPTION-CANARY".utf8)) == nil,
+            "Typed Codex draft leaked outside encrypted snapshot content"
+        )
+    }
+
+    static func schemaSeventeenCannotAcquireCodexDraftAuthority() throws {
+        let base = makeSnapshot()
+        let injected = typedCodexSuggestion(createdAt: base.savedAt)
+        let legacy = PlannerSnapshot(
+            schemaVersion: 17,
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: [injected],
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let encoded = try encoder.encode(legacy)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = 17
+        let decoded = try decoder.decode(PlannerSnapshot.self, from: encoded)
+        let migrated = try decoded.migratedToCurrentSchema()
+
+        try require(migrated.schemaVersion == 18, "Schema 17 did not migrate to schema 18")
+        try require(migrated.suggestions.count == 1, "Legacy suggestion was unexpectedly dropped")
+        guard case .advisory = migrated.suggestions[0].payload else {
+            throw PersistenceScenarioFailure(
+                description: "Schema 17 injected an actionable Codex item draft"
+            )
+        }
+        try require(
+            migrated.suggestions[0].resultingItemID == nil
+                && migrated.suggestions[0].resultingMutationID == nil,
+            "Schema 17 injected accepted-item linkage"
+        )
+        try require(
+            migrated.localSuggestionDateHighWater == nil,
+            "Schema 17 migration invented a typed-draft clock authority"
+        )
+    }
+
+    static func malformedCodexHighWaterIsRejected() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let pending = typedCodexSuggestion(createdAt: base.savedAt)
+
+        func snapshot(
+            suggestions: [PlanningSuggestion] = [pending],
+            highWater: Date?
+        ) -> PlannerSnapshot {
+            PlannerSnapshot(
+                savedAt: base.savedAt,
+                destination: base.destination,
+                selectedBlockID: base.selectedBlockID,
+                blocks: base.blocks,
+                suggestions: suggestions,
+                localSuggestionDateHighWater: highWater,
+                assistantMessages: base.assistantMessages,
+                lastScheduleMessage: base.lastScheduleMessage,
+                protectedFreeMinutes: base.protectedFreeMinutes,
+                scheduleProfile: base.scheduleProfile,
+                freezeHours: base.freezeHours,
+                showCompleted: base.showCompleted
+            )
+        }
+
+        let malformed = [
+            snapshot(highWater: nil),
+            snapshot(highWater: pending.createdAt.addingTimeInterval(-1)),
+            snapshot(highWater: pending.expiresAt),
+            snapshot(highWater: Date(timeIntervalSinceReferenceDate: .infinity)),
+            snapshot(suggestions: base.suggestions, highWater: base.savedAt),
+        ]
+        for value in malformed {
+            var observedError: PlannerPersistenceError?
+            do {
+                try context.persistence.preflightSave(value)
+            } catch {
+                observedError = error
+            }
+            try require(
+                observedError == .snapshotEncodingFailed,
+                "Malformed typed-draft retention high-water was persistable"
+            )
+        }
+    }
+
+    static func malformedCodexSuggestionStateIsRejected() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let pending = typedCodexSuggestion(createdAt: base.savedAt)
+        guard case let .canonicalItemDraft(itemDraft) = pending.payload else {
+            throw PersistenceScenarioFailure(description: "Typed fixture was not actionable")
+        }
+        let malformed = PlanningSuggestion(
+            id: pending.id,
+            title: pending.title,
+            summary: pending.summary,
+            source: pending.source,
+            createdAt: pending.createdAt,
+            expiresAt: pending.expiresAt,
+            state: .accepted,
+            payload: .canonicalItemReference(itemID: itemDraft.itemID),
+            resultingItemID: itemDraft.itemID,
+            resultingMutationID: nil
+        )
+        let snapshot = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: [malformed],
+            assistantMessages: base.assistantMessages,
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            scheduleProfile: base.scheduleProfile,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted
+        )
+        var observedError: PlannerPersistenceError?
+        do {
+            try context.persistence.preflightSave(snapshot)
+        } catch {
+            observedError = error
+        }
+        try require(
+            observedError == .snapshotEncodingFailed,
+            "Malformed accepted Codex suggestion was persistable"
+        )
+    }
+
     private static func require(
         _ condition: @autoclosure () -> Bool,
         _ message: String
@@ -999,6 +1236,38 @@ private enum EncryptedPlannerPersistenceScenarios {
             protectedFreeMinutes: 120,
             freezeHours: 3,
             showCompleted: true
+        )
+    }
+
+    private static func typedCodexSuggestion(createdAt: Date) -> PlanningSuggestion {
+        let itemID = UUID(uuidString: "21000000-0000-4000-8000-000000000002")!
+        let draft = DayWeaveCanonicalItemDraft(
+            isSensitive: true,
+            kind: .task,
+            status: .inbox,
+            title: "Review AI-created item",
+            notes: "AI-DRAFT-ENCRYPTION-CANARY",
+            timezoneName: "Europe/Madrid",
+            durationSeconds: 2_700,
+            flexibleConstraints: .object([:]),
+            splitPolicy: .splittable(
+                minimumChunkSeconds: 900,
+                maximumChunkSeconds: 2_700
+            ),
+            importance: 70,
+            urgency: 55
+        )
+        return PlanningSuggestion(
+            id: UUID(uuidString: "22000000-0000-4000-8000-000000000002")!,
+            title: draft.title,
+            summary: "Review every field before creating this Inbox item.",
+            source: PlanningSuggestion.codexSource,
+            createdAt: createdAt,
+            expiresAt: createdAt.addingTimeInterval(7 * 24 * 60 * 60),
+            state: .pending,
+            payload: .canonicalItemDraft(
+                PlanningSuggestionItemDraft(itemID: itemID, draft: draft)
+            )
         )
     }
 
@@ -1142,6 +1411,18 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
     func testMalformedCanonicalAuthoringStateIsRejected() throws {
         try EncryptedPlannerPersistenceScenarios.malformedCanonicalAuthoringStateIsRejected()
     }
+
+    func testTypedCodexSuggestionRoundTripsEncrypted() throws {
+        try EncryptedPlannerPersistenceScenarios.typedCodexSuggestionRoundTripsEncrypted()
+    }
+
+    func testSchemaSeventeenCannotAcquireCodexDraftAuthority() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSeventeenCannotAcquireCodexDraftAuthority()
+    }
+
+    func testMalformedCodexSuggestionStateIsRejected() throws {
+        try EncryptedPlannerPersistenceScenarios.malformedCodexSuggestionStateIsRejected()
+    }
 }
 #elseif canImport(Testing)
 @Suite("Encrypted planner persistence")
@@ -1155,6 +1436,12 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Schedule content is encrypted at rest")
     func encryptedAtRest() throws {
         try EncryptedPlannerPersistenceScenarios.encryptedAtRest()
+    }
+
+    @Test("Crash-orphaned encrypted temp files are cleaned without following symlinks")
+    func crashOrphanCleanup() throws {
+        try EncryptedPlannerPersistenceScenarios
+            .crashOrphanedTemporaryEnvelopeIsCleanedSafely()
     }
 
     @Test("Ciphertext corruption fails authentication")
@@ -1245,6 +1532,26 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Malformed canonical authoring state fails closed")
     func malformedCanonicalAuthoringState() throws {
         try EncryptedPlannerPersistenceScenarios.malformedCanonicalAuthoringStateIsRejected()
+    }
+
+    @Test("Typed Codex item drafts are encrypted and round-trip exactly")
+    func typedCodexSuggestionRoundTrip() throws {
+        try EncryptedPlannerPersistenceScenarios.typedCodexSuggestionRoundTripsEncrypted()
+    }
+
+    @Test("Schema 17 prose cannot gain typed Codex draft authority")
+    func schemaSeventeenCodexDraftMigration() throws {
+        try EncryptedPlannerPersistenceScenarios.schemaSeventeenCannotAcquireCodexDraftAuthority()
+    }
+
+    @Test("Malformed Codex decision linkage fails closed")
+    func malformedCodexSuggestionState() throws {
+        try EncryptedPlannerPersistenceScenarios.malformedCodexSuggestionStateIsRejected()
+    }
+
+    @Test("Malformed Codex retention high-water fails closed")
+    func malformedCodexHighWater() throws {
+        try EncryptedPlannerPersistenceScenarios.malformedCodexHighWaterIsRejected()
     }
 }
 #endif

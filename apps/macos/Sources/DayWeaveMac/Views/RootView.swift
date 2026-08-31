@@ -3849,6 +3849,8 @@ private struct AssistantView: View {
                 .padding(.horizontal, 14)
                 .padding(.vertical, 7)
                 .background(Color.purple.opacity(0.08))
+                .accessibilityAddTraits(.updatesFrequently)
+                .accessibilityIdentifier("assistant.proposals-ready")
             }
 
             Divider()
@@ -3858,6 +3860,8 @@ private struct AssistantView: View {
                     .lineLimit(1...5)
                     .onSubmit(send)
                     .disabled(!isSignedIn || conversation.activity.isBusy)
+                    .accessibilityLabel("Message to Codex")
+                    .accessibilityIdentifier("assistant.composer")
                 Button(action: primaryComposerAction) {
                     Image(systemName: conversation.isTurnActive ? "stop.circle.fill" : "arrow.up.circle.fill")
                         .font(.title2)
@@ -3865,8 +3869,23 @@ private struct AssistantView: View {
                 .buttonStyle(.plain)
                 .disabled(conversation.isTurnActive ? conversation.activity == .stopping : !canSend)
                 .help(conversation.isTurnActive ? "Stop response" : "Send to Codex")
+                .accessibilityLabel(conversation.isTurnActive ? "Stop response" : "Send to Codex")
+                .accessibilityIdentifier("assistant.composer.primary-action")
             }
             .padding(12)
+        }
+        .onChange(of: conversation.activity) { _, activity in
+            guard case let .failed(message) = activity else { return }
+            dayWeavePostAccessibilityAnnouncement(
+                "Codex response failed. \(message)",
+                priority: .high
+            )
+        }
+        .onChange(of: conversation.lastProposalCount) { _, count in
+            guard count > 0 else { return }
+            dayWeavePostAccessibilityAnnouncement(
+                "\(count) Codex proposal\(count == 1 ? "" : "s") ready in Inbox for review."
+            )
         }
     }
 
@@ -3990,6 +4009,40 @@ private struct AssistantBubble: View {
     }
 }
 
+struct LocalCanonicalItemSuggestionReviewRoute: Identifiable, Equatable {
+    let suggestionID: UUID
+    let itemID: UUID
+    let draft: DayWeaveCanonicalItemDraft
+
+    var id: UUID { suggestionID }
+}
+
+enum LocalCanonicalItemSuggestionReviewAvailability: Equatable {
+    case pending
+    case accepted
+    case unavailable
+}
+
+func localCanonicalItemSuggestionReviewAvailability(
+    route: LocalCanonicalItemSuggestionReviewRoute,
+    suggestions: [PlanningSuggestion]
+) -> LocalCanonicalItemSuggestionReviewAvailability {
+    guard let suggestion = suggestions.first(where: { $0.id == route.suggestionID }) else {
+        return .unavailable
+    }
+    if suggestion.state == .accepted,
+       case let .canonicalItemReference(itemID) = suggestion.payload,
+       itemID == route.itemID {
+        return .accepted
+    }
+    if suggestion.state == .pending,
+       case let .canonicalItemDraft(itemDraft) = suggestion.payload,
+       itemDraft.itemID == route.itemID {
+        return .pending
+    }
+    return .unavailable
+}
+
 private struct UnifiedInboxView: View {
     private enum Section: String, CaseIterable, Identifiable {
         case items
@@ -4008,6 +4061,9 @@ private struct UnifiedInboxView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
     @State private var section: Section = .items
+    @State private var localSuggestionReviewRoute:
+        LocalCanonicalItemSuggestionReviewRoute?
+    @State private var localSuggestionReviewNotice: String?
 
     private var canonicalPresentation: CanonicalInboxPresentation {
         CanonicalInboxPresentation.build(
@@ -4073,17 +4129,74 @@ private struct UnifiedInboxView: View {
 
             Divider()
 
+            if let localSuggestionReviewNotice {
+                HStack(spacing: 10) {
+                    Label(localSuggestionReviewNotice, systemImage: "clock.badge.exclamationmark")
+                        .font(.subheadline)
+                    Spacer()
+                    Button("Dismiss") {
+                        self.localSuggestionReviewNotice = nil
+                    }
+                    .buttonStyle(.borderless)
+                }
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                .background(Color.orange.opacity(0.09))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("inbox.suggestion-review-notice")
+
+                Divider()
+            }
+
             switch section {
             case .items:
                 CanonicalCapturedInboxView()
             case .suggestions:
-                SuggestionsInboxView()
+                SuggestionsInboxView(
+                    reviewCanonicalItemDraft: reviewCanonicalItemSuggestion
+                )
             }
         }
         .navigationTitle("Inbox")
+        .sheet(item: $localSuggestionReviewRoute) { route in
+            CanonicalItemEditorView(
+                mode: .createFromSuggestion(
+                    suggestionID: route.suggestionID,
+                    itemID: route.itemID,
+                    draft: route.draft
+                ),
+                profileTimezoneName: store.scheduleProfile.timezoneName,
+                onSave: {
+                    section = .items
+                }
+            )
+            .environmentObject(store)
+        }
         .onChange(of: section) { _, value in
             if value == .suggestions {
                 store.selectCanonicalItem(nil)
+            }
+        }
+        .onChange(of: store.suggestions) { _, currentSuggestions in
+            guard let route = localSuggestionReviewRoute else { return }
+            switch localCanonicalItemSuggestionReviewAvailability(
+                route: route,
+                suggestions: currentSuggestions
+            ) {
+            case .pending:
+                break
+            case .accepted:
+                // The editor's successful save owns navigation and user
+                // feedback. Release the redundant process-local route only.
+                localSuggestionReviewRoute = nil
+            case .unavailable:
+                // Expiration/rejection scrubs the durable body; release the
+                // sheet's process-local copy at the same boundary.
+                localSuggestionReviewRoute = nil
+                let notice = "The Codex draft expired or became unavailable, so its review was closed."
+                localSuggestionReviewNotice = notice
+                dayWeavePostAccessibilityAnnouncement(notice, priority: .high)
             }
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -4093,6 +4206,22 @@ private struct UnifiedInboxView: View {
             store.selectCanonicalItem(nil)
         }
         .accessibilityIdentifier("unified-inbox")
+    }
+
+    private func reviewCanonicalItemSuggestion(_ suggestionID: UUID) {
+        store.expireLocalSuggestions()
+        guard let suggestion = store.suggestions.first(where: {
+            $0.id == suggestionID && $0.state == .pending
+        }),
+              case let .canonicalItemDraft(itemDraft) = suggestion.payload else {
+            return
+        }
+        localSuggestionReviewNotice = nil
+        localSuggestionReviewRoute = .init(
+            suggestionID: suggestion.id,
+            itemID: itemDraft.itemID,
+            draft: itemDraft.draft
+        )
     }
 
     private var sectionDescription: String {
@@ -4113,6 +4242,7 @@ private struct SuggestionsInboxView: View {
     @EnvironmentObject private var serviceCoordinator: DayWeaveServiceCoordinator
     @State private var proposalBeingEdited: DayWeaveProposal?
     @State private var proposalBeingReviewed: DayWeaveProposal?
+    let reviewCanonicalItemDraft: (UUID) -> Void
 
     private var pendingLocalSuggestions: [PlanningSuggestion] {
         store.suggestions.filter { $0.state == .pending }
@@ -4179,22 +4309,19 @@ private struct SuggestionsInboxView: View {
             if !pendingLocalSuggestions.isEmpty {
                 Section("On this Mac") {
                     ForEach(pendingLocalSuggestions) { suggestion in
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Image(systemName: "sparkles").foregroundStyle(.purple)
-                                Text(suggestion.title).font(.headline)
-                                Spacer()
-                                Text(suggestion.source).font(.caption).foregroundStyle(.secondary)
+                        LocalPlanningSuggestionRow(
+                            suggestion: suggestion,
+                            canMutate: store.canMutatePlan,
+                            reviewCanonicalItemDraft: {
+                                reviewCanonicalItemDraft(suggestion.id)
+                            },
+                            markAdvisoryReviewed: {
+                                store.acceptSuggestion(suggestion.id)
+                            },
+                            reject: {
+                                store.rejectSuggestion(suggestion.id)
                             }
-                            Text(suggestion.summary).foregroundStyle(.secondary)
-                            HStack {
-                                Button("Review & accept") { store.acceptSuggestion(suggestion.id) }
-                                    .buttonStyle(.borderedProminent)
-                                Button("Reject") { store.rejectSuggestion(suggestion.id) }
-                            }
-                            .controlSize(.small)
-                        }
-                        .padding(.vertical, 8)
+                        )
                     }
                 }
             }
@@ -4238,6 +4365,7 @@ private struct SuggestionsInboxView: View {
         }
         .navigationTitle("Suggestions")
         .task {
+            store.expireLocalSuggestions()
             guard suggestionSync.isConfigured,
                   !proposalApplications.hasPendingRecovery else { return }
             await suggestionSync.refresh()
@@ -4281,6 +4409,139 @@ private struct SuggestionsInboxView: View {
             "Refresh to check the authenticated DayWeave API. Local planning remains available offline."
         } else {
             "Add an API URL and bearer token in Settings. Local suggestions continue to work without them."
+        }
+    }
+}
+
+private struct LocalPlanningSuggestionRow: View {
+    let suggestion: PlanningSuggestion
+    let canMutate: Bool
+    let reviewCanonicalItemDraft: () -> Void
+    let markAdvisoryReviewed: () -> Void
+    let reject: () -> Void
+
+    private var canonicalItemDraft: PlanningSuggestionItemDraft? {
+        guard case let .canonicalItemDraft(itemDraft) = suggestion.payload else {
+            return nil
+        }
+        return itemDraft
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(.purple)
+                    .accessibilityHidden(true)
+                Text(suggestion.title)
+                    .font(.headline)
+                    .privacySensitive(canonicalItemDraft?.draft.isSensitive == true)
+                    .accessibilityIdentifier(localIdentifier("title"))
+                Spacer()
+                Text(suggestion.source)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(suggestion.summary)
+                .foregroundStyle(.secondary)
+                .privacySensitive(canonicalItemDraft?.draft.isSensitive == true)
+                .accessibilityIdentifier(localIdentifier("summary"))
+
+            if let itemDraft = canonicalItemDraft {
+                typedDraftMetadata(itemDraft.draft)
+                Label(
+                    "Review every field before creating this item.",
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption)
+                .foregroundStyle(.blue)
+
+                HStack {
+                    Button("Review item draft…", action: reviewCanonicalItemDraft)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canMutate || suggestion.expiresAt <= Date())
+                        .help("Open this typed draft in the canonical item editor")
+                        .accessibilityLabel("Review \(itemDraft.draft.title) item draft")
+                        .accessibilityIdentifier(localIdentifier("review-item-draft"))
+                    Button("Reject", action: reject)
+                        .disabled(!canMutate)
+                        .accessibilityIdentifier(localIdentifier("reject"))
+                }
+                .controlSize(.small)
+            } else {
+                Label(
+                    "Advisory only · marking reviewed never creates or changes an item",
+                    systemImage: "text.bubble"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+                HStack {
+                    Button("Mark reviewed", action: markAdvisoryReviewed)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canMutate || suggestion.expiresAt <= Date())
+                        .accessibilityIdentifier(localIdentifier("mark-reviewed"))
+                    Button("Reject", action: reject)
+                        .disabled(!canMutate)
+                        .accessibilityIdentifier(localIdentifier("reject"))
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.vertical, 8)
+        .privacySensitive(canonicalItemDraft?.draft.isSensitive == true)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(localIdentifier("row"))
+    }
+
+    @ViewBuilder
+    private func typedDraftMetadata(_ draft: DayWeaveCanonicalItemDraft) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) { typedDraftMetadataContent(draft) }
+            VStack(alignment: .leading, spacing: 5) { typedDraftMetadataContent(draft) }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier(localIdentifier("metadata"))
+    }
+
+    @ViewBuilder
+    private func typedDraftMetadataContent(_ draft: DayWeaveCanonicalItemDraft) -> some View {
+        Label(
+            draft.kind.wireValue.replacingOccurrences(of: "_", with: " ").capitalized,
+            systemImage: canonicalItemKindSymbol(draft.kind)
+        )
+        Label(
+            draft.status.wireValue.replacingOccurrences(of: "_", with: " ").capitalized,
+            systemImage: draft.status == .planned ? "checkmark.circle" : "tray"
+        )
+        if let durationSeconds = draft.durationSeconds {
+            Label(
+                CanonicalItemEditorState.durationDescription(durationSeconds),
+                systemImage: "timer"
+            )
+        }
+        Label(
+            "Expires \(suggestion.expiresAt.formatted(date: .abbreviated, time: .shortened))",
+            systemImage: "clock"
+        )
+        .accessibilityIdentifier(localIdentifier("expiry"))
+    }
+
+    private func localIdentifier(_ suffix: String) -> String {
+        "local-suggestion.\(suggestion.id.uuidString.lowercased()).\(suffix)"
+    }
+
+    private func canonicalItemKindSymbol(_ kind: DayWeaveCanonicalItemKind) -> String {
+        switch kind {
+        case .event: "calendar"
+        case .task: "checkmark.circle"
+        case .habit: "repeat"
+        case .routine: "list.number"
+        case .goal: "target"
+        case .breakTime: "cup.and.saucer"
+        case .unknown: "questionmark.diamond"
         }
     }
 }

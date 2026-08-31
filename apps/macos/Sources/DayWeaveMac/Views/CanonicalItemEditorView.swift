@@ -2,6 +2,11 @@ import SwiftUI
 
 enum CanonicalItemEditorMode: Equatable, Sendable {
     case create(itemID: UUID)
+    case createFromSuggestion(
+        suggestionID: UUID,
+        itemID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    )
     case replace(itemID: UUID, draft: DayWeaveCanonicalItemDraft)
     case updatePending(
         mutationID: UUID,
@@ -11,7 +16,10 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
 
     var itemID: UUID {
         switch self {
-        case let .create(itemID), let .replace(itemID, _), let .updatePending(_, itemID, _):
+        case let .create(itemID),
+             let .createFromSuggestion(_, itemID, _),
+             let .replace(itemID, _),
+             let .updatePending(_, itemID, _):
             itemID
         }
     }
@@ -19,13 +27,16 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var initialDraft: DayWeaveCanonicalItemDraft? {
         switch self {
         case .create: nil
-        case let .replace(_, draft), let .updatePending(_, _, draft): draft
+        case let .createFromSuggestion(_, _, draft),
+             let .replace(_, draft),
+             let .updatePending(_, _, draft): draft
         }
     }
 
     var title: String {
         switch self {
         case .create: "New item"
+        case .createFromSuggestion: "Review Codex item draft"
         case .replace: "Edit item"
         case .updatePending: "Edit queued item"
         }
@@ -34,9 +45,34 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var actionTitle: String {
         switch self {
         case .create: "Add to Inbox"
+        case .createFromSuggestion: "Create item"
         case .replace: "Queue changes"
         case .updatePending: "Update queued change"
         }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .createFromSuggestion:
+            "Review every field. Codex cannot create this item until you approve it here."
+        case .create, .replace, .updatePending:
+            "Saved locally first. Sync applies the exact queued change later."
+        }
+    }
+
+    var allowsUnchangedDraft: Bool {
+        switch self {
+        case .create, .createFromSuggestion: true
+        case .replace, .updatePending: false
+        }
+    }
+
+    /// A Codex draft is durably private while review is open. Letting the user
+    /// edit the eventual sensitivity flag must not expose the process-local
+    /// title or notes before the atomic approval transition finishes.
+    var preservesSensitivePresentation: Bool {
+        if case .createFromSuggestion = self { return true }
+        return false
     }
 }
 
@@ -47,6 +83,7 @@ struct CanonicalItemEditorView: View {
 
     let mode: CanonicalItemEditorMode
     let externalReadOnlyDiagnostic: String?
+    let onSave: () -> Void
     @State private var state: CanonicalItemEditorState
     @State private var saveError: String?
 
@@ -54,10 +91,12 @@ struct CanonicalItemEditorView: View {
         mode: CanonicalItemEditorMode,
         readOnlyDiagnostic: String? = nil,
         profileTimezoneName: String,
-        now: Date = Date()
+        now: Date = Date(),
+        onSave: @escaping () -> Void = {}
     ) {
         self.mode = mode
         externalReadOnlyDiagnostic = readOnlyDiagnostic
+        self.onSave = onSave
         _state = State(initialValue: CanonicalItemEditorState(
             itemID: mode.itemID,
             draft: mode.initialDraft,
@@ -105,6 +144,13 @@ struct CanonicalItemEditorView: View {
         .onChange(of: state.kind) { _, _ in
             state.normalizeForKindChange()
         }
+        .onChange(of: saveError) { _, error in
+            guard let error else { return }
+            dayWeavePostAccessibilityAnnouncement(
+                "The item could not be saved. \(error)",
+                priority: .high
+            )
+        }
         .accessibilityIdentifier("canonical-editor")
     }
 
@@ -117,7 +163,7 @@ struct CanonicalItemEditorView: View {
                 .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
             VStack(alignment: .leading, spacing: 3) {
                 Text(mode.title).font(.title2.weight(.semibold))
-                Text("Saved locally first. Sync applies the exact queued change later.")
+                Text(mode.subtitle)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -440,7 +486,7 @@ struct CanonicalItemEditorView: View {
     /// ancestry, or the durable pre-edit item is sensitive. Removing a marker
     /// never weakens presentation before the queued server change is proven.
     private var requiresSensitivePresentation: Bool {
-        if state.isSensitive { return true }
+        if state.isSensitive || mode.preservesSensitivePresentation { return true }
         if let parentID = state.parentID,
            store.canonicalItemRequiresSensitivePresentation(itemID: parentID) {
             return true
@@ -448,6 +494,8 @@ struct CanonicalItemEditorView: View {
         switch mode {
         case .create:
             return false
+        case .createFromSuggestion:
+            return true
         case .replace, .updatePending:
             return store.canonicalItemRequiresSensitivePresentation(itemID: mode.itemID)
         }
@@ -464,7 +512,8 @@ struct CanonicalItemEditorView: View {
         guard store.canMutatePlan,
               readOnlyDiagnostic == nil,
               localValidationIssue == nil else { return false }
-        return mode.initialDraft?.normalized != state.draft || mode.initialDraft == nil
+        return mode.allowsUnchangedDraft
+            || mode.initialDraft?.normalized != state.draft
     }
 
     private func parentOptionTitle(_ option: CanonicalItemEditorParentOption) -> String {
@@ -480,12 +529,19 @@ struct CanonicalItemEditorView: View {
             switch mode {
             case let .create(itemID):
                 try store.enqueueCanonicalCreate(itemID: itemID, draft: state.draft)
+            case let .createFromSuggestion(suggestionID, itemID, _):
+                try store.acceptCanonicalItemSuggestion(
+                    suggestionID,
+                    itemID: itemID,
+                    draft: state.draft
+                )
             case let .replace(itemID, _):
                 try store.enqueueCanonicalReplace(itemID: itemID, draft: state.draft)
             case let .updatePending(mutationID, _, _):
                 try store.updateCanonicalAuthoringDraft(mutationID, draft: state.draft)
             }
             store.selectCanonicalItem(mode.itemID)
+            onSave()
             dismiss()
         } catch {
             saveError = error.localizedDescription
@@ -504,6 +560,7 @@ struct CanonicalItemEditorView: View {
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .combine)
         .accessibilityIdentifier("canonical-editor.diagnostic")
     }
 

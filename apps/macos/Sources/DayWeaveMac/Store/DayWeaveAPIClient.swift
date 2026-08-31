@@ -3077,7 +3077,7 @@ private final class DayWeaveURLSessionTaskCancellationBox: @unchecked Sendable {
 /// keyed container can inspect them. Destructive trust promotion therefore
 /// performs a small duplicate-aware grammar pass over the exact wire bytes
 /// before using `JSONSerialization` for typed envelope checks.
-private struct StrictJSONObjectKeyScanner {
+struct StrictJSONObjectKeyScanner {
     private static let maximumDepth = 64
 
     private let bytes: [UInt8]

@@ -452,6 +452,7 @@ struct CodexAppServerClientTests {
     func testConversationControllerRoutesOnlyReviewableProposals() async throws {
         let harness = try CodexProtocolHarness()
         let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
+        let persistenceContext = try Self.makePersistence()
         let block = ScheduleBlock(
             id: UUID(),
             title: "Deep work",
@@ -467,17 +468,24 @@ struct CodexAppServerClientTests {
             actualMinutes: nil,
             placementReason: "NEVER-SEND-THIS-DIAGNOSTIC"
         )
-        let store = PlannerStore(blocks: [block], restoreFromPersistence: false)
+        let responseDate = Date(timeIntervalSince1970: 1_787_986_845)
+        let store = PlannerStore(
+            blocks: [block],
+            persistence: persistenceContext.persistence,
+            restoreFromPersistence: false,
+            now: { responseDate }
+        )
         let controller = CodexConversationController(
             client: client,
             contextProvider: store,
             suggestionRouter: CodexSuggestionInboxRouter(planner: store),
-            now: { Date(timeIntervalSince1970: 1_787_986_845) }
+            now: { responseDate }
         )
         defer {
             controller.shutDown()
             client.shutDown()
             harness.cleanUp()
+            try? FileManager.default.removeItem(at: persistenceContext.directory)
         }
         try await initializeSignedIn(client, harness: harness)
 
@@ -528,7 +536,26 @@ struct CodexAppServerClientTests {
         ])
         let completedText = """
         Keep the morning block intact.
-        <dayweave-proposals-v1>{"suggestions":[{"title":"Protect focus block","summary":"Keep the deep-work block fixed in the morning."}]}</dayweave-proposals-v1>
+        <dayweave-item-drafts-v1>{
+          "schema": "dayweave.item-drafts/1",
+          "drafts": [{
+            "summary": "Keep the deep-work block fixed in the morning.",
+            "item": {
+              "kind": "task",
+              "title": "Protect focus block",
+              "notes": null,
+              "timezone_name": "UTC",
+              "duration_seconds": 3600,
+              "deadline_at": null,
+              "earliest_start_at": null,
+              "recurrence": null,
+              "flexible_constraints": {},
+              "split_policy": {"type": "indivisible"},
+              "importance": 80,
+              "urgency": 70
+            }
+          }]
+        }</dayweave-item-drafts-v1>
         """
         try harness.sendServerMessage([
             "method": "item/completed",
@@ -553,7 +580,24 @@ struct CodexAppServerClientTests {
         #expect(controller.messages.last?.text == "Keep the morning block intact.")
         #expect(controller.messages.last?.delivery == .complete)
         #expect(store.suggestions.count == 1)
-        #expect(store.suggestions[0].state == .pending)
+        let routedSuggestion = try #require(store.suggestions.first)
+        #expect(routedSuggestion.state == .pending)
+        #expect(routedSuggestion.summary == "Keep the deep-work block fixed in the morning.")
+        let routedItemDraft: PlanningSuggestionItemDraft?
+        if case let .canonicalItemDraft(itemDraft) = routedSuggestion.payload {
+            routedItemDraft = itemDraft
+        } else {
+            routedItemDraft = nil
+        }
+        let itemDraft = try #require(routedItemDraft)
+        #expect(itemDraft.version == PlanningSuggestionItemDraft.currentVersion)
+        #expect(itemDraft.draft.title == "Protect focus block")
+        #expect(itemDraft.draft.kind == .task)
+        #expect(itemDraft.draft.durationSeconds == 3_600)
+        #expect(itemDraft.draft.importance == 80)
+        #expect(itemDraft.draft.urgency == 70)
+        #expect(itemDraft.draft.isSensitive)
+        #expect(itemDraft.draft.status == .inbox)
         #expect(store.blocks == [block])
     }
 
@@ -621,7 +665,11 @@ struct CodexAppServerClientTests {
     func testPrivacySuspensionInvalidatesLateConversationEvents() async throws {
         let harness = try CodexProtocolHarness()
         let client = CodexAppServerClient(launcher: harness, verificationPageOpener: { _ in true })
-        let store = PlannerStore(restoreFromPersistence: false)
+        let persistenceContext = try Self.makePersistence()
+        let store = PlannerStore(
+            persistence: persistenceContext.persistence,
+            restoreFromPersistence: false
+        )
         let controller = CodexConversationController(
             client: client,
             contextProvider: store,
@@ -631,6 +679,7 @@ struct CodexAppServerClientTests {
             controller.shutDown()
             client.shutDown()
             harness.cleanUp()
+            try? FileManager.default.removeItem(at: persistenceContext.directory)
         }
         try await initializeSignedIn(client, harness: harness)
 
@@ -672,7 +721,26 @@ struct CodexAppServerClientTests {
 
         let completedText = """
         This must never land.
-        <dayweave-proposals-v1>{"suggestions":[{"title":"Late proposal","summary":"Must not reach the Inbox."}]}</dayweave-proposals-v1>
+        <dayweave-item-drafts-v1>{
+          "schema": "dayweave.item-drafts/1",
+          "drafts": [{
+            "summary": "Must not reach the Inbox.",
+            "item": {
+              "kind": "task",
+              "title": "Late proposal",
+              "notes": null,
+              "timezone_name": "UTC",
+              "duration_seconds": 1800,
+              "deadline_at": null,
+              "earliest_start_at": null,
+              "recurrence": null,
+              "flexible_constraints": {},
+              "split_policy": {"type": "indivisible"},
+              "importance": 50,
+              "urgency": 50
+            }
+          }]
+        }</dayweave-item-drafts-v1>
         """
         // Keep these bytes queued while the main actor crosses the privacy
         // boundary. A previously scheduled receive callback must fail closed.
@@ -880,6 +948,28 @@ struct CodexAppServerClientTests {
         ]
     }
 
+    private static func makePersistence() throws -> (
+        directory: URL,
+        persistence: EncryptedPlannerPersistence
+    ) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "DayWeaveCodexAppServerClientTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false
+        )
+        let key = try PlannerEncryptionKey(data: Data(repeating: 43, count: 32))
+        return (
+            directory,
+            EncryptedPlannerPersistence(
+                fileURL: directory.appendingPathComponent("planner.snapshot.encrypted"),
+                key: key
+            )
+        )
+    }
+
     private func requestID(_ message: [String: Any]) throws -> Int {
         let number = try #require(message["id"] as? NSNumber)
         return number.intValue
@@ -887,7 +977,7 @@ struct CodexAppServerClientTests {
 
     private func eventually(
         _ predicate: @MainActor () -> Bool,
-        attempts: Int = 100
+        attempts: Int = 500
     ) async -> Bool {
         for _ in 0..<attempts {
             if predicate() { return true }

@@ -378,65 +378,329 @@ struct CodexConversationControllerTests {
         }
     }
 
-    @Test("only strict bounded proposal metadata becomes a reviewable Inbox entry")
-    func testProposalEnvelopeAndApprovalBoundary() {
-        let raw = """
-        Moving the task after lunch protects your focus block.
-        <dayweave-proposals-v1>{"suggestions":[{"title":"Move launch prep","summary":"Move the flexible launch-prep block to after lunch."}]}</dayweave-proposals-v1>
-        """
+    @Test("a strict item-draft envelope becomes an app-owned editable canonical draft")
+    func testCanonicalItemDraftEnvelope() throws {
+        let item = Self.itemJSON(
+            title: "  Move launch prep  ",
+            deadline: "\"2026-09-02T17:30:00+02:00\"",
+            earliestStart: "\"2026-09-01T09:00:00+02:00\"",
+            recurrence: "{\"type\":\"daily\",\"times_per_day\":1}",
+            constraints: "{\"energy\":\"deep\"}",
+            splitPolicy: "{\"type\":\"splittable\",\"minimum_chunk_seconds\":900,\"maximum_chunk_seconds\":1800}"
+        )
+        let raw = Self.envelope(
+            [Self.suggestionJSON(
+                summary: "Move the flexible launch-prep block to after lunch.",
+                item: item
+            )],
+            visibleText: "Moving the task after lunch protects your focus block."
+        )
         let parsed = CodexProposalEnvelopeParser.parse(raw)
         #expect(parsed.visibleText == "Moving the task after lunch protects your focus block.")
-        #expect(parsed.drafts == [CodexSuggestionDraft(
-            title: "Move launch prep",
-            summary: "Move the flexible launch-prep block to after lunch."
-        )])
         #expect(!parsed.containedInvalidEnvelope)
-
-        let block = ScheduleBlock(
-            id: UUID(),
-            title: "Launch prep",
-            kind: .task,
-            start: Date(timeIntervalSince1970: 1_787_980_000),
-            end: Date(timeIntervalSince1970: 1_787_983_600),
-            status: .scheduled,
-            project: nil,
-            notes: "",
-            energy: .deep,
-            isFlexible: true,
-            isHardConstraint: false,
-            actualMinutes: nil
+        let suggestion = try #require(parsed.drafts.first)
+        #expect(suggestion.summary == "Move the flexible launch-prep block to after lunch.")
+        #expect(suggestion.canonicalDraft.isSensitive)
+        #expect(suggestion.canonicalDraft.status == .inbox)
+        #expect(suggestion.canonicalDraft.parentID == nil)
+        #expect(suggestion.canonicalDraft.siblingOrder == 0)
+        #expect(suggestion.canonicalDraft.title == "Move launch prep")
+        #expect(suggestion.canonicalDraft.kind == .task)
+        #expect(suggestion.canonicalDraft.durationSeconds == 1_800)
+        #expect(suggestion.canonicalDraft.importance == 50)
+        #expect(suggestion.canonicalDraft.urgency == 50)
+        #expect(suggestion.canonicalDraft.validationIssue(itemID: UUID()) == nil)
+        let editor = CanonicalItemEditorState(
+            itemID: UUID(),
+            draft: suggestion.canonicalDraft
         )
-        let store = PlannerStore(blocks: [block], restoreFromPersistence: false)
-        let router = CodexSuggestionInboxRouter(planner: store)
-        let originalBlocks = store.blocks
-        let createdAt = Date(timeIntervalSince1970: 1_787_986_845)
-
-        #expect(router.routeCodexSuggestionsToInbox(parsed.drafts, createdAt: createdAt) == 1)
-        let suggestion = store.suggestions[0]
-        #expect(suggestion.state == .pending)
-        #expect(suggestion.source == "Codex · requires approval")
-        #expect(suggestion.expiresAt == createdAt.addingTimeInterval(7 * 24 * 60 * 60))
-        #expect(store.blocks == originalBlocks)
-
-        store.acceptSuggestion(suggestion.id)
-        #expect(store.suggestions[0].state == .accepted)
-        #expect(store.blocks == originalBlocks)
-        #expect(router.routeCodexSuggestionsToInbox(parsed.drafts, createdAt: createdAt) == 0)
-        #expect(store.blocks == originalBlocks)
+        #expect(editor.readOnlyDiagnostic == nil)
+        #expect(editor.validationIssue == nil)
     }
 
-    @Test("malformed or partial proposal metadata remains hidden and never routes")
-    func testMalformedProposalEnvelopeIsRejected() {
-        let malformed = """
-        Human reply
-        <dayweave-proposals-v1>{"suggestions":[{"title":"Unsafe","summary":"No","extra":true}]}</dayweave-proposals-v1>
+    @Test("all supported editable item kinds cross the Codex boundary")
+    func testAllEditableItemKinds() {
+        let eventConstraints = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T09:00:00Z","ends_at":"2026-09-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
         """
-        let parsed = CodexProposalEnvelopeParser.parse(malformed)
-        #expect(parsed.visibleText == "Human reply")
+        let items = [
+            Self.itemJSON(kind: "event", duration: "3600", constraints: eventConstraints),
+            Self.itemJSON(kind: "task"),
+            Self.itemJSON(
+                kind: "habit",
+                recurrence: "{\"type\":\"weekly\",\"times_per_week\":3,\"weekdays\":[\"monday\",\"wednesday\",\"friday\"]}"
+            ),
+            Self.itemJSON(
+                kind: "routine",
+                constraints: "{\"has_own_effort\":false}"
+            ),
+            Self.itemJSON(
+                kind: "goal",
+                constraints: "{\"has_own_effort\":false}"
+            ),
+            Self.itemJSON(kind: "break"),
+        ]
+        for item in items {
+            let single = CodexProposalEnvelopeParser.parse(
+                Self.envelope([Self.suggestionJSON(summary: "Editable", item: item)])
+            )
+            #expect(!single.containedInvalidEnvelope)
+            #expect(single.drafts.count == 1)
+        }
+    }
+
+    @Test("exact root, draft, and item keys are mandatory")
+    func testExactEnvelopeKeys() {
+        let validItem = Self.itemJSON()
+        let validDraft = Self.suggestionJSON(summary: "Valid", item: validItem)
+        let invalidJSON = [
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[\(validDraft)],\"extra\":true}",
+            "{\"schema\":\"dayweave.item-drafts/2\",\"drafts\":[\(validDraft)]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"Valid\",\"item\":\(validItem),\"extra\":true}]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"Valid\",\"item\":\(Self.itemJSON(extraField: ",\"id\":\"01234567-89ab-cdef-0123-456789abcdef\""))}]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"Valid\",\"item\":\(Self.itemJSON(omitUrgency: true))}]}",
+        ]
+
+        for json in invalidJSON {
+            let parsed = CodexProposalEnvelopeParser.parse(Self.wrapped(json))
+            #expect(parsed.drafts.isEmpty)
+            #expect(parsed.containedInvalidEnvelope)
+        }
+    }
+
+    @Test("duplicate JSON keys at every depth reject the whole envelope")
+    func testDuplicateKeysFailClosedAtEveryDepth() {
+        let validItem = Self.itemJSON()
+        let duplicateJSON = [
+            "{\"schema\":\"dayweave.item-drafts/1\",\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"One\",\"summary\":\"Two\",\"item\":\(validItem)}]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"One\",\"item\":\(Self.itemJSON(extraField: ",\"title\":\"Duplicate\""))}]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"One\",\"item\":\(Self.itemJSON(kind: "habit", recurrence: "{\"type\":\"daily\",\"type\":\"daily\",\"times_per_day\":1}"))}]}",
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[{\"summary\":\"One\",\"item\":\(Self.itemJSON(constraints: "{\"energy\":\"low\",\"energy\":\"deep\"}"))}]}",
+        ]
+
+        for json in duplicateJSON {
+            let parsed = CodexProposalEnvelopeParser.parse(Self.wrapped(json))
+            #expect(parsed.drafts.isEmpty)
+            #expect(parsed.containedInvalidEnvelope)
+        }
+    }
+
+    @Test("one invalid draft rejects every otherwise-valid member")
+    func testEnvelopeIsAtomicAtIngress() {
+        let valid = Self.suggestionJSON(summary: "Valid", item: Self.itemJSON())
+        let invalid = Self.suggestionJSON(
+            summary: "Invalid",
+            item: Self.itemJSON(kind: "unsupported")
+        )
+        let parsed = CodexProposalEnvelopeParser.parse(Self.envelope([valid, invalid]))
+
         #expect(parsed.drafts.isEmpty)
         #expect(parsed.containedInvalidEnvelope)
+    }
 
-        #expect(CodexProposalEnvelopeParser.visibleStreamingText("Reply<dayweave-prop") == "Reply")
+    @Test("unsupported values, non-integers, unsafe text, and read-only forms are denied")
+    func testUnsafeOrUnsupportedDraftValuesAreDenied() {
+        let invalidItems = [
+            Self.itemJSON(timezone: "PST"),
+            Self.itemJSON(deadline: "\"2026-02-30T12:00:00Z\""),
+            Self.itemJSON(deadline: "\"2026-09-01T12:00:00+0200\""),
+            Self.itemJSON(duration: "1800.0"),
+            Self.itemJSON(importance: "true"),
+            Self.itemJSON(title: "Unsafe\\u202Etitle"),
+            Self.itemJSON(notes: "\"Unsafe\\nnotes\""),
+            Self.itemJSON(
+                recurrence: "{\"type\":\"frequency\",\"target\":2,\"period\":\"week\",\"semantics\":\"calendar\"}"
+            ),
+            Self.itemJSON(
+                kind: "event",
+                constraints: "{\"calendar_event\":{\"start\":\"2026-09-01T09:00:00Z\",\"end\":\"2026-09-01T10:00:00Z\",\"immutable\":true,\"all_day\":false}}"
+            ),
+        ]
+
+        for item in invalidItems {
+            let parsed = CodexProposalEnvelopeParser.parse(Self.envelope([
+                Self.suggestionJSON(summary: "Unsafe", item: item),
+            ]))
+            #expect(parsed.drafts.isEmpty)
+            #expect(parsed.containedInvalidEnvelope)
+        }
+    }
+
+    @Test("Codex drafts cannot hide semantics outside the typed review surface")
+    func testHiddenReviewFieldsAreDenied() {
+        let ordinaryFirmBlock = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T09:00:00Z","ends_at":"2026-09-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
+        """
+        let fractionalFirmBlock = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T09:00:00.000000001Z","ends_at":"2026-09-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
+        """
+        let historicalFirmBlock = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"1890-01-01T09:00:00Z","ends_at":"1890-01-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
+        """
+        let nonMidnightAllDayFirmBlock = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T12:00:00Z","ends_at":"2026-09-02T12:00:00Z","all_day":true,"tentative":false,"busy":true}}
+        """
+        let ambiguousFallBackFirmBlock = """
+        {"dayweave_firm_block":{"owned":true,"starts_at":"2026-11-01T01:30:00-04:00","ends_at":"2026-11-01T01:30:00-05:00","all_day":false,"tentative":false,"busy":true}}
+        """
+        let hiddenConstraints = [
+            "{\"routine_ordered\":true}",
+            "{\"preserves_streak_when_paused\":true}",
+            "{\"break_category\":\"rest\"}",
+            "{\"break_mandatory\":true}",
+            "{\"break_prompt_to_resume\":true}",
+            "{\"has_own_effort\":true}",
+        ]
+        var invalidItems = hiddenConstraints.map { Self.itemJSON(constraints: $0) }
+        invalidItems.append(contentsOf: [
+            Self.itemJSON(kind: "goal"),
+            Self.itemJSON(deadline: "\"2026-09-01T12:00:01Z\""),
+            Self.itemJSON(
+                kind: "event",
+                duration: "1800",
+                constraints: ordinaryFirmBlock
+            ),
+            Self.itemJSON(
+                kind: "event",
+                constraints: ordinaryFirmBlock,
+                splitPolicy: "{\"type\":\"splittable\",\"minimum_chunk_seconds\":900,\"maximum_chunk_seconds\":1800}"
+            ),
+            Self.itemJSON(
+                kind: "event",
+                constraints: fractionalFirmBlock
+            ),
+            Self.itemJSON(
+                kind: "event",
+                timezone: "Europe/Paris",
+                constraints: historicalFirmBlock
+            ),
+            Self.itemJSON(
+                kind: "event",
+                duration: "86400",
+                constraints: nonMidnightAllDayFirmBlock
+            ),
+            Self.itemJSON(
+                kind: "event",
+                timezone: "America/New_York",
+                duration: "3600",
+                constraints: ambiguousFallBackFirmBlock
+            ),
+            Self.itemJSON(
+                timezone: "America/New_York",
+                deadline: "\"2026-11-01T01:30:00-04:00\""
+            ),
+        ])
+
+        for item in invalidItems {
+            let parsed = CodexProposalEnvelopeParser.parse(Self.envelope([
+                Self.suggestionJSON(summary: "Must be visible", item: item),
+            ]))
+            #expect(parsed.drafts.isEmpty)
+            #expect(parsed.containedInvalidEnvelope)
+        }
+
+        let nilDurationEvent = CodexProposalEnvelopeParser.parse(Self.envelope([
+            Self.suggestionJSON(
+                summary: "Visible fixed range",
+                item: Self.itemJSON(
+                    kind: "event",
+                    duration: "null",
+                    constraints: ordinaryFirmBlock
+                )
+            ),
+        ]))
+        #expect(!nilDurationEvent.containedInvalidEnvelope)
+        #expect(nilDurationEvent.drafts.count == 1)
+    }
+
+    @Test("the item-draft envelope is bounded, trailing, and hidden while streaming")
+    func testEnvelopeBoundsAndStreamingVisibility() {
+        let draft = Self.suggestionJSON(summary: "Bounded", item: Self.itemJSON())
+        let fiveDrafts = CodexProposalEnvelopeParser.parse(
+            Self.envelope(Array(repeating: draft, count: 5))
+        )
+        #expect(!fiveDrafts.containedInvalidEnvelope)
+        #expect(fiveDrafts.drafts.count == 5)
+
+        let sixDrafts = CodexProposalEnvelopeParser.parse(
+            Self.envelope(Array(repeating: draft, count: 6))
+        )
+        #expect(sixDrafts.drafts.isEmpty)
+        #expect(sixDrafts.containedInvalidEnvelope)
+
+        let oversizedItem = Self.itemJSON(notes: "\"\(String(repeating: "x", count: 66_000))\"")
+        let oversized = CodexProposalEnvelopeParser.parse(Self.envelope([
+            Self.suggestionJSON(summary: "Large", item: oversizedItem),
+        ]))
+        #expect(oversized.drafts.isEmpty)
+        #expect(oversized.containedInvalidEnvelope)
+
+        let trailing = CodexProposalEnvelopeParser.parse(
+            Self.envelope([draft]) + " trailing"
+        )
+        #expect(trailing.drafts.isEmpty)
+        #expect(trailing.containedInvalidEnvelope)
+
+        #expect(CodexProposalEnvelopeParser.visibleStreamingText(
+            "Reply<dayweave-item-draf"
+        ) == "Reply")
+        let malformed = CodexProposalEnvelopeParser.parse(
+            "Reply<dayweave-item-drafts-v1>{}"
+        )
+        #expect(malformed.visibleText == "Reply")
+        #expect(malformed.containedInvalidEnvelope)
+    }
+
+    @Test("the developer prompt exposes only the strict draft contract")
+    func testDeveloperPromptUsesStrictDraftContract() {
+        let prompt = CodexConversationController.developerInstructions
+        #expect(prompt.contains(CodexProposalEnvelopeParser.startMarker))
+        #expect(prompt.contains("dayweave.item-drafts/1"))
+        #expect(prompt.contains("never emit IDs, status, sensitivity"))
+        #expect(prompt.contains("unambiguous whole minute"))
+        #expect(prompt.contains("start and end at local midnight"))
+        #expect(!prompt.contains("dayweave-proposals-v1"))
+    }
+
+    private static func itemJSON(
+        kind: String = "task",
+        title: String = "Draft item",
+        notes: String = "null",
+        timezone: String = "UTC",
+        duration: String = "1800",
+        deadline: String = "null",
+        earliestStart: String = "null",
+        recurrence: String = "null",
+        constraints: String = "{}",
+        splitPolicy: String = "{\"type\":\"indivisible\"}",
+        importance: String = "50",
+        urgency: String = "50",
+        extraField: String = "",
+        omitUrgency: Bool = false
+    ) -> String {
+        let urgencyField = omitUrgency ? "" : ",\"urgency\":\(urgency)"
+        return """
+        {"kind":"\(kind)","title":"\(title)","notes":\(notes),"timezone_name":"\(timezone)","duration_seconds":\(duration),"deadline_at":\(deadline),"earliest_start_at":\(earliestStart),"recurrence":\(recurrence),"flexible_constraints":\(constraints),"split_policy":\(splitPolicy),"importance":\(importance)\(urgencyField)\(extraField)}
+        """
+    }
+
+    private static func suggestionJSON(summary: String, item: String) -> String {
+        "{\"summary\":\"\(summary)\",\"item\":\(item)}"
+    }
+
+    private static func envelope(
+        _ suggestions: [String],
+        visibleText: String = "Reply"
+    ) -> String {
+        wrapped(
+            "{\"schema\":\"dayweave.item-drafts/1\",\"drafts\":[\(suggestions.joined(separator: ","))]}",
+            visibleText: visibleText
+        )
+    }
+
+    private static func wrapped(_ json: String, visibleText: String = "Reply") -> String {
+        "\(visibleText)\n\(CodexProposalEnvelopeParser.startMarker)\(json)\(CodexProposalEnvelopeParser.endMarker)"
     }
 
     private static func canonicalItem(

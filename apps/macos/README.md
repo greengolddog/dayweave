@@ -333,6 +333,21 @@ and recovered before canonical or execution synchronization may continue.
 Local suggestions and all local planning remain available when the API is
 absent or offline, with the last request state shown in the Inbox.
 
+The contained Codex assistant may also return one trailing, versioned typed-item
+envelope in a completed final answer. Its parser rejects duplicate or unknown
+keys, unsupported editor forms, unsafe text, non-integer numbers, invalid dates,
+hidden DST-fold offsets, non-midnight all-day bounds, more than five drafts, or
+an envelope above 64 KiB. The app supplies stable item and mutation identities,
+forces private Inbox state, and persists pending drafts only in the encrypted
+snapshot for seven days. Identity-bound monotonic deadlines and a five-minute
+encrypted clock high-water checkpoint keep a quiet process or later wall-clock
+rollback from silently granting another review lifetime. **Review item draft…**
+opens the same complete canonical editor used by manual authoring. **Create
+item** commits the exact edited create journal and accepted-suggestion linkage
+atomically; no schedule or network mutation occurs until normal canonical sync.
+Rejection and expiry scrub the draft body, while migrated prose-only suggestions
+stay non-actionable.
+
 The same authenticated configuration powers canonical planner sync. A sync:
 
 1. pulls the ordered `/v1/items/delta` stream using its opaque cursor;

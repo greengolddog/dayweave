@@ -428,10 +428,13 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// publication recovery watermark, version 16 replaces local execution
     /// move approvals with exact server-issued defer assessment evidence, and
     /// version 17 retains the selected defer target until that target passes
-    /// while expiring only the server-issued assessment evidence.
+    /// while expiring only the server-issued assessment evidence, and version
+    /// 18 adds bounded, typed, approval-only Codex canonical-item drafts plus
+    /// immutable accepted-item journal linkage. Legacy prose suggestions stay
+    /// advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 17
+    static let currentSchemaVersion = 18
 
     let schemaVersion: Int
     let savedAt: Date
@@ -440,6 +443,10 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let selectedCanonicalItemID: UUID?
     let blocks: [ScheduleBlock]
     let suggestions: [PlanningSuggestion]
+    /// Highest authenticated wall-clock observation used for local Codex
+    /// draft retention. It prevents a later clock rollback (including across
+    /// relaunch) from silently granting another review lifetime.
+    let localSuggestionDateHighWater: Date?
     let assistantMessages: [AssistantMessage]
     let lastScheduleMessage: String
     let protectedFreeMinutes: Int
@@ -481,6 +488,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         selectedCanonicalItemID: UUID? = nil,
         blocks: [ScheduleBlock],
         suggestions: [PlanningSuggestion],
+        localSuggestionDateHighWater: Date? = nil,
         assistantMessages: [AssistantMessage],
         lastScheduleMessage: String,
         protectedFreeMinutes: Int,
@@ -518,6 +526,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.selectedCanonicalItemID = selectedCanonicalItemID
         self.blocks = blocks
         self.suggestions = suggestions
+        self.localSuggestionDateHighWater = localSuggestionDateHighWater
         self.assistantMessages = assistantMessages
         self.lastScheduleMessage = lastScheduleMessage
         self.protectedFreeMinutes = protectedFreeMinutes
@@ -562,6 +571,24 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     func migratedToCurrentSchema() throws(PlannerPersistenceError) -> PlannerSnapshot {
         switch schemaVersion {
         case Self.currentSchemaVersion:
+            let pendingTypedSuggestions = suggestions.filter { suggestion in
+                guard suggestion.state == .pending,
+                      case .canonicalItemDraft = suggestion.payload else {
+                    return false
+                }
+                return true
+            }
+            let localSuggestionHighWaterIsValid: Bool
+            if pendingTypedSuggestions.isEmpty {
+                localSuggestionHighWaterIsValid = localSuggestionDateHighWater == nil
+            } else if let highWater = localSuggestionDateHighWater,
+                      highWater.timeIntervalSinceReferenceDate.isFinite {
+                localSuggestionHighWaterIsValid = pendingTypedSuggestions.allSatisfy {
+                    $0.createdAt <= highWater && highWater < $0.expiresAt
+                }
+            } else {
+                localSuggestionHighWaterIsValid = false
+            }
             let deferredPublicationStateIsValid = executionState.map { state in
                 guard let deferredExecutionPublicationSessionIDs else { return false }
                 return deferredExecutionPublicationSessionIDs.count <= 10_000
@@ -603,6 +630,8 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   let proposalApplicationReceipts,
                   let pendingCanonicalAuthoringMutations,
                   let canonicalTrash,
+                  localSuggestionHighWaterIsValid,
+                  PlanningSuggestion.collectionIsValid(suggestions),
                   PlannerProposalApplicationJournalValidator.isValidState(
                       pending: pendingProposalApplicationMutation,
                       receipts: proposalApplicationReceipts
@@ -640,6 +669,48 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 17:
+            // Schema 17 suggestions were prose-only. Deliberately strip any
+            // injected schema-18 payload/linkage fields while preserving their
+            // display state so migration can never turn legacy text into a
+            // canonical create request.
+            return try PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions.map(\.migratedLegacyAdvisory),
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: pendingExecutionDeferIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 16:
             // Schema 16 capped the durable user's target at 24 hours even when
             // move_start was later. Preserve the exact target and any exact
@@ -1406,6 +1477,7 @@ struct EncryptedPlannerPersistence: Sendable {
         return try withExclusiveLock { () throws(PlannerPersistenceError) -> (
             PlannerSnapshot?, PlannerPersistenceRevision
         ) in
+            try removeOrphanedTemporaryFiles()
             guard let envelopeData = try readEnvelopeDataIfPresent() else {
                 return (nil, .missing)
             }
@@ -1472,6 +1544,7 @@ struct EncryptedPlannerPersistence: Sendable {
             if (1..<5).contains(probe.schemaVersion) {
                 decoder.userInfo[.dayWeaveAllowsMissingSensitivity] = true
             }
+            decoder.userInfo[.dayWeavePlannerSnapshotSchemaVersion] = probe.schemaVersion
             snapshot = try decoder.decode(PlannerSnapshot.self, from: plaintext)
         } catch {
             throw .snapshotDecodingFailed
@@ -1497,6 +1570,7 @@ struct EncryptedPlannerPersistence: Sendable {
         let data = try encodeEnvelope(for: snapshot)
         try prepareParentDirectory()
         return try withExclusiveLock { () throws(PlannerPersistenceError) -> PlannerPersistenceRevision in
+            try removeOrphanedTemporaryFiles()
             let currentData = try readEnvelopeDataIfPresent()
             guard Self.revision(for: currentData) == expectedRevision else {
                 throw PlannerPersistenceError.concurrentModification
@@ -1571,16 +1645,127 @@ struct EncryptedPlannerPersistence: Sendable {
     }
 
     private func writeEnvelopeData(_ data: Data) throws(PlannerPersistenceError) {
+        let directoryURL = fileURL.deletingLastPathComponent()
+        let directoryDescriptor = Darwin.open(
+            directoryURL.path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard directoryDescriptor >= 0 else {
+            throw .fileWriteFailed(cocoaCode: nil)
+        }
+        defer { _ = Darwin.close(directoryDescriptor) }
+
+        let temporaryURL = directoryURL.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp",
+            isDirectory: false
+        )
+        let flags = O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW
+        var descriptor = Darwin.open(
+            temporaryURL.path,
+            flags,
+            mode_t(S_IRUSR | S_IWUSR)
+        )
+        guard descriptor >= 0 else {
+            throw .fileWriteFailed(cocoaCode: nil)
+        }
+        var temporaryFileExists = true
+        defer {
+            if descriptor >= 0 { _ = Darwin.close(descriptor) }
+            if temporaryFileExists { _ = Darwin.unlink(temporaryURL.path) }
+        }
+
         do {
-            // Data's atomic option writes a sibling temporary file and renames it,
-            // preventing a partial snapshot from replacing the last good one.
-            try data.write(to: fileURL, options: .atomic)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: NSNumber(value: Int16(0o600))],
-                ofItemAtPath: fileURL.path
-            )
+            guard Darwin.fchmod(descriptor, mode_t(S_IRUSR | S_IWUSR)) == 0 else {
+                throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+            }
+            try data.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else { return }
+                var written = 0
+                while written < bytes.count {
+                    let result = Darwin.write(
+                        descriptor,
+                        baseAddress.advanced(by: written),
+                        bytes.count - written
+                    )
+                    if result < 0, errno == EINTR { continue }
+                    guard result > 0 else {
+                        throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+                    }
+                    written += result
+                }
+            }
+            guard Darwin.fsync(descriptor) == 0 else {
+                throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+            }
+            guard Darwin.close(descriptor) == 0 else {
+                descriptor = -1
+                throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+            }
+            descriptor = -1
+
+            // The temporary file already has its final private permissions.
+            // rename(2) atomically changes the name; the directory fsync below
+            // is the durability barrier before that commit may be reported.
+            guard Darwin.rename(temporaryURL.path, fileURL.path) == 0 else {
+                throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+            }
+            temporaryFileExists = false
+            guard Darwin.fsync(directoryDescriptor) == 0 else {
+                // The rename may already be visible, so callers treat this as
+                // an ambiguous persistence failure and lock until reload.
+                throw PlannerPersistenceError.fileWriteFailed(cocoaCode: nil)
+            }
+        } catch let error as PlannerPersistenceError {
+            throw error
         } catch {
             throw .fileWriteFailed(cocoaCode: Self.cocoaCode(for: error))
+        }
+    }
+
+    /// Removes only regular files matching the exact random sibling name used
+    /// by `writeEnvelopeData`. Cleanup runs while holding the same lock as
+    /// load/save, and `lstat` ensures a matching symlink is never followed or
+    /// removed. This bounds encrypted copies left by a crash before rename.
+    private func removeOrphanedTemporaryFiles() throws(PlannerPersistenceError) {
+        let directory = fileURL.deletingLastPathComponent()
+        let prefix = ".\(fileURL.lastPathComponent)."
+        let suffix = ".tmp"
+        let names: [String]
+        do {
+            names = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        } catch {
+            throw .fileWriteFailed(cocoaCode: Self.cocoaCode(for: error))
+        }
+
+        for name in names where name.hasPrefix(prefix) && name.hasSuffix(suffix) {
+            let identifierStart = name.index(name.startIndex, offsetBy: prefix.count)
+            let identifierEnd = name.index(name.endIndex, offsetBy: -suffix.count)
+            let identifierText = String(name[identifierStart..<identifierEnd])
+            guard let identifier = UUID(uuidString: identifierText),
+                  identifier.uuidString == identifierText else {
+                continue
+            }
+            let orphanURL = directory.appendingPathComponent(name, isDirectory: false)
+            var metadata = stat()
+            let status = orphanURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return -1 }
+                return Darwin.lstat(path, &metadata)
+            }
+            if status != 0 {
+                if errno == ENOENT { continue }
+                throw .fileWriteFailed(cocoaCode: nil)
+            }
+            guard metadata.st_mode & S_IFMT == S_IFREG,
+                  metadata.st_uid == geteuid() else {
+                continue
+            }
+            let unlinkStatus = orphanURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+                guard let path else { return -1 }
+                return Darwin.unlink(path)
+            }
+            if unlinkStatus != 0, errno != ENOENT {
+                throw .fileWriteFailed(cocoaCode: nil)
+            }
         }
     }
 

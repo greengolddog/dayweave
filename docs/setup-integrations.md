@@ -483,15 +483,33 @@ has no direct access to app storage.
 
 Conversation history currently lasts for the running app session only; the UI
 does not yet expose model or reasoning controls. All server-initiated tool,
-command, file-change, and approval requests are denied. A reply may include a
-strict bounded change-proposal envelope, but DayWeave can only route valid entries
-to the local Suggestions Inbox through an app-owned router. The conversation
-controller never mutates `PlannerStore` directly, and accepting a proposal
-from this session-local embedded-Codex route currently records the review
-decision without changing the schedule. Separately, a server-backed
-`dayweave.proposal-change-set/1` suggestion can be simulated, reviewed field by
-field, explicitly approved, applied atomically, and undone through the native
-device workflow documented in
+command, file-change, and approval requests are denied. A completed final-answer
+message may append one strict, duplicate-key-free
+`<dayweave-item-drafts-v1>` envelope containing at most five editable canonical
+item bodies and no identifiers, status, hierarchy, sensitivity, revision, or
+configuration authority. Interrupted, failed, streaming, malformed, oversized,
+or non-final output cannot route a draft.
+
+DayWeave validates the complete envelope atomically, generates every item and
+mutation identity locally, forces each draft to private Inbox state, and saves
+it only in the encrypted planner snapshot with a seven-day expiry. An
+identity-bound monotonic deadline runs for each pending record, and the app
+commits an encrypted wall-clock high-water checkpoint every five minutes while
+a private draft remains, so a quiet process and later clock rollback cannot
+silently restart its full retention window. Hidden sub-minute values, repeated
+DST-fold offsets, and all-day bounds outside local midnight are rejected before
+the review Inbox. The local Suggestions Inbox opens the ordinary typed item
+editor; nothing is created until the owner reviews every field and chooses
+**Create item**. Approval saves the accepted linkage and exact canonical create
+journal in one encrypted transition. It does not change the composed schedule
+or make a network request; the existing canonical sync later publishes that
+immutable idempotent journal. Rejecting or expiring a draft scrubs its retained
+body. Legacy local prose suggestions remain advisory, and **Mark reviewed**
+never creates an item.
+
+Separately, a server-backed `dayweave.proposal-change-set/1` suggestion can be
+simulated, reviewed field by field, explicitly approved, applied atomically,
+and undone through the native device workflow documented in
 [proposal-applications.md](proposal-applications.md).
 Chat requires a signed-in ChatGPT account and network access; there is no offline
 model fallback.
