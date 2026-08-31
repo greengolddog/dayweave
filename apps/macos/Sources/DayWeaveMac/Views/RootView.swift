@@ -243,6 +243,10 @@ struct RootView: View {
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @ObservedObject private var breakNotificationTapRouter =
+        DayWeaveBreakNotificationTapRouter.shared
+    @ObservedObject private var breakNotificationDeliveryPulse =
+        DayWeaveBreakNotificationDeliveryPulse.shared
     @StateObject private var willDoLaterPresenter = WillDoLaterPresenter()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var isResolvingExpiredBreak = false
@@ -259,6 +263,12 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(min: 300, ideal: 360, max: 430)
         }
         .environmentObject(willDoLaterPresenter)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                staleBreakNotificationTapBanner
+                breakNotificationPermissionBanner
+            }
+        }
         .sheet(isPresented: $store.isQuickAddPresented) {
             QuickCaptureView(profileTimezoneName: store.scheduleProfile.timezoneName)
                 .environmentObject(store)
@@ -272,6 +282,9 @@ struct RootView: View {
         }
         .onAppear {
             codex.startIfNeeded()
+        }
+        .onChange(of: breakNotificationDeliveryPulse.generation) { _, _ in
+            executionSync.breakNotificationForegroundDeliveryDidOccur()
         }
         .alert("Your break has ended", isPresented: expiredBreakAlertBinding) {
             Button("Resume") {
@@ -287,8 +300,28 @@ struct RootView: View {
             .disabled(executionSync.isSyncing
                 || store.executionState.pendingCommand != nil
                 || !store.canMutatePlan)
+            Button("Extend 10 minutes") {
+                if let blockID = activeExecutionBlockID {
+                    isResolvingExpiredBreak = true
+                    Task {
+                        _ = await executionSync.pause(
+                            blockID,
+                            durationSeconds: 10 * 60
+                        )
+                        isResolvingExpiredBreak = false
+                    }
+                }
+            }
+            .accessibilityIdentifier("execution.expired-break.extend-10-minutes")
+            .disabled(executionSync.isSyncing
+                || store.executionState.pendingCommand != nil
+                || !store.canMutatePlan)
             Button("Keep paused") {
-                _ = executionSync.keepPausedAfterExpiredBreak()
+                isResolvingExpiredBreak = true
+                Task {
+                    _ = await executionSync.keepPausedAfterExpiredBreak()
+                    isResolvingExpiredBreak = false
+                }
             }
             .accessibilityIdentifier("execution.expired-break.keep-paused")
             .disabled(executionSync.isSyncing
@@ -352,7 +385,11 @@ struct RootView: View {
     private var expiredBreakAlertBinding: Binding<Bool> {
         Binding(
             get: {
-                executionSync.expiredBreakChoiceRequired && !isResolvingExpiredBreak
+                executionSync.shouldPresentExpiredBreakResolution(
+                    pendingNotificationIdentifier:
+                        breakNotificationTapRouter.pendingIdentifier
+                )
+                    && !isResolvingExpiredBreak
             },
             set: { _ in }
         )
@@ -361,6 +398,75 @@ struct RootView: View {
     private var activeExecutionBlockID: UUID? {
         guard let active = executionSync.activeSession else { return nil }
         return executionBlock(matching: active, in: store.blocks)?.id
+    }
+
+    @ViewBuilder
+    private var staleBreakNotificationTapBanner: some View {
+        if let issue = executionSync.breakNotificationTapIssue {
+            HStack(spacing: 12) {
+                Label(issue.message, systemImage: "bell.slash")
+                    .font(.subheadline.weight(.medium))
+                    .accessibilityIdentifier("execution.break-notification.stale-tap")
+                Spacer()
+                Button(executionSync.expiredBreakChoiceRequired
+                    ? "Review current break" : "Dismiss") {
+                    executionSync.acknowledgeStaleBreakNotificationTap()
+                }
+                .accessibilityIdentifier(
+                    "execution.break-notification.stale-tap-acknowledge"
+                )
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(.bar)
+            .overlay(alignment: .bottom) { Divider() }
+        }
+    }
+
+    @ViewBuilder
+    private var breakNotificationPermissionBanner: some View {
+        if executionSync.breakNotificationBannerShouldBePresented {
+            HStack(spacing: 12) {
+                Label(
+                    executionSync.breakNotificationIssue?.message
+                        ?? (executionSync.breakNotificationAuthorizationState == .denied
+                            ? "Break reminders are disabled"
+                            : "Get a reminder when this break ends"),
+                    systemImage: "bell.badge"
+                )
+                .font(.subheadline.weight(.medium))
+                .accessibilityIdentifier("execution.break-notification.status")
+                Spacer()
+                if let issue = executionSync.breakNotificationIssue {
+                    Button(issue.retryTitle) {
+                        Task { _ = await executionSync.retryBreakNotification() }
+                    }
+                    .disabled(executionSync.isRequestingBreakNotificationAuthorization)
+                    .accessibilityIdentifier("execution.break-notification.retry")
+                } else if executionSync.breakNotificationAuthorizationState == .notDetermined {
+                    Button("Enable reminders") {
+                        Task {
+                            _ = await executionSync.requestBreakNotificationAuthorization()
+                        }
+                    }
+                    .disabled(executionSync.isRequestingBreakNotificationAuthorization)
+                    .accessibilityIdentifier("execution.break-notification.enable")
+                } else {
+                    Button("Open Notification Settings") {
+                        if let url = URL(string:
+                            "x-apple.systempreferences:com.apple.Notifications-Settings.extension"
+                        ) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    .accessibilityIdentifier("execution.break-notification.settings")
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(.bar)
+            .overlay(alignment: .bottom) { Divider() }
+        }
     }
 
     @ViewBuilder
@@ -4913,8 +5019,21 @@ struct MenuBarView: View {
                             accessibilityScope: "menu-bar-active"
                         )
                         if executionSync.expiredBreakChoiceRequired {
+                            Button("Extend break 10 minutes") {
+                                Task {
+                                    _ = await executionSync.pause(
+                                        active.id,
+                                        durationSeconds: 10 * 60
+                                    )
+                                }
+                            }
+                            .disabled(executionSync.isSyncing
+                                || store.executionState.pendingCommand != nil
+                                || !store.canMutatePlan)
                             Button("Keep paused") {
-                                _ = executionSync.keepPausedAfterExpiredBreak()
+                                Task {
+                                    _ = await executionSync.keepPausedAfterExpiredBreak()
+                                }
                             }
                             .disabled(executionSync.isSyncing
                                 || store.executionState.pendingCommand != nil
@@ -6033,6 +6152,19 @@ struct SettingsView: View {
                     .foregroundStyle(canonicalSync.status.isFailure ? .red : .secondary)
                 LabeledContent("Execution sync", value: executionSync.status.message)
                     .foregroundStyle(executionStatusIsFailure ? .red : .secondary)
+                if let notificationIssue = executionSync.breakNotificationIssue {
+                    HStack {
+                        Text(notificationIssue.message)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Spacer()
+                        Button(notificationIssue.retryTitle) {
+                            Task { _ = await executionSync.retryBreakNotification() }
+                        }
+                        .disabled(executionSync.isRequestingBreakNotificationAuthorization)
+                    }
+                    .accessibilityIdentifier("settings.execution.break-notification.issue")
+                }
                 Button("Reset local canonical cache…", role: .destructive) {
                     isCanonicalResetConfirmationPresented = true
                 }
@@ -6068,7 +6200,16 @@ struct SettingsView: View {
             titleVisibility: .visible
         ) {
             Button("Reset local cache", role: .destructive) {
-                canonicalSync.resetCanonicalSyncState()
+                Task { @MainActor in
+                    let cancellation = await executionSync
+                        .cancelBreakNotificationsForConfigurationReset()
+                    guard cancellation.isVerifiedCancellation else { return }
+                    canonicalSync.resetCanonicalSyncState()
+                    // If the reset lost a preflight race and was refused, this
+                    // restores the still-authoritative reminder. A successful
+                    // reset simply confirms that the center remains empty.
+                    _ = await executionSync.reconcileBreakNotification()
+                }
             }
         } message: {
             Text("This removes cached canonical items, preview blocks, recurrence history, and pending/conflicted canonical edits from this Mac. It does not change the server or locally authored captures.")
@@ -6322,15 +6463,20 @@ struct SettingsView: View {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
             let replacementRequired = apiCredentialReplacementRequired
-            if replacementRequired {
-                try executionSync.prepareForCredentialReplacement()
-            }
             let bootstrap = dayWeaveBearerToken
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             Task { @MainActor in
                 defer {
                     if reservedGoogleTransition {
                         googleIntegration.endCredentialTransition()
+                    }
+                }
+                if replacementRequired {
+                    do {
+                        try await executionSync.prepareForCredentialReplacement()
+                    } catch {
+                        apiSettingsError = error.localizedDescription
+                        return
                     }
                 }
                 if !bootstrap.isEmpty {
@@ -6365,7 +6511,7 @@ struct SettingsView: View {
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
                 canonicalSync.configurationDidChange()
-                executionSync.configurationDidChange()
+                await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {
@@ -6379,11 +6525,18 @@ struct SettingsView: View {
     private func revokeAndRemoveAuthentication() {
         apiSettingsError = nil
         guard allowGoogleCredentialTransition() else { return }
+        let baseURL: DayWeaveAPIBaseURL
         do {
-            try executionSync.prepareForCredentialReplacement()
-            let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
-            Task { @MainActor in
-                defer { googleIntegration.endCredentialTransition() }
+            baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+        } catch {
+            googleIntegration.endCredentialTransition()
+            apiSettingsError = error.localizedDescription
+            return
+        }
+        Task { @MainActor in
+            defer { googleIntegration.endCredentialTransition() }
+            do {
+                try await executionSync.prepareForCredentialReplacement()
                 guard await durableAuth.revokeAndForget(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -6392,23 +6545,22 @@ struct SettingsView: View {
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
                 canonicalSync.configurationDidChange()
-                executionSync.configurationDidChange()
+                await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
+            } catch {
+                apiSettingsError = error.localizedDescription
             }
-        } catch {
-            googleIntegration.endCredentialTransition()
-            apiSettingsError = error.localizedDescription
         }
     }
 
     private func forgetAuthenticationLocally() {
         apiSettingsError = nil
         guard allowGoogleCredentialTransition() else { return }
-        do {
-            try executionSync.prepareForCredentialReplacement()
-            let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
-            Task { @MainActor in
-                defer { googleIntegration.endCredentialTransition() }
+        let baseURL = try? DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
+        Task { @MainActor in
+            defer { googleIntegration.endCredentialTransition() }
+            do {
+                try await executionSync.prepareForCredentialReplacement()
                 guard await durableAuth.forgetLocally(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -6417,13 +6569,12 @@ struct SettingsView: View {
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
                 canonicalSync.configurationDidChange()
-                executionSync.configurationDidChange()
+                await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
                 dayWeaveEnrollmentCode = ""
+            } catch {
+                apiSettingsError = error.localizedDescription
             }
-        } catch {
-            googleIntegration.endCredentialTransition()
-            apiSettingsError = error.localizedDescription
         }
     }
 
@@ -6433,10 +6584,15 @@ struct SettingsView: View {
         do {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
-            try executionSync.prepareForCredentialReplacement()
             let code = dayWeaveEnrollmentCode
             Task { @MainActor in
                 defer { googleIntegration.endCredentialTransition() }
+                do {
+                    try await executionSync.prepareForCredentialReplacement()
+                } catch {
+                    apiSettingsError = error.localizedDescription
+                    return
+                }
                 guard await durableAuth.consumeEnrollmentCode(baseURL: baseURL, code: code) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -6454,7 +6610,7 @@ struct SettingsView: View {
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
                 canonicalSync.configurationDidChange()
-                executionSync.configurationDidChange()
+                await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {
@@ -6469,9 +6625,14 @@ struct SettingsView: View {
         do {
             let baseURL = try DayWeaveAPIBaseURL(dayWeaveAPIBaseURL)
             let capturedBaseURL = baseURL.url.absoluteString
-            try executionSync.prepareForCredentialReplacement()
             Task { @MainActor in
                 defer { googleIntegration.endCredentialTransition() }
+                do {
+                    try await executionSync.prepareForCredentialReplacement()
+                } catch {
+                    apiSettingsError = error.localizedDescription
+                    return
+                }
                 guard await durableAuth.enroll(baseURL: baseURL) else {
                     apiSettingsError = durableAuth.errorMessage
                     return
@@ -6488,7 +6649,7 @@ struct SettingsView: View {
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
                 canonicalSync.configurationDidChange()
-                executionSync.configurationDidChange()
+                await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
             }
         } catch {

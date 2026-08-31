@@ -67,7 +67,8 @@ struct ExecutionSyncStoreTests {
                 origin: baseURL.credentialOriginIdentifier
             ),
             session: URLProtocolStub.makeSession(),
-            now: { Self.baseDate }
+            now: { Self.baseDate },
+            breakNotificationCoordinator: DayWeaveNoopBreakNotificationCoordinator()
         )
 
         #expect(await sync.refresh() == .success)
@@ -1342,7 +1343,10 @@ struct ExecutionSyncStoreTests {
     func schema15DeferApprovalMigratesFailClosed() async throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
-        let paused = try Self.pausedSession(sessionID: Self.uuid(1_141))
+        let paused = try Self.pausedSession(
+            sessionID: Self.uuid(1_141),
+            accumulatedSeconds: 300
+        )
         let moveStart = Self.baseDate.addingTimeInterval(3_600)
         let legacy = DayWeavePendingExecutionDeferIntent(
             version: 5,
@@ -2593,16 +2597,690 @@ struct ExecutionSyncStoreTests {
         state.historyVerified = true
         let planner = Self.planner(persistence: context.persistence, executionState: state)
         let transport = ExecutionTransportDouble(snapshots: [], pages: [])
+        let notificationCoordinator = GatedBreakNotificationCoordinator()
         let sync = Self.controller(
             planner: planner,
             transport: transport,
-            now: { paused.pauseUntil!.addingTimeInterval(1) }
+            now: { paused.pauseUntil!.addingTimeInterval(1) },
+            breakNotificationCoordinator: notificationCoordinator
         )
 
         #expect(sync.expiredBreakChoiceRequired)
-        #expect(sync.keepPausedAfterExpiredBreak() == .success)
+        let completion = AsyncCompletionProbe()
+        let keepPaused = Task { @MainActor in
+            let outcome = await sync.keepPausedAfterExpiredBreak()
+            await completion.markComplete()
+            return outcome
+        }
+        await notificationCoordinator.waitUntilEntered()
+        #expect(!(await completion.isComplete))
         #expect(!sync.expiredBreakChoiceRequired)
         #expect(planner.executionState.activeSession?.status == .paused)
+        await notificationCoordinator.release()
+        #expect(await keepPaused.value == .success)
+    }
+
+    @Test("a notification tap only presents its exact expired lease without mutating it")
+    func breakNotificationTapIsExactAndPresentationOnly() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(81))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { paused.pauseUntil!.addingTimeInterval(1) }
+        )
+        let identifier = try #require(
+            DayWeaveBreakNotificationContract.descriptor(for: paused)?.identifier
+        )
+        let before = planner.executionState
+
+        #expect(sync.routeBreakNotificationTap(identifier: identifier))
+        #expect(sync.breakResolutionPresentation == .init(
+            notificationIdentifier: identifier,
+            observedSessionVersion: .init(
+                sessionID: paused.id,
+                revision: paused.revision
+            ),
+            observedBreakIdentifier: identifier
+        ))
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+        #expect(planner.executionState == before)
+
+        #expect(await sync.keepPausedAfterExpiredBreak() == .success)
+        #expect(sync.breakResolutionPresentation == nil)
+        let acknowledged = planner.executionState
+        #expect(!sync.routeBreakNotificationTap(identifier: identifier))
+        #expect(!sync.expiredBreakResolutionShouldBePresented)
+        #expect(planner.executionState == acknowledged)
+    }
+
+    @Test("a stale notification tap cannot present a newer expired break")
+    func staleBreakNotificationDoesNotRetargetPresentation() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let stale = try Self.pausedSession(sessionID: Self.uuid(88))
+        let current = try Self.pausedSession(sessionID: Self.uuid(89))
+        var state = Self.emptyBoundState
+        state.revision = current.revision
+        state.activeSession = current
+        state.historyWindow = [current]
+        state.historyWindowRevision = current.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { current.pauseUntil!.addingTimeInterval(1) }
+        )
+        let staleIdentifier = try #require(
+            DayWeaveBreakNotificationContract.descriptor(for: stale)?.identifier
+        )
+        let currentIdentifier = try #require(
+            DayWeaveBreakNotificationContract.descriptor(for: current)?.identifier
+        )
+
+        // With no notification response, the ordinary in-app expiration path
+        // still presents the current break.
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+        let router = DayWeaveBreakNotificationTapRouter()
+        #expect(router.route(identifier: staleIdentifier))
+        #expect(!sync.shouldPresentExpiredBreakResolution(
+            pendingNotificationIdentifier: router.pendingIdentifier
+        ))
+        // Closed-window and app-lock rendering both see the pending mailbox and
+        // stay suppressed until content is available for exact routing.
+        #expect(router.deliverPending(
+            contentAvailable: false,
+            route: sync.routeBreakNotificationTap(identifier:)
+        ) == nil)
+        #expect(router.pendingIdentifier == staleIdentifier)
+        #expect(!sync.shouldPresentExpiredBreakResolution(
+            pendingNotificationIdentifier: router.pendingIdentifier
+        ))
+
+        // Delivery installs the rejected exact token synchronously before the
+        // router clears its mailbox, so B never sees an unguarded render.
+        #expect(router.deliverPending(
+            contentAvailable: true,
+            route: sync.routeBreakNotificationTap(identifier:)
+        ) == false)
+        #expect(router.pendingIdentifier == nil)
+        #expect(!sync.expiredBreakResolutionShouldBePresented)
+        #expect(sync.breakResolutionPresentation == .init(
+            notificationIdentifier: staleIdentifier,
+            observedSessionVersion: .init(
+                sessionID: current.id,
+                revision: current.revision
+            ),
+            observedBreakIdentifier: currentIdentifier
+        ))
+        #expect(sync.breakNotificationTapIssue == .staleReminder)
+
+        // Recovery requires a separate, explicit acknowledgement. The stale A
+        // click itself never opens B, while the button restores the ordinary
+        // current-break resolver without waiting for another notification.
+        sync.acknowledgeStaleBreakNotificationTap()
+        #expect(sync.breakNotificationTapIssue == nil)
+        #expect(sync.breakResolutionPresentation == nil)
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+
+        #expect(router.route(identifier: currentIdentifier))
+        #expect(!sync.shouldPresentExpiredBreakResolution(
+            pendingNotificationIdentifier: router.pendingIdentifier
+        ))
+        #expect(router.deliverPending(
+            contentAvailable: true,
+            route: sync.routeBreakNotificationTap(identifier:)
+        ) == true)
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+    }
+
+    @Test("an offline deadline task publishes an exact local resolver wake")
+    func localBreakDeadlineWakeDoesNotDependOnPolling() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(94))
+        let clock = ExecutionSequenceClock([paused.pausedAt!])
+        let sleeper = BreakDeadlineSleepGate()
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { clock.now() },
+            breakDeadlineSleep: { duration in
+                await sleeper.sleep(for: duration)
+            }
+        )
+
+        let delay = await sleeper.waitUntilEntered()
+        #expect(delay == .seconds(60))
+        #expect(sync.breakResolutionWakeGeneration == 0)
+        #expect(!sync.expiredBreakChoiceRequired)
+
+        clock.advance(to: paused.pauseUntil!.addingTimeInterval(1))
+        await sleeper.release()
+        for _ in 0..<20 where sync.breakResolutionWakeGeneration == 0 {
+            await Task.yield()
+        }
+        #expect(sync.breakResolutionWakeGeneration == 1)
+        #expect(sync.expiredBreakChoiceRequired)
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+    }
+
+    @Test("a rejected tap cannot suppress a later clock-driven expiration")
+    func staleTapSuppressionExpiresWithObservedDigest() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let stale = try Self.pausedSession(sessionID: Self.uuid(92))
+        let current = try Self.pausedSession(sessionID: Self.uuid(93))
+        let clock = ExecutionSequenceClock([current.pausedAt!])
+        var state = Self.emptyBoundState
+        state.revision = current.revision
+        state.activeSession = current
+        state.historyWindow = [current]
+        state.historyWindowRevision = current.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { clock.now() }
+        )
+        let staleIdentifier = try #require(
+            DayWeaveBreakNotificationContract.descriptor(for: stale)?.identifier
+        )
+
+        #expect(!sync.routeBreakNotificationTap(identifier: staleIdentifier))
+        #expect(!sync.expiredBreakChoiceRequired)
+        #expect(sync.breakResolutionPresentation?.observedBreakIdentifier == nil)
+
+        clock.advance(to: current.pauseUntil!.addingTimeInterval(1))
+        #expect(sync.expiredBreakChoiceRequired)
+        #expect(sync.expiredBreakResolutionShouldBePresented)
+    }
+
+    @Test("an authorized add is durable before pause completion makes termination safe")
+    func breakNotificationSchedulingIsAnAwaitedPauseBarrier() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sessionID = Self.uuid(82)
+        let active = try Self.activeSession(sessionID: sessionID)
+        let pausedAt = Self.baseDate.addingTimeInterval(60)
+        let paused = try Self.session(
+            id: sessionID,
+            status: .paused,
+            revision: 2,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate,
+            updatedAt: pausedAt,
+            accumulatedSeconds: 60,
+            actualSeconds: nil,
+            runningSince: nil,
+            pausedAt: pausedAt,
+            pauseUntil: pausedAt.addingTimeInterval(600),
+            endedAt: nil
+        )
+        let activeSnapshot = DayWeaveExecutionSnapshot(revision: 1, activeSession: active)
+        let pausedSnapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: paused)
+        let transport = ExecutionTransportDouble(
+            snapshots: [activeSnapshot, activeSnapshot, pausedSnapshot, pausedSnapshot],
+            pages: [
+                .init(sessions: [active], nextOffset: nil),
+                .init(sessions: [paused], nextOffset: nil),
+            ],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: 2,
+                active: paused,
+                changed: paused,
+                replayed: false
+            ))]
+        )
+        var durable = Self.emptyBoundState
+        durable.revision = 1
+        durable.activeSession = active
+        durable.historyWindow = [active]
+        durable.historyWindowRevision = 1
+        durable.historyContinuityEstablished = true
+        durable.historyVerified = true
+        durable.leaseProjectionEligibility[sessionID] = true
+        durable.presentedBlockIDs = [Self.blockID]
+        var activeBlock = Self.block()
+        activeBlock.status = .active
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [activeBlock],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: durable
+        )
+        let notificationCoordinator = GatedBreakNotificationCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { pausedAt },
+            breakNotificationCoordinator: notificationCoordinator
+        )
+
+        let completion = AsyncCompletionProbe()
+        let pause = Task { @MainActor in
+            let outcome = await sync.pause(Self.blockID, durationSeconds: 600)
+            await completion.markComplete()
+            return outcome
+        }
+        await notificationCoordinator.waitUntilEntered()
+        #expect(!(await completion.isComplete))
+        #expect(planner.executionState.activeSession == paused)
+        await notificationCoordinator.release()
+        #expect(await pause.value == .success)
+        #expect(await completion.isComplete)
+    }
+
+    @Test("resume awaits cancellation of the prior timed-break notification")
+    func resumeAwaitsBreakNotificationCancellation() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let sessionID = Self.uuid(86)
+        let paused = try Self.pausedSession(sessionID: sessionID)
+        let resumedAt = paused.updatedAt.addingTimeInterval(30)
+        let resumed = try Self.session(
+            id: sessionID,
+            status: .active,
+            revision: 3,
+            sessionIndex: 0,
+            plannedBlockID: Self.blockID,
+            startedAt: Self.baseDate,
+            updatedAt: resumedAt,
+            accumulatedSeconds: paused.accumulatedSeconds,
+            actualSeconds: nil,
+            runningSince: resumedAt,
+            pausedAt: nil,
+            pauseUntil: nil,
+            endedAt: nil
+        )
+        let pausedSnapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: paused)
+        let resumedSnapshot = DayWeaveExecutionSnapshot(revision: 3, activeSession: resumed)
+        let transport = ExecutionTransportDouble(
+            snapshots: [pausedSnapshot, pausedSnapshot, resumedSnapshot, resumedSnapshot],
+            pages: [
+                .init(sessions: [paused], nextOffset: nil),
+                .init(sessions: [resumed], nextOffset: nil),
+            ],
+            commandReplies: [.mutation(try Self.mutation(
+                revision: 3,
+                active: resumed,
+                changed: resumed,
+                replayed: false
+            ))]
+        )
+        var state = Self.emptyBoundState
+        state.revision = 2
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = 2
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        state.leaseProjectionEligibility[sessionID] = true
+        state.presentedBlockIDs = [Self.blockID]
+        var pausedBlock = Self.block()
+        pausedBlock.status = .paused
+        let planner = Self.planner(
+            persistence: context.persistence,
+            blocks: [pausedBlock],
+            canonicalItems: [try Self.canonicalItem()],
+            executionState: state
+        )
+        let notifications = GatedBreakNotificationCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            now: { resumedAt },
+            breakNotificationCoordinator: notifications
+        )
+        let completion = AsyncCompletionProbe()
+
+        let resume = Task { @MainActor in
+            let outcome = await sync.resume(Self.blockID)
+            await completion.markComplete()
+            return outcome
+        }
+        await notifications.waitUntilEntered()
+        #expect(planner.executionState.activeSession == resumed)
+        #expect(!(await completion.isComplete))
+        await notifications.release()
+        #expect(await resume.value == .success)
+    }
+
+    @Test("an explicit permission prompt is separate from the authoritative pause lane")
+    func explicitBreakNotificationPermissionDoesNotHoldExecutionUI() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(83))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let prompt = GatedBreakNotificationPermissionCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { paused.pausedAt! },
+            breakNotificationCoordinator: prompt
+        )
+
+        let request = Task { @MainActor in
+            await sync.requestBreakNotificationAuthorization()
+        }
+        await prompt.waitUntilAuthorizationRequestEntered()
+        #expect(!sync.isSyncing)
+        #expect(planner.executionState.activeSession == paused)
+        #expect(sync.isRequestingBreakNotificationAuthorization)
+        await prompt.releaseAuthorizationRequest()
+        #expect(await request.value == .scheduled)
+        #expect(!sync.isRequestingBreakNotificationAuthorization)
+    }
+
+    @Test("notification service failures remain visible and can be retried")
+    func breakNotificationServiceFailureHasRetryState() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(90))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = RecoveringBreakNotificationCoordinator(mode: .schedulingUnavailable)
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { paused.pausedAt! },
+            breakNotificationCoordinator: notifications
+        )
+
+        #expect(await sync.reconcileBreakNotification() == .unavailable)
+        #expect(sync.breakNotificationAuthorizationState == .authorized)
+        #expect(sync.breakNotificationIssue == .schedulingUnavailable)
+        #expect(sync.breakNotificationIssue?.message.isEmpty == false)
+
+        await notifications.setMode(.available)
+        #expect(await sync.retryBreakNotification() == .scheduled)
+        #expect(sync.breakNotificationIssue == nil)
+    }
+
+    @Test("authorization-service failure is visible until explicit retry succeeds")
+    func breakNotificationAuthorizationFailureHasRetryState() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(91))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = RecoveringBreakNotificationCoordinator(
+            mode: .authorizationUnavailable
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { paused.pausedAt! },
+            breakNotificationCoordinator: notifications
+        )
+
+        #expect(await sync.requestBreakNotificationAuthorization() == .unavailable)
+        #expect(sync.breakNotificationAuthorizationState == .notDetermined)
+        #expect(sync.breakNotificationIssue == .authorizationUnavailable)
+
+        await notifications.setMode(.available)
+        #expect(await sync.retryBreakNotification() == .scheduled)
+        #expect(sync.breakNotificationAuthorizationState == .authorized)
+        #expect(sync.breakNotificationIssue == nil)
+    }
+
+    @Test("removal convergence failure is not mislabeled as scheduling failure")
+    func breakNotificationRemovalFailureHasExactRetryState() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(96))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = RecoveringBreakNotificationCoordinator(
+            mode: .cancellationUnavailable
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            now: { paused.pausedAt! },
+            breakNotificationCoordinator: notifications
+        )
+
+        #expect(await sync.reconcileBreakNotification() == .cancellationUnavailable)
+        #expect(sync.breakNotificationIssue == .cancellationUnavailable)
+        #expect(sync.breakNotificationIssue?.message.contains("removal") == true)
+
+        await notifications.setMode(.available)
+        #expect(await sync.retryBreakNotification() == .scheduled)
+        #expect(sync.breakNotificationIssue == nil)
+    }
+
+    @Test("denied alert permission cannot bypass a stale-removal retry")
+    func cancellationRetryIgnoresDeniedAuthorization() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = Self.planner(persistence: context.persistence)
+        let notifications = DeniedCancellationRetryCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+
+        #expect(await sync.reconcileBreakNotification() == .cancellationUnavailable)
+        #expect(sync.breakNotificationAuthorizationState == .denied)
+        #expect(sync.breakNotificationIssue == .cancellationUnavailable)
+
+        #expect(await sync.retryBreakNotification() == .canceled)
+        #expect(await notifications.reconcileAttempts == 2)
+        #expect(sync.breakNotificationIssue == nil)
+    }
+
+    @Test("a cancellation issue stays visible without a future timed break")
+    func cancellationIssueBannerDoesNotRequireFutureBreak() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let planner = Self.planner(persistence: context.persistence)
+        let notifications = RecoveringBreakNotificationCoordinator(
+            mode: .cancellationUnavailable
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+
+        #expect(!sync.hasFutureTimedBreakForNotificationPermission)
+        #expect(!sync.breakNotificationBannerShouldBePresented)
+
+        #expect(await sync.reconcileBreakNotification() == .cancellationUnavailable)
+        #expect(sync.breakNotificationIssue == .cancellationUnavailable)
+        #expect(sync.breakNotificationBannerShouldBePresented)
+    }
+
+    @Test("credential replacement awaits removal of the old notification generation")
+    func credentialReplacementAwaitsBreakNotificationCancellation() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(84))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = GatedBreakNotificationCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+        let completion = AsyncCompletionProbe()
+
+        let replacement = Task { @MainActor in
+            try await sync.prepareForCredentialReplacement()
+            await completion.markComplete()
+        }
+        await notifications.waitUntilEntered()
+        #expect(!(await completion.isComplete))
+        // The encrypted lease remains intact until notification cancellation
+        // completes, so process termination at this boundary is recoverable.
+        #expect(planner.executionState.activeSession == paused)
+        #expect(await notifications.lastSessionWasNil)
+        await notifications.release()
+        try await replacement.value
+        #expect(await completion.isComplete)
+        #expect(planner.executionState.activeSession == nil)
+    }
+
+    @Test("failed credential preparation restores the still-current reminder")
+    func failedCredentialPreparationReconcilesCurrentBreak() async throws {
+        let paused = try Self.pausedSession(sessionID: Self.uuid(87))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = PlannerStore(
+            canonicalConfigurationIdentifier: Self.canonicalConfiguration,
+            executionState: state,
+            restoreFromPersistence: false,
+            now: { Self.baseDate }
+        )
+        let notifications = RecordingBreakNotificationCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+
+        do {
+            try await sync.prepareForCredentialReplacement()
+            Issue.record("Expected encrypted persistence to be required")
+        } catch PlannerExecutionStateError.encryptedPersistenceRequired {
+            // Expected: the first nil is the cancellation precondition and the
+            // exact paused lease is then reconciled after preparation fails.
+        }
+
+        #expect(await notifications.observedSessionIDs == [nil, paused.id])
+        #expect(planner.executionState.activeSession == paused)
+        #expect(!sync.isSyncing)
+    }
+
+    @Test("unverified notification cancellation preserves encrypted credentials and lease")
+    func failedNotificationCancellationBlocksCredentialReplacement() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(95))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = RecoveringBreakNotificationCoordinator(
+            mode: .schedulingUnavailable
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+
+        do {
+            try await sync.prepareForCredentialReplacement()
+            Issue.record("Expected notification cancellation to block replacement")
+        } catch PlannerExecutionStateError.breakNotificationCancellationUnavailable {
+            // Expected: no encrypted state may be destroyed without observable
+            // pending-and-delivered disappearance.
+        }
+
+        #expect(planner.executionState.activeSession == paused)
+        #expect(planner.hasEncryptedPersistence)
+        #expect(sync.breakNotificationIssue == .cancellationUnavailable)
+        #expect(!sync.isSyncing)
+    }
+
+    @Test("canonical reset cancellation is an awaited barrier and leaves no presentation")
+    func canonicalResetAwaitsBreakNotificationCancellation() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let paused = try Self.pausedSession(sessionID: Self.uuid(85))
+        var state = Self.emptyBoundState
+        state.revision = paused.revision
+        state.activeSession = paused
+        state.historyWindow = [paused]
+        state.historyWindowRevision = paused.revision
+        state.historyContinuityEstablished = true
+        state.historyVerified = true
+        let planner = Self.planner(persistence: context.persistence, executionState: state)
+        let notifications = GatedBreakNotificationCoordinator()
+        let sync = Self.controller(
+            planner: planner,
+            transport: ExecutionTransportDouble(snapshots: [], pages: []),
+            breakNotificationCoordinator: notifications
+        )
+        let completion = AsyncCompletionProbe()
+
+        let cancellation = Task { @MainActor in
+            await sync.cancelBreakNotificationsForConfigurationReset()
+            await completion.markComplete()
+        }
+        await notifications.waitUntilEntered()
+        #expect(!(await completion.isComplete))
+        #expect(await notifications.lastSessionWasNil)
+        await notifications.release()
+        await cancellation.value
+        #expect(await completion.isComplete)
+        #expect(sync.breakResolutionPresentation == nil)
     }
 
     @Test("execution refresh waits for the shared canonical mutation fence")
@@ -2935,7 +3613,12 @@ struct ExecutionSyncStoreTests {
         planner: PlannerStore,
         transport: ExecutionTransportDouble,
         binding: String = binding,
-        now: @escaping @Sendable () -> Date = { baseDate }
+        now: @escaping @Sendable () -> Date = { baseDate },
+        breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating =
+            DayWeaveNoopBreakNotificationCoordinator(),
+        breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration)
+        }
     ) -> ExecutionSyncStore {
         let connection = DayWeaveExecutionConnection(
             canonicalConfigurationIdentifier: canonicalConfiguration,
@@ -2946,7 +3629,9 @@ struct ExecutionSyncStoreTests {
             planner: planner,
             connectionProvider: { connection },
             now: now,
-            makeUUID: { uuid(500) }
+            makeUUID: { uuid(500) },
+            breakNotificationCoordinator: breakNotificationCoordinator,
+            breakDeadlineSleep: breakDeadlineSleep
         )
     }
 
@@ -3079,8 +3764,11 @@ struct ExecutionSyncStoreTests {
         )
     }
 
-    private static func pausedSession(sessionID: UUID) throws -> DayWeaveExecutionSession {
-        let updated = baseDate.addingTimeInterval(10)
+    private static func pausedSession(
+        sessionID: UUID,
+        accumulatedSeconds: UInt64 = 10
+    ) throws -> DayWeaveExecutionSession {
+        let updated = baseDate.addingTimeInterval(TimeInterval(accumulatedSeconds))
         return try session(
             id: sessionID,
             status: .paused,
@@ -3089,7 +3777,7 @@ struct ExecutionSyncStoreTests {
             plannedBlockID: blockID,
             startedAt: baseDate,
             updatedAt: updated,
-            accumulatedSeconds: 10,
+            accumulatedSeconds: accumulatedSeconds,
             actualSeconds: nil,
             runningSince: nil,
             pausedAt: updated,
@@ -3360,6 +4048,230 @@ private final class ExecutionSequenceClock: @unchecked Sendable {
         dates = [date]
         lock.unlock()
     }
+}
+
+private actor BreakDeadlineSleepGate {
+    private var enteredDuration: Duration?
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Duration, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func sleep(for duration: Duration) async {
+        enteredDuration = duration
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume(returning: duration) }
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilEntered() async -> Duration {
+        if let enteredDuration { return enteredDuration }
+        return await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+private actor GatedBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinating {
+    private var entered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var observedSession: DayWeaveExecutionSession?
+
+    var lastSessionWasNil: Bool { entered && observedSession == nil }
+
+    func authorizationState() async -> DayWeaveNotificationAuthorizationState {
+        .authorized
+    }
+
+    func requestAuthorization() async -> DayWeaveNotificationAuthorizationRequestResult {
+        .authorized
+    }
+
+    func reconcile(
+        session: DayWeaveExecutionSession?,
+        acknowledged: DayWeaveExecutionSessionVersion?
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        observedSession = session
+        _ = acknowledged
+        entered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        return DayWeaveBreakNotificationContract.descriptor(for: session) == nil
+            ? .canceled : .scheduled
+    }
+
+    func waitUntilEntered() async {
+        guard !entered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor GatedBreakNotificationPermissionCoordinator:
+    DayWeaveBreakNotificationCoordinating
+{
+    private var authorizationRequestEntered = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func authorizationState() async -> DayWeaveNotificationAuthorizationState {
+        authorizationRequestEntered ? .authorized : .notDetermined
+    }
+
+    func requestAuthorization() async -> DayWeaveNotificationAuthorizationRequestResult {
+        authorizationRequestEntered = true
+        let waiters = entryWaiters
+        entryWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+        return .authorized
+    }
+
+    func reconcile(
+        session: DayWeaveExecutionSession?,
+        acknowledged: DayWeaveExecutionSessionVersion?
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        _ = session
+        _ = acknowledged
+        return .scheduled
+    }
+
+    func waitUntilAuthorizationRequestEntered() async {
+        guard !authorizationRequestEntered else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append(continuation)
+        }
+    }
+
+    func releaseAuthorizationRequest() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+private actor RecordingBreakNotificationCoordinator: DayWeaveBreakNotificationCoordinating {
+    private(set) var observedSessionIDs: [UUID?] = []
+
+    func authorizationState() async -> DayWeaveNotificationAuthorizationState {
+        .authorized
+    }
+
+    func requestAuthorization() async -> DayWeaveNotificationAuthorizationRequestResult {
+        .authorized
+    }
+
+    func reconcile(
+        session: DayWeaveExecutionSession?,
+        acknowledged: DayWeaveExecutionSessionVersion?
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        _ = acknowledged
+        observedSessionIDs.append(session?.id)
+        return session == nil ? .canceled : .scheduled
+    }
+}
+
+private actor RecoveringBreakNotificationCoordinator:
+    DayWeaveBreakNotificationCoordinating
+{
+    enum Mode: Sendable {
+        case authorizationUnavailable
+        case schedulingUnavailable
+        case cancellationUnavailable
+        case available
+    }
+
+    private var mode: Mode
+
+    init(mode: Mode) {
+        self.mode = mode
+    }
+
+    func authorizationState() async -> DayWeaveNotificationAuthorizationState {
+        switch mode {
+        case .authorizationUnavailable: .notDetermined
+        case .schedulingUnavailable, .cancellationUnavailable, .available: .authorized
+        }
+    }
+
+    func requestAuthorization() async -> DayWeaveNotificationAuthorizationRequestResult {
+        switch mode {
+        case .authorizationUnavailable: .unavailable
+        case .schedulingUnavailable, .cancellationUnavailable, .available: .authorized
+        }
+    }
+
+    func reconcile(
+        session: DayWeaveExecutionSession?,
+        acknowledged: DayWeaveExecutionSessionVersion?
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        _ = session
+        _ = acknowledged
+        return switch mode {
+        case .authorizationUnavailable: .permissionRequired
+        case .schedulingUnavailable: .unavailable
+        case .cancellationUnavailable: .cancellationUnavailable
+        case .available: .scheduled
+        }
+    }
+
+    func setMode(_ mode: Mode) {
+        self.mode = mode
+    }
+}
+
+private actor DeniedCancellationRetryCoordinator:
+    DayWeaveBreakNotificationCoordinating
+{
+    private(set) var reconcileAttempts = 0
+
+    func authorizationState() async -> DayWeaveNotificationAuthorizationState {
+        .denied
+    }
+
+    func requestAuthorization() async -> DayWeaveNotificationAuthorizationRequestResult {
+        .denied
+    }
+
+    func reconcile(
+        session: DayWeaveExecutionSession?,
+        acknowledged: DayWeaveExecutionSessionVersion?
+    ) async -> DayWeaveBreakNotificationReconcileResult {
+        _ = session
+        _ = acknowledged
+        reconcileAttempts += 1
+        return reconcileAttempts == 1 ? .cancellationUnavailable : .canceled
+    }
+}
+
+private actor AsyncCompletionProbe {
+    private var completed = false
+
+    var isComplete: Bool { completed }
+
+    func markComplete() { completed = true }
 }
 
 private actor ExecutionTransportDouble: DayWeaveExecutionTransport {

@@ -77,6 +77,44 @@ private struct ExecutionCommandSpec {
     let projectionEligibleAtStart: Bool
 }
 
+struct DayWeaveBreakResolutionPresentation: Equatable, Sendable {
+    let notificationIdentifier: String
+    let observedSessionVersion: DayWeaveExecutionSessionVersion?
+    let observedBreakIdentifier: String?
+}
+
+enum DayWeaveBreakNotificationIssue: Equatable, Sendable {
+    case authorizationUnavailable
+    case schedulingUnavailable
+    case cancellationUnavailable
+
+    var message: String {
+        switch self {
+        case .authorizationUnavailable:
+            "Break reminder permission could not be checked. Retry when Notification Center is available."
+        case .schedulingUnavailable:
+            "The break reminder could not be scheduled. Retry before the break ends."
+        case .cancellationUnavailable:
+            "DayWeave could not verify removal of its break reminder. Encrypted execution data and credentials were preserved."
+        }
+    }
+
+    var retryTitle: String {
+        switch self {
+        case .authorizationUnavailable: "Retry permission"
+        case .schedulingUnavailable, .cancellationUnavailable: "Retry reminder check"
+        }
+    }
+}
+
+enum DayWeaveBreakNotificationTapIssue: Equatable, Sendable {
+    case staleReminder
+
+    var message: String {
+        "That reminder no longer matches the current break. Review the current break separately."
+    }
+}
+
 /// Serializes every execution transition around an encrypted byte-for-byte
 /// request fence. The server lease is the only authoritative active timer.
 @MainActor
@@ -86,14 +124,29 @@ final class ExecutionSyncStore: ObservableObject {
 
     @Published private(set) var status: ExecutionSyncStatus
     @Published private(set) var isSyncing = false
+    @Published private(set) var breakResolutionPresentation:
+        DayWeaveBreakResolutionPresentation? = nil
+    @Published private(set) var breakNotificationAuthorizationState:
+        DayWeaveNotificationAuthorizationState = .notDetermined
+    @Published private(set) var breakNotificationIssue:
+        DayWeaveBreakNotificationIssue? = nil
+    @Published private(set) var breakNotificationTapIssue:
+        DayWeaveBreakNotificationTapIssue? = nil
+    @Published private(set) var isRequestingBreakNotificationAuthorization = false
+    @Published private(set) var breakResolutionWakeGeneration: UInt64 = 0
 
     private let planner: PlannerStore
     private let connectionProvider: @MainActor @Sendable () throws -> DayWeaveExecutionConnection
     private let now: @Sendable () -> Date
     private let makeUUID: @Sendable () -> UUID
+    private let breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating
+    private let breakDeadlineSleep: @Sendable (Duration) async -> Void
     private var operationID: UUID?
     private var configurationGeneration: UInt64 = 0
     private var foregroundPollingTask: Task<Void, Never>?
+    private var breakDeadlineWakeTask: Task<Void, Never>?
+    private var scheduledBreakDeadlineIdentifier: String?
+    private var breakNotificationReconciliationIsSuppressed = false
     private var deferredPublicationCoordinator: (@MainActor @Sendable () async -> Bool)?
 
     init(
@@ -104,11 +157,18 @@ final class ExecutionSyncStore: ObservableObject {
         authCoordinator: DurableAuthCoordinator? = nil,
         session: URLSession = makeDayWeaveEphemeralSession(),
         now: @escaping @Sendable () -> Date = Date.init,
-        makeUUID: @escaping @Sendable () -> UUID = UUID.init
+        makeUUID: @escaping @Sendable () -> UUID = UUID.init,
+        breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating =
+            DayWeaveBreakNotificationCoordinator(),
+        breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration)
+        }
     ) {
         self.planner = planner
         self.now = now
         self.makeUUID = makeUUID
+        self.breakNotificationCoordinator = breakNotificationCoordinator
+        self.breakDeadlineSleep = breakDeadlineSleep
         connectionProvider = {
             guard let configuredURL = configurationStore.loadBaseURL() else {
                 throw ExecutionSyncControllerError.notConfigured
@@ -145,6 +205,7 @@ final class ExecutionSyncStore: ObservableObject {
             )
         }
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
+        scheduleBreakDeadlineWakeIfNeeded()
     }
 
     init(
@@ -152,13 +213,21 @@ final class ExecutionSyncStore: ObservableObject {
         connectionProvider: @escaping @MainActor @Sendable () throws
             -> DayWeaveExecutionConnection,
         now: @escaping @Sendable () -> Date = Date.init,
-        makeUUID: @escaping @Sendable () -> UUID = UUID.init
+        makeUUID: @escaping @Sendable () -> UUID = UUID.init,
+        breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating =
+            DayWeaveNoopBreakNotificationCoordinator(),
+        breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
+            try? await Task.sleep(for: duration)
+        }
     ) {
         self.planner = planner
         self.connectionProvider = connectionProvider
         self.now = now
         self.makeUUID = makeUUID
+        self.breakNotificationCoordinator = breakNotificationCoordinator
+        self.breakDeadlineSleep = breakDeadlineSleep
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
+        scheduleBreakDeadlineWakeIfNeeded()
     }
 
     var activeSession: DayWeaveExecutionSession? { planner.executionState.activeSession }
@@ -172,8 +241,175 @@ final class ExecutionSyncStore: ObservableObject {
             != .init(sessionID: active.id, revision: active.revision)
     }
 
+    var expiredBreakResolutionShouldBePresented: Bool {
+        shouldPresentExpiredBreakResolution(pendingNotificationIdentifier: nil)
+    }
+
+    func shouldPresentExpiredBreakResolution(
+        pendingNotificationIdentifier: String?
+    ) -> Bool {
+        if let pendingNotificationIdentifier,
+           DayWeaveBreakNotificationContract.owns(
+               identifier: pendingNotificationIdentifier
+           ) {
+            // The process-lifetime router installs the exact store token before
+            // clearing its mailbox. Suppress this initial render so a closed or
+            // newly unlocked window cannot briefly present current break B while
+            // notification response A is still waiting to be revalidated.
+            return false
+        }
+        guard expiredBreakChoiceRequired,
+              let active = planner.executionState.activeSession,
+              let descriptor = DayWeaveBreakNotificationContract.descriptor(for: active) else {
+            return false
+        }
+        guard let presentation = breakResolutionPresentation else {
+            // No notification response is driving this render, so the ordinary
+            // in-app clock/state path presents the current expired break.
+            return true
+        }
+        guard presentation.observedBreakIdentifier == descriptor.identifier else {
+            // A tap observed no expired break or an older exact digest. It
+            // cannot suppress a later deadline or independently expired lease,
+            // even if a malformed peer reused the same numeric revision.
+            return true
+        }
+        return presentation.notificationIdentifier == descriptor.identifier
+    }
+
     var credentialReplacementIsBlocked: Bool {
         planner.hasExecutionCredentialReplacementBlocker
+    }
+
+    var hasFutureTimedBreakForNotificationPermission: Bool {
+        DayWeaveBreakNotificationContract.request(
+            for: planner.executionState.activeSession,
+            acknowledged: planner.executionState.acknowledgedExpiredPause,
+            now: now()
+        ) != nil
+    }
+
+    var breakNotificationBannerShouldBePresented: Bool {
+        breakNotificationIssue != nil
+            || (hasFutureTimedBreakForNotificationPermission
+                && breakNotificationAuthorizationState != .authorized)
+    }
+
+    @discardableResult
+    func reconcileBreakNotification() async -> DayWeaveBreakNotificationReconcileResult {
+        scheduleBreakDeadlineWakeIfNeeded()
+        let session = breakNotificationReconciliationIsSuppressed
+            ? nil : planner.executionState.activeSession
+        let acknowledged = breakNotificationReconciliationIsSuppressed
+            ? nil : planner.executionState.acknowledgedExpiredPause
+        let result = await breakNotificationCoordinator.reconcile(
+            session: session,
+            acknowledged: acknowledged
+        )
+        breakNotificationAuthorizationState =
+            await breakNotificationCoordinator.authorizationState()
+        applyBreakNotificationResult(result)
+        clearBreakResolutionPresentationIfStale()
+        scheduleBreakDeadlineWakeIfNeeded()
+        return result
+    }
+
+    /// The system prompt is reachable only from an explicit user action. An
+    /// automatic launch, refresh, or remote pause reconciliation never calls
+    /// this method and therefore cannot hold execution UI behind a modal OS
+    /// permission sheet.
+    @discardableResult
+    func requestBreakNotificationAuthorization()
+        async -> DayWeaveBreakNotificationReconcileResult
+    {
+        guard hasFutureTimedBreakForNotificationPermission,
+              !isRequestingBreakNotificationAuthorization else { return .superseded }
+        isRequestingBreakNotificationAuthorization = true
+        defer { isRequestingBreakNotificationAuthorization = false }
+        let result = await breakNotificationCoordinator.requestAuthorization()
+        switch result {
+        case .authorized:
+            breakNotificationAuthorizationState = .authorized
+            return await reconcileBreakNotification()
+        case .denied:
+            breakNotificationAuthorizationState = .denied
+            breakNotificationIssue = nil
+            return .permissionDenied
+        case .unavailable:
+            breakNotificationAuthorizationState =
+                await breakNotificationCoordinator.authorizationState()
+            breakNotificationIssue = .authorizationUnavailable
+            return .unavailable
+        }
+    }
+
+    @discardableResult
+    func retryBreakNotification() async -> DayWeaveBreakNotificationReconcileResult {
+        if breakNotificationIssue == .cancellationUnavailable {
+            // Removing an owned request does not require alert authorization.
+            // A denied state must not erase the visible convergence failure
+            // without actually retrying the pending-and-delivered barrier.
+            return await reconcileBreakNotification()
+        }
+        switch breakNotificationAuthorizationState {
+        case .notDetermined:
+            return await requestBreakNotificationAuthorization()
+        case .authorized:
+            return await reconcileBreakNotification()
+        case .denied:
+            breakNotificationIssue = nil
+            return .permissionDenied
+        }
+    }
+
+    @discardableResult
+    func routeBreakNotificationTap(identifier: String) -> Bool {
+        guard DayWeaveBreakNotificationContract.owns(identifier: identifier) else {
+            return false
+        }
+        let observedSession = expiredBreakChoiceRequired
+            ? planner.executionState.activeSession : nil
+        let observedVersion = observedSession.map {
+            DayWeaveExecutionSessionVersion(sessionID: $0.id, revision: $0.revision)
+        }
+        let observedBreakIdentifier = observedSession.flatMap {
+            DayWeaveBreakNotificationContract.descriptor(for: $0)?.identifier
+        }
+        // Retain the clicked opaque digest even when it is stale. The alert
+        // binding can then distinguish a rejected A response from the current B
+        // generation instead of retargeting the click to B. With no tap state,
+        // ordinary clock-driven expiration remains unchanged.
+        breakResolutionPresentation = .init(
+            notificationIdentifier: identifier,
+            observedSessionVersion: observedVersion,
+            observedBreakIdentifier: observedBreakIdentifier
+        )
+        let accepted = DayWeaveBreakNotificationContract.tapMatchesUnresolvedBreak(
+            identifier: identifier,
+            session: planner.executionState.activeSession,
+            acknowledged: planner.executionState.acknowledgedExpiredPause,
+            now: now()
+        )
+        breakNotificationTapIssue = accepted ? nil : .staleReminder
+        return accepted
+    }
+
+    /// A stale notification response is never silently retargeted. This
+    /// explicit acknowledgement clears its exact suppression token; only then
+    /// may the ordinary current-break resolver present independently.
+    func acknowledgeStaleBreakNotificationTap() {
+        breakResolutionPresentation = nil
+        breakNotificationTapIssue = nil
+        breakResolutionWakeGeneration &+= 1
+        scheduleBreakDeadlineWakeIfNeeded()
+    }
+
+    /// Called from the privacy-safe process-local foreground-delivery pulse.
+    /// The pulse contains no request identifier or planner content.
+    func breakNotificationForegroundDeliveryDidOccur() {
+        clearBreakResolutionPresentationIfStale()
+        breakResolutionWakeGeneration &+= 1
+        scheduleBreakDeadlineWakeIfNeeded()
     }
 
     func installDeferredPublicationCoordinator(
@@ -182,7 +418,7 @@ final class ExecutionSyncStore: ObservableObject {
         deferredPublicationCoordinator = coordinator
     }
 
-    func configurationDidChange() {
+    func configurationDidChange() async {
         configurationGeneration &+= 1
         stopForegroundPolling()
         status = .init(
@@ -191,14 +427,80 @@ final class ExecutionSyncStore: ObservableObject {
                 ? "API settings changed; execution must be reconciled again."
                 : "API settings changed; the exact pending command remains fenced."
         )
+        await cancelBreakNotificationsForConfigurationReset()
     }
 
-    func prepareForCredentialReplacement() throws {
+    func prepareForCredentialReplacement() async throws {
         guard operationID == nil else {
             throw PlannerExecutionStateError.credentialReplacementBlocked
         }
-        try planner.prepareForExecutionCredentialReplacement()
-        configurationGeneration &+= 1
+        let transitionID = UUID()
+        operationID = transitionID
+        isSyncing = true
+        stopForegroundPolling()
+        breakNotificationReconciliationIsSuppressed = true
+        var cancellationConverged = false
+        do {
+            // Cancellation is the awaited precondition to destroying the only
+            // encrypted state capable of identifying this notification. This
+            // closes the crash window where a surviving request could outlive
+            // its authoritative lease cache.
+            let cancellation = await cancelBreakNotificationsForConfigurationReset()
+            guard cancellation.isVerifiedCancellation else {
+                throw PlannerExecutionStateError.breakNotificationCancellationUnavailable
+            }
+            cancellationConverged = true
+            try planner.prepareForExecutionCredentialReplacement()
+            configurationGeneration &+= 1
+            breakNotificationReconciliationIsSuppressed = false
+            operationID = nil
+            isSyncing = false
+        } catch {
+            breakNotificationReconciliationIsSuppressed = false
+            // If local quarantine was refused, restore notification state from
+            // whichever authoritative lease remains current.
+            if cancellationConverged {
+                _ = await reconcileBreakNotification()
+            }
+            if operationID == transitionID {
+                operationID = nil
+                isSyncing = false
+            }
+            throw error
+        }
+    }
+
+    /// Called before an explicit local canonical-cache reset. The caller must
+    /// await this barrier before erasing the encrypted authoritative session so
+    /// an old pending or delivered request cannot survive the reset.
+    @discardableResult
+    func cancelBreakNotificationsForConfigurationReset()
+        async -> DayWeaveBreakNotificationReconcileResult
+    {
+        let wasSuppressed = breakNotificationReconciliationIsSuppressed
+        breakNotificationReconciliationIsSuppressed = true
+        let result = await breakNotificationCoordinator.reconcile(
+            session: nil,
+            acknowledged: nil
+        )
+        if result.isVerifiedCancellation {
+            breakResolutionPresentation = nil
+            breakNotificationTapIssue = nil
+            breakDeadlineWakeTask?.cancel()
+            breakDeadlineWakeTask = nil
+            scheduledBreakDeadlineIdentifier = nil
+        }
+        breakNotificationAuthorizationState =
+            await breakNotificationCoordinator.authorizationState()
+        applyBreakNotificationResult(result)
+        if !result.isVerifiedCancellation {
+            breakNotificationIssue = .cancellationUnavailable
+        }
+        breakNotificationReconciliationIsSuppressed = wasSuppressed
+        if wasSuppressed == false {
+            scheduleBreakDeadlineWakeIfNeeded()
+        }
+        return result
     }
 
     func refresh() async -> ExecutionSyncOutcome {
@@ -887,7 +1189,7 @@ final class ExecutionSyncStore: ObservableObject {
         }
     }
 
-    func keepPausedAfterExpiredBreak() -> ExecutionSyncOutcome {
+    func keepPausedAfterExpiredBreak() async -> ExecutionSyncOutcome {
         guard expiredBreakChoiceRequired,
               let active = planner.executionState.activeSession else { return .invalidLocalState }
         var next = planner.executionState
@@ -897,6 +1199,9 @@ final class ExecutionSyncStore: ObservableObject {
                 next,
                 message: "Break ended; the session remains paused until you resume or finish it"
             )
+            breakResolutionPresentation = nil
+            breakNotificationTapIssue = nil
+            _ = await reconcileBreakNotification()
             return .success
         } catch {
             return report(error)
@@ -1672,17 +1977,97 @@ final class ExecutionSyncStore: ObservableObject {
         let generation = configurationGeneration
         operationID = id
         isSyncing = true
-        defer {
-            if operationID == id {
-                operationID = nil
-                isSyncing = false
-            }
-            planner.endCanonicalSync()
-        }
+        let outcome: ExecutionSyncOutcome
         do {
-            return try await operation(id, generation)
+            outcome = try await operation(id, generation)
         } catch {
-            return report(error)
+            outcome = report(error)
+        }
+        clearBreakResolutionPresentationIfStale()
+        // OS scheduling/removal is an awaited durability boundary for an
+        // already-authorized notification center. A not-determined state is
+        // returned without prompting and therefore cannot delay the server
+        // command behind a system permission sheet.
+        _ = await reconcileBreakNotification()
+        if operationID == id {
+            operationID = nil
+            isSyncing = false
+        }
+        planner.endCanonicalSync()
+        return outcome
+    }
+
+    private func clearBreakResolutionPresentationIfStale() {
+        guard let presented = breakResolutionPresentation else { return }
+        let currentIdentifier = planner.executionState.activeSession.flatMap {
+            DayWeaveBreakNotificationContract.descriptor(for: $0)?.identifier
+        }
+        if currentIdentifier != presented.observedBreakIdentifier
+            || !expiredBreakChoiceRequired {
+            breakResolutionPresentation = nil
+            breakNotificationTapIssue = nil
+        }
+    }
+
+    private func scheduleBreakDeadlineWakeIfNeeded() {
+        let descriptor = DayWeaveBreakNotificationContract.descriptor(
+            for: planner.executionState.activeSession
+        )
+        let acknowledged = planner.executionState.acknowledgedExpiredPause
+        let observedAt = now()
+        guard !breakNotificationReconciliationIsSuppressed,
+              let descriptor,
+              descriptor.version != acknowledged,
+              descriptor.deadline > observedAt else {
+            breakDeadlineWakeTask?.cancel()
+            breakDeadlineWakeTask = nil
+            scheduledBreakDeadlineIdentifier = nil
+            return
+        }
+        guard scheduledBreakDeadlineIdentifier != descriptor.identifier
+                || breakDeadlineWakeTask == nil else { return }
+
+        breakDeadlineWakeTask?.cancel()
+        scheduledBreakDeadlineIdentifier = descriptor.identifier
+        let delay = Duration.seconds(
+            descriptor.deadline.timeIntervalSince(observedAt)
+        )
+        let sleep = breakDeadlineSleep
+        breakDeadlineWakeTask = Task { @MainActor [weak self] in
+            await sleep(delay)
+            guard !Task.isCancelled,
+                  let self,
+                  self.scheduledBreakDeadlineIdentifier == descriptor.identifier else {
+                return
+            }
+            self.breakDeadlineWakeTask = nil
+            self.scheduledBreakDeadlineIdentifier = nil
+            self.clearBreakResolutionPresentationIfStale()
+            self.breakResolutionWakeGeneration &+= 1
+        }
+    }
+
+    private func applyBreakNotificationResult(
+        _ result: DayWeaveBreakNotificationReconcileResult
+    ) {
+        switch result {
+        case .unavailable:
+            breakNotificationIssue = .schedulingUnavailable
+        case .cancellationUnavailable:
+            breakNotificationIssue = .cancellationUnavailable
+        case .scheduled, .canceled, .unchanged, .permissionDenied:
+            breakNotificationIssue = nil
+        case .permissionRequired:
+            // A prior add failure is no longer relevant, but a failed explicit
+            // permission request remains visible until the user retries it.
+            if breakNotificationIssue == .schedulingUnavailable {
+                breakNotificationIssue = nil
+            }
+        case .superseded:
+            // This caller waited for a newer generation to converge. The owner
+            // of that newest input publishes its result; an older waiter must
+            // not overwrite it after resumption.
+            break
         }
     }
 

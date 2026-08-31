@@ -25,6 +25,7 @@ enum PlannerExecutionStateError: LocalizedError, Equatable, Sendable {
     case invalidDurableState
     case configurationMismatch
     case credentialReplacementBlocked
+    case breakNotificationCancellationUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -36,6 +37,8 @@ enum PlannerExecutionStateError: LocalizedError, Equatable, Sendable {
             "Execution recovery state belongs to another API credential binding."
         case .credentialReplacementBlocked:
             "Reconcile the pending execution, canonical projection, or exact schedule publication before replacing credentials."
+        case .breakNotificationCancellationUnavailable:
+            "DayWeave could not verify removal of its break reminder. Your encrypted execution state and credentials were preserved; retry when Notification Center is available."
         }
     }
 }

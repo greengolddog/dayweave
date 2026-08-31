@@ -126,6 +126,17 @@ struct DayWeaveExecutionSession: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+extension DayWeaveExecutionSession {
+    var hasValidShape: Bool {
+        do {
+            try validateExecutionSession(self, codingPath: [])
+            return true
+        } catch {
+            return false
+        }
+    }
+}
+
 struct DayWeaveExecutionSnapshot: Codable, Equatable, Sendable {
     let revision: UInt64
     let activeSession: DayWeaveExecutionSession?

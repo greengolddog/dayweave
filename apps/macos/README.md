@@ -29,6 +29,70 @@ change fail closed. Preferences contain no schedule or credential material and
 are stored as one versioned `UserDefaults` record; a malformed existing record
 is treated as enabled so it can be recovered only after authentication.
 
+## Execution timers and break reminders
+
+Canonical focus sessions use the server-authoritative execution lease and are
+reconciled before every start, pause, resume, completion, skip, or defer. A
+timed pause never resumes automatically. At its deadline the in-app resolution
+offers **Resume**, **Extend 10 minutes**, or **Keep paused**; extension is a new
+revision-guarded pause command and keeping the session paused is recorded in
+the encrypted execution snapshot without inventing a server mutation.
+
+For a future timed-pause deadline, macOS schedules one local Notification
+Center request only after validating the encrypted session shape. The request
+identifier is a domain-separated SHA-256 value over the session revision and
+deadline. Its fixed title and body contain no task title, notes, raw item or
+session identifier, `userInfo`, or direct mutation action. Reconciliation after
+launch and each execution transition replaces or removes stale pending and
+delivered requests; resume, completion, skip, defer, replacement, and an
+explicit **Keep paused** acknowledgment therefore cancel the old reminder.
+Each stale opaque identifier is removed from both Notification Center
+collections so a request firing during cancellation cannot escape by moving
+from pending to delivered. Concurrent reconciliations coalesce to the newest
+lease, but every initiating caller remains suspended until that newest state
+has converged.
+Because the system removal calls themselves return before daemon-side state is
+observable, cancellation uses a bounded remove-and-requery barrier across both
+collections. Credential replacement and canonical-cache reset proceed only
+after that barrier proves every owned identifier absent. A timeout is visible
+in the app and preserves the encrypted execution lease and credentials for a
+safe retry. Already-authorized scheduling and verified cancellation are awaited
+before the initiating execution or local acknowledgment finishes. DayWeave
+never opens a system permission prompt during launch, restoration, polling, or
+a server pause: a future timed break instead shows an explicit **Enable
+reminders** control (and a System Settings remediation link after denial), so
+permission denial or an unavailable notification service never blocks the
+authoritative pause. Permission-service, scheduling, and cancellation failures
+remain visible with an explicit retry control; an authorized-but-failed request
+is not silently presented as configured.
+
+A notification click retains only that opaque identifier, waits behind the app
+lock, revalidates the exact still-paused expired session, consumes stale clicks,
+and activates the single-instance DayWeave window with the existing explicit
+resolution UI. The clicked digest is bound to the lease generation observed at
+routing time. While that digest remains in the process-lifetime tap mailbox,
+the main window suppresses expired-break alerts; exact routing installs the
+store presentation token before consuming the mailbox. Stale response A
+therefore cannot briefly present a newer expired break B during closed-window
+activation or unlock. A rejected tap shows a generic stale-reminder banner; the
+user must explicitly choose **Review current break** before B's ordinary
+resolver can appear, so the old click is never silently retargeted and cannot
+leave B unreachable. The suppression is bound to the observed break digest, so
+a different later deadline or lease returns to ordinary clock-driven
+presentation; with no notification response, that presentation is unchanged.
+Foreground banners are suppressed only for owned break reminders because the
+app delegate has no access to decrypted lease state; other app notification
+categories keep their foreground banner and sound. An owned delivery emits
+only a process-local counter—no identifier or planner content—to invalidate the
+in-app resolver. The execution store also owns an exact local deadline wake-up,
+so an expired break becomes actionable without waiting for network polling or a
+foreground notification callback. A resume performed on another device can
+cancel this reminder only after the Mac receives the newer lease; near-real-time
+background execution updates remain part of the separate push-sync requirement.
+Final acceptance still needs one bundled-app smoke test for permission UI,
+background delivery, lock/unlock routing, background banner/sound appearance,
+and Notification Center click behavior.
+
 ## DayWeave API
 
 Open **Settings → DayWeave API** and provide:

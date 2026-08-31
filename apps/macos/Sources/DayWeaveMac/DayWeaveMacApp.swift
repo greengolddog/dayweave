@@ -36,6 +36,8 @@ private struct DayWeaveCommands: Commands {
 @MainActor
 struct DayWeaveMacApp: App {
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.openWindow) private var openWindow
+    @NSApplicationDelegateAdaptor(DayWeaveMacAppDelegate.self) private var appDelegate
     @StateObject private var store: PlannerStore
     @StateObject private var codex: CodexAppServerClient
     @StateObject private var codexConversation: CodexConversationController
@@ -49,6 +51,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
     @StateObject private var appearance: AppearanceController
+    private let breakNotificationTapRouter = DayWeaveBreakNotificationTapRouter.shared
     init() {
         let store = PlannerStore.live()
         _store = StateObject(wrappedValue: store)
@@ -121,7 +124,7 @@ struct DayWeaveMacApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        Window("DayWeave", id: "main") {
             Group {
                 if appLock.isContentAvailable {
                     RootView()
@@ -146,10 +149,12 @@ struct DayWeaveMacApp: App {
                 .tint(appearance.accentColor)
                 .frame(minWidth: 1_080, minHeight: 720)
                 .onAppear {
+                    installBreakNotificationWindowActivation()
                     updateAppLock(for: scenePhase)
                     if scenePhase == .active {
                         activateServices()
                     }
+                    routePendingBreakNotificationTap()
                 }
                 .onChange(of: scenePhase) { _, phase in
                     updateAppLock(for: phase)
@@ -163,6 +168,7 @@ struct DayWeaveMacApp: App {
                 .onChange(of: appLock.isContentAvailable) { _, isAvailable in
                     if isAvailable, scenePhase == .active {
                         activateServices()
+                        routePendingBreakNotificationTap()
                     } else {
                         deactivateServices()
                         store.flushPersistence()
@@ -173,6 +179,13 @@ struct DayWeaveMacApp: App {
                     store.flushPersistence()
                     codexConversation.shutDown()
                     codex.shutDown()
+                }
+                .onReceive(breakNotificationTapRouter.$pendingIdentifier) { _ in
+                    // @Published emits during willSet. Defer one MainActor turn
+                    // so deliverPending observes the newly stored identifier;
+                    // this matters when the singleton window is already open
+                    // and therefore has no fresh onAppear callback.
+                    Task { @MainActor in routePendingBreakNotificationTap() }
                 }
                 .onReceive(NSWorkspace.shared.notificationCenter.publisher(
                     for: NSWorkspace.sessionDidResignActiveNotification
@@ -276,6 +289,9 @@ struct DayWeaveMacApp: App {
             )) { _ in
                 resumeAfterSystemBoundaryIfFrontmost()
             }
+            .onReceive(breakNotificationTapRouter.$pendingIdentifier) { _ in
+                Task { @MainActor in routePendingBreakNotificationTap() }
+            }
         }
         .defaultPosition(.center)
         .windowResizability(.contentSize)
@@ -300,6 +316,9 @@ struct DayWeaveMacApp: App {
             }
             .environmentObject(appLock)
             .environmentObject(appearance)
+            .onReceive(breakNotificationTapRouter.$pendingIdentifier) { _ in
+                Task { @MainActor in routePendingBreakNotificationTap() }
+            }
             .preferredColorScheme(appearance.preferredColorScheme)
             .tint(appearance.accentColor)
         }
@@ -336,6 +355,8 @@ struct DayWeaveMacApp: App {
         codex.startIfNeeded()
         googleIntegration.activate()
         serviceCoordinator.activate()
+        Task { await executionSync.reconcileBreakNotification() }
+        routePendingBreakNotificationTap()
     }
 
     private func deactivateServices() {
@@ -358,5 +379,21 @@ struct DayWeaveMacApp: App {
         guard NSApp.isActive else { return }
         appLock.applicationBecameActive()
         activateServices()
+    }
+
+    private func routePendingBreakNotificationTap() {
+        guard breakNotificationTapRouter.deliverPending(
+            contentAvailable: appLock.isContentAvailable,
+            route: executionSync.routeBreakNotificationTap(identifier:)
+        ) == true else { return }
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "main")
+    }
+
+    private func installBreakNotificationWindowActivation() {
+        breakNotificationTapRouter.installMainWindowActivation {
+            NSApp.activate(ignoringOtherApps: true)
+            openWindow(id: "main")
+        }
     }
 }
