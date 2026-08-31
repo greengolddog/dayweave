@@ -20,6 +20,19 @@ struct DayWeaveExecutionConnection: Sendable {
     let canonicalConfigurationIdentifier: String
     let bindingIdentifier: String
     let transport: any DayWeaveExecutionTransport
+    let streamTransport: (any DayWeaveExecutionStreamTransport)?
+
+    init(
+        canonicalConfigurationIdentifier: String,
+        bindingIdentifier: String,
+        transport: any DayWeaveExecutionTransport,
+        streamTransport: (any DayWeaveExecutionStreamTransport)? = nil
+    ) {
+        self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
+        self.bindingIdentifier = bindingIdentifier
+        self.transport = transport
+        self.streamTransport = streamTransport
+    }
 }
 
 enum ExecutionSyncOutcome: Equatable, Sendable {
@@ -144,9 +157,17 @@ final class ExecutionSyncStore: ObservableObject {
     private let makeUUID: @Sendable () -> UUID
     private let breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating
     private let breakDeadlineSleep: @Sendable (Duration) async -> Void
+    private let executionStreamSleep: @Sendable (Duration) async throws -> Void
     private var operationID: UUID?
     private var configurationGeneration: UInt64 = 0
     private var foregroundPollingTask: Task<Void, Never>?
+    private var foregroundStreamTask: Task<Void, Never>?
+    private var foregroundStreamDrainTask: Task<Void, Never>?
+    private var foregroundStreamGeneration: UInt64 = 0
+    private var foregroundStreamConnectionGeneration: UInt64 = 0
+    private var foregroundStreamRefreshAttemptedConnection: UInt64?
+    private var foregroundStreamHighWaterRevision: UInt64?
+    private var foregroundStreamUnavailableForActivation = false
     private var breakDeadlineWakeTask: Task<Void, Never>?
     private var scheduledBreakDeadlineIdentifier: String?
     private var breakNotificationReconciliationIsSuppressed = false
@@ -165,6 +186,9 @@ final class ExecutionSyncStore: ObservableObject {
             DayWeaveBreakNotificationCoordinator(),
         breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
+        },
+        executionStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
         }
     ) {
         self.planner = planner
@@ -172,6 +196,7 @@ final class ExecutionSyncStore: ObservableObject {
         self.makeUUID = makeUUID
         self.breakNotificationCoordinator = breakNotificationCoordinator
         self.breakDeadlineSleep = breakDeadlineSleep
+        self.executionStreamSleep = executionStreamSleep
         connectionProvider = {
             guard let configuredURL = configurationStore.loadBaseURL() else {
                 throw ExecutionSyncControllerError.notConfigured
@@ -187,7 +212,8 @@ final class ExecutionSyncStore: ObservableObject {
                 return DayWeaveExecutionConnection(
                     canonicalConfigurationIdentifier: client.configurationIdentifier,
                     bindingIdentifier: bindingIdentifier,
-                    transport: client
+                    transport: client,
+                    streamTransport: client
                 )
             }
             guard let token = try tokenStore.loadToken(boundTo: baseURL), !token.isEmpty else {
@@ -204,7 +230,8 @@ final class ExecutionSyncStore: ObservableObject {
             return DayWeaveExecutionConnection(
                 canonicalConfigurationIdentifier: client.configurationIdentifier,
                 bindingIdentifier: "execution-v1:\(baseURL.canonicalConfigurationIdentifier):\(tokenDigest)",
-                transport: client
+                transport: client,
+                streamTransport: client
             )
         }
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
@@ -221,6 +248,9 @@ final class ExecutionSyncStore: ObservableObject {
             DayWeaveNoopBreakNotificationCoordinator(),
         breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
+        },
+        executionStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
         }
     ) {
         self.planner = planner
@@ -229,6 +259,7 @@ final class ExecutionSyncStore: ObservableObject {
         self.makeUUID = makeUUID
         self.breakNotificationCoordinator = breakNotificationCoordinator
         self.breakDeadlineSleep = breakDeadlineSleep
+        self.executionStreamSleep = executionStreamSleep
         status = .init(phase: .ready, message: "Ready to reconcile cross-device execution.")
         scheduleBreakDeadlineWakeIfNeeded()
     }
@@ -1261,10 +1292,20 @@ final class ExecutionSyncStore: ObservableObject {
 
     func startForegroundPolling(every interval: Duration = .seconds(30)) {
         guard foregroundPollingTask == nil else { return }
+        foregroundStreamUnavailableForActivation = false
         foregroundPollingTask = Task { @MainActor [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                _ = await self.refreshAndCoordinateDeferredPublication()
+                let outcome = await self.refreshAndCoordinateDeferredPublication()
+                if outcome == .success,
+                   !Task.isCancelled,
+                   self.foregroundPollingTask != nil {
+                    // A successful poll proves the binding installation or
+                    // quarantine reached encrypted persistence before
+                    // Last-Event-ID is captured. A later successful poll can
+                    // retry if an earlier attempt failed before that boundary.
+                    self.startForegroundExecutionStreamIfReady()
+                }
                 do {
                     try await Task.sleep(for: interval)
                 } catch {
@@ -1277,11 +1318,217 @@ final class ExecutionSyncStore: ObservableObject {
     func stopForegroundPolling() {
         foregroundPollingTask?.cancel()
         foregroundPollingTask = nil
+        foregroundStreamGeneration &+= 1
+        foregroundStreamTask?.cancel()
+        foregroundStreamTask = nil
+        foregroundStreamDrainTask?.cancel()
+        foregroundStreamDrainTask = nil
+        foregroundStreamRefreshAttemptedConnection = nil
+        foregroundStreamHighWaterRevision = nil
+        foregroundStreamUnavailableForActivation = false
+    }
+
+    private func startForegroundExecutionStreamIfReady() {
+        guard foregroundStreamTask == nil,
+              !foregroundStreamUnavailableForActivation,
+              planner.canPersistPlan,
+              planner.hasEncryptedPersistence,
+              let connection = try? configuredConnection(),
+              connection.streamTransport != nil,
+              planner.executionState.bindingIdentifier == connection.bindingIdentifier,
+              connectionIsCurrent(connection) else { return }
+        foregroundStreamGeneration &+= 1
+        let generation = foregroundStreamGeneration
+        foregroundStreamTask = Task { @MainActor [weak self] in
+            await self?.runForegroundExecutionStream(generation: generation)
+        }
+    }
+
+    private func runForegroundExecutionStream(generation: UInt64) async {
+        var retrySeconds = 1
+        defer {
+            if generation == foregroundStreamGeneration {
+                foregroundStreamTask = nil
+            }
+        }
+        while foregroundStreamIsCurrent(generation) {
+            var reconnectDelaySeconds = 1
+            let connection: DayWeaveExecutionConnection
+            do {
+                connection = try configuredConnection()
+            } catch {
+                // Polling remains responsible for user-visible configuration
+                // and authentication status. Stream health is intentionally
+                // silent and activation-scoped.
+                return
+            }
+            guard let streamTransport = connection.streamTransport,
+                  planner.executionState.bindingIdentifier == connection.bindingIdentifier,
+                  connectionIsCurrent(connection) else { return }
+            let durableRevision = planner.executionState.revision
+            foregroundStreamConnectionGeneration &+= 1
+            let connectionGeneration = foregroundStreamConnectionGeneration
+
+            do {
+                let completion = try await streamTransport.consumeExecutionInvalidations(
+                    after: durableRevision
+                ) { [weak self] revision in
+                    await self?.acceptExecutionStreamHint(
+                        revision,
+                        connection: connection,
+                        generation: generation,
+                        connectionGeneration: connectionGeneration
+                    )
+                }
+                guard foregroundStreamIsCurrent(generation) else { return }
+                switch completion {
+                case .unsupported:
+                    // Do not probe again until a later foreground activation.
+                    foregroundStreamUnavailableForActivation = true
+                    return
+                case .endOfStream:
+                    // An immediate clean EOF is still a transient failure; a
+                    // broken proxy must not create one request per second for
+                    // the entire foreground activation.
+                    reconnectDelaySeconds = retrySeconds
+                    retrySeconds = min(retrySeconds * 2, 30)
+                case .liveEndOfStream:
+                    retrySeconds = 1
+                    reconnectDelaySeconds = 1
+                }
+            } catch {
+                guard foregroundStreamIsCurrent(generation) else { return }
+                guard executionStreamFailureIsTransient(error) else {
+                    foregroundStreamUnavailableForActivation = true
+                    return
+                }
+                reconnectDelaySeconds = retrySeconds
+                retrySeconds = min(retrySeconds * 2, 30)
+            }
+
+            do {
+                try await executionStreamSleep(.seconds(reconnectDelaySeconds))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func acceptExecutionStreamHint(
+        _ revision: UInt64,
+        connection: DayWeaveExecutionConnection,
+        generation: UInt64,
+        connectionGeneration: UInt64
+    ) {
+        guard foregroundStreamIsCurrent(generation),
+              connectionIsCurrent(connection),
+              planner.executionState.bindingIdentifier == connection.bindingIdentifier,
+              revision > planner.executionState.revision else { return }
+        foregroundStreamHighWaterRevision = max(
+            foregroundStreamHighWaterRevision ?? revision,
+            revision
+        )
+        guard foregroundStreamDrainTask == nil,
+              foregroundStreamRefreshAttemptedConnection != connectionGeneration else { return }
+        foregroundStreamDrainTask = Task { @MainActor [weak self] in
+            await self?.drainExecutionStreamHighWater(
+                connection: connection,
+                generation: generation,
+                connectionGeneration: connectionGeneration
+            )
+        }
+    }
+
+    private func drainExecutionStreamHighWater(
+        connection: DayWeaveExecutionConnection,
+        generation: UInt64,
+        connectionGeneration: UInt64
+    ) async {
+        defer {
+            if generation == foregroundStreamGeneration {
+                foregroundStreamDrainTask = nil
+            }
+        }
+        while foregroundStreamIsCurrent(generation) {
+            guard connectionIsCurrent(connection),
+                  planner.executionState.bindingIdentifier == connection.bindingIdentifier else {
+                return
+            }
+            guard let highWater = foregroundStreamHighWaterRevision else { return }
+            if highWater <= planner.executionState.revision {
+                foregroundStreamHighWaterRevision = nil
+                continue
+            }
+
+            // A stream hint arriving during a user command or canonical-sync
+            // lane must wait for admission instead of being discarded as a
+            // duplicate operation. The normal poll remains independent.
+            if operationID != nil || planner.isCanonicalSyncLocked {
+                do {
+                    try await executionStreamSleep(.milliseconds(25))
+                } catch {
+                    return
+                }
+                continue
+            }
+
+            foregroundStreamRefreshAttemptedConnection = connectionGeneration
+            _ = await refreshAndCoordinateDeferredPublication()
+            guard foregroundStreamIsCurrent(generation),
+                  connectionIsCurrent(connection),
+                  planner.executionState.bindingIdentifier == connection.bindingIdentifier else {
+                return
+            }
+            if let currentHighWater = foregroundStreamHighWaterRevision,
+               currentHighWater <= planner.executionState.revision {
+                foregroundStreamHighWaterRevision = nil
+                return
+            }
+            // An invalidation is an untrusted hint, not proof that this API
+            // origin can ever produce the advertised revision. One coalesced
+            // snapshot attempt per stream connection prevents a malicious high
+            // water value from creating a tight request loop. Keep the target
+            // in memory and yield durable catch-up to the unchanged poll.
+            return
+        }
+    }
+
+    private func foregroundStreamIsCurrent(_ generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && foregroundPollingTask != nil
+            && generation == foregroundStreamGeneration
+    }
+
+    private func connectionIsCurrent(_ connection: DayWeaveExecutionConnection) -> Bool {
+        guard let current = try? configuredConnection() else { return false }
+        return current.bindingIdentifier == connection.bindingIdentifier
+            && current.canonicalConfigurationIdentifier
+                == connection.canonicalConfigurationIdentifier
+    }
+
+    private func executionStreamFailureIsTransient(_ error: Error) -> Bool {
+        switch error {
+        case let DayWeaveAPIError.transport(code):
+            return code != .cancelled
+        case let DayWeaveAPIError.server(statusCode, _, _, _):
+            return statusCode == 408 || statusCode == 429 || statusCode >= 500
+        case let DayWeaveAPIError.durableAuthentication(error):
+            switch error {
+            case .transport, .retryableServer: return true
+            default: return false
+            }
+        default:
+            return false
+        }
     }
 
     @discardableResult
     func refreshAndCoordinateDeferredPublication() async -> ExecutionSyncOutcome {
         let outcome = await refresh()
+        if let highWater = foregroundStreamHighWaterRevision,
+           highWater <= planner.executionState.revision {
+            foregroundStreamHighWaterRevision = nil
+        }
         guard outcome == .success,
               planner.hasDeferredExecutionPublicationWork,
               let deferredPublicationCoordinator else { return outcome }

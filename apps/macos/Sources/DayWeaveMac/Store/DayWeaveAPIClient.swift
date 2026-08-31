@@ -686,6 +686,7 @@ struct DayWeaveAPIClient: Sendable {
     static let maximumRequestBytes = 16 * 1_048_576
     static let maximumExecutionHistoryLimit = 100
     static let maximumCanonicalItemListLimit = 200
+    static let maximumExecutionStreamLifetime: Duration = .seconds(330)
 
     private static let defaultCanonicalItemListLimit = 100
 
@@ -784,6 +785,7 @@ struct DayWeaveAPIClient: Sendable {
     private let authCoordinator: DurableAuthCoordinator?
     private let expectedBindingIdentifier: String
     private let now: @Sendable () -> Date
+    private let executionStreamLifetimeSleep: @Sendable () async throws -> Void
 
     let configurationIdentifier: String
 
@@ -791,13 +793,17 @@ struct DayWeaveAPIClient: Sendable {
         baseURL: DayWeaveAPIBaseURL,
         session: URLSession = makeDayWeaveEphemeralSession(),
         bearerToken: String?,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        executionStreamLifetimeSleep: @escaping @Sendable () async throws -> Void = {
+            try await Task.sleep(for: DayWeaveAPIClient.maximumExecutionStreamLifetime)
+        }
     ) {
         self.baseURL = baseURL
         self.session = session
         self.bearerToken = bearerToken
         authCoordinator = nil
         self.now = now
+        self.executionStreamLifetimeSleep = executionStreamLifetimeSleep
         let binding = Self.staticBindingIdentifier(token: bearerToken)
         expectedBindingIdentifier = binding
         configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
@@ -807,13 +813,17 @@ struct DayWeaveAPIClient: Sendable {
         baseURL: DayWeaveAPIBaseURL,
         session: URLSession = makeDayWeaveEphemeralSession(),
         authCoordinator: DurableAuthCoordinator,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        executionStreamLifetimeSleep: @escaping @Sendable () async throws -> Void = {
+            try await Task.sleep(for: DayWeaveAPIClient.maximumExecutionStreamLifetime)
+        }
     ) {
         self.baseURL = baseURL
         self.session = session
         bearerToken = nil
         self.authCoordinator = authCoordinator
         self.now = now
+        self.executionStreamLifetimeSleep = executionStreamLifetimeSleep
         let binding = (try? authCoordinator.bindingIdentifier(boundTo: baseURL))
             ?? "device-v1-unavailable:\(baseURL.canonicalConfigurationIdentifier)"
         expectedBindingIdentifier = binding
@@ -827,13 +837,17 @@ struct DayWeaveAPIClient: Sendable {
         baseURL: DayWeaveAPIBaseURL,
         session: URLSession = makeDayWeaveEphemeralSession(),
         durableAuthCoordinator authCoordinator: DurableAuthCoordinator,
-        now: @escaping @Sendable () -> Date = Date.init
+        now: @escaping @Sendable () -> Date = Date.init,
+        executionStreamLifetimeSleep: @escaping @Sendable () async throws -> Void = {
+            try await Task.sleep(for: DayWeaveAPIClient.maximumExecutionStreamLifetime)
+        }
     ) throws {
         self.baseURL = baseURL
         self.session = session
         bearerToken = nil
         self.authCoordinator = authCoordinator
         self.now = now
+        self.executionStreamLifetimeSleep = executionStreamLifetimeSleep
         let binding = try authCoordinator.durableBindingIdentifier(boundTo: baseURL)
         expectedBindingIdentifier = binding
         configurationIdentifier = Self.configurationIdentifier(baseURL: baseURL, binding: binding)
@@ -1464,6 +1478,179 @@ struct DayWeaveAPIClient: Sendable {
             pathComponents: ["v1", "execution"]
         )
         return envelope.execution
+    }
+
+    /// Opens the privacy-safe foreground invalidation stream. Revisions from
+    /// this method are hints only; callers must fetch and validate the ordinary
+    /// execution snapshot before persisting any state.
+    func consumeExecutionInvalidations(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamCompletion {
+        try await withThrowingTaskGroup(
+            of: DayWeaveExecutionStreamCompletion.self
+        ) { group in
+            group.addTask {
+                try await consumeExecutionInvalidationsWithinLifetime(
+                    after: revision,
+                    receive
+                )
+            }
+            group.addTask {
+                try await executionStreamLifetimeSleep()
+                try Task.checkCancellation()
+                throw DayWeaveAPIError.transport(.timedOut)
+            }
+            do {
+                guard let result = try await group.next() else {
+                    throw DayWeaveAPIError.transport(.unknown)
+                }
+                group.cancelAll()
+                return result
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
+    private func consumeExecutionInvalidationsWithinLifetime(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamCompletion {
+        guard revision <= UInt64(Int64.max) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let endpoint: URL
+        do {
+            endpoint = try baseURL.endpoint(pathComponents: ["v1", "execution", "stream"])
+        } catch {
+            throw DayWeaveAPIError.invalidEndpoint
+        }
+
+        var pristineRequest = URLRequest(url: endpoint)
+        pristineRequest.httpMethod = "GET"
+        // The server deliberately ends healthy connections at five minutes.
+        // Leave a small transport margin without permitting an unbounded read.
+        pristineRequest.timeoutInterval = 330
+        pristineRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        pristineRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        pristineRequest.setValue(String(revision), forHTTPHeaderField: "Last-Event-ID")
+        pristineRequest.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        pristineRequest.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        pristineRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+        let initialAuthorization: DurableAuthorization
+        if let authCoordinator {
+            do {
+                initialAuthorization = try await authCoordinator.authorization(boundTo: baseURL)
+            } catch let error as DurableAuthError {
+                throw DayWeaveAPIError.durableAuthentication(error)
+            } catch {
+                throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+            }
+        } else {
+            guard let bearerToken, !bearerToken.isEmpty else {
+                throw DayWeaveAPIError.credentialUnavailable
+            }
+            initialAuthorization = .init(
+                bearerToken: bearerToken,
+                bindingIdentifier: expectedBindingIdentifier,
+                isDurable: false
+            )
+        }
+        guard initialAuthorization.bindingIdentifier == expectedBindingIdentifier else {
+            throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+        }
+
+        var authorization = initialAuthorization
+        var tokensToRedact = [authorization.bearerToken]
+        for attemptIndex in 0...1 {
+            let result = try await performExecutionInvalidationStreamRequest(
+                pristineRequest,
+                bearer: authorization.bearerToken,
+                bindingIdentifier: initialAuthorization.bindingIdentifier,
+                initialRevision: revision,
+                receive
+            )
+            switch result {
+            case let .endOfStream(wasLive):
+                return wasLive ? .liveEndOfStream : .endOfStream
+            case let .http(response, body):
+                let normalizedHeaders = Self.normalizedHeaders(response)
+                if attemptIndex == 0,
+                   response.statusCode == 401,
+                   let authCoordinator,
+                   DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+                       statusCode: response.statusCode,
+                       headers: normalizedHeaders,
+                       body: body
+                   ) {
+                    let recovered: DurableAuthorization
+                    do {
+                        recovered = try await authCoordinator.recoverFromUnauthorized(
+                            rejectedBearer: authorization.bearerToken,
+                            boundTo: baseURL
+                        )
+                    } catch let error as DurableAuthError {
+                        throw DayWeaveAPIError.durableAuthentication(error)
+                    } catch {
+                        throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+                    }
+                    guard recovered.bindingIdentifier == initialAuthorization.bindingIdentifier,
+                          recovered.bindingIdentifier == expectedBindingIdentifier else {
+                        throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+                    }
+                    authorization = recovered
+                    tokensToRedact.append(recovered.bearerToken)
+                    continue
+                }
+                if attemptIndex == 1,
+                   response.statusCode == 401,
+                   let authCoordinator,
+                   DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+                       statusCode: response.statusCode,
+                       headers: normalizedHeaders,
+                       body: body
+                   ) {
+                    do {
+                        try await authCoordinator.retireDefinitivelyRejectedAuthorization(
+                            authorization,
+                            boundTo: baseURL
+                        )
+                        throw DayWeaveAPIError.durableAuthentication(.reauthenticationRequired)
+                    } catch let error as DayWeaveAPIError {
+                        throw error
+                    } catch let error as DurableAuthError {
+                        throw DayWeaveAPIError.durableAuthentication(error)
+                    } catch {
+                        throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+                    }
+                }
+                try validatePostResponseBinding(initialAuthorization.bindingIdentifier)
+                if response.statusCode == 404 {
+                    return .unsupported
+                }
+                let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: body)
+                throw DayWeaveAPIError.server(
+                    statusCode: response.statusCode,
+                    code: DayWeaveDiagnosticSanitizer.code(
+                        envelope?.error.code,
+                        secrets: tokensToRedact
+                    ),
+                    message: DayWeaveDiagnosticSanitizer.text(
+                        envelope?.error.message,
+                        secrets: tokensToRedact,
+                        maximumCharacters: 500
+                    ),
+                    requestID: DayWeaveDiagnosticSanitizer.requestID(
+                        response.value(forHTTPHeaderField: "x-request-id"),
+                        secrets: tokensToRedact
+                    )
+                )
+            }
+        }
+        throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
     }
 
     func executionHistory(limit: Int = Self.maximumExecutionHistoryLimit) async throws
@@ -2407,6 +2594,127 @@ struct DayWeaveAPIClient: Sendable {
         }
     }
 
+    private func performExecutionInvalidationStreamRequest(
+        _ pristineRequest: URLRequest,
+        bearer: String,
+        bindingIdentifier: String,
+        initialRevision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamAttemptResult {
+        var request = pristineRequest
+        request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
+        let cancellation = DayWeaveURLSessionTaskCancellationBox()
+        return try await withTaskCancellationHandler {
+            do {
+                let (bytes, receivedResponse) = try await session.bytes(
+                    for: request,
+                    delegate: RejectRedirectDelegate.shared
+                )
+                cancellation.install(bytes.task)
+                defer {
+                    bytes.task.cancel()
+                    cancellation.clear(bytes.task)
+                }
+                guard let response = receivedResponse as? HTTPURLResponse else {
+                    throw DayWeaveAPIError.nonHTTPResponse
+                }
+                guard response.statusCode == 200 else {
+                    if response.statusCode == 404 {
+                        // Absence is the complete activation-scoped signal; no
+                        // response body is trusted or needed to classify it.
+                        return .http(response, Data())
+                    }
+                    let maximumErrorBytes = 8 * 1_024
+                    if receivedResponse.expectedContentLength > Int64(maximumErrorBytes) {
+                        throw DayWeaveAPIError.responseTooLarge(limitBytes: maximumErrorBytes)
+                    }
+                    var body = Data()
+                    if receivedResponse.expectedContentLength > 0 {
+                        body.reserveCapacity(Int(receivedResponse.expectedContentLength))
+                    }
+                    for try await byte in bytes {
+                        guard body.count < maximumErrorBytes else {
+                            throw DayWeaveAPIError.responseTooLarge(limitBytes: maximumErrorBytes)
+                        }
+                        body.append(byte)
+                    }
+                    return .http(response, body)
+                }
+                guard Self.isStrictEventStreamMediaType(
+                    response.value(forHTTPHeaderField: "content-type")
+                ) else {
+                    throw DayWeaveExecutionStreamProtocolError.invalidContentType
+                }
+                guard Self.isStrictIdentityContentEncoding(
+                    response.value(forHTTPHeaderField: "content-encoding")
+                ) else {
+                    throw DayWeaveExecutionStreamProtocolError.invalidContentEncoding
+                }
+                try validatePostResponseBinding(bindingIdentifier)
+
+                var parser = DayWeaveExecutionSSEParser(after: initialRevision)
+                for try await byte in bytes {
+                    try Task.checkCancellation()
+                    if let revision = try parser.consume(byte) {
+                        // The auth binding may be replaced while a long-lived
+                        // response is open. Revalidate before allowing its hint
+                        // to cross the transport boundary.
+                        try validatePostResponseBinding(bindingIdentifier)
+                        await receive(revision)
+                    }
+                }
+                try parser.finish()
+                try validatePostResponseBinding(bindingIdentifier)
+                return .endOfStream(wasLive: parser.hasObservedLiveness)
+            } catch let error as DayWeaveAPIError {
+                throw error
+            } catch let error as DayWeaveExecutionStreamProtocolError {
+                throw error
+            } catch is CancellationError {
+                throw DayWeaveAPIError.transport(.cancelled)
+            } catch let error as URLError {
+                throw DayWeaveAPIError.transport(error.code)
+            } catch {
+                throw DayWeaveAPIError.transport(Task.isCancelled ? .cancelled : .unknown)
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    private static func isStrictEventStreamMediaType(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let components = value.split(separator: ";", omittingEmptySubsequences: false)
+        guard let mediaType = components.first?.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(), mediaType == "text/event-stream" else {
+            return false
+        }
+        switch components.count {
+        case 1:
+            return true
+        case 2:
+            let parameter = components[1].split(
+                separator: "=",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            )
+            return parameter.count == 2
+                && parameter[0].trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "charset"
+                && parameter[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                    .lowercased() == "utf-8"
+        default:
+            return false
+        }
+    }
+
+    private static func isStrictIdentityContentEncoding(_ value: String?) -> Bool {
+        guard let value else { return true }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !normalized.contains(",")
+            && normalized.caseInsensitiveCompare("identity") == .orderedSame
+    }
+
     private func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
@@ -2468,7 +2776,44 @@ struct DayWeaveAPIClient: Sendable {
     }
 }
 
-extension DayWeaveAPIClient: GoogleOutboundTransport {}
+extension DayWeaveAPIClient: GoogleOutboundTransport, DayWeaveExecutionStreamTransport {}
+
+private enum DayWeaveExecutionStreamAttemptResult: Sendable {
+    case endOfStream(wasLive: Bool)
+    case http(HTTPURLResponse, Data)
+}
+
+/// Bridges structured-task cancellation to the URLSession task even when the
+/// task is canceled while `bytes(for:)` is still establishing the response.
+private final class DayWeaveURLSessionTaskCancellationBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionTask?
+    private var cancellationRequested = false
+
+    func install(_ task: URLSessionTask) {
+        let shouldCancel = lock.withLock {
+            self.task = task
+            return cancellationRequested
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    func clear(_ task: URLSessionTask) {
+        lock.withLock {
+            if self.task === task {
+                self.task = nil
+            }
+        }
+    }
+
+    func cancel() {
+        let task = lock.withLock {
+            cancellationRequested = true
+            return self.task
+        }
+        task?.cancel()
+    }
+}
 
 /// Foundation's JSON object decoders collapse duplicate member names before a
 /// keyed container can inspect them. Destructive trust promotion therefore

@@ -3356,6 +3356,545 @@ struct ExecutionSyncStoreTests {
         #expect(planner.executionState.historyVerified)
     }
 
+    @Test("foreground stream coalesces high-water hints through authoritative refresh")
+    func foregroundStreamCoalescesHintsWithoutPersistingThem() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let terminal = try Self.terminalSession(
+            sessionID: Self.uuid(1_401),
+            sessionIndex: 0,
+            startedAt: Self.baseDate.addingTimeInterval(-60)
+        )
+        let advanced = DayWeaveExecutionSnapshot(revision: 2, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty, advanced, advanced],
+            pages: [
+                .init(sessions: [], nextOffset: nil),
+                .init(sessions: [terminal], nextOffset: nil),
+            ],
+            snapshotDelay: .milliseconds(75)
+        )
+        let stream = ExecutionStreamDouble(
+            initialDelay: .milliseconds(250),
+            revisions: [1, 2],
+            completion: .unsupported
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let emissionDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.emissionCount() < 2, ContinuousClock.now < emissionDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        // Delivery cannot promote the advertised revision. The delayed
+        // snapshot read is still the only path that can change durable state.
+        #expect(planner.executionState.revision == 0)
+
+        let refreshDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while planner.executionState.revision < 2, ContinuousClock.now < refreshDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.revision == 2)
+        #expect(planner.executionState.terminalOutcomes[terminal.id]?.session == terminal)
+        #expect(await transport.snapshotRequestCount() == 4)
+        #expect(await stream.requestedRevisions() == [0])
+    }
+
+    @Test("unreachable stream high-water causes at most one refresh per connection")
+    func foregroundStreamBoundsUnreachableHintRefresh() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty, empty, empty],
+            pages: [
+                .init(sessions: [], nextOffset: nil),
+                .init(sessions: [], nextOffset: nil),
+            ],
+            snapshotDelay: .milliseconds(30)
+        )
+        let stream = ExecutionStreamDouble(
+            initialDelay: .milliseconds(150),
+            interEventDelay: .milliseconds(250),
+            revisions: [9, 10, 11],
+            completion: .unsupported
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.emissionCount() < 3, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(300))
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.revision == 0)
+        // Two stable snapshots for the immediate poll and exactly two for the
+        // one coalesced hint refresh—never a 250 ms retry loop.
+        #expect(await transport.snapshotRequestCount() == 4)
+    }
+
+    @Test("stream ignores revisions already represented by durable encrypted state")
+    func foregroundStreamIgnoresOldAndEqualHints() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let terminal = try Self.terminalSession(
+            sessionID: Self.uuid(1_402),
+            sessionIndex: 0,
+            startedAt: Self.baseDate.addingTimeInterval(-60)
+        )
+        let snapshot = DayWeaveExecutionSnapshot(revision: 2, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [snapshot, snapshot],
+            pages: [.init(sessions: [terminal], nextOffset: nil)]
+        )
+        let stream = ExecutionStreamDouble(
+            initialDelay: .milliseconds(100),
+            revisions: [1, 2],
+            completion: .unsupported
+        )
+        let planner = Self.planner(
+            persistence: context.persistence,
+            executionState: Self.terminalState(terminal)
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.emissionCount() < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        sync.stopForegroundPolling()
+
+        #expect(await transport.snapshotRequestCount() == 2)
+        #expect(await stream.requestedRevisions() == [2])
+        #expect(planner.executionState.revision == 2)
+    }
+
+    @Test("stopping foreground services cancels a blocked stream immediately")
+    func stoppingForegroundServicesCancelsStream() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = BlockingExecutionStreamDouble()
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let startDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await stream.hasStarted()), ContinuousClock.now < startDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+        let cancellationDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !(await stream.wasCancelled()), ContinuousClock.now < cancellationDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        #expect(await stream.hasStarted())
+        #expect(await stream.wasCancelled())
+    }
+
+    @Test("stream hint waits for the active execution lane instead of being dropped")
+    func foregroundStreamRetriesBusyAdmission() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let terminal = try Self.terminalSession(
+            sessionID: Self.uuid(1_403),
+            sessionIndex: 0,
+            startedAt: Self.baseDate.addingTimeInterval(-60)
+        )
+        let advanced = DayWeaveExecutionSnapshot(revision: 2, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty, empty, empty, advanced, advanced],
+            pages: [
+                .init(sessions: [], nextOffset: nil),
+                .init(sessions: [], nextOffset: nil),
+                .init(sessions: [terminal], nextOffset: nil),
+            ],
+            snapshotDelay: .milliseconds(100)
+        )
+        // Streaming starts only after the immediate foreground poll. Delay its
+        // first hint long enough for an explicit refresh to acquire the shared
+        // execution lane, then prove the hint waits and retries admission.
+        let stream = ExecutionStreamDouble(
+            initialDelay: .milliseconds(150),
+            revisions: [2],
+            completion: .unsupported
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let streamDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestedRevisions().isEmpty,
+              ContinuousClock.now < streamDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let overlappingRefresh = Task { @MainActor in
+            await sync.refresh()
+        }
+        #expect(await overlappingRefresh.value == .success)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while planner.executionState.revision < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.revision == 2)
+        #expect(await transport.snapshotRequestCount() == 6)
+    }
+
+    @Test("transient stream failures back off from one to thirty seconds silently")
+    func foregroundStreamReconnectsWithBoundedBackoff() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let failure = DayWeaveAPIError.transport(.networkConnectionLost)
+        let stream = PlannedExecutionStreamDouble(plans: [
+            .failure(failure), .failure(failure), .failure(failure),
+            .failure(failure), .failure(failure), .failure(failure),
+            .failure(failure), .completion(.unsupported),
+        ])
+        let sleeps = ExecutionStreamSleepRecorder()
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream,
+            executionStreamSleep: { duration in
+                await sleeps.record(duration)
+            }
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestCount() < 8, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        while sync.status.phase != .connected, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+
+        #expect(await sleeps.values() == [
+            .seconds(1), .seconds(2), .seconds(4), .seconds(8),
+            .seconds(16), .seconds(30), .seconds(30),
+        ])
+        #expect(sync.status.phase == .connected)
+    }
+
+    @Test("repeated immediate stream EOFs use the same bounded transient backoff")
+    func foregroundStreamBacksOffRepeatedImmediateEOF() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = PlannedExecutionStreamDouble(plans: [
+            .completion(.endOfStream), .completion(.endOfStream),
+            .completion(.endOfStream), .completion(.endOfStream),
+            .completion(.endOfStream), .completion(.endOfStream),
+            .completion(.endOfStream), .completion(.unsupported),
+        ])
+        let sleeps = ExecutionStreamSleepRecorder()
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream,
+            executionStreamSleep: { duration in
+                await sleeps.record(duration)
+            }
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestCount() < 8, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        sync.stopForegroundPolling()
+
+        #expect(await sleeps.values() == [
+            .seconds(1), .seconds(2), .seconds(4), .seconds(8),
+            .seconds(16), .seconds(30), .seconds(30),
+        ])
+        #expect(sync.status.phase == .connected)
+    }
+
+    @Test("stream liveness resets early-EOF reconnect backoff")
+    func foregroundStreamLivenessResetsEOFBackoff() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = PlannedExecutionStreamDouble(plans: [
+            .completion(.endOfStream), .completion(.endOfStream),
+            .completion(.liveEndOfStream), .completion(.endOfStream),
+            .completion(.unsupported),
+        ])
+        let sleeps = ExecutionStreamSleepRecorder()
+        let planner = Self.planner(persistence: context.persistence)
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream,
+            executionStreamSleep: { duration in
+                await sleeps.record(duration)
+            }
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestCount() < 5, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        sync.stopForegroundPolling()
+
+        #expect(await sleeps.values() == [
+            .seconds(1), .seconds(2), .seconds(1), .seconds(1),
+        ])
+    }
+
+    @Test("stream captures Last-Event-ID only after a foreign binding is quarantined")
+    func foregroundStreamStartsAfterFreshBindingPoll() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        var foreignState = Self.emptyBoundState
+        foreignState.bindingIdentifier = "execution-v1:foreign-binding"
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = ExecutionStreamDouble(
+            revisions: [],
+            completion: .unsupported
+        )
+        let planner = Self.planner(
+            persistence: context.persistence,
+            executionState: foreignState
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestedRevisions().isEmpty,
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.bindingIdentifier == Self.binding)
+        #expect(planner.executionState.historyVerified)
+        #expect(await stream.requestedRevisions() == [0])
+        #expect(await transport.snapshotRequestCount() == 2)
+    }
+
+    @Test("failed durable binding persistence never admits the foreground stream")
+    func foregroundStreamRequiresDurableBindingPersistence() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        var foreignState = Self.emptyBoundState
+        foreignState.bindingIdentifier = "execution-v1:foreign-binding"
+        let planner = Self.planner(
+            persistence: context.persistence,
+            executionState: foreignState
+        )
+        planner.flushPersistence()
+        #expect(planner.persistenceError == nil)
+
+        // Advance the encrypted compare-and-swap generation behind this
+        // process. prepareExecutionBinding will update memory first, but its
+        // mandatory flush must fail closed before streaming can capture that
+        // non-durable binding as Last-Event-ID.
+        let newerWriter = PlannerStore(
+            persistence: context.persistence,
+            autosaveDelay: .seconds(60)
+        )
+        newerWriter.lastScheduleMessage = "Newer encrypted writer"
+        newerWriter.flushPersistence()
+        #expect(newerWriter.persistenceError == nil)
+
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = ExecutionStreamDouble(
+            revisions: [],
+            completion: .unsupported
+        )
+        let sync = Self.controller(
+            planner: planner,
+            transport: transport,
+            streamTransport: stream
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let failureDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while planner.loadState != .persistenceFailed,
+              ContinuousClock.now < failureDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        sync.stopForegroundPolling()
+
+        #expect(planner.loadState == .persistenceFailed)
+        #expect(planner.executionState.bindingIdentifier == Self.binding)
+        #expect(await stream.requestedRevisions().isEmpty)
+        #expect(await transport.snapshotRequestCount() == 0)
+    }
+
+    @Test("stream retries readiness when the first foreground poll cannot bind")
+    func foregroundStreamStartsAfterLaterSuccessfulBindingPoll() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = ExecutionStreamDouble(
+            revisions: [],
+            completion: .unsupported
+        )
+        let connection = DayWeaveExecutionConnection(
+            canonicalConfigurationIdentifier: Self.canonicalConfiguration,
+            bindingIdentifier: Self.binding,
+            transport: transport,
+            streamTransport: stream
+        )
+        let connectionAvailability = ExecutionConnectionAvailability(connection: connection)
+        let planner = Self.planner(
+            persistence: context.persistence,
+            executionState: .empty
+        )
+        let sync = ExecutionSyncStore(
+            planner: planner,
+            connectionProvider: {
+                try connectionAvailability.provide()
+            },
+            now: { Self.baseDate },
+            makeUUID: { Self.uuid(500) }
+        )
+
+        sync.startForegroundPolling(every: .milliseconds(75))
+        let failureDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while sync.status.phase != .offline, ContinuousClock.now < failureDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(sync.status.phase == .offline)
+        #expect(await stream.requestedRevisions().isEmpty)
+
+        connectionAvailability.isAvailable = true
+        let recoveryDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.requestedRevisions().isEmpty,
+              ContinuousClock.now < recoveryDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.bindingIdentifier == Self.binding)
+        #expect(planner.executionState.historyVerified)
+        #expect(await stream.requestedRevisions() == [0])
+        #expect(sync.status.phase == .connected)
+    }
+
+    @Test("late events from a replaced credential binding are ignored")
+    func foregroundStreamIgnoresOldBindingHints() async throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
+        let transport = ExecutionTransportDouble(
+            snapshots: [empty, empty],
+            pages: [.init(sessions: [], nextOffset: nil)]
+        )
+        let stream = ExecutionStreamDouble(
+            initialDelay: .milliseconds(200),
+            revisions: [10],
+            completion: .unsupported
+        )
+        let planner = Self.planner(persistence: context.persistence)
+        var connection = DayWeaveExecutionConnection(
+            canonicalConfigurationIdentifier: Self.canonicalConfiguration,
+            bindingIdentifier: Self.binding,
+            transport: transport,
+            streamTransport: stream
+        )
+        let sync = ExecutionSyncStore(
+            planner: planner,
+            connectionProvider: { connection },
+            now: { Self.baseDate },
+            makeUUID: { Self.uuid(500) }
+        )
+
+        sync.startForegroundPolling(every: .seconds(60))
+        let pollDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while sync.status.phase != .connected, ContinuousClock.now < pollDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        connection = DayWeaveExecutionConnection(
+            canonicalConfigurationIdentifier: Self.canonicalConfiguration,
+            bindingIdentifier: "execution-v1:replacement-binding",
+            transport: transport
+        )
+        let emissionDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await stream.emissionCount() < 1, ContinuousClock.now < emissionDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        sync.stopForegroundPolling()
+
+        #expect(planner.executionState.revision == 0)
+        #expect(await transport.snapshotRequestCount() == 2)
+    }
+
     private static var emptyBoundState: DayWeaveExecutionDurableState {
         var state = DayWeaveExecutionDurableState.empty
         state.deviceID = deviceID
@@ -3614,18 +4153,23 @@ struct ExecutionSyncStoreTests {
     private static func controller(
         planner: PlannerStore,
         transport: ExecutionTransportDouble,
+        streamTransport: (any DayWeaveExecutionStreamTransport)? = nil,
         binding: String = binding,
         now: @escaping @Sendable () -> Date = { baseDate },
         breakNotificationCoordinator: any DayWeaveBreakNotificationCoordinating =
             DayWeaveNoopBreakNotificationCoordinator(),
         breakDeadlineSleep: @escaping @Sendable (Duration) async -> Void = { duration in
             try? await Task.sleep(for: duration)
+        },
+        executionStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
         }
     ) -> ExecutionSyncStore {
         let connection = DayWeaveExecutionConnection(
             canonicalConfigurationIdentifier: canonicalConfiguration,
             bindingIdentifier: binding,
-            transport: transport
+            transport: transport,
+            streamTransport: streamTransport
         )
         return ExecutionSyncStore(
             planner: planner,
@@ -3633,7 +4177,8 @@ struct ExecutionSyncStoreTests {
             now: now,
             makeUUID: { uuid(500) },
             breakNotificationCoordinator: breakNotificationCoordinator,
-            breakDeadlineSleep: breakDeadlineSleep
+            breakDeadlineSleep: breakDeadlineSleep,
+            executionStreamSleep: executionStreamSleep
         )
     }
 
@@ -4287,6 +4832,123 @@ private actor AsyncCompletionProbe {
     var isComplete: Bool { completed }
 
     func markComplete() { completed = true }
+}
+
+@MainActor
+private final class ExecutionConnectionAvailability {
+    let connection: DayWeaveExecutionConnection
+    var isAvailable = false
+
+    init(connection: DayWeaveExecutionConnection) {
+        self.connection = connection
+    }
+
+    func provide() throws -> DayWeaveExecutionConnection {
+        guard isAvailable else {
+            throw DayWeaveAPIError.transport(.notConnectedToInternet)
+        }
+        return connection
+    }
+}
+
+private actor ExecutionStreamDouble: DayWeaveExecutionStreamTransport {
+    private let initialDelay: Duration?
+    private let interEventDelay: Duration?
+    private let revisions: [UInt64]
+    private let completion: DayWeaveExecutionStreamCompletion
+    private var requests: [UInt64] = []
+    private var emissions = 0
+
+    init(
+        initialDelay: Duration? = nil,
+        interEventDelay: Duration? = nil,
+        revisions: [UInt64],
+        completion: DayWeaveExecutionStreamCompletion
+    ) {
+        self.initialDelay = initialDelay
+        self.interEventDelay = interEventDelay
+        self.revisions = revisions
+        self.completion = completion
+    }
+
+    func consumeExecutionInvalidations(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamCompletion {
+        requests.append(revision)
+        if let initialDelay { try await Task.sleep(for: initialDelay) }
+        for (index, revision) in revisions.enumerated() {
+            if index > 0, let interEventDelay {
+                try await Task.sleep(for: interEventDelay)
+            }
+            emissions += 1
+            await receive(revision)
+        }
+        return completion
+    }
+
+    func requestedRevisions() -> [UInt64] { requests }
+    func emissionCount() -> Int { emissions }
+}
+
+private actor BlockingExecutionStreamDouble: DayWeaveExecutionStreamTransport {
+    private var started = false
+    private var cancelled = false
+
+    func consumeExecutionInvalidations(
+        after _: UInt64,
+        _: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamCompletion {
+        started = true
+        do {
+            try await Task.sleep(for: .seconds(3_600))
+            return .endOfStream
+        } catch {
+            cancelled = Task.isCancelled
+            throw error
+        }
+    }
+
+    func hasStarted() -> Bool { started }
+    func wasCancelled() -> Bool { cancelled }
+}
+
+private actor PlannedExecutionStreamDouble: DayWeaveExecutionStreamTransport {
+    enum Plan: Sendable {
+        case failure(DayWeaveAPIError)
+        case completion(DayWeaveExecutionStreamCompletion)
+    }
+
+    private var plans: [Plan]
+    private var requests: [UInt64] = []
+
+    init(plans: [Plan]) {
+        self.plans = plans
+    }
+
+    func consumeExecutionInvalidations(
+        after revision: UInt64,
+        _: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveExecutionStreamCompletion {
+        requests.append(revision)
+        guard !plans.isEmpty else { return .unsupported }
+        switch plans.removeFirst() {
+        case let .failure(error): throw error
+        case let .completion(completion): return completion
+        }
+    }
+
+    func requestCount() -> Int { requests.count }
+}
+
+private actor ExecutionStreamSleepRecorder {
+    private var recorded: [Duration] = []
+
+    func record(_ duration: Duration) {
+        recorded.append(duration)
+    }
+
+    func values() -> [Duration] { recorded }
 }
 
 private actor ExecutionTransportDouble: DayWeaveExecutionTransport {

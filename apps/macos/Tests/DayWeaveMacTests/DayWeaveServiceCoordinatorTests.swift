@@ -144,6 +144,36 @@ struct DayWeaveServiceCoordinatorTests {
             "execution.poll",
         ])
     }
+
+    @Test("privacy deactivation stops all execution foreground delivery")
+    func deactivationStopsExecutionForegroundDelivery() async {
+        let events = ServiceEventLog()
+        let proposals = ProposalRecoveryDouble(
+            hasPendingRecovery: false,
+            resolvesRecovery: false,
+            reportedResult: false,
+            events: events
+        )
+        let execution = ExecutionServiceDouble(events: events)
+        let canonical = CanonicalServiceDouble(events: events)
+        let coordinator = DayWeaveServiceCoordinator(
+            proposalApplications: proposals,
+            executionSync: execution,
+            canonicalSync: canonical
+        )
+
+        coordinator.activate()
+        await coordinator.waitForActivation()
+        coordinator.deactivate()
+
+        #expect(!coordinator.servicesAreActive)
+        #expect(events.values == [
+            "execution.refresh",
+            "canonical.sync",
+            "execution.poll",
+            "execution.stop",
+        ])
+    }
 }
 
 @MainActor

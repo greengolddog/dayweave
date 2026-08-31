@@ -94,8 +94,10 @@ only a process-local counter—no identifier or planner content—to invalidate 
 in-app resolver. The execution store also owns an exact local deadline wake-up,
 so an expired break becomes actionable without waiting for network polling or a
 foreground notification callback. A resume performed on another device can
-cancel this reminder only after the Mac receives the newer lease; near-real-time
-background execution updates remain part of the separate push-sync requirement.
+cancel this reminder only after the Mac receives the newer lease. While the app
+is foregrounded and unlocked, an execution invalidation stream now requests
+that reconciliation promptly; the independent 30-second poll remains the
+durable catch-up path.
 Final acceptance still needs one bundled-app smoke test for permission UI,
 background delivery, lock/unlock routing, background banner/sound appearance,
 and Notification Center click behavior.
@@ -189,6 +191,39 @@ the same origin therefore quarantines stale work instead of sending it under a
 new identity. Legacy raw-token records have no trustworthy origin and require
 explicit re-entry. Credentials are device-only and are never added to the
 Codable planner snapshot or application diagnostics.
+
+Foreground execution sync opens `GET /v1/execution/stream` with
+`Accept: text/event-stream`, `Accept-Encoding: identity`, and the exact
+encrypted execution revision as `Last-Event-ID`. Successful frames must contain
+one canonical integer `id`, the event name `execution-invalidation`, and the
+exact matching `{"revision":N}` payload; the only accepted comment frame is a
+standalone `: heartbeat`. The byte parser bounds every line, frame, total frame
+count, and event count; rejects empty or mixed comment frames, malformed UTF-8,
+control bytes, duplicate or unknown fields, noncanonical JSON integers, and any
+revision that does not advance beyond the durable resume cursor. Redirects
+remain disabled, successful responses require the strict event-stream media
+type and an absent or single exact identity content encoding, non-success bodies
+have a small independent bound, and durable authentication gets the same single
+exact 401 recovery attempt and binding checks as normal API calls. One independent
+330-second absolute watchdog covers the whole public stream call—including
+that recovery attempt—so heartbeat or byte progress cannot extend the
+connection indefinitely; expiration and task cancellation close the underlying
+URLSession task.
+
+An invalidation is never persisted as execution state. The store coalesces its
+highest new revision and runs the existing authoritative snapshot/history plus
+deferred-publication reconciliation. A connection can provoke only one such
+coalesced refresh when an advertised revision stays unreachable; the 30-second
+poll retains durable catch-up. An immediate EOF is a transient failure and
+joins other transient failures in bounded exponential 1-to-30-second backoff;
+a connection that demonstrates bounded heartbeat or event liveness resets that
+backoff before a normal five-minute EOF reconnects from the newest durable
+revision. A 404 disables only that foreground activation. Streaming begins only
+after a successful poll proves the current binding reached healthy encrypted
+persistence, and later polls retry readiness if an earlier poll could not bind.
+Stream health is silent and cannot replace the poll's user-facing status.
+Leaving the foreground, app lock, API configuration changes, or credential
+replacement cancels the stream and its URLSession task immediately.
 
 ## Google Calendar and Tasks
 

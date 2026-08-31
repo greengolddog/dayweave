@@ -778,6 +778,151 @@ struct DurableAuthCoordinatorTests {
         #expect(await transport.records().count == 1)
     }
 
+    @Test("execution stream 401 recovery reopens the exact resume request once")
+    @MainActor
+    func executionStreamUnauthorizedRecoveryReplaysExactly() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 55, refreshMarker: 56)
+        let state = TestDurableAuthStateStore(initial: envelope(active: active, revision: 20))
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .session(
+                    issuedAt: instant.addingTimeInterval(60),
+                    statusCode: 200,
+                    replayed: false
+                ),
+            ]
+        )
+        let nextAccess = syntheticCredential(prefix: "dw_da1_", marker: 57)
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [57, 58]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        URLProtocolStub.storage.reset(key: active.credentials.accessToken)
+        URLProtocolStub.storage.reset(key: nextAccess)
+        URLProtocolStub.storage.enqueue(
+            key: active.credentials.accessToken,
+            .init(
+                statusCode: 401,
+                headers: trustedUnauthorizedHeaders,
+                body: trustedUnauthorizedBody
+            )
+        )
+        URLProtocolStub.storage.enqueue(
+            key: nextAccess,
+            .init(
+                statusCode: 200,
+                headers: ["Content-Type": "text/event-stream"],
+                body: Data(
+                    "id: 5\nevent: execution-invalidation\ndata: {\"revision\":5}\n\n".utf8
+                )
+            )
+        )
+        let client = DayWeaveAPIClient(
+            baseURL: baseURL,
+            session: URLProtocolStub.makeSession(),
+            authCoordinator: coordinator
+        )
+        let revisions = DurableAuthStreamRevisionRecorder()
+
+        let completion = try await client.consumeExecutionInvalidations(after: 4) {
+            await revisions.append($0)
+        }
+
+        #expect(completion == .liveEndOfStream)
+        #expect(await revisions.values() == [5])
+        let first = try #require(
+            URLProtocolStub.storage.requests(for: active.credentials.accessToken).first
+        )
+        let replay = try #require(URLProtocolStub.storage.requests(for: nextAccess).first)
+        #expect(first.method == replay.method)
+        #expect(first.url == replay.url)
+        #expect(first.body == nil && replay.body == nil)
+        var firstHeaders = first.headers
+        var replayHeaders = replay.headers
+        firstHeaders.removeValue(forKey: "Authorization")
+        replayHeaders.removeValue(forKey: "Authorization")
+        #expect(firstHeaders == replayHeaders)
+        #expect(first.headers["Last-Event-ID"] == "4")
+        #expect(await transport.records().count == 1)
+    }
+
+    @Test("execution stream 401 recovery remains inside one absolute lifetime")
+    @MainActor
+    func executionStreamUnauthorizedRecoverySharesLifetimeWatchdog() async throws {
+        let active = makeActive(issuedAt: instant, accessMarker: 155, refreshMarker: 156)
+        let state = TestDurableAuthStateStore(initial: envelope(active: active, revision: 21))
+        let transport = TestDurableAuthTransport(
+            stateStore: state,
+            plans: [
+                .session(
+                    issuedAt: instant.addingTimeInterval(60),
+                    statusCode: 200,
+                    replayed: false
+                ),
+            ]
+        )
+        let nextAccess = syntheticCredential(prefix: "dw_da1_", marker: 157)
+        let coordinator = makeCoordinator(
+            state: state,
+            transport: transport,
+            generator: TestDurableCredentialGenerator(markers: [157, 158]),
+            now: { instant.addingTimeInterval(60) }
+        )
+        URLProtocolStub.storage.reset(key: active.credentials.accessToken)
+        URLProtocolStub.storage.reset(key: nextAccess)
+        URLProtocolStub.storage.enqueue(
+            key: active.credentials.accessToken,
+            .init(
+                statusCode: 401,
+                headers: trustedUnauthorizedHeaders,
+                body: trustedUnauthorizedBody
+            )
+        )
+        URLProtocolStub.storage.enqueue(
+            key: nextAccess,
+            .init(
+                statusCode: 200,
+                headers: ["Content-Type": "text/event-stream"],
+                body: Data(),
+                delay: 5
+            )
+        )
+        let lifetime = DurableAuthStreamLifetimeGate()
+        let client = DayWeaveAPIClient(
+            baseURL: baseURL,
+            session: URLProtocolStub.makeSession(),
+            authCoordinator: coordinator,
+            executionStreamLifetimeSleep: {
+                try await lifetime.wait()
+            }
+        )
+        let task = Task {
+            try await client.consumeExecutionInvalidations(after: 4) { _ in }
+        }
+
+        let replayDeadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while URLProtocolStub.storage.requests(for: nextAccess).isEmpty,
+              ContinuousClock.now < replayDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(URLProtocolStub.storage.requests(for: nextAccess).count == 1)
+        #expect(lifetime.waitCount == 1)
+
+        lifetime.fire()
+        do {
+            _ = try await task.value
+            Issue.record("Expected the shared absolute lifetime to expire")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .transport(.timedOut))
+        } catch {
+            Issue.record("Unexpected error: \(error)")
+        }
+        #expect(lifetime.waitCount == 1)
+    }
+
     @Test("durable rejection never falls back to a residual legacy bearer")
     func durableRejectionNeverFallsBack() async throws {
         let active = makeActive(issuedAt: instant, accessMarker: 61, refreshMarker: 62)
@@ -3576,6 +3721,63 @@ private final class FailOnceBearerTokenStore: BearerTokenStoring, @unchecked Sen
             }
             credential = nil
         }
+    }
+}
+
+private actor DurableAuthStreamRevisionRecorder {
+    private var revisions: [UInt64] = []
+
+    func append(_ revision: UInt64) {
+        revisions.append(revision)
+    }
+
+    func values() -> [UInt64] { revisions }
+}
+
+private final class DurableAuthStreamLifetimeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuations: [UUID: CheckedContinuation<Void, Error>] = [:]
+    private var isFired = false
+    private var observedWaitCount = 0
+
+    var waitCount: Int { lock.withLock { observedWaitCount } }
+
+    func wait() async throws {
+        let id = UUID()
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let shouldResume: Bool = lock.withLock {
+                    observedWaitCount += 1
+                    guard !isFired, !Task.isCancelled else { return true }
+                    continuations[id] = continuation
+                    return false
+                }
+                if shouldResume {
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        continuation.resume()
+                    }
+                }
+            }
+        } onCancel: {
+            let continuation = self.lock.withLock {
+                self.continuations.removeValue(forKey: id)
+            }
+            continuation?.resume(throwing: CancellationError())
+        }
+        try Task.checkCancellation()
+    }
+
+    func fire() {
+        let pending: [CheckedContinuation<Void, Error>] = lock.withLock {
+            isFired = true
+            let pending = Array(continuations.values)
+            continuations.removeAll()
+            return pending
+        }
+        pending.forEach { $0.resume() }
     }
 }
 #endif
