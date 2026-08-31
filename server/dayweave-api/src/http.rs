@@ -72,6 +72,7 @@ const MAX_LIST_LIMIT: usize = 200;
         crate::scheduling::http::publish_schedule,
         crate::scheduling::http::list_retained_manual_placements,
         crate::execution::http::get_execution,
+        crate::execution::http::execution_stream,
         crate::execution::http::apply_execution_command,
         crate::execution::http::assess_defer,
         crate::execution::http::execution_history,

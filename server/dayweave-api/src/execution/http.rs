@@ -1,13 +1,19 @@
+use std::convert::Infallible;
+
 use axum::{
     Json, Router,
     extract::{
         Query, State,
         rejection::{JsonRejection, QueryRejection},
     },
-    http::{HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -23,18 +29,132 @@ use super::{
     DeferAssessment, DeferAssessmentRequest, ExecutionCommand, ExecutionDomainError,
     ExecutionIdempotencyKey, ExecutionMutation, ExecutionRepositoryError, ExecutionServiceError,
     ExecutionSession, ExecutionSnapshot,
+    invalidation::{ExecutionInvalidationOpenError, ExecutionInvalidationSignal},
 };
 
 const DEFAULT_HISTORY_LIMIT: usize = 50;
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 const REPLAY_HEADER: &str = "idempotency-replayed";
+const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+const EVENT_STREAM_MEDIA_TYPE: &str = "text/event-stream";
+const INVALIDATION_EVENT: &str = "execution-invalidation";
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
         .route("/execution", get(get_execution))
+        .route("/execution/stream", get(execution_stream))
         .route("/execution/commands", post(apply_execution_command))
         .route("/execution/defer-assessments", post(assess_defer))
         .route("/execution/history", get(execution_history))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/execution/stream",
+    tag = "execution",
+    security(("bearer_token" = [])),
+    params(
+        ("Accept" = String, Header, description = "Must be exactly text/event-stream"),
+        ("Last-Event-ID" = Option<String>, Header, description = "Last applied execution revision as canonical unsigned decimal; omitted means 0")
+    ),
+    responses(
+        (status = 200, description = "Content-free execution revision invalidations", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Malformed Last-Event-ID", body = crate::error::ErrorEnvelope),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Credential lacks execution_read", body = crate::error::ErrorEnvelope),
+        (status = 406, description = "Accept is not exactly text/event-stream", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Last-Event-ID is ahead of the authoritative execution revision", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Stream capacity or durable execution state is unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn execution_stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_event_stream_accept(&headers)?;
+    let cursor = parse_last_event_id(&headers)?;
+    let stream = state
+        .execution
+        .invalidation_stream(cursor)
+        .await
+        .map_err(|error| map_invalidation_open_error(&error))?
+        .into_stream()
+        .map(|signal| {
+            let event = match signal {
+                ExecutionInvalidationSignal::Revision(revision) => Event::default()
+                    .id(revision.to_string())
+                    .event(INVALIDATION_EVENT)
+                    .data(format!(r#"{{"revision":{revision}}}"#)),
+                ExecutionInvalidationSignal::Heartbeat => Event::default().comment("heartbeat"),
+            };
+            Ok::<Event, Infallible>(event)
+        });
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
+}
+
+fn require_event_stream_accept(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    let accepted = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(EVENT_STREAM_MEDIA_TYPE));
+    if !accepted || values.next().is_some() {
+        return Err(ApiError::not_acceptable(
+            "Accept must be exactly text/event-stream",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let name = HeaderName::from_static(LAST_EVENT_ID_HEADER);
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(0);
+    };
+    if values.next().is_some() {
+        return Err(invalid_last_event_id());
+    }
+    let value = value.to_str().map_err(|_| invalid_last_event_id())?;
+    let canonical = value == "0"
+        || (value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && !value.starts_with('0')
+            && value.bytes().all(|byte| byte.is_ascii_digit()));
+    if !canonical {
+        return Err(invalid_last_event_id());
+    }
+    value.parse().map_err(|_| invalid_last_event_id())
+}
+
+fn invalid_last_event_id() -> ApiError {
+    ApiError::bad_request("Last-Event-ID must be canonical unsigned decimal")
+}
+
+fn map_invalidation_open_error(error: &ExecutionInvalidationOpenError) -> ApiError {
+    match error {
+        ExecutionInvalidationOpenError::Capacity => {
+            ApiError::unavailable("execution stream capacity is temporarily exhausted")
+        }
+        ExecutionInvalidationOpenError::CursorAhead { cursor, head } => {
+            ApiError::conflict("execution stream cursor is ahead of authoritative state")
+                .with_details(json!({ "cursor_revision": cursor, "head_revision": head }))
+        }
+        ExecutionInvalidationOpenError::Repository(_) => {
+            ApiError::unavailable("execution stream cannot read authoritative state")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

@@ -18,8 +18,8 @@ The architecture is optimized for five constraints:
 
 ```mermaid
 flowchart LR
-    Mac[Native macOS app] -->|HTTPS + WebSocket| API[DayWeave API]
-    Android[Native Android app] -->|HTTPS + WebSocket| API
+    Mac[Native macOS app] -->|HTTPS; optional execution SSE| API[DayWeave API]
+    Android[Native Android app] -->|HTTPS; optional execution SSE| API
     Mac --> CoreM[Embedded Rust core]
     Android --> CoreA[Embedded Rust core]
     Ext[ChatGPT / Codex clients] -->|authenticated MCP| MCP[MCP facade]
@@ -46,7 +46,7 @@ dayweave/
 │   ├── dayweave-ffi/             # UniFFI/C ABI boundary and generated schemas
 │   └── dayweave-contracts/       # API/sync/provider wire contracts
 ├── server/
-│   ├── dayweave-api/             # HTTP, WebSocket, auth, sync, MCP facade
+│   ├── dayweave-api/             # HTTP/SSE, auth, sync, MCP facade
 │   └── dayweave-worker/          # Google, AI, notifications, maintenance
 ├── integrations/dayweave/        # private Codex plugin, skill, MCP registration
 ├── deploy/                        # containers, migrations, Nebius, backup, runbooks
@@ -146,7 +146,7 @@ Both clients follow the same conceptual layers:
 2. application commands/queries and view-state reducers;
 3. encrypted SQLite local store, durable operation outbox, and sync inbox;
 4. generated Rust-core bindings for validation, recurrence, scheduling, and explanations; and
-5. HTTP/WebSocket API client plus attachment transfer manager.
+5. HTTP API client, optional execution SSE, and attachment transfer manager.
 
 The binding surface exchanges versioned, serialization-friendly value objects. Swift and Kotlin do not hold Rust references across UI frames. Panics and errors become typed native errors; unsafe Rust is forbidden in the workspace unless a separately reviewed FFI shim makes the minimum unavoidable exception.
 
@@ -174,7 +174,8 @@ The Rust API service provides:
 
 - session and device authentication;
 - REST-style command/query endpoints described by a versioned OpenAPI contract;
-- a WebSocket change stream with cursor-based catch-up;
+- an authenticated, content-free execution invalidation SSE stream with
+  revision-based durable catch-up;
 - idempotency-key enforcement;
 - attachment preflight and signed transfer URLs;
 - proposal review/apply endpoints;
@@ -215,7 +216,13 @@ The sync model combines canonical current state with an append-only ordered oper
 
 - The client creates an operation ID and writes the local mutation plus outbox entry atomically.
 - The server deduplicates the operation ID, checks base revision, applies or returns a structured conflict, and assigns a monotonic workspace cursor.
-- The WebSocket announces new cursors; clients fetch ordered deltas and persist the cursor with the applied inbox transaction.
+- The implemented execution SSE announces only a coalesced execution revision;
+  clients fetch the authoritative execution snapshot and persist its revision
+  with the applied local transaction. Its immediate wakeup hub is process-local,
+  while a shared durable-head probe gives open streams convergence within five
+  seconds after cross-instance commits or a lost local wakeup. A broader item
+  operation announcement stream remains planned; item clients continue using
+  the durable delta endpoint for catch-up.
 - Entity tombstones make deletion converge. Thirty-day trash is a product state; tombstone retention may be longer for sync safety.
 - Commutative field changes merge automatically. Concurrent changes to the same semantic field or structure return both values for review.
 - Single-active-item uses a short server lease/version. An offline start is accepted locally; reconnect resolves a conflict without losing either time segment.

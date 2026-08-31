@@ -26,6 +26,8 @@ in [`docs/security.md`](docs/security.md).
 The deterministic preview, immutable publication/read-model contract, and
 strict canonical scheduling metadata are
 documented in [`docs/scheduling-api.md`](docs/scheduling-api.md).
+The authenticated, content-free execution invalidation and durable catch-up
+contract is documented in [`docs/execution-sync.md`](docs/execution-sync.md).
 The typed, grouped AI proposal preview/apply/get/undo boundary is documented in
 [`docs/proposal-applications.md`](docs/proposal-applications.md).
 The disabled-by-default Auth0 account-linking boundary for published MCP

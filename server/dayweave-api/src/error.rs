@@ -36,6 +36,16 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", message)
+    }
+
+    #[must_use]
+    pub fn not_acceptable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_ACCEPTABLE, "not_acceptable", message)
+    }
+
+    #[must_use]
     pub fn not_found(resource: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,

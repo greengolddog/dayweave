@@ -14,6 +14,10 @@ use super::{
     DeferAssessment, DeferAssessmentRequest, ExecutionCommand, ExecutionDomainError,
     ExecutionIdempotency, ExecutionMutation, ExecutionRepository, ExecutionRepositoryError,
     ExecutionSession, ExecutionSnapshot, StartExecution,
+    invalidation::{
+        ExecutionInvalidationConfig, ExecutionInvalidationHub, ExecutionInvalidationOpenError,
+        ExecutionInvalidationStream,
+    },
 };
 
 const IDEMPOTENCY_TTL: StdDuration = StdDuration::from_hours(24);
@@ -36,6 +40,7 @@ pub struct ExecutionService {
     items: Arc<ItemService>,
     clock: Arc<dyn Clock>,
     start_operation_gate: Option<Arc<Mutex<()>>>,
+    invalidations: ExecutionInvalidationHub,
 }
 
 impl std::fmt::Debug for ExecutionService {
@@ -58,12 +63,30 @@ impl ExecutionService {
             items,
             clock,
             start_operation_gate: None,
+            invalidations: ExecutionInvalidationHub::new(ExecutionInvalidationConfig::default()),
         }
     }
 
     pub(crate) fn with_start_operation_gate(mut self, gate: Arc<Mutex<()>>) -> Self {
         self.start_operation_gate = Some(gate);
         self
+    }
+
+    /// Replaces the bounded invalidation stream configuration while assembling
+    /// a service. Primarily useful for deterministic embedded/HTTP tests.
+    #[must_use]
+    pub fn with_invalidation_config(mut self, config: ExecutionInvalidationConfig) -> Self {
+        self.invalidations = ExecutionInvalidationHub::new(config);
+        self
+    }
+
+    pub(crate) async fn invalidation_stream(
+        &self,
+        cursor: u64,
+    ) -> Result<ExecutionInvalidationStream, ExecutionInvalidationOpenError> {
+        self.invalidations
+            .open(self.repository.clone(), cursor)
+            .await
     }
 
     /// Returns the canonical cross-device execution lease.
@@ -124,6 +147,7 @@ impl ExecutionService {
         // the original transaction. The repository repeats this check inside
         // `apply` to close the concurrent first-request race.
         if let Some(mutation) = self.repository.replay(now, &idempotency).await? {
+            self.invalidations.publish(mutation.revision);
             return Ok(mutation);
         }
         command.validate(now)?;
@@ -132,18 +156,22 @@ impl ExecutionService {
             if let Some(gate) = &self.start_operation_gate {
                 let _operation = gate.lock().await;
                 self.validate_start_item(input).await?;
-                return Ok(self
+                let mutation = self
                     .repository
                     .apply(expected_revision, command, now, idempotency)
-                    .await?);
+                    .await?;
+                self.invalidations.publish(mutation.revision);
+                return Ok(mutation);
             }
             self.validate_start_item(input).await?;
         }
 
-        Ok(self
+        let mutation = self
             .repository
             .apply(expected_revision, command, now, idempotency)
-            .await?)
+            .await?;
+        self.invalidations.publish(mutation.revision);
+        Ok(mutation)
     }
 
     async fn validate_start_item(

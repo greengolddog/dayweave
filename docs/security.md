@@ -142,6 +142,11 @@ effects must flow through an auditable proposal or outbox boundary.
   receive `execution_write`. A compromised execution-write device credential
   can nevertheless echo the digest, so revocation and device protection remain
   part of this boundary.
+- The execution invalidation SSE requires the native REST `execution_read`
+  boundary and carries only a monotonic revision ID. It never serializes the
+  active lease, item/session/device identifiers, status, titles, or timestamps.
+  Responses disable caching and proxy buffering; heartbeat, lifetime, and a
+  per-process connection permit cap bound authenticated long-lived resource use.
 - Defer assessment and claim triggers are database defense-in-depth for
   repository mistakes and races. Core conflict recomputation remains an API
   responsibility; a role allowed arbitrary direct table writes is inside the
