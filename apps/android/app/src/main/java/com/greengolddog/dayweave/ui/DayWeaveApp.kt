@@ -262,6 +262,8 @@ private fun DayWeaveRoot(
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
     val timedBreakNotificationPermissionRequestDigest by
         viewModel.timedBreakNotificationPermissionRequestDigest.collectAsStateWithLifecycle()
+    val scheduleCompositionProfileUpdateState by
+        viewModel.scheduleCompositionProfileUpdateState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
@@ -632,6 +634,12 @@ private fun DayWeaveRoot(
                 onToggleCompleted = viewModel::toggleCompleted,
                 onToggleQuietSuggestions = viewModel::toggleQuietSuggestions,
                 onToggleDynamicColor = viewModel::toggleDynamicColor,
+                scheduleCompositionProfileUpdateState =
+                    scheduleCompositionProfileUpdateState,
+                onUpdateScheduleCompositionProfile =
+                    viewModel::updateScheduleCompositionProfile,
+                onAcknowledgeScheduleCompositionProfileUpdate =
+                    viewModel::acknowledgeScheduleCompositionProfileUpdate,
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
                 googleAccountState = googleAccountState,

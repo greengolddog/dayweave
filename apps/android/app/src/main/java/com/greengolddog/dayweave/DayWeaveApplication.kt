@@ -49,6 +49,8 @@ import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
 import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
+import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateCoordinator
+import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -67,6 +69,12 @@ class DayWeaveApplication : Application() {
         actionGate = canonicalActionGate,
         compose = { generation -> canonicalSyncManager.composeLocally(generation) },
     )
+    internal val scheduleCompositionProfileUpdateCoordinator by lazy {
+        ScheduleCompositionProfileUpdateCoordinator(
+            plannerStore = plannerStore,
+            launchCanonicalAction = ::launchCanonicalAction,
+        )
+    }
 
     val appAuthenticationProcessFence = AppAuthenticationProcessFence()
 
@@ -368,6 +376,7 @@ class DayWeaveApplication : Application() {
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        ScheduleCompositionProfileDraftMemory.clear()
         setLocalScheduleCompositionForegroundActive(false)
         if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
             canonicalItemInvalidationManager.cancelActiveSession()

@@ -302,6 +302,11 @@ class PlannerStoreTest {
         assertNull(store.state.value.publishedScheduleRevision)
         assertNull(store.state.value.publishedScheduleProof)
         assertNull(store.state.value.scheduleInputDigest)
+        assertNull(store.state.value.localScheduleCompositionProvenance)
+        assertEquals(
+            "Scheduling profile changed · recompose to refresh the day",
+            store.state.value.scheduleMessage,
+        )
         assertTrue(store.isCanonicalExecutionStartBlocked(block.id))
 
         val pending = publication(

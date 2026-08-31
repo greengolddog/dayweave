@@ -4322,48 +4322,37 @@ class PlannerStore(
         mutate { it.copy(useDynamicColor = !it.useDynamicColor) }
     }
 
-    /**
-     * Persists work-window/weight changes and revokes old authority. Future UI callers must hold
-     * the process canonical-action gate; this remains internal until profile settings ship.
-     */
+    /** Persists work-window/weight changes and revokes old schedule authority. */
     internal fun updateScheduleCompositionProfile(
         profile: ScheduleCompositionProfileSnapshot,
     ): Boolean {
         require(profile.hasValidShape())
-        return mutate { current ->
-            if (current.scheduleCompositionProfile == profile) {
-                current
-            } else {
-                require(
-                    current.pendingSchedulePublication == null &&
-                        current.pendingProposalApplicationMutation == null &&
-                        current.pendingCanonicalMutation == null &&
-                        current.pendingCanonicalAuthoringMutations.isEmpty() &&
-                        current.pendingExecutionCommand == null &&
-                        current.pendingExecutionDeferIntent == null &&
-                        current.canonicalExecutionSession == null &&
-                        current.activeSession == null &&
-                        current.schedule.none { block ->
-                            block.canonicalItemId != null &&
-                                block.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED)
-                        } &&
-                        current.terminalExecutionOutcomes.values.none { outcome ->
-                            outcome.requiresCanonicalItemProjection &&
-                                outcome.canonicalProjectionRevision == null &&
-                                outcome.canonicalProjectionResolution == null &&
-                                current.isNewestExecutionForProjection(outcome.session)
-                        },
-                ) { "A canonical action must reconcile before changing the scheduling profile" }
-                current.copy(
-                    scheduleCompositionProfile = profile,
-                    publishedScheduleRevision = null,
-                    publishedScheduleProof = null,
-                    scheduleInputDigest = null,
-                    localScheduleCompositionProvenance = null,
-                    scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
-                )
-            }
+        return mutate { current -> current.withScheduleCompositionProfile(profile) }
+    }
+
+    /** Exact encrypted save used by the settings UI before it reports success. */
+    internal fun updateScheduleCompositionProfileDurably(
+        profile: ScheduleCompositionProfileSnapshot,
+    ): PlannerPersistenceReceipt? {
+        require(profile.hasValidShape())
+        return mutateDurably { current -> current.withScheduleCompositionProfile(profile) }
+    }
+
+    private fun DayWeaveUiState.withScheduleCompositionProfile(
+        profile: ScheduleCompositionProfileSnapshot,
+    ): DayWeaveUiState {
+        if (scheduleCompositionProfile == profile) return this
+        require(scheduleCompositionProfileEditBlocker() == null) {
+            "A canonical action must reconcile before changing the scheduling profile"
         }
+        return copy(
+            scheduleCompositionProfile = profile,
+            publishedScheduleRevision = null,
+            publishedScheduleProof = null,
+            scheduleInputDigest = null,
+            localScheduleCompositionProvenance = null,
+            scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
+        )
     }
 
     fun enableHealthConnectSync(): Boolean = mutate { current ->

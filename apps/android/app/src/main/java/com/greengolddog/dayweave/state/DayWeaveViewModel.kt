@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
@@ -50,6 +51,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         PlannerTimedBreakNotificationRouteAccess(plannerStore)
     private val timedBreakNotificationPermissionRequestState =
         TimedBreakNotificationPermissionRequestState()
+    private val scheduleCompositionProfileUpdateCoordinator =
+        dayWeaveApplication.scheduleCompositionProfileUpdateCoordinator
 
     val state: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState> = plannerStore.state
     val durableState: StateFlow<com.greengolddog.dayweave.model.DayWeaveUiState?> =
@@ -66,6 +69,9 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
     val timedBreakNotificationPermissionRequestDigest: StateFlow<String?> =
         timedBreakNotificationPermissionRequestState.requestDigest
+    internal val scheduleCompositionProfileUpdateState:
+        StateFlow<ScheduleCompositionProfileUpdateState> =
+        scheduleCompositionProfileUpdateCoordinator.state
 
     init {
         viewModelScope.launch {
@@ -440,6 +446,12 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun toggleCompleted() = plannerStore.toggleCompleted()
     fun toggleQuietSuggestions() = plannerStore.toggleQuietSuggestions()
     fun toggleDynamicColor() = plannerStore.toggleDynamicColor()
+    fun updateScheduleCompositionProfile(profile: ScheduleCompositionProfileSnapshot): Boolean =
+        scheduleCompositionProfileUpdateCoordinator.update(profile)
+
+    fun acknowledgeScheduleCompositionProfileUpdate() =
+        scheduleCompositionProfileUpdateCoordinator.acknowledge()
+
     fun recordManualEnergyCheckIn(level: EnergyLevel) {
         plannerStore.recordManualEnergyCheckIn(level)
     }

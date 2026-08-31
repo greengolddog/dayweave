@@ -35,9 +35,11 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,6 +54,7 @@ import com.greengolddog.dayweave.health.EnergySignalState
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
@@ -62,6 +65,8 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
+import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
 
 @Composable
@@ -70,6 +75,9 @@ fun MoreScreen(
     onToggleCompleted: () -> Unit,
     onToggleQuietSuggestions: () -> Unit,
     onToggleDynamicColor: () -> Unit,
+    scheduleCompositionProfileUpdateState: ScheduleCompositionProfileUpdateState,
+    onUpdateScheduleCompositionProfile: (ScheduleCompositionProfileSnapshot) -> Unit,
+    onAcknowledgeScheduleCompositionProfileUpdate: () -> Unit,
     suggestionSyncState: SuggestionSyncState,
     canonicalSyncState: CanonicalSyncState,
     googleAccountState: GoogleAccountState,
@@ -97,6 +105,20 @@ fun MoreScreen(
 ) {
     var pendingSensitivityRemoval by remember {
         mutableStateOf<CanonicalItemSnapshot?>(null)
+    }
+    var showPlanningProfileEditor by rememberSaveable { mutableStateOf(false) }
+    val profileEditBlockedMessage = planningProfileEditBlockedMessage(
+        state = state,
+        canonicalActionBusy = canonicalSyncState.isBusy,
+    )
+    LaunchedEffect(scheduleCompositionProfileUpdateState.phase) {
+        if (
+            scheduleCompositionProfileUpdateState.phase ==
+            ScheduleCompositionProfileUpdatePhase.SAVED
+        ) {
+            showPlanningProfileEditor = false
+            onAcknowledgeScheduleCompositionProfileUpdate()
+        }
     }
     LazyColumn(
         modifier = modifier,
@@ -170,6 +192,17 @@ fun MoreScreen(
         }
 
         item { SettingsSectionTitle("Planning") }
+        item {
+            PlanningProfileCard(
+                profile = state.scheduleCompositionProfile,
+                editBlockedMessage = profileEditBlockedMessage,
+                updateState = scheduleCompositionProfileUpdateState,
+                onEdit = {
+                    onAcknowledgeScheduleCompositionProfileUpdate()
+                    showPlanningProfileEditor = true
+                },
+            )
+        }
         item {
             Card {
                 SettingsInfo(
@@ -308,6 +341,21 @@ fun MoreScreen(
             },
             dismissButton = {
                 TextButton(onClick = { pendingSensitivityRemoval = null }) { Text("Cancel") }
+            },
+        )
+    }
+
+    if (showPlanningProfileEditor) {
+        PlanningProfileEditorDialog(
+            currentProfile = state.scheduleCompositionProfile,
+            editBlockedMessage = profileEditBlockedMessage,
+            updateState = scheduleCompositionProfileUpdateState,
+            onSave = onUpdateScheduleCompositionProfile,
+            onDismiss = {
+                if (!scheduleCompositionProfileUpdateState.isSaving) {
+                    showPlanningProfileEditor = false
+                    onAcknowledgeScheduleCompositionProfileUpdate()
+                }
             },
         )
     }
