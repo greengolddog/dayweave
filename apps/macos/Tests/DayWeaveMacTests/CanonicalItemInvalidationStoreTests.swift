@@ -687,7 +687,8 @@ struct CanonicalItemInvalidationStoreTests {
         #expect(context.planner.blocks.isEmpty)
         #expect(context.planner.schedulePreviewProvenance == nil)
         #expect(context.planner.publishedScheduleProof == nil)
-        #expect(try #require(context.persistence.load()).publishedScheduleProof == nil)
+        let persisted = try #require(try context.persistence.load())
+        #expect(persisted.publishedScheduleProof == nil)
         #expect(URLProtocolStub.storage.requests(
             for: token,
             includingSchedulePublication: true
