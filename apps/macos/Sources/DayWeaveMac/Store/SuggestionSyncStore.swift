@@ -156,6 +156,18 @@ final class SuggestionSyncStore: ObservableObject {
         ).configurationIdentifier
     }
 
+    /// Positive, process-local evidence that the currently configured client
+    /// completed an authenticated request. A stored origin-bound credential by
+    /// itself is intentionally not treated as verified connectivity.
+    var verifiedApplicationConfigurationIdentifier: String? {
+        guard case .online = status,
+              let current = currentApplicationConfigurationIdentifier,
+              proposalsConfigurationIdentifier == current else {
+            return nil
+        }
+        return current
+    }
+
     @discardableResult
     func applyConfiguration(baseURL: String, newToken: String) -> Bool {
         guard refreshID == nil, activeProposalIDs.isEmpty else {

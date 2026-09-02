@@ -349,6 +349,10 @@ final class PlannerStore: ObservableObject {
     @Published private(set) var publishedScheduleProof: DayWeavePublishedScheduleProof? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var onboardingFirstItemAnchor:
+        DayWeaveOnboardingFirstItemAnchor? {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localScheduleCompositionProvenance:
         LocalScheduleCompositionProvenance? {
         didSet { scheduleAutosave() }
@@ -443,6 +447,7 @@ final class PlannerStore: ObservableObject {
         let recurrenceOccurrenceMoves: [RecurrenceOccurrenceMove]
         let schedulePreviewProvenance: SchedulePreviewProvenance?
         let publishedScheduleProof: DayWeavePublishedScheduleProof?
+        let onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor?
         let localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
         let pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]
         let canonicalTrash: [DayWeaveCanonicalTrashEntry]
@@ -470,6 +475,7 @@ final class PlannerStore: ObservableObject {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
+        onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor? = nil,
         localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
@@ -550,6 +556,10 @@ final class PlannerStore: ObservableObject {
             ? publishedScheduleProof
             : restoredSnapshot?.publishedScheduleProof
         self.publishedScheduleProof = initialPublishedScheduleProof
+        let initialOnboardingFirstItemAnchor = restoredSnapshot == nil
+            ? onboardingFirstItemAnchor
+            : restoredSnapshot?.onboardingFirstItemAnchor
+        self.onboardingFirstItemAnchor = initialOnboardingFirstItemAnchor
         self.localScheduleCompositionProvenance = initialLocalScheduleCompositionProvenance
         if initialLocalScheduleCompositionProvenance?.hasValidShape == false
             || (initialSchedulePreviewProvenance != nil
@@ -624,6 +634,25 @@ final class PlannerStore: ObservableObject {
             tombstoneRevisions: initialCanonicalTombstoneRevisions,
             configurationIdentifier: initialCanonicalConfigurationIdentifier
         ) {
+            restorationError = .snapshotDecodingFailed
+        }
+        if initialOnboardingFirstItemAnchor.map({ anchor in
+            guard anchor.hasValidShape else { return true }
+            if let revision = anchor.canonicalRevision {
+                return !initialCanonicalItems.contains {
+                    $0.id == anchor.itemID
+                        && $0.revision == revision
+                        && $0.deletedAt == nil
+                }
+            }
+            return !boundedCanonicalAuthoringMutations.contains { mutation in
+                mutation.itemID == anchor.itemID
+                    && mutation.operation == .create
+                    && mutation.draft.map {
+                        $0.createsPlanningDemand(itemID: anchor.itemID)
+                    } == true
+            }
+        }) == true {
             restorationError = .snapshotDecodingFailed
         }
         let initialGoogleOutboundRecoveryJournal = restoredSnapshot == nil
@@ -1036,6 +1065,17 @@ final class PlannerStore: ObservableObject {
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
         pendingCanonicalAuthoringMutations = preservedCreates
+        if let anchor = onboardingFirstItemAnchor,
+           preservedCreates.contains(where: {
+               $0.itemID == anchor.itemID && $0.operation == .create
+           }) {
+            onboardingFirstItemAnchor = .init(
+                itemID: anchor.itemID,
+                canonicalRevision: nil
+            )
+        } else {
+            onboardingFirstItemAnchor = nil
+        }
         localCaptureDiagnostics = localCaptureDiagnostics.filter { id, _ in
             blocks.contains { $0.id == id && $0.isLocallyAuthored && $0.sourceItemID == nil }
         }
@@ -1524,6 +1564,7 @@ final class PlannerStore: ObservableObject {
                 > expectedRevision
         }
         canonicalItems = Self.hierarchicallySorted(Array(indexed.values))
+        reconcileOnboardingFirstItemAnchor()
         canonicalTrash = Self.boundedCanonicalTrash(
             canonicalTrash,
             referenceDate: now(),
@@ -1704,6 +1745,7 @@ final class PlannerStore: ObservableObject {
             referenceDate: now(),
             pinnedItemIDs: pendingCanonicalRecoveryItemIDs
         )
+        reconcileOnboardingFirstItemAnchor(authoritativeMissing: true)
         reconcileSelectedCanonicalItem()
         hardenPendingSensitivityPresentation()
     }
@@ -1759,6 +1801,7 @@ final class PlannerStore: ObservableObject {
             recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
             schedulePreviewProvenance: schedulePreviewProvenance,
             publishedScheduleProof: publishedScheduleProof,
+            onboardingFirstItemAnchor: onboardingFirstItemAnchor,
             localScheduleCompositionProvenance: localScheduleCompositionProvenance,
             pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
             canonicalTrash: canonicalTrash,
@@ -1783,6 +1826,7 @@ final class PlannerStore: ObservableObject {
         recurrenceOccurrenceMoves = preimage.recurrenceOccurrenceMoves
         schedulePreviewProvenance = preimage.schedulePreviewProvenance
         publishedScheduleProof = preimage.publishedScheduleProof
+        onboardingFirstItemAnchor = preimage.onboardingFirstItemAnchor
         localScheduleCompositionProvenance = preimage.localScheduleCompositionProvenance
         pendingCanonicalAuthoringMutations = preimage.pendingCanonicalAuthoringMutations
         canonicalTrash = preimage.canonicalTrash
@@ -1805,6 +1849,7 @@ final class PlannerStore: ObservableObject {
         canonicalTombstoneRevisions.removeValue(forKey: item.id)
         canonicalTrash.removeAll { $0.id == item.id && $0.revision < item.revision }
         canonicalItems = Self.hierarchicallySorted(canonicalItems)
+        reconcileOnboardingFirstItemAnchor()
     }
 
     func bindLocalBlock(_ blockID: UUID, to item: DayWeaveCanonicalItem) {
@@ -1876,6 +1921,32 @@ final class PlannerStore: ObservableObject {
             createdAt: now()
         )
         return try appendCanonicalAuthoringMutation(mutation)
+    }
+
+    /// Atomically designates and queues the exact reviewed onboarding item.
+    /// The content remains solely in the encrypted authoring journal; the
+    /// anchor carries only its opaque UUID until canonical reconciliation.
+    @discardableResult
+    func enqueueOnboardingFirstItemCreate(
+        itemID: UUID,
+        draft: DayWeaveCanonicalItemDraft
+    ) throws -> DayWeavePendingCanonicalAuthoringMutation {
+        guard draft.createsPlanningDemand(itemID: itemID),
+              onboardingFirstItemAnchor == nil
+                || onboardingFirstItemAnchor == .init(
+                    itemID: itemID,
+                    canonicalRevision: nil
+                ) else {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
+        let priorAnchor = onboardingFirstItemAnchor
+        onboardingFirstItemAnchor = .init(itemID: itemID, canonicalRevision: nil)
+        do {
+            return try enqueueCanonicalCreate(itemID: itemID, draft: draft)
+        } catch {
+            onboardingFirstItemAnchor = priorAnchor
+            throw error
+        }
     }
 
     @discardableResult
@@ -2129,6 +2200,12 @@ final class PlannerStore: ObservableObject {
               prior.operation == .create || prior.operation == .replace else {
             throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
         }
+        if prior.operation == .create,
+           onboardingFirstItemAnchor?.itemID == prior.itemID,
+           onboardingFirstItemAnchor?.canonicalRevision == nil,
+           !draft.createsPlanningDemand(itemID: prior.itemID) {
+            throw PlannerCanonicalAuthoringError.invalidDraft
+        }
         try validateCanonicalAuthoringDraft(draft, itemID: prior.itemID)
         let replacement = DayWeavePendingCanonicalAuthoringMutation(
             id: prior.id,
@@ -2275,12 +2352,19 @@ final class PlannerStore: ObservableObject {
             throw PlannerCanonicalAuthoringError.submittedMutationIsImmutable
         }
         let priorSelection = selectedCanonicalItemID
+        let priorOnboardingFirstItemAnchor = onboardingFirstItemAnchor
         pendingCanonicalAuthoringMutations.remove(at: index)
+        if mutation.operation == .create,
+           onboardingFirstItemAnchor?.itemID == mutation.itemID,
+           onboardingFirstItemAnchor?.canonicalRevision == nil {
+            onboardingFirstItemAnchor = nil
+        }
         reconcileSelectedCanonicalItem()
         do {
             try flushCanonicalAuthoringTransition()
         } catch {
             pendingCanonicalAuthoringMutations.insert(mutation, at: index)
+            onboardingFirstItemAnchor = priorOnboardingFirstItemAnchor
             selectedCanonicalItemID = priorSelection
             throw error
         }
@@ -2383,6 +2467,7 @@ final class PlannerStore: ObservableObject {
         let priorTrash = canonicalTrash
         let priorTombstones = canonicalTombstoneRevisions
         let priorMutations = pendingCanonicalAuthoringMutations
+        let priorOnboardingFirstItemAnchor = onboardingFirstItemAnchor
         let priorSelection = selectedCanonicalItemID
 
         switch mutation.operation {
@@ -2416,12 +2501,25 @@ final class PlannerStore: ObservableObject {
             canonicalTrash.removeAll { $0.id == response.id }
         }
         pendingCanonicalAuthoringMutations.remove(at: index)
+        if onboardingFirstItemAnchor?.itemID == response.id {
+            switch mutation.operation {
+            case .create, .replace, .restore:
+                onboardingFirstItemAnchor = .init(
+                    itemID: response.id,
+                    canonicalRevision: canonicalItem(id: response.id)?.revision
+                        ?? response.revision
+                )
+            case .trash:
+                onboardingFirstItemAnchor = nil
+            }
+        }
         selectedCanonicalItemID = response.id
         guard currentCanonicalAuthoringStateIsValid else {
             canonicalItems = priorItems
             canonicalTrash = priorTrash
             canonicalTombstoneRevisions = priorTombstones
             pendingCanonicalAuthoringMutations = priorMutations
+            onboardingFirstItemAnchor = priorOnboardingFirstItemAnchor
             selectedCanonicalItemID = priorSelection
             throw PlannerCanonicalAuthoringError.invalidMutation
         }
@@ -2432,6 +2530,7 @@ final class PlannerStore: ObservableObject {
             canonicalTrash = priorTrash
             canonicalTombstoneRevisions = priorTombstones
             pendingCanonicalAuthoringMutations = priorMutations
+            onboardingFirstItemAnchor = priorOnboardingFirstItemAnchor
             selectedCanonicalItemID = priorSelection
             throw error
         }
@@ -3346,6 +3445,69 @@ final class PlannerStore: ObservableObject {
 
     func canonicalItem(id: UUID) -> DayWeaveCanonicalItem? {
         canonicalItems.first(where: { $0.id == id })
+    }
+
+    var hasExactOnboardingFirstPlanProof: Bool {
+        onboardingFirstItemAnchor?.hasExactPublishedPlanProof(
+            canonicalItems: canonicalItems,
+            pendingAuthoringMutations: pendingCanonicalAuthoringMutations,
+            publishedScheduleProof: publishedScheduleProof
+        ) == true
+    }
+
+    private func reconcileOnboardingFirstItemAnchor(
+        authoritativeMissing: Bool = false
+    ) {
+        guard let anchor = onboardingFirstItemAnchor else { return }
+        if let item = canonicalItem(id: anchor.itemID), item.deletedAt == nil {
+            if anchor.canonicalRevision == item.revision { return }
+            let exactReviewedMutation = pendingCanonicalAuthoringMutations.contains {
+                mutation in
+                mutation.itemID == anchor.itemID
+                    && (anchor.canonicalRevision == nil
+                        ? mutation.operation == .create
+                        : mutation.operation == .create || mutation.operation == .replace)
+                    && mutation.draft.map {
+                        $0.createsPlanningDemand(itemID: anchor.itemID)
+                            && $0.matches(item)
+                    } == true
+            }
+            if exactReviewedMutation {
+                let replacement = DayWeaveOnboardingFirstItemAnchor(
+                    itemID: item.id,
+                    canonicalRevision: item.revision
+                )
+                if replacement != anchor { onboardingFirstItemAnchor = replacement }
+            } else if anchor.canonicalRevision != nil {
+                // A newer cross-device revision has not crossed this Mac's
+                // review boundary. Drop the designation instead of silently
+                // calling that revision the reviewed onboarding item.
+                onboardingFirstItemAnchor = nil
+            }
+            return
+        }
+        let wasDeleted = canonicalTombstoneRevisions[anchor.itemID] != nil
+            || canonicalTrash.contains { $0.id == anchor.itemID }
+        if wasDeleted {
+            onboardingFirstItemAnchor = nil
+            return
+        }
+        guard authoritativeMissing else { return }
+        if pendingCanonicalAuthoringMutations.contains(where: { mutation in
+            mutation.itemID == anchor.itemID
+                && mutation.operation == .create
+                && mutation.draft.map {
+                    $0.createsPlanningDemand(itemID: anchor.itemID)
+                } == true
+        }) {
+            let replacement = DayWeaveOnboardingFirstItemAnchor(
+                itemID: anchor.itemID,
+                canonicalRevision: nil
+            )
+            if replacement != anchor { onboardingFirstItemAnchor = replacement }
+        } else {
+            onboardingFirstItemAnchor = nil
+        }
     }
 
     /// Resolves inherited sensitivity and fails closed for a missing or cyclic ancestor.
@@ -4631,6 +4793,17 @@ final class PlannerStore: ObservableObject {
         pendingProposalApplicationMutation = nil
         proposalApplicationReceipts = []
         pendingCanonicalAuthoringMutations = preservedCreates
+        if let anchor = onboardingFirstItemAnchor,
+           preservedCreates.contains(where: {
+               $0.itemID == anchor.itemID && $0.operation == .create
+           }) {
+            onboardingFirstItemAnchor = .init(
+                itemID: anchor.itemID,
+                canonicalRevision: nil
+            )
+        } else {
+            onboardingFirstItemAnchor = nil
+        }
         isCanonicalPreviewValidatedForCurrentLaunch = false
         var empty = DayWeaveExecutionDurableState.empty
         empty.deviceID = deviceID
@@ -5779,6 +5952,7 @@ final class PlannerStore: ObservableObject {
             canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
             schedulePreviewProvenance: schedulePreviewProvenance,
             publishedScheduleProof: publishedScheduleProof,
+            onboardingFirstItemAnchor: onboardingFirstItemAnchor,
             localScheduleCompositionProvenance: localScheduleCompositionProvenance,
             pendingSchedulePublication: pendingSchedulePublication,
             pendingProposalApplicationMutation: pendingProposalApplicationMutation,

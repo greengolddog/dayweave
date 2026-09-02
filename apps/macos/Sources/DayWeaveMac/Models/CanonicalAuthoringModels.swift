@@ -221,6 +221,31 @@ struct DayWeaveCanonicalItemDraft: Codable, Equatable, Sendable {
         return nil
     }
 
+    /// A pure, fail-closed check for the minimum canonical shape that can add
+    /// work to a composed schedule. Keeping this beside draft validation lets
+    /// onboarding, persistence, and tests share one definition without giving
+    /// a locally queued create any canonical or publication authority.
+    func createsPlanningDemand(itemID: UUID) -> Bool {
+        guard validationIssue(itemID: itemID) == nil,
+              normalized.status == .planned else { return false }
+        let value = normalized
+        if value.kind == .event { return true }
+        guard value.durationSeconds.map({ $0 > 0 }) == true else { return false }
+        switch value.kind {
+        case .goal, .routine:
+            guard case let .object(constraints) = value.flexibleConstraints else {
+                return false
+            }
+            return constraints["has_own_effort"] == .bool(true)
+        case .task, .habit, .breakTime:
+            return true
+        case .event:
+            return true
+        case .unknown:
+            return false
+        }
+    }
+
     /// Foundation accepts convenience aliases such as `PST` and `GMT+2` that
     /// the server's IANA parser rejects. Region identifiers are accepted only
     /// when Foundation can resolve them; the explicit non-region set mirrors
@@ -425,6 +450,30 @@ struct DayWeaveCanonicalTrashEntry: Codable, Equatable, Identifiable, Sendable {
 }
 
 extension DayWeaveCanonicalItem {
+    /// Mirrors the draft-side onboarding predicate after the server has
+    /// assigned canonical execution state. Goal and routine containers count
+    /// only when their visible `has_own_effort` flag is explicitly true.
+    var createsPlanningDemand: Bool {
+        guard deletedAt == nil,
+              isExecutable,
+              status == .planned || status == .scheduled else { return false }
+        if kind == .event { return true }
+        guard durationSeconds.map({ $0 > 0 }) == true else { return false }
+        switch kind {
+        case .goal, .routine:
+            guard case let .object(constraints) = flexibleConstraints else {
+                return false
+            }
+            return constraints["has_own_effort"] == .bool(true)
+        case .task, .habit, .breakTime:
+            return true
+        case .event:
+            return true
+        case .unknown:
+            return false
+        }
+    }
+
     /// Full authoring is allowed for the typed subset whose semantic values can
     /// be reconstructed safely. Legacy background status/privacy publication
     /// intentionally keeps using the stricter lossless-replacement predicate.

@@ -2,6 +2,7 @@ import SwiftUI
 
 enum CanonicalItemEditorMode: Equatable, Sendable {
     case create(itemID: UUID)
+    case createPrepared(itemID: UUID, draft: DayWeaveCanonicalItemDraft)
     case createFromSuggestion(
         suggestionID: UUID,
         itemID: UUID,
@@ -17,6 +18,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var itemID: UUID {
         switch self {
         case let .create(itemID),
+             let .createPrepared(itemID, _),
              let .createFromSuggestion(_, itemID, _),
              let .replace(itemID, _),
              let .updatePending(_, itemID, _):
@@ -27,7 +29,8 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var initialDraft: DayWeaveCanonicalItemDraft? {
         switch self {
         case .create: nil
-        case let .createFromSuggestion(_, _, draft),
+        case let .createPrepared(_, draft),
+             let .createFromSuggestion(_, _, draft),
              let .replace(_, draft),
              let .updatePending(_, _, draft): draft
         }
@@ -36,6 +39,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var title: String {
         switch self {
         case .create: "New item"
+        case .createPrepared: "Your first planned item"
         case .createFromSuggestion: "Review Codex item draft"
         case .replace: "Edit item"
         case .updatePending: "Edit queued item"
@@ -45,6 +49,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
     var actionTitle: String {
         switch self {
         case .create: "Add to Inbox"
+        case .createPrepared: "Save planned item"
         case .createFromSuggestion: "Create item"
         case .replace: "Queue changes"
         case .updatePending: "Update queued change"
@@ -55,6 +60,8 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
         switch self {
         case .createFromSuggestion:
             "Review every field. Codex cannot create this item until you approve it here."
+        case .createPrepared:
+            "Review every field. This is encrypted locally before it can join your first plan."
         case .create, .replace, .updatePending:
             "Saved locally first. Sync applies the exact queued change later."
         }
@@ -62,7 +69,7 @@ enum CanonicalItemEditorMode: Equatable, Sendable {
 
     var allowsUnchangedDraft: Bool {
         switch self {
-        case .create, .createFromSuggestion: true
+        case .create, .createPrepared, .createFromSuggestion: true
         case .replace, .updatePending: false
         }
     }
@@ -139,7 +146,12 @@ struct CanonicalItemEditorView: View {
         }
         .frame(minWidth: 680, idealWidth: 720, minHeight: 680, idealHeight: 780)
         .onAppear {
-            if case .create = mode { titleIsFocused = true }
+            switch mode {
+            case .create, .createPrepared:
+                titleIsFocused = true
+            case .createFromSuggestion, .replace, .updatePending:
+                break
+            }
         }
         .onChange(of: state.kind) { _, _ in
             state.normalizeForKindChange()
@@ -492,7 +504,7 @@ struct CanonicalItemEditorView: View {
             return true
         }
         switch mode {
-        case .create:
+        case .create, .createPrepared:
             return false
         case .createFromSuggestion:
             return true
@@ -529,6 +541,11 @@ struct CanonicalItemEditorView: View {
             switch mode {
             case let .create(itemID):
                 try store.enqueueCanonicalCreate(itemID: itemID, draft: state.draft)
+            case let .createPrepared(itemID, _):
+                try store.enqueueOnboardingFirstItemCreate(
+                    itemID: itemID,
+                    draft: state.draft
+                )
             case let .createFromSuggestion(suggestionID, itemID, _):
                 try store.acceptCanonicalItemSuggestion(
                     suggestionID,

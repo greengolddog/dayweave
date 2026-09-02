@@ -5,6 +5,43 @@ new production profile starts with an empty plan and restores the encrypted
 snapshot synchronously before exposing actions; preview fixtures are used only
 by `PlannerStore.preview` and tests.
 
+## Guided onboarding
+
+First launch presents a resumable **Welcome & privacy → DayWeave API → Google
+resources → Schedule profile → Notifications → First item → First plan →
+Ready** flow. Until the privacy and approval boundaries are acknowledged,
+workspace surfaces remain hidden, mutation commands are unavailable, and
+network and contained Codex services stay paused. Readiness after that boundary
+is always derived from the authoritative stores rather than trusted from the
+onboarding checkpoint.
+
+- The API step requires an origin-bound credential plus a completed
+  authenticated request for the current process and configuration. Merely
+  storing a credential—or retaining an older publication proof—is not enough;
+  relaunch requires a fresh check so a previously rejected credential cannot
+  regain readiness offline.
+- The Google step requires saved, selected Calendar and Tasks resources on
+  active, sync-enabled accounts. Every participating account must complete an
+  initial import, and each selected Calendar must reach the planning projection
+  at its saved collection revision.
+- Schedule profile and notification access are informational confirmations.
+  The profile page summarizes the valid encrypted profile that will be used;
+  the notification page reports allowed, denied, or deferred permission and
+  never invents a break or opens a permission prompt during onboarding.
+- The first-item step creates or follows one reviewed planning-demand item. A
+  content-free anchor to that exact item and, after sync, its canonical revision
+  lives with the item in the encrypted planner snapshot. The first-plan step
+  succeeds only when the current exact publication proof matches the preview,
+  the complete published plan, the current API configuration, and a block for
+  that anchored item revision.
+
+**Set up later** dismisses the flow without completing it or weakening any
+gate. The current step is retained and can be resumed from the privacy
+backdrop, Today, or Settings. If the strict onboarding checkpoint is corrupt or
+from a future unsupported version, DayWeave leaves it untouched, blocks
+checkpoint writes, and offers a confirmed reset of setup progress only; planner
+data, credentials, accounts, recoveries, items, and schedules are not reset.
+
 ## Appearance
 
 **Settings → Appearance** supports the system theme plus explicit light and

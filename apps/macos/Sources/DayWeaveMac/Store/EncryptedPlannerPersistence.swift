@@ -430,11 +430,12 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// version 17 retains the selected defer target until that target passes
     /// while expiring only the server-issued assessment evidence, and version
     /// 18 adds bounded, typed, approval-only Codex canonical-item drafts plus
-    /// immutable accepted-item journal linkage. Legacy prose suggestions stay
-    /// advisory and cannot acquire create authority during migration.
+    /// immutable accepted-item journal linkage. Version 19 adds the encrypted,
+    /// content-free onboarding first-item identity and canonical revision.
+    /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 18
+    static let currentSchemaVersion = 19
 
     let schemaVersion: Int
     let savedAt: Date
@@ -470,6 +471,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let canonicalConfigurationIdentifier: String?
     let schedulePreviewProvenance: SchedulePreviewProvenance?
     let publishedScheduleProof: DayWeavePublishedScheduleProof?
+    let onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor?
     let localScheduleCompositionProvenance: LocalScheduleCompositionProvenance?
     let pendingSchedulePublication: PendingSchedulePublication?
     let pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation?
@@ -509,6 +511,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         canonicalConfigurationIdentifier: String? = nil,
         schedulePreviewProvenance: SchedulePreviewProvenance? = nil,
         publishedScheduleProof: DayWeavePublishedScheduleProof? = nil,
+        onboardingFirstItemAnchor: DayWeaveOnboardingFirstItemAnchor? = nil,
         localScheduleCompositionProvenance: LocalScheduleCompositionProvenance? = nil,
         pendingSchedulePublication: PendingSchedulePublication? = nil,
         pendingProposalApplicationMutation: DayWeavePendingProposalApplicationMutation? = nil,
@@ -557,6 +560,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.canonicalConfigurationIdentifier = canonicalConfigurationIdentifier
         self.schedulePreviewProvenance = schedulePreviewProvenance
         self.publishedScheduleProof = publishedScheduleProof
+        self.onboardingFirstItemAnchor = onboardingFirstItemAnchor
         self.localScheduleCompositionProvenance = localScheduleCompositionProvenance
         self.pendingSchedulePublication = pendingSchedulePublication
         self.pendingProposalApplicationMutation = pendingProposalApplicationMutation
@@ -645,6 +649,23 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   ),
                   googleOutboundRecoveryJournal?.hasValidShape != false,
                   localScheduleCompositionProvenance?.hasValidShape != false,
+                  (onboardingFirstItemAnchor.map { anchor in
+                      guard anchor.hasValidShape else { return false }
+                      if let revision = anchor.canonicalRevision {
+                          return (canonicalItems ?? []).contains {
+                              $0.id == anchor.itemID
+                                  && $0.revision == revision
+                                  && $0.deletedAt == nil
+                          }
+                      }
+                      return pendingCanonicalAuthoringMutations.contains { mutation in
+                          mutation.itemID == anchor.itemID
+                              && mutation.operation == .create
+                              && mutation.draft.map {
+                                  $0.createsPlanningDemand(itemID: anchor.itemID)
+                              } == true
+                      }
+                  } ?? true),
                   schedulePreviewProvenance == nil
                     || localScheduleCompositionProvenance == nil,
                   (localScheduleCompositionProvenance.map {
@@ -669,6 +690,49 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 18:
+            // Schema 18 predates the onboarding anchor. Ignore any injected
+            // value so migration cannot designate an arbitrary canonical item
+            // as the user's reviewed first item.
+            return try PlannerSnapshot(
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                localSuggestionDateHighWater: localSuggestionDateHighWater,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: pendingExecutionDeferIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                onboardingFirstItemAnchor: nil,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 17:
             // Schema 17 suggestions were prose-only. Deliberately strip any
             // injected schema-18 payload/linkage fields while preserving their

@@ -7,6 +7,7 @@ private struct DayWeaveCommands: Commands {
     @ObservedObject var store: PlannerStore
     @ObservedObject var canonicalSync: CanonicalSyncStore
     @ObservedObject var appLock: AppLockController
+    @ObservedObject var onboarding: DayWeaveOnboardingController
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
@@ -14,7 +15,11 @@ private struct DayWeaveCommands: Commands {
                 openWindow(id: "quick-capture")
             }
             .keyboardShortcut("n", modifiers: [.command, .shift])
-            .disabled(!appLock.isContentAvailable || !store.canMutatePlan)
+            .disabled(
+                !appLock.isContentAvailable
+                    || !onboarding.progress.privacyAcknowledged
+                    || !store.canMutatePlan
+            )
 
             Button("Compose on This Mac") {
                 Task { await canonicalSync.recomposeLocally() }
@@ -22,6 +27,7 @@ private struct DayWeaveCommands: Commands {
             .keyboardShortcut("r", modifiers: [.command, .option])
             .disabled(
                 !appLock.isContentAvailable
+                    || !onboarding.progress.privacyAcknowledged
                     || !store.canMutatePlan
                     || canonicalSync.isSyncing
                     || canonicalSync.isLocallyComposing
@@ -51,6 +57,7 @@ struct DayWeaveMacApp: App {
     @StateObject private var durableAuth: DurableAuthSettingsModel
     @StateObject private var appLock: AppLockController
     @StateObject private var appearance: AppearanceController
+    @StateObject private var onboarding: DayWeaveOnboardingController
     private let breakNotificationTapRouter = DayWeaveBreakNotificationTapRouter.shared
     init() {
         let store = PlannerStore.live()
@@ -121,13 +128,14 @@ struct DayWeaveMacApp: App {
         ))
         _appLock = StateObject(wrappedValue: AppLockController.live())
         _appearance = StateObject(wrappedValue: AppearanceController.live())
+        _onboarding = StateObject(wrappedValue: DayWeaveOnboardingController.live())
     }
 
     var body: some Scene {
         Window("DayWeave", id: "main") {
             Group {
                 if appLock.isContentAvailable {
-                    RootView()
+                    DayWeaveOnboardingHost()
                 } else {
                     AppLockedView()
                 }
@@ -145,6 +153,7 @@ struct DayWeaveMacApp: App {
                 .environmentObject(durableAuth)
                 .environmentObject(appLock)
                 .environmentObject(appearance)
+                .environmentObject(onboarding)
                 .preferredColorScheme(appearance.preferredColorScheme)
                 .tint(appearance.accentColor)
                 .frame(minWidth: 1_080, minHeight: 720)
@@ -169,6 +178,14 @@ struct DayWeaveMacApp: App {
                     if isAvailable, scenePhase == .active {
                         activateServices()
                         routePendingBreakNotificationTap()
+                    } else {
+                        deactivateServices()
+                        store.flushPersistence()
+                    }
+                }
+                .onChange(of: onboarding.progress.privacyAcknowledged) { _, acknowledged in
+                    if acknowledged, appLock.isContentAvailable, scenePhase == .active {
+                        activateServices()
                     } else {
                         deactivateServices()
                         store.flushPersistence()
@@ -217,17 +234,23 @@ struct DayWeaveMacApp: App {
             DayWeaveCommands(
                 store: store,
                 canonicalSync: canonicalSync,
-                appLock: appLock
+                appLock: appLock,
+                onboarding: onboarding
             )
         }
 
         Window("Quick Capture", id: "quick-capture") {
             Group {
-                if appLock.isContentAvailable {
+                if appLock.isContentAvailable,
+                   onboarding.progress.privacyAcknowledged {
                     QuickCaptureView(
                         profileTimezoneName: store.scheduleProfile.timezoneName
                     )
                         .environmentObject(store)
+                } else if appLock.isContentAvailable {
+                    DayWeaveOnboardingPrivacyBackdrop(
+                        resume: resumeOnboardingInMainWindow
+                    )
                 } else {
                     AppLockedView()
                 }
@@ -299,17 +322,23 @@ struct DayWeaveMacApp: App {
         MenuBarExtra(
             "DayWeave",
             systemImage: appLock.isContentAvailable
+                && onboarding.progress.privacyAcknowledged
                 ? (executionSync.activeSession == nil && store.activeItem == nil
                     ? "sparkles" : "timer")
                 : "lock.fill"
         ) {
             Group {
-                if appLock.isContentAvailable {
+                if appLock.isContentAvailable,
+                   onboarding.progress.privacyAcknowledged {
                     MenuBarView()
                         .environmentObject(store)
                         .environmentObject(canonicalSync)
                         .environmentObject(executionSync)
                         .environmentObject(durableAuth)
+                } else if appLock.isContentAvailable {
+                    DayWeaveOnboardingPrivacyMenuView(
+                        resume: resumeOnboardingInMainWindow
+                    )
                 } else {
                     AppLockMenuBarView()
                 }
@@ -326,7 +355,8 @@ struct DayWeaveMacApp: App {
 
         Settings {
             Group {
-                if appLock.isContentAvailable {
+                if appLock.isContentAvailable,
+                   onboarding.progress.privacyAcknowledged {
                     SettingsView()
                         .environmentObject(store)
                         .environmentObject(codex)
@@ -337,6 +367,11 @@ struct DayWeaveMacApp: App {
                         .environmentObject(googleIntegration)
                         .environmentObject(googleOutbound)
                         .environmentObject(durableAuth)
+                        .environmentObject(onboarding)
+                } else if appLock.isContentAvailable {
+                    DayWeaveOnboardingPrivacyBackdrop(
+                        resume: resumeOnboardingInMainWindow
+                    )
                 } else {
                     AppLockedView()
                 }
@@ -350,7 +385,8 @@ struct DayWeaveMacApp: App {
     }
 
     private func activateServices() {
-        guard appLock.isContentAvailable else { return }
+        guard appLock.isContentAvailable,
+              onboarding.progress.privacyAcknowledged else { return }
         googleOutbound.setPrivacyAvailable(true)
         codex.startIfNeeded()
         googleIntegration.activate()
@@ -382,6 +418,7 @@ struct DayWeaveMacApp: App {
     }
 
     private func routePendingBreakNotificationTap() {
+        guard onboarding.progress.privacyAcknowledged else { return }
         guard breakNotificationTapRouter.deliverPending(
             contentAvailable: appLock.isContentAvailable,
             route: executionSync.routeBreakNotificationTap(identifier:)
@@ -395,5 +432,30 @@ struct DayWeaveMacApp: App {
             NSApp.activate(ignoringOtherApps: true)
             openWindow(id: "main")
         }
+    }
+
+    private func resumeOnboardingInMainWindow() {
+        onboarding.present()
+        NSApp.activate(ignoringOtherApps: true)
+        openWindow(id: "main")
+    }
+}
+
+private struct DayWeaveOnboardingPrivacyMenuView: View {
+    let resume: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("Privacy review required", systemImage: "lock.shield.fill")
+                .font(.headline)
+            Text("Workspace content and network services are paused.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Resume guided setup", action: resume)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(14)
+        .frame(width: 270)
+        .accessibilityIdentifier("onboarding.privacy-menu")
     }
 }

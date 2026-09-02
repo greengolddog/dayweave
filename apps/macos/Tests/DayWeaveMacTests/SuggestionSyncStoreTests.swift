@@ -47,6 +47,34 @@ struct SuggestionSyncStoreTests {
         #expect(message.contains("no schedule changes"))
     }
 
+    @Test("stored credentials are not verified until an authenticated request succeeds")
+    func testVerifiedConfigurationRequiresSuccessfulRefresh() async throws {
+        let token = "suggestion-verification-token"
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(statusCode: 200, body: DayWeaveAPIClientTests.listEnvelope())
+        )
+        let sync = SuggestionSyncStore(
+            configurationStore: TestSuggestionConfigurationStore(
+                baseURL: "https://api.example.com/gateway"
+            ),
+            tokenStore: TestBearerTokenStore(token: token),
+            session: URLProtocolStub.makeSession()
+        )
+        let configured = try #require(sync.currentApplicationConfigurationIdentifier)
+
+        #expect(sync.verifiedApplicationConfigurationIdentifier == nil)
+        await sync.refresh()
+        #expect(sync.verifiedApplicationConfigurationIdentifier == configured)
+
+        #expect(sync.applyConfiguration(
+            baseURL: "https://other.example.com/gateway",
+            newToken: "replacement-verification-token"
+        ))
+        #expect(sync.verifiedApplicationConfigurationIdentifier == nil)
+    }
+
     @Test("malformed decision responses never remove local review intent")
     func testDecisionResponseIdentityRevisionAndStatusAreValidated() async throws {
         let token = "suggestion-mutation-validation-token"

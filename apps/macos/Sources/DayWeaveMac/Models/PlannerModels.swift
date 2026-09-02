@@ -909,6 +909,43 @@ struct SchedulePreviewProvenance: Equatable, Codable, Sendable {
     let timezoneName: String
 }
 
+/// Encrypted, content-free identity for the item explicitly created during
+/// onboarding. A nil revision means only the exact local create is retained;
+/// it cannot prove that a canonical item or a published first plan exists.
+struct DayWeaveOnboardingFirstItemAnchor: Equatable, Codable, Sendable {
+    let itemID: UUID
+    let canonicalRevision: UInt64?
+
+    var hasValidShape: Bool {
+        itemID != UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+            && canonicalRevision.map { $0 > 0 } != false
+    }
+
+    /// Core exact-item proof used in addition to the caller's full publication
+    /// provenance/freshness checks. Any pending authoring operation, including
+    /// a submitted create, fails closed.
+    func hasExactPublishedPlanProof(
+        canonicalItems: [DayWeaveCanonicalItem],
+        pendingAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation],
+        publishedScheduleProof: DayWeavePublishedScheduleProof?
+    ) -> Bool {
+        guard hasValidShape,
+              let canonicalRevision,
+              !pendingAuthoringMutations.contains(where: { $0.itemID == itemID }),
+              canonicalItems.contains(where: {
+                  $0.id == itemID
+                      && $0.revision == canonicalRevision
+                      && $0.deletedAt == nil
+                      && $0.isExecutable
+              }),
+              let publishedScheduleProof,
+              publishedScheduleProof.hasValidShape else { return false }
+        return publishedScheduleProof.publishedBlocks.contains {
+            $0.itemID == itemID && $0.itemRevision == canonicalRevision
+        }
+    }
+}
+
 /// Evidence for a schedule composed by the signed helper on this Mac. This is
 /// intentionally disjoint from `SchedulePreviewProvenance`: a local
 /// fingerprint is not a server `input_digest` and cannot authorize schedule

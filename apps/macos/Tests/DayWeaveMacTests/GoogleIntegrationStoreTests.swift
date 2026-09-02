@@ -512,6 +512,7 @@ struct GoogleIntegrationStoreTests {
         let store = Self.store(transport: transport)
         store.activate(automaticallyReload: false)
         await store.reload()
+        #expect(store.syncStatusByAccount[account.id] != nil)
 
         await store.configureSource(initial, selected: true, visible: true, role: .readOnly)
 
@@ -524,6 +525,7 @@ struct GoogleIntegrationStoreTests {
         #expect(record.role == .readOnly)
         #expect(await transport.collectionRequestCount() == 2)
         #expect(store.collectionsByAccount[account.id] == [updated])
+        #expect(store.syncStatusByAccount[account.id] == nil)
         #expect(!store.status.isFailure)
     }
 
@@ -560,12 +562,26 @@ struct GoogleIntegrationStoreTests {
     @Test("refresh composes once only after a matching completed idle run")
     func refreshComposesOnlyAfterMatchingCompletion() async throws {
         let account = try Self.account()
-        let collection = try Self.collection(accountID: account.id)
+        let configuredAt = Self.now.addingTimeInterval(-300)
+        let collection = try Self.collection(
+            accountID: account.id,
+            kind: .taskList,
+            selected: true,
+            configuredAt: configuredAt,
+            lastImportAt: configuredAt.addingTimeInterval(-60)
+        )
+        let refreshedCollection = try Self.collection(
+            accountID: account.id,
+            kind: .taskList,
+            selected: true,
+            configuredAt: configuredAt,
+            lastImportAt: Self.now.addingTimeInterval(-120)
+        )
         let requestedAt = Self.now
         let completedGate = SuspendedGoogleValue<GoogleSyncStatus>()
         let transport = FakeGoogleIntegrationTransport(
             accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
-            collections: [.value([collection])],
+            collections: [.value([collection]), .value([refreshedCollection])],
             syncStatuses: [
                 .value(try Self.syncStatus(
                     accountID: account.id,
@@ -620,6 +636,8 @@ struct GoogleIntegrationStoreTests {
 
         #expect(await completions.value() == 1)
         #expect(await transport.refreshRequestCount() == 1)
+        #expect(await transport.collectionRequestCount() == 2)
+        #expect(store.collectionsByAccount[account.id] == [refreshedCollection])
         #expect(store.status.message.contains("very large change set"))
         if case .connected = store.status {
             // Matching authoritative completion accepted.
@@ -689,7 +707,7 @@ struct GoogleIntegrationStoreTests {
         let journalStore = InMemoryGooglePendingRefreshCompletionJournalStore()
         let transport = FakeGoogleIntegrationTransport(
             accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
-            collections: [.value([collection])],
+            collections: [.value([collection]), .value([collection])],
             syncStatuses: [
                 .value(try Self.syncStatus(accountID: account.id)),
                 .value(completed),
@@ -820,7 +838,7 @@ struct GoogleIntegrationStoreTests {
             )
             let transport = FakeGoogleIntegrationTransport(
                 accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
-                collections: [.value([collection])],
+                collections: [.value([collection]), .value([collection])],
                 syncStatuses: [.value(terminal), .value(staleIdle), .value(freshIdle)],
                 refreshes: [.value(try Self.refreshAccepted(
                     accountID: account.id,
@@ -1837,9 +1855,13 @@ struct GoogleIntegrationStoreTests {
         providerAccessRole: String? = "owner",
         publishAllDay: Bool = false,
         publishTentative: Bool = false,
-        publishFree: Bool = false
+        publishFree: Bool = false,
+        configuredAt: Date? = nil,
+        lastImportAt: Date? = nil
     ) throws -> GoogleSyncCollection {
         let encodedProviderAccessRole = providerAccessRole.map { "\"\($0)\"" } ?? "null"
+        let encodedConfiguredAt = configuredAt.map { "\"\(timestamp($0))\"" } ?? "null"
+        let encodedLastImportAt = lastImportAt.map { "\"\(timestamp($0))\"" } ?? "null"
         return try decode(
             GoogleSyncCollection.self,
             """
@@ -1868,8 +1890,8 @@ struct GoogleIntegrationStoreTests {
               },
               "revision":\(revision),
               "discovered_at":"\(timestamp(now.addingTimeInterval(-3_600)))",
-              "configured_at":null,
-              "last_import_at":null,
+              "configured_at":\(encodedConfiguredAt),
+              "last_import_at":\(encodedLastImportAt),
               "planning_projection_state":"uninitialized",
               "planning_generation":0,
               "planning_collection_revision":null,

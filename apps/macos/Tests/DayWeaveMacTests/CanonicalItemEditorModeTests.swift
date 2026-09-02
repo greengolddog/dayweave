@@ -61,6 +61,29 @@ struct CanonicalItemEditorModeTests {
         #expect(!CanonicalItemEditorMode.create(itemID: itemID).preservesSensitivePresentation)
     }
 
+    @Test("a prepared first item remains an ordinary reviewed create")
+    func preparedCreateMode() {
+        let itemID = UUID(uuidString: "cc000000-0000-4000-8000-000000000002")!
+        let draft = DayWeaveCanonicalItemDraft(
+            kind: .task,
+            status: .planned,
+            title: "",
+            timezoneName: "Europe/Madrid",
+            durationSeconds: 1_800
+        )
+        let mode = CanonicalItemEditorMode.createPrepared(
+            itemID: itemID,
+            draft: draft
+        )
+
+        #expect(mode.itemID == itemID)
+        #expect(mode.initialDraft == draft)
+        #expect(mode.title == "Your first planned item")
+        #expect(mode.actionTitle == "Save planned item")
+        #expect(mode.allowsUnchangedDraft)
+        #expect(!mode.preservesSensitivePresentation)
+    }
+
     @Test("suggestion review availability closes only terminal or invalid routes")
     func suggestionReviewAvailability() {
         let suggestionID = UUID(uuidString: "ee000000-0000-4000-8000-000000000001")!

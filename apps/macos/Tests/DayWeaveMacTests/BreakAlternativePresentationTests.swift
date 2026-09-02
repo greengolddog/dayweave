@@ -578,11 +578,19 @@ struct BreakAlternativePresentationTests {
             ),
             encoding: .utf8
         )
+        let onboardingHostSource = try String(
+            contentsOf: package.appendingPathComponent(
+                "Sources/DayWeaveMac/Views/DayWeaveOnboardingHost.swift"
+            ),
+            encoding: .utf8
+        )
 
         #expect(appSource.contains("if appLock.isContentAvailable"))
-        #expect(appSource.contains("RootView()"))
+        #expect(appSource.contains("DayWeaveOnboardingHost()"))
+        #expect(onboardingHostSource.contains("RootView()"))
         #expect(rootSource.contains("BreakAlternativeHandoffView"))
         #expect(!appSource.contains("BreakAlternativeHandoffView"))
+        #expect(!onboardingHostSource.contains("BreakAlternativeHandoffView"))
     }
 
     private struct ActionFixture {

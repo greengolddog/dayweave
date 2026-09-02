@@ -1048,7 +1048,10 @@ private enum EncryptedPlannerPersistenceScenarios {
         let decoded = try decoder.decode(PlannerSnapshot.self, from: encoded)
         let migrated = try decoded.migratedToCurrentSchema()
 
-        try require(migrated.schemaVersion == 18, "Schema 17 did not migrate to schema 18")
+        try require(
+            migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion,
+            "Schema 17 did not migrate to the current planner schema"
+        )
         try require(migrated.suggestions.count == 1, "Legacy suggestion was unexpectedly dropped")
         guard case .advisory = migrated.suggestions[0].payload else {
             throw PersistenceScenarioFailure(

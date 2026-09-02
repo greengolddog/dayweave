@@ -736,10 +736,14 @@ private struct TodayView: View {
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var canonicalSync: CanonicalSyncStore
     @EnvironmentObject private var executionSync: ExecutionSyncStore
+    @EnvironmentObject private var onboarding: DayWeaveOnboardingController
 
     var body: some View {
         VStack(spacing: 0) {
             TodayHeader()
+            if !onboarding.isComplete, !onboarding.isPresented {
+                OnboardingResumeBanner()
+            }
             CanonicalSyncBanner()
             LocalCompositionBanner()
             ExecutionSyncBanner()
@@ -818,6 +822,37 @@ private struct TodayView: View {
         Button("Quick Capture") { store.isQuickAddPresented = true }
             .disabled(!store.canMutatePlan)
             .accessibilityIdentifier("today.quick-capture")
+    }
+}
+
+private struct OnboardingResumeBanner: View {
+    @EnvironmentObject private var onboarding: DayWeaveOnboardingController
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "checklist")
+                .foregroundStyle(.tint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Finish setting up DayWeave")
+                    .font(.subheadline.weight(.semibold))
+                Text("Resume at \(onboarding.currentStep.title.lowercased()).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Resume setup") {
+                onboarding.present()
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("onboarding.resume.today")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color.accentColor.opacity(0.07))
+        .overlay(alignment: .bottom) { Divider() }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("onboarding.resume-banner")
     }
 }
 
@@ -6258,6 +6293,7 @@ private struct ScheduleProfileSettingsEditor: View {
 }
 
 struct SettingsView: View {
+    @Environment(\.openWindow) private var openWindow
     @EnvironmentObject private var store: PlannerStore
     @EnvironmentObject private var codex: CodexAppServerClient
     @EnvironmentObject private var suggestionSync: SuggestionSyncStore
@@ -6268,6 +6304,7 @@ struct SettingsView: View {
     @EnvironmentObject private var durableAuth: DurableAuthSettingsModel
     @EnvironmentObject private var appLock: AppLockController
     @EnvironmentObject private var appearance: AppearanceController
+    @EnvironmentObject private var onboarding: DayWeaveOnboardingController
     @State private var dayWeaveAPIBaseURL = ""
     @State private var dayWeaveBearerToken = ""
     @State private var dayWeaveEnrollmentCode = ""
@@ -6281,6 +6318,23 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
+            if !onboarding.isComplete {
+                Section("Getting started") {
+                    LabeledContent(
+                        "Guided setup",
+                        value: onboarding.currentStep.title
+                    )
+                    Text("Setup is resumable and does not mark itself complete until a planned item and an exact first schedule are safely stored.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Resume guided setup") {
+                        onboarding.present()
+                        NSApp.activate(ignoringOtherApps: true)
+                        openWindow(id: "main")
+                    }
+                    .accessibilityIdentifier("onboarding.resume.settings")
+                }
+            }
             Section("Scheduling") {
                 Stepper(
                     "Freeze the next \(store.freezeHours) hours",

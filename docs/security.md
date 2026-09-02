@@ -33,6 +33,18 @@ effects must flow through an auditable proposal or outbox boundary.
 
 - macOS planner snapshots use AES-GCM. The encryption key is stored in the
   login Keychain, and snapshot replacement is atomic.
+- macOS guided onboarding stores only a strict, versioned, size-bounded
+  `UserDefaults` checkpoint: current and furthest step, privacy acknowledgment,
+  and completion. It contains no service URL, credential, account or resource
+  metadata, profile, item identifier or content, or schedule proof. A malformed
+  or future-version checkpoint fails closed until the user explicitly resets
+  setup progress; that reset does not touch planner data or credentials.
+- The first-item onboarding anchor is deliberately separate from that
+  preference. Its content-free item identifier and optional exact canonical
+  revision live inside the AES-GCM planner snapshot beside the canonical
+  item/mutation and publication evidence. First-item and first-plan readiness
+  require those exact records to agree; the non-secret `UserDefaults`
+  checkpoint cannot assert either milestone on its own.
 - macOS has an opt-in app-wide presentation lock backed by device-owner
   authentication (Touch ID or the Mac login password). It fails closed on cold
   start, supports immediate or configured inactivity timeouts, gates the main,

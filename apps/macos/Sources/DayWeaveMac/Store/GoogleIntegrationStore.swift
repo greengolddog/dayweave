@@ -1616,6 +1616,11 @@ final class GoogleIntegrationStore: ObservableObject {
                 throw GoogleIntegrationLocalError.invalidMutationResponse
             }
             replaceCollection(updated)
+            // Configuring a selected source increments the server's account
+            // refresh generation. The previously cached run can no longer
+            // prove that this collection revision was imported, even when
+            // server timestamps happen to compare equal.
+            syncStatusByAccount.removeValue(forKey: collection.accountID)
             trustedConfigurationIdentifier = operation.configurationIdentifier
             status = .connected(
                 updatedAt: now(),
@@ -1883,6 +1888,14 @@ final class GoogleIntegrationStore: ObservableObject {
                 guard let run = sync.run else { continue }
                 if run.state == .idle,
                    run.completedRefreshGeneration >= targetRefreshGeneration {
+                    let refreshedCollections = try await operation.transport.googleCollections(
+                        accountID: accountID
+                    )
+                    try requireCurrent(operation)
+                    guard refreshedCollections.allSatisfy({ $0.accountID == accountID }) else {
+                        throw GoogleIntegrationLocalError.invalidMutationResponse
+                    }
+                    collectionsByAccount[accountID] = Self.sortCollections(refreshedCollections)
                     let changeCounts = [
                         run.importedCount, run.updatedCount, run.deletedCount,
                     ]
