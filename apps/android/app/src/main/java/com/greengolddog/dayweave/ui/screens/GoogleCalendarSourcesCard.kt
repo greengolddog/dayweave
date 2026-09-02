@@ -300,7 +300,7 @@ fun GoogleSourcesCard(
         }
 
         Text(
-            "These controls are inbound-only. A writable Publish calendar configured on macOS can be used separately from an exact event review in Items.",
+            "These controls are inbound-only. Writable Publish calendars and task lists configured on macOS can be used separately from exact reviews in Items.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)

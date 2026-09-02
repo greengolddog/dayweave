@@ -1342,7 +1342,7 @@ data class DayWeaveUiState(
     val canonicalDeltaCursor: String? = null,
     /** Non-null only between durable staging and a strictly validated publish receipt. */
     val pendingSchedulePublication: PendingSchedulePublication? = null,
-    /** Exact reviewed Google Calendar authority; retained until enqueue is durably accepted. */
+    /** Exact reviewed Google Calendar/Tasks authority; retained until enqueue is accepted. */
     val pendingGoogleCalendarOutbound: GoogleCalendarOutboundJournal? = null,
     /** Exact apply/undo request awaiting an authoritative result. */
     val pendingProposalApplicationMutation: PendingProposalApplicationMutation? = null,

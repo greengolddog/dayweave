@@ -21,6 +21,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -31,18 +32,24 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okio.BufferedSink
 
-/** Android deliberately supports only explicitly reviewed Calendar event upserts. */
+/** Exact mutation requested by an explicitly reviewed Google outbound workflow. */
 @Serializable
 enum class GoogleCalendarOutboundOperation {
     @SerialName("upsert")
     UPSERT,
+
+    @SerialName("delete")
+    DELETE,
 }
 
-/** Android refuses every outbound entity type except a fixed Google Calendar event. */
+/** Provider entity whose exact projection is being reviewed. */
 @Serializable
 enum class GoogleCalendarOutboundEntityKind {
     @SerialName("calendar_event")
     CALENDAR_EVENT,
+
+    @SerialName("task")
+    TASK,
 }
 
 @Serializable
@@ -64,7 +71,7 @@ data class RemoteGoogleOutboundPreview(
 ) {
     /** Provider payloads contain private event content and must never enter diagnostics. */
     override fun toString(): String =
-        "RemoteGoogleOutboundPreview(entityKind=CALENDAR_EVENT, operation=UPSERT, " +
+        "RemoteGoogleOutboundPreview(entityKind=$entityKind, operation=$operation, " +
             "providerPayload=<redacted>)"
 }
 
@@ -91,7 +98,7 @@ private data class GoogleCalendarOutboundPreviewRequest(
     @SerialName("collection_id") val collectionId: String,
     @SerialName("item_id") val itemId: String,
     @SerialName("expected_item_revision") val expectedItemRevision: Long,
-    val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
+    val operation: GoogleCalendarOutboundOperation,
 )
 
 @Serializable
@@ -104,11 +111,11 @@ private data class GoogleCalendarOutboundEnqueueRequest(
     @SerialName("collection_id") val collectionId: String,
     @SerialName("item_id") val itemId: String,
     @SerialName("expected_item_revision") val expectedItemRevision: Long,
-    val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
+    val operation: GoogleCalendarOutboundOperation,
     @SerialName("approval_capability") val approvalCapability: String,
 ) {
     override fun toString(): String =
-        "GoogleCalendarOutboundEnqueueRequest(operation=UPSERT, " +
+        "GoogleCalendarOutboundEnqueueRequest(operation=$operation, " +
             "approvalCapability=<redacted>)"
 }
 
@@ -134,20 +141,20 @@ sealed class GoogleCalendarOutboundApiException(message: String) : IOException(m
         GoogleCalendarOutboundApiException("The DayWeave API rejected the bearer token")
 
     class NotFound :
-        GoogleCalendarOutboundApiException("The Google Calendar publication target was not found")
+        GoogleCalendarOutboundApiException("The Google publication target was not found")
 
     class Conflict :
-        GoogleCalendarOutboundApiException("The Google Calendar publication authority changed")
+        GoogleCalendarOutboundApiException("The Google publication authority changed")
 
     class Validation(val statusCode: Int) : GoogleCalendarOutboundApiException(
-        "The DayWeave API rejected the Google Calendar publication with HTTP $statusCode",
+        "The DayWeave API rejected the Google publication with HTTP $statusCode",
     )
 
     class Upstream :
-        GoogleCalendarOutboundApiException("Google Calendar could not be reached by the server")
+        GoogleCalendarOutboundApiException("Google could not be reached by the server")
 
     class Unavailable :
-        GoogleCalendarOutboundApiException("Google Calendar publication is unavailable")
+        GoogleCalendarOutboundApiException("Google publication is unavailable")
 
     class Http(val statusCode: Int) : GoogleCalendarOutboundApiException(
         "The DayWeave API returned HTTP $statusCode",
@@ -155,7 +162,7 @@ sealed class GoogleCalendarOutboundApiException(message: String) : IOException(m
 
     /** Deliberately carries no decoder cause because it may contain private response material. */
     class InvalidResponse : GoogleCalendarOutboundApiException(
-        "The DayWeave API returned an unreadable Google Calendar publication response",
+        "The DayWeave API returned an unreadable Google publication response",
     )
 }
 
@@ -166,6 +173,7 @@ interface GoogleCalendarOutboundTransport {
         collectionId: String,
         itemId: String,
         expectedItemRevision: Long,
+        operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
     ): RemoteGoogleOutboundPreview
 
     suspend fun approve(
@@ -182,6 +190,7 @@ interface GoogleCalendarOutboundTransport {
         itemId: String,
         expectedItemRevision: Long,
         approvalCapability: String,
+        operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
     ): RemoteGoogleOutboundAccepted
 }
 
@@ -201,6 +210,7 @@ class OkHttpGoogleCalendarOutboundTransport(
         collectionId: String,
         itemId: String,
         expectedItemRevision: Long,
+        operation: GoogleCalendarOutboundOperation,
     ): RemoteGoogleOutboundPreview {
         requireOutboundIdentity(accountId, "Google account ID")
         requireOutboundIdentity(collectionId, "Google collection ID")
@@ -210,6 +220,7 @@ class OkHttpGoogleCalendarOutboundTransport(
             collectionId = collectionId,
             itemId = itemId,
             expectedItemRevision = expectedItemRevision,
+            operation = operation,
         )
         val url = accountUrl(configuration, accountId)
             .addPathSegments("outbound/previews")
@@ -226,8 +237,7 @@ class OkHttpGoogleCalendarOutboundTransport(
             preview.collectionId != collectionId ||
             preview.itemId != itemId ||
             preview.itemRevision != expectedItemRevision ||
-            preview.entityKind != GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ||
-            preview.operation != GoogleCalendarOutboundOperation.UPSERT
+            preview.operation != operation
         ) {
             throw GoogleCalendarOutboundApiException.InvalidResponse()
         }
@@ -271,6 +281,7 @@ class OkHttpGoogleCalendarOutboundTransport(
         itemId: String,
         expectedItemRevision: Long,
         approvalCapability: String,
+        operation: GoogleCalendarOutboundOperation,
     ): RemoteGoogleOutboundAccepted {
         requireOutboundIdentity(accountId, "Google account ID")
         requireOutboundIdentity(collectionId, "Google collection ID")
@@ -283,6 +294,7 @@ class OkHttpGoogleCalendarOutboundTransport(
             collectionId = collectionId,
             itemId = itemId,
             expectedItemRevision = expectedItemRevision,
+            operation = operation,
             approvalCapability = approvalCapability,
         )
         val url = accountUrl(configuration, accountId).addPathSegment("outbound").build()
@@ -423,7 +435,8 @@ private fun String.toOneShotOutboundRequestBody(contentType: MediaType): Request
 
 private fun validatePreview(preview: RemoteGoogleOutboundPreview) {
     val providerBindingIsValid = when {
-        preview.providerResourceId == null && preview.providerEtag == null -> true
+        preview.operation == GoogleCalendarOutboundOperation.UPSERT &&
+            preview.providerResourceId == null && preview.providerEtag == null -> true
         preview.providerResourceId != null && preview.providerEtag != null ->
             validOutboundText(preview.providerResourceId, 2_048) &&
                 validOutboundText(preview.providerEtag, 2_048)
@@ -439,9 +452,21 @@ private fun validatePreview(preview: RemoteGoogleOutboundPreview) {
         validOutboundText(preview.collectionDisplayName, 4_096) &&
         providerBindingIsValid &&
         validOutboundHash(preview.previewHash) &&
-        preview.providerPayload.isNotEmpty() &&
-        validProviderPayload(preview.providerPayload) &&
-        validPrivateFixedCalendarEvent(preview.providerPayload) &&
+        validProviderPayload(
+            preview.providerPayload,
+            maximumValueStringBytes = if (
+                preview.entityKind == GoogleCalendarOutboundEntityKind.TASK
+            ) {
+                MAX_TASK_VALUE_STRING_BYTES
+            } else {
+                MAX_PROVIDER_VALUE_STRING_BYTES
+            },
+        ) &&
+        validOutboundProviderProjection(
+            preview.providerPayload,
+            preview.entityKind,
+            preview.operation,
+        ) &&
         outboundInstantOrNull(preview.expiresAt) != null
     if (!valid) throw GoogleCalendarOutboundApiException.InvalidResponse()
 }
@@ -513,7 +538,10 @@ private fun validOutboundCapability(value: String): Boolean {
     }
 }
 
-private fun validProviderPayload(payload: JsonObject): Boolean {
+private fun validProviderPayload(
+    payload: JsonObject,
+    maximumValueStringBytes: Int = MAX_PROVIDER_VALUE_STRING_BYTES,
+): Boolean {
     var nodes = 0
     var stringBytes = 0L
 
@@ -543,7 +571,7 @@ private fun validProviderPayload(payload: JsonObject): Boolean {
             is JsonPrimitive -> if (element.isString) {
                 consumeString(
                     element.content,
-                    MAX_PROVIDER_VALUE_STRING_BYTES,
+                    maximumValueStringBytes,
                     forbidControls = false,
                 )
             } else {
@@ -555,6 +583,87 @@ private fun validProviderPayload(payload: JsonObject): Boolean {
     }
 
     return payload.size <= MAX_PROVIDER_CONTAINER_ENTRIES && validate(payload, depth = 0)
+}
+
+private fun validOutboundProviderProjection(
+    payload: JsonObject,
+    entityKind: GoogleCalendarOutboundEntityKind,
+    operation: GoogleCalendarOutboundOperation,
+): Boolean = when (operation) {
+    GoogleCalendarOutboundOperation.DELETE -> payload.isEmpty()
+    GoogleCalendarOutboundOperation.UPSERT -> when (entityKind) {
+        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ->
+            payload.isNotEmpty() && validPrivateFixedCalendarEvent(payload)
+        GoogleCalendarOutboundEntityKind.TASK ->
+            payload.isNotEmpty() && validGoogleTaskPreviewPayload(payload)
+    }
+}
+
+/**
+ * Exact review-only projection of the server's Google Task. Provider-managed hierarchy, links,
+ * update metadata, deletion state, and hidden state must remain inert.
+ */
+private fun validGoogleTaskPreviewPayload(payload: JsonObject): Boolean {
+    if (payload.keys != GOOGLE_TASK_ROOT_KEYS) return false
+    val id = payload["id"].outboundStringOrNull()
+    val title = payload["title"].outboundStringOrNull()
+    val status = payload["status"].outboundStringOrNull()
+    val completed = payload["completed"]
+    return id != null && id.isEmpty() &&
+        payload["etag"] == JsonNull &&
+        title != null && validGoogleTaskTitle(title) &&
+        validGoogleTaskNotes(payload["notes"]) &&
+        status in setOf("needsAction", "completed") &&
+        validGoogleTaskTimestamp(payload["due"], required = false) &&
+        validGoogleTaskTimestamp(completed, required = status == "completed") &&
+        (status == "completed") == (completed != JsonNull) &&
+        payload["updated"] == JsonNull &&
+        payload["parent"] == JsonNull &&
+        payload["position"] == JsonNull &&
+        payload["links"] == JsonNull &&
+        payload["deleted"].outboundBooleanOrNull() == false &&
+        payload["hidden"].outboundBooleanOrNull() == false
+}
+
+private fun validGoogleTaskTitle(value: String): Boolean =
+    value.isNotEmpty() &&
+        value.codePointCount(0, value.length) <= MAX_GOOGLE_TASK_TITLE_CODE_POINTS &&
+        value == value.trim()
+
+private fun validGoogleTaskNotes(value: JsonElement?): Boolean = when (value) {
+    JsonNull -> true
+    is JsonPrimitive -> value.isString && value.content.let { notes ->
+        notes.isNotEmpty() &&
+            notes.codePointCount(0, notes.length) <= MAX_GOOGLE_TASK_NOTES_CODE_POINTS &&
+            notes == notes.trim() &&
+            notes.all { character -> character == '\n' || !character.isISOControl() } &&
+            notes.split('\n').all { line -> line.isNotEmpty() && line == line.trim() } &&
+            !containsLegacyGoogleTaskMarker(notes)
+    }
+    else -> false
+}
+
+private fun containsLegacyGoogleTaskMarker(value: String): Boolean {
+    val lower = value.lowercase()
+    var searchFrom = 0
+    while (searchFrom < lower.length) {
+        val marker = lower.indexOf("[dayweave", startIndex = searchFrom)
+        if (marker < 0) return false
+        var suffix = marker + "[dayweave".length
+        while (suffix < lower.length && lower[suffix].isWhitespace()) suffix += 1
+        if (lower.startsWith("item:", startIndex = suffix)) return true
+        searchFrom = marker + "[dayweave".length
+    }
+    return false
+}
+
+private fun validGoogleTaskTimestamp(value: JsonElement?, required: Boolean): Boolean = when (value) {
+    JsonNull -> !required
+    is JsonPrimitive -> value.isString && value.content.let { timestamp ->
+        timestamp.isNotEmpty() && timestamp.toByteArray(StandardCharsets.UTF_8).size <= 64 &&
+            offsetDateTimeOrNull(timestamp) != null
+    }
+    else -> false
 }
 
 /**
@@ -649,6 +758,9 @@ private fun JsonElement?.outboundStringOrNull(): String? = when (this) {
     is JsonPrimitive -> content.takeIf { isString }
     else -> null
 }
+
+private fun JsonElement?.outboundBooleanOrNull(): Boolean? =
+    (this as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
 
 private fun offsetDateTimeOrNull(value: String): OffsetDateTime? = try {
     OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
@@ -787,11 +899,14 @@ private const val MAX_PROVIDER_STRING_BYTES = 1024L * 1024L
 private const val MAX_PROVIDER_CONTAINER_ENTRIES = 10_000
 private const val MAX_PROVIDER_KEY_BYTES = 1_024
 private const val MAX_PROVIDER_VALUE_STRING_BYTES = 256 * 1_024
+private const val MAX_TASK_VALUE_STRING_BYTES = 400_000
 private const val MAX_PROVIDER_NUMBER_BYTES = 128
 private const val MAX_CALENDAR_SUMMARY_BYTES = 8 * 1024
 private const val MAX_CALENDAR_SUMMARY_CODE_POINTS = 500
 private const val MAX_CALENDAR_DESCRIPTION_BYTES = 256 * 1024
 private const val MAX_CALENDAR_DESCRIPTION_CODE_POINTS = 100_000
+private const val MAX_GOOGLE_TASK_TITLE_CODE_POINTS = 500
+private const val MAX_GOOGLE_TASK_NOTES_CODE_POINTS = 100_000
 private const val MIN_CALENDAR_EVENT_ID_CHARS = 66
 private const val MAX_CALENDAR_EVENT_ID_CHARS = 73
 private const val DAYWEAVE_OWNERSHIP_PROOF_KEY = "dayweaveOwnershipProof"
@@ -821,4 +936,19 @@ private val CALENDAR_EVENT_ROOT_KEYS = setOf(
 )
 private val CALENDAR_EXTENDED_PROPERTY_KEYS = setOf("private", "shared")
 private val CALENDAR_PRIVATE_PROPERTY_KEYS = setOf(DAYWEAVE_OWNERSHIP_PROOF_KEY)
+private val GOOGLE_TASK_ROOT_KEYS = setOf(
+    "id",
+    "etag",
+    "title",
+    "notes",
+    "status",
+    "due",
+    "completed",
+    "updated",
+    "parent",
+    "position",
+    "links",
+    "deleted",
+    "hidden",
+)
 private val ZERO_OUTBOUND_UUID = UUID(0, 0)

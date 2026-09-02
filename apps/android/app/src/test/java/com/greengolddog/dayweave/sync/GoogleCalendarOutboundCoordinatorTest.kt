@@ -4,6 +4,7 @@ import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalEventTimingDraft
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalRecentlyDeletedRecord
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundApprovalCapability
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
@@ -62,6 +63,7 @@ class GoogleCalendarOutboundCoordinatorTest {
                     assertEquals(COLLECTION_ID, call.collectionId)
                     assertEquals(ITEM_ID, call.itemId)
                     assertEquals(ITEM_REVISION, call.expectedItemRevision)
+                    assertEquals(GoogleCalendarOutboundOperation.UPSERT, call.operation)
                     validPreview()
                 }
             }
@@ -90,6 +92,131 @@ class GoogleCalendarOutboundCoordinatorTest {
             assertTrue(transport.approvalCalls.isEmpty())
             assertTrue(transport.enqueueCalls.isEmpty())
         }
+
+    @Test
+    fun taskUpsertUsesTaskScopeListAndExactOneShotRecoveryContract() = runBlocking {
+        val store = PlannerStore(outboundState(item = canonicalTask()))
+        val transport = FakeGoogleOutboundTransport().apply {
+            onPreview = { call ->
+                val persisted = requireNotNull(
+                    store.durableState.value?.pendingGoogleCalendarOutbound,
+                )
+                assertEquals(GoogleCalendarOutboundStage.INTENT, persisted.stage)
+                assertEquals(GoogleCalendarOutboundEntityKind.TASK, persisted.entityKind)
+                assertEquals(GoogleCalendarOutboundOperation.UPSERT, persisted.operation)
+                assertEquals(GoogleCalendarOutboundOperation.UPSERT, call.operation)
+                validTaskPreview()
+            }
+            onApproval = { validApproval() }
+            onEnqueue = { call ->
+                assertEquals(GoogleCalendarOutboundOperation.UPSERT, call.operation)
+                assertEquals(TASK_LIST_ID, call.collectionId)
+                assertEquals(CAPABILITY, call.approvalCapability)
+                RemoteGoogleOutboundAccepted(OUTBOX_ID, replayed = false)
+            }
+        }
+        val coordinator = coordinator(
+            store = store,
+            transport = transport,
+            accounts = accountState(taskAccountSummary()),
+            imports = importState(taskListCollection()),
+        )
+
+        assertEquals(listOf(TASK_TARGET), coordinator.targetsFor(ITEM_ID).map { it.target })
+        assertEquals(
+            GoogleCalendarOutboundOutcome.PREVIEW_READY,
+            coordinator.preparePreview(ITEM_ID, TASK_TARGET),
+        )
+        val confirmation = requireNotNull(coordinator.approvalConfirmation())
+        assertEquals(
+            GoogleCalendarOutboundOutcome.ACCEPTED,
+            coordinator.approveAndEnqueue(confirmation),
+        )
+        assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
+        assertTrue(coordinator.state.value.message.contains("Google Tasks"))
+        assertEquals(1, transport.previewCalls.size)
+        assertEquals(1, transport.approvalCalls.size)
+        assertEquals(1, transport.enqueueCalls.size)
+    }
+
+    @Test
+    fun retainedCalendarAndTaskDeletionBindDeleteThroughPreviewAndEnqueue() = runBlocking {
+        val cases = listOf(
+            DeletionCase(
+                item = canonicalEvent().asDeleted(),
+                entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                target = TARGET.copy(operation = GoogleCalendarOutboundOperation.DELETE),
+                account = accountSummary(),
+                collection = writableCollection(),
+                preview = validDeletionPreview(
+                    entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                    collectionId = COLLECTION_ID,
+                    collectionName = "Private calendar",
+                ),
+            ),
+            DeletionCase(
+                item = canonicalTask().asDeleted(),
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                target = TASK_TARGET.copy(operation = GoogleCalendarOutboundOperation.DELETE),
+                account = taskAccountSummary(),
+                collection = taskListCollection(),
+                preview = validDeletionPreview(
+                    entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                    collectionId = TASK_LIST_ID,
+                    collectionName = "Personal tasks",
+                ),
+            ),
+        )
+
+        cases.forEach { case ->
+            val retained = CanonicalRecentlyDeletedRecord(
+                id = case.item.id,
+                revision = case.item.revision,
+                deletedAt = requireNotNull(case.item.deletedAt),
+                lastKnownItem = case.item,
+                effectiveIsSensitive = case.item.isSensitive,
+                retentionAnchorAt = case.item.deletedAt,
+            )
+            val store = PlannerStore(
+                outboundState(item = case.item).copy(
+                    canonicalItems = emptyList(),
+                    canonicalRecentlyDeleted = listOf(retained),
+                ),
+            )
+            val transport = FakeGoogleOutboundTransport().apply {
+                onPreview = { call ->
+                    assertEquals(GoogleCalendarOutboundOperation.DELETE, call.operation)
+                    case.preview
+                }
+                onApproval = { validApproval() }
+                onEnqueue = { call ->
+                    assertEquals(GoogleCalendarOutboundOperation.DELETE, call.operation)
+                    RemoteGoogleOutboundAccepted(OUTBOX_ID, replayed = false)
+                }
+            }
+            val coordinator = coordinator(
+                store = store,
+                transport = transport,
+                accounts = accountState(case.account),
+                imports = importState(case.collection),
+            )
+
+            assertEquals(listOf(case.target), coordinator.targetsFor(ITEM_ID).map { it.target })
+            assertEquals(
+                GoogleCalendarOutboundOutcome.PREVIEW_READY,
+                coordinator.preparePreview(ITEM_ID, case.target),
+            )
+            assertEquals(
+                case.entityKind,
+                store.durableState.value?.pendingGoogleCalendarOutbound?.entityKind,
+            )
+            assertEquals(
+                GoogleCalendarOutboundOutcome.ACCEPTED,
+                coordinator.approveAndEnqueue(requireNotNull(coordinator.approvalConfirmation())),
+            )
+            assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
+        }
+    }
 
     @Test
     fun prepareRequiresCurrentEligibleCandidateAndExactAuthoritativeWritableTarget() = runBlocking {
@@ -871,6 +998,46 @@ class GoogleCalendarOutboundCoordinatorTest {
         )
     }
 
+    private fun canonicalTask(): CanonicalItemSnapshot {
+        val draft = CanonicalItemDraft(
+            placement = CanonicalDraftPlacement.PLANNED,
+            kind = ItemKind.TASK,
+            title = "Private task",
+            notes = "Private task notes",
+            timezoneName = "Europe/Paris",
+            durationSeconds = 1_800,
+            deadlineAt = "2026-09-03T12:00:00Z",
+        )
+        return CanonicalItemSnapshot(
+            id = ITEM_ID,
+            kind = "task",
+            status = "planned",
+            title = draft.title,
+            notes = draft.notes,
+            timezoneName = draft.timezoneName,
+            durationSeconds = draft.durationSeconds,
+            deadlineAt = draft.deadlineAt,
+            flexibleConstraintsJson = draft.constraints.toCanonicalJson(
+                eventTiming = null,
+                durationSeconds = draft.durationSeconds,
+                timezoneName = draft.timezoneName,
+            ).toString(),
+            splitPolicyJson = draft.split.toCanonicalJson(draft.durationSeconds).toString(),
+            importance = draft.importance,
+            urgency = draft.urgency,
+            siblingOrder = draft.siblingOrder,
+            isExecutable = true,
+            revision = ITEM_REVISION,
+            createdAt = "2026-09-02T09:00:00Z",
+            updatedAt = "2026-09-02T09:00:00Z",
+        )
+    }
+
+    private fun CanonicalItemSnapshot.asDeleted(): CanonicalItemSnapshot = copy(
+        deletedAt = "2026-09-02T11:00:00Z",
+        updatedAt = "2026-09-02T11:00:00Z",
+    )
+
     private fun accountSummary() = GoogleAccountSummary(
         id = ACCOUNT_ID,
         label = "Private Gmail",
@@ -882,6 +1049,13 @@ class GoogleCalendarOutboundCoordinatorTest {
         hasTasks = false,
         hasTasksWriteScope = false,
         revision = 3,
+    )
+
+    private fun taskAccountSummary() = accountSummary().copy(
+        hasCalendar = false,
+        hasCalendarWriteScope = false,
+        hasTasks = true,
+        hasTasksWriteScope = true,
     )
 
     private fun accountState(
@@ -910,6 +1084,13 @@ class GoogleCalendarOutboundCoordinatorTest {
         providerAccessRole = "owner",
     )
 
+    private fun taskListCollection() = writableCollection().copy(
+        id = TASK_LIST_ID,
+        displayName = "Personal tasks",
+        kind = RemoteGoogleCollectionKind.TASK_LIST,
+        providerAccessRole = null,
+    )
+
     private fun importState(
         collection: GoogleImportCollectionState = writableCollection(),
         configurationId: String = CONFIGURATION_A,
@@ -932,6 +1113,7 @@ class GoogleCalendarOutboundCoordinatorTest {
         collectionId = COLLECTION_ID,
         itemId = ITEM_ID,
         expectedItemRevision = ITEM_REVISION,
+        entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
         intentExpiresAt = "2026-09-02T12:30:00Z",
         createdAt = NOW.toString(),
     )
@@ -956,6 +1138,44 @@ class GoogleCalendarOutboundCoordinatorTest {
         providerEtag = null,
         previewHash = PREVIEW_HASH,
         providerPayload = VALID_PAYLOAD,
+        expiresAt = "2026-09-02T12:20:00Z",
+    )
+
+    private fun validTaskPreview() = RemoteGoogleOutboundPreview(
+        id = PREVIEW_ID,
+        accountId = ACCOUNT_ID,
+        collectionId = TASK_LIST_ID,
+        collectionRevision = COLLECTION_REVISION,
+        collectionDisplayName = "Personal tasks",
+        itemId = ITEM_ID,
+        itemRevision = ITEM_REVISION,
+        entityKind = GoogleCalendarOutboundEntityKind.TASK,
+        operation = GoogleCalendarOutboundOperation.UPSERT,
+        providerResourceId = null,
+        providerEtag = null,
+        previewHash = PREVIEW_HASH,
+        providerPayload = VALID_TASK_PAYLOAD,
+        expiresAt = "2026-09-02T12:20:00Z",
+    )
+
+    private fun validDeletionPreview(
+        entityKind: GoogleCalendarOutboundEntityKind,
+        collectionId: String,
+        collectionName: String,
+    ) = RemoteGoogleOutboundPreview(
+        id = PREVIEW_ID,
+        accountId = ACCOUNT_ID,
+        collectionId = collectionId,
+        collectionRevision = COLLECTION_REVISION,
+        collectionDisplayName = collectionName,
+        itemId = ITEM_ID,
+        itemRevision = ITEM_REVISION,
+        entityKind = entityKind,
+        operation = GoogleCalendarOutboundOperation.DELETE,
+        providerResourceId = "provider-resource",
+        providerEtag = "provider-etag",
+        previewHash = PREVIEW_HASH,
+        providerPayload = JsonObject(emptyMap()),
         expiresAt = "2026-09-02T12:20:00Z",
     )
 
@@ -995,6 +1215,15 @@ class GoogleCalendarOutboundCoordinatorTest {
         val collection: GoogleImportCollectionState,
     )
 
+    private data class DeletionCase(
+        val item: CanonicalItemSnapshot,
+        val entityKind: GoogleCalendarOutboundEntityKind,
+        val target: GoogleCalendarOutboundTarget,
+        val account: GoogleAccountSummary,
+        val collection: GoogleImportCollectionState,
+        val preview: RemoteGoogleOutboundPreview,
+    )
+
     private enum class LateResponseFence {
         PRIVACY,
         BINDING,
@@ -1009,6 +1238,7 @@ class GoogleCalendarOutboundCoordinatorTest {
         const val OTHER_RECOVERY_ID = "99999999-9999-4999-8999-999999999999"
         const val ACCOUNT_ID = "22222222-2222-4222-8222-222222222222"
         const val COLLECTION_ID = "33333333-3333-4333-8333-333333333333"
+        const val TASK_LIST_ID = "38383838-3838-4383-8383-383838383838"
         const val ITEM_ID = "44444444-4444-4444-8444-444444444444"
         const val PREVIEW_ID = "55555555-5555-4555-8555-555555555555"
         const val OTHER_PREVIEW_ID = "66666666-6666-4666-8666-666666666666"
@@ -1026,6 +1256,12 @@ class GoogleCalendarOutboundCoordinatorTest {
             accountId = ACCOUNT_ID,
             collectionId = COLLECTION_ID,
             collectionRevision = COLLECTION_REVISION,
+        )
+        val TASK_TARGET = GoogleCalendarOutboundTarget(
+            accountId = ACCOUNT_ID,
+            collectionId = TASK_LIST_ID,
+            collectionRevision = COLLECTION_REVISION,
+            entityKind = GoogleCalendarOutboundEntityKind.TASK,
         )
         val VALID_PAYLOAD: JsonObject = Json.parseToJsonElement(
             """
@@ -1053,6 +1289,25 @@ class GoogleCalendarOutboundCoordinatorTest {
                 "private":{"dayweaveOwnershipProof":"$OWNERSHIP_PROOF"},
                 "shared":{}
               }
+            }
+            """.trimIndent(),
+        ) as JsonObject
+        val VALID_TASK_PAYLOAD: JsonObject = Json.parseToJsonElement(
+            """
+            {
+              "id":"",
+              "etag":null,
+              "title":"Private task",
+              "notes":"Private task notes",
+              "status":"needsAction",
+              "due":"2026-09-03T12:00:00Z",
+              "completed":null,
+              "updated":null,
+              "parent":null,
+              "position":null,
+              "links":null,
+              "deleted":false,
+              "hidden":false
             }
             """.trimIndent(),
         ) as JsonObject
@@ -1098,6 +1353,7 @@ private data class PreviewCall(
     val collectionId: String,
     val itemId: String,
     val expectedItemRevision: Long,
+    val operation: GoogleCalendarOutboundOperation,
 )
 
 private data class ApprovalCall(
@@ -1112,6 +1368,7 @@ private data class EnqueueCall(
     val itemId: String,
     val expectedItemRevision: Long,
     val approvalCapability: String,
+    val operation: GoogleCalendarOutboundOperation,
 )
 
 private class FakeGoogleOutboundTransport : GoogleCalendarOutboundTransport {
@@ -1134,8 +1391,15 @@ private class FakeGoogleOutboundTransport : GoogleCalendarOutboundTransport {
         collectionId: String,
         itemId: String,
         expectedItemRevision: Long,
+        operation: GoogleCalendarOutboundOperation,
     ): RemoteGoogleOutboundPreview {
-        val call = PreviewCall(accountId, collectionId, itemId, expectedItemRevision)
+        val call = PreviewCall(
+            accountId,
+            collectionId,
+            itemId,
+            expectedItemRevision,
+            operation,
+        )
         previewCalls += call
         return onPreview(call)
     }
@@ -1158,6 +1422,7 @@ private class FakeGoogleOutboundTransport : GoogleCalendarOutboundTransport {
         itemId: String,
         expectedItemRevision: Long,
         approvalCapability: String,
+        operation: GoogleCalendarOutboundOperation,
     ): RemoteGoogleOutboundAccepted {
         val call = EnqueueCall(
             accountId,
@@ -1165,6 +1430,7 @@ private class FakeGoogleOutboundTransport : GoogleCalendarOutboundTransport {
             itemId,
             expectedItemRevision,
             approvalCapability,
+            operation,
         )
         enqueueCalls += call
         return onEnqueue(call)

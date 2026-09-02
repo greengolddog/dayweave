@@ -57,9 +57,12 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V12 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V13 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V12 -> decodeCurrentSnapshot(
+                migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
+            )
             PlannerSnapshotFormats.JSON_V11 -> decodeCurrentSnapshot(
-                payload = snapshot.payload,
+                payload = migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
                 requireFirmHorizonDaysField = false,
                 // V11 provenance was one-day only; a relabeled newer record has no authority.
             ).copy(localScheduleCompositionProvenance = null)
@@ -169,7 +172,8 @@ class RoomPlannerStateRepository(
         }
         val outboundHardened = if (
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11 ||
-            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V12
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V12 ||
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V13
         ) {
             decoded
         } else {
@@ -186,7 +190,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V12 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V13 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -207,14 +211,36 @@ class RoomPlannerStateRepository(
         validateSchedulePublicationState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
-        validateGoogleCalendarOutboundState(retainedState)
+        validateGoogleOutboundState(retainedState)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V12,
+                payloadFormat = PlannerSnapshotFormats.JSON_V13,
             ),
+        )
+    }
+
+    /**
+     * V11 and V12 could authorize only Calendar-event upserts. Normalize that historical
+     * authority before the generalized v13 model is decoded, so a relabeled old payload cannot
+     * acquire Task or delete authority through injected fields.
+     */
+    private fun migrateLegacyCalendarOutboundSnapshot(payload: String): String {
+        val root = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
+        val legacyJournal = root["pendingGoogleCalendarOutbound"]
+        if (legacyJournal !is JsonObject) return payload
+        val normalizedJournal = JsonObject(
+            (legacyJournal - "entityKind") + mapOf(
+                "schemaVersion" to JsonPrimitive(2),
+                "entityKind" to JsonPrimitive("calendar_event"),
+                "operation" to JsonPrimitive("upsert"),
+            ),
+        )
+        return SNAPSHOT_JSON.encodeToString(
+            JsonObject.serializer(),
+            JsonObject(root + ("pendingGoogleCalendarOutbound" to normalizedJournal)),
         )
     }
 
@@ -314,7 +340,7 @@ class RoomPlannerStateRepository(
             requireGoogleCalendarOutboundField &&
             !root.containsKey("pendingGoogleCalendarOutbound")
         ) {
-            throw SerializationException("Current Google Calendar outbound recovery is required")
+            throw SerializationException("Current Google outbound recovery is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -365,7 +391,7 @@ class RoomPlannerStateRepository(
                 validateSchedulePublicationState(it)
                 validateProposalApplicationState(it)
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
-                validateGoogleCalendarOutboundState(it)
+                validateGoogleOutboundState(it)
             }
     }
 
@@ -852,7 +878,7 @@ class RoomPlannerStateRepository(
     }
 
     /** The one-time provider capability must stay inside one exact canonical API binding. */
-    private fun validateGoogleCalendarOutboundState(state: DayWeaveUiState) {
+    private fun validateGoogleOutboundState(state: DayWeaveUiState) {
         val journal = state.pendingGoogleCalendarOutbound ?: return
         try {
             journal.requireValidShape()
@@ -860,11 +886,11 @@ class RoomPlannerStateRepository(
             require(
                 state.canonicalSyncOrigin == journal.apiBaseUrl &&
                     state.canonicalConfigurationId == journal.configurationId,
-            ) { "Google Calendar outbound recovery crosses the canonical binding" }
+            ) { "Google outbound recovery crosses the canonical binding" }
         } catch (error: SerializationException) {
             throw error
         } catch (error: Exception) {
-            throw SerializationException("Google Calendar outbound recovery is invalid", error)
+            throw SerializationException("Google outbound recovery is invalid", error)
         }
     }
 

@@ -25,6 +25,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
 
 @Serializable
 enum class GoogleCalendarOutboundStage {
@@ -86,12 +87,11 @@ data class GoogleCalendarOutboundPreviewSnapshot(
         requireCanonicalOutboundUuid(collectionId)
         requireCanonicalOutboundUuid(itemId)
         require(collectionRevision > 0 && itemRevision > 0)
-        require(entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT)
-        require(operation == GoogleCalendarOutboundOperation.UPSERT)
         requireValidOutboundText(collectionDisplayName, MAX_COLLECTION_DISPLAY_NAME_BYTES)
         require(
             when {
-                providerResourceId == null && providerEtag == null -> true
+                operation == GoogleCalendarOutboundOperation.UPSERT &&
+                    providerResourceId == null && providerEtag == null -> true
                 providerResourceId != null && providerEtag != null -> {
                     isValidOutboundText(providerResourceId, MAX_PROVIDER_BINDING_BYTES) &&
                         isValidOutboundText(providerEtag, MAX_PROVIDER_BINDING_BYTES)
@@ -101,17 +101,23 @@ data class GoogleCalendarOutboundPreviewSnapshot(
         ) { "Google Calendar outbound provider binding is incomplete" }
         require(isValidGoogleCalendarOutboundHash(previewHash))
         require(
-            providerPayload.isNotEmpty() &&
-                providerPayload.hasValidOutboundBudget() &&
-                providerPayload.isValidPrivateFixedCalendarEvent(),
+            providerPayload.hasValidOutboundBudget(
+                maximumValueStringBytes = if (
+                    entityKind == GoogleCalendarOutboundEntityKind.TASK
+                ) {
+                    MAX_TASK_VALUE_STRING_BYTES
+                } else {
+                    MAX_PROVIDER_VALUE_STRING_BYTES
+                },
+            ) && providerPayload.isValidGoogleOutboundProjection(entityKind, operation),
         ) { "Google Calendar outbound provider payload is invalid" }
         requireCanonicalOutboundInstant(expiresAt)
     }
 
     /** Private provider payloads, hashes, and identifiers never enter diagnostics. */
     override fun toString(): String =
-        "GoogleCalendarOutboundPreviewSnapshot(entityKind=CALENDAR_EVENT, " +
-            "operation=UPSERT, providerPayload=<redacted>)"
+        "GoogleCalendarOutboundPreviewSnapshot(entityKind=$entityKind, " +
+            "operation=$operation, providerPayload=<redacted>)"
 
     companion object {
         fun fromRemote(remote: RemoteGoogleOutboundPreview): GoogleCalendarOutboundPreviewSnapshot =
@@ -135,7 +141,7 @@ data class GoogleCalendarOutboundPreviewSnapshot(
 }
 
 /**
- * Complete crash-recovery fence for one explicitly reviewed Calendar event upsert.
+ * Complete crash-recovery fence for one explicitly reviewed Google mutation.
  *
  * Approval is one-shot. The attempted marker must become durable before asking the server to mint
  * a capability, and the capability must become durable before enqueue. A validated authoritative
@@ -152,6 +158,7 @@ data class GoogleCalendarOutboundJournal(
     val collectionId: String,
     val itemId: String,
     val expectedItemRevision: Long,
+    val entityKind: GoogleCalendarOutboundEntityKind,
     val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
     val intentExpiresAt: String,
     val preview: GoogleCalendarOutboundPreviewSnapshot? = null,
@@ -182,7 +189,6 @@ data class GoogleCalendarOutboundJournal(
         requireCanonicalOutboundUuid(collectionId)
         requireCanonicalOutboundUuid(itemId)
         require(expectedItemRevision > 0)
-        require(operation == GoogleCalendarOutboundOperation.UPSERT)
         val created = requireCanonicalOutboundInstant(createdAt)
         val intentExpiry = requireCanonicalOutboundInstant(intentExpiresAt)
         require(intentExpiry > created)
@@ -196,7 +202,7 @@ data class GoogleCalendarOutboundJournal(
                     exactPreview.collectionId == collectionId &&
                     exactPreview.itemId == itemId &&
                     exactPreview.itemRevision == expectedItemRevision &&
-                    exactPreview.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT &&
+                    exactPreview.entityKind == entityKind &&
                     exactPreview.operation == operation,
             ) { "Google Calendar outbound preview does not match its recovery intent" }
             require(previewExpiry >= created.minus(MAXIMUM_CLOCK_SKEW))
@@ -296,58 +302,65 @@ data class GoogleCalendarOutboundJournal(
             collectionId == other.collectionId &&
             itemId == other.itemId &&
             expectedItemRevision == other.expectedItemRevision &&
+            entityKind == other.entityKind &&
             operation == other.operation &&
             intentExpiresAt == other.intentExpiresAt &&
             createdAt == other.createdAt
 
     /** Capabilities, provider payloads, hashes, and all bound identifiers stay redacted. */
     override fun toString(): String =
-        "GoogleCalendarOutboundJournal(stage=$stage, binding=<redacted>, " +
+        "GoogleCalendarOutboundJournal(stage=$stage, entityKind=$entityKind, " +
+            "operation=$operation, binding=<redacted>, " +
             "target=<redacted>, capability=<redacted>)"
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 1
+        const val CURRENT_SCHEMA_VERSION = 2
         val MAXIMUM_INTENT_LIFETIME: Duration = Duration.ofMinutes(35)
         val MAXIMUM_CLOCK_SKEW: Duration = Duration.ofMinutes(5)
     }
 }
 
-/** Current canonical event identity accepted by Android's outbound-only coordinator. */
+/** Current or retained canonical identity accepted by Android's outbound-only coordinator. */
 data class GoogleCalendarOutboundCandidate(
     val itemId: String,
     val expectedItemRevision: Long,
+    val entityKind: GoogleCalendarOutboundEntityKind =
+        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
     val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
 ) {
     init {
         requireCanonicalOutboundUuid(itemId)
         require(expectedItemRevision > 0)
-        require(operation == GoogleCalendarOutboundOperation.UPSERT)
     }
 
     override fun toString(): String =
-        "GoogleCalendarOutboundCandidate(operation=UPSERT, item=<redacted>)"
+        "GoogleCalendarOutboundCandidate(entityKind=$entityKind, operation=$operation, " +
+            "item=<redacted>)"
 }
 
-/** Selected writable Calendar identity accepted by Android's outbound-only coordinator. */
+/** Selected writable Google identity accepted by Android's outbound-only coordinator. */
 data class GoogleCalendarOutboundTarget(
     val accountId: String,
     val collectionId: String,
     val collectionRevision: Long,
+    val entityKind: GoogleCalendarOutboundEntityKind =
+        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
     val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
 ) {
     init {
         requireCanonicalOutboundUuid(accountId)
         requireCanonicalOutboundUuid(collectionId)
         require(collectionRevision > 0)
-        require(operation == GoogleCalendarOutboundOperation.UPSERT)
     }
 
     override fun toString(): String =
-        "GoogleCalendarOutboundTarget(account=<redacted>, collection=<redacted>)"
+        "GoogleCalendarOutboundTarget(entityKind=$entityKind, operation=$operation, " +
+            "account=<redacted>, collection=<redacted>)"
 }
 
 /**
- * Parses only a synced, current, app-owned timed event with no write uncertainty for that item.
+ * Parses only a synced app-owned event/task or its retained recent-trash identity, with no write
+ * uncertainty for that item. Provider-imported Tasks fail the canonical authoring projection gate.
  */
 fun DayWeaveUiState.googleCalendarOutboundCandidate(
     itemId: String,
@@ -358,18 +371,73 @@ fun DayWeaveUiState.googleCalendarOutboundCandidate(
     require(!canonicalDeltaCursor.isNullOrBlank())
     require(pendingCanonicalMutation == null)
     require(pendingCanonicalAuthoringMutations.none { it.itemId == itemId })
-    val item = canonicalItems.single { it.id == itemId }
-    require(item.deletedAt == null && item.revision > 0)
-    val draft = item.toCanonicalDraft()
-    val timing = requireNotNull(draft.eventTiming)
-    require(draft.kind == ItemKind.EVENT)
-    require(draft.placement == CanonicalDraftPlacement.PLANNED)
-    require(!timing.allDay && !timing.tentative && timing.busy)
-    GoogleCalendarOutboundCandidate(
-        itemId = item.id,
-        expectedItemRevision = item.revision,
-    )
+    val active = canonicalItems.singleOrNull { it.id == itemId && it.deletedAt == null }
+    val retained = canonicalRecentlyDeleted.singleOrNull { it.id == itemId }
+    require((active != null) xor (retained != null))
+    if (active != null) {
+        active.googleOutboundCandidate(
+            expectedItemRevision = active.revision,
+            operation = GoogleCalendarOutboundOperation.UPSERT,
+        )
+    } else {
+        val record = requireNotNull(retained)
+        record.requireValid()
+        requireNotNull(record.lastKnownItem).googleOutboundCandidate(
+            expectedItemRevision = record.revision,
+            operation = GoogleCalendarOutboundOperation.DELETE,
+        )
+    }
 }.getOrNull()
+
+private fun CanonicalItemSnapshot.googleOutboundCandidate(
+    expectedItemRevision: Long,
+    operation: GoogleCalendarOutboundOperation,
+): GoogleCalendarOutboundCandidate {
+    require(revision > 0 && expectedItemRevision >= revision)
+    return when (kind) {
+        "event" -> {
+            if (operation == GoogleCalendarOutboundOperation.UPSERT) require(status == "planned")
+            val draft = copy(status = "planned", deletedAt = null).toCanonicalDraft()
+            val timing = requireNotNull(draft.eventTiming)
+            require(draft.kind == ItemKind.EVENT)
+            if (operation == GoogleCalendarOutboundOperation.UPSERT) {
+                require(!timing.allDay && !timing.tentative && timing.busy)
+            }
+            GoogleCalendarOutboundCandidate(
+                itemId = id,
+                expectedItemRevision = expectedItemRevision,
+                entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                operation = operation,
+            )
+        }
+        "task" -> {
+            val reviewable = if (operation == GoogleCalendarOutboundOperation.DELETE) {
+                // Deletion sends no canonical body. Retain only enough parsing to prove this was
+                // app-authored rather than a `google_sync` import, so newer task fields cannot
+                // strand an already-owned provider mapping.
+                copy(
+                    status = "planned",
+                    deletedAt = null,
+                    recurrenceJson = null,
+                    splitPolicyJson = "{\"type\":\"indivisible\"}",
+                )
+            } else {
+                require(status in GOOGLE_TASK_PUBLISHABLE_STATUSES)
+                require(recurrenceJson == null)
+                copy(status = "planned", deletedAt = null)
+            }
+            val draft = reviewable.toCanonicalDraft()
+            require(draft.kind == ItemKind.TASK)
+            GoogleCalendarOutboundCandidate(
+                itemId = id,
+                expectedItemRevision = expectedItemRevision,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = operation,
+            )
+        }
+        else -> throw IllegalArgumentException("Unsupported Google outbound entity")
+    }
+}
 
 /**
  * Applies the complete Android target gate without retaining account labels or provider IDs.
@@ -380,22 +448,41 @@ fun googleCalendarOutboundTarget(
     accountSyncEnabled: Boolean,
     accountHasCalendarWriteScope: Boolean,
     collection: RemoteGoogleSyncCollection,
+    entityKind: GoogleCalendarOutboundEntityKind =
+        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+    operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
+    accountHasTasksWriteScope: Boolean = false,
 ): GoogleCalendarOutboundTarget? = runCatching {
     requireCanonicalOutboundUuid(accountId)
-    require(accountStatus == "active" && accountSyncEnabled && accountHasCalendarWriteScope)
+    require(accountStatus == "active" && accountSyncEnabled)
+    require(
+        when (entityKind) {
+            GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> accountHasCalendarWriteScope
+            GoogleCalendarOutboundEntityKind.TASK -> accountHasTasksWriteScope
+        },
+    )
     require(collection.accountId == accountId)
     requireCanonicalOutboundUuid(collection.id)
-    require(collection.kind == RemoteGoogleCollectionKind.CALENDAR)
+    require(
+        collection.kind == when (entityKind) {
+            GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> RemoteGoogleCollectionKind.CALENDAR
+            GoogleCalendarOutboundEntityKind.TASK -> RemoteGoogleCollectionKind.TASK_LIST
+        },
+    )
     require(collection.selected && !collection.providerDeleted)
     require(collection.syncRole == RemoteGoogleSyncRole.WRITABLE)
     require(collection.revision > 0)
-    require(
-        collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"),
-    )
+    if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+        require(
+            collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"),
+        )
+    }
     GoogleCalendarOutboundTarget(
         accountId = accountId,
         collectionId = collection.id,
         collectionRevision = collection.revision,
+        entityKind = entityKind,
+        operation = operation,
     )
 }.getOrNull()
 
@@ -457,7 +544,9 @@ private fun isValidGoogleCalendarOutboundCapability(value: String): Boolean {
     }.getOrDefault(false)
 }
 
-private fun JsonObject.hasValidOutboundBudget(): Boolean {
+private fun JsonObject.hasValidOutboundBudget(
+    maximumValueStringBytes: Int = MAX_PROVIDER_VALUE_STRING_BYTES,
+): Boolean {
     var nodes = 0
     var stringBytes = 0L
 
@@ -484,7 +573,7 @@ private fun JsonObject.hasValidOutboundBudget(): Boolean {
             is JsonPrimitive -> if (element.isString) {
                 consumeString(
                     element.content,
-                    MAX_PROVIDER_VALUE_STRING_BYTES,
+                    maximumValueStringBytes,
                     forbidControls = false,
                 )
             } else {
@@ -495,6 +584,81 @@ private fun JsonObject.hasValidOutboundBudget(): Boolean {
     }
 
     return size <= MAX_PROVIDER_CONTAINER_ENTRIES && validate(this, depth = 0)
+}
+
+private fun JsonObject.isValidGoogleOutboundProjection(
+    entityKind: GoogleCalendarOutboundEntityKind,
+    operation: GoogleCalendarOutboundOperation,
+): Boolean = when (operation) {
+    GoogleCalendarOutboundOperation.DELETE -> isEmpty()
+    GoogleCalendarOutboundOperation.UPSERT -> when (entityKind) {
+        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ->
+            isNotEmpty() && isValidPrivateFixedCalendarEvent()
+        GoogleCalendarOutboundEntityKind.TASK ->
+            isNotEmpty() && isValidGoogleTaskPreviewPayload()
+    }
+}
+
+private fun JsonObject.isValidGoogleTaskPreviewPayload(): Boolean {
+    if (keys != GOOGLE_TASK_ROOT_KEYS) return false
+    val id = this["id"].outboundStringOrNull()
+    val title = this["title"].outboundStringOrNull()
+    val status = this["status"].outboundStringOrNull()
+    val completed = this["completed"]
+    return id != null && id.isEmpty() &&
+        this["etag"] == JsonNull &&
+        title != null && title.isValidGoogleTaskTitle() &&
+        this["notes"].isValidGoogleTaskNotes() &&
+        status in setOf("needsAction", "completed") &&
+        this["due"].isValidGoogleTaskTimestamp(required = false) &&
+        completed.isValidGoogleTaskTimestamp(required = status == "completed") &&
+        (status == "completed") == (completed != JsonNull) &&
+        this["updated"] == JsonNull &&
+        this["parent"] == JsonNull &&
+        this["position"] == JsonNull &&
+        this["links"] == JsonNull &&
+        this["deleted"].outboundBooleanOrNull() == false &&
+        this["hidden"].outboundBooleanOrNull() == false
+}
+
+private fun String.isValidGoogleTaskTitle(): Boolean =
+    isNotEmpty() && codePointCount(0, length) <= MAX_GOOGLE_TASK_TITLE_CODE_POINTS &&
+        this == trim()
+
+private fun JsonElement?.isValidGoogleTaskNotes(): Boolean = when (this) {
+    JsonNull -> true
+    is JsonPrimitive -> isString && content.let { notes ->
+        notes.isNotEmpty() &&
+            notes.codePointCount(0, notes.length) <= MAX_GOOGLE_TASK_NOTES_CODE_POINTS &&
+            notes == notes.trim() &&
+            notes.all { character -> character == '\n' || !character.isISOControl() } &&
+            notes.split('\n').all { line -> line.isNotEmpty() && line == line.trim() } &&
+            !notes.containsLegacyGoogleTaskMarker()
+    }
+    else -> false
+}
+
+private fun String.containsLegacyGoogleTaskMarker(): Boolean {
+    val lower = lowercase()
+    var searchFrom = 0
+    while (searchFrom < lower.length) {
+        val marker = lower.indexOf("[dayweave", startIndex = searchFrom)
+        if (marker < 0) return false
+        var suffix = marker + "[dayweave".length
+        while (suffix < lower.length && lower[suffix].isWhitespace()) suffix += 1
+        if (lower.startsWith("item:", startIndex = suffix)) return true
+        searchFrom = marker + "[dayweave".length
+    }
+    return false
+}
+
+private fun JsonElement?.isValidGoogleTaskTimestamp(required: Boolean): Boolean = when (this) {
+    JsonNull -> !required
+    is JsonPrimitive -> isString && content.let { timestamp ->
+        timestamp.isNotEmpty() && timestamp.toByteArray(StandardCharsets.UTF_8).size <= 64 &&
+            offsetDateTimeOrNull(timestamp) != null
+    }
+    else -> false
 }
 
 /**
@@ -589,6 +753,9 @@ private fun JsonElement?.outboundStringOrNull(): String? = when (this) {
     else -> null
 }
 
+private fun JsonElement?.outboundBooleanOrNull(): Boolean? =
+    (this as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
+
 private fun offsetDateTimeOrNull(value: String): OffsetDateTime? = try {
     OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
 } catch (_: DateTimeParseException) {
@@ -612,11 +779,14 @@ private const val MAX_PROVIDER_STRING_BYTES = 1024L * 1024L
 private const val MAX_PROVIDER_CONTAINER_ENTRIES = 10_000
 private const val MAX_PROVIDER_KEY_BYTES = 1_024
 private const val MAX_PROVIDER_VALUE_STRING_BYTES = 256 * 1_024
+private const val MAX_TASK_VALUE_STRING_BYTES = 400_000
 private const val MAX_PROVIDER_NUMBER_BYTES = 128
 private const val MAX_CALENDAR_SUMMARY_BYTES = 8 * 1_024
 private const val MAX_CALENDAR_SUMMARY_CODE_POINTS = 500
 private const val MAX_CALENDAR_DESCRIPTION_BYTES = 256 * 1_024
 private const val MAX_CALENDAR_DESCRIPTION_CODE_POINTS = 100_000
+private const val MAX_GOOGLE_TASK_TITLE_CODE_POINTS = 500
+private const val MAX_GOOGLE_TASK_NOTES_CODE_POINTS = 100_000
 private const val MIN_CALENDAR_EVENT_ID_CHARS = 66
 private const val MAX_CALENDAR_EVENT_ID_CHARS = 73
 private const val DAYWEAVE_OWNERSHIP_PROOF_KEY = "dayweaveOwnershipProof"
@@ -646,4 +816,27 @@ private val CALENDAR_EVENT_ROOT_KEYS = setOf(
 )
 private val CALENDAR_EXTENDED_PROPERTY_KEYS = setOf("private", "shared")
 private val CALENDAR_PRIVATE_PROPERTY_KEYS = setOf(DAYWEAVE_OWNERSHIP_PROOF_KEY)
+private val GOOGLE_TASK_ROOT_KEYS = setOf(
+    "id",
+    "etag",
+    "title",
+    "notes",
+    "status",
+    "due",
+    "completed",
+    "updated",
+    "parent",
+    "position",
+    "links",
+    "deleted",
+    "hidden",
+)
+private val GOOGLE_TASK_PUBLISHABLE_STATUSES = setOf(
+    "inbox",
+    "planned",
+    "scheduled",
+    "in_progress",
+    "paused",
+    "completed",
+)
 private val ZERO_UUID = UUID(0L, 0L)

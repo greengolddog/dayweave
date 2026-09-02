@@ -1252,11 +1252,20 @@ private fun DayWeaveRoot(
         } ?: currentTargets.singleOrNull()
         val reviewDestination = googlePublicationReview?.selectedTarget
             ?: viewModel.pendingGoogleCalendarDestination()
+        val reviewTarget = selectedTarget ?: reviewDestination
+        val reviewItemId = googlePublicationReview?.itemId
+            ?: state.pendingGoogleCalendarOutbound?.itemId
+        val reviewItemTitle = reviewItemId?.let { itemId ->
+            state.canonicalItems.singleOrNull { it.id == itemId }?.title
+                ?: state.canonicalRecentlyDeleted.singleOrNull { it.id == itemId }
+                    ?.lastKnownItem?.title
+        }
         GoogleCalendarOutboundReviewSheet(
             state = googleCalendarOutboundState,
             targets = currentTargets,
-            selectedTarget = selectedTarget,
+            selectedTarget = reviewTarget,
             reviewDestinationDisplayName = reviewDestination?.displayName,
+            reviewItemTitle = reviewItemTitle,
             approvalConfirmation = viewModel.googleCalendarApprovalConfirmation(),
             canRecover = state.pendingGoogleCalendarOutbound != null &&
                 googleCalendarOutboundState.phase in setOf(

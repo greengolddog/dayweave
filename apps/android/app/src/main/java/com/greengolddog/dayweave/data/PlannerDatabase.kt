@@ -52,11 +52,13 @@ object PlannerSnapshotFormats {
     const val JSON_V11 = "json-v11-google-calendar-outbound-recovery"
     /** Configurable firm-horizon policy; older labels must not accept an injected day count. */
     const val JSON_V12 = "json-v12-configurable-firm-horizon"
+    /** Generic Google outbound recovery; older labels remain Calendar-upsert-only. */
+    const val JSON_V13 = "json-v13-google-outbound-recovery"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 12,
+    version = 13,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -152,6 +154,15 @@ object PlannerDatabaseMigrations {
     val MIGRATION_11_12 = object : Migration(11, 12) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted outbound journal gains an explicit provider
+     * entity kind and delete operation; the Room version prevents rollback to Calendar-only code
+     * that could ignore generalized recovery authority.
+     */
+    val MIGRATION_12_13 = object : Migration(12, 13) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -203,6 +214,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_9_10,
                 PlannerDatabaseMigrations.MIGRATION_10_11,
                 PlannerDatabaseMigrations.MIGRATION_11_12,
+                PlannerDatabaseMigrations.MIGRATION_12_13,
             )
             .build()
     }

@@ -12,6 +12,8 @@ import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundApiException
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundEntityKind
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundOperation
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundTransport
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
@@ -93,7 +95,7 @@ enum class GoogleCalendarOutboundOutcome {
 }
 
 /**
- * Privacy-fenced, crash-safe orchestration for one explicitly reviewed fixed Calendar event.
+ * Privacy-fenced, crash-safe orchestration for one explicitly reviewed Google mutation.
  *
  * No schedule block or provider payload is accepted from the caller. The coordinator derives the
  * current canonical item and writable target from authoritative cached state, persists every
@@ -164,12 +166,11 @@ class GoogleCalendarOutboundCoordinator(
         )
     }
 
-    /** Returns only currently proven owner/writer Calendar targets for this exact fixed event. */
+    /** Returns only currently proven writable targets for this exact entity and operation. */
     fun targetsFor(itemId: String): List<GoogleCalendarOutboundTargetOption> {
         if (!operationAllowed()) return emptyList()
-        if (plannerStore.durableState.value?.googleCalendarOutboundCandidate(itemId) == null) {
-            return emptyList()
-        }
+        val candidate = plannerStore.durableState.value
+            ?.googleCalendarOutboundCandidate(itemId) ?: return emptyList()
         if (plannerStore.state.value.pendingGoogleCalendarOutbound != null) return emptyList()
         val snapshot = credentialStore.snapshot()
         val accounts = googleAccountState()
@@ -184,14 +185,16 @@ class GoogleCalendarOutboundCoordinator(
             return emptyList()
         }
         return accounts.accounts.asSequence()
-            .filter { account ->
-                account.status == "active" && account.syncEnabled &&
-                    account.hasCalendarWriteScope
-            }
+            .filter { account -> account.hasWriteScopeFor(candidate.entityKind) }
             .flatMap { account ->
                 imports.accounts[account.id]?.collections.orEmpty().asSequence().mapNotNull {
                     collection ->
-                    currentTarget(account, collection)?.let { target ->
+                    currentTarget(
+                        account = account,
+                        collection = collection,
+                        entityKind = candidate.entityKind,
+                        operation = candidate.operation,
+                    )?.let { target ->
                         GoogleCalendarOutboundTargetOption(
                             target = target,
                             displayName = "${account.label} · ${collection.displayName}",
@@ -218,7 +221,12 @@ class GoogleCalendarOutboundCoordinator(
         val account = accounts.accounts.singleOrNull { it.id == journal.accountId } ?: return null
         val collection = imports.accounts[journal.accountId]
             ?.collections?.singleOrNull { it.id == journal.collectionId } ?: return null
-        val target = currentTarget(account, collection) ?: return null
+        val target = currentTarget(
+            account = account,
+            collection = collection,
+            entityKind = journal.entityKind,
+            operation = journal.operation,
+        ) ?: return null
         if (journal.preview?.collectionRevision?.let { it != target.collectionRevision } == true) {
             return null
         }
@@ -249,17 +257,19 @@ class GoogleCalendarOutboundCoordinator(
                 ?: return@withLock failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.ERROR,
-                    "Only a synced app-authored timed, confirmed, busy event can be published.",
+                    "Only a supported synced app-authored event or task can be published.",
                     GoogleCalendarOutboundOutcome.FAILED,
                 )
             val target = requireCurrentTarget(
                 requested = requestedTarget,
                 expectedConfigurationId = binding.configurationId,
+                expectedEntityKind = candidate.entityKind,
+                expectedOperation = candidate.operation,
             )
                 ?: return@withLock failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.ERROR,
-                    "That Publish calendar is no longer available. Refresh Google sources.",
+                    "That Google publication destination is no longer available. Refresh Google sources.",
                     GoogleCalendarOutboundOutcome.FAILED,
                 )
             val createdAt = now()
@@ -272,6 +282,8 @@ class GoogleCalendarOutboundCoordinator(
                 collectionId = target.collectionId,
                 itemId = candidate.itemId,
                 expectedItemRevision = candidate.expectedItemRevision,
+                entityKind = candidate.entityKind,
+                operation = candidate.operation,
                 intentExpiresAt = createdAt
                     .plus(GoogleCalendarOutboundJournal.MAXIMUM_INTENT_LIFETIME)
                     .toString(),
@@ -281,7 +293,7 @@ class GoogleCalendarOutboundCoordinator(
                 lifecycle,
                 GoogleCalendarOutboundState(
                     phase = GoogleCalendarOutboundPhase.PREVIEWING,
-                    message = "Preparing the exact private Google Calendar change…",
+                    message = "Preparing the exact ${candidate.serviceTitle()} change…",
                     hasPendingRecovery = true,
                     isBusy = true,
                     configurationId = binding.configurationId,
@@ -302,6 +314,7 @@ class GoogleCalendarOutboundCoordinator(
                 collectionId = journal.collectionId,
                 itemId = journal.itemId,
                 expectedItemRevision = journal.expectedItemRevision,
+                operation = journal.operation,
             )
             requireCurrent(lifecycle, binding)
             if (
@@ -348,7 +361,7 @@ class GoogleCalendarOutboundCoordinator(
                 return@withLock failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
-                    "The event, destination, or preview changed. Nothing was approved.",
+                    "The item, destination, or preview changed. Nothing was approved.",
                     GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
                 )
             }
@@ -421,14 +434,14 @@ class GoogleCalendarOutboundCoordinator(
                             ?: return@withLock failure(
                                 lifecycle,
                                 GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
-                                "The saved event or Publish calendar changed. Nothing was sent.",
+                                "The saved item or Publish destination changed. Nothing was sent.",
                                 GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
                             )
                         setState(
                             lifecycle,
                             GoogleCalendarOutboundState(
                                 phase = GoogleCalendarOutboundPhase.PREVIEWING,
-                                message = "Recovering the saved Google Calendar preview…",
+                                message = "Recovering the saved ${journal.serviceTitle()} preview…",
                                 hasPendingRecovery = true,
                                 isBusy = true,
                                 configurationId = binding.configurationId,
@@ -440,6 +453,7 @@ class GoogleCalendarOutboundCoordinator(
                             collectionId = journal.collectionId,
                             itemId = journal.itemId,
                             expectedItemRevision = journal.expectedItemRevision,
+                            operation = journal.operation,
                         )
                         requireCurrent(lifecycle, binding)
                         if (
@@ -496,7 +510,7 @@ class GoogleCalendarOutboundCoordinator(
             lifecycle,
             GoogleCalendarOutboundState(
                 phase = GoogleCalendarOutboundPhase.ENQUEUEING,
-                message = "Saving the approved Calendar change to the durable outbox…",
+                message = "Saving the approved ${journal.serviceTitle()} change to the durable outbox…",
                 hasPendingRecovery = true,
                 isBusy = true,
                 configurationId = binding.configurationId,
@@ -508,6 +522,7 @@ class GoogleCalendarOutboundCoordinator(
             collectionId = journal.collectionId,
             itemId = journal.itemId,
             expectedItemRevision = journal.expectedItemRevision,
+            operation = journal.operation,
             approvalCapability = requireNotNull(journal.approvalCapability).value,
         )
         requireCurrent(lifecycle, binding)
@@ -520,9 +535,9 @@ class GoogleCalendarOutboundCoordinator(
             GoogleCalendarOutboundState(
                 phase = GoogleCalendarOutboundPhase.ACCEPTED,
                 message = if (accepted.replayed) {
-                    "The previously queued Google Calendar change was recovered."
+                    "The previously queued ${journal.serviceTitle()} change was recovered."
                 } else {
-                    "The private Google Calendar change is queued for publication."
+                    "The reviewed ${journal.serviceTitle()} change is queued for publication."
                 },
                 hasPendingRecovery = false,
                 acceptedWasReplay = accepted.replayed,
@@ -535,6 +550,8 @@ class GoogleCalendarOutboundCoordinator(
     private fun requireCurrentTarget(
         requested: GoogleCalendarOutboundTarget,
         expectedConfigurationId: String,
+        expectedEntityKind: GoogleCalendarOutboundEntityKind,
+        expectedOperation: GoogleCalendarOutboundOperation,
     ): GoogleCalendarOutboundTarget? {
         val accounts = googleAccountState()
         val imports = googleImportState()
@@ -550,24 +567,44 @@ class GoogleCalendarOutboundCoordinator(
             ?: return null
         val collection = imports.accounts[requested.accountId]
             ?.collections?.singleOrNull { it.id == requested.collectionId } ?: return null
-        return currentTarget(account, collection)?.takeIf { it == requested }
+        return currentTarget(
+            account = account,
+            collection = collection,
+            entityKind = expectedEntityKind,
+            operation = expectedOperation,
+        )?.takeIf { it == requested }
     }
 
     private fun currentTarget(
         account: GoogleAccountSummary,
         collection: GoogleImportCollectionState,
+        entityKind: GoogleCalendarOutboundEntityKind,
+        operation: GoogleCalendarOutboundOperation,
     ): GoogleCalendarOutboundTarget? = runCatching {
-        require(account.status == "active" && account.syncEnabled && account.hasCalendarWriteScope)
+        require(account.hasWriteScopeFor(entityKind))
         require(collection.accountId == account.id)
-        require(collection.kind == RemoteGoogleCollectionKind.CALENDAR)
+        require(
+            collection.kind == when (entityKind) {
+                GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ->
+                    RemoteGoogleCollectionKind.CALENDAR
+                GoogleCalendarOutboundEntityKind.TASK ->
+                    RemoteGoogleCollectionKind.TASK_LIST
+            },
+        )
         require(collection.selected && !collection.providerDeleted)
         require(collection.syncRole == RemoteGoogleSyncRole.WRITABLE)
         require(collection.revision > 0)
-        require(collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"))
+        if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+            require(
+                collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"),
+            )
+        }
         GoogleCalendarOutboundTarget(
             accountId = account.id,
             collectionId = collection.id,
             collectionRevision = collection.revision,
+            entityKind = entityKind,
+            operation = operation,
         )
     }.getOrNull()
 
@@ -591,12 +628,21 @@ class GoogleCalendarOutboundCoordinator(
         }
         val candidate = plannerStore.durableState.value
             ?.googleCalendarOutboundCandidate(journal.itemId) ?: return null
-        if (candidate.expectedItemRevision != journal.expectedItemRevision) return null
+        if (
+            candidate.expectedItemRevision != journal.expectedItemRevision ||
+            candidate.entityKind != journal.entityKind ||
+            candidate.operation != journal.operation
+        ) return null
         val account = accounts.accounts.singleOrNull { it.id == journal.accountId }
             ?: return null
         val collection = imports.accounts[journal.accountId]
             ?.collections?.singleOrNull { it.id == journal.collectionId } ?: return null
-        val target = currentTarget(account, collection) ?: return null
+        val target = currentTarget(
+            account = account,
+            collection = collection,
+            entityKind = journal.entityKind,
+            operation = journal.operation,
+        ) ?: return null
         return candidate to target
     }
 
@@ -607,7 +653,7 @@ class GoogleCalendarOutboundCoordinator(
                 currentTime.isBefore(requireNotNull(journal.preview).let { Instant.parse(it.expiresAt) }) ->
                 GoogleCalendarOutboundState(
                     phase = GoogleCalendarOutboundPhase.AWAITING_APPROVAL,
-                    message = "Review the exact private Calendar change, then approve it explicitly.",
+                    message = "Review the exact ${journal.serviceTitle()} change, then approve it explicitly.",
                     preview = journal.preview,
                     hasPendingRecovery = true,
                     configurationId = journal.configurationId,
@@ -629,7 +675,7 @@ class GoogleCalendarOutboundCoordinator(
                 )
             else -> GoogleCalendarOutboundState(
                 phase = GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
-                message = "Recover the saved Google Calendar publication before starting another.",
+                message = "Recover the saved ${journal.serviceTitle()} publication before starting another.",
                 hasPendingRecovery = true,
                 configurationId = journal.configurationId,
             )
@@ -765,17 +811,17 @@ class GoogleCalendarOutboundCoordinator(
                 } else {
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED
                 },
-                "The saved Calendar change is stale or no longer authorized. Recovery remains saved.",
+                "The saved Google change is stale or no longer authorized. Recovery remains saved.",
                 GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
             )
             is IOException -> Triple(
                 GoogleCalendarOutboundPhase.OFFLINE,
-                "Offline or server unavailable · the exact Calendar operation remains saved.",
+                "Offline or server unavailable · the exact Google operation remains saved.",
                 GoogleCalendarOutboundOutcome.PENDING,
             )
             else -> Triple(
                 GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
-                "The Google Calendar operation could not be verified. Recovery remains saved.",
+                "The Google operation could not be verified. Recovery remains saved.",
                 GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
             )
         }
@@ -808,7 +854,7 @@ class GoogleCalendarOutboundCoordinator(
     private fun readyState(binding: BoundGoogleOutboundConfiguration) =
         GoogleCalendarOutboundState(
             phase = GoogleCalendarOutboundPhase.READY,
-            message = "Choose a synced fixed event and review its private Calendar change.",
+            message = "Choose a supported synced event or task and review its Google change.",
             configurationId = binding.configurationId,
         )
 
@@ -820,13 +866,13 @@ class GoogleCalendarOutboundCoordinator(
         )
         !credentialStore.snapshot().hasBearerToken -> GoogleCalendarOutboundState(
             phase = GoogleCalendarOutboundPhase.NOT_CONFIGURED,
-            message = "Connect the DayWeave API before publishing to Google Calendar.",
+            message = "Connect the DayWeave API before publishing to Google.",
             hasPendingRecovery = plannerStore.state.value.pendingGoogleCalendarOutbound != null,
             configurationId = credentialStore.snapshot().configurationId,
         )
         else -> GoogleCalendarOutboundState(
             phase = GoogleCalendarOutboundPhase.READY,
-            message = "Choose a synced fixed event and review its private Calendar change.",
+            message = "Choose a supported synced event or task and review its Google change.",
             hasPendingRecovery = plannerStore.state.value.pendingGoogleCalendarOutbound != null,
             configurationId = credentialStore.snapshot().configurationId,
         )
@@ -842,18 +888,35 @@ class GoogleCalendarOutboundCoordinator(
     )
 
     private class StaleGoogleOutboundOperationException : IOException(
-        "Google Calendar outbound operation changed",
+        "Google outbound operation changed",
     )
 
     private class InvalidGoogleOutboundResponseException : IOException(
-        "Google Calendar outbound response was invalid",
+        "Google outbound response was invalid",
     )
 
     private class GoogleOutboundRecoveryChangedException : IOException(
-        "Google Calendar outbound recovery changed",
+        "Google outbound recovery changed",
     )
 
     private companion object {
+        fun GoogleAccountSummary.hasWriteScopeFor(
+            entityKind: GoogleCalendarOutboundEntityKind,
+        ): Boolean = status == "active" && syncEnabled && when (entityKind) {
+            GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> hasCalendarWriteScope
+            GoogleCalendarOutboundEntityKind.TASK -> hasTasksWriteScope
+        }
+
+        fun GoogleCalendarOutboundJournal.serviceTitle(): String = when (entityKind) {
+            GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> "Google Calendar"
+            GoogleCalendarOutboundEntityKind.TASK -> "Google Tasks"
+        }
+
+        fun GoogleCalendarOutboundCandidate.serviceTitle(): String = when (entityKind) {
+            GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> "Google Calendar"
+            GoogleCalendarOutboundEntityKind.TASK -> "Google Tasks"
+        }
+
         fun sameBinding(left: ApiConnectionSnapshot, right: ApiConnectionSnapshot): Boolean =
             left.baseUrl == right.baseUrl && left.hasBearerToken == right.hasBearerToken &&
                 left.configurationId == right.configurationId

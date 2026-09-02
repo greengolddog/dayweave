@@ -3464,7 +3464,9 @@ class PlannerStore(
                     ) { "Google Calendar outbound recovery crosses the canonical binding" }
                     val candidate = current.googleCalendarOutboundCandidate(replacement.itemId)
                     require(
-                        candidate?.expectedItemRevision == replacement.expectedItemRevision,
+                        candidate?.expectedItemRevision == replacement.expectedItemRevision &&
+                            candidate.entityKind == replacement.entityKind &&
+                            candidate.operation == replacement.operation,
                     ) { "Google Calendar outbound item is no longer publishable" }
                     require(
                         current.pendingSchedulePublication == null &&
@@ -3483,7 +3485,9 @@ class PlannerStore(
                     ) {
                         val candidate = current.googleCalendarOutboundCandidate(replacement.itemId)
                         require(
-                            candidate?.expectedItemRevision == replacement.expectedItemRevision,
+                            candidate?.expectedItemRevision == replacement.expectedItemRevision &&
+                                candidate.entityKind == replacement.entityKind &&
+                                candidate.operation == replacement.operation,
                         ) { "Google Calendar outbound item changed before approval" }
                     }
                 }

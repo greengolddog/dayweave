@@ -174,6 +174,92 @@ class GoogleCalendarOutboundReviewSheetTest {
     }
 
     @Test
+    fun taskReviewShowsSanitizedFieldsAndKeepsPlanningMetadataOut() {
+        val preview = taskPreview()
+        val confirmation = GoogleCalendarOutboundApprovalConfirmation(
+            recoveryId = RECOVERY_ID,
+            operationGeneration = 9,
+            configurationId = "config-1",
+            previewId = PREVIEW_ID,
+            previewHash = PREVIEW_HASH,
+        )
+
+        composeRule.setContent {
+            DayWeaveTheme(useDynamicColor = false) {
+                GoogleCalendarOutboundReviewSheet(
+                    state = GoogleCalendarOutboundState(
+                        phase = GoogleCalendarOutboundPhase.AWAITING_APPROVAL,
+                        message = "Review the exact Google Tasks change.",
+                        preview = preview,
+                        hasPendingRecovery = true,
+                        configurationId = "config-1",
+                    ),
+                    targets = emptyList(),
+                    selectedTarget = null,
+                    reviewDestinationDisplayName = "Private Gmail · Personal tasks",
+                    reviewItemTitle = "Finish launch checklist",
+                    approvalConfirmation = confirmation,
+                    canRecover = false,
+                    canDiscardExpiredRecovery = false,
+                    onTargetSelected = {},
+                    onRequestPreview = {},
+                    onApproveAndQueue = {},
+                    onRecover = {},
+                    onDiscardExpiredRecovery = {},
+                    onDismissRequest = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithText("Review Google Tasks change").assertExists()
+        composeRule.onNodeWithTag(GOOGLE_OUTBOUND_CHANGE_TAG)
+            .assertTextContains("Create new task", substring = true)
+        composeRule.onNodeWithTag(GOOGLE_OUTBOUND_TITLE_TAG)
+            .assertTextContains("Finish launch checklist", substring = true)
+        composeRule.onNodeWithTag(GOOGLE_OUTBOUND_DESCRIPTION_TAG)
+            .assertTextContains("Confirm the release gates", substring = true)
+        composeRule.onNodeWithTag(GOOGLE_OUTBOUND_STATUS_TAG)
+            .assertTextContains("Needs action", substring = true)
+        composeRule.onNodeWithTag(GOOGLE_OUTBOUND_DUE_TAG)
+            .assertTextContains("2030", substring = true)
+
+        listOf(
+            "task-provider-id",
+            "task-provider-etag",
+            "parent",
+            "position",
+            PREVIEW_HASH,
+        ).forEach { forbidden ->
+            composeRule.onAllNodesWithText(
+                forbidden,
+                substring = true,
+                useUnmergedTree = true,
+            ).assertCountEquals(0)
+        }
+    }
+
+    @Test
+    fun deletionReviewUsesCanonicalFallbackTitleAndEmptyProviderPayload() {
+        val calendarDeletion = preview().copy(
+            operation = GoogleCalendarOutboundOperation.DELETE,
+            providerResourceId = "provider-event-id",
+            providerEtag = "provider-event-etag",
+            providerPayload = JsonObject(emptyMap()),
+        ).toSanitizedOutboundPresentation("Architecture focus")
+        val taskDeletion = taskPreview().copy(
+            operation = GoogleCalendarOutboundOperation.DELETE,
+            providerResourceId = "provider-task-id",
+            providerEtag = "provider-task-etag",
+            providerPayload = JsonObject(emptyMap()),
+        ).toSanitizedOutboundPresentation("Finish launch checklist")
+
+        assertEquals("Delete existing event", calendarDeletion?.change)
+        assertEquals("Architecture focus", calendarDeletion?.title)
+        assertEquals("Delete existing task", taskDeletion?.change)
+        assertEquals("Finish launch checklist", taskDeletion?.title)
+    }
+
+    @Test
     fun recoveryAndDiscardActionsExistOnlyWhenHostAllowsThem() {
         val recoverAllowed = mutableStateOf(false)
         val discardAllowed = mutableStateOf(false)
@@ -287,6 +373,41 @@ class GoogleCalendarOutboundReviewSheetTest {
                 "private":{"dayweaveOwnershipProof":"$OWNERSHIP_PROOF_CANARY"},
                 "shared":{}
               }
+            }
+            """.trimIndent(),
+        ) as JsonObject,
+        expiresAt = "2030-09-02T12:00:00Z",
+    )
+
+    private fun taskPreview() = GoogleCalendarOutboundPreviewSnapshot(
+        id = PREVIEW_ID,
+        accountId = ACCOUNT_ID,
+        collectionId = COLLECTION_ID,
+        collectionRevision = 4,
+        collectionDisplayName = "Personal tasks",
+        itemId = ITEM_ID,
+        itemRevision = 7,
+        entityKind = GoogleCalendarOutboundEntityKind.TASK,
+        operation = GoogleCalendarOutboundOperation.UPSERT,
+        providerResourceId = null,
+        providerEtag = null,
+        previewHash = PREVIEW_HASH,
+        providerPayload = Json.parseToJsonElement(
+            """
+            {
+              "id":"",
+              "etag":null,
+              "title":"Finish launch checklist",
+              "notes":"Confirm the release gates",
+              "status":"needsAction",
+              "due":"2030-09-03T12:00:00Z",
+              "completed":null,
+              "updated":null,
+              "parent":null,
+              "position":null,
+              "links":null,
+              "deleted":false,
+              "hidden":false
             }
             """.trimIndent(),
         ) as JsonObject,

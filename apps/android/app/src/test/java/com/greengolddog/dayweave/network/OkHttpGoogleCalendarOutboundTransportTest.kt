@@ -161,26 +161,165 @@ class OkHttpGoogleCalendarOutboundTransportTest {
     }
 
     @Test
-    fun outboundSurfaceCannotExpressDeleteOrNonCalendarEntity() {
+    fun outboundSurfaceSupportsOnlyExactCalendarTaskAndUpsertDeleteEnums() {
         assertEquals(
-            listOf(GoogleCalendarOutboundOperation.UPSERT),
+            listOf(
+                GoogleCalendarOutboundOperation.UPSERT,
+                GoogleCalendarOutboundOperation.DELETE,
+            ),
             GoogleCalendarOutboundOperation.entries,
         )
         assertEquals(
-            listOf(GoogleCalendarOutboundEntityKind.CALENDAR_EVENT),
+            listOf(
+                GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                GoogleCalendarOutboundEntityKind.TASK,
+            ),
             GoogleCalendarOutboundEntityKind.entries,
         )
 
         listOf(
-            previewEnvelopeJson().replace("\"operation\":\"upsert\"", "\"operation\":\"delete\""),
+            previewEnvelopeJson().replace("\"operation\":\"upsert\"", "\"operation\":\"archive\""),
             previewEnvelopeJson().replace(
                 "\"entity_kind\":\"calendar_event\"",
-                "\"entity_kind\":\"task\"",
+                "\"entity_kind\":\"habit\"",
             ),
         ).forEach { response ->
             server.enqueue(jsonResponse(200, response))
             assertThrows(GoogleCalendarOutboundApiException.InvalidResponse::class.java) {
                 runBlocking { preview() }
+            }
+        }
+    }
+
+    @Test
+    fun taskUpsertAndDeleteCarryExactOperationContracts() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                200,
+                previewEnvelopeJson(
+                    collectionDisplayName = "Personal tasks",
+                    entityKind = "task",
+                    providerPayload = TASK_PROVIDER_PAYLOAD,
+                ),
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                previewEnvelopeJson(
+                    collectionDisplayName = "Personal tasks",
+                    providerResourceId = "provider-task-id",
+                    providerEtag = "provider-etag",
+                    entityKind = "task",
+                    operation = "delete",
+                    providerPayload = "{}",
+                ),
+            ),
+        )
+        server.enqueue(jsonResponse(202, acceptedEnvelopeJson()))
+
+        val taskUpsert = transport.preview(
+            configuration(),
+            ACCOUNT_ID,
+            COLLECTION_ID,
+            ITEM_ID,
+            ITEM_REVISION,
+            GoogleCalendarOutboundOperation.UPSERT,
+        )
+        val taskDelete = transport.preview(
+            configuration(),
+            ACCOUNT_ID,
+            COLLECTION_ID,
+            ITEM_ID,
+            ITEM_REVISION,
+            GoogleCalendarOutboundOperation.DELETE,
+        )
+        transport.enqueue(
+            configuration(),
+            ACCOUNT_ID,
+            COLLECTION_ID,
+            ITEM_ID,
+            ITEM_REVISION,
+            APPROVAL_CAPABILITY,
+            GoogleCalendarOutboundOperation.DELETE,
+        )
+
+        assertEquals(GoogleCalendarOutboundEntityKind.TASK, taskUpsert.entityKind)
+        assertEquals("Private task", taskUpsert.providerPayload["title"]?.jsonPrimitive?.content)
+        assertEquals(GoogleCalendarOutboundEntityKind.TASK, taskDelete.entityKind)
+        assertEquals(GoogleCalendarOutboundOperation.DELETE, taskDelete.operation)
+        assertTrue(taskDelete.providerPayload.isEmpty())
+
+        assertEquals("upsert", stringBody(server.takeRequest().body?.utf8())["operation"])
+        assertEquals("delete", stringBody(server.takeRequest().body?.utf8())["operation"])
+        assertEquals("delete", stringBody(server.takeRequest().body?.utf8())["operation"])
+    }
+
+    @Test
+    fun taskPreviewRejectsChangedProjectionAndDeletePayloads() {
+        val invalidTaskPayloads = listOf(
+            TASK_PROVIDER_PAYLOAD.replace("\"title\":\"Private task\",", ""),
+            TASK_PROVIDER_PAYLOAD.dropLast(1) + ",\"kind\":\"tasks#task\"}",
+            TASK_PROVIDER_PAYLOAD.replace("\"id\":\"\"", "\"id\":\"provider-task-id\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"etag\":null", "\"etag\":\"provider-etag\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"title\":\"Private task\"", "\"title\":\"  task\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"status\":\"completed\"", "\"status\":\"cancelled\""),
+            TASK_PROVIDER_PAYLOAD.replace(
+                "\"notes\":\"Private notes\"",
+                "\"notes\":\"ordinary\\n[DayWeave item:1]\"",
+            ),
+            TASK_PROVIDER_PAYLOAD.replace(
+                "\"completed\":\"2026-09-02T12:00:00.000Z\"",
+                "\"completed\":null",
+            ),
+            TASK_PROVIDER_PAYLOAD.replace("\"updated\":null", "\"updated\":\"now\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"parent\":null", "\"parent\":\"parent-id\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"position\":null", "\"position\":\"0001\""),
+            TASK_PROVIDER_PAYLOAD.replace("\"links\":null", "\"links\":[]"),
+            TASK_PROVIDER_PAYLOAD.replace("\"deleted\":false", "\"deleted\":true"),
+            TASK_PROVIDER_PAYLOAD.replace("\"hidden\":false", "\"hidden\":true"),
+        )
+        invalidTaskPayloads.forEach { payload ->
+            server.enqueue(
+                jsonResponse(
+                    200,
+                    previewEnvelopeJson(
+                        entityKind = "task",
+                        providerPayload = payload,
+                    ),
+                ),
+            )
+            assertThrows(GoogleCalendarOutboundApiException.InvalidResponse::class.java) {
+                runBlocking { preview() }
+            }
+        }
+
+        listOf(
+            previewEnvelopeJson(
+                entityKind = "task",
+                operation = "delete",
+                providerResourceId = "provider-task-id",
+                providerEtag = "provider-etag",
+                providerPayload = TASK_PROVIDER_PAYLOAD,
+            ),
+            previewEnvelopeJson(
+                entityKind = "task",
+                operation = "delete",
+                providerPayload = "{}",
+            ),
+        ).forEach { body ->
+            server.enqueue(jsonResponse(200, body))
+            assertThrows(GoogleCalendarOutboundApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.preview(
+                        configuration(),
+                        ACCOUNT_ID,
+                        COLLECTION_ID,
+                        ITEM_ID,
+                        ITEM_REVISION,
+                        GoogleCalendarOutboundOperation.DELETE,
+                    )
+                }
             }
         }
     }
@@ -601,6 +740,8 @@ class OkHttpGoogleCalendarOutboundTransportTest {
         previewHash: String = PREVIEW_HASH,
         providerPayload: String = PROVIDER_PAYLOAD,
         expiresAt: String = "2026-09-02T12:10:00Z",
+        entityKind: String = "calendar_event",
+        operation: String = "upsert",
     ): String =
         "{\"preview\":" + previewJson(
             collectionRevision,
@@ -610,6 +751,8 @@ class OkHttpGoogleCalendarOutboundTransportTest {
             previewHash,
             providerPayload,
             expiresAt,
+            entityKind,
+            operation,
         ) + "}"
 
     private fun previewJson(
@@ -620,6 +763,8 @@ class OkHttpGoogleCalendarOutboundTransportTest {
         previewHash: String = PREVIEW_HASH,
         providerPayload: String = PROVIDER_PAYLOAD,
         expiresAt: String = "2026-09-02T12:10:00Z",
+        entityKind: String = "calendar_event",
+        operation: String = "upsert",
     ): String {
         val resource = providerResourceId?.let { "\"$it\"" } ?: "null"
         val etag = providerEtag?.let { "\"$it\"" } ?: "null"
@@ -627,8 +772,8 @@ class OkHttpGoogleCalendarOutboundTransportTest {
             "\"collection_id\":\"$COLLECTION_ID\",\"collection_revision\":" +
             "$collectionRevision,\"collection_display_name\":" +
             Json.encodeToString(collectionDisplayName) + ",\"item_id\":\"$ITEM_ID\"," +
-            "\"item_revision\":$ITEM_REVISION,\"entity_kind\":\"calendar_event\"," +
-            "\"operation\":\"upsert\",\"provider_resource_id\":$resource," +
+            "\"item_revision\":$ITEM_REVISION,\"entity_kind\":\"$entityKind\"," +
+            "\"operation\":\"$operation\",\"provider_resource_id\":$resource," +
             "\"provider_etag\":$etag,\"preview_hash\":\"$previewHash\"," +
             "\"provider_payload\":$providerPayload,\"expires_at\":\"$expiresAt\"}"
     }
@@ -682,5 +827,12 @@ class OkHttpGoogleCalendarOutboundTransportTest {
                 "\"conferenceData\":null,\"attachments\":[],\"updated\":null," +
                 "\"sequence\":null,\"extendedProperties\":{\"private\":{" +
                 "\"dayweaveOwnershipProof\":\"$OWNERSHIP_PROOF\"},\"shared\":{}}}"
+        val TASK_PROVIDER_PAYLOAD =
+            "{\"id\":\"\",\"etag\":null,\"title\":\"Private task\"," +
+                "\"notes\":\"Private notes\",\"status\":\"completed\"," +
+                "\"due\":\"2026-09-03T00:00:00.000Z\"," +
+                "\"completed\":\"2026-09-02T12:00:00.000Z\"," +
+                "\"updated\":null,\"parent\":null,\"position\":null," +
+                "\"links\":null,\"deleted\":false,\"hidden\":false}"
     }
 }

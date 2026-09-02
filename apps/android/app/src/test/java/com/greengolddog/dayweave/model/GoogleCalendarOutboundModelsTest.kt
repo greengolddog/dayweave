@@ -22,6 +22,7 @@ import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 
 class GoogleCalendarOutboundModelsTest {
     @Test
@@ -48,6 +49,16 @@ class GoogleCalendarOutboundModelsTest {
         assertFalse(preview.canTransitionTo(approved))
         assertFalse(approved.canTransitionTo(attempted))
         assertFalse(intent.canTransitionTo(preview.copy(operationGeneration = 2)))
+        assertFalse(
+            intent.canTransitionTo(
+                intent.copy(entityKind = GoogleCalendarOutboundEntityKind.TASK),
+            ),
+        )
+        assertFalse(
+            intent.canTransitionTo(
+                intent.copy(operation = GoogleCalendarOutboundOperation.DELETE),
+            ),
+        )
         assertEquals(Instant.parse("2026-09-02T12:14:00Z"), approved.authorityExpiresAt())
         assertEquals(Instant.parse("2026-09-02T12:19:00Z"), approved.safeDiscardAt())
 
@@ -165,6 +176,72 @@ class GoogleCalendarOutboundModelsTest {
     }
 
     @Test
+    fun taskUpsertRequiresExactInertProjectionAndDeleteRequiresEmptyPayload() {
+        val task = validRemoteTaskPreview()
+        val snapshot = GoogleCalendarOutboundPreviewSnapshot.fromRemote(task)
+        assertEquals(GoogleCalendarOutboundEntityKind.TASK, snapshot.entityKind)
+        assertEquals(GoogleCalendarOutboundOperation.UPSERT, snapshot.operation)
+        assertEquals("Private task", snapshot.providerPayload["title"]?.jsonPrimitive?.content)
+        assertEquals(
+            GoogleCalendarOutboundStage.PREVIEWED,
+            validIntent().copy(entityKind = GoogleCalendarOutboundEntityKind.TASK)
+                .recordingPreview(task).stage,
+        )
+
+        val invalidPayloads = listOf(
+            JsonObject(validTaskPayload() - "title"),
+            JsonObject(validTaskPayload() + ("kind" to JsonPrimitive("tasks#task"))),
+            validTaskPayload().replacing("id", JsonPrimitive("provider-task-id")),
+            validTaskPayload().replacing("etag", JsonPrimitive("provider-etag")),
+            validTaskPayload().replacing("title", JsonPrimitive("  Private task")),
+            validTaskPayload().replacing("notes", JsonPrimitive("ordinary\n[DayWeave item:1]")),
+            validTaskPayload().replacing("status", JsonPrimitive("cancelled")),
+            validTaskPayload().replacing("completed", JsonNull),
+            validTaskPayload().replacing("updated", JsonPrimitive("2026-09-02T12:00:00Z")),
+            validTaskPayload().replacing("parent", JsonPrimitive("provider-parent")),
+            validTaskPayload().replacing("position", JsonPrimitive("0001")),
+            validTaskPayload().replacing("links", JsonArray(emptyList())),
+            validTaskPayload().replacing("deleted", JsonPrimitive(true)),
+            validTaskPayload().replacing("hidden", JsonPrimitive(true)),
+        )
+        invalidPayloads.forEachIndexed { index, payload ->
+            assertThrows("task payload case $index", IllegalArgumentException::class.java) {
+                GoogleCalendarOutboundPreviewSnapshot.fromRemote(
+                    task.copy(providerPayload = payload),
+                )
+            }
+        }
+
+        val delete = task.copy(
+            operation = GoogleCalendarOutboundOperation.DELETE,
+            providerResourceId = "provider-task-id",
+            providerEtag = "provider-etag",
+            providerPayload = JsonObject(emptyMap()),
+        )
+        assertEquals(
+            GoogleCalendarOutboundOperation.DELETE,
+            GoogleCalendarOutboundPreviewSnapshot.fromRemote(delete).operation,
+        )
+        assertEquals(
+            GoogleCalendarOutboundStage.PREVIEWED,
+            validIntent().copy(
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = GoogleCalendarOutboundOperation.DELETE,
+            ).recordingPreview(delete).stage,
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            GoogleCalendarOutboundPreviewSnapshot.fromRemote(
+                delete.copy(providerPayload = validTaskPayload()),
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            GoogleCalendarOutboundPreviewSnapshot.fromRemote(
+                delete.copy(providerResourceId = null, providerEtag = null),
+            )
+        }
+    }
+
+    @Test
     fun capabilityCandidateAndTargetConstructorsFailClosed() {
         assertThrows(IllegalArgumentException::class.java) {
             GoogleCalendarOutboundApprovalCapability("dw_ga1_not-a-capability")
@@ -246,6 +323,63 @@ class GoogleCalendarOutboundModelsTest {
     }
 
     @Test
+    fun candidateParserBindsActiveAndRecentTrashEventAndTaskOperations() {
+        val activeTask = canonicalTask()
+        assertEquals(
+            GoogleCalendarOutboundCandidate(
+                itemId = ITEM_ID,
+                expectedItemRevision = 7,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = GoogleCalendarOutboundOperation.UPSERT,
+            ),
+            syncedState(activeTask).googleCalendarOutboundCandidate(ITEM_ID),
+        )
+
+        val deletedTask = activeTask.copy(
+            revision = 8,
+            status = "cancelled",
+            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+            splitPolicyJson = "{\"type\":\"future_policy\"}",
+            deletedAt = "2026-09-02T12:01:00Z",
+        )
+        val taskTrash = recentlyDeleted(deletedTask)
+        assertEquals(
+            GoogleCalendarOutboundCandidate(
+                itemId = ITEM_ID,
+                expectedItemRevision = 8,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = GoogleCalendarOutboundOperation.DELETE,
+            ),
+            syncedStateWithTrash(taskTrash).googleCalendarOutboundCandidate(ITEM_ID),
+        )
+
+        val deletedEvent = canonicalEvent(allDay = true).copy(
+            revision = 8,
+            deletedAt = "2026-09-02T12:01:00Z",
+        )
+        assertEquals(
+            GoogleCalendarOutboundCandidate(
+                itemId = ITEM_ID,
+                expectedItemRevision = 8,
+                entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                operation = GoogleCalendarOutboundOperation.DELETE,
+            ),
+            syncedStateWithTrash(recentlyDeleted(deletedEvent))
+                .googleCalendarOutboundCandidate(ITEM_ID),
+        )
+
+        val importedTask = activeTask.copy(
+            flexibleConstraintsJson = "{\"google_sync\":{}}",
+        )
+        assertNull(syncedState(importedTask).googleCalendarOutboundCandidate(ITEM_ID))
+        assertNull(
+            syncedStateWithTrash(
+                recentlyDeleted(importedTask.copy(deletedAt = "2026-09-02T12:01:00Z")),
+            ).googleCalendarOutboundCandidate(ITEM_ID),
+        )
+    }
+
+    @Test
     fun targetParserRequiresActiveWriteScopeAndSelectedWritableOwnerOrWriter() {
         val collection = writableCollection()
         assertNotNull(
@@ -289,6 +423,53 @@ class GoogleCalendarOutboundModelsTest {
                 ),
             )
         }
+
+
+        val taskList = collection.copy(
+            kind = RemoteGoogleCollectionKind.TASK_LIST,
+            providerAccessRole = null,
+        )
+        assertEquals(
+            GoogleCalendarOutboundTarget(
+                accountId = ACCOUNT_ID,
+                collectionId = COLLECTION_ID,
+                collectionRevision = 4,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = GoogleCalendarOutboundOperation.DELETE,
+            ),
+            googleCalendarOutboundTarget(
+                accountId = ACCOUNT_ID,
+                accountStatus = "active",
+                accountSyncEnabled = true,
+                accountHasCalendarWriteScope = false,
+                collection = taskList,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                operation = GoogleCalendarOutboundOperation.DELETE,
+                accountHasTasksWriteScope = true,
+            ),
+        )
+        assertNull(
+            googleCalendarOutboundTarget(
+                accountId = ACCOUNT_ID,
+                accountStatus = "active",
+                accountSyncEnabled = true,
+                accountHasCalendarWriteScope = true,
+                collection = taskList,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                accountHasTasksWriteScope = false,
+            ),
+        )
+        assertNull(
+            googleCalendarOutboundTarget(
+                accountId = ACCOUNT_ID,
+                accountStatus = "active",
+                accountSyncEnabled = true,
+                accountHasCalendarWriteScope = true,
+                collection = collection,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                accountHasTasksWriteScope = true,
+            ),
+        )
     }
 
     private fun validIntent() = GoogleCalendarOutboundJournal(
@@ -300,6 +481,7 @@ class GoogleCalendarOutboundModelsTest {
         collectionId = COLLECTION_ID,
         itemId = ITEM_ID,
         expectedItemRevision = 7,
+        entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
         intentExpiresAt = "2026-09-02T12:30:00Z",
         createdAt = "2026-09-02T12:00:00Z",
     )
@@ -318,6 +500,23 @@ class GoogleCalendarOutboundModelsTest {
         providerEtag = null,
         previewHash = PREVIEW_HASH,
         providerPayload = validPayload(),
+        expiresAt = "2026-09-02T12:20:00Z",
+    )
+
+    private fun validRemoteTaskPreview() = RemoteGoogleOutboundPreview(
+        id = PREVIEW_ID,
+        accountId = ACCOUNT_ID,
+        collectionId = COLLECTION_ID,
+        collectionRevision = 4,
+        collectionDisplayName = "Personal tasks",
+        itemId = ITEM_ID,
+        itemRevision = 7,
+        entityKind = GoogleCalendarOutboundEntityKind.TASK,
+        operation = GoogleCalendarOutboundOperation.UPSERT,
+        providerResourceId = null,
+        providerEtag = null,
+        previewHash = PREVIEW_HASH,
+        providerPayload = validTaskPayload(),
         expiresAt = "2026-09-02T12:20:00Z",
     )
 
@@ -347,6 +546,26 @@ class GoogleCalendarOutboundModelsTest {
             "private":{"dayweaveOwnershipProof":"$OWNERSHIP_PROOF"},
             "shared":{}
           }
+        }
+        """.trimIndent(),
+    ) as JsonObject
+
+    private fun validTaskPayload(): JsonObject = Json.parseToJsonElement(
+        """
+        {
+          "id":"",
+          "etag":null,
+          "title":"Private task",
+          "notes":"Private notes",
+          "status":"completed",
+          "due":"2026-09-03T00:00:00.000Z",
+          "completed":"2026-09-02T12:00:00.000Z",
+          "updated":null,
+          "parent":null,
+          "position":null,
+          "links":null,
+          "deleted":false,
+          "hidden":false
         }
         """.trimIndent(),
     ) as JsonObject
@@ -419,8 +638,59 @@ class GoogleCalendarOutboundModelsTest {
         )
     }
 
+    private fun canonicalTask(): CanonicalItemSnapshot {
+        val draft = CanonicalItemDraft(
+            placement = CanonicalDraftPlacement.PLANNED,
+            kind = ItemKind.TASK,
+            title = "Private task",
+            notes = "Private notes",
+            timezoneName = "Europe/Paris",
+            durationSeconds = 3_600,
+            deadlineAt = "2026-09-03T10:00:00Z",
+        )
+        return CanonicalItemSnapshot(
+            id = ITEM_ID,
+            kind = "task",
+            status = "planned",
+            title = draft.title,
+            notes = draft.notes,
+            timezoneName = draft.timezoneName,
+            durationSeconds = draft.durationSeconds,
+            deadlineAt = draft.deadlineAt,
+            flexibleConstraintsJson = draft.constraints.toCanonicalJson(
+                eventTiming = null,
+                durationSeconds = draft.durationSeconds,
+            ).toString(),
+            splitPolicyJson = draft.split.toCanonicalJson(draft.durationSeconds).toString(),
+            importance = draft.importance,
+            urgency = draft.urgency,
+            siblingOrder = draft.siblingOrder,
+            isExecutable = true,
+            revision = 7,
+            createdAt = "2026-09-02T09:00:00Z",
+            updatedAt = "2026-09-02T09:00:00Z",
+        )
+    }
+
+    private fun recentlyDeleted(item: CanonicalItemSnapshot) = CanonicalRecentlyDeletedRecord(
+        id = item.id,
+        revision = item.revision,
+        deletedAt = requireNotNull(item.deletedAt),
+        parentId = item.parentId,
+        lastKnownItem = item,
+        effectiveIsSensitive = item.isSensitive,
+        retentionAnchorAt = item.deletedAt,
+    )
+
     private fun syncedState(item: CanonicalItemSnapshot) = DayWeaveUiState(
         canonicalItems = listOf(item),
+        canonicalSyncOrigin = "https://api.example.test",
+        canonicalConfigurationId = "config-1",
+        canonicalDeltaCursor = "cursor-1",
+    )
+
+    private fun syncedStateWithTrash(record: CanonicalRecentlyDeletedRecord) = DayWeaveUiState(
+        canonicalRecentlyDeleted = listOf(record),
         canonicalSyncOrigin = "https://api.example.test",
         canonicalConfigurationId = "config-1",
         canonicalDeltaCursor = "cursor-1",

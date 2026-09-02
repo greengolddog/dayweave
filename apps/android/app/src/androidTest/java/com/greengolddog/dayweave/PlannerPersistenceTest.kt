@@ -561,6 +561,40 @@ class PlannerPersistenceTest {
         migrated.close()
     }
 
+    @Test
+    fun migrationTwelveToThirteenPreservesV12PayloadUntilRepositoryRewrite() {
+        System.loadLibrary("sqlcipher")
+        migrationHelper.createDatabase(MIGRATION_DATABASE, 12).apply {
+            execSQL(
+                "INSERT INTO planner_snapshot " +
+                    "(singletonId, payload, updatedAtEpochMillis, payloadFormat) " +
+                    "VALUES (1, '{\"canary\":\"SYNTHETIC-GOOGLE-OUTBOUND-V13-ANDROID\"}', " +
+                    "1695, '${PlannerSnapshotFormats.JSON_V12}')",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            MIGRATION_DATABASE,
+            13,
+            true,
+            PlannerDatabaseMigrations.MIGRATION_12_13,
+        )
+        migrated.query(
+            "SELECT payload, updatedAtEpochMillis, payloadFormat " +
+                "FROM planner_snapshot WHERE singletonId = 1",
+        ).use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(
+                "{\"canary\":\"SYNTHETIC-GOOGLE-OUTBOUND-V13-ANDROID\"}",
+                cursor.getString(0),
+            )
+            assertEquals(1695L, cursor.getLong(1))
+            assertEquals(PlannerSnapshotFormats.JSON_V12, cursor.getString(2))
+        }
+        migrated.close()
+    }
+
     private companion object {
         const val RESTORE_DATABASE = "planner-persistence-restore-test.db"
         const val MIGRATION_DATABASE = "planner-persistence-migration-test.db"

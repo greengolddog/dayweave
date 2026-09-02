@@ -15,7 +15,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.CheckCircle
+import androidx.compose.material.icons.outlined.Checklist
 import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Refresh
@@ -46,6 +48,8 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.SecureFlagPolicy
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundPreviewSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundEntityKind
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundOperation
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundApprovalConfirmation
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundPhase
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundState
@@ -59,7 +63,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
 /**
- * Secure, exact review surface for the first Google Calendar outbound slice.
+ * Secure, exact review surface for one Google Calendar or Tasks mutation.
  *
  * The host owns selection and all authority. In particular, approval is impossible unless the
  * coordinator supplies an opaque [GoogleCalendarOutboundApprovalConfirmation] for the preview
@@ -71,6 +75,7 @@ internal fun GoogleCalendarOutboundReviewSheet(
     targets: List<GoogleCalendarOutboundTargetOption>,
     selectedTarget: GoogleCalendarOutboundTargetOption?,
     reviewDestinationDisplayName: String? = null,
+    reviewItemTitle: String? = null,
     approvalConfirmation: GoogleCalendarOutboundApprovalConfirmation?,
     canRecover: Boolean,
     canDiscardExpiredRecovery: Boolean,
@@ -86,8 +91,20 @@ internal fun GoogleCalendarOutboundReviewSheet(
         selectedTarget != null && targets.contains(selectedTarget) -> selectedTarget
         else -> null
     }
-    val previewPresentation = remember(state.preview, reviewDestinationDisplayName) {
-        state.preview?.toSanitizedOutboundPresentation()?.let { presentation ->
+    val presentedEntityKind = state.preview?.entityKind
+        ?: effectiveTarget?.target?.entityKind
+        ?: selectedTarget?.target?.entityKind
+        ?: GoogleCalendarOutboundEntityKind.CALENDAR_EVENT
+    val presentedOperation = state.preview?.operation
+        ?: effectiveTarget?.target?.operation
+        ?: selectedTarget?.target?.operation
+        ?: GoogleCalendarOutboundOperation.UPSERT
+    val previewPresentation = remember(
+        state.preview,
+        reviewDestinationDisplayName,
+        reviewItemTitle,
+    ) {
+        state.preview?.toSanitizedOutboundPresentation(reviewItemTitle)?.let { presentation ->
             reviewDestinationDisplayName?.let { displayName ->
                 presentation.copy(
                     destination = displayName.sanitizeDisplayText(
@@ -122,6 +139,8 @@ internal fun GoogleCalendarOutboundReviewSheet(
                 verticalArrangement = Arrangement.spacedBy(16.dp),
             ) {
                 ReviewHeader(
+                    entityKind = presentedEntityKind,
+                    operation = presentedOperation,
                     isBusy = state.isBusy,
                     onDismissRequest = onDismissRequest,
                 )
@@ -140,6 +159,7 @@ internal fun GoogleCalendarOutboundReviewSheet(
                         canStartPreview -> DestinationPicker(
                             targets = targets,
                             selectedTarget = effectiveTarget,
+                            entityKind = presentedEntityKind,
                             onTargetSelected = onTargetSelected,
                         )
                     }
@@ -205,6 +225,8 @@ internal fun GoogleCalendarOutboundReviewSheet(
 
 @Composable
 private fun ReviewHeader(
+    entityKind: GoogleCalendarOutboundEntityKind,
+    operation: GoogleCalendarOutboundOperation,
     isBusy: Boolean,
     onDismissRequest: () -> Unit,
 ) {
@@ -218,7 +240,13 @@ private fun ReviewHeader(
             color = MaterialTheme.colorScheme.primaryContainer,
         ) {
             Icon(
-                Icons.Outlined.CalendarMonth,
+                when {
+                    operation == GoogleCalendarOutboundOperation.DELETE ->
+                        Icons.Outlined.DeleteOutline
+                    entityKind == GoogleCalendarOutboundEntityKind.TASK ->
+                        Icons.Outlined.Checklist
+                    else -> Icons.Outlined.CalendarMonth
+                },
                 contentDescription = null,
                 tint = MaterialTheme.colorScheme.onPrimaryContainer,
                 modifier = Modifier.padding(10.dp),
@@ -226,12 +254,31 @@ private fun ReviewHeader(
         }
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                "Publish to Google Calendar",
+                when (entityKind) {
+                    GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ->
+                        "Review Google Calendar change"
+                    GoogleCalendarOutboundEntityKind.TASK ->
+                        "Review Google Tasks change"
+                },
                 style = MaterialTheme.typography.titleLarge,
                 fontWeight = FontWeight.SemiBold,
             )
             Text(
-                "One private, attendee-free event",
+                when (entityKind to operation) {
+                    GoogleCalendarOutboundEntityKind.CALENDAR_EVENT to
+                        GoogleCalendarOutboundOperation.UPSERT ->
+                        "One private, attendee-free event"
+                    GoogleCalendarOutboundEntityKind.CALENDAR_EVENT to
+                        GoogleCalendarOutboundOperation.DELETE ->
+                        "Remove one mapped DayWeave event"
+                    GoogleCalendarOutboundEntityKind.TASK to
+                        GoogleCalendarOutboundOperation.UPSERT ->
+                        "One task; planning metadata stays local"
+                    GoogleCalendarOutboundEntityKind.TASK to
+                        GoogleCalendarOutboundOperation.DELETE ->
+                        "Remove one mapped DayWeave task"
+                    else -> "One explicitly reviewed Google change"
+                },
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -240,7 +287,7 @@ private fun ReviewHeader(
             onClick = onDismissRequest,
             enabled = !isBusy,
         ) {
-            Icon(Icons.Outlined.Close, contentDescription = "Close Google Calendar review")
+            Icon(Icons.Outlined.Close, contentDescription = "Close Google publication review")
         }
     }
 }
@@ -295,6 +342,7 @@ private fun StatusBanner(state: GoogleCalendarOutboundState) {
 private fun DestinationPicker(
     targets: List<GoogleCalendarOutboundTargetOption>,
     selectedTarget: GoogleCalendarOutboundTargetOption?,
+    entityKind: GoogleCalendarOutboundEntityKind,
     onTargetSelected: (GoogleCalendarOutboundTargetOption) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -305,7 +353,11 @@ private fun DestinationPicker(
         )
         when {
             targets.isEmpty() -> Text(
-                "No writable owner or writer calendar is available. Enable publishing in Google settings first.",
+                if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                    "No writable owner or writer calendar is available. Enable Calendar publishing first."
+                } else {
+                    "No writable task list is available. Enable Google Tasks publishing first."
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.error,
             )
@@ -322,7 +374,13 @@ private fun DestinationPicker(
                             .testTag(GOOGLE_OUTBOUND_DESTINATION_PICKER_TAG),
                     ) {
                         Text(
-                            selectedTarget?.displayName ?: "Choose a calendar",
+                            selectedTarget?.displayName ?: if (
+                                entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT
+                            ) {
+                                "Choose a calendar"
+                            } else {
+                                "Choose a task list"
+                            },
                             modifier = Modifier.weight(1f),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
@@ -353,7 +411,7 @@ private fun DestinationPicker(
                 }
                 if (selectedTarget == null) {
                     Text(
-                        "Choose the exact calendar before generating a server preview.",
+                        "Choose the exact ${if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) "calendar" else "task list"} before generating a server preview.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -397,9 +455,18 @@ private fun PreviewDetails(preview: GoogleCalendarOutboundPreviewPresentation) {
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            ReviewBadge("Private")
-            ReviewBadge("No guests")
-            ReviewBadge("No conferencing")
+            when (preview.entityKind) {
+                GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> {
+                    ReviewBadge("Private")
+                    ReviewBadge("No guests")
+                    ReviewBadge("No conferencing")
+                }
+                GoogleCalendarOutboundEntityKind.TASK -> {
+                    ReviewBadge("Google Task")
+                    ReviewBadge("Explicit approval")
+                    ReviewBadge("Planning stays local")
+                }
+            }
         }
 
         ReviewSection("Publication") {
@@ -408,22 +475,65 @@ private fun PreviewDetails(preview: GoogleCalendarOutboundPreviewPresentation) {
             ReviewField("Expires", preview.expires, GOOGLE_OUTBOUND_EXPIRY_TAG)
         }
 
-        ReviewSection("Event") {
+        ReviewSection(
+            if (preview.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                "Event"
+            } else {
+                "Task"
+            },
+        ) {
             ReviewField("Title", preview.title, GOOGLE_OUTBOUND_TITLE_TAG)
-            ReviewField(
-                "Description",
-                preview.description ?: "No description",
-                GOOGLE_OUTBOUND_DESCRIPTION_TAG,
-                subdued = preview.description == null,
-            )
-            ReviewField("Starts", preview.starts, GOOGLE_OUTBOUND_START_TAG)
-            ReviewField("Ends", preview.ends, GOOGLE_OUTBOUND_END_TAG)
-            ReviewField("Status", preview.status, GOOGLE_OUTBOUND_STATUS_TAG)
-            ReviewField(
-                "Availability",
-                preview.transparency,
-                GOOGLE_OUTBOUND_TRANSPARENCY_TAG,
-            )
+            if (preview.operation == GoogleCalendarOutboundOperation.DELETE) {
+                Text(
+                    if (preview.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                        "Google will remove only the mapped event whose retained provider identity and ownership proof still match."
+                    } else {
+                        "Google will remove only the mapped task whose retained provider identity and version still match."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else if (preview.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                ReviewField(
+                    "Description",
+                    preview.description ?: "No description",
+                    GOOGLE_OUTBOUND_DESCRIPTION_TAG,
+                    subdued = preview.description == null,
+                )
+                ReviewField("Starts", requireNotNull(preview.starts), GOOGLE_OUTBOUND_START_TAG)
+                ReviewField("Ends", requireNotNull(preview.ends), GOOGLE_OUTBOUND_END_TAG)
+                ReviewField(
+                    "Status",
+                    requireNotNull(preview.status),
+                    GOOGLE_OUTBOUND_STATUS_TAG,
+                )
+                ReviewField(
+                    "Availability",
+                    requireNotNull(preview.transparency),
+                    GOOGLE_OUTBOUND_TRANSPARENCY_TAG,
+                )
+            } else {
+                ReviewField(
+                    "Notes",
+                    preview.description ?: "No notes",
+                    GOOGLE_OUTBOUND_DESCRIPTION_TAG,
+                    subdued = preview.description == null,
+                )
+                ReviewField(
+                    "Status",
+                    requireNotNull(preview.status),
+                    GOOGLE_OUTBOUND_STATUS_TAG,
+                )
+                ReviewField(
+                    "Due",
+                    preview.due ?: "No due date",
+                    GOOGLE_OUTBOUND_DUE_TAG,
+                    subdued = preview.due == null,
+                )
+                preview.completed?.let {
+                    ReviewField("Completed", it, GOOGLE_OUTBOUND_COMPLETED_TAG)
+                }
+            }
         }
 
         Text(
@@ -507,7 +617,7 @@ private fun InvalidPreviewNotice() {
         color = MaterialTheme.colorScheme.errorContainer,
     ) {
         Text(
-            "This server preview is not a timed private event and cannot be approved here.",
+            "This server preview is not an exact supported Calendar or Tasks change and cannot be approved here.",
             modifier = Modifier.padding(14.dp),
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onErrorContainer,
@@ -592,46 +702,105 @@ private fun RecoveryCard(
 
 /** Only these display-safe fields are allowed to cross from provider JSON into Compose. */
 internal data class GoogleCalendarOutboundPreviewPresentation(
+    val entityKind: GoogleCalendarOutboundEntityKind,
+    val operation: GoogleCalendarOutboundOperation,
     val destination: String,
     val change: String,
     val title: String,
     val description: String?,
-    val starts: String,
-    val ends: String,
-    val status: String,
-    val transparency: String,
+    val starts: String? = null,
+    val ends: String? = null,
+    val due: String? = null,
+    val completed: String? = null,
+    val status: String? = null,
+    val transparency: String? = null,
     val expires: String,
 )
 
-internal fun GoogleCalendarOutboundPreviewSnapshot.toSanitizedOutboundPresentation():
+internal fun GoogleCalendarOutboundPreviewSnapshot.toSanitizedOutboundPresentation(
+    fallbackTitle: String? = null,
+):
     GoogleCalendarOutboundPreviewPresentation? = runCatching {
     val payload = providerPayload
-    val title = requireNotNull(payload.displayString("summary"))
-    val description = payload.displayString("description", MAX_DESCRIPTION_DISPLAY_CHARS)
-    val status = when (payload.requiredDisplayString("status")) {
-        "confirmed" -> "Confirmed"
-        "tentative" -> "Tentative"
-        else -> error("Unsupported Calendar status")
-    }
-    val transparency = when (payload.requiredDisplayString("transparency")) {
-        "opaque" -> "Busy"
-        "transparent" -> "Free"
-        else -> error("Unsupported Calendar transparency")
-    }
-    val start = payload.requiredTimedBoundary("start")
-    val end = payload.requiredTimedBoundary("end")
     val expiry = Instant.parse(expiresAt)
-    GoogleCalendarOutboundPreviewPresentation(
-        destination = collectionDisplayName.sanitizeDisplayText(MAX_DESTINATION_DISPLAY_CHARS),
-        change = if (providerResourceId == null) "Create new event" else "Update existing event",
-        title = title,
-        description = description,
-        starts = start.displayLabel(),
-        ends = end.displayLabel(),
-        status = status,
-        transparency = transparency,
-        expires = expiry.atZone(ZoneId.systemDefault()).format(expiryFormatter()),
-    )
+    val destination = collectionDisplayName.sanitizeDisplayText(MAX_DESTINATION_DISPLAY_CHARS)
+    val expires = expiry.atZone(ZoneId.systemDefault()).format(expiryFormatter())
+    if (operation == GoogleCalendarOutboundOperation.DELETE) {
+        require(payload.isEmpty())
+        GoogleCalendarOutboundPreviewPresentation(
+            entityKind = entityKind,
+            operation = operation,
+            destination = destination,
+            change = if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                "Delete existing event"
+            } else {
+                "Delete existing task"
+            },
+            title = fallbackTitle?.sanitizeDisplayText(MAX_GENERAL_DISPLAY_CHARS)
+                ?.takeIf(String::isNotEmpty)
+                ?: if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+                    "Mapped DayWeave event"
+                } else {
+                    "Mapped DayWeave task"
+                },
+            description = null,
+            expires = expires,
+        )
+    } else if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+        val title = requireNotNull(payload.displayString("summary"))
+        val description = payload.displayString("description", MAX_DESCRIPTION_DISPLAY_CHARS)
+        val status = when (payload.requiredDisplayString("status")) {
+            "confirmed" -> "Confirmed"
+            "tentative" -> "Tentative"
+            else -> error("Unsupported Calendar status")
+        }
+        val transparency = when (payload.requiredDisplayString("transparency")) {
+            "opaque" -> "Busy"
+            "transparent" -> "Free"
+            else -> error("Unsupported Calendar transparency")
+        }
+        val start = payload.requiredTimedBoundary("start")
+        val end = payload.requiredTimedBoundary("end")
+        GoogleCalendarOutboundPreviewPresentation(
+            entityKind = entityKind,
+            operation = operation,
+            destination = destination,
+            change = if (providerResourceId == null) {
+                "Create new event"
+            } else {
+                "Update existing event"
+            },
+            title = title,
+            description = description,
+            starts = start.displayLabel(),
+            ends = end.displayLabel(),
+            status = status,
+            transparency = transparency,
+            expires = expires,
+        )
+    } else {
+        val status = when (payload.requiredDisplayString("status")) {
+            "needsAction" -> "Needs action"
+            "completed" -> "Completed"
+            else -> error("Unsupported Google Task status")
+        }
+        GoogleCalendarOutboundPreviewPresentation(
+            entityKind = entityKind,
+            operation = operation,
+            destination = destination,
+            change = if (providerResourceId == null) {
+                "Create new task"
+            } else {
+                "Update existing task"
+            },
+            title = payload.requiredDisplayString("title"),
+            description = payload.displayString("notes", MAX_DESCRIPTION_DISPLAY_CHARS),
+            due = payload.displayInstant("due"),
+            completed = payload.displayInstant("completed"),
+            status = status,
+            expires = expires,
+        )
+    }
 }.getOrNull()
 
 private data class TimedBoundary(
@@ -662,6 +831,13 @@ private fun JsonObject.displayString(
     ?.takeIf(JsonPrimitive::isString)
     ?.content
     ?.sanitizeDisplayText(maximumCharacters)
+
+private fun JsonObject.displayInstant(key: String): String? {
+    val raw = displayString(key) ?: return null
+    return Instant.parse(raw)
+        .atZone(ZoneId.systemDefault())
+        .format(expiryFormatter())
+}
 
 private fun String.sanitizeDisplayText(maximumCharacters: Int): String {
     val normalized = buildString(length.coerceAtMost(maximumCharacters)) {
@@ -698,6 +874,8 @@ internal const val GOOGLE_OUTBOUND_START_TAG = "google_outbound_preview_start"
 internal const val GOOGLE_OUTBOUND_END_TAG = "google_outbound_preview_end"
 internal const val GOOGLE_OUTBOUND_STATUS_TAG = "google_outbound_preview_status"
 internal const val GOOGLE_OUTBOUND_TRANSPARENCY_TAG = "google_outbound_preview_transparency"
+internal const val GOOGLE_OUTBOUND_DUE_TAG = "google_outbound_preview_due"
+internal const val GOOGLE_OUTBOUND_COMPLETED_TAG = "google_outbound_preview_completed"
 internal const val GOOGLE_OUTBOUND_EXPIRY_TAG = "google_outbound_preview_expiry"
 
 private const val MAX_GENERAL_DISPLAY_CHARS = 1_024
