@@ -1,8 +1,16 @@
+use std::convert::Infallible;
+
 use axum::{
     Extension, Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::{HeaderMap, HeaderName, HeaderValue, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
+use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
@@ -11,16 +19,22 @@ use uuid::Uuid;
 use crate::{AppState, auth::Principal, error::ApiError};
 
 use super::{
-    ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult, ManualPlacementApproval,
-    PublishScheduleSpec, RetainedManualPlacementCatalog, ScheduleAccess, SchedulePublication,
-    SchedulePublicationError, compose_canonical_schedule, compose_canonical_schedule_unfenced,
-    postgres::decode_prefixed_sha256,
+    ComposeScheduleError, ComposeScheduleRequest, ComposeScheduleResult, CurrentPublishedSchedule,
+    ManualPlacementApproval, PublishScheduleSpec, RetainedManualPlacementCatalog, ScheduleAccess,
+    ScheduleInvalidationOpenError, ScheduleInvalidationSignal, SchedulePublication,
+    SchedulePublicationError, SchedulingPortError, compose_canonical_schedule,
+    compose_canonical_schedule_unfenced, postgres::decode_prefixed_sha256,
 };
 
 pub const SCHEDULE_BODY_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+const EVENT_STREAM_MEDIA_TYPE: &str = "text/event-stream";
+const INVALIDATION_EVENT: &str = "schedule-invalidation";
 
 pub(crate) fn routes() -> Router<AppState> {
     Router::new()
+        .route("/schedule/current", get(get_current_schedule))
+        .route("/schedule/stream", get(schedule_stream))
         .route("/schedule/preview", post(preview_schedule))
         .route("/schedule/publish", post(publish_schedule))
         .route(
@@ -28,6 +42,199 @@ pub(crate) fn routes() -> Router<AppState> {
             get(list_retained_manual_placements),
         )
         .layer(DefaultBodyLimit::max(SCHEDULE_BODY_LIMIT_BYTES))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/schedule/current",
+    tag = "schedule",
+    security(("bearer_token" = [])),
+    responses(
+        (status = 200, description = "Exact current immutable publication for a trusted native replica", body = CurrentPublishedSchedule),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Credential lacks schedule_read", body = crate::error::ErrorEnvelope),
+        (status = 404, description = "No schedule has been published", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Current schedule predates the supported durable snapshot schema", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Durable schedule storage is unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn get_current_schedule(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Response, ApiError> {
+    let repository = state
+        .scheduling
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Durable schedule storage is not configured"))?;
+    let access = ScheduleAccess {
+        subject: principal.subject,
+        include_sensitive: true,
+        workspace_id: principal.workspace_id,
+        user_id: principal.user_id,
+    };
+    let current = match repository.current_native_schedule(&access).await {
+        Ok(current) => current,
+        Err(error) => {
+            let mut response = map_schedule_read_error(error).into_response();
+            apply_current_schedule_cache_headers(&mut response);
+            return Ok(response);
+        }
+    };
+    let etag = HeaderValue::from_str(&format!(r#""{}""#, current.revision.revision))
+        .map_err(|_| ApiError::unavailable("Published schedule revision is invalid"))?;
+    let mut response = Json(current).into_response();
+    apply_current_schedule_cache_headers(&mut response);
+    response.headers_mut().insert(header::ETAG, etag);
+    Ok(response)
+}
+
+fn apply_current_schedule_cache_headers(response: &mut Response) {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/schedule/stream",
+    tag = "schedule",
+    security(("bearer_token" = [])),
+    params(
+        ("Accept" = String, Header, description = "Must be exactly text/event-stream"),
+        ("Last-Event-ID" = Option<String>, Header, description = "Last installed published schedule revision as canonical unsigned decimal; omitted means 0")
+    ),
+    responses(
+        (status = 200, description = "Content-free published schedule revision invalidations", body = String, content_type = "text/event-stream"),
+        (status = 400, description = "Malformed Last-Event-ID", body = crate::error::ErrorEnvelope),
+        (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
+        (status = 403, description = "Credential lacks schedule_read", body = crate::error::ErrorEnvelope),
+        (status = 406, description = "Accept is not exactly text/event-stream", body = crate::error::ErrorEnvelope),
+        (status = 409, description = "Last-Event-ID is ahead of the authoritative published revision", body = crate::error::ErrorEnvelope),
+        (status = 503, description = "Stream capacity or durable schedule state is unavailable", body = crate::error::ErrorEnvelope)
+    )
+)]
+pub(crate) async fn schedule_stream(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_event_stream_accept(&headers)?;
+    let cursor = parse_last_event_id(&headers)?;
+    let repository = state
+        .scheduling
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Durable schedule storage is not configured"))?;
+    let access = ScheduleAccess {
+        subject: principal.subject,
+        include_sensitive: false,
+        workspace_id: principal.workspace_id,
+        user_id: principal.user_id,
+    };
+    let stream = repository
+        .invalidation_stream(&access, cursor)
+        .await
+        .map_err(|error| map_invalidation_open_error(&error))?
+        .into_stream()
+        .map(|signal| {
+            let event = match signal {
+                ScheduleInvalidationSignal::Revision(revision) => Event::default()
+                    .id(revision.to_string())
+                    .event(INVALIDATION_EVENT)
+                    .data(format!(r#"{{"revision":{revision}}}"#)),
+                ScheduleInvalidationSignal::Heartbeat => Event::default().comment("heartbeat"),
+            };
+            Ok::<Event, Infallible>(event)
+        });
+    let mut response = Sse::new(stream).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
+}
+
+fn require_event_stream_accept(headers: &HeaderMap) -> Result<(), ApiError> {
+    let mut values = headers.get_all(header::ACCEPT).iter();
+    let accepted = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case(EVENT_STREAM_MEDIA_TYPE));
+    if !accepted || values.next().is_some() {
+        return Err(ApiError::not_acceptable(
+            "Accept must be exactly text/event-stream",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_last_event_id(headers: &HeaderMap) -> Result<u64, ApiError> {
+    let name = HeaderName::from_static(LAST_EVENT_ID_HEADER);
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(0);
+    };
+    if values.next().is_some() {
+        return Err(invalid_last_event_id());
+    }
+    let value = value.to_str().map_err(|_| invalid_last_event_id())?;
+    let canonical = value == "0"
+        || (value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && !value.starts_with('0')
+            && value.bytes().all(|byte| byte.is_ascii_digit()));
+    if !canonical {
+        return Err(invalid_last_event_id());
+    }
+    value.parse().map_err(|_| invalid_last_event_id())
+}
+
+fn invalid_last_event_id() -> ApiError {
+    ApiError::bad_request("Last-Event-ID must be canonical unsigned decimal")
+}
+
+fn map_invalidation_open_error(error: &ScheduleInvalidationOpenError) -> ApiError {
+    match error {
+        ScheduleInvalidationOpenError::AccessDenied => ApiError::forbidden(),
+        ScheduleInvalidationOpenError::Capacity => {
+            ApiError::unavailable("schedule stream capacity is temporarily exhausted")
+        }
+        ScheduleInvalidationOpenError::CursorAhead { cursor, head } => {
+            ApiError::conflict("schedule stream cursor is ahead of authoritative state")
+                .with_details(serde_json::json!({
+                    "cursor_revision": cursor,
+                    "head_revision": head,
+                }))
+        }
+        ScheduleInvalidationOpenError::Repository(_) => {
+            ApiError::unavailable("schedule stream cannot read authoritative state")
+        }
+    }
+}
+
+fn map_schedule_read_error(error: SchedulingPortError) -> ApiError {
+    match error {
+        SchedulingPortError::NotFound => ApiError::not_found("Published schedule"),
+        SchedulingPortError::RepublishRequired => ApiError::conflict(
+            "Published schedule must be recomposed before this client can install it",
+        ),
+        SchedulingPortError::RevisionConflict { .. } => {
+            ApiError::conflict("Published schedule revision changed; retry")
+        }
+        SchedulingPortError::InvalidQuery(message) => ApiError::validation(message),
+        SchedulingPortError::Unavailable(_) => {
+            ApiError::unavailable("Durable schedule storage is temporarily unavailable")
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]

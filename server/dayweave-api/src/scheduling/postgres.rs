@@ -32,15 +32,18 @@ use crate::{
 use super::{
     CalendarProjectionFenceError, CalendarProjectionStamp, ComposeScheduleResult, ConflictQuery,
     ConflictReport, ItemSearchQuery, ItemSearchResult, ItemSummary,
-    MANUAL_PLACEMENT_PUBLICATION_SCHEMA, ManualPlacementInput, ManualPlacementViolationOutput,
-    PlacementAlternative, PlacementExplanation, PlacementReason, PlanOperationKind,
-    PlanningSimulationPort, PreviousAssignmentInput, PreviousBlockInput, ProposalSubmissionError,
-    ProposalSubmissionPort, ProposalSubmissionResult, ProposalSubmissionSpec,
-    RetainedManualPlacementCatalog, SCHEDULER_PUBLICATION_SCHEMA, ScheduleAccess,
-    ScheduleBlockView, ScheduleConflict, ScheduleDetail, ScheduleQuery, ScheduleQueryPort,
+    MANUAL_PLACEMENT_PUBLICATION_SCHEMA, ManualPlacementAssessmentOutput, ManualPlacementInput,
+    ManualPlacementViolationOutput, PlacementAlternative, PlacementExplanation, PlacementReason,
+    PlanOperationKind, PlanningSimulationPort, PreviousAssignmentInput, PreviousBlockInput,
+    ProposalSubmissionError, ProposalSubmissionPort, ProposalSubmissionResult,
+    ProposalSubmissionSpec, RetainedManualPlacementCatalog, SCHEDULER_PUBLICATION_SCHEMA,
+    ScheduleAccess, ScheduleBlockView, ScheduleConflict, ScheduleDetail,
+    ScheduleInvalidationConfig, ScheduleInvalidationOpenError, ScheduleQuery, ScheduleQueryPort,
     ScheduleView, SchedulingPortError, SimulatedBlockMove, SimulationConsumption, SimulationIssue,
     SimulationProposalEvidence, SimulationRequest, SimulationResult,
-    has_postgres_timestamp_precision, materialize_proposal,
+    has_postgres_timestamp_precision,
+    invalidation::{ScheduleInvalidationHub, ScheduleInvalidationStream},
+    materialize_proposal,
     proposal_bridge::{
         OperationCompilation, RequestCompilation, classify_request, compile_operation,
         finish_evidence, parent_item_id, target_item_id,
@@ -72,6 +75,149 @@ pub struct PublishedScheduleRevision {
 pub struct SchedulePublication {
     pub revision: PublishedScheduleRevision,
     pub replayed: bool,
+}
+
+/// Exact immutable publication consumed by trusted native replicas.
+///
+/// `schedule` is the public `ComposeScheduleResult` JSON stored at publication
+/// time. Private planning, execution, Calendar-generation, and sensitivity
+/// evidence are siblings in the durable snapshot and never cross this type.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+pub struct CurrentPublishedSchedule {
+    pub revision: PublishedScheduleRevision,
+    #[schema(value_type = ComposeScheduleResult)]
+    pub schedule: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeComposeSnapshot {
+    input_digest: String,
+    source_item_count: usize,
+    source_item_revisions: BTreeMap<Uuid, u64>,
+    accepted_item_count: usize,
+    rejected_items: Vec<NativeRejectedItem>,
+    ignored_previous_assignments: Vec<NativeIgnoredPreviousAssignment>,
+    #[serde(default)]
+    manual_placement_assessments: Vec<ManualPlacementAssessmentOutput>,
+    plan: NativeSchedulePlan,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeRejectedItem {
+    item_id: Uuid,
+    #[allow(dead_code)]
+    is_sensitive: bool,
+    title: String,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeIgnoredPreviousAssignment {
+    item_id: Uuid,
+    requested_revision: u64,
+    current_revision: Option<u64>,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeSchedulePlan {
+    as_of: String,
+    horizon_start: String,
+    horizon_end: String,
+    blocks: Vec<NativeScheduleBlock>,
+    unscheduled: Vec<NativeUnscheduledWork>,
+    decisions: Vec<NativePlanDecision>,
+    violations: Vec<NativePlanViolation>,
+    score: NativePlanScore,
+    occurrences: Vec<NativeOccurrence>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeScheduleBlock {
+    id: Uuid,
+    #[allow(dead_code)]
+    is_sensitive: bool,
+    item_id: Option<Uuid>,
+    occurrence_id: Option<Uuid>,
+    external_block_id: Option<Uuid>,
+    title: String,
+    start: String,
+    end: String,
+    #[allow(dead_code)]
+    session_index: u16,
+    kind: ScheduleBlockKind,
+    explanations: Vec<NativePlacementExplanation>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePlacementExplanation {
+    code: ExplanationCode,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeUnscheduledWork {
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+    #[allow(dead_code)]
+    remaining: u32,
+    reason: dayweave_core::UnscheduledReason,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePlanDecision {
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+    kind: dayweave_core::DecisionKind,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePlanViolation {
+    kind: dayweave_core::ViolationKind,
+    severity: dayweave_core::ViolationSeverity,
+    item_ids: Vec<Uuid>,
+    occurrence_ids: Vec<Uuid>,
+    start: Option<String>,
+    end: Option<String>,
+    #[allow(dead_code)]
+    penalty: u64,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePlanScore {
+    scheduled_minutes: u32,
+    unscheduled_minutes: u32,
+    soft_penalty: u64,
+    moved_minutes: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeOccurrence {
+    id: Uuid,
+    series_item_id: Uuid,
+    identity: dayweave_core::RecurrenceOccurrenceIdentity,
+    nominal_start: String,
+    nominal_end: String,
+    window_start: String,
+    window_end: String,
+    local_date: Option<String>,
+    #[allow(dead_code)]
+    ordinal: u32,
+    state: dayweave_core::OccurrenceState,
 }
 
 #[derive(Clone, Debug)]
@@ -186,6 +332,7 @@ pub enum SchedulePublicationError {
 pub struct PostgresSchedulingRepository {
     pool: PgPool,
     scope: DatabaseScope,
+    invalidations: ScheduleInvalidationHub,
 }
 
 impl std::fmt::Debug for PostgresSchedulingRepository {
@@ -200,7 +347,90 @@ impl std::fmt::Debug for PostgresSchedulingRepository {
 impl PostgresSchedulingRepository {
     #[must_use]
     pub fn new(pool: PgPool, scope: DatabaseScope) -> Self {
-        Self { pool, scope }
+        Self {
+            pool,
+            scope,
+            invalidations: ScheduleInvalidationHub::new(ScheduleInvalidationConfig::default()),
+        }
+    }
+
+    /// Replaces bounded stream timing/capacity while assembling deterministic
+    /// tests or an embedded deployment.
+    #[must_use]
+    pub fn with_invalidation_config(mut self, config: ScheduleInvalidationConfig) -> Self {
+        self.invalidations = ScheduleInvalidationHub::new(config);
+        self
+    }
+
+    /// Returns the exact public payload of the current immutable publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` before the first publication, `RepublishRequired`
+    /// for an older or malformed durable schema, and `Unavailable` for storage
+    /// failures.
+    pub async fn current_native_schedule(
+        &self,
+        access: &ScheduleAccess,
+    ) -> Result<CurrentPublishedSchedule, SchedulingPortError> {
+        self.require_query_access(access)?;
+        let row = sqlx::query(
+            "SELECT revision.id, revision.revision_number, revision.input_digest, \
+               revision.horizon_start, revision.horizon_end, revision.timezone_name, \
+               revision.published_at, revision.solver_version, detail.result_snapshot \
+             FROM schedule_revisions AS revision \
+             LEFT JOIN schedule_revision_details AS detail \
+               ON detail.workspace_id = revision.workspace_id \
+              AND detail.user_id = revision.created_by_user_id \
+              AND detail.schedule_revision_id = revision.id \
+             WHERE revision.workspace_id = $1 AND revision.created_by_user_id = $2 \
+               AND revision.state = 'published'",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(storage_port)?
+        .ok_or(SchedulingPortError::NotFound)?;
+        let revision = revision_from_row(&row).map_err(|_| {
+            SchedulingPortError::Unavailable(
+                "published schedule revision metadata is invalid".to_owned(),
+            )
+        })?;
+        let solver_version: String = row.try_get("solver_version").map_err(storage_port)?;
+        let snapshot: Option<Value> = row.try_get("result_snapshot").map_err(storage_port)?;
+        let snapshot = snapshot.ok_or(SchedulingPortError::RepublishRequired)?;
+        let schedule = public_compose_snapshot(&snapshot, &revision, &solver_version)?;
+        Ok(CurrentPublishedSchedule { revision, schedule })
+    }
+
+    /// Returns zero before the first publication and otherwise the current
+    /// durable revision number used by native invalidation cursors.
+    pub(crate) async fn published_revision_head(&self) -> Result<u64, SchedulingPortError> {
+        let head: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(revision_number), 0) FROM schedule_revisions \
+             WHERE workspace_id = $1 AND created_by_user_id = $2 AND state = 'published'",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(storage_port)?;
+        u64::try_from(head).map_err(|_| {
+            SchedulingPortError::Unavailable(
+                "published schedule revision head is invalid".to_owned(),
+            )
+        })
+    }
+
+    pub(crate) async fn invalidation_stream(
+        &self,
+        access: &ScheduleAccess,
+        cursor: u64,
+    ) -> Result<ScheduleInvalidationStream, ScheduleInvalidationOpenError> {
+        self.require_access(access)
+            .map_err(|_| ScheduleInvalidationOpenError::AccessDenied)?;
+        self.invalidations.open(self.clone(), cursor).await
     }
 
     /// Reads execution progress and current immutable assignment evidence from
@@ -626,10 +856,11 @@ impl PostgresSchedulingRepository {
                     .commit()
                     .await
                     .map_err(|_| SchedulePublicationError::Unavailable)?;
-                return Ok(SchedulePublication {
+                let publication = SchedulePublication {
                     revision,
                     replayed: false,
-                });
+                };
+                return Ok(publication);
             }
         }
 
@@ -797,10 +1028,13 @@ impl PostgresSchedulingRepository {
             .commit()
             .await
             .map_err(|_| SchedulePublicationError::Unavailable)?;
-        Ok(SchedulePublication {
+        let publication = SchedulePublication {
             revision: published_revision,
             replayed: false,
-        })
+        };
+        self.invalidations
+            .publish(publication.revision.revision_number);
+        Ok(publication)
     }
 
     fn require_access(&self, access: &ScheduleAccess) -> Result<(), SchedulePublicationError> {
@@ -3437,6 +3671,336 @@ fn revision_from_row(
     })
 }
 
+fn public_compose_snapshot(
+    snapshot: &Value,
+    revision: &PublishedScheduleRevision,
+    solver_version: &str,
+) -> Result<Value, SchedulingPortError> {
+    let republish = || SchedulingPortError::RepublishRequired;
+    if solver_version != SCHEDULER_PUBLICATION_SCHEMA
+        || snapshot.get("schema_version").and_then(Value::as_u64) != Some(5)
+        || snapshot
+            .get("scheduler_publication_schema")
+            .and_then(Value::as_str)
+            != Some(SCHEDULER_PUBLICATION_SCHEMA)
+    {
+        return Err(republish());
+    }
+    let compose = snapshot.get("compose").cloned().ok_or_else(republish)?;
+    let parsed: NativeComposeSnapshot =
+        serde_json::from_value(compose.clone()).map_err(|_| republish())?;
+    if parsed.input_digest != revision.input_digest
+        || parsed.source_item_count != parsed.source_item_revisions.len()
+        || parsed
+            .accepted_item_count
+            .checked_add(parsed.rejected_items.len())
+            != Some(parsed.source_item_count)
+        || parsed
+            .source_item_revisions
+            .values()
+            .any(|revision| *revision == 0)
+        || parsed.source_item_revisions.keys().any(Uuid::is_nil)
+        || parsed.rejected_items.iter().any(|item| {
+            !parsed.source_item_revisions.contains_key(&item.item_id)
+                || item.title.trim().is_empty()
+                || item.title.chars().count() > 500
+                || item.title.chars().any(char::is_control)
+                || item.reason.trim().is_empty()
+                || item.reason.chars().any(char::is_control)
+        })
+        || parsed.ignored_previous_assignments.iter().any(|item| {
+            item.requested_revision == 0
+                || item.current_revision == Some(0)
+                || item.item_id.is_nil()
+                || item.reason.trim().is_empty()
+                || item.reason.chars().any(char::is_control)
+        })
+        || parsed
+            .manual_placement_assessments
+            .iter()
+            .any(|assessment| assessment.placement_id.is_nil())
+    {
+        return Err(republish());
+    }
+    let parse_instant = |value: &str| {
+        DateTime::parse_from_rfc3339(value)
+            .ok()
+            .map(|value| value.with_timezone(&Utc))
+    };
+    let plan = &parsed.plan;
+    let Some(occurrence_items) = native_occurrence_items(
+        &plan.occurrences,
+        &parsed.source_item_revisions,
+        &parse_instant,
+    ) else {
+        return Err(republish());
+    };
+    if !valid_native_plan_envelope(plan, revision, &parse_instant)
+        || !valid_native_blocks(
+            &plan.blocks,
+            &parsed.source_item_revisions,
+            &occurrence_items,
+            &parse_instant,
+        )
+        || !valid_native_unscheduled(
+            &plan.unscheduled,
+            &parsed.source_item_revisions,
+            &occurrence_items,
+        )
+        || !valid_native_decisions(
+            &plan.decisions,
+            &parsed.source_item_revisions,
+            &occurrence_items,
+        )
+        || !valid_native_violations(
+            &plan.violations,
+            &parsed.source_item_revisions,
+            &occurrence_items,
+            &parse_instant,
+        )
+    {
+        return Err(republish());
+    }
+    if serde_json::to_vec(&compose).map_or(true, |encoded| encoded.len() > 8 * 1024 * 1024) {
+        return Err(SchedulingPortError::Unavailable(
+            "published schedule snapshot exceeds the supported limit".to_owned(),
+        ));
+    }
+    Ok(compose)
+}
+
+fn valid_native_plan_envelope(
+    plan: &NativeSchedulePlan,
+    revision: &PublishedScheduleRevision,
+    parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
+) -> bool {
+    parse_instant(&plan.as_of).is_some()
+        && parse_instant(&plan.horizon_start) == Some(revision.horizon_start)
+        && parse_instant(&plan.horizon_end) == Some(revision.horizon_end)
+        && plan
+            .score
+            .scheduled_minutes
+            .checked_add(plan.score.unscheduled_minutes)
+            .is_some()
+        && plan
+            .score
+            .soft_penalty
+            .checked_add(u64::from(plan.score.moved_minutes))
+            .is_some()
+}
+
+fn valid_native_blocks(
+    blocks: &[NativeScheduleBlock],
+    revisions: &BTreeMap<Uuid, u64>,
+    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
+) -> bool {
+    let mut ids = BTreeSet::new();
+    blocks.iter().all(|block| {
+        let start = parse_instant(&block.start);
+        let end = parse_instant(&block.end);
+        let identity_is_consistent = match block.kind {
+            ScheduleBlockKind::Planned
+            | ScheduleBlockKind::Pinned
+            | ScheduleBlockKind::CalendarEvent => {
+                block.item_id.is_some() && block.external_block_id.is_none()
+            }
+            ScheduleBlockKind::ExternalFixed => {
+                block.item_id.is_none()
+                    && block.occurrence_id.is_none()
+                    && block.external_block_id.is_some()
+            }
+        };
+        ids.insert(block.id)
+            && !block.id.is_nil()
+            && block
+                .item_id
+                .map_or(block.occurrence_id.is_none(), |item_id| {
+                    valid_native_item_reference(
+                        item_id,
+                        block.occurrence_id,
+                        revisions,
+                        occurrence_items,
+                    )
+                })
+            && block.external_block_id.is_none_or(|id| !id.is_nil())
+            && !block.title.trim().is_empty()
+            && block.title.chars().count() <= 500
+            && !block.title.chars().any(char::is_control)
+            && start.is_some()
+            && end.is_some()
+            && start < end
+            && identity_is_consistent
+            && matches!(
+                block.kind,
+                ScheduleBlockKind::Planned
+                    | ScheduleBlockKind::Pinned
+                    | ScheduleBlockKind::CalendarEvent
+                    | ScheduleBlockKind::ExternalFixed
+            )
+            && block.explanations.iter().all(|explanation| {
+                !explanation.message.trim().is_empty()
+                    && !explanation.message.chars().any(char::is_control)
+                    && matches!(
+                        explanation.code,
+                        ExplanationCode::FixedEvent
+                            | ExplanationCode::Pinned
+                            | ExplanationCode::HardDeadline
+                            | ExplanationCode::GoalProgress
+                            | ExplanationCode::HabitOrRoutine
+                            | ExplanationCode::Priority
+                            | ExplanationCode::PreferredWindow
+                            | ExplanationCode::ContextMatch
+                            | ExplanationCode::EnergyMatch
+                            | ExplanationCode::Dependency
+                            | ExplanationCode::StableTime
+                            | ExplanationCode::EarliestAvailable
+                            | ExplanationCode::SplitSession
+                    )
+            })
+    })
+}
+
+fn valid_native_unscheduled(
+    values: &[NativeUnscheduledWork],
+    revisions: &BTreeMap<Uuid, u64>,
+    occurrence_items: &BTreeMap<Uuid, Uuid>,
+) -> bool {
+    values.iter().all(|value| {
+        valid_native_item_reference(
+            value.item_id,
+            value.occurrence_id,
+            revisions,
+            occurrence_items,
+        ) && !value.message.trim().is_empty()
+            && !value.message.chars().any(char::is_control)
+            && matches!(
+                value.reason,
+                dayweave_core::UnscheduledReason::MissingDuration
+                    | dayweave_core::UnscheduledReason::NoCapacity
+                    | dayweave_core::UnscheduledReason::HardConstraint
+                    | dayweave_core::UnscheduledReason::Blocked
+                    | dayweave_core::UnscheduledReason::DependencyUnavailable
+                    | dayweave_core::UnscheduledReason::DependencyCycle
+                    | dayweave_core::UnscheduledReason::SessionLimit
+            )
+    })
+}
+
+fn valid_native_decisions(
+    values: &[NativePlanDecision],
+    revisions: &BTreeMap<Uuid, u64>,
+    occurrence_items: &BTreeMap<Uuid, Uuid>,
+) -> bool {
+    values.iter().all(|value| {
+        valid_native_item_reference(
+            value.item_id,
+            value.occurrence_id,
+            revisions,
+            occurrence_items,
+        ) && !value.message.trim().is_empty()
+            && !value.message.chars().any(char::is_control)
+            && matches!(
+                value.kind,
+                dayweave_core::DecisionKind::ContainerRolledUp
+                    | dayweave_core::DecisionKind::TerminalItemIgnored
+                    | dayweave_core::DecisionKind::FixedEventRetained
+                    | dayweave_core::DecisionKind::Scheduled
+                    | dayweave_core::DecisionKind::PartiallyScheduled
+                    | dayweave_core::DecisionKind::KeptPinned
+            )
+    })
+}
+
+fn valid_native_violations(
+    values: &[NativePlanViolation],
+    revisions: &BTreeMap<Uuid, u64>,
+    occurrence_items: &BTreeMap<Uuid, Uuid>,
+    parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
+) -> bool {
+    values.iter().all(|value| {
+        let start = value.start.as_deref().and_then(parse_instant);
+        let end = value.end.as_deref().and_then(parse_instant);
+        value.item_ids.iter().all(|id| revisions.contains_key(id))
+            && value.occurrence_ids.iter().all(|id| {
+                occurrence_items
+                    .get(id)
+                    .is_some_and(|series_item_id| value.item_ids.contains(series_item_id))
+            })
+            && value.start.is_some() == start.is_some()
+            && value.end.is_some() == end.is_some()
+            && start.zip(end).is_none_or(|(start, end)| start < end)
+            && !value.message.trim().is_empty()
+            && !value.message.chars().any(char::is_control)
+            && matches!(
+                value.kind,
+                dayweave_core::ViolationKind::SoftConstraint
+                    | dayweave_core::ViolationKind::FixedOverlap
+                    | dayweave_core::ViolationKind::PinnedConflict
+                    | dayweave_core::ViolationKind::DeadlineRisk
+                    | dayweave_core::ViolationKind::Dependency
+                    | dayweave_core::ViolationKind::BufferCompressed
+                    | dayweave_core::ViolationKind::Capacity
+            )
+            && matches!(
+                value.severity,
+                dayweave_core::ViolationSeverity::Warning | dayweave_core::ViolationSeverity::Error
+            )
+    })
+}
+
+fn native_occurrence_items(
+    values: &[NativeOccurrence],
+    revisions: &BTreeMap<Uuid, u64>,
+    parse_instant: &impl Fn(&str) -> Option<DateTime<Utc>>,
+) -> Option<BTreeMap<Uuid, Uuid>> {
+    let mut occurrence_items = BTreeMap::new();
+    for value in values {
+        let nominal_start = parse_instant(&value.nominal_start);
+        let nominal_end = parse_instant(&value.nominal_end);
+        let window_start = parse_instant(&value.window_start);
+        let window_end = parse_instant(&value.window_end);
+        if value.id.is_nil()
+            || !revisions.contains_key(&value.series_item_id)
+            || occurrence_items
+                .insert(value.id, value.series_item_id)
+                .is_some()
+            || nominal_start
+                .zip(nominal_end)
+                .is_none_or(|(start, end)| start >= end)
+            || window_start
+                .zip(window_end)
+                .is_none_or(|(start, end)| start >= end)
+            || value
+                .local_date
+                .as_ref()
+                .is_some_and(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err())
+            || serde_json::to_value(value.identity).is_err()
+            || !matches!(
+                value.state,
+                dayweave_core::OccurrenceState::Generated
+                    | dayweave_core::OccurrenceState::Completed
+                    | dayweave_core::OccurrenceState::Paused
+                    | dayweave_core::OccurrenceState::Skipped
+            )
+        {
+            return None;
+        }
+    }
+    Some(occurrence_items)
+}
+
+fn valid_native_item_reference(
+    item_id: Uuid,
+    occurrence_id: Option<Uuid>,
+    revisions: &BTreeMap<Uuid, u64>,
+    occurrence_items: &BTreeMap<Uuid, Uuid>,
+) -> bool {
+    revisions.contains_key(&item_id)
+        && occurrence_id
+            .is_none_or(|occurrence_id| occurrence_items.get(&occurrence_id) == Some(&item_id))
+}
+
 pub(crate) async fn assert_current_item_snapshot(
     transaction: &mut Transaction<'_, Postgres>,
     scope: DatabaseScope,
@@ -4729,6 +5293,279 @@ mod tests {
         assert_eq!(
             manual_placement_block_evidence_index(&[placement], &[state], &[block]),
             Err(SchedulePublicationError::InvalidPayload)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn native_snapshot_requires_strict_shape_and_consistent_cross_references() {
+        let horizon_start = "2026-09-01T00:00:00Z".parse().unwrap();
+        let horizon_end = "2026-09-02T00:00:00Z".parse().unwrap();
+        let item_id = Uuid::from_u128(101);
+        let occurrence_id = Uuid::from_u128(102);
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let compose = json!({
+            "input_digest": digest,
+            "source_item_count": 1,
+            "source_item_revisions": {(item_id.to_string()): 3},
+            "accepted_item_count": 1,
+            "rejected_items": [],
+            "ignored_previous_assignments": [],
+            "manual_placement_assessments": [],
+            "plan": {
+                "as_of": "2026-09-01T06:00:00Z",
+                "horizon_start": "2026-09-01T00:00:00Z",
+                "horizon_end": "2026-09-02T00:00:00Z",
+                "blocks": [],
+                "unscheduled": [],
+                "decisions": [],
+                "violations": [],
+                "score": {
+                    "scheduled_minutes": 0,
+                    "unscheduled_minutes": 0,
+                    "soft_penalty": 0,
+                    "moved_minutes": 0
+                },
+                "occurrences": [{
+                    "id": occurrence_id,
+                    "series_item_id": item_id,
+                    "identity": {
+                        "type": "calendar_day",
+                        "date": "2026-09-01",
+                        "bucket_ordinal": 0
+                    },
+                    "nominal_start": "2026-09-01T07:00:00Z",
+                    "nominal_end": "2026-09-01T08:00:00Z",
+                    "window_start": "2026-09-01T07:00:00Z",
+                    "window_end": "2026-09-01T08:00:00Z",
+                    "local_date": "2026-09-01",
+                    "ordinal": 0,
+                    "state": "generated"
+                }]
+            }
+        });
+        let revision = PublishedScheduleRevision {
+            id: Uuid::from_u128(103),
+            revision: format!("1:{}", Uuid::from_u128(103)),
+            revision_number: 1,
+            input_digest: digest,
+            horizon_start,
+            horizon_end,
+            timezone_name: "Europe/Madrid".to_owned(),
+            published_at: "2026-09-01T06:01:00Z".parse().unwrap(),
+        };
+        let snapshot = json!({
+            "schema_version": 5,
+            "scheduler_publication_schema": SCHEDULER_PUBLICATION_SCHEMA,
+            "compose": compose,
+        });
+        assert_eq!(
+            public_compose_snapshot(&snapshot, &revision, SCHEDULER_PUBLICATION_SCHEMA).unwrap(),
+            snapshot["compose"]
+        );
+
+        let mut valid_external_block = snapshot.clone();
+        valid_external_block["compose"]["plan"]["blocks"] = json!([{
+            "id": Uuid::from_u128(104),
+            "is_sensitive": false,
+            "item_id": null,
+            "occurrence_id": null,
+            "external_block_id": Uuid::from_u128(104),
+            "title": "External fixed time",
+            "start": "2026-09-01T09:00:00Z",
+            "end": "2026-09-01T10:00:00Z",
+            "session_index": 0,
+            "kind": "external_fixed",
+            "explanations": [{
+                "code": "fixed_event",
+                "message": "External fixed time is retained."
+            }]
+        }]);
+        assert!(
+            public_compose_snapshot(
+                &valid_external_block,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            )
+            .is_ok()
+        );
+
+        let mut external_with_item = valid_external_block;
+        external_with_item["compose"]["plan"]["blocks"][0]["item_id"] = json!(item_id);
+        assert_eq!(
+            public_compose_snapshot(&external_with_item, &revision, SCHEDULER_PUBLICATION_SCHEMA),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut planned_without_item = snapshot.clone();
+        planned_without_item["compose"]["plan"]["blocks"] = json!([{
+            "id": Uuid::from_u128(105),
+            "is_sensitive": false,
+            "item_id": null,
+            "occurrence_id": null,
+            "external_block_id": null,
+            "title": "Planned work",
+            "start": "2026-09-01T10:00:00Z",
+            "end": "2026-09-01T11:00:00Z",
+            "session_index": 0,
+            "kind": "planned",
+            "explanations": [{
+                "code": "priority",
+                "message": "Priority work is scheduled."
+            }]
+        }]);
+        assert_eq!(
+            public_compose_snapshot(
+                &planned_without_item,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut valid_occurrence_block = snapshot.clone();
+        valid_occurrence_block["compose"]["plan"]["blocks"] = json!([{
+            "id": Uuid::from_u128(106),
+            "is_sensitive": false,
+            "item_id": item_id,
+            "occurrence_id": occurrence_id,
+            "external_block_id": null,
+            "title": "Recurring planned work",
+            "start": "2026-09-01T07:00:00Z",
+            "end": "2026-09-01T08:00:00Z",
+            "session_index": 0,
+            "kind": "planned",
+            "explanations": [{
+                "code": "priority",
+                "message": "Priority work is scheduled."
+            }]
+        }]);
+        assert!(
+            public_compose_snapshot(
+                &valid_occurrence_block,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            )
+            .is_ok()
+        );
+
+        let mut block_with_missing_occurrence = valid_occurrence_block;
+        block_with_missing_occurrence["compose"]["plan"]["blocks"][0]["occurrence_id"] =
+            json!(Uuid::from_u128(107));
+        assert_eq!(
+            public_compose_snapshot(
+                &block_with_missing_occurrence,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut occurrence_with_missing_series = snapshot.clone();
+        occurrence_with_missing_series["compose"]["plan"]["occurrences"][0]["series_item_id"] =
+            json!(Uuid::from_u128(108));
+        assert_eq!(
+            public_compose_snapshot(
+                &occurrence_with_missing_series,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let other_item_id = Uuid::from_u128(109);
+        let mut two_item_snapshot = snapshot.clone();
+        two_item_snapshot["compose"]["source_item_count"] = json!(2);
+        two_item_snapshot["compose"]["accepted_item_count"] = json!(2);
+        two_item_snapshot["compose"]["source_item_revisions"]
+            .as_object_mut()
+            .unwrap()
+            .insert(other_item_id.to_string(), json!(1));
+
+        let mut mismatched_unscheduled_occurrence = two_item_snapshot.clone();
+        mismatched_unscheduled_occurrence["compose"]["plan"]["unscheduled"] = json!([{
+            "item_id": other_item_id,
+            "occurrence_id": occurrence_id,
+            "remaining": 30,
+            "reason": "no_capacity",
+            "message": "No capacity remains."
+        }]);
+        assert_eq!(
+            public_compose_snapshot(
+                &mismatched_unscheduled_occurrence,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut decision_with_missing_item = snapshot.clone();
+        decision_with_missing_item["compose"]["plan"]["decisions"] = json!([{
+            "item_id": Uuid::from_u128(110),
+            "occurrence_id": null,
+            "kind": "scheduled",
+            "message": "Work was scheduled."
+        }]);
+        assert_eq!(
+            public_compose_snapshot(
+                &decision_with_missing_item,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut mismatched_violation_occurrence = two_item_snapshot;
+        mismatched_violation_occurrence["compose"]["plan"]["violations"] = json!([{
+            "kind": "capacity",
+            "severity": "warning",
+            "item_ids": [other_item_id],
+            "occurrence_ids": [occurrence_id],
+            "start": null,
+            "end": null,
+            "penalty": 1,
+            "message": "Capacity is constrained."
+        }]);
+        assert_eq!(
+            public_compose_snapshot(
+                &mismatched_violation_occurrence,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut missing_identity = snapshot.clone();
+        missing_identity["compose"]["plan"]["occurrences"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("identity");
+        assert_eq!(
+            public_compose_snapshot(&missing_identity, &revision, SCHEDULER_PUBLICATION_SCHEMA),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut unknown_nested_field = snapshot.clone();
+        unknown_nested_field["compose"]["plan"]["score"]["private_evidence"] = json!(true);
+        assert_eq!(
+            public_compose_snapshot(
+                &unknown_nested_field,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
+        );
+
+        let mut malformed_timestamp = snapshot;
+        malformed_timestamp["compose"]["plan"]["occurrences"][0]["nominal_start"] =
+            json!("not-a-timestamp");
+        assert_eq!(
+            public_compose_snapshot(
+                &malformed_timestamp,
+                &revision,
+                SCHEDULER_PUBLICATION_SCHEMA
+            ),
+            Err(SchedulingPortError::RepublishRequired)
         );
     }
 }

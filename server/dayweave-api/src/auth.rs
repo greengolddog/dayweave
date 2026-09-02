@@ -376,7 +376,10 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
             &Method::POST | &Method::PUT | &Method::DELETE,
             "/items" | "/items/{id}" | "/items/{id}/restore",
         ) => Some(Scope::ItemsWrite),
-        (&Method::GET, "/schedule/manual-placements") => Some(Scope::ScheduleRead),
+        (
+            &Method::GET,
+            "/schedule/current" | "/schedule/stream" | "/schedule/manual-placements",
+        ) => Some(Scope::ScheduleRead),
         (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
         (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history" | "/execution/stream") => {

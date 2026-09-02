@@ -318,6 +318,7 @@ impl<'a> TryFrom<&'a dayweave_core::PlanViolation> for PlanViolationOutput<'a> {
 struct OccurrenceOutput {
     id: OccurrenceId,
     series_item_id: ItemId,
+    identity: dayweave_core::RecurrenceOccurrenceIdentity,
     nominal_start: String,
     nominal_end: String,
     window_start: String,
@@ -334,6 +335,7 @@ impl TryFrom<&dayweave_core::Occurrence> for OccurrenceOutput {
         Ok(Self {
             id: occurrence.id,
             series_item_id: occurrence.series_item_id,
+            identity: occurrence.identity,
             nominal_start: rfc3339(occurrence.nominal_start)?,
             nominal_end: rfc3339(occurrence.nominal_end)?,
             window_start: rfc3339(occurrence.window_start)?,
@@ -3112,5 +3114,39 @@ mod tests {
         let result = compose_items(vec![invalid], preview_request()).unwrap();
         assert_eq!(result.accepted_item_count, 0);
         assert_eq!(result.rejected_items.len(), 1);
+    }
+
+    #[test]
+    fn public_occurrence_output_includes_stable_recurrence_identity() {
+        let date = time::Date::from_calendar_date(2026, time::Month::September, 1).unwrap();
+        let nominal_start = time::OffsetDateTime::from_unix_timestamp(1_788_236_400).unwrap();
+        let occurrence = dayweave_core::Occurrence {
+            id: dayweave_core::OccurrenceId(Uuid::from_u128(201)),
+            series_item_id: dayweave_core::ItemId(Uuid::from_u128(202)),
+            identity: dayweave_core::RecurrenceOccurrenceIdentity::CalendarDay {
+                date,
+                bucket_ordinal: 2,
+            },
+            nominal_start,
+            nominal_end: nominal_start + time::Duration::hours(1),
+            window_start: nominal_start,
+            window_end: nominal_start + time::Duration::hours(1),
+            local_date: Some(date),
+            ordinal: 2,
+            state: dayweave_core::OccurrenceState::Generated,
+        };
+
+        let output = serde_json::to_value(
+            OccurrenceOutput::try_from(&occurrence).expect("occurrence must encode"),
+        )
+        .unwrap();
+        assert_eq!(
+            output["identity"],
+            json!({
+                "type": "calendar_day",
+                "date": "2026-09-01",
+                "bucket_ordinal": 2
+            })
+        );
     }
 }

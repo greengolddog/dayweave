@@ -1,5 +1,6 @@
 mod compose;
 pub(crate) mod http;
+mod invalidation;
 mod memory;
 mod ports;
 mod postgres;
@@ -38,6 +39,8 @@ pub use dayweave_compose::{
     ManualPlacementReleaseInput, PreviousAssignmentInput, PreviousBlockInput, RejectedScheduleItem,
     SchedulerConfigInput,
 };
+pub use invalidation::{ScheduleInvalidationConfig, ScheduleInvalidationConfigError};
+pub(crate) use invalidation::{ScheduleInvalidationOpenError, ScheduleInvalidationSignal};
 pub use memory::{
     InMemoryScheduleQueryPort, InMemorySimulationPort, simulation_request_digest,
     simulation_request_hash,
@@ -49,8 +52,8 @@ pub(crate) use postgres::{
     authoritative_planning_evidence_tx, lock_owner, published_planning_policy_tx,
 };
 pub use postgres::{
-    PostgresSchedulingRepository, PublishScheduleSpec, PublishedScheduleRevision,
-    SchedulePublication, SchedulePublicationError,
+    CurrentPublishedSchedule, PostgresSchedulingRepository, PublishScheduleSpec,
+    PublishedScheduleRevision, SchedulePublication, SchedulePublicationError,
 };
 pub(crate) use projection::{CalendarProjectionFenceError, CalendarProjectionStamp};
 pub(crate) use proposal_bridge::materialize_proposal;

@@ -304,6 +304,80 @@ to the already-current revision and therefore carry an older `published_at`;
 that response remains installable after the same exact validation.
 Preview remains side-effect-free and never creates draft/publication rows.
 
+## Native current-schedule replication
+
+`GET /v1/schedule/current` is the authoritative bootstrap and recovery read for
+a trusted native replica. It requires a device credential with `schedule_read`
+and the exact configured workspace and owner identity. Before the first
+publication it returns `404` with
+`{"error":{"code":"not_found","message":"Published schedule was not found"}}`.
+A cross-scope current read has the same non-enumerating result. Successful and
+not-found route responses carry `Cache-Control: no-store, max-age=0` and
+`Pragma: no-cache`; a successful response also carries a strong `ETag` equal to
+the quoted revision label.
+
+The successful JSON object has exactly two top-level members:
+
+```json
+{
+  "revision": {
+    "id": "22222222-2222-4222-8222-222222222222",
+    "revision": "7:22222222-2222-4222-8222-222222222222",
+    "revision_number": 7,
+    "input_digest": "sha256:replace-with-the-64-lowercase-hex-preview-digest",
+    "horizon_start": "2026-09-01T00:00:00Z",
+    "horizon_end": "2026-09-02T00:00:00Z",
+    "timezone_name": "Europe/Madrid",
+    "published_at": "2026-09-01T07:00:03Z"
+  },
+  "schedule": {}
+}
+```
+
+`schedule` is byte-for-JSON-value equivalent to the public
+`ComposeScheduleResult` returned by preview and sealed into the immutable v5
+publication. Private planning policy, execution evidence, Calendar projection
+stamps, sensitivity maps, and manual-placement state remain sibling evidence
+and are never copied into this envelope. The server strictly decodes the whole
+nested public snapshot before returning it, including block identity
+cross-fields, RFC 3339 instants, and complete recurrence occurrence `identity`.
+An older or malformed durable snapshot returns `409 conflict` and must be
+recomposed and published; the server never serves a plausible partial plan.
+
+`GET /v1/schedule/stream` is the content-free invalidation channel for that
+read. It requires the same `schedule_read` scope and exact owner identity,
+`Accept: text/event-stream`, and an optional `Last-Event-ID` containing the
+canonical unsigned decimal revision number. An omitted cursor means `0`. Zero
+is also the expected durable cursor on a new installation; when no schedule has
+ever been published the stream stays open at authoritative head zero. A cursor
+ahead of the head returns `409 conflict` with
+`details.cursor_revision` and `details.head_revision`; malformed cursors return
+`400`, and a non-exact Accept value returns `406`.
+
+Each revision event contains only the new high-water revision:
+
+```text
+id: 8
+event: schedule-invalidation
+data: {"revision":8}
+
+```
+
+The server emits an invalidation only after a genuinely new publication
+commits. Exact idempotent replay and a fresh key that binds identical content
+to the already-current revision do not emit false work. Process-local wakeups
+are backed by a durable PostgreSQL head probe, so a stream served by another
+process converges within five seconds. Streams send heartbeat comments within
+15 seconds, expire within five minutes to force a clean authenticated
+reconnect, and are capped at 32 concurrent connections per repository process.
+
+An event is never an install receipt. On every event or reconnect, fetch
+`/v1/schedule/current`, validate the complete revision and schedule, atomically
+install them, and only then persist that `revision_number` as the next
+`Last-Event-ID`. If fetching or validation fails, retain the old cursor and
+retry; advancing from the event alone could permanently skip the only durable
+copy of a publication.
+
 ## Published schedule reads and what-if simulations
 
 With PostgreSQL configured, the production MCP dependency graph reads only the

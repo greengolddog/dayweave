@@ -3,7 +3,7 @@ use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
 use axum::{
     Router,
     body::Body,
-    http::{Request, StatusCode, header},
+    http::{HeaderValue, Request, StatusCode, header},
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
@@ -38,9 +38,9 @@ use dayweave_api::{
         PlanningSimulationPort, PostgresSchedulingRepository, PreviousAssignmentInput,
         PreviousBlockInput, ProposalSubmissionError, ProposalSubmissionPort,
         ProposalSubmissionSpec, PublishScheduleSpec, ScheduleAccess, ScheduleDetail,
-        SchedulePublicationError, ScheduleQuery, ScheduleQueryPort, SchedulingPortError,
-        SimulationRequest, compose_canonical_schedule, simulation_request_digest,
-        simulation_request_hash,
+        ScheduleInvalidationConfig, SchedulePublicationError, ScheduleQuery, ScheduleQueryPort,
+        SchedulingPortError, SimulationRequest, compose_canonical_schedule,
+        simulation_request_digest, simulation_request_hash,
     },
 };
 use http_body_util::BodyExt as _;
@@ -52,6 +52,8 @@ use sqlx::{
 };
 use tower::ServiceExt as _;
 use uuid::Uuid;
+
+use tokio::time::timeout;
 
 type StoredSimulationEvidenceRow = (
     bool,
@@ -3873,6 +3875,10 @@ async fn legacy_schedule_upgrade_is_sealed_and_requires_one_fresh_publication() 
 
     let schedules = PostgresSchedulingRepository::new(test_database.pool.clone(), scope);
     let access = owner_access(scope, "auth0|legacy-upgrade-owner");
+    assert!(matches!(
+        schedules.current_native_schedule(&access).await,
+        Err(SchedulingPortError::RepublishRequired)
+    ));
     let legacy = schedules
         .get_schedule(
             &access,
@@ -4337,6 +4343,291 @@ async fn calendar_projection_fences_preview_publication_and_exact_replay() {
     let replay = body_json(replay).await;
     assert_eq!(replay["replayed"], true);
     assert_eq!(replay["revision"], published["revision"]);
+
+    test_database.destroy().await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn native_schedule_replication_is_exact_scoped_and_cross_process_durable() {
+    let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+        eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; native schedule replication test skipped");
+        return;
+    };
+    let test_database = TestDatabase::create(&database_url).await;
+    MIGRATOR
+        .run(&test_database.pool)
+        .await
+        .expect("migrations apply");
+    let scope = seed_scope(&test_database.pool).await;
+    let items = Arc::new(ItemService::new(
+        Arc::new(PostgresItemRepository::new(
+            test_database.pool.clone(),
+            scope,
+        )),
+        Arc::new(SystemClock),
+    ));
+    items
+        .create(
+            task(
+                Uuid::new_v4(),
+                "Native replica task",
+                false,
+                None,
+                json!({}),
+            ),
+            idempotency(241),
+        )
+        .await
+        .expect("create native replica task");
+    let stream_config = ScheduleInvalidationConfig::new(
+        StdDuration::from_millis(50),
+        StdDuration::from_millis(250),
+        StdDuration::from_secs(3),
+        8,
+    )
+    .expect("bounded native stream config");
+    let schedules = Arc::new(
+        PostgresSchedulingRepository::new(test_database.pool.clone(), scope)
+            .with_invalidation_config(stream_config),
+    );
+    let (app, access_token) =
+        credential_publish_app(&test_database.pool, scope, items.clone(), schedules.clone()).await;
+
+    let missing = app
+        .clone()
+        .oneshot(authenticated_get("/v1/schedule/current", &access_token))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        missing.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    assert_eq!(missing.headers()[header::PRAGMA], "no-cache");
+    assert_eq!(
+        body_json(missing).await,
+        json!({
+            "error": {
+                "code": "not_found",
+                "message": "Published schedule was not found"
+            }
+        })
+    );
+
+    let unacceptable = app
+        .clone()
+        .oneshot(authenticated_get("/v1/schedule/stream", &access_token))
+        .await
+        .unwrap();
+    assert_eq!(unacceptable.status(), StatusCode::NOT_ACCEPTABLE);
+    let malformed = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("01")))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let ahead = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("1")))
+        .await
+        .unwrap();
+    assert_eq!(ahead.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_json(ahead).await,
+        json!({
+            "error": {
+                "code": "conflict",
+                "message": "schedule stream cursor is ahead of authoritative state",
+                "details": {"cursor_revision": 1, "head_revision": 0}
+            }
+        })
+    );
+    let empty_stream = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("0")))
+        .await
+        .unwrap();
+    assert_eq!(empty_stream.status(), StatusCode::OK);
+    assert_eq!(
+        empty_stream.headers()[header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    drop(empty_stream);
+
+    let request = compose_request();
+    let preview = public_schedule_preview(&app, &access_token, &request).await;
+    let publish_body = schedule_publish_body(
+        Uuid::new_v4(),
+        preview["input_digest"].as_str().unwrap(),
+        &request,
+    );
+    let published = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &publish_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    assert_eq!(body_json(published).await["revision"]["revision_number"], 1);
+
+    let current = app
+        .clone()
+        .oneshot(authenticated_get("/v1/schedule/current", &access_token))
+        .await
+        .unwrap();
+    assert_eq!(current.status(), StatusCode::OK);
+    assert_eq!(
+        current.headers()[header::CACHE_CONTROL],
+        "no-store, max-age=0"
+    );
+    assert_eq!(current.headers()[header::PRAGMA], "no-cache");
+    let etag = current.headers()[header::ETAG].to_str().unwrap().to_owned();
+    let current = body_json(current).await;
+    assert_eq!(
+        current
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["revision", "schedule"])
+    );
+    assert_eq!(current["revision"]["revision_number"], 1);
+    assert_eq!(current["schedule"], preview);
+    assert_eq!(
+        etag,
+        format!(r#""{}""#, current["revision"]["revision"].as_str().unwrap())
+    );
+    let encoded_current = current.to_string();
+    assert!(!encoded_current.contains("planning_evidence"));
+    assert!(!encoded_current.contains("manual_placement_state"));
+    assert!(!encoded_current.contains("calendar_projection_stamps"));
+
+    let mut catch_up = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("0")))
+        .await
+        .unwrap();
+    assert_schedule_revision_frame(
+        &next_schedule_stream_chunk(&mut catch_up, StdDuration::from_secs(1))
+            .await
+            .expect("catch-up revision event"),
+        1,
+    );
+
+    let mut replay_stream = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("1")))
+        .await
+        .unwrap();
+    let replay = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &publish_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(body_json(replay).await["replayed"], true);
+    assert!(
+        timeout(
+            StdDuration::from_millis(120),
+            replay_stream.body_mut().frame()
+        )
+        .await
+        .is_err(),
+        "an idempotent replay must not generate a false invalidation"
+    );
+
+    let mut second_request = request.clone();
+    second_request.fixed_blocks[0].title = "Changed public fixed block".to_owned();
+    let second_preview = public_schedule_preview(&app, &access_token, &second_request).await;
+    let second_body = schedule_publish_body(
+        Uuid::new_v4(),
+        second_preview["input_digest"].as_str().unwrap(),
+        &second_request,
+    );
+    let mut live = app
+        .clone()
+        .oneshot(schedule_stream_request(&access_token, Some("1")))
+        .await
+        .unwrap();
+    let second = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &second_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(body_json(second).await["revision"]["revision_number"], 2);
+    assert_schedule_revision_frame(
+        &next_schedule_stream_chunk(&mut live, StdDuration::from_secs(1))
+            .await
+            .expect("live revision event"),
+        2,
+    );
+
+    let polling_schedules = Arc::new(
+        PostgresSchedulingRepository::new(test_database.pool.clone(), scope)
+            .with_invalidation_config(stream_config),
+    );
+    let (polling_app, polling_token) =
+        credential_publish_app(&test_database.pool, scope, items.clone(), polling_schedules).await;
+    let mut polling_stream = polling_app
+        .clone()
+        .oneshot(schedule_stream_request(&polling_token, Some("2")))
+        .await
+        .unwrap();
+    let mut third_request = second_request;
+    third_request.fixed_blocks[0].title = "Cross-process publication".to_owned();
+    let third_preview = public_schedule_preview(&app, &access_token, &third_request).await;
+    let third_body = schedule_publish_body(
+        Uuid::new_v4(),
+        third_preview["input_digest"].as_str().unwrap(),
+        &third_request,
+    );
+    let third = app
+        .clone()
+        .oneshot(json_request(
+            "/v1/schedule/publish",
+            &third_body,
+            &access_token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
+    assert_eq!(body_json(third).await["revision"]["revision_number"], 3);
+    assert_schedule_revision_frame(
+        &next_schedule_stream_chunk(&mut polling_stream, StdDuration::from_secs(1))
+            .await
+            .expect("durable polling revision event"),
+        3,
+    );
+
+    let foreign_scope = seed_scope(&test_database.pool).await;
+    let (foreign_app, foreign_token) =
+        credential_publish_app(&test_database.pool, foreign_scope, items, schedules).await;
+    let foreign_current = foreign_app
+        .clone()
+        .oneshot(authenticated_get("/v1/schedule/current", &foreign_token))
+        .await
+        .unwrap();
+    assert_eq!(foreign_current.status(), StatusCode::NOT_FOUND);
+    let foreign_stream = foreign_app
+        .clone()
+        .oneshot(schedule_stream_request(&foreign_token, Some("0")))
+        .await
+        .unwrap();
+    assert_eq!(foreign_stream.status(), StatusCode::FORBIDDEN);
 
     test_database.destroy().await;
 }
@@ -5627,6 +5918,57 @@ async fn credential_publish_app(
             ),
     );
     (app, access_token)
+}
+
+fn authenticated_get(uri: &str, access_token: &str) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {access_token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+fn schedule_stream_request(access_token: &str, cursor: Option<&str>) -> Request<Body> {
+    let mut request = authenticated_get("/v1/schedule/stream", access_token);
+    request.headers_mut().insert(
+        header::ACCEPT,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    if let Some(cursor) = cursor {
+        request.headers_mut().insert(
+            "last-event-id",
+            HeaderValue::from_str(cursor).expect("valid test cursor header"),
+        );
+    }
+    request
+}
+
+async fn next_schedule_stream_chunk(
+    response: &mut axum::response::Response,
+    wait: StdDuration,
+) -> Option<String> {
+    let frame = timeout(wait, response.body_mut().frame())
+        .await
+        .expect("schedule stream produced or ended before timeout")?;
+    let frame = frame.expect("valid schedule stream frame");
+    let data = frame.into_data().expect("schedule stream data frame");
+    Some(String::from_utf8(data.to_vec()).expect("UTF-8 schedule stream frame"))
+}
+
+fn assert_schedule_revision_frame(frame: &str, revision: u64) {
+    assert_eq!(
+        frame,
+        format!(
+            "id: {revision}\nevent: schedule-invalidation\ndata: {{\"revision\":{revision}}}\n\n"
+        )
+    );
+    for forbidden in ["block", "item", "title", "sensitive"] {
+        assert!(
+            !frame.contains(forbidden),
+            "schedule SSE leaked {forbidden}"
+        );
+    }
 }
 
 fn json_request(uri: &str, body: &Value, access_token: &str) -> Request<Body> {
