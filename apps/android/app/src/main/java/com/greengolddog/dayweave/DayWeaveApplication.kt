@@ -7,6 +7,7 @@ import android.util.Log
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.health.EnergySignalManager
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
+import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthBindingFence
@@ -17,6 +18,7 @@ import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalItemInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionInvalidationStreamTransport
+import com.greengolddog.dayweave.network.OkHttpScheduleInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
@@ -43,6 +45,8 @@ import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.DurableExecutionInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundExecutionInvalidationManager
 import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
+import com.greengolddog.dayweave.sync.DurableScheduleInvalidationCursor
+import com.greengolddog.dayweave.sync.ForegroundScheduleInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
@@ -144,6 +148,9 @@ class DayWeaveApplication : Application() {
                     }
                     if (executionInvalidationManagerDelegate.isInitialized()) {
                         executionInvalidationManager.cancelAndDrainActiveSession()
+                    }
+                    if (scheduleInvalidationManagerDelegate.isInitialized()) {
+                        scheduleInvalidationManager.cancelAndDrainActiveSession()
                     }
                     val quarantined = try {
                         plannerStore.abandonCanonicalConnection()?.awaitDurable() == true
@@ -279,6 +286,33 @@ class DayWeaveApplication : Application() {
     private val executionInvalidationManager: ForegroundExecutionInvalidationManager
         get() = executionInvalidationManagerDelegate.value
 
+    private val scheduleInvalidationManagerDelegate = lazy {
+        ForegroundScheduleInvalidationManager(
+            credentialStore = apiCredentialStore,
+            streamTransport = OkHttpScheduleInvalidationStreamTransport(),
+            durableCursor = {
+                val durable = plannerStore.durableState.value
+                val proof = durable?.publishedScheduleProof?.takeIf { candidate ->
+                    candidate.hasCurrentImmutablePlanSeal() &&
+                        candidate.matchesStateBinding(durable) &&
+                        candidate.matchesPublishedPlan(durable.schedule)
+                }
+                DurableScheduleInvalidationCursor(
+                    syncOrigin = proof?.syncOrigin,
+                    configurationId = proof?.configurationId,
+                    revision = proof?.revision?.revisionNumber ?: 0uL,
+                )
+            },
+            tryLaunchAuthoritativeRefresh = ::launchCanonicalAction,
+            authoritativeRefresh = {
+                canonicalSyncManager.refreshCurrentPublishedSchedule() ==
+                    CanonicalRefreshOutcome.SUCCESS
+            },
+        )
+    }
+    private val scheduleInvalidationManager: ForegroundScheduleInvalidationManager
+        get() = scheduleInvalidationManagerDelegate.value
+
     private val googleAccountManagerDelegate = lazy {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
@@ -344,7 +378,7 @@ class DayWeaveApplication : Application() {
             deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
             suggestionSyncSchedulingCoordinator.onAppStart()
             if (deviceAuthCoordinator.snapshot().hasBearerToken) {
-                launchCanonicalAction { refreshCanonicalState() }
+                launchCanonicalAction { recoverCurrentPublishedSchedule() }
             }
         }
     }
@@ -384,6 +418,9 @@ class DayWeaveApplication : Application() {
         if (executionInvalidationManagerDelegate.isInitialized()) {
             executionInvalidationManager.cancelActiveSession()
         }
+        if (scheduleInvalidationManagerDelegate.isInitialized()) {
+            scheduleInvalidationManager.cancelActiveSession()
+        }
         if (proposalApplicationManagerDelegate.isInitialized()) {
             proposalApplicationManager.discardReviewForPrivacyBoundary()
         }
@@ -397,6 +434,28 @@ class DayWeaveApplication : Application() {
     /** Includes the 30-second delta fallback and runs only in the unlocked STARTED UI. */
     suspend fun runForegroundCanonicalItemInvalidations() {
         canonicalItemInvalidationManager.runForegroundActivation()
+    }
+
+    /** Includes an immediate authoritative GET and 30-second fallback while unlocked. */
+    suspend fun runForegroundScheduleInvalidations() {
+        scheduleInvalidationManager.runForegroundActivation()
+    }
+
+    /** Startup recovery installs the immutable head without creating a competing publication. */
+    suspend fun recoverCurrentPublishedSchedule(): CanonicalRefreshOutcome? {
+        proposalApplicationManager.recoverPending()
+        if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
+        return recoverCurrentPublishedScheduleSequence(
+            requiresWriteRecovery = plannerStore.state.value.requiresStartupWriteRecovery(),
+            canonicalWriteRecovery = {
+                refreshCanonicalStateSequence(
+                    executionRefresh = executionSyncManager::refresh,
+                    canonicalRefresh = canonicalSyncManager::refreshAndCompose,
+                )
+            },
+            executionRefresh = executionSyncManager::refresh,
+            replicaRefresh = canonicalSyncManager::refreshCurrentPublishedSchedule,
+        )
     }
 
     /** Reconciles an old/remote lease both before and after replacing today's composition. */
@@ -448,6 +507,34 @@ internal suspend fun refreshCanonicalStateSequence(
     val canonicalOutcome = canonicalRefresh()
     executionRefresh()
     return canonicalOutcome
+}
+
+/** Startup must reconcile immutable write journals before attempting a read-only replica GET. */
+internal fun DayWeaveUiState.requiresStartupWriteRecovery(): Boolean =
+    pendingSchedulePublication != null || pendingCanonicalMutation != null ||
+        pendingCanonicalAuthoringMutations.any {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        } || pendingExecutionCommand != null ||
+        pendingExecutionDeferIntent != null || deferredExecutionRecompositionNeeded() ||
+        terminalExecutionOutcomes.values.any { outcome ->
+            outcome.requiresCanonicalItemProjection && outcome.canonicalProjectionRevision == null &&
+                outcome.canonicalProjectionResolution == null && isNewestExecutionForProjection(
+                outcome.session,
+            )
+        }
+
+/** Read-only native recovery seam kept deterministic for process-death tests. */
+internal suspend fun recoverCurrentPublishedScheduleSequence(
+    requiresWriteRecovery: Boolean,
+    canonicalWriteRecovery: suspend () -> CanonicalRefreshOutcome?,
+    executionRefresh: suspend () -> ExecutionSyncOutcome,
+    replicaRefresh: suspend () -> CanonicalRefreshOutcome,
+): CanonicalRefreshOutcome? {
+    if (requiresWriteRecovery) return canonicalWriteRecovery()
+    if (executionRefresh() !in EXECUTION_REFRESH_SUCCESSES) return null
+    val outcome = replicaRefresh()
+    executionRefresh()
+    return outcome
 }
 
 /** Runs the expensive compose/projection pass only when the execution poll discovered work. */

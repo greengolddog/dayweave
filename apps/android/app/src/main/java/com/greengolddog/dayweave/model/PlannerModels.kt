@@ -1,16 +1,18 @@
 package com.greengolddog.dayweave.model
 
-import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
 import com.greengolddog.dayweave.network.ProposalApplicationHttpRequest
+import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
+import java.security.MessageDigest
+import java.time.DayOfWeek
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import java.security.MessageDigest
+import java.util.Locale
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
-import java.util.UUID
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
@@ -160,6 +162,23 @@ data class ScheduleItem(
         val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
     }
 }
+
+/** A view-only clipped interval. [item] retains the exact proof-bound publication identity. */
+data class ScheduleItemPresentationSlice(
+    val item: ScheduleItem,
+    val clippedStart: Instant?,
+    val clippedEnd: Instant?,
+    val startTimeLabel: String,
+    val weekStartLabel: String,
+    val durationMinutes: Int,
+    val durationLabel: String,
+    val continuationLabel: String? = null,
+)
+
+private const val PRESENTATION_MINUTES_PER_DAY = 24 * 60
+private val SLICE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private val SLICE_WEEK_FORMAT: DateTimeFormatter =
+    DateTimeFormatter.ofPattern("EEE HH:mm", Locale.getDefault())
 
 /**
  * Lossless encrypted cache of the canonical item wire contract.
@@ -789,25 +808,37 @@ data class PublishedScheduleRevisionSnapshot(
     val publishedAt: String,
 )
 
-/** Exact immutable identity of one item-backed block accepted for schedule publication. */
+/** Exact immutable identity of one block accepted for schedule publication. */
 @Serializable
 data class PublishedScheduleBlockProofSnapshot(
     val id: String,
-    val itemId: String,
-    val itemRevision: Long,
+    val itemId: String? = null,
+    val itemRevision: Long? = null,
     val occurrenceId: String? = null,
-    val sessionIndex: Int,
+    val sessionIndex: Int? = null,
     val start: String,
     val end: String,
     val kind: String,
+    /** SHA-256 of every publication-static [ScheduleItem] field, excluding execution projection. */
+    val immutableDigest: String? = null,
 ) {
-    fun hasValidShape(horizonStart: Instant, horizonEnd: Instant): Boolean = runCatching {
+    fun hasValidShape(
+        horizonStart: Instant,
+        horizonEnd: Instant,
+        requireFullSeal: Boolean,
+    ): Boolean = runCatching {
         requireCanonicalUuid(id, "published schedule block")
-        requireCanonicalUuid(itemId, "published schedule item")
-        occurrenceId?.let { requireCanonicalUuid(it, "published schedule occurrence") }
-        require(itemRevision > 0)
-        require(sessionIndex in 0..UShort.MAX_VALUE.toInt())
+        if (itemId == null) {
+            require(itemRevision == null && occurrenceId == null)
+            require(!requireFullSeal || kind in setOf("calendar_event", "external_fixed"))
+        } else {
+            requireCanonicalUuid(itemId, "published schedule item")
+            occurrenceId?.let { requireCanonicalUuid(it, "published schedule occurrence") }
+            require(requireNotNull(itemRevision) > 0)
+        }
+        require(requireNotNull(sessionIndex) in 0..UShort.MAX_VALUE.toInt())
         require(kind.isNotBlank() && kind.length <= 128 && kind.none(Char::isISOControl))
+        if (requireFullSeal) requireScheduleDigest(requireNotNull(immutableDigest))
         val blockStart = Instant.parse(start)
         val blockEnd = Instant.parse(end)
         require(blockStart < blockEnd)
@@ -824,12 +855,97 @@ data class PublishedScheduleBlockProofSnapshot(
             block.sessionIndex == sessionIndex &&
             block.canonicalBlockKind == kind &&
             sameInstant(block.absoluteStartAt, start) &&
-            sameInstant(block.absoluteEndAt, end)
+            sameInstant(block.absoluteEndAt, end) &&
+            immutableDigest?.let { it == publishedScheduleBlockImmutableDigest(block) } != false
 
     private fun sameInstant(left: String?, right: String): Boolean =
         left?.let { raw -> runCatching { Instant.parse(raw) }.getOrNull() } ==
             runCatching { Instant.parse(right) }.getOrNull()
+
+    companion object {
+        fun from(block: ScheduleItem): PublishedScheduleBlockProofSnapshot =
+            PublishedScheduleBlockProofSnapshot(
+                id = block.id,
+                itemId = block.canonicalItemId,
+                itemRevision = block.canonicalRevision,
+                occurrenceId = block.occurrenceId,
+                sessionIndex = block.sessionIndex,
+                start = requireNotNull(block.absoluteStartAt),
+                end = requireNotNull(block.absoluteEndAt),
+                kind = requireNotNull(block.canonicalBlockKind),
+                immutableDigest = publishedScheduleBlockImmutableDigest(block),
+            )
+    }
 }
+
+@Serializable
+private data class PublishedScheduleBlockDigestSnapshot(
+    val id: String,
+    val isSensitive: Boolean,
+    val title: String,
+    val itemKind: String,
+    val startMinute: Int,
+    val durationMinutes: Int,
+    val project: String?,
+    val energy: String,
+    val isFlexible: Boolean,
+    val isHardConstraint: Boolean,
+    val isSplittable: Boolean,
+    val note: String,
+    val canonicalItemId: String?,
+    val occurrenceId: String?,
+    val canonicalRevision: Long?,
+    val sessionIndex: Int?,
+    val absoluteStartAt: String?,
+    val absoluteEndAt: String?,
+    val planningZoneId: String?,
+    val canonicalBlockKind: String?,
+)
+
+private fun publishedScheduleBlockImmutableDigest(block: ScheduleItem): String {
+    // Status and actual minutes are server execution projections applied after publication.
+    val immutable = PublishedScheduleBlockDigestSnapshot(
+        id = block.id,
+        isSensitive = block.isSensitive,
+        title = block.title,
+        itemKind = block.kind.name,
+        startMinute = block.startMinute,
+        durationMinutes = block.durationMinutes,
+        project = block.project,
+        energy = block.energy.name,
+        isFlexible = block.isFlexible,
+        isHardConstraint = block.isHardConstraint,
+        isSplittable = block.isSplittable,
+        note = block.note,
+        canonicalItemId = block.canonicalItemId,
+        occurrenceId = block.occurrenceId,
+        canonicalRevision = block.canonicalRevision,
+        sessionIndex = block.sessionIndex,
+        absoluteStartAt = block.absoluteStartAt,
+        absoluteEndAt = block.absoluteEndAt,
+        planningZoneId = block.planningZoneId,
+        canonicalBlockKind = block.canonicalBlockKind,
+    )
+    val bytes = PUBLISHED_SCHEDULE_BLOCK_DIGEST_JSON.encodeToString(immutable)
+        .toByteArray(Charsets.UTF_8)
+    return "sha256:" + MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") {
+        byte -> "%02x".format(byte.toInt() and 0xff)
+    }
+}
+
+private fun requireScheduleDigest(value: String) {
+    require(
+        value.length == 71 && value.startsWith("sha256:") &&
+            value.drop(7).all { it in '0'..'9' || it in 'a'..'f' },
+    )
+}
+
+private val PUBLISHED_SCHEDULE_BLOCK_DIGEST_JSON = Json {
+    encodeDefaults = true
+    explicitNulls = true
+}
+
+private val SERVER_NAMED_TIMEZONE_IDS = ZoneId.getAvailableZoneIds()
 
 /**
  * Durable positive authority for the exact candidate installed after a validated, non-replayed
@@ -845,7 +961,7 @@ data class PublishedScheduleProofSnapshot(
     val blocks: List<PublishedScheduleBlockProofSnapshot>,
 ) {
     fun hasValidShape(): Boolean = runCatching {
-        require(schemaVersion == CURRENT_SCHEMA_VERSION)
+        require(schemaVersion in LEGACY_SCHEMA_VERSION..CURRENT_SCHEMA_VERSION)
         require(
             syncOrigin.isNotBlank() && syncOrigin.length <= 4_096 &&
                 syncOrigin.none(Char::isISOControl),
@@ -871,12 +987,26 @@ data class PublishedScheduleProofSnapshot(
             revision.timezoneName.isNotBlank() && revision.timezoneName.length <= 255 &&
                 revision.timezoneName.none(Char::isISOControl),
         )
+        require(revision.timezoneName in SERVER_NAMED_TIMEZONE_IDS)
         requireNotNull(runCatching { ZoneId.of(revision.timezoneName) }.getOrNull())
         requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
         require(blocks.size <= MAX_PUBLISHED_BLOCKS)
         require(blocks.map { it.id }.distinct().size == blocks.size)
-        require(blocks.all { it.hasValidShape(horizonStart, horizonEnd) })
+        require(blocks.all {
+            it.hasValidShape(
+                horizonStart = horizonStart,
+                horizonEnd = horizonEnd,
+                requireFullSeal = schemaVersion >= FULL_PLAN_SCHEMA_VERSION,
+            )
+        })
     }.isSuccess
+
+    /**
+     * Only the current full-plan proof seals immutable context rows as well as executable items.
+     * Legacy proofs remain decodable for migration, but cannot make a plan current or actionable.
+     */
+    fun hasCurrentImmutablePlanSeal(): Boolean =
+        schemaVersion == CURRENT_SCHEMA_VERSION && hasValidShape()
 
     fun matchesStateBinding(state: DayWeaveUiState): Boolean =
         hasValidShape() &&
@@ -888,7 +1018,8 @@ data class PublishedScheduleProofSnapshot(
             state.schedulePlanningZoneId == revision.timezoneName
 
     fun matches(block: ScheduleItem): Boolean =
-        hasValidShape() && blocks.singleOrNull { it.id == block.id }?.matches(block) == true
+        hasCurrentImmutablePlanSeal() &&
+            blocks.singleOrNull { it.id == block.id }?.matches(block) == true
 
     /**
      * Verifies the complete canonical plan accepted by publication, rather than granting
@@ -899,8 +1030,9 @@ data class PublishedScheduleProofSnapshot(
     fun matchesPublishedPlan(schedule: List<ScheduleItem>): Boolean {
         if (!hasValidShape()) return false
         val publicationBacked = schedule.filter { block ->
-            block.canonicalItemId != null &&
-                block.canonicalBlockKind != REMOTE_EXECUTION_LEASE_KIND
+            block.canonicalBlockKind != null &&
+                block.canonicalBlockKind != REMOTE_EXECUTION_LEASE_KIND &&
+                (schemaVersion >= FULL_PLAN_SCHEMA_VERSION || block.canonicalItemId != null)
         }
         if (publicationBacked.size != blocks.size) return false
         val scheduleById = publicationBacked.associateBy(ScheduleItem::id)
@@ -913,7 +1045,9 @@ data class PublishedScheduleProofSnapshot(
             runCatching { Instant.parse(right) }.getOrNull()
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 1
+        const val CURRENT_SCHEMA_VERSION = 2
+        private const val LEGACY_SCHEMA_VERSION = 1
+        private const val FULL_PLAN_SCHEMA_VERSION = 2
         private const val MAX_PUBLISHED_BLOCKS = 10_000
         private const val REMOTE_EXECUTION_LEASE_KIND = "remote_execution_lease"
         private val NIL_PUBLICATION_UUID = UUID(0L, 0L)
@@ -1270,6 +1404,128 @@ data class DayWeaveUiState(
                 }
             }
 
+    /** Today renders only blocks intersecting its local calendar day, even for a long replica. */
+    fun visibleScheduleForDay(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): List<ScheduleItem> = visibleScheduleSlicesForDay(reference, currentZone)
+        .map(ScheduleItemPresentationSlice::item)
+
+    fun visibleScheduleSlicesForDay(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): List<ScheduleItemPresentationSlice> {
+        val date = reference.atZone(currentZone).toLocalDate()
+        val dayStart = date.atStartOfDay(currentZone).toInstant()
+        val dayEnd = date.plusDays(1).atStartOfDay(currentZone).toInstant()
+        return visibleScheduleSlicesIntersecting(
+            intervalStart = dayStart,
+            intervalEnd = dayEnd,
+            displayZone = currentZone,
+            isDaySlice = true,
+        )
+    }
+
+    /** Calendar renders the same Monday-based local week shown by its seven-day strip. */
+    fun visibleScheduleForWeek(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+        firstDayOfWeek: DayOfWeek = DayOfWeek.MONDAY,
+    ): List<ScheduleItem> = visibleScheduleSlicesForWeek(
+        reference,
+        currentZone,
+        firstDayOfWeek,
+    ).map(ScheduleItemPresentationSlice::item)
+
+    fun visibleScheduleSlicesForWeek(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+        firstDayOfWeek: DayOfWeek = DayOfWeek.MONDAY,
+    ): List<ScheduleItemPresentationSlice> {
+        val date = reference.atZone(currentZone).toLocalDate()
+        val daysSinceWeekStart =
+            (date.dayOfWeek.value - firstDayOfWeek.value + 7) % 7
+        val weekStartDate = date.minusDays(daysSinceWeekStart.toLong())
+        val weekStart = weekStartDate.atStartOfDay(currentZone).toInstant()
+        val weekEnd = weekStartDate.plusDays(7).atStartOfDay(currentZone).toInstant()
+        return visibleScheduleSlicesIntersecting(
+            intervalStart = weekStart,
+            intervalEnd = weekEnd,
+            displayZone = currentZone,
+            isDaySlice = false,
+        )
+    }
+
+    private fun visibleScheduleSlicesIntersecting(
+        intervalStart: Instant,
+        intervalEnd: Instant,
+        displayZone: ZoneId,
+        isDaySlice: Boolean,
+    ): List<ScheduleItemPresentationSlice> {
+        return visibleSchedule.mapNotNull { block ->
+            if (block.absoluteStartAt == null && block.absoluteEndAt == null) {
+                return@mapNotNull ScheduleItemPresentationSlice(
+                    item = block,
+                    clippedStart = null,
+                    clippedEnd = null,
+                    startTimeLabel = block.timeRange().substringBefore('–'),
+                    weekStartLabel = block.timeRange().substringBefore('–'),
+                    durationMinutes = block.durationMinutes,
+                    durationLabel = "${block.durationMinutes}m",
+                )
+            }
+            val start = block.absoluteStartAt?.let { raw ->
+                runCatching { Instant.parse(raw) }.getOrNull()
+            } ?: return@mapNotNull null
+            val end = block.absoluteEndAt?.let { raw ->
+                runCatching { Instant.parse(raw) }.getOrNull()
+            } ?: return@mapNotNull null
+            if (start >= end || end <= intervalStart || start >= intervalEnd) {
+                return@mapNotNull null
+            }
+            val clippedStart = maxOf(start, intervalStart)
+            val clippedEnd = minOf(end, intervalEnd)
+            val duration = Duration.between(clippedStart, clippedEnd)
+            val wholeMinutes = duration.seconds / 60
+            val durationMinutes = (
+                wholeMinutes + if (duration.seconds % 60 != 0L || duration.nano != 0) 1 else 0
+                ).coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
+            val continuesBefore = start < intervalStart
+            val continuesAfter = end > intervalEnd
+            val spansMultipleDisplayDays =
+                start.atZone(displayZone).toLocalDate() !=
+                end.minusNanos(1).atZone(displayZone).toLocalDate()
+            val localStart = clippedStart.atZone(displayZone)
+            val continuation = when {
+                isDaySlice && continuesBefore && continuesAfter -> "Ongoing all day"
+                isDaySlice && continuesBefore -> "Ongoing · ends today"
+                isDaySlice && continuesAfter -> "Continues tomorrow"
+                continuesBefore && continuesAfter -> "Ongoing"
+                continuesBefore -> "Started earlier"
+                continuesAfter -> "Continues"
+                spansMultipleDisplayDays -> "Multi-day"
+                else -> null
+            }
+            val durationLabel = when {
+                isDaySlice && continuesBefore && continuesAfter -> "All day"
+                durationMinutes >= PRESENTATION_MINUTES_PER_DAY &&
+                    durationMinutes % PRESENTATION_MINUTES_PER_DAY == 0 ->
+                    "${durationMinutes / PRESENTATION_MINUTES_PER_DAY}d"
+                else -> "${durationMinutes}m"
+            }
+            ScheduleItemPresentationSlice(
+                item = block,
+                clippedStart = clippedStart,
+                clippedEnd = clippedEnd,
+                startTimeLabel = localStart.toLocalTime().format(SLICE_TIME_FORMAT),
+                weekStartLabel = localStart.format(SLICE_WEEK_FORMAT),
+                durationMinutes = durationMinutes,
+                durationLabel = durationLabel,
+                continuationLabel = continuation,
+            )
+        }
+    }
+
     val activeItem: ScheduleItem?
         get() = activeSession?.let { session -> schedule.firstOrNull { it.id == session.itemId } }
 
@@ -1317,7 +1573,7 @@ data class DayWeaveUiState(
     ): ScheduleItem? {
         val capacity = effectiveEnergySignal(reference, currentZone)?.energy ?: return null
         val capacityRank = capacity.rank()
-        return visibleSchedule.firstOrNull { item ->
+        return visibleScheduleForDay(reference, currentZone).firstOrNull { item ->
             item.status in setOf(ItemStatus.NOT_STARTED, ItemStatus.SCHEDULED) &&
                 !item.isHardConstraint && item.energy.rank() <= capacityRank
         }
@@ -1337,13 +1593,48 @@ data class DayWeaveUiState(
     ): Boolean {
         if (pendingSchedulePublication != null) return false
         if (canonicalSyncOrigin == null) return true
+        return isPublishedScheduleDisplayCurrent(reference, currentZone, requireSameZone = true)
+    }
+
+    /**
+     * A proof-bound server replica remains useful for display throughout its published horizon.
+     * A replica composed in another IANA zone is deliberately read-only, but must not disappear.
+     */
+    fun isPublishedScheduleDisplayCurrent(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): Boolean = isPublishedScheduleDisplayCurrent(reference, currentZone, requireSameZone = false)
+
+    private fun isPublishedScheduleDisplayCurrent(
+        reference: Instant,
+        currentZone: ZoneId,
+        requireSameZone: Boolean,
+    ): Boolean {
+        if (pendingSchedulePublication != null || canonicalSyncOrigin == null) return false
         val proof = publishedScheduleProof ?: return false
-        if (!proof.matchesStateBinding(this) || !proof.matchesPublishedPlan(schedule)) return false
+        if (
+            !proof.hasCurrentImmutablePlanSeal() || !proof.matchesStateBinding(this) ||
+            !proof.matchesPublishedPlan(schedule)
+        ) {
+            return false
+        }
         val zone = schedulePlanningZoneId?.let { raw ->
             runCatching { ZoneId.of(raw) }.getOrNull()
         } ?: return false
-        return proof.revision.timezoneName == zone.id && zone == currentZone &&
-            canonicalPlanningDate() == reference.atZone(currentZone).toLocalDate()
+        if (proof.revision.timezoneName != zone.id || requireSameZone && zone != currentZone) {
+            return false
+        }
+        val horizonStart = runCatching {
+            Instant.parse(proof.revision.horizonStart)
+        }.getOrNull() ?: return false
+        val horizonEnd = runCatching {
+            Instant.parse(proof.revision.horizonEnd)
+        }.getOrNull() ?: return false
+        if (horizonStart >= horizonEnd) return false
+        val date = reference.atZone(currentZone).toLocalDate()
+        val dayStart = date.atStartOfDay(currentZone).toInstant()
+        val dayEnd = date.plusDays(1).atStartOfDay(currentZone).toInstant()
+        return horizonStart < dayEnd && dayStart < horizonEnd
     }
 
     /** Allows a current bundled-core plan to remain visible while all server actions stay locked. */
@@ -1352,6 +1643,7 @@ data class DayWeaveUiState(
         currentZone: ZoneId = ZoneId.systemDefault(),
     ): Boolean {
         if (isCanonicalPlanCurrent(reference, currentZone)) return true
+        if (isPublishedScheduleDisplayCurrent(reference, currentZone)) return true
         val provenance = localScheduleCompositionProvenance ?: return false
         if (!provenance.matchesState(this)) return false
         val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return false
@@ -1366,8 +1658,8 @@ data class DayWeaveUiState(
         if (pendingSchedulePublication != null || block.sessionIndex == null) return false
         val proof = publishedScheduleProof ?: return false
         if (
-            !proof.matchesStateBinding(this) || !proof.matchesPublishedPlan(schedule) ||
-            !proof.matches(block)
+            !proof.hasCurrentImmutablePlanSeal() || !proof.matchesStateBinding(this) ||
+            !proof.matchesPublishedPlan(schedule) || !proof.matches(block)
         ) {
             return false
         }

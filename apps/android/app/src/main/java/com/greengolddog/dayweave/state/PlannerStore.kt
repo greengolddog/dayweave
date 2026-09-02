@@ -650,6 +650,156 @@ class PlannerStore(
     }
 
     /**
+     * Atomically installs the exact immutable head returned by `/v1/schedule/current`.
+     *
+     * The caller must map both the canonical-item generation and schedule before entering this
+     * boundary. Equality with the last SQLCipher-confirmed state prevents a response for one item
+     * generation or credential binding from being installed into another.
+     */
+    fun installCurrentPublishedSchedule(
+        expectedState: DayWeaveUiState,
+        update: CanonicalPlanUpdate,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PlannerPersistenceReceipt? {
+        validateCanonicalPlanUpdate(update)
+        val proof = currentPublishedScheduleProof(update, revision)
+        return mutateDurablyWithSnapshot { current ->
+            require(current == expectedState && mutableDurableState.value == expectedState) {
+                "Planner state changed while the published schedule was in flight"
+            }
+            requireCurrentScheduleReplicaPreflight(current, update)
+            val accepted = canonicalPlanState(current, update)
+            require(accepted.scheduleInputDigest == revision.inputDigest)
+            accepted.copy(
+                pendingSchedulePublication = null,
+                publishedScheduleRevision = revision,
+                publishedScheduleProof = proof,
+                scheduleMessage = update.message,
+            ).also { installed ->
+                require(proof.matchesStateBinding(installed))
+                require(proof.matchesPublishedPlan(installed.schedule))
+            }
+        }?.receipt
+    }
+
+    /** Clears stale publication authority only for an exact durable binding and state generation. */
+    fun installNoCurrentPublishedSchedule(
+        expectedState: DayWeaveUiState,
+        syncOrigin: String,
+        configurationId: String,
+    ): PlannerPersistenceReceipt? = mutateDurablyWithSnapshot { current ->
+        require(current == expectedState && mutableDurableState.value == expectedState) {
+            "Planner state changed while the empty schedule head was in flight"
+        }
+        require(current.canonicalSyncOrigin == null || current.canonicalSyncOrigin == syncOrigin)
+        require(
+            current.canonicalConfigurationId == null ||
+                current.canonicalConfigurationId == configurationId,
+        )
+        requireNoReplicaBlockingMutation(current)
+        val retainedLeaseIds = current.canonicalExecutionSession
+            ?.takeIf { it.status in OPEN_EXECUTION_STATUSES }
+            ?.let { lease ->
+                current.schedule.filter { block -> lease.matches(block) }
+                    .mapTo(hashSetOf(), ScheduleItem::id)
+            }
+            .orEmpty()
+        current.copy(
+            schedule = current.schedule.filter { block ->
+                block.canonicalBlockKind == "remote_execution_lease" ||
+                    block.id in retainedLeaseIds
+            },
+            activeSession = current.activeSession?.takeIf { session ->
+                session.itemId in retainedLeaseIds
+            },
+            pendingSchedulePublication = null,
+            publishedScheduleRevision = null,
+            publishedScheduleProof = null,
+            scheduleInputDigest = null,
+            localScheduleCompositionProvenance = null,
+            scheduleGeneratedAt = null,
+            schedulePlanningZoneId = null,
+            rejectedCanonicalItemCount = 0,
+            unscheduledCanonicalItemCount = 0,
+            scheduleViolationMessages = emptyList(),
+            scheduleViolationCount = 0,
+            scheduleErrorViolationCount = 0,
+            unscheduledWork = emptyList(),
+            occurrenceSeriesItemIds = emptyMap(),
+            recurrenceOccurrenceSources = emptyMap(),
+            scheduleMessage = "No schedule has been published for this workspace yet",
+        )
+    }?.receipt
+
+    private fun requireCurrentScheduleReplicaPreflight(
+        current: DayWeaveUiState,
+        update: CanonicalPlanUpdate,
+    ) {
+        requireNoReplicaBlockingMutation(current)
+        require(update.configurationId != null)
+        require(
+            current.canonicalSyncOrigin == null ||
+                current.canonicalSyncOrigin == update.syncOrigin,
+        )
+        require(
+            current.canonicalConfigurationId == null ||
+                current.canonicalConfigurationId == update.configurationId,
+        )
+        require(
+            current.canonicalExecutionSyncOrigin == null ||
+                current.canonicalExecutionSyncOrigin == update.syncOrigin,
+        )
+        require(
+            current.canonicalExecutionConfigurationId == null ||
+                current.canonicalExecutionConfigurationId == update.configurationId,
+        )
+    }
+
+    private fun requireNoReplicaBlockingMutation(current: DayWeaveUiState) {
+        require(current.pendingSchedulePublication == null)
+        require(current.pendingProposalApplicationMutation == null)
+        require(current.pendingCanonicalMutation == null)
+        require(current.pendingCanonicalAuthoringMutations.none {
+            it.disposition == CanonicalAuthoringDisposition.PENDING
+        })
+        require(current.pendingExecutionCommand == null)
+        require(current.pendingExecutionDeferIntent == null)
+    }
+
+    private fun currentPublishedScheduleProof(
+        update: CanonicalPlanUpdate,
+        revision: PublishedScheduleRevisionSnapshot,
+    ): PublishedScheduleProofSnapshot {
+        val revisionId = UUID.fromString(revision.id)
+        require(revisionId != NIL_UUID && revisionId.toString() == revision.id)
+        require(revision.revisionNumber > 0uL)
+        require(revision.revision == "${revision.revisionNumber}:${revision.id}")
+        requireScheduleInputDigest(revision.inputDigest)
+        require(revision.inputDigest == update.inputDigest)
+        val horizonStart = Instant.parse(revision.horizonStart)
+        val horizonEnd = Instant.parse(revision.horizonEnd)
+        val asOf = Instant.parse(update.generatedAt)
+        require(horizonStart <= asOf && asOf < horizonEnd)
+        require(revision.timezoneName == update.planningZoneId)
+        requireNotNull(runCatching { ZoneId.of(revision.timezoneName) }.getOrNull())
+        requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
+        val blocks = update.schedule.filter {
+            it.canonicalBlockKind != null && it.canonicalBlockKind != "remote_execution_lease"
+        }.map(PublishedScheduleBlockProofSnapshot::from).sortedBy { it.id }
+        return PublishedScheduleProofSnapshot(
+            schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+            syncOrigin = update.syncOrigin,
+            configurationId = requireNotNull(update.configurationId),
+            revision = revision,
+            asOf = update.generatedAt,
+            blocks = blocks,
+        ).also { proof ->
+            require(proof.hasValidShape())
+            require(proof.matchesPublishedPlan(update.schedule))
+        }
+    }
+
+    /**
      * Atomically installs one bundled-core composition only if every input generation is unchanged.
      *
      * The local fingerprint is retained as encrypted display provenance. Server publication
@@ -1520,31 +1670,11 @@ class PlannerStore(
             expectedBaseUrl = publication.syncOrigin,
             request = publication.request,
         )
-        val itemBackedBlocks = publication.candidate.schedule.filter {
-            it.canonicalItemId != null
+        val publicationBlocks = publication.candidate.schedule.filter {
+            it.canonicalBlockKind != null && it.canonicalBlockKind != "remote_execution_lease"
         }
-        val blocks = itemBackedBlocks.map { block ->
-            PublishedScheduleBlockProofSnapshot(
-                id = block.id,
-                itemId = requireNotNull(block.canonicalItemId),
-                itemRevision = requireNotNull(block.canonicalRevision) {
-                    "A published block needs an exact item revision"
-                },
-                occurrenceId = block.occurrenceId,
-                sessionIndex = requireNotNull(block.sessionIndex) {
-                    "A published block needs its server session index"
-                },
-                start = requireNotNull(block.absoluteStartAt) {
-                    "A published block needs an exact start"
-                },
-                end = requireNotNull(block.absoluteEndAt) {
-                    "A published block needs an exact end"
-                },
-                kind = requireNotNull(block.canonicalBlockKind) {
-                    "A published block needs its server kind"
-                },
-            )
-        }.sortedBy { it.id }
+        val blocks = publicationBlocks.map(PublishedScheduleBlockProofSnapshot::from)
+            .sortedBy { it.id }
         val proof = PublishedScheduleProofSnapshot(
             schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
             syncOrigin = publication.syncOrigin,
@@ -1554,7 +1684,7 @@ class PlannerStore(
             blocks = blocks,
         )
         require(proof.hasValidShape()) { "Published schedule proof is invalid" }
-        require(proof.blocks.size == itemBackedBlocks.size)
+        require(proof.blocks.size == publicationBlocks.size)
         require(proof.matchesPublishedPlan(publication.candidate.schedule)) {
             "Published schedule proof does not match the accepted candidate"
         }
@@ -3087,6 +3217,9 @@ class PlannerStore(
                 focused.absoluteStartAt == intent.sourceStart &&
                 focused.absoluteEndAt == intent.sourceEnd,
         ) { "Move-later intent does not match the exact source block" }
+        require(current.hasPublishedExecutionAuthority(focused)) {
+            "The execution source has no current immutable publication seal"
+        }
         val proof = current.publishedScheduleProof?.blocks?.singleOrNull {
             it.id == intent.plannedBlockId
         } ?: throw IllegalArgumentException("The execution source has no publication proof")
@@ -5078,6 +5211,8 @@ class PlannerStore(
             sourceDuration.nano == 0 &&
                 sourceDuration.seconds == assessment.plannedDurationSeconds,
         )
+        val source = schedule.single { it.id == intent.focusedBlockId }
+        require(hasPublishedExecutionAuthority(source))
         val publication = requireNotNull(publishedScheduleProof)
         require(
             publication.blocks.single { it.id == intent.plannedBlockId }.let { proof ->
@@ -5207,6 +5342,7 @@ class PlannerStore(
                     source.absoluteStartAt == intent.sourceStart &&
                     source.absoluteEndAt == intent.sourceEnd,
             )
+            require(hasPublishedExecutionAuthority(source))
             val proofEnvelope = requireNotNull(publishedScheduleProof)
             require(
                 proofEnvelope.syncOrigin == intent.syncOrigin &&

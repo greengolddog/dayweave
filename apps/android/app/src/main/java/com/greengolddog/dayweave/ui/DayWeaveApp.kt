@@ -363,6 +363,11 @@ private fun DayWeaveRoot(
                     } else {
                         null
                     },
+                    scheduleInvalidations = if (deviceAuthState.isConfigured) {
+                        viewModel::collectForegroundScheduleInvalidations
+                    } else {
+                        null
+                    },
                     polling = {
                         // Polling remains the durable fallback for old servers and missed publishes.
                         while (isActive) {
@@ -1105,9 +1110,14 @@ private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L
 internal suspend fun runForegroundInvalidationWorkers(
     executionInvalidationStream: (suspend () -> Unit)?,
     canonicalItemInvalidations: (suspend () -> Unit)?,
+    scheduleInvalidations: (suspend () -> Unit)? = null,
     polling: suspend () -> Unit,
 ) = supervisorScope {
-    listOfNotNull(executionInvalidationStream, canonicalItemInvalidations).forEach {
+    listOfNotNull(
+        executionInvalidationStream,
+        canonicalItemInvalidations,
+        scheduleInvalidations,
+    ).forEach {
         collectInvalidations ->
         launch {
             try {

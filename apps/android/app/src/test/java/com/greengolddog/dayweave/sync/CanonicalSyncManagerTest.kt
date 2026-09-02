@@ -9,6 +9,7 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
+import com.greengolddog.dayweave.model.PublishedScheduleBlockProofSnapshot
 import com.greengolddog.dayweave.model.RecurrenceMoveSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOutcomeSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
@@ -29,9 +30,14 @@ import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.InvalidApiConfigurationException
 import com.greengolddog.dayweave.network.PlannerApiException
 import com.greengolddog.dayweave.network.RemoteCanonicalItem
+import com.greengolddog.dayweave.network.RemoteCurrentPublishedSchedule
 import com.greengolddog.dayweave.network.RemoteItemDeltaChange
 import com.greengolddog.dayweave.network.RemoteItemDeltaPage
 import com.greengolddog.dayweave.network.RemoteItemTombstone
+import com.greengolddog.dayweave.network.RemoteManualPlacementAssessment
+import com.greengolddog.dayweave.network.RemoteManualPlacementConflict
+import com.greengolddog.dayweave.network.RemoteManualPlacementViolation
+import com.greengolddog.dayweave.network.RemotePlanViolation
 import com.greengolddog.dayweave.network.RemotePlanScore
 import com.greengolddog.dayweave.network.RemotePlanOccurrence
 import com.greengolddog.dayweave.network.RemoteScheduleBlock
@@ -39,6 +45,7 @@ import com.greengolddog.dayweave.network.RemoteSchedulePlan
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
 import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
 import com.greengolddog.dayweave.network.RemotePublishedScheduleRevision
+import com.greengolddog.dayweave.network.RemoteUnscheduledWork
 import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishHttpRequest
@@ -80,6 +87,723 @@ import org.junit.Test
 
 class CanonicalSyncManagerTest {
     private val clock = Instant.parse("2026-09-01T07:00:00Z")
+
+    @Test
+    fun currentScheduleDeltaStaysReadOnlyUntilExactSnapshotIsAtomicallyInstalled() = runBlocking {
+        val initial = DayWeaveUiState()
+        val plannerStore = PlannerStore(initial)
+        val deltaStarted = CompletableDeferred<Unit>()
+        val releaseDelta = CompletableDeferred<Unit>()
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(preview())
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            this.deltaStarted = deltaStarted
+            deltaGate = releaseDelta
+        }
+        val refresh = async { manager(plannerStore, transport).refreshCurrentPublishedSchedule() }
+
+        withTimeout(2_000) { deltaStarted.await() }
+        assertEquals(initial, plannerStore.state.value)
+        assertEquals(initial, plannerStore.durableState.value)
+        assertTrue(plannerStore.state.value.canonicalItems.isEmpty())
+        assertEquals(null, plannerStore.state.value.canonicalDeltaCursor)
+        assertEquals(null, plannerStore.state.value.publishedScheduleProof)
+
+        releaseDelta.complete(Unit)
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, withTimeout(2_000) { refresh.await() })
+        val installed = plannerStore.state.value
+        assertEquals("cursor-1", installed.canonicalDeltaCursor)
+        assertEquals(7L, installed.canonicalItems.single().revision)
+        assertEquals(1uL, installed.publishedScheduleRevision?.revisionNumber)
+        assertTrue(requireNotNull(installed.publishedScheduleProof).matchesPublishedPlan(
+            installed.schedule,
+        ))
+        assertEquals(installed, plannerStore.durableState.value)
+        assertTrue(transport.previewRequests.isEmpty())
+        assertTrue(transport.publicationRequests.isEmpty())
+        assertEquals(2, transport.currentScheduleConfigurations.size)
+    }
+
+    @Test
+    fun currentScheduleAcceptsNamedPublicationZoneAndRejectsJavaOnlyFixedZoneForms() = runBlocking {
+        val parisHead = currentSchedule(preview()).let { current ->
+            current.copy(revision = current.revision.copy(timezoneName = "Europe/Paris"))
+        }
+        val parisStore = PlannerStore(DayWeaveUiState())
+        val parisTransport = FakeCanonicalTransport().apply {
+            currentScheduleResult = parisHead
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-paris",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(parisStore, parisTransport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals("Europe/Paris", parisStore.state.value.schedulePlanningZoneId)
+
+        listOf("+02:00", "GMT+02:00").forEach { invalidZone ->
+            val invalidStore = PlannerStore(DayWeaveUiState())
+            val invalidTransport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(preview()).let { current ->
+                    current.copy(revision = current.revision.copy(timezoneName = invalidZone))
+                }
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-invalid",
+                    false,
+                )
+            }
+
+            assertEquals(
+                invalidZone,
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+                manager(invalidStore, invalidTransport).refreshCurrentPublishedSchedule(),
+            )
+            assertEquals(DayWeaveUiState(), invalidStore.durableState.value)
+        }
+    }
+
+    @Test
+    fun currentScheduleAcceptsUnscheduledDemandBeyondThePublicationHorizon() = runBlocking {
+        val remaining = 200_000L
+        val longWork = remoteItem().copy(
+            durationSeconds = (remaining + 60L) * 60L,
+        )
+        val replicated = preview().copy(
+            plan = preview().plan.copy(
+                unscheduled = listOf(
+                    RemoteUnscheduledWork(
+                        itemId = TASK_ID,
+                        remaining = remaining,
+                        reason = "no_capacity",
+                        message = "Demand beyond this horizon remains visible",
+                    ),
+                ),
+                violations = listOf(
+                    RemotePlanViolation(
+                        kind = "capacity",
+                        severity = "warning",
+                        itemIds = listOf(TASK_ID),
+                        occurrenceIds = emptyList(),
+                        penalty = ULong.MAX_VALUE,
+                        message = "Wire-sized penalty remains safely clamped for display",
+                    ),
+                ),
+                score = RemotePlanScore(
+                    scheduledMinutes = 60,
+                    unscheduledMinutes = remaining,
+                    softPenalty = ULong.MAX_VALUE,
+                    movedMinutes = 4_294_967_295L,
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(replicated)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = longWork)),
+                "cursor-long-demand",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(remaining, store.state.value.unscheduledWork.single().remainingMinutes)
+        assertEquals(0, store.state.value.dayScore)
+        assertEquals(1, store.state.value.scheduleViolationCount)
+    }
+
+    @Test
+    fun currentScheduleReplicaAcceptsValidatedExternalFixedContextWithoutMintingAuthority() =
+        runBlocking {
+            val externalId = SECOND_BLOCK_ID
+            val replicated = preview().copy(
+                manualPlacementAssessments = listOf(
+                    RemoteManualPlacementAssessment(
+                        placementId = "88888888-8888-4888-8888-888888888888",
+                        environmentDigest = "sha256:${"b".repeat(64)}",
+                        approvalDigest = "sha256:${"c".repeat(64)}",
+                        approvalRequired = false,
+                        violations = listOf(
+                            RemoteManualPlacementViolation(
+                                code = "immutable_overlap",
+                                itemIds = listOf(TASK_ID),
+                                occurrenceIds = emptyList(),
+                                conflictingBlockIds = listOf(SECOND_BLOCK_ID),
+                                conflictingBlocks = listOf(
+                                    RemoteManualPlacementConflict(
+                                        blockId = SECOND_BLOCK_ID,
+                                        externalBlockId = externalId,
+                                        kind = "external_fixed",
+                                        start = "2026-09-01T10:00:00+02:00",
+                                        end = "2026-09-04T10:00:00+02:00",
+                                    ),
+                                ),
+                                start = "2026-09-01T10:00:00+02:00",
+                                end = "2026-09-01T10:30:00+02:00",
+                                message = "Authorized pinned work overlaps immutable context",
+                            ),
+                        ),
+                    ),
+                ),
+                plan = preview().plan.copy(
+                    blocks = preview().plan.blocks + RemoteScheduleBlock(
+                        id = SECOND_BLOCK_ID,
+                        isSensitive = true,
+                        externalBlockId = externalId,
+                        title = "Private calendar hold",
+                        start = "2026-09-01T10:00:00+02:00",
+                        end = "2026-09-04T10:00:00+02:00",
+                        sessionIndex = 0,
+                        kind = "external_fixed",
+                        explanations = emptyList(),
+                    ) + RemoteScheduleBlock(
+                        id = THIRD_BLOCK_ID,
+                        isSensitive = false,
+                        itemId = TASK_ID,
+                        title = "Compose Android timeline",
+                        start = "2026-09-01T10:00:00+02:00",
+                        end = "2026-09-01T10:30:00+02:00",
+                        sessionIndex = 1,
+                        kind = "pinned",
+                        explanations = emptyList(),
+                    ),
+                    score = RemotePlanScore(90, 0, 0uL, 0),
+                ),
+            )
+            val transport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(replicated)
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+            }
+            val store = PlannerStore(DayWeaveUiState())
+
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(store, transport).refreshCurrentPublishedSchedule(),
+            )
+
+            val external = store.state.value.schedule.single { it.id == SECOND_BLOCK_ID }
+            assertEquals(null, external.canonicalItemId)
+            assertEquals(null, external.canonicalRevision)
+            assertEquals(ItemKind.EVENT, external.kind)
+            assertTrue(external.isHardConstraint)
+            assertTrue(external.isSensitive)
+            assertEquals(3 * 24 * 60, external.durationMinutes)
+            val proof = requireNotNull(store.state.value.publishedScheduleProof)
+            assertEquals(
+                listOf(BLOCK_ID, SECOND_BLOCK_ID, THIRD_BLOCK_ID),
+                proof.blocks.map { it.id },
+            )
+            assertTrue(proof.matchesPublishedPlan(store.state.value.schedule))
+            assertFalse(
+                proof.matchesPublishedPlan(
+                    store.state.value.schedule.filterNot { it.id == SECOND_BLOCK_ID },
+                ),
+            )
+            assertFalse(
+                proof.matchesPublishedPlan(
+                    store.state.value.schedule.map { block ->
+                        if (block.id == SECOND_BLOCK_ID) {
+                            block.copy(isHardConstraint = false)
+                        } else {
+                            block
+                        }
+                    },
+                ),
+            )
+            assertFalse(
+                proof.matchesPublishedPlan(
+                    store.state.value.schedule + external.copy(
+                        id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    ),
+                ),
+            )
+        }
+
+    @Test
+    fun currentScheduleRejectsExternalBlockWhoseIdentityDiffersFromFixedIdentity() = runBlocking {
+        val invalid = preview().copy(
+            plan = preview().plan.copy(
+                blocks = preview().plan.blocks + RemoteScheduleBlock(
+                    id = SECOND_BLOCK_ID,
+                    isSensitive = false,
+                    externalBlockId = "88888888-8888-4888-8888-888888888888",
+                    title = "Forged external identity",
+                    start = "2026-09-01T10:00:00+02:00",
+                    end = "2026-09-01T10:30:00+02:00",
+                    sessionIndex = 0,
+                    kind = "external_fixed",
+                    explanations = emptyList(),
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleRejectsManualExternalConflictWithSplitIdentity() = runBlocking {
+        val invalid = preview().copy(
+            manualPlacementAssessments = listOf(
+                RemoteManualPlacementAssessment(
+                    placementId = "88888888-8888-4888-8888-888888888888",
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = false,
+                    violations = listOf(
+                        RemoteManualPlacementViolation(
+                            code = "immutable_overlap",
+                            itemIds = listOf(TASK_ID),
+                            occurrenceIds = emptyList(),
+                            conflictingBlockIds = listOf(SECOND_BLOCK_ID),
+                            conflictingBlocks = listOf(
+                                RemoteManualPlacementConflict(
+                                    blockId = SECOND_BLOCK_ID,
+                                    externalBlockId = THIRD_BLOCK_ID,
+                                    kind = "external_fixed",
+                                    start = "2026-09-01T09:15:00+02:00",
+                                    end = "2026-09-01T09:45:00+02:00",
+                                ),
+                            ),
+                            start = "2026-09-01T09:00:00+02:00",
+                            end = "2026-09-01T10:00:00+02:00",
+                            message = "Forged external identity",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleRejectsPlannedBlockOverlappingAnyEarlierBlock() = runBlocking {
+        val invalid = preview().copy(
+            plan = preview().plan.copy(
+                blocks = preview().plan.blocks + preview().plan.blocks.single().copy(
+                    id = SECOND_BLOCK_ID,
+                    start = "2026-09-01T09:30:00+02:00",
+                    end = "2026-09-01T10:30:00+02:00",
+                    sessionIndex = 1,
+                ),
+                score = RemotePlanScore(120, 0, 0uL, 0),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleProofSealsNonExecutableCalendarContextWithoutMintingAuthority() =
+        runBlocking {
+            val calendarItem = remoteItem(split = false, isSensitive = true).copy(
+                id = CALENDAR_ITEM_ID,
+                kind = "event",
+                title = "Shared calendar context",
+                durationSeconds = 1_800,
+                isExecutable = false,
+                revision = 3,
+            )
+            val replicated = preview().copy(
+                sourceItemCount = 2,
+                sourceItemRevisions = mapOf(TASK_ID to 7, CALENDAR_ITEM_ID to 3),
+                acceptedItemCount = 2,
+                plan = preview().plan.copy(
+                    blocks = preview().plan.blocks + RemoteScheduleBlock(
+                        id = CALENDAR_BLOCK_ID,
+                        isSensitive = true,
+                        itemId = CALENDAR_ITEM_ID,
+                        title = calendarItem.title,
+                        start = "2026-09-01T10:30:00+02:00",
+                        end = "2026-09-01T11:00:00+02:00",
+                        sessionIndex = 0,
+                        kind = "calendar_event",
+                        explanations = emptyList(),
+                    ),
+                ),
+            )
+            val transport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(replicated)
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(
+                        RemoteItemDeltaChange(type = "upsert", item = remoteItem()),
+                        RemoteItemDeltaChange(type = "upsert", item = calendarItem),
+                    ),
+                    "cursor-1",
+                    false,
+                )
+            }
+            val store = PlannerStore(DayWeaveUiState())
+
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(store, transport).refreshCurrentPublishedSchedule(),
+            )
+
+            val context = store.state.value.schedule.single { it.id == CALENDAR_BLOCK_ID }
+            assertEquals(null, context.canonicalItemId)
+            assertEquals(null, context.canonicalRevision)
+            assertEquals(null, context.occurrenceId)
+            assertFalse(store.state.value.hasPublishedExecutionAuthority(context))
+            val proof = requireNotNull(store.state.value.publishedScheduleProof)
+            assertEquals(null, proof.blocks.single { it.id == CALENDAR_BLOCK_ID }.itemId)
+            assertTrue(proof.matchesPublishedPlan(store.state.value.schedule))
+            assertFalse(
+                proof.matchesPublishedPlan(
+                    store.state.value.schedule.map { block ->
+                        if (block.id == CALENDAR_BLOCK_ID) {
+                            block.copy(title = "Tampered context")
+                        } else {
+                            block
+                        }
+                    },
+                ),
+            )
+        }
+
+    @Test
+    fun currentScheduleRejectsViolationOccurrenceNotLinkedToItsItemEvidence() = runBlocking {
+        val recurring = remoteItem().copy(recurrence = dailyRecurrence())
+        val occurrence = RemotePlanOccurrence(
+            id = OCCURRENCE_ID,
+            seriesItemId = TASK_ID,
+            identity = dailyOccurrenceIdentity(),
+            nominalStart = "2026-09-01T09:00:00+02:00",
+            nominalEnd = "2026-09-01T10:00:00+02:00",
+            windowStart = "2026-09-01T07:00:00+02:00",
+            windowEnd = "2026-09-01T12:00:00+02:00",
+            localDate = "2026-09-01",
+            ordinal = 0,
+            state = "generated",
+        )
+        val invalid = preview().copy(
+            plan = preview().plan.copy(
+                blocks = listOf(
+                    preview().plan.blocks.single().copy(occurrenceId = OCCURRENCE_ID),
+                ),
+                occurrences = listOf(occurrence),
+                violations = listOf(
+                    RemotePlanViolation(
+                        kind = "soft_constraint",
+                        severity = "warning",
+                        itemIds = emptyList(),
+                        occurrenceIds = listOf(OCCURRENCE_ID),
+                        start = "2026-09-01T09:00:00+02:00",
+                        end = "2026-09-01T10:00:00+02:00",
+                        penalty = 1uL,
+                        message = "Invalid unowned occurrence evidence",
+                    ),
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = recurring)),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.state.value)
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleRejectsManualBoundaryFieldsThatDoNotMatchViolationKind() = runBlocking {
+        val invalid = preview().copy(
+            manualPlacementAssessments = listOf(
+                RemoteManualPlacementAssessment(
+                    placementId = "88888888-8888-4888-8888-888888888888",
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = true,
+                    violations = listOf(
+                        RemoteManualPlacementViolation(
+                            code = "earliest_start",
+                            itemIds = listOf(TASK_ID),
+                            occurrenceIds = emptyList(),
+                            conflictingBlockIds = emptyList(),
+                            conflictingBlocks = emptyList(),
+                            start = "2026-09-01T09:00:00+02:00",
+                            end = "2026-09-01T10:00:00+02:00",
+                            boundaryStart = "2026-09-01T09:30:00+02:00",
+                            boundaryEnd = "2026-09-01T10:30:00+02:00",
+                            message = "Earliest start must have only a start boundary",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleAcceptsAuthorizedManualPlacementWithRetainedViolations() = runBlocking {
+        val authorized = preview().copy(
+            manualPlacementAssessments = listOf(
+                RemoteManualPlacementAssessment(
+                    placementId = "88888888-8888-4888-8888-888888888888",
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = false,
+                    violations = listOf(
+                        RemoteManualPlacementViolation(
+                            code = "outside_availability",
+                            itemIds = listOf(TASK_ID),
+                            occurrenceIds = emptyList(),
+                            conflictingBlockIds = emptyList(),
+                            conflictingBlocks = emptyList(),
+                            start = "2026-09-01T09:00:00+02:00",
+                            end = "2026-09-01T10:00:00+02:00",
+                            message = "Authorized placement remains outside availability",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(authorized)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(1uL, store.state.value.publishedScheduleRevision?.revisionNumber)
+        assertTrue(
+            requireNotNull(store.state.value.publishedScheduleProof)
+                .matchesPublishedPlan(store.state.value.schedule),
+        )
+    }
+
+    @Test
+    fun currentScheduleRejectsMoreThanSixtyFourManualPlacementAssessments() = runBlocking {
+        val invalid = preview().copy(
+            manualPlacementAssessments = (0..64).map { index ->
+                RemoteManualPlacementAssessment(
+                    placementId = UUID.nameUUIDFromBytes(
+                        "manual-placement-$index".toByteArray(),
+                    ).toString(),
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = false,
+                    violations = emptyList(),
+                )
+            },
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(invalid)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
+    }
+
+    @Test
+    fun currentScheduleRejectsAggregateManualEvidenceBeyondGlobalCaps() = runBlocking {
+        val baseViolation = RemoteManualPlacementViolation(
+            code = "outside_availability",
+            itemIds = listOf(TASK_ID),
+            occurrenceIds = emptyList(),
+            conflictingBlockIds = emptyList(),
+            conflictingBlocks = emptyList(),
+            start = "2026-09-01T09:00:00+02:00",
+            end = "2026-09-01T10:00:00+02:00",
+            message = "Outside availability",
+        )
+        val aggregateViolationOverflow = preview().copy(
+            manualPlacementAssessments = listOf(
+                RemoteManualPlacementAssessment(
+                    placementId = "88888888-8888-4888-8888-888888888888",
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = true,
+                    violations = List(4_096) { baseViolation },
+                ),
+                RemoteManualPlacementAssessment(
+                    placementId = "99999999-9999-4999-8999-999999999999",
+                    environmentDigest = "sha256:${"d".repeat(64)}",
+                    approvalDigest = "sha256:${"e".repeat(64)}",
+                    approvalRequired = true,
+                    violations = listOf(baseViolation),
+                ),
+            ),
+        )
+        val conflicts = (0..4_096).map { index ->
+            val id = UUID.nameUUIDFromBytes("manual-conflict-$index".toByteArray()).toString()
+            RemoteManualPlacementConflict(
+                blockId = id,
+                externalBlockId = id,
+                kind = "external_fixed",
+                start = "2026-09-01T09:15:00+02:00",
+                end = "2026-09-01T09:45:00+02:00",
+            )
+        }
+        val aggregateConflictOverflow = preview().copy(
+            manualPlacementAssessments = listOf(
+                RemoteManualPlacementAssessment(
+                    placementId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    environmentDigest = "sha256:${"b".repeat(64)}",
+                    approvalDigest = "sha256:${"c".repeat(64)}",
+                    approvalRequired = true,
+                    violations = listOf(
+                        baseViolation.copy(
+                            code = "immutable_overlap",
+                            conflictingBlockIds = conflicts.map { it.blockId },
+                            conflictingBlocks = conflicts,
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        listOf(aggregateViolationOverflow, aggregateConflictOverflow).forEach { invalid ->
+            val store = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(invalid)
+                pages[null] = RemoteItemDeltaPage(
+                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    "cursor-1",
+                    false,
+                )
+            }
+            assertEquals(
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+                manager(store, transport).refreshCurrentPublishedSchedule(),
+            )
+            assertEquals(DayWeaveUiState(), store.durableState.value)
+        }
+    }
+
+    @Test
+    fun currentScheduleAcceptsMoreThanTwoThousandBoundedBlocks() = runBlocking {
+        val externalBlocks = (0 until 2_000).map { index ->
+            val id = UUID.nameUUIDFromBytes("external-fixed-$index".toByteArray()).toString()
+            RemoteScheduleBlock(
+                id = id,
+                isSensitive = false,
+                externalBlockId = id,
+                title = "External hold $index",
+                start = "2026-09-01T10:00:00+02:00",
+                end = "2026-09-01T10:15:00+02:00",
+                sessionIndex = 0,
+                kind = "external_fixed",
+                explanations = emptyList(),
+            )
+        }
+        val replicated = preview().copy(
+            plan = preview().plan.copy(blocks = preview().plan.blocks + externalBlocks),
+        )
+        val store = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(replicated)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-large-plan",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(2_001, store.state.value.schedule.size)
+        assertTrue(
+            requireNotNull(store.state.value.publishedScheduleProof)
+                .hasCurrentImmutablePlanSeal(),
+        )
+    }
 
     @Test
     fun failedPublicationKeepsOldPlanAndRestartReplaysExactJournal() = runBlocking {
@@ -1793,7 +2517,7 @@ class CanonicalSyncManagerTest {
         val longPreview = preview().copy(
             plan = preview().plan.copy(
                 blocks = listOf(longBlock),
-                score = RemotePlanScore(180, 0, 0, 0),
+                score = RemotePlanScore(180, 0, 0uL, 0),
             ),
         )
         val plannerStore = PlannerStore(DayWeaveUiState())
@@ -3131,13 +3855,7 @@ class CanonicalSyncManagerTest {
             canonicalBlockKind = "pinned",
         )
         val publishedProof = requireNotNull(initialStore.state.value.publishedScheduleProof)
-        val pinnedSiblingProof = publishedProof.blocks.single().copy(
-            id = SECOND_BLOCK_ID,
-            sessionIndex = 1,
-            start = "2026-09-01T08:00:00Z",
-            end = "2026-09-01T08:30:00Z",
-            kind = "pinned",
-        )
+        val pinnedSiblingProof = PublishedScheduleBlockProofSnapshot.from(pinnedSibling)
         val unsafeStates = listOf(
             initialStore.state.value.copy(
                 schedule = initialStore.state.value.schedule + pinnedSibling,
@@ -3797,10 +4515,14 @@ class CanonicalSyncManagerTest {
                                 end = "2026-09-01T08:30:00Z",
                                 sessionIndex = 0,
                                 kind = "planned",
+                                explanations = emptyList(),
                             ),
                         ),
                         unscheduled = emptyList(),
-                        score = RemotePlanScore(30, 0, 0, 0),
+                        decisions = emptyList(),
+                        violations = emptyList(),
+                        score = RemotePlanScore(30, 0, 0uL, 0),
+                        occurrences = emptyList(),
                     ),
                 )
             },
@@ -4231,7 +4953,7 @@ class CanonicalSyncManagerTest {
                 unscheduled = emptyList(),
                 decisions = emptyList(),
                 violations = emptyList(),
-                score = RemotePlanScore(0, 0, 0, 0),
+                score = RemotePlanScore(0, 0, 0uL, 0),
                 occurrences = emptyList(),
             ),
         )
@@ -4474,16 +5196,34 @@ class CanonicalSyncManagerTest {
                     end = "2026-09-01T10:00:00+02:00",
                     sessionIndex = 0,
                     kind = "planned",
+                    explanations = emptyList(),
                 ),
             ),
             unscheduled = emptyList(),
+            decisions = emptyList(),
+            violations = emptyList(),
             score = RemotePlanScore(
                 scheduledMinutes = 60,
                 unscheduledMinutes = 0,
-                softPenalty = 0,
+                softPenalty = 0uL,
                 movedMinutes = 0,
             ),
+            occurrences = emptyList(),
         ),
+    )
+
+    private fun currentSchedule(schedule: RemoteSchedulePreview) = RemoteCurrentPublishedSchedule(
+        revision = RemotePublishedScheduleRevision(
+            id = "77777777-7777-4777-8777-777777777777",
+            revision = "1:77777777-7777-4777-8777-777777777777",
+            revisionNumber = 1uL,
+            inputDigest = schedule.inputDigest,
+            horizonStart = schedule.plan.horizonStart,
+            horizonEnd = schedule.plan.horizonEnd,
+            timezoneName = "Europe/Madrid",
+            publishedAt = clock.toString(),
+        ),
+        schedule = schedule,
     )
 
     private fun terminalPreview(revision: Long) = preview().copy(
@@ -4493,7 +5233,7 @@ class CanonicalSyncManagerTest {
             score = RemotePlanScore(
                 scheduledMinutes = 0,
                 unscheduledMinutes = 0,
-                softPenalty = 0,
+                softPenalty = 0uL,
                 movedMinutes = 0,
             ),
         ),
@@ -4517,7 +5257,7 @@ class CanonicalSyncManagerTest {
             score = RemotePlanScore(
                 scheduledMinutes = 0,
                 unscheduledMinutes = 0,
-                softPenalty = 0,
+                softPenalty = 0uL,
                 movedMinutes = 0,
             ),
         ),
@@ -4560,9 +5300,12 @@ class CanonicalSyncManagerTest {
         const val TASK_ID = "11111111-1111-4111-8111-111111111111"
         const val BLOCK_ID = "22222222-2222-4222-8222-222222222222"
         const val SECOND_BLOCK_ID = "33333333-3333-4333-8333-333333333333"
+        const val THIRD_BLOCK_ID = "99999999-9999-4999-8999-999999999999"
         const val OCCURRENCE_ID = "44444444-4444-5444-8444-444444444444"
         const val EXECUTION_ID = "55555555-5555-4555-8555-555555555555"
         const val DEVICE_ID = "66666666-6666-4666-8666-666666666666"
+        const val CALENDAR_ITEM_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        const val CALENDAR_BLOCK_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     }
 }
 
@@ -4646,6 +5389,9 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
     var deltaStarted: CompletableDeferred<Unit>? = null
     var deltaGate: CompletableDeferred<Unit>? = null
     var deltaError: Throwable? = null
+    var currentScheduleResult: RemoteCurrentPublishedSchedule? = null
+    var currentScheduleError: Throwable? = null
+    val currentScheduleConfigurations = mutableListOf<String?>()
     var replacementResult: RemoteCanonicalItem? = null
     var replacementRequest: ReplaceCanonicalItemRequest? = null
     val replacementRequests = mutableListOf<ReplaceCanonicalItemRequest>()
@@ -4694,6 +5440,14 @@ private class FakeCanonicalTransport : CanonicalPlannerTransport {
         deltaGate?.await()
         deltaError?.let { throw it }
         return queuedPages[cursor]?.removeFirstOrNull() ?: requireNotNull(pages[cursor])
+    }
+
+    override suspend fun currentSchedule(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteCurrentPublishedSchedule? {
+        currentScheduleConfigurations += configuration.configurationId
+        currentScheduleError?.let { throw it }
+        return currentScheduleResult
     }
 
     override suspend fun preview(

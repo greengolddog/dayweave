@@ -41,6 +41,7 @@ import com.greengolddog.dayweave.network.PreviousScheduleBlockRequest
 import com.greengolddog.dayweave.network.ReplaceCanonicalItemRequest
 import com.greengolddog.dayweave.network.RemoteCanonicalItem
 import com.greengolddog.dayweave.network.RemoteItemDeltaChange
+import com.greengolddog.dayweave.network.RemotePublishedScheduleRevision
 import com.greengolddog.dayweave.network.RemoteScheduleBlock
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
 import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
@@ -362,6 +363,183 @@ class CanonicalSyncManager(
                 handleFailure(error)
             }
         }
+    }
+
+    /**
+     * Recovers the server's exact immutable schedule head without previewing or publishing.
+     * SSE callers use this same path; a revision hint itself never mutates planner state.
+     */
+    suspend fun refreshCurrentPublishedSchedule(): CanonicalRefreshOutcome {
+        val loadState = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
+        if (loadState != PlannerLoadState.READY) {
+            updateError("Encrypted planner storage is unavailable; the cached plan was kept.")
+            return CanonicalRefreshOutcome.LOCAL_STORAGE_FAILURE
+        }
+        return operationMutex.withLock {
+            val resolution = authenticatedConfiguration()
+            if (resolution is ConfigurationResolution.Failed) return@withLock resolution.outcome
+            val configuration = (resolution as ConfigurationResolution.Ready).configuration
+            mutableState.value = CanonicalSyncState(
+                phase = CanonicalSyncPhase.SYNCING,
+                message = "Checking the current published schedule…",
+                lastInputDigest = plannerStore.state.value.scheduleInputDigest,
+                sourceItemCount = plannerStore.state.value.canonicalItems.size,
+                scheduledBlockCount = plannerStore.state.value.schedule.size,
+            )
+            try {
+                configuration.withBindingOperation {
+                    ensureDurableWorkspaceBinding(configuration)
+                    val expected = plannerStore.state.value
+                    if (plannerStore.durableState.value != expected) {
+                        throw LocalPlannerStorageException()
+                    }
+                    if (expected.hasReplicaBlockingMutation()) {
+                        throw CurrentScheduleReplicaBlockedException()
+                    }
+                    var current = transport.currentSchedule(configuration)
+                    ensureConfigurationCurrent(configuration)
+                    if (current == null) {
+                        val receipt = plannerStore.installNoCurrentPublishedSchedule(
+                            expectedState = expected,
+                            syncOrigin = configuration.baseUrl.toString(),
+                            configurationId = requireNotNull(configuration.configurationId),
+                        )
+                        if (receipt != null && !receipt.awaitDurable()) {
+                            throw LocalPlannerStorageException()
+                        }
+                        ensureConfigurationCurrent(configuration)
+                        updateReplicaSuccess("No schedule has been published for this workspace yet")
+                        return@withBindingOperation CanonicalRefreshOutcome.SUCCESS
+                    }
+                    val canonical = loadDelta(configuration)
+                    ensureConfigurationCurrent(configuration)
+                    // Publication can advance while item deltas are draining. Refetch the
+                    // immutable head so the exact revision map is validated against the newest
+                    // canonical generation observed under this binding fence.
+                    current = transport.currentSchedule(configuration)
+                    ensureConfigurationCurrent(configuration)
+                    if (current == null) {
+                        val receipt = plannerStore.installNoCurrentPublishedSchedule(
+                            expectedState = expected,
+                            syncOrigin = configuration.baseUrl.toString(),
+                            configurationId = requireNotNull(configuration.configurationId),
+                        )
+                        if (receipt != null && !receipt.awaitDurable()) {
+                            throw LocalPlannerStorageException()
+                        }
+                        ensureConfigurationCurrent(configuration)
+                        updateReplicaSuccess("No schedule has been published for this workspace yet")
+                        return@withBindingOperation CanonicalRefreshOutcome.SUCCESS
+                    }
+                    val revision = validateCurrentScheduleRevision(
+                        requireNotNull(current).revision,
+                        requireNotNull(current).schedule,
+                    )
+                    val planningZone = ZoneId.of(revision.timezoneName)
+                    val generatedAt = Instant.parse(requireNotNull(current).schedule.plan.asOf)
+                    val planningDate = generatedAt.atZone(planningZone).toLocalDate()
+                    val profile = expected.scheduleCompositionProfile
+                    if (!profile.hasValidShape()) throw RemotePlannerMappingException()
+                    val update = mapPreview(
+                        preview = requireNotNull(current).schedule,
+                        canonicalItems = canonical.items,
+                        syncOrigin = configuration.baseUrl.toString(),
+                        deltaCursor = canonical.cursor,
+                        generatedAt = generatedAt,
+                        planningDate = planningDate,
+                        planningZone = planningZone,
+                        availabilityStart = localMinute(
+                            planningDate,
+                            planningZone,
+                            profile.dayStartMinute,
+                        ),
+                        availabilityEnd = localMinute(
+                            planningDate,
+                            planningZone,
+                            profile.dayEndMinute,
+                        ),
+                        replicaHorizonStart = Instant.parse(revision.horizonStart),
+                        replicaHorizonEnd = Instant.parse(revision.horizonEnd),
+                        allowExternalFixed = true,
+                        preservationState = expected,
+                    ).copy(
+                        configurationId = configuration.configurationId,
+                        message = "Installed published schedule revision ${revision.revisionNumber}",
+                    )
+                    val receipt = plannerStore.installCurrentPublishedSchedule(
+                        expectedState = expected,
+                        update = update,
+                        revision = revision,
+                    )
+                    if (receipt != null && !receipt.awaitDurable()) {
+                        throw LocalPlannerStorageException()
+                    }
+                    ensureConfigurationCurrent(configuration)
+                    updateReplicaSuccess(update.message)
+                    CanonicalRefreshOutcome.SUCCESS
+                }
+            } catch (error: Throwable) {
+                handleFailure(error)
+            }
+        }
+    }
+
+    private fun updateReplicaSuccess(message: String) {
+        val installed = plannerStore.state.value
+        mutableState.value = CanonicalSyncState(
+            phase = CanonicalSyncPhase.CONNECTED,
+            message = message,
+            lastInputDigest = installed.scheduleInputDigest,
+            sourceItemCount = installed.canonicalItems.size,
+            scheduledBlockCount = installed.schedule.size,
+        )
+    }
+
+    private fun com.greengolddog.dayweave.model.DayWeaveUiState.hasReplicaBlockingMutation(): Boolean =
+        pendingSchedulePublication != null ||
+            pendingProposalApplicationMutation != null ||
+            pendingCanonicalMutation != null ||
+            pendingCanonicalAuthoringMutations.any {
+                it.disposition == CanonicalAuthoringDisposition.PENDING
+            } ||
+            pendingExecutionCommand != null || pendingExecutionDeferIntent != null
+
+    private fun validateCurrentScheduleRevision(
+        remote: RemotePublishedScheduleRevision,
+        schedule: RemoteSchedulePreview,
+    ): PublishedScheduleRevisionSnapshot = try {
+        val revisionId = UUID.fromString(remote.id)
+        require(revisionId != NIL_UUID && revisionId.toString() == remote.id)
+        require(remote.revisionNumber > 0uL)
+        require(remote.revision == "${remote.revisionNumber}:${remote.id}")
+        require(remote.inputDigest.matches(DIGEST_PATTERN))
+        require(remote.inputDigest == schedule.inputDigest)
+        val horizonStart = Instant.parse(remote.horizonStart)
+        val horizonEnd = Instant.parse(remote.horizonEnd)
+        require(horizonStart < horizonEnd)
+        require(Duration.between(horizonStart, horizonEnd) <= Duration.ofDays(90))
+        require(remote.horizonStart == schedule.plan.horizonStart)
+        require(remote.horizonEnd == schedule.plan.horizonEnd)
+        require(Instant.parse(schedule.plan.horizonStart) == horizonStart)
+        require(Instant.parse(schedule.plan.horizonEnd) == horizonEnd)
+        val asOf = Instant.parse(schedule.plan.asOf)
+        require(horizonStart <= asOf && asOf < horizonEnd)
+        require(remote.timezoneName in SERVER_NAMED_TIMEZONE_IDS)
+        requireNotNull(runCatching { ZoneId.of(remote.timezoneName) }.getOrNull())
+        val publishedAt = Instant.parse(remote.publishedAt)
+        require(!publishedAt.isAfter(now().plusSeconds(PUBLICATION_CLOCK_SKEW_SECONDS)))
+        PublishedScheduleRevisionSnapshot(
+            id = remote.id,
+            revision = remote.revision,
+            revisionNumber = remote.revisionNumber,
+            inputDigest = remote.inputDigest,
+            horizonStart = remote.horizonStart,
+            horizonEnd = remote.horizonEnd,
+            timezoneName = remote.timezoneName,
+            publishedAt = remote.publishedAt,
+        )
+    } catch (error: IllegalArgumentException) {
+        throw RemotePlannerMappingException(error)
     }
 
     /**
@@ -2934,6 +3112,9 @@ class CanonicalSyncManager(
         availabilityEnd: ZonedDateTime,
         inputDigestPattern: Regex = DIGEST_PATTERN,
         preservationState: com.greengolddog.dayweave.model.DayWeaveUiState? = null,
+        replicaHorizonStart: Instant? = null,
+        replicaHorizonEnd: Instant? = null,
+        allowExternalFixed: Boolean = false,
     ): CanonicalPlanUpdate {
         val items = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         if (
@@ -2948,10 +3129,12 @@ class CanonicalSyncManager(
             preview.ignoredPreviousAssignments.size > MAX_SCHEDULE_BLOCKS ||
             preview.plan.decisions.size > MAX_SCHEDULE_BLOCKS ||
             preview.plan.violations.size > MAX_SCHEDULE_BLOCKS ||
-            preview.plan.occurrences.size > MAX_SCHEDULE_BLOCKS
+            preview.plan.occurrences.size > MAX_SCHEDULE_BLOCKS ||
+            preview.manualPlacementAssessments.size > MAX_MANUAL_PLACEMENTS
         ) {
             throw RemotePlannerMappingException()
         }
+        validateManualPlacementAssessments(preview, items)
         preview.sourceItemRevisions.forEach { (id, revision) ->
             validateUuid(id)
             if (revision <= 0) throw RemotePlannerMappingException()
@@ -2973,8 +3156,10 @@ class CanonicalSyncManager(
             rejected.itemId
         }
         if (rejectedIds.distinct().size != rejectedIds.size) throw RemotePlannerMappingException()
-        val expectedHorizonStart = planningDate.atStartOfDay(planningZone).toInstant()
-        val expectedHorizonEnd = planningDate.plusDays(1).atStartOfDay(planningZone).toInstant()
+        val expectedHorizonStart = replicaHorizonStart
+            ?: planningDate.atStartOfDay(planningZone).toInstant()
+        val expectedHorizonEnd = replicaHorizonEnd
+            ?: planningDate.plusDays(1).atStartOfDay(planningZone).toInstant()
         if (
             parseTimestamp(preview.plan.asOf).toInstant() != generatedAt ||
             parseTimestamp(preview.plan.horizonStart).toInstant() != expectedHorizonStart ||
@@ -2991,6 +3176,7 @@ class CanonicalSyncManager(
             }
             if (
                 occurrence.seriesItemId !in items || occurrence.ordinal !in 0..UInt.MAX_VALUE.toLong() ||
+                items[occurrence.seriesItemId]?.recurrenceJson == null ||
                 occurrence.state !in SUPPORTED_OCCURRENCE_STATES
             ) {
                 throw RemotePlannerMappingException()
@@ -3019,7 +3205,7 @@ class CanonicalSyncManager(
             validateUuid(work.itemId)
             work.occurrenceId?.let(::validateUuid)
             if (
-                work.itemId !in items || work.remaining !in 0..MAX_PLAN_MINUTES ||
+                work.itemId !in items || work.remaining !in 0..MAX_WIRE_U32 ||
                 work.reason !in SUPPORTED_UNSCHEDULED_REASONS ||
                 work.message.isBlank() || work.message.length > MAX_REMOTE_MESSAGE_CHARS ||
                 work.occurrenceId?.let { occurrenceId ->
@@ -3063,8 +3249,40 @@ class CanonicalSyncManager(
             }
         }
 
+        // Validate occurrence ownership before mapping. Non-executable Calendar context is
+        // deliberately stripped of execution identity below, but its remote identity must still
+        // be internally consistent with the published occurrence table.
+        preview.plan.blocks.forEach { block ->
+            block.occurrenceId?.let { occurrenceId ->
+                val occurrence = occurrencesById[occurrenceId]
+                    ?: throw RemotePlannerMappingException()
+                val itemId = block.itemId ?: throw RemotePlannerMappingException()
+                if (!itemBelongsToSeries(itemId, occurrence.seriesItemId, items)) {
+                    throw RemotePlannerMappingException()
+                }
+            }
+        }
+        validateRemotePlanGeometry(
+            preview = preview,
+            items = items,
+            horizonStart = expectedHorizonStart,
+            horizonEnd = expectedHorizonEnd,
+        )
+
+        val externalBlockIds = preview.plan.blocks.mapNotNull { it.externalBlockId }
+        if (externalBlockIds.distinct().size != externalBlockIds.size) {
+            throw RemotePlannerMappingException()
+        }
         val schedule = preview.plan.blocks.map { block ->
-            mapScheduleBlock(block, items, planningDate, planningZone)
+            mapScheduleBlock(
+                block = block,
+                items = items,
+                planningDate = planningDate,
+                planningZone = planningZone,
+                replicaHorizonStart = replicaHorizonStart,
+                replicaHorizonEnd = replicaHorizonEnd,
+                allowExternalFixed = allowExternalFixed,
+            )
         }.let {
             preserveLocalSessionState(
                 composed = it,
@@ -3079,9 +3297,11 @@ class CanonicalSyncManager(
         if (schedule.map(ScheduleItem::id).distinct().size != schedule.size) {
             throw RemotePlannerMappingException()
         }
+        val canonicalSchedule = schedule.filter { it.canonicalItemId != null }
         if (
-            schedule.map { Triple(it.canonicalItemId, it.occurrenceId, it.sessionIndex) }
-                .distinct().size != schedule.size ||
+            canonicalSchedule.map {
+                Triple(it.canonicalItemId, it.occurrenceId, it.sessionIndex)
+            }.distinct().size != canonicalSchedule.size ||
             schedule.count { it.status in setOf(ItemStatus.ACTIVE, ItemStatus.PAUSED) } > 1
         ) {
             throw RemotePlannerMappingException()
@@ -3107,7 +3327,9 @@ class CanonicalSyncManager(
                 violation.severity !in SUPPORTED_VIOLATION_SEVERITIES ||
                 violation.itemIds.size > MAX_CANONICAL_ITEMS ||
                 violation.occurrenceIds.size > MAX_SCHEDULE_BLOCKS ||
-                violation.penalty < 0 || violation.message.isBlank() ||
+                violation.itemIds.distinct().size != violation.itemIds.size ||
+                violation.occurrenceIds.distinct().size != violation.occurrenceIds.size ||
+                violation.message.isBlank() ||
                 violation.message.length > MAX_VIOLATION_MESSAGE_CHARS
             ) {
                 throw RemotePlannerMappingException()
@@ -3116,21 +3338,32 @@ class CanonicalSyncManager(
                 validateUuid(id)
                 if (id !in items) throw RemotePlannerMappingException()
             }
-            violation.occurrenceIds.forEach(::validateUuid)
+            violation.occurrenceIds.forEach { occurrenceId ->
+                validateOccurrenceUuid(occurrenceId)
+                val occurrence = occurrencesById[occurrenceId]
+                    ?: throw RemotePlannerMappingException()
+                if (violation.itemIds.none { itemId ->
+                        itemBelongsToSeries(itemId, occurrence.seriesItemId, items)
+                    }
+                ) {
+                    throw RemotePlannerMappingException()
+                }
+            }
             val violationStart = violation.start?.let(::parseTimestamp)
             val violationEnd = violation.end?.let(::parseTimestamp)
-            if (violationStart != null && violationEnd != null && violationStart >= violationEnd) {
+            if (
+                (violationStart == null) != (violationEnd == null) ||
+                violationStart != null && violationEnd != null && violationStart >= violationEnd
+            ) {
                 throw RemotePlannerMappingException()
             }
             violation.message
         }
         val score = preview.plan.score
         if (
-            score.scheduledMinutes < 0 || score.unscheduledMinutes < 0 ||
-            score.softPenalty < 0 || score.movedMinutes < 0 ||
-            score.scheduledMinutes > MAX_PLAN_MINUTES ||
-            score.unscheduledMinutes > MAX_PLAN_MINUTES ||
-            score.movedMinutes > MAX_PLAN_MINUTES
+            score.scheduledMinutes !in 0..MAX_WIRE_U32 ||
+            score.unscheduledMinutes !in 0..MAX_WIRE_U32 ||
+            score.movedMinutes !in 0..MAX_WIRE_U32
         ) {
             throw RemotePlannerMappingException()
         }
@@ -3140,7 +3373,8 @@ class CanonicalSyncManager(
         } else {
             ((score.scheduledMinutes * 100L) / totalWork).toInt()
         }
-        val penalty = (score.softPenalty / 100L).coerceAtMost(MAX_SCORE_PENALTY.toLong()).toInt()
+        val penalty = (score.softPenalty / 100uL)
+            .coerceAtMost(MAX_SCORE_PENALTY.toULong()).toInt()
         val dayScore = (completionScore - penalty).coerceIn(0, 100)
         val protectedMinutes = protectedMinutes(
             schedule,
@@ -3203,11 +3437,96 @@ class CanonicalSyncManager(
         )
     }
 
+    /** Rechecks the core's non-overlap and score invariants before any replica can be installed. */
+    private fun validateRemotePlanGeometry(
+        preview: RemoteSchedulePreview,
+        items: Map<String, CanonicalItemSnapshot>,
+        horizonStart: Instant,
+        horizonEnd: Instant,
+    ) {
+        var latestAnyEnd: Instant? = null
+        var latestPlannedEnd: Instant? = null
+        var scheduledMinutes = 0L
+        val ordered = preview.plan.blocks.sortedWith(
+            compareBy<RemoteScheduleBlock>(
+                { parseTimestamp(it.start).toInstant() },
+                { parseTimestamp(it.end).toInstant() },
+                RemoteScheduleBlock::id,
+            ),
+        )
+        ordered.forEach { block ->
+            val start = parseTimestamp(block.start).toInstant()
+            val end = parseTimestamp(block.end).toInstant()
+            if (start >= end || end <= horizonStart || start >= horizonEnd) {
+                throw RemotePlannerMappingException()
+            }
+            when (block.kind) {
+                "planned", "pinned" -> {
+                    val item = block.itemId?.let(items::get)
+                        ?: throw RemotePlannerMappingException()
+                    if (
+                        !item.isExecutable || block.externalBlockId != null ||
+                        start < horizonStart || end > horizonEnd ||
+                        block.kind == "planned" && latestAnyEnd?.let { it > start } == true ||
+                        block.kind == "pinned" && latestPlannedEnd?.let { it > start } == true
+                    ) {
+                        throw RemotePlannerMappingException()
+                    }
+                    val duration = Duration.between(start, end)
+                    if (duration.nano != 0 || duration.seconds % 60L != 0L) {
+                        throw RemotePlannerMappingException()
+                    }
+                    scheduledMinutes = try {
+                        Math.addExact(scheduledMinutes, duration.toMinutes())
+                    } catch (error: ArithmeticException) {
+                        throw RemotePlannerMappingException(error)
+                    }
+                    if (block.kind == "planned") latestPlannedEnd = end
+                }
+                "calendar_event" -> {
+                    val item = block.itemId?.let(items::get)
+                        ?: throw RemotePlannerMappingException()
+                    if (
+                        item.kind != "event" || block.externalBlockId != null ||
+                        latestPlannedEnd?.let { it > start } == true
+                    ) {
+                        throw RemotePlannerMappingException()
+                    }
+                }
+                "external_fixed" -> if (
+                    block.itemId != null || block.occurrenceId != null ||
+                    block.externalBlockId == null || block.id != block.externalBlockId ||
+                    latestPlannedEnd?.let { it > start } == true
+                ) {
+                    throw RemotePlannerMappingException()
+                }
+                else -> throw RemotePlannerMappingException()
+            }
+            if (latestAnyEnd == null || end > requireNotNull(latestAnyEnd)) latestAnyEnd = end
+        }
+        val unscheduledMinutes = preview.plan.unscheduled.fold(0L) { total, work ->
+            try {
+                Math.addExact(total, work.remaining)
+            } catch (error: ArithmeticException) {
+                throw RemotePlannerMappingException(error)
+            }
+        }
+        if (
+            preview.plan.score.scheduledMinutes != scheduledMinutes.coerceAtMost(MAX_WIRE_U32) ||
+            preview.plan.score.unscheduledMinutes != unscheduledMinutes.coerceAtMost(MAX_WIRE_U32)
+        ) {
+            throw RemotePlannerMappingException()
+        }
+    }
+
     private fun mapScheduleBlock(
         block: RemoteScheduleBlock,
         items: Map<String, CanonicalItemSnapshot>,
         planningDate: LocalDate,
         planningZone: ZoneId,
+        replicaHorizonStart: Instant? = null,
+        replicaHorizonEnd: Instant? = null,
+        allowExternalFixed: Boolean = false,
     ): ScheduleItem {
         validateUuid(block.id)
         block.occurrenceId?.let(::validateUuid)
@@ -3226,49 +3545,82 @@ class CanonicalSyncManager(
                 throw RemotePlannerMappingException()
             }
         }
-        if (
-            block.kind !in SUPPORTED_BLOCK_KINDS || block.kind == "external_fixed" ||
-            block.externalBlockId != null
-        ) {
-            // Android currently sends no fixed blocks, so accepting one would make the response
-            // describe input this client never authorized.
+        if (block.kind !in SUPPORTED_BLOCK_KINDS) {
             throw RemotePlannerMappingException()
         }
         val actualStart = parseTimestamp(block.start).atZoneSameInstant(planningZone)
         val actualEnd = parseTimestamp(block.end).atZoneSameInstant(planningZone)
-        val horizonStart = planningDate.atStartOfDay(planningZone)
-        val horizonEnd = planningDate.plusDays(1).atStartOfDay(planningZone)
+        val replica = replicaHorizonStart != null || replicaHorizonEnd != null
+        if (replicaHorizonStart == null != (replicaHorizonEnd == null)) {
+            throw RemotePlannerMappingException()
+        }
+        val horizonStart = replicaHorizonStart?.atZone(planningZone)
+            ?: planningDate.atStartOfDay(planningZone)
+        val horizonEnd = replicaHorizonEnd?.atZone(planningZone)
+            ?: planningDate.plusDays(1).atStartOfDay(planningZone)
         if (actualEnd <= horizonStart || actualStart >= horizonEnd) {
             throw RemotePlannerMappingException()
         }
-        val start = if (actualStart < horizonStart) horizonStart else actualStart
-        val end = if (actualEnd > horizonEnd) horizonEnd else actualEnd
-        val durationSeconds = Duration.between(start.toInstant(), end.toInstant()).seconds
+        val start = if (replica) actualStart else if (actualStart < horizonStart) horizonStart else actualStart
+        val end = if (replica) actualEnd else if (actualEnd > horizonEnd) horizonEnd else actualEnd
+        val exactDuration = Duration.between(start.toInstant(), end.toInstant())
         if (
-            durationSeconds <= 0 || start.toLocalDate() != planningDate || end > horizonEnd
+            exactDuration.isZero || exactDuration.isNegative || !replica &&
+            (start.toLocalDate() != planningDate || end > horizonEnd)
         ) {
             throw RemotePlannerMappingException()
         }
-        val durationMinutes = ceil(durationSeconds / 60.0).toInt()
-        if (durationMinutes !in 1..MAX_BLOCK_MINUTES) throw RemotePlannerMappingException()
+        val durationMinutesLong = try {
+            val roundedSeconds = Math.addExact(
+                exactDuration.seconds,
+                if (exactDuration.nano == 0) 0L else 1L,
+            )
+            Math.addExact(roundedSeconds, 59L) / 60L
+        } catch (error: ArithmeticException) {
+            throw RemotePlannerMappingException(error)
+        }
+        val acceptsLongExactReplica = replica
+        val startMinute = start.hour * 60 + start.minute
+        if (
+            durationMinutesLong <= 0L || durationMinutesLong > Int.MAX_VALUE - startMinute ||
+            !acceptsLongExactReplica && durationMinutesLong > MAX_BLOCK_MINUTES
+        ) {
+            throw RemotePlannerMappingException()
+        }
+        val durationMinutes = durationMinutesLong.toInt()
+        val isExternal = block.kind == "external_fixed"
+        if (
+            isExternal != (block.externalBlockId != null) ||
+            isExternal && (
+                !allowExternalFixed || block.itemId != null || block.occurrenceId != null ||
+                    block.id != block.externalBlockId
+                )
+        ) {
+            throw RemotePlannerMappingException()
+        }
         val canonical = block.itemId?.let { itemId ->
             validateUuid(itemId)
             items[itemId] ?: throw RemotePlannerMappingException()
-        } ?: throw RemotePlannerMappingException()
+        }
+        if (!isExternal && (canonical == null || block.externalBlockId != null)) {
+            throw RemotePlannerMappingException()
+        }
         if (
-            !canonical.isExecutable || block.title != canonical.title ||
-            block.isSensitive != effectiveSensitivity(canonical, items)
+            canonical != null &&
+            ((!canonical.isExecutable && block.kind != "calendar_event") ||
+                block.title != canonical.title ||
+                block.isSensitive != effectiveSensitivity(canonical, items))
         ) {
             throw RemotePlannerMappingException()
         }
-        val itemKind = mapItemKind(canonical.kind)
-        val status = mapItemStatus(canonical.status)
-        val splitType = canonical.splitPolicyJson
-            .let(JsonObjectParser::parse)
-            .get("type")
+        val itemKind = canonical?.let { mapItemKind(it.kind) } ?: ItemKind.EVENT
+        val status = canonical?.let { mapItemStatus(it.status) } ?: ItemStatus.SCHEDULED
+        val splitType = canonical?.splitPolicyJson
+            ?.let(JsonObjectParser::parse)
+            ?.get("type")
             ?.let { it as? JsonPrimitive }
             ?.contentOrNull
-        val constraints = canonical.flexibleConstraintsJson.let(JsonObjectParser::parse)
+        val constraints = canonical?.flexibleConstraintsJson?.let(JsonObjectParser::parse)
         val energyValue = constraints?.get("energy")?.let(::energyValue)
         val hard = block.kind in setOf("pinned", "calendar_event", "external_fixed")
         return ScheduleItem(
@@ -3276,10 +3628,10 @@ class CanonicalSyncManager(
             isSensitive = block.isSensitive,
             title = block.title,
             kind = itemKind,
-            startMinute = start.hour * 60 + start.minute,
+            startMinute = startMinute,
             durationMinutes = durationMinutes,
             status = status,
-            project = canonical.parentId?.let { items[it]?.title },
+            project = canonical?.parentId?.let { items[it]?.title },
             energy = when (energyValue) {
                 "low" -> EnergyLevel.LOW
                 "deep" -> EnergyLevel.DEEP
@@ -3291,9 +3643,11 @@ class CanonicalSyncManager(
             // Notes remain available once in canonicalItems. Copying a large note into every
             // split block amplifies an otherwise bounded preview during encrypted serialization.
             note = "",
-            canonicalItemId = canonical.id,
-            occurrenceId = block.occurrenceId,
-            canonicalRevision = canonical.revision,
+            // Non-executable Calendar context remains visible but cannot acquire execution
+            // authority merely because it was present in a published schedule snapshot.
+            canonicalItemId = canonical?.takeIf { it.isExecutable }?.id,
+            occurrenceId = block.occurrenceId.takeIf { canonical?.isExecutable == true },
+            canonicalRevision = canonical?.takeIf { it.isExecutable }?.revision,
             sessionIndex = block.sessionIndex,
             // The UI duration is clipped to today's visible lane, but publication/execution
             // identity retains the server's exact bounds (including overnight pinned events).
@@ -3302,6 +3656,141 @@ class CanonicalSyncManager(
             planningZoneId = planningZone.id,
             canonicalBlockKind = block.kind,
         )
+    }
+
+    private fun validateManualPlacementAssessments(
+        preview: RemoteSchedulePreview,
+        items: Map<String, CanonicalItemSnapshot>,
+    ) {
+        val occurrences = preview.plan.occurrences.associateBy { it.id }
+        val placementIds = mutableSetOf<String>()
+        var violationCount = 0
+        var conflictFactCount = 0
+        preview.manualPlacementAssessments.forEach { assessment ->
+            validateUuid(assessment.placementId)
+            if (
+                !placementIds.add(assessment.placementId) ||
+                !assessment.environmentDigest.matches(DIGEST_PATTERN) ||
+                !assessment.approvalDigest.matches(DIGEST_PATTERN) ||
+                assessment.approvalRequired && assessment.violations.isEmpty() ||
+                assessment.violations.size > MAX_MANUAL_PLACEMENT_VIOLATIONS
+            ) {
+                throw RemotePlannerMappingException()
+            }
+            assessment.violations.forEach { violation ->
+                if (
+                    violationCount >= MAX_MANUAL_PLACEMENT_VIOLATIONS ||
+                    violation.conflictingBlocks.size >
+                    MAX_MANUAL_PLACEMENT_CONFLICT_FACTS - conflictFactCount
+                ) {
+                    throw RemotePlannerMappingException()
+                }
+                violationCount += 1
+                conflictFactCount += violation.conflictingBlocks.size
+                if (
+                    violation.code !in SUPPORTED_MANUAL_PLACEMENT_VIOLATION_CODES ||
+                    violation.message.isBlank() ||
+                    violation.message.length > MAX_VIOLATION_MESSAGE_CHARS ||
+                    violation.itemIds.size > MAX_CANONICAL_ITEMS ||
+                    violation.occurrenceIds.size > MAX_SCHEDULE_BLOCKS ||
+                    violation.conflictingBlockIds.size > MAX_SCHEDULE_BLOCKS ||
+                    violation.conflictingBlocks.size > MAX_SCHEDULE_BLOCKS ||
+                    violation.itemIds.distinct().size != violation.itemIds.size ||
+                    violation.occurrenceIds.distinct().size != violation.occurrenceIds.size ||
+                    violation.conflictingBlockIds.distinct().size !=
+                    violation.conflictingBlockIds.size ||
+                    violation.conflictingBlocks.map { it.blockId }.distinct().size !=
+                    violation.conflictingBlocks.size
+                ) {
+                    throw RemotePlannerMappingException()
+                }
+                violation.itemIds.forEach { id ->
+                    validateUuid(id)
+                    if (id !in items) throw RemotePlannerMappingException()
+                }
+                violation.occurrenceIds.forEach { id ->
+                    validateOccurrenceUuid(id)
+                    val occurrence = occurrences[id]
+                        ?: throw RemotePlannerMappingException()
+                    if (violation.itemIds.none { itemId ->
+                            itemBelongsToSeries(itemId, occurrence.seriesItemId, items)
+                        }
+                    ) {
+                        throw RemotePlannerMappingException()
+                    }
+                }
+                if (
+                    violation.conflictingBlockIds.toSet() !=
+                    violation.conflictingBlocks.mapTo(hashSetOf()) { it.blockId }
+                ) {
+                    throw RemotePlannerMappingException()
+                }
+                val start = parseTimestamp(violation.start)
+                val end = parseTimestamp(violation.end)
+                if (start >= end) throw RemotePlannerMappingException()
+                validateManualPlacementBoundaries(violation, start, end)
+                violation.conflictingBlocks.forEach { conflict ->
+                    validateUuid(conflict.blockId)
+                    val conflictItem = conflict.itemId?.let { id ->
+                        validateUuid(id)
+                        items[id] ?: throw RemotePlannerMappingException()
+                    }
+                    conflict.occurrenceId?.let { id ->
+                        validateOccurrenceUuid(id)
+                        val occurrence = occurrences[id]
+                            ?: throw RemotePlannerMappingException()
+                        if (
+                            conflictItem == null ||
+                            !itemBelongsToSeries(conflictItem.id, occurrence.seriesItemId, items)
+                        ) {
+                            throw RemotePlannerMappingException()
+                        }
+                    }
+                    conflict.externalBlockId?.let(::validateUuid)
+                    if (
+                        conflict.kind !in SUPPORTED_BLOCK_KINDS ||
+                        (conflict.kind == "external_fixed") !=
+                        (conflict.externalBlockId != null) ||
+                        conflict.kind == "external_fixed" &&
+                        conflict.blockId != conflict.externalBlockId ||
+                        conflict.kind == "external_fixed" &&
+                        (conflict.itemId != null || conflict.occurrenceId != null) ||
+                        conflict.kind != "external_fixed" && conflictItem == null ||
+                        conflict.kind in setOf("planned", "pinned") &&
+                        conflictItem?.isExecutable != true ||
+                        conflict.kind == "calendar_event" && conflictItem?.kind != "event" ||
+                        parseTimestamp(conflict.start) >= parseTimestamp(conflict.end)
+                    ) {
+                        throw RemotePlannerMappingException()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun validateManualPlacementBoundaries(
+        violation: com.greengolddog.dayweave.network.RemoteManualPlacementViolation,
+        start: OffsetDateTime,
+        end: OffsetDateTime,
+    ) {
+        val boundaryStart = violation.boundaryStart?.let(::parseTimestamp)
+        val boundaryEnd = violation.boundaryEnd?.let(::parseTimestamp)
+        val valid = when (violation.code) {
+            "earliest_start", "minimum_notice" ->
+                boundaryStart != null && boundaryEnd == null && start < boundaryStart
+            "latest_finish" ->
+                boundaryStart == null && boundaryEnd != null && end > boundaryEnd
+            "preferred_absolute_window" ->
+                boundaryStart != null && boundaryEnd != null && boundaryStart < boundaryEnd
+            "forbidden_window" ->
+                boundaryStart != null && boundaryEnd != null && boundaryStart < boundaryEnd &&
+                    start < boundaryEnd && boundaryStart < end
+            "buffer_compressed" ->
+                boundaryStart != null && boundaryEnd != null && boundaryStart < boundaryEnd &&
+                    boundaryStart <= start && boundaryEnd >= end
+            else -> boundaryStart == null && boundaryEnd == null
+        }
+        if (!valid) throw RemotePlannerMappingException()
     }
 
     /** Mirrors the server's cycle-safe ancestor propagation and fails closed on partial trees. */
@@ -3588,6 +4077,11 @@ class CanonicalSyncManager(
                 error.message ?: "On-device composition is not available yet.",
                 CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
             )
+            is CurrentScheduleReplicaBlockedException -> Triple(
+                CanonicalSyncPhase.READY,
+                "Finish or reconcile the pending canonical action before installing a remote schedule.",
+                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
+            )
             is SchedulePublicationRecoveryExhaustedException -> Triple(
                 CanonicalSyncPhase.ERROR,
                 "Canonical items kept changing during publication. Recompose again to publish a fresh schedule.",
@@ -3772,6 +4266,9 @@ class CanonicalSyncManager(
     private class LocalCompositionGenerationChangedException :
         IllegalStateException("Local composition input generation changed")
 
+    private class CurrentScheduleReplicaBlockedException :
+        IllegalStateException("A pending canonical action blocks schedule replication")
+
     private object JsonObjectParser {
         private val json = Json
 
@@ -3786,6 +4283,7 @@ class CanonicalSyncManager(
         private val TERMINAL_DISPLAY_STATUSES = setOf(ItemStatus.COMPLETED, ItemStatus.SKIPPED)
         private const val MINUTES_PER_DAY = 24 * 60
         private const val MAX_BLOCK_MINUTES = 2 * MINUTES_PER_DAY
+        private val SERVER_NAMED_TIMEZONE_IDS = ZoneId.getAvailableZoneIds()
         private const val MAX_CANONICAL_ITEMS = 10_000
         private const val MAX_SCHEDULE_PUBLICATION_RECOVERY_RECOMPOSITIONS = 1
         private const val MAX_CANONICAL_CACHE_ESTIMATED_BYTES = 24L * 1024L * 1024L
@@ -3794,13 +4292,13 @@ class CanonicalSyncManager(
         private const val MAX_SNAPSHOT_ATTEMPTS = 3
         private const val MAX_DELTA_PAGE_SIZE = 50
         private const val MAX_DELTA_CHANGES = MAX_DELTA_PAGES * MAX_DELTA_PAGE_SIZE
-        private const val MAX_SCHEDULE_BLOCKS = 2_000
+        private const val MAX_SCHEDULE_BLOCKS = 10_000
         private const val MAX_SCHEDULE_CACHE_ESTIMATED_BYTES = 8L * 1024L * 1024L
         private const val SCHEDULE_ITEM_OBJECT_OVERHEAD_BYTES = 512L
         private const val MAX_PENDING_MUTATION_JSON_CHARS = 2 * 1024 * 1024
         private const val MAX_RECURRENCE_CONTEXT_IDS = 9_000
         private const val OUTCOME_CONTEXT_MARGIN_SECONDS = 2L * 24L * 60L * 60L
-        private const val MAX_PLAN_MINUTES = 90L * MINUTES_PER_DAY
+        private const val MAX_WIRE_U32 = 4_294_967_295L
         private const val MAX_SCORE_PENALTY = 20
         private const val MAX_CURSOR_CHARS = 4_096
         private const val MAX_PAUSE_MINUTES = 24 * 60
@@ -3812,6 +4310,9 @@ class CanonicalSyncManager(
         private const val MAX_VIOLATION_MESSAGE_CHARS = 2_000
         private const val MAX_REMOTE_MESSAGE_CHARS = 4_000
         private const val MAX_BLOCK_EXPLANATIONS = 64
+        private const val MAX_MANUAL_PLACEMENTS = 64
+        private const val MAX_MANUAL_PLACEMENT_VIOLATIONS = 4_096
+        private const val MAX_MANUAL_PLACEMENT_CONFLICT_FACTS = 4_096
         private const val MAX_PERSISTED_VIOLATION_MESSAGES = 100
         private const val SCHEDULE_PUBLICATION_JOURNAL_VERSION = 1
         private const val PUBLICATION_CLOCK_SKEW_SECONDS = 5 * 60L
@@ -3874,6 +4375,25 @@ class CanonicalSyncManager(
             "capacity",
         )
         private val SUPPORTED_VIOLATION_SEVERITIES = setOf("warning", "error")
+        private val SUPPORTED_MANUAL_PLACEMENT_VIOLATION_CODES = setOf(
+            "outside_availability",
+            "earliest_start",
+            "latest_finish",
+            "minimum_notice",
+            "allowed_weekday",
+            "preferred_daily_window",
+            "preferred_absolute_window",
+            "forbidden_window",
+            "required_context",
+            "required_location",
+            "required_capabilities",
+            "energy",
+            "dependency",
+            "maximum_daily_work",
+            "maximum_weekly_work",
+            "buffer_compressed",
+            "immutable_overlap",
+        )
 
         private fun stateFrom(snapshot: ApiConnectionSnapshot): CanonicalSyncState = when {
             snapshot.baseUrl == null -> CanonicalSyncState(

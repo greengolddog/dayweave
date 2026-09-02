@@ -36,6 +36,7 @@ import com.greengolddog.dayweave.network.prepareProposalUndoHttpRequest
 import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.state.PlannerStore
 import java.time.Instant
+import java.time.ZoneId
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -686,6 +687,35 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
+    fun legacyPublicationProofRoundTripsForMigrationButRemainsReadOnly() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 24 }
+        val current = publishedScheduleState()
+        val currentProof = requireNotNull(current.publishedScheduleProof)
+        val legacyProof = currentProof.copy(
+            schemaVersion = 1,
+            blocks = currentProof.blocks.map { it.copy(immutableDigest = null) },
+        )
+
+        repository.save(current.copy(publishedScheduleProof = legacyProof))
+        val restored = requireNotNull(repository.load())
+        val restoredProof = requireNotNull(restored.publishedScheduleProof)
+        val block = restored.schedule.single()
+        val reference = Instant.parse("2026-08-29T12:00:00Z")
+        val zone = ZoneId.of("UTC")
+
+        assertEquals(legacyProof, restoredProof)
+        assertTrue(restoredProof.hasValidShape())
+        assertTrue(restoredProof.matchesStateBinding(restored))
+        assertTrue(restoredProof.matchesPublishedPlan(restored.schedule))
+        assertFalse(restoredProof.hasCurrentImmutablePlanSeal())
+        assertFalse(restoredProof.matches(block))
+        assertFalse(restored.isCanonicalPlanCurrent(reference, zone))
+        assertFalse(restored.isPublishedScheduleDisplayCurrent(reference, zone))
+        assertFalse(restored.hasPublishedExecutionAuthority(block))
+    }
+
+    @Test
     fun exactSchedulePublicationProofRequiresTheWholePublishedBlockSet() = runBlocking {
         val dao = FakePlannerSnapshotDao()
         val repository = RoomPlannerStateRepository(dao) { 27 }
@@ -725,6 +755,61 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matchesPublishedPlan(restored.schedule),
         )
+    }
+
+    @Test
+    fun fullPlanProofRoundTripsExternalContextAndRejectsImmutableDisplayTampering() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 28 }
+        val base = publishedScheduleState()
+        val external = ScheduleItem(
+            id = "77777777-7777-4777-8777-777777777777",
+            isSensitive = true,
+            title = "Private calendar hold",
+            kind = ItemKind.EVENT,
+            startMinute = 10 * 60,
+            durationMinutes = 30,
+            status = ItemStatus.SCHEDULED,
+            isFlexible = false,
+            isHardConstraint = true,
+            sessionIndex = 0,
+            absoluteStartAt = "2026-08-29T10:00:00Z",
+            absoluteEndAt = "2026-08-29T10:30:00Z",
+            planningZoneId = "UTC",
+            canonicalBlockKind = "external_fixed",
+        )
+        val proof = requireNotNull(base.publishedScheduleProof).copy(
+            blocks = (
+                requireNotNull(base.publishedScheduleProof).blocks +
+                    PublishedScheduleBlockProofSnapshot.from(external)
+                ).sortedBy { it.id },
+        )
+        val state = base.copy(
+            schedule = base.schedule + external,
+            publishedScheduleProof = proof,
+        )
+
+        repository.save(state)
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(state, restored)
+        assertTrue(proof.matchesPublishedPlan(restored.schedule))
+        assertThrows(SerializationException::class.java) {
+            runBlocking {
+                repository.save(
+                    restored.copy(
+                        schedule = restored.schedule.map { block ->
+                            if (block.id == external.id) {
+                                block.copy(isHardConstraint = false)
+                            } else {
+                                block
+                            }
+                        },
+                    ),
+                )
+            }
+        }
+        Unit
     }
 
     @Test
@@ -1156,15 +1241,7 @@ class PlannerStateRepositoryTest {
                 revision = revision,
                 asOf = "2026-08-29T08:00:00Z",
                 blocks = listOf(
-                    PublishedScheduleBlockProofSnapshot(
-                        id = blockId,
-                        itemId = itemId,
-                        itemRevision = 7,
-                        sessionIndex = 2,
-                        start = "2026-08-29T09:00:00Z",
-                        end = "2026-08-29T09:30:00Z",
-                        kind = "planned",
-                    ),
+                    PublishedScheduleBlockProofSnapshot.from(block),
                 ),
             ),
             scheduleInputDigest = digest,

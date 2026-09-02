@@ -714,14 +714,10 @@ class ExecutionSyncManagerTest {
             absoluteEndAt = moveStart.plusSeconds(20 * 60L).toString(),
             planningZoneId = "Europe/Madrid",
             canonicalBlockKind = "external_fixed",
+            sessionIndex = 0,
         )
         val store = PlannerStore(
-            original.state.value.copy(
-                schedule = listOf(pinnedSource, hardBlock),
-                publishedScheduleProof = requireNotNull(
-                    original.state.value.publishedScheduleProof,
-                ).copy(blocks = listOf(publishedBlockProof(pinnedSource))),
-            ),
+            original.state.value.withPublishedSchedule(listOf(pinnedSource, hardBlock)),
             nowEpochMillis = { NOW.toEpochMilli() },
         )
         var serverSession = activeSession(SESSION_ID)
@@ -1078,6 +1074,7 @@ class ExecutionSyncManagerTest {
             absoluteEndAt = moveStart.plusSeconds((minuteOffset + 10L) * 60L).toString(),
             planningZoneId = "Europe/Madrid",
             canonicalBlockKind = "external_fixed",
+            sessionIndex = 0,
         )
         val reviewedConflict = hardBlock(
             "88888888-8888-4888-8888-888888888888",
@@ -1086,7 +1083,7 @@ class ExecutionSyncManagerTest {
         )
         val reviewedStore = PlannerStore(
             plannerStore().state.value.let { state ->
-                state.copy(schedule = state.schedule + reviewedConflict)
+                state.withPublishedSchedule(state.schedule + reviewedConflict)
             },
             nowEpochMillis = { NOW.toEpochMilli() },
         )
@@ -1103,7 +1100,7 @@ class ExecutionSyncManagerTest {
         )
         val mutationStore = PlannerStore(
             reviewedStore.state.value.let { state ->
-                state.copy(schedule = state.schedule + newlyArrivedConflict)
+                state.withPublishedSchedule(state.schedule + newlyArrivedConflict)
             },
             nowEpochMillis = { NOW.toEpochMilli() },
         )
@@ -1151,9 +1148,12 @@ class ExecutionSyncManagerTest {
             absoluteEndAt = "2026-09-01T08:30:00Z",
             planningZoneId = "Europe/Madrid",
             canonicalBlockKind = "external_fixed",
+            sessionIndex = 0,
         )
         val store = PlannerStore(
-            original.state.value.copy(schedule = original.state.value.schedule + hardBlock),
+            original.state.value.withPublishedSchedule(
+                original.state.value.schedule + hardBlock,
+            ),
             nowEpochMillis = { NOW.toEpochMilli() },
         )
         val running = activeSession(SESSION_ID)
@@ -1448,9 +1448,12 @@ class ExecutionSyncManagerTest {
             absoluteEndAt = moveStart.plusSeconds(30 * 60L).toString(),
             planningZoneId = "Europe/Madrid",
             canonicalBlockKind = "external_fixed",
+            sessionIndex = 0,
         )
         val store = PlannerStore(
-            original.state.value.copy(schedule = original.state.value.schedule + hardBlock),
+            original.state.value.withPublishedSchedule(
+                original.state.value.schedule + hardBlock,
+            ),
             nowEpochMillis = { NOW.toEpochMilli() },
         )
         val running = activeSession(SESSION_ID)
@@ -1580,7 +1583,10 @@ class ExecutionSyncManagerTest {
         assertEquals(moveStart.toString(), store.state.value.pendingExecutionDeferIntent?.moveStart)
         assertEquals("pause", store.state.value.pendingExecutionCommand?.commandType)
 
-        val relaunched = PlannerStore(store.state.value)
+        val relaunched = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
         assertEquals(ExecutionSyncOutcome.SUCCESS, manager(relaunched, transport).refresh())
 
         assertNull(relaunched.state.value.pendingExecutionCommand)
@@ -1627,7 +1633,10 @@ class ExecutionSyncManagerTest {
             manager.doLater(BLOCK_ID, selected),
         )
 
-        val relaunched = PlannerStore(store.state.value)
+        val relaunched = PlannerStore(
+            store.state.value,
+            nowEpochMillis = { NOW.toEpochMilli() },
+        )
         val afterExpiry = manager(
             relaunched,
             transport,
@@ -3092,16 +3101,21 @@ class ExecutionSyncManagerTest {
     )
 
     private fun publishedBlockProof(block: ScheduleItem) =
-        PublishedScheduleBlockProofSnapshot(
-            id = block.id,
-            itemId = requireNotNull(block.canonicalItemId),
-            itemRevision = requireNotNull(block.canonicalRevision),
-            occurrenceId = block.occurrenceId,
-            sessionIndex = requireNotNull(block.sessionIndex),
-            start = requireNotNull(block.absoluteStartAt),
-            end = requireNotNull(block.absoluteEndAt),
-            kind = requireNotNull(block.canonicalBlockKind),
-        )
+        PublishedScheduleBlockProofSnapshot.from(block)
+
+    private fun DayWeaveUiState.withPublishedSchedule(
+        publishedSchedule: List<ScheduleItem>,
+    ): DayWeaveUiState = copy(
+        schedule = publishedSchedule,
+        publishedScheduleProof = requireNotNull(publishedScheduleProof).copy(
+            blocks = publishedSchedule
+                .filter {
+                    it.canonicalBlockKind != null &&
+                        it.canonicalBlockKind != "remote_execution_lease"
+                }
+                .map(::publishedBlockProof),
+        ),
+    )
 
     private fun warningAssessment(
         transport: FakeExecutionTransport,

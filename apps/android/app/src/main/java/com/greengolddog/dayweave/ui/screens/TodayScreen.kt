@@ -60,8 +60,15 @@ fun TodayScreen(
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
     val isDisplayCurrent = state.isScheduleDisplayCurrent()
-    val isLocalPlan = isDisplayCurrent && !isCurrentPlan
-    val visibleTimeline = if (isDisplayCurrent) state.visibleSchedule else emptyList()
+    val isPublishedReplica = state.isPublishedScheduleDisplayCurrent()
+    val isLocalPlan = isDisplayCurrent && !isPublishedReplica
+    val isReadOnlyPublishedReplica = isPublishedReplica && !isCurrentPlan
+    val canonicalScheduleActionsEnabled = canonicalExecutionActionsEnabled && isCurrentPlan
+    val visibleTimeline = if (isDisplayCurrent) {
+        state.visibleScheduleSlicesForDay()
+    } else {
+        emptyList()
+    }
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 18.dp),
@@ -129,6 +136,30 @@ fun TodayScreen(
                         Text("Composed on this device", style = MaterialTheme.typography.titleMedium)
                         Text(
                             "This encrypted plan is visible offline. Sync and publish before starting, skipping, or moving canonical work.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
+        }
+
+        if (isReadOnlyPublishedReplica) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        Text(
+                            "Published in another time zone",
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            "Showing today’s local slice of the published ${state.schedulePlanningZoneId.orEmpty()} schedule. Change time zone or recompose here before canonical actions.",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -217,7 +248,7 @@ fun TodayScreen(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 MetricCard(
-                    value = "${visibleTimeline.count { it.status == com.greengolddog.dayweave.model.ItemStatus.COMPLETED }}/${visibleTimeline.size}",
+                    value = "${visibleTimeline.count { it.item.status == com.greengolddog.dayweave.model.ItemStatus.COMPLETED }}/${visibleTimeline.size}",
                     label = "done",
                     modifier = Modifier.weight(1f),
                 )
@@ -348,7 +379,8 @@ fun TodayScreen(
             }
         }
 
-        items(visibleTimeline, key = { it.id }) { item ->
+        items(visibleTimeline, key = { it.item.id }) { slice ->
+            val item = slice.item
             val terminalStartBlocked = state.terminalExecutionOutcomes.values.any { outcome ->
                 val sameOrigin = outcome.syncOrigin == (
                     state.canonicalSyncOrigin ?: state.canonicalExecutionSyncOrigin
@@ -379,14 +411,16 @@ fun TodayScreen(
                 item = item,
                 onStart = { onStart(item.id) },
                 onLater = if (
-                    state.canMoveScheduledLater(item)
+                    state.canMoveScheduledLater(item) &&
+                    (item.canonicalItemId == null || canonicalScheduleActionsEnabled)
                 ) {
                     { onLaterScheduled(item.id) }
                 } else {
                     null
                 },
                 onSkip = if (
-                    item.canonicalItemId != null && state.canSafelySkipScheduled(item)
+                    item.canonicalItemId != null && canonicalScheduleActionsEnabled &&
+                    state.canSafelySkipScheduled(item)
                 ) {
                     { onSkipScheduled(item.id) }
                 } else {
@@ -394,14 +428,18 @@ fun TodayScreen(
                 },
                 canStart = !terminalStartBlocked && (
                     item.canonicalItemId == null ||
-                        canonicalExecutionActionsEnabled && state.hasPublishedExecutionAuthority(item)
+                        canonicalScheduleActionsEnabled && state.hasPublishedExecutionAuthority(item)
                 ),
                 unavailableLabel = when {
                     terminalStartBlocked -> "Needs review"
+                    isReadOnlyPublishedReplica -> "Read-only zone"
                     item.canonicalItemId != null && !state.hasPublishedExecutionAuthority(item) ->
                         "Sync to start"
                     else -> "Syncing…"
                 },
+                displayStartLabel = slice.startTimeLabel,
+                displayDurationLabel = slice.durationLabel,
+                displayContextLabel = slice.continuationLabel,
             )
         }
 

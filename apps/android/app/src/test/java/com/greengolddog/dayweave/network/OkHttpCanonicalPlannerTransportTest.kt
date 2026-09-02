@@ -120,6 +120,186 @@ class OkHttpCanonicalPlannerTransportTest {
     }
 
     @Test
+    fun currentScheduleUsesReadOnlyHeadersAndStrictlyDecodesOccurrenceIdentity() = runBlocking {
+        val occurrenceId = "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa"
+        val recurring = previewJson().replace(
+            "\"occurrence_id\":null",
+            "\"occurrence_id\":\"$occurrenceId\"",
+        ).replace(
+            "\"occurrences\":[]",
+            """"occurrences":[{
+              "id":"$occurrenceId",
+              "series_item_id":"$TASK_ID",
+              "identity":{"type":"weekly","local_date":"2026-09-01"},
+              "nominal_start":"2026-09-01T09:00:00+02:00",
+              "nominal_end":"2026-09-01T10:00:00+02:00",
+              "window_start":"2026-09-01T09:00:00+02:00",
+              "window_end":"2026-09-01T10:00:00+02:00",
+              "local_date":"2026-09-01",
+              "ordinal":0,
+              "state":"generated"
+            }]""",
+        )
+        server.enqueue(currentScheduleResponse(currentScheduleJson(recurring)))
+
+        val current = requireNotNull(transport.currentSchedule(configuration()))
+
+        assertEquals(9uL, current.revision.revisionNumber)
+        assertEquals(
+            "weekly",
+            current.schedule.plan.occurrences.single().identity["type"]?.jsonPrimitive?.content,
+        )
+        val request = server.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/tenant/v1/schedule/current", request.url.encodedPath)
+        assertEquals("application/json", request.headers["Accept"])
+        assertEquals("no-store, max-age=0", request.headers["Cache-Control"])
+        assertEquals("no-cache", request.headers["Pragma"])
+        assertEquals("Bearer unit-test-secret", request.headers["Authorization"])
+    }
+
+    @Test
+    fun currentScheduleDecodesExactUnsignedScoreAndPenaltyDomains() = runBlocking {
+        val unsigned = previewJson()
+            .replace(
+                "\"violations\":[]",
+                """"violations":[{"kind":"capacity","severity":"warning","item_ids":["$TASK_ID"],"occurrence_ids":[],"start":null,"end":null,"penalty":18446744073709551615,"message":"Unsigned penalty"}]""",
+            )
+            .replace("\"scheduled_minutes\":60", "\"scheduled_minutes\":4294967295")
+            .replace("\"unscheduled_minutes\":0", "\"unscheduled_minutes\":4294967295")
+            .replace("\"soft_penalty\":0", "\"soft_penalty\":18446744073709551615")
+            .replace("\"moved_minutes\":0", "\"moved_minutes\":4294967295")
+        server.enqueue(currentScheduleResponse(currentScheduleJson(unsigned)))
+
+        val plan = requireNotNull(transport.currentSchedule(configuration())).schedule.plan
+
+        assertEquals(4_294_967_295L, plan.score.scheduledMinutes)
+        assertEquals(4_294_967_295L, plan.score.unscheduledMinutes)
+        assertEquals(ULong.MAX_VALUE, plan.score.softPenalty)
+        assertEquals(4_294_967_295L, plan.score.movedMinutes)
+        assertEquals(ULong.MAX_VALUE, plan.violations.single().penalty)
+    }
+
+    @Test
+    fun currentScheduleRejectsUnknownFieldsMissingIdentityAndUncacheableResponses() {
+        server.enqueue(
+            currentScheduleResponse(
+                currentScheduleJson(previewJson()),
+                etag = "\"8:55555555-5555-4555-8555-555555555555\"",
+            ),
+        )
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.currentSchedule(configuration()) }
+        }
+
+        val duplicateEscapedKey = currentScheduleJson(previewJson()).replace(
+            "\"revision_number\":9",
+            "\"revision_number\":9,\"revision\\u005fnumber\":9",
+        )
+        server.enqueue(currentScheduleResponse(duplicateEscapedKey))
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.currentSchedule(configuration()) }
+        }
+
+        server.enqueue(
+            currentScheduleResponse(
+                currentScheduleJson(previewJson()).dropLast(1) + ",\"future\":true}",
+            ),
+        )
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.currentSchedule(configuration()) }
+        }
+
+        val occurrenceId = "aaaaaaaa-aaaa-5aaa-8aaa-aaaaaaaaaaaa"
+        val missingIdentity = previewJson().replace(
+            "\"occurrences\":[]",
+            """"occurrences":[{
+              "id":"$occurrenceId",
+              "series_item_id":"$TASK_ID",
+              "nominal_start":"2026-09-01T09:00:00+02:00",
+              "nominal_end":"2026-09-01T10:00:00+02:00",
+              "window_start":"2026-09-01T09:00:00+02:00",
+              "window_end":"2026-09-01T10:00:00+02:00",
+              "local_date":"2026-09-01",
+              "ordinal":0,
+              "state":"generated"
+            }]""",
+        )
+        server.enqueue(currentScheduleResponse(currentScheduleJson(missingIdentity)))
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.currentSchedule(configuration()) }
+        }
+
+        server.enqueue(jsonResponse(currentScheduleJson(previewJson())))
+        assertThrows(PlannerApiException.InvalidResponse::class.java) {
+            runBlocking { transport.currentSchedule(configuration()) }
+        }
+    }
+
+    @Test
+    fun currentScheduleRejectsOmittedRequiredNestedEvidenceArrays() {
+        val base = previewJson()
+        val withViolation = base.replace(
+            "\"violations\":[],",
+            """"violations":[{"kind":"capacity","severity":"warning","item_ids":["$TASK_ID"],"occurrence_ids":[],"start":null,"end":null,"penalty":1,"message":"Capacity"}],""",
+        )
+        val omissions = listOf(
+            "decisions" to base.replace("\"decisions\":[],", ""),
+            "violations" to base.replace("\"violations\":[],", ""),
+            "occurrences" to base.replace(
+                Regex(""",\s*"occurrences":\[\]"""),
+                "",
+            ),
+            "block explanations" to
+                base.replace(Regex(""",\s*"explanations":\[\]"""), ""),
+            "violation occurrence_ids" to
+                withViolation.replace("\"occurrence_ids\":[],", ""),
+        )
+
+        omissions.forEach { (label, schedule) ->
+            assertFalse("$label fixture must omit its target", schedule == base)
+            server.enqueue(currentScheduleResponse(currentScheduleJson(schedule)))
+            assertThrows(label, PlannerApiException.InvalidResponse::class.java) {
+                runBlocking { transport.currentSchedule(configuration()) }
+            }
+        }
+    }
+
+    @Test
+    fun currentScheduleTrustsOnlyExactNoPublication404() {
+        val missing =
+            """{"error":{"code":"not_found","message":"Published schedule was not found"}}"""
+        server.enqueue(trustedError(404, missing))
+        assertEquals(null, runBlocking { transport.currentSchedule(configuration()) })
+
+        listOf(
+            MockResponse.Builder()
+                .code(404)
+                .addHeader("Content-Type", "application/json")
+                .body(missing)
+                .build(),
+            trustedError(
+                404,
+                """{"error":{"code":"not_found","message":"Another resource was not found"}}""",
+            ),
+            trustedError(
+                404,
+                """{"error":{"code":"not_found","message":"Published schedule was not found","details":null}}""",
+            ),
+            trustedError(
+                404,
+                """{"error":{"code":"not_found","code":"not_found","message":"Published schedule was not found"}}""",
+            ),
+        ).forEach { response ->
+            server.enqueue(response)
+            val error = assertThrows(PlannerApiException.Http::class.java) {
+                runBlocking { transport.currentSchedule(configuration()) }
+            }
+            assertEquals(404, error.statusCode)
+        }
+    }
+
+    @Test
     fun publishSendsExactJournaledRequestAndDecodesStrictRevision() = runBlocking {
         val configuration = configuration()
         val schedule = scheduleRequest()
@@ -565,6 +745,18 @@ class OkHttpCanonicalPlannerTransportTest {
         .body(body)
         .build()
 
+    private fun currentScheduleResponse(
+        body: String,
+        etag: String = "\"9:55555555-5555-4555-8555-555555555555\"",
+    ): MockResponse = MockResponse.Builder()
+        .code(200)
+        .addHeader("Content-Type", "application/json; charset=utf-8")
+        .addHeader("Cache-Control", "no-store, max-age=0")
+        .addHeader("Pragma", "no-cache")
+        .addHeader("ETag", etag)
+        .body(body)
+        .build()
+
     private fun trustedConflict(body: String): MockResponse = MockResponse.Builder()
         .code(409)
         .addHeader("Content-Type", "application/json; charset=utf-8")
@@ -683,6 +875,11 @@ class OkHttpCanonicalPlannerTransportTest {
           }
         }
     """.trimIndent()
+
+    private fun currentScheduleJson(schedule: String): String {
+        val revisionId = "55555555-5555-4555-8555-555555555555"
+        return """{"revision":{"id":"$revisionId","revision":"9:$revisionId","revision_number":9,"input_digest":"sha256:${"a".repeat(64)}","horizon_start":"2026-08-31T22:00:00Z","horizon_end":"2026-09-01T22:00:00Z","timezone_name":"Europe/Madrid","published_at":"2026-09-01T07:01:00Z"},"schedule":$schedule}"""
+    }
 
     private fun scheduleRequest() = SchedulePreviewRequest(
         asOf = "2026-09-01T07:00:00Z",

@@ -254,7 +254,7 @@ data class RemoteScheduleBlock(
     val end: String,
     @SerialName("session_index") val sessionIndex: Int,
     val kind: String,
-    val explanations: List<RemotePlacementExplanation> = emptyList(),
+    val explanations: List<RemotePlacementExplanation>,
 )
 
 @Serializable
@@ -303,10 +303,45 @@ data class RemoteIgnoredPreviousAssignment(
 )
 
 @Serializable
+data class RemoteManualPlacementConflict(
+    @SerialName("block_id") val blockId: String,
+    @SerialName("item_id") val itemId: String? = null,
+    @SerialName("occurrence_id") val occurrenceId: String? = null,
+    @SerialName("external_block_id") val externalBlockId: String? = null,
+    val kind: String,
+    val start: String,
+    val end: String,
+)
+
+@Serializable
+data class RemoteManualPlacementViolation(
+    val code: String,
+    @SerialName("item_ids") val itemIds: List<String>,
+    @SerialName("occurrence_ids") val occurrenceIds: List<String>,
+    @SerialName("conflicting_block_ids") val conflictingBlockIds: List<String>,
+    @SerialName("conflicting_blocks")
+    val conflictingBlocks: List<RemoteManualPlacementConflict>,
+    val start: String,
+    val end: String,
+    @SerialName("boundary_start") val boundaryStart: String? = null,
+    @SerialName("boundary_end") val boundaryEnd: String? = null,
+    val message: String,
+)
+
+@Serializable
+data class RemoteManualPlacementAssessment(
+    @SerialName("placement_id") val placementId: String,
+    @SerialName("environment_digest") val environmentDigest: String,
+    @SerialName("approval_digest") val approvalDigest: String,
+    @SerialName("approval_required") val approvalRequired: Boolean,
+    val violations: List<RemoteManualPlacementViolation>,
+)
+
+@Serializable
 data class RemotePlanScore(
     @SerialName("scheduled_minutes") val scheduledMinutes: Long,
     @SerialName("unscheduled_minutes") val unscheduledMinutes: Long,
-    @SerialName("soft_penalty") val softPenalty: Long,
+    @SerialName("soft_penalty") val softPenalty: ULong,
     @SerialName("moved_minutes") val movedMinutes: Long,
 )
 
@@ -315,10 +350,10 @@ data class RemotePlanViolation(
     val kind: String,
     val severity: String,
     @SerialName("item_ids") val itemIds: List<String>,
-    @SerialName("occurrence_ids") val occurrenceIds: List<String> = emptyList(),
+    @SerialName("occurrence_ids") val occurrenceIds: List<String>,
     val start: String? = null,
     val end: String? = null,
-    val penalty: Long,
+    val penalty: ULong,
     val message: String,
 )
 
@@ -329,10 +364,10 @@ data class RemoteSchedulePlan(
     @SerialName("horizon_end") val horizonEnd: String,
     val blocks: List<RemoteScheduleBlock>,
     val unscheduled: List<RemoteUnscheduledWork>,
-    val decisions: List<RemotePlanDecision> = emptyList(),
-    val violations: List<RemotePlanViolation> = emptyList(),
+    val decisions: List<RemotePlanDecision>,
+    val violations: List<RemotePlanViolation>,
     val score: RemotePlanScore,
-    val occurrences: List<RemotePlanOccurrence> = emptyList(),
+    val occurrences: List<RemotePlanOccurrence>,
 )
 
 @Serializable
@@ -344,7 +379,15 @@ data class RemoteSchedulePreview(
     @SerialName("rejected_items") val rejectedItems: List<RemoteRejectedScheduleItem>,
     @SerialName("ignored_previous_assignments")
     val ignoredPreviousAssignments: List<RemoteIgnoredPreviousAssignment>,
+    @SerialName("manual_placement_assessments")
+    val manualPlacementAssessments: List<RemoteManualPlacementAssessment> = emptyList(),
     val plan: RemoteSchedulePlan,
+)
+
+@Serializable
+data class RemoteCurrentPublishedSchedule(
+    val revision: RemotePublishedScheduleRevision,
+    val schedule: RemoteSchedulePreview,
 )
 
 sealed class PlannerApiException(message: String, cause: Throwable? = null) :
@@ -395,6 +438,11 @@ interface CanonicalPlannerTransport {
         configuration: AuthenticatedApiConfiguration,
         cursor: String?,
     ): RemoteItemDeltaPage = itemDelta(configuration, cursor)
+
+    /** `null` is returned only for the exact authenticated `not_found` envelope. */
+    suspend fun currentSchedule(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteCurrentPublishedSchedule?
 
     suspend fun preview(
         configuration: AuthenticatedApiConfiguration,
@@ -460,6 +508,20 @@ class OkHttpCanonicalPlannerTransport(
             .apply { if (cursor != null) addQueryParameter("cursor", cursor) }
             .build()
         return execute(requestBuilder(configuration, url.toString()).get().build())
+    }
+
+    override suspend fun currentSchedule(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteCurrentPublishedSchedule? {
+        val url = configuration.baseUrl.newBuilder()
+            .addPathSegments("v1/schedule/current")
+            .build()
+        val request = requestBuilder(configuration, url.toString())
+            .header("Cache-Control", "no-store, max-age=0")
+            .header("Pragma", "no-cache")
+            .get()
+            .build()
+        return executeCurrentSchedule(request)
     }
 
     override suspend fun preview(
@@ -657,6 +719,88 @@ class OkHttpCanonicalPlannerTransport(
         }
     }
 
+    private suspend fun executeCurrentSchedule(
+        request: Request,
+    ): RemoteCurrentPublishedSchedule? {
+        val configuration = request.tag(AuthenticatedApiConfiguration::class.java)
+            ?: throw PlannerApiException.InvalidResponse()
+        val response = configuration.executeAuthenticated(client, request)
+        response.use {
+            if (response.code == 404) {
+                return if (response.isStrictMissingCurrentSchedule()) {
+                    null
+                } else {
+                    throw PlannerApiException.Http(404)
+                }
+            }
+            if (response.code != 200) {
+                throw if (response.code == 401) {
+                    PlannerApiException.Authentication()
+                } else {
+                    PlannerApiException.Http(response.code)
+                }
+            }
+            if (!response.hasStrictNoStoreHeaders() || !response.hasJsonMediaType()) {
+                throw PlannerApiException.InvalidResponse()
+            }
+            val etag = response.headers.values("ETag").singleOrNull()
+                ?: throw PlannerApiException.InvalidResponse()
+            val responseText = response.body.charStream().use { reader ->
+                reader.readBoundedPlannerText()
+            }
+            val duplicateKeys = runCatching {
+                StrictJsonObjectKeyScanner(responseText, json).hasDuplicateKeys()
+            }.getOrElse { error ->
+                throw PlannerApiException.InvalidResponse(error)
+            }
+            if (duplicateKeys) throw PlannerApiException.InvalidResponse()
+            return try {
+                json.decodeFromString<RemoteCurrentPublishedSchedule>(responseText).also { current ->
+                    if (etag != "\"${current.revision.revision}\"") {
+                        throw PlannerApiException.InvalidResponse()
+                    }
+                }
+            } catch (error: SerializationException) {
+                throw PlannerApiException.InvalidResponse(error)
+            } catch (error: IllegalArgumentException) {
+                throw PlannerApiException.InvalidResponse(error)
+            }
+        }
+    }
+
+    private fun Response.isStrictMissingCurrentSchedule(): Boolean {
+        if (!hasStrictNoStoreHeaders() || !hasJsonMediaType()) return false
+        val responseText = runCatching {
+            body.charStream().use { reader ->
+                reader.readBoundedPlannerText(MAX_ERROR_RESPONSE_CHARS)
+            }
+        }.getOrNull() ?: return false
+        if (runCatching { StrictJsonObjectKeyScanner(responseText, json).hasDuplicateKeys() }
+                .getOrElse { return false }
+        ) {
+            return false
+        }
+        val root = runCatching { json.parseToJsonElement(responseText).jsonObject }
+            .getOrNull() ?: return false
+        if (root.keys != setOf("error")) return false
+        val error = runCatching { root.getValue("error").jsonObject }.getOrNull() ?: return false
+        return error.keys == setOf("code", "message") &&
+            error["code"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull == "not_found" &&
+            error["message"]?.jsonPrimitive?.takeIf { it.isString }?.contentOrNull ==
+            "Published schedule was not found"
+    }
+
+    private fun Response.hasStrictNoStoreHeaders(): Boolean =
+        headers.values("Cache-Control").singleOrNull()?.lowercase() == "no-store, max-age=0" &&
+            headers.values("Pragma").singleOrNull()?.lowercase() == "no-cache"
+
+    private fun Response.hasJsonMediaType(): Boolean {
+        val values = headers.values("Content-Type")
+        if (values.size != 1) return false
+        val mediaType = values.single().toMediaTypeOrNull() ?: return false
+        return mediaType.type == "application" && mediaType.subtype == "json"
+    }
+
     private fun Response.toPlannerApiException(): PlannerApiException = when (code) {
         401 -> PlannerApiException.Authentication()
         404 -> strictCanonicalMutationNotFound() ?: PlannerApiException.Http(code)
@@ -851,6 +995,121 @@ class OkHttpCanonicalPlannerTransport(
             }
             return result.toString()
         }
+    }
+}
+
+/** Detects duplicate object keys (including equivalent escaped spellings) before typed decoding. */
+private class StrictJsonObjectKeyScanner(
+    private val source: String,
+    private val json: Json,
+) {
+    private var index = 0
+
+    fun hasDuplicateKeys(): Boolean {
+        skipWhitespace()
+        val duplicate = parseValue()
+        skipWhitespace()
+        require(index == source.length)
+        return duplicate
+    }
+
+    private fun parseValue(): Boolean {
+        skipWhitespace()
+        require(index < source.length)
+        return when (source[index]) {
+            '{' -> parseObject()
+            '[' -> parseArray()
+            '"' -> {
+                parseString()
+                false
+            }
+            else -> {
+                parsePrimitive()
+                false
+            }
+        }
+    }
+
+    private fun parseObject(): Boolean {
+        index += 1
+        skipWhitespace()
+        if (takeIfPresent('}')) return false
+        val keys = hashSetOf<String>()
+        var duplicate = false
+        while (true) {
+            skipWhitespace()
+            require(source.getOrNull(index) == '"')
+            if (!keys.add(parseString())) duplicate = true
+            skipWhitespace()
+            require(takeIfPresent(':'))
+            if (parseValue()) duplicate = true
+            skipWhitespace()
+            when {
+                takeIfPresent('}') -> return duplicate
+                takeIfPresent(',') -> Unit
+                else -> throw IllegalArgumentException("Invalid JSON object")
+            }
+        }
+    }
+
+    private fun parseArray(): Boolean {
+        index += 1
+        skipWhitespace()
+        if (takeIfPresent(']')) return false
+        var duplicate = false
+        while (true) {
+            if (parseValue()) duplicate = true
+            skipWhitespace()
+            when {
+                takeIfPresent(']') -> return duplicate
+                takeIfPresent(',') -> Unit
+                else -> throw IllegalArgumentException("Invalid JSON array")
+            }
+        }
+    }
+
+    private fun parseString(): String {
+        val start = index
+        require(takeIfPresent('"'))
+        while (index < source.length) {
+            when (source[index++]) {
+                '"' -> return json.decodeFromString(source.substring(start, index))
+                '\\' -> {
+                    require(index < source.length)
+                    if (source[index++] == 'u') {
+                        repeat(4) {
+                            require(source.getOrNull(index)?.isHexDigit() == true)
+                            index += 1
+                        }
+                    }
+                }
+            }
+        }
+        throw IllegalArgumentException("Unterminated JSON string")
+    }
+
+    private fun parsePrimitive() {
+        val start = index
+        while (index < source.length && source[index] !in PRIMITIVE_DELIMITERS) index += 1
+        require(index > start)
+    }
+
+    private fun skipWhitespace() {
+        while (index < source.length && source[index] in JSON_WHITESPACE) index += 1
+    }
+
+    private fun takeIfPresent(character: Char): Boolean {
+        if (source.getOrNull(index) != character) return false
+        index += 1
+        return true
+    }
+
+    private fun Char.isHexDigit(): Boolean =
+        this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    private companion object {
+        val JSON_WHITESPACE = setOf(' ', '\t', '\r', '\n')
+        val PRIMITIVE_DELIMITERS = JSON_WHITESPACE + setOf(',', ']', '}')
     }
 }
 

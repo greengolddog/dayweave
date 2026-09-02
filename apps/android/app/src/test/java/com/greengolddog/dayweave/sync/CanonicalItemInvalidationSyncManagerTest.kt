@@ -11,6 +11,7 @@ import com.greengolddog.dayweave.network.CanonicalPlannerTransport
 import com.greengolddog.dayweave.network.CreateCanonicalItemRequest
 import com.greengolddog.dayweave.network.PlannerApiException
 import com.greengolddog.dayweave.network.RemoteCanonicalItem
+import com.greengolddog.dayweave.network.RemoteCurrentPublishedSchedule
 import com.greengolddog.dayweave.network.RemoteItemDeltaPage
 import com.greengolddog.dayweave.network.RemoteSchedulePreview
 import com.greengolddog.dayweave.network.RemoteSchedulePublishResponse
@@ -618,6 +619,10 @@ private class FakePlannerTransport(
         configuration: AuthenticatedApiConfiguration,
         cursor: String?,
     ): RemoteItemDeltaPage = probe(cursor)
+
+    override suspend fun currentSchedule(
+        configuration: AuthenticatedApiConfiguration,
+    ): RemoteCurrentPublishedSchedule? = error("Not used")
 
     override suspend fun preview(
         configuration: AuthenticatedApiConfiguration,

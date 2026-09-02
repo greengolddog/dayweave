@@ -108,6 +108,24 @@ stream endpoint or missed wakeup still converges without periodically composing 
 Item streaming and probing stop on background, app lock, or credential replacement; replacement
 drains their exact calls before the encrypted canonical cache is quarantined.
 
+Published schedules also replicate natively between devices. On a clean startup and while the
+unlocked UI is foregrounded, Android reads `/v1/schedule/current`, drains canonical item deltas,
+refetches the immutable head to close a publication/item race, and validates the exact revision,
+strong ETag, input digest, horizon, timezone, source revision map, occurrences, blocks, scores, and
+manual-placement evidence. The complete plan and its execution proof are installed together in one
+SQLCipher generation only if the credential binding and last durable planner snapshot are still
+exact. A trusted typed 404 can clear obsolete publication authority; a generic 404 cannot. Startup
+always replays any durable publication, authoring, execution, defer, or projection journal before
+this read-only recovery path, so process death never strands an ambiguous write behind polling.
+
+While foregrounded, `/v1/schedule/stream` supplies only content-free unsigned revision hints. Its
+`Last-Event-ID` comes exclusively from the encrypted installed proof, never from memory or an SSE
+event. A strict cursor-ahead 409 stops that stream and forces the authoritative GET; a missing
+stream falls back to the independent immediate/30-second GET. Events are coalesced through the
+process action gate, reconnect with bounded backoff, and cannot mutate state themselves. App lock,
+backgrounding, or credential quarantine stops new polling and cancels the SSE call; credential
+replacement additionally drains old-binding work before quarantining the encrypted cache.
+
 All authenticated Android APIs share one process-wide device-auth coordinator. Contract version 2
 adds the REST-only `schedule_publish` scope to the Android enrollment tuple; it is not an MCP scope.
 An older active or pending contract cannot gain that authority through refresh and therefore fails

@@ -228,16 +228,7 @@ class TodayActionEligibilityTest {
             revision = revision,
             asOf = "2026-09-01T07:00:00Z",
             blocks = schedule.map { block ->
-                PublishedScheduleBlockProofSnapshot(
-                    id = block.id,
-                    itemId = requireNotNull(block.canonicalItemId),
-                    itemRevision = requireNotNull(block.canonicalRevision),
-                    occurrenceId = block.occurrenceId,
-                    sessionIndex = requireNotNull(block.sessionIndex),
-                    start = requireNotNull(block.absoluteStartAt),
-                    end = requireNotNull(block.absoluteEndAt),
-                    kind = requireNotNull(block.canonicalBlockKind),
-                )
+                PublishedScheduleBlockProofSnapshot.from(block)
             },
         )
         return DayWeaveUiState(

@@ -515,6 +515,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.runForegroundCanonicalItemInvalidations()
     }
 
+    /** The caller owns the unlocked STARTED lifecycle and therefore the schedule GET/SSE sockets. */
+    suspend fun collectForegroundScheduleInvalidations() {
+        dayWeaveApplication.runForegroundScheduleInvalidations()
+    }
+
     fun keepLatestItemAfterTerminalConflict(sessionId: String) {
         if (isCanonicalBusy() || plannerStore.state.value.pendingCanonicalMutation != null) return
         dayWeaveApplication.launchCanonicalAction {

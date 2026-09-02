@@ -40,8 +40,14 @@ fun CalendarScreen(
 ) {
     val isCurrentPlan = state.isCanonicalPlanCurrent()
     val isDisplayCurrent = state.isScheduleDisplayCurrent()
-    val isLocalPlan = isDisplayCurrent && !isCurrentPlan
-    val visibleTimeline = if (isDisplayCurrent) state.visibleSchedule else emptyList()
+    val isPublishedReplica = state.isPublishedScheduleDisplayCurrent()
+    val isLocalPlan = isDisplayCurrent && !isPublishedReplica
+    val isReadOnlyPublishedReplica = isPublishedReplica && !isCurrentPlan
+    val visibleTimeline = if (isDisplayCurrent) {
+        state.visibleScheduleSlicesForWeek()
+    } else {
+        emptyList()
+    }
     LazyColumn(
         modifier = modifier,
         contentPadding = PaddingValues(16.dp),
@@ -56,7 +62,9 @@ fun CalendarScreen(
                 Column {
                     Text("This week", style = MaterialTheme.typography.headlineSmall)
                     Text(
-                        if (isLocalPlan) {
+                        if (isReadOnlyPublishedReplica) {
+                            "Published ${state.schedulePlanningZoneId.orEmpty()} schedule · read-only in this device time zone"
+                        } else if (isLocalPlan) {
                             "On-device plan · sync before canonical actions"
                         } else if (isCurrentPlan) {
                             "Canonical schedule preview · Google connection is configured separately"
@@ -102,7 +110,7 @@ fun CalendarScreen(
         }
 
         item {
-            Text("Today’s shape", style = MaterialTheme.typography.titleLarge)
+            Text("Week’s shape", style = MaterialTheme.typography.titleLarge)
         }
 
         item {
@@ -113,25 +121,27 @@ fun CalendarScreen(
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(11.dp),
                 ) {
-                    visibleTimeline.forEach { item ->
+                    visibleTimeline.forEach { slice ->
+                        val item = slice.item
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp),
                         ) {
                             Text(
-                                item.timeRange().substringBefore('–'),
+                                slice.weekStartLabel,
                                 style = MaterialTheme.typography.labelMedium,
                                 modifier = Modifier.weight(0.18f),
                             )
                             Box(
                                 Modifier
-                                    .weight((item.durationMinutes / 30f).coerceIn(0.4f, 3f))
+                                    .weight((slice.durationMinutes / 30f).coerceIn(0.4f, 3f))
                                     .height(25.dp)
                                     .background(item.kind.color(), MaterialTheme.shapes.small),
                             )
                             Text(
-                                item.title,
+                                listOfNotNull(item.title, slice.continuationLabel)
+                                    .joinToString(" · "),
                                 modifier = Modifier.weight(1f),
                                 style = MaterialTheme.typography.bodySmall,
                                 maxLines = 1,

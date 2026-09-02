@@ -58,6 +58,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -282,6 +283,119 @@ class PlannerStoreTest {
         }
         assertTrue(stale.isFailure)
         assertEquals("cursor-1", store.state.value.canonicalDeltaCursor)
+    }
+
+    @Test
+    fun currentScheduleReplicaInstallsExactProofThenClearsOnlyFromDurableExpectedState() =
+        runBlocking {
+            val initial = DayWeaveUiState(
+                canonicalItems = listOf(canonicalItem("planned", 7)),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            )
+            val store = PlannerStore(initial)
+            val expected = store.state.value
+            val update = canonicalUpdate(
+                item = canonicalItem("planned", 8),
+                block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                cursor = "cursor-1",
+            )
+
+            val install = requireNotNull(
+                store.installCurrentPublishedSchedule(expected, update, publishedRevision()),
+            )
+            assertTrue(install.awaitDurable())
+            val installed = store.state.value
+            assertEquals(8L, installed.canonicalItems.single().revision)
+            assertEquals("cursor-1", installed.canonicalDeltaCursor)
+            assertEquals(publishedRevision(), installed.publishedScheduleRevision)
+            assertTrue(requireNotNull(installed.publishedScheduleProof).matchesPublishedPlan(
+                installed.schedule,
+            ))
+
+            val clear = requireNotNull(
+                store.installNoCurrentPublishedSchedule(
+                    expectedState = installed,
+                    syncOrigin = CANONICAL_ORIGIN,
+                    configurationId = "connection-1",
+                ),
+            )
+            assertTrue(clear.awaitDurable())
+            assertNull(store.state.value.publishedScheduleRevision)
+            assertNull(store.state.value.publishedScheduleProof)
+            assertNull(store.state.value.scheduleInputDigest)
+            assertTrue(store.state.value.schedule.isEmpty())
+        }
+
+    @Test
+    fun typedMissingCurrentScheduleClearsDisplayOnlyLocalComposition() = runBlocking {
+        val local = DayWeaveUiState(
+            canonicalItems = listOf(canonicalItem("planned", 7)),
+            canonicalSyncOrigin = CANONICAL_ORIGIN,
+            canonicalConfigurationId = "connection-1",
+            canonicalDeltaCursor = "cursor-0",
+            schedule = listOf(canonicalBlock(ItemStatus.SCHEDULED, 7)),
+            scheduleGeneratedAt = "1970-01-01T00:00:00Z",
+            schedulePlanningZoneId = "UTC",
+        )
+        val store = PlannerStore(local)
+
+        val clear = requireNotNull(
+            store.installNoCurrentPublishedSchedule(
+                expectedState = store.state.value,
+                syncOrigin = CANONICAL_ORIGIN,
+                configurationId = "connection-1",
+            ),
+        )
+
+        assertTrue(clear.awaitDurable())
+        assertTrue(store.state.value.schedule.isEmpty())
+        assertNull(store.state.value.scheduleGeneratedAt)
+        assertEquals(
+            "No schedule has been published for this workspace yet",
+            store.state.value.scheduleMessage,
+        )
+    }
+
+    @Test
+    fun staleEncryptedExpectedStateCannotInstallOrClearCurrentSchedule() = runBlocking {
+        val installStore = PlannerStore(
+            DayWeaveUiState(
+                canonicalItems = listOf(canonicalItem("planned", 7)),
+                canonicalSyncOrigin = CANONICAL_ORIGIN,
+                canonicalConfigurationId = "connection-1",
+                canonicalDeltaCursor = "cursor-0",
+            ),
+        )
+        val staleInstallExpected = installStore.state.value
+        installStore.toggleCompleted()
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            installStore.installCurrentPublishedSchedule(
+                staleInstallExpected,
+                canonicalUpdate(
+                    item = canonicalItem("planned", 8),
+                    block = canonicalBlock(ItemStatus.SCHEDULED, 8),
+                    cursor = "cursor-1",
+                ),
+                publishedRevision(),
+            )
+        }
+        assertNull(installStore.state.value.publishedScheduleProof)
+        assertEquals(7L, installStore.state.value.canonicalItems.single().revision)
+
+        val clearStore = PlannerStore(publishedCanonicalState())
+        val staleClearExpected = clearStore.state.value
+        clearStore.toggleCompleted()
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            clearStore.installNoCurrentPublishedSchedule(
+                staleClearExpected,
+                CANONICAL_ORIGIN,
+                "connection-1",
+            )
+        }
+        assertNotNull(clearStore.state.value.publishedScheduleProof)
+        assertEquals(publishedRevision(), clearStore.state.value.publishedScheduleRevision)
     }
 
     @Test
@@ -2431,6 +2545,7 @@ class PlannerStoreTest {
         val valid = pendingExecutionDeferState()
         val intent = requireNotNull(valid.pendingExecutionDeferIntent)
         val session = requireNotNull(valid.canonicalExecutionSession)
+        val currentProof = requireNotNull(valid.publishedScheduleProof)
         val invalidStates = listOf(
             "legacy local approval schema" to valid.copy(
                 pendingExecutionDeferIntent = intent.copy(schemaVersion = 0),
@@ -2447,6 +2562,12 @@ class PlannerStoreTest {
             "binding mismatch" to valid.copy(
                 canonicalExecutionConfigurationId = "connection-2",
             ),
+            "legacy item-only publication proof" to valid.copy(
+                publishedScheduleProof = currentProof.copy(
+                    schemaVersion = 1,
+                    blocks = currentProof.blocks.map { it.copy(immutableDigest = null) },
+                ),
+            ),
         )
 
         invalidStates.forEach { (label, restored) ->
@@ -2460,6 +2581,28 @@ class PlannerStoreTest {
             )
             assertTrue(label, store.state.value.scheduleMessage.contains("abandoned safely"))
         }
+    }
+
+    @Test
+    fun legacyPublicationProofCannotStageExecutionDeferIntent() {
+        val pending = pendingExecutionDeferState()
+        val intent = requireNotNull(pending.pendingExecutionDeferIntent)
+        val currentProof = requireNotNull(pending.publishedScheduleProof)
+        val store = PlannerStore(
+            pending.copy(
+                pendingExecutionDeferIntent = null,
+                publishedScheduleProof = currentProof.copy(
+                    schemaVersion = 1,
+                    blocks = currentProof.blocks.map { it.copy(immutableDigest = null) },
+                ),
+            ),
+            nowEpochMillis = { 3_600_000L },
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            store.stageExecutionDeferIntent(intent)
+        }
+        assertNull(store.state.value.pendingExecutionDeferIntent)
     }
 
     @Test
@@ -2664,16 +2807,7 @@ class PlannerStoreTest {
         revision = revision,
         asOf = "1970-01-01T00:00:00Z",
         blocks = listOf(
-            PublishedScheduleBlockProofSnapshot(
-                id = block.id,
-                itemId = requireNotNull(block.canonicalItemId),
-                itemRevision = requireNotNull(block.canonicalRevision),
-                occurrenceId = block.occurrenceId,
-                sessionIndex = requireNotNull(block.sessionIndex),
-                start = requireNotNull(block.absoluteStartAt),
-                end = requireNotNull(block.absoluteEndAt),
-                kind = requireNotNull(block.canonicalBlockKind),
-            ),
+            PublishedScheduleBlockProofSnapshot.from(block),
         ),
     )
 

@@ -47,7 +47,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun exactReviewApplyReceiptAndUndoCompleteWithoutLegacyDraft() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         var requestObservedAfterDurableStage = false
         transport.onApply = {
@@ -82,7 +82,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun lostApplyResponseIsRecoveredByProposalBeforeAnyReplay() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport().apply {
             applyFailure = IOException("synthetic lost response")
             proposalLookup = appliedReceipt()
@@ -103,7 +103,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun transientLookupFailureRetainsExactApplyJournalForRestart() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport().apply {
             applyFailure = IOException("synthetic lost response")
             proposalLookupFailure = IOException("synthetic lookup outage")
@@ -123,7 +123,7 @@ class ProposalApplicationManagerTest {
 
         transport.applyFailure = null
         transport.proposalLookupFailure = null
-        val restarted = PlannerStore(store.state.value)
+        val restarted = plannerStore(store.state.value)
         val restartedManager = manager(restarted, transport)
         assertTrue(restartedManager.recoverPending())
         assertEquals(2, transport.applyCalls)
@@ -138,7 +138,7 @@ class ProposalApplicationManagerTest {
     @Test
     fun typedApplyNoEffectConflictClearsJournalOnlyAfterNotFoundLookupAndExactReplay() =
         runBlocking {
-            val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+            val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
             val transport = FakeProposalApplicationsTransport().apply {
                 applyFailure = ProposalApplicationApiException.Conflict(
                     RemoteProposalConflictCode.PREVIEW_EXPIRED,
@@ -163,7 +163,7 @@ class ProposalApplicationManagerTest {
             ProposalApplicationApiException.Conflict(),
             ProposalApplicationApiException.Validation(422),
         ).forEach { failure ->
-            val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+            val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
             val transport = FakeProposalApplicationsTransport().apply {
                 applyFailure = failure
             }
@@ -180,7 +180,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun lostUndoResponseIsRecoveredByApplicationBeforeAnyReplay() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         val manager = manager(store, transport)
         assertTrue(manager.prepareReview(PROPOSAL_ID))
@@ -201,7 +201,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun typedUndoNoEffectConflictClearsJournalAndRetainsAppliedReceipt() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         val manager = manager(store, transport)
         assertTrue(manager.prepareReview(PROPOSAL_ID))
@@ -226,7 +226,7 @@ class ProposalApplicationManagerTest {
         val proposal = typedProposal().copy(remotePayloadSchema = "dayweave.proposal-change-set/2")
         val transport = FakeProposalApplicationsTransport()
         val manager = manager(
-            PlannerStore(DayWeaveUiState(suggestions = listOf(proposal))),
+            plannerStore(DayWeaveUiState(suggestions = listOf(proposal))),
             transport,
         )
 
@@ -245,7 +245,7 @@ class ProposalApplicationManagerTest {
             { approval -> approval.copy(reviewHash = OTHER_REVIEW_HASH) },
         )
         mutations.forEach { mutate ->
-            val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+            val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
             val transport = FakeProposalApplicationsTransport()
             val manager = manager(store, transport)
             assertTrue(manager.prepareReview(PROPOSAL_ID))
@@ -260,7 +260,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun approvalFromSupersededReviewCannotApplyNewPreview() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         val manager = manager(store, transport)
         assertTrue(manager.prepareReview(PROPOSAL_ID))
@@ -279,7 +279,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun expiredReviewCanBeRegeneratedAndConfigurationQuarantineClearsIt() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport().apply {
             previewResponse = applicationPreview().copy(expiresAt = "2026-08-30T09:59:59Z")
         }
@@ -302,7 +302,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun privacyBoundaryDropsReviewButDoesNotCorruptJournaledApply() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         val manager = manager(store, transport)
         assertTrue(manager.prepareReview(PROPOSAL_ID))
@@ -334,7 +334,7 @@ class ProposalApplicationManagerTest {
 
     @Test
     fun privacyBoundaryPreventsInflightPreviewFromReappearing() = runBlocking {
-        val store = PlannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
+        val store = plannerStore(DayWeaveUiState(suggestions = listOf(typedProposal())))
         val transport = FakeProposalApplicationsTransport()
         val previewStarted = CompletableDeferred<Unit>()
         val releasePreview = CompletableDeferred<Unit>()
@@ -359,6 +359,11 @@ class ProposalApplicationManagerTest {
         plannerStore = store,
         credentialStore = ProposalCredentialStore(),
         transport = transport,
+        nowEpochMillis = { now },
+    )
+
+    private fun plannerStore(state: DayWeaveUiState): PlannerStore = PlannerStore(
+        initialState = state,
         nowEpochMillis = { now },
     )
 

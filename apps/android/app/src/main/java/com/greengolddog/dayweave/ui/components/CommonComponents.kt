@@ -84,6 +84,9 @@ fun ScheduleItemCard(
     modifier: Modifier = Modifier,
     canStart: Boolean = true,
     unavailableLabel: String = "Needs review",
+    displayStartLabel: String = item.timeRange().substringBefore('–'),
+    displayDurationLabel: String = "${item.durationMinutes}m",
+    displayContextLabel: String? = null,
 ) {
     val kindColor = item.kind.color()
     Card(
@@ -97,12 +100,20 @@ fun ScheduleItemCard(
             verticalAlignment = Alignment.Top,
         ) {
             Column(horizontalAlignment = Alignment.End, modifier = Modifier.width(54.dp)) {
-                Text(item.timeRange().substringBefore('–'), style = MaterialTheme.typography.labelLarge)
+                Text(displayStartLabel, style = MaterialTheme.typography.labelLarge)
                 Text(
-                    "${item.durationMinutes}m",
+                    displayDurationLabel,
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                displayContextLabel?.let { label ->
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                    )
+                }
             }
 
             Box(
