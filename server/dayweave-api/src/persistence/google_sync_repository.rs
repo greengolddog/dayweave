@@ -10525,19 +10525,26 @@ mod tests {
             .expect("initial refresh is durably accepted");
 
         for status in ["paused", "revoked"] {
-            sqlx::query(
+            let lifecycle_update = if status == "revoked" {
+                "UPDATE provider_accounts SET status = $4, sync_enabled = false, \
+                 encrypted_credentials = NULL, credential_key_version = NULL, \
+                 granted_scopes = '{}', token_expires_at = NULL, is_default = false, \
+                 disconnected_at = $5, revision = revision + 1, updated_at = $5 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3"
+            } else {
                 "UPDATE provider_accounts SET status = $4, sync_enabled = false, \
                  revision = revision + 1, updated_at = $5 \
-                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
-            )
-            .bind(fixture.scope.workspace_id)
-            .bind(fixture.scope.user_id)
-            .bind(fixture.account_id)
-            .bind(status)
-            .bind(fixture.now + Duration::minutes(1))
-            .execute(&fixture.database.pool)
-            .await
-            .expect("account lifecycle mutation");
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3"
+            };
+            sqlx::query(lifecycle_update)
+                .bind(fixture.scope.workspace_id)
+                .bind(fixture.scope.user_id)
+                .bind(fixture.account_id)
+                .bind(status)
+                .bind(fixture.now + Duration::minutes(1))
+                .execute(&fixture.database.pool)
+                .await
+                .expect("account lifecycle mutation");
 
             let lookup = fixture
                 .repository
