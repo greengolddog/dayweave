@@ -127,6 +127,14 @@ publication after durable DayWeave device enrollment is active:
    revision, operation, hash, entity kind, and expiry. Expiry validation tolerates
    the supported five-minute device clock skew while locally elapsed authority
    remains non-actionable.
+7. Android uses the same server preview/approval/outbox contract for a strict
+   upsert-only subset. Configure the account's full Calendar grant and writable
+   **Publish** destination on macOS first, refresh **More → Google sources** on
+   Android, then use **Inbox → Items → Publish**. Android accepts only a current
+   app-owned, non-all-day, confirmed, busy timed event; it never publishes task
+   schedule blocks, recurrence, guests, meetings, attachments, Google Tasks, or
+   deletion from this surface. Its secure review says **queued** after HTTP 202,
+   while provider delivery remains asynchronous.
 
 Before preview transport, the Mac synchronously saves the exact intent to its
 encrypted planner snapshot. It persists the returned preview before display and

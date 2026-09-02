@@ -22,6 +22,7 @@ import com.greengolddog.dayweave.network.OkHttpScheduleInvalidationStreamTranspo
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleCalendarInboundTransport
+import com.greengolddog.dayweave.network.OkHttpGoogleCalendarOutboundTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationCoordinator
@@ -53,6 +54,7 @@ import com.greengolddog.dayweave.sync.GoogleAccountManager
 import com.greengolddog.dayweave.sync.GoogleCalendarImportCompletionPipeline
 import com.greengolddog.dayweave.sync.GoogleCalendarImportCoordinator
 import com.greengolddog.dayweave.sync.GoogleCalendarImportPersistenceReceipt
+import com.greengolddog.dayweave.sync.GoogleCalendarOutboundCoordinator
 import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -195,6 +197,9 @@ class DayWeaveApplication : Application() {
                             googleAccountManager.quarantineBindingState()
                         }
                         googleCalendarImportCoordinator.quarantineBindingState()
+                        if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
+                            googleCalendarOutboundCoordinator.quarantineBindingState()
+                        }
                     }
                     return quarantined
                 }
@@ -372,6 +377,19 @@ class DayWeaveApplication : Application() {
     val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator
         get() = googleCalendarImportCoordinatorDelegate.value
 
+    private val googleCalendarOutboundCoordinatorDelegate = lazy {
+        GoogleCalendarOutboundCoordinator(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpGoogleCalendarOutboundTransport(),
+            googleAccountState = { googleAccountManager.state.value },
+            googleImportState = { googleCalendarImportCoordinator.state.value },
+            operationAllowed = privatePresentationAllowed::get,
+        )
+    }
+    val googleCalendarOutboundCoordinator: GoogleCalendarOutboundCoordinator
+        get() = googleCalendarOutboundCoordinatorDelegate.value
+
     val energySignalManager: EnergySignalManager by lazy {
         EnergySignalManager(
             provider = HealthConnectEnergyProvider(this),
@@ -493,6 +511,9 @@ class DayWeaveApplication : Application() {
         }
         if (googleCalendarImportCoordinatorDelegate.isInitialized()) {
             googleCalendarImportCoordinator.quarantineBindingState()
+        }
+        if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
+            googleCalendarOutboundCoordinator.quarantineBindingState()
         }
     }
 

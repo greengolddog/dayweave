@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.CloudDone
 import androidx.compose.material.icons.outlined.CloudOff
 import androidx.compose.material.icons.outlined.PhoneAndroid
@@ -35,6 +36,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -89,6 +91,7 @@ import com.greengolddog.dayweave.ui.components.QuickCaptureSheet
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorMode
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorSheet
+import com.greengolddog.dayweave.ui.authoring.GoogleCalendarOutboundReviewSheet
 import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
@@ -100,6 +103,9 @@ import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.sync.GoogleCalendarOutboundPhase
+import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
+import java.time.Instant
 import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
@@ -260,6 +266,8 @@ private fun DayWeaveRoot(
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
     val googleCalendarImportState by
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
+    val googleCalendarOutboundState by
+        viewModel.googleCalendarOutboundState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
     val timedBreakNotificationPermissionRequestDigest by
@@ -290,10 +298,11 @@ private fun DayWeaveRoot(
     }
     val canonicalExecutionActionsEnabled =
         !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
-            !proposalApplicationState.isBusy &&
+            !proposalApplicationState.isBusy && !googleCalendarOutboundState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
             state.pendingExecutionDeferIntent == null &&
-            state.pendingProposalApplicationMutation == null
+            state.pendingProposalApplicationMutation == null &&
+            state.pendingGoogleCalendarOutbound == null
     val canonicalAuthoringActionsEnabled = canonicalExecutionActionsEnabled &&
         state.canonicalExecutionSession == null &&
         state.pendingSchedulePublication == null &&
@@ -307,6 +316,11 @@ private fun DayWeaveRoot(
     var showApiConnection by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
     var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
+    var googlePublicationReview by remember {
+        mutableStateOf<GoogleCalendarPublicationReview?>(null)
+    }
+    var showGooglePublicationReview by remember { mutableStateOf(false) }
+    var googleOutboundClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
     var authorizedNotificationBreakDigest by rememberSaveable {
@@ -327,6 +341,18 @@ private fun DayWeaveRoot(
         sdkInt = Build.VERSION.SDK_INT,
         systemState = timedBreakNotificationSystemState,
     )
+    LaunchedEffect(
+        state.pendingGoogleCalendarOutbound?.recoveryId,
+        state.pendingGoogleCalendarOutbound?.stage,
+    ) {
+        if (state.pendingGoogleCalendarOutbound != null) {
+            showGooglePublicationReview = true
+            while (isActive) {
+                googleOutboundClockMillis = System.currentTimeMillis()
+                delay(1_000)
+            }
+        }
+    }
     LaunchedEffect(
         lifecycleOwner,
         viewModel,
@@ -544,6 +570,39 @@ private fun DayWeaveRoot(
                         }
                     }
                 }
+                if (state.pendingGoogleCalendarOutbound != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Outlined.CalendarMonth, contentDescription = null)
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(horizontal = 10.dp),
+                            ) {
+                                Text(
+                                    "Google Calendar publication saved",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    googleCalendarOutboundState.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 2,
+                                )
+                            }
+                            TextButton(onClick = { showGooglePublicationReview = true }) {
+                                Text("Review")
+                            }
+                        }
+                    }
+                }
                 val active = state.activeItem
                 val session = state.activeSession
                 AnimatedVisibility(visible = active != null && session != null) {
@@ -629,6 +688,21 @@ private fun DayWeaveRoot(
                     canonicalEditorRoute = CanonicalItemEditorRoute.fromInbox(draft)
                 },
                 onRetryCanonicalAuthoring = viewModel::retryCanonicalAuthoring,
+                googleOutboundBlocked = state.pendingGoogleCalendarOutbound != null ||
+                    googleCalendarOutboundState.isBusy,
+                googlePublishingTargets = viewModel::googleCalendarPublishingTargets,
+                onRequestGooglePublication = { itemId, targets ->
+                    if (
+                        targets.isNotEmpty() &&
+                        viewModel.resetGoogleCalendarPublicationPresentation()
+                    ) {
+                        googlePublicationReview = GoogleCalendarPublicationReview(
+                            itemId = itemId,
+                            selectedTarget = targets.singleOrNull(),
+                        )
+                        showGooglePublicationReview = true
+                    }
+                },
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.ASSISTANT -> AssistantScreen(
@@ -1108,6 +1182,71 @@ private fun DayWeaveRoot(
             },
         )
     }
+
+    if (
+        showGooglePublicationReview &&
+        (
+            googlePublicationReview != null ||
+                state.pendingGoogleCalendarOutbound != null ||
+                googleCalendarOutboundState.phase == GoogleCalendarOutboundPhase.ACCEPTED
+        )
+    ) {
+        val currentTargets = googlePublicationReview?.let { review ->
+            viewModel.googleCalendarPublishingTargets(review.itemId)
+        }.orEmpty()
+        val selectedTarget = googlePublicationReview?.selectedTarget?.takeIf {
+            it in currentTargets
+        } ?: currentTargets.singleOrNull()
+        val reviewDestination = googlePublicationReview?.selectedTarget
+            ?: viewModel.pendingGoogleCalendarDestination()
+        GoogleCalendarOutboundReviewSheet(
+            state = googleCalendarOutboundState,
+            targets = currentTargets,
+            selectedTarget = selectedTarget,
+            reviewDestinationDisplayName = reviewDestination?.displayName,
+            approvalConfirmation = viewModel.googleCalendarApprovalConfirmation(),
+            canRecover = state.pendingGoogleCalendarOutbound != null &&
+                googleCalendarOutboundState.phase in setOf(
+                    GoogleCalendarOutboundPhase.AUTH_REQUIRED,
+                    GoogleCalendarOutboundPhase.OFFLINE,
+                    GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
+                ),
+            canDiscardExpiredRecovery = state.pendingGoogleCalendarOutbound
+                ?.canDiscardExpiredAt(Instant.ofEpochMilli(googleOutboundClockMillis)) == true,
+            onTargetSelected = { target ->
+                googlePublicationReview?.let { review ->
+                    googlePublicationReview = GoogleCalendarPublicationReview(
+                        itemId = review.itemId,
+                        selectedTarget = target,
+                    )
+                }
+            },
+            onRequestPreview = { target ->
+                googlePublicationReview?.itemId?.let { itemId ->
+                    viewModel.prepareGoogleCalendarPreview(itemId, target)
+                }
+            },
+            onApproveAndQueue = { confirmation ->
+                viewModel.approveGoogleCalendarPreview(confirmation)
+            },
+            onRecover = { viewModel.recoverGoogleCalendarOutbound() },
+            onDiscardExpiredRecovery = {
+                viewModel.discardExpiredGoogleCalendarOutbound()
+            },
+            onDismissRequest = {
+                showGooglePublicationReview = false
+                googlePublicationReview = null
+                viewModel.resetGoogleCalendarPublicationPresentation()
+            },
+        )
+    }
+}
+
+private class GoogleCalendarPublicationReview(
+    val itemId: String,
+    val selectedTarget: GoogleCalendarOutboundTargetOption?,
+) {
+    override fun toString(): String = "GoogleCalendarPublicationReview(<redacted>)"
 }
 
 private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L

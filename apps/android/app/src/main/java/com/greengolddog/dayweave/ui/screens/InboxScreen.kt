@@ -51,6 +51,7 @@ import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
 import com.greengolddog.dayweave.sync.ProposalApplicationPhase
 import com.greengolddog.dayweave.sync.ProposalApplicationState
+import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.SuggestionSyncState
 import com.greengolddog.dayweave.ui.authoring.CanonicalAuthoringList
@@ -83,6 +84,12 @@ internal fun InboxScreen(
     onCopyCanonicalConflict: suspend (String) -> Boolean,
     onReviewLegacyDraft: (InboxItem) -> Unit,
     onRetryCanonicalAuthoring: () -> Unit,
+    googleOutboundBlocked: Boolean,
+    googlePublishingTargets: (String) -> List<GoogleCalendarOutboundTargetOption>,
+    onRequestGooglePublication: (
+        String,
+        List<GoogleCalendarOutboundTargetOption>,
+    ) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var tab by remember { mutableIntStateOf(0) }
@@ -142,6 +149,9 @@ internal fun InboxScreen(
                 onCopyConflict = onCopyCanonicalConflict,
                 onReviewLegacy = onReviewLegacyDraft,
                 onRetry = onRetryCanonicalAuthoring,
+                googleOutboundBlocked = googleOutboundBlocked,
+                googlePublishingTargets = googlePublishingTargets,
+                onRequestGooglePublication = onRequestGooglePublication,
                 modifier = Modifier.weight(1f),
             )
         } else {

@@ -48,11 +48,13 @@ object PlannerSnapshotFormats {
     const val JSON_V9 = "json-v9-timed-break-notification-receipts"
     /** Local provenance plus scheduling profile; older binaries must not ignore either safety gap. */
     const val JSON_V10 = "json-v10-local-schedule-composition-provenance"
+    /** Encrypted Google preview/approval authority; rollback must never ignore an open journal. */
+    const val JSON_V11 = "json-v11-google-calendar-outbound-recovery"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 10,
+    version = 11,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -132,6 +134,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_9_10 = object : Migration(9, 10) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains one-shot Google Calendar approval
+     * recovery; the Room version prevents rollback to code that could ignore or reuse it.
+     */
+    val MIGRATION_10_11 = object : Migration(10, 11) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -181,6 +191,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_7_8,
                 PlannerDatabaseMigrations.MIGRATION_8_9,
                 PlannerDatabaseMigrations.MIGRATION_9_10,
+                PlannerDatabaseMigrations.MIGRATION_10_11,
             )
             .build()
     }

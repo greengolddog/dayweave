@@ -869,6 +869,10 @@ class GoogleCalendarImportCoordinatorTest {
         assertEquals(setOf(ACCOUNT_A, ACCOUNT_B), state.accounts.keys)
         assertEquals(RemoteGoogleSyncRole.WRITABLE, state.accounts[ACCOUNT_A]
             ?.collections?.single()?.syncRole)
+        assertEquals(
+            "owner",
+            state.accounts[ACCOUNT_A]?.collections?.single()?.providerAccessRole,
+        )
         assertTrue(state.accounts[ACCOUNT_A]?.collections?.single()?.providerDeleted == true)
         val diagnostic = state.toString() + writable.toStateForDiagnostic().toString()
         assertFalse(diagnostic.contains(ACCOUNT_A))

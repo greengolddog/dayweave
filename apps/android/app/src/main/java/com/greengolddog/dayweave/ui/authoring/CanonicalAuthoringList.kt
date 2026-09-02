@@ -17,6 +17,7 @@ import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.EventAvailable
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.Lock
@@ -45,6 +46,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.InboxItem
+import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
+import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -64,6 +67,12 @@ internal fun CanonicalAuthoringList(
     onCopyConflict: suspend (String) -> Boolean,
     onReviewLegacy: (InboxItem) -> Unit,
     onRetry: () -> Unit,
+    googleOutboundBlocked: Boolean,
+    googlePublishingTargets: (String) -> List<GoogleCalendarOutboundTargetOption>,
+    onRequestGooglePublication: (
+        String,
+        List<GoogleCalendarOutboundTargetOption>,
+    ) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val presentation = remember(
@@ -180,6 +189,12 @@ internal fun CanonicalAuthoringList(
                     }
                 }
             },
+            isGooglePublishCandidate = {
+                state.googleCalendarOutboundCandidate(it) != null
+            },
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
         )
         canonicalSection(
             title = "Planned",
@@ -201,6 +216,12 @@ internal fun CanonicalAuthoringList(
                     perform("The retained draft could not be copied.") { onCopyConflict(mutationId) }
                 }
             },
+            isGooglePublishCandidate = {
+                state.googleCalendarOutboundCandidate(it) != null
+            },
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
         )
         canonicalSection(
             title = "Conflicts",
@@ -222,6 +243,12 @@ internal fun CanonicalAuthoringList(
                     perform("The retained draft could not be copied.") { onCopyConflict(mutationId) }
                 }
             },
+            isGooglePublishCandidate = {
+                state.googleCalendarOutboundCandidate(it) != null
+            },
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
         )
         canonicalSection(
             title = "Recently Deleted",
@@ -245,6 +272,12 @@ internal fun CanonicalAuthoringList(
                     perform("The retained draft could not be copied.") { onCopyConflict(mutationId) }
                 }
             },
+            isGooglePublishCandidate = {
+                state.googleCalendarOutboundCandidate(it) != null
+            },
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
         )
 
         legacyCapturedSection(
@@ -306,6 +339,13 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
     onRestore: (CanonicalAuthoringRow) -> Unit,
     onDiscard: (CanonicalAuthoringRow) -> Unit,
     onCopy: (CanonicalAuthoringRow) -> Unit,
+    isGooglePublishCandidate: (String) -> Boolean,
+    googleOutboundBlocked: Boolean,
+    googlePublishingTargets: (String) -> List<GoogleCalendarOutboundTargetOption>,
+    onRequestGooglePublication: (
+        String,
+        List<GoogleCalendarOutboundTargetOption>,
+    ) -> Unit,
 ) {
     item(key = "canonical-section-$title") {
         Text(
@@ -333,6 +373,10 @@ private fun androidx.compose.foundation.lazy.LazyListScope.canonicalSection(
             onRestore = { onRestore(row) },
             onDiscard = { onDiscard(row) },
             onCopy = { onCopy(row) },
+            isGooglePublishCandidate = isGooglePublishCandidate(row.itemId),
+            googleOutboundBlocked = googleOutboundBlocked,
+            googlePublishingTargets = googlePublishingTargets,
+            onRequestGooglePublication = onRequestGooglePublication,
         )
     }
 }
@@ -346,7 +390,19 @@ private fun CanonicalAuthoringCard(
     onRestore: () -> Unit,
     onDiscard: () -> Unit,
     onCopy: () -> Unit,
+    isGooglePublishCandidate: Boolean,
+    googleOutboundBlocked: Boolean,
+    googlePublishingTargets: (String) -> List<GoogleCalendarOutboundTargetOption>,
+    onRequestGooglePublication: (
+        String,
+        List<GoogleCalendarOutboundTargetOption>,
+    ) -> Unit,
 ) {
+    val googleTargets = if (isGooglePublishCandidate && !googleOutboundBlocked) {
+        googlePublishingTargets(row.itemId)
+    } else {
+        emptyList()
+    }
     Card(
         modifier = Modifier.fillMaxWidth().testTag("canonical_row_${row.itemId}"),
         colors = CardDefaults.cardColors(
@@ -519,6 +575,33 @@ private fun CanonicalAuthoringCard(
                                 }
                             }
                     }
+                    if (isGooglePublishCandidate) {
+                        OutlinedButton(
+                            onClick = {
+                                onRequestGooglePublication(row.itemId, googleTargets)
+                            },
+                            enabled = actionsEnabled && !googleOutboundBlocked &&
+                                googleTargets.isNotEmpty(),
+                            modifier = Modifier.testTag("google_calendar_publish_${row.itemId}"),
+                        ) {
+                            Icon(Icons.Outlined.EventAvailable, contentDescription = null)
+                            Text("Publish")
+                        }
+                    }
+                }
+                if (isGooglePublishCandidate && googleTargets.isEmpty()) {
+                    Text(
+                        if (googleOutboundBlocked) {
+                            "Finish the saved Google Calendar publication before starting another."
+                        } else {
+                            "Choose a writable Publish calendar on macOS, then refresh Google sources."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag(
+                            "google_calendar_publish_prerequisite_${row.itemId}",
+                        ),
+                    )
                 }
             }
         }

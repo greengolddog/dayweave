@@ -6,6 +6,9 @@ import com.greengolddog.dayweave.model.CanonicalPlanUpdate
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import com.greengolddog.dayweave.model.ExecutionDeferViolationSnapshot
+import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
+import com.greengolddog.dayweave.model.GoogleCalendarOutboundPreviewSnapshot
+import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.LocalScheduleCompositionProvenanceSnapshot
@@ -27,6 +30,9 @@ import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.TerminalExecutionOutcomeSnapshot
 import com.greengolddog.dayweave.model.localScheduleCompositionStateFingerprint
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundEntityKind
+import com.greengolddog.dayweave.network.GoogleCalendarOutboundOperation
+import com.greengolddog.dayweave.network.RemoteGoogleOutboundApproval
 import com.greengolddog.dayweave.network.ScheduleAvailabilityRequest
 import com.greengolddog.dayweave.network.SchedulePreviewRequest
 import com.greengolddog.dayweave.network.SchedulePublishRequest
@@ -48,6 +54,8 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
@@ -59,7 +67,7 @@ import org.junit.Test
 
 class PlannerStateRepositoryTest {
     @Test
-    fun v1ThroughV9LabelsDiscardInjectedLocalProvenanceAndSchedulingProfile() = runBlocking {
+    fun v1ThroughV9LabelsDiscardInjectedNewerPolicyAndOutboundAuthority() = runBlocking {
         val predecessorFormats = listOf(
             PlannerSnapshotFormats.JSON_V1,
             PlannerSnapshotFormats.JSON_V2,
@@ -91,6 +99,10 @@ class PlannerStateRepositoryTest {
                             "defaultSoftWeight" to JsonPrimitive(999),
                         ),
                     ),
+                    "pendingGoogleCalendarOutbound" to Json.encodeToJsonElement(
+                        GoogleCalendarOutboundJournal.serializer(),
+                        validOutboundJournal(),
+                    ),
                 ),
             )
             dao.snapshot = current.copy(
@@ -102,15 +114,17 @@ class PlannerStateRepositoryTest {
 
             assertEquals(null, restored.localScheduleCompositionProvenance)
             assertEquals(ScheduleCompositionProfileSnapshot(), restored.scheduleCompositionProfile)
-            assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+            assertEquals(null, restored.pendingGoogleCalendarOutbound)
+            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         }
     }
 
     @Test
-    fun v10RequiresLocalProvenanceAndSchedulingProfileRootFields() = runBlocking {
+    fun v11RequiresLocalProvenanceAndSchedulingProfileRootFields() = runBlocking {
         listOf(
             "localScheduleCompositionProvenance",
             "scheduleCompositionProfile",
+            "pendingGoogleCalendarOutbound",
         ).forEach { missingField ->
             val dao = FakePlannerSnapshotDao()
             val repository = RoomPlannerStateRepository(dao) { 4 }
@@ -130,6 +144,150 @@ class PlannerStateRepositoryTest {
             }
             assertEquals(missing, dao.snapshot)
         }
+    }
+
+    @Test
+    fun v10CannotSmuggleOutboundAuthorityAndMigratesWithNullAuthority() = runBlocking {
+        listOf(true, false).forEach { injectNewerField ->
+            val now = Instant.parse("2026-09-02T12:10:00Z").toEpochMilli()
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { now }
+            repository.save(outboundState(validOutboundJournal()))
+            val current = requireNotNull(dao.snapshot)
+            val root = Json.parseToJsonElement(current.payload).jsonObject
+            val v10Payload = if (injectNewerField) root else {
+                JsonObject(root - "pendingGoogleCalendarOutbound")
+            }
+            dao.snapshot = current.copy(
+                payload = Json.encodeToString(JsonObject.serializer(), v10Payload),
+                payloadFormat = PlannerSnapshotFormats.JSON_V10,
+            )
+
+            val restored = requireNotNull(repository.load())
+
+            assertEquals(null, restored.pendingGoogleCalendarOutbound)
+            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertTrue(
+                requireNotNull(dao.snapshot).payload.contains(
+                    "\"pendingGoogleCalendarOutbound\":null",
+                ),
+            )
+            assertFalse(requireNotNull(dao.snapshot).payload.contains(OUTBOUND_CAPABILITY))
+        }
+    }
+
+    @Test
+    fun currentAndExpiredOutboundRecoveryJournalsRoundTripExactly() = runBlocking {
+        val now = Instant.parse("2026-09-02T12:10:00Z")
+        val expiredAttempt = validOutboundJournal(
+            stage = GoogleCalendarOutboundStage.APPROVAL_ATTEMPTED,
+            createdAt = "2026-09-02T10:00:00Z",
+            intentExpiresAt = "2026-09-02T10:30:00Z",
+            previewExpiresAt = "2026-09-02T10:20:00Z",
+            approvalExpiresAt = "2026-09-02T10:15:00Z",
+        )
+        val expiredApproved = validOutboundJournal(
+            stage = GoogleCalendarOutboundStage.APPROVED,
+            createdAt = "2026-09-02T10:00:00Z",
+            intentExpiresAt = "2026-09-02T10:30:00Z",
+            previewExpiresAt = "2026-09-02T10:20:00Z",
+            approvalExpiresAt = "2026-09-02T10:15:00Z",
+        )
+        assertTrue(expiredAttempt.canDiscardExpiredAt(now))
+        assertTrue(expiredApproved.canDiscardExpiredAt(now))
+
+        (
+            GoogleCalendarOutboundStage.entries.map { validOutboundJournal(stage = it) } +
+                listOf(expiredAttempt, expiredApproved)
+        ).forEach { journal ->
+            val dao = FakePlannerSnapshotDao()
+            val repository = RoomPlannerStateRepository(dao) { now.toEpochMilli() }
+
+            repository.save(outboundState(journal))
+            val restored = requireNotNull(repository.load())
+
+            assertEquals(journal, restored.pendingGoogleCalendarOutbound)
+            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        }
+    }
+
+    @Test
+    fun malformedAndFutureCreatedOutboundJournalsFailClosed() = runBlocking {
+        val now = Instant.parse("2026-09-02T12:00:00Z").toEpochMilli()
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { now }
+        repository.save(outboundState(validOutboundJournal()))
+        val stored = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(stored.payload).jsonObject
+        val journal = root.getValue("pendingGoogleCalendarOutbound").jsonObject
+        dao.snapshot = stored.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(
+                    root + (
+                        "pendingGoogleCalendarOutbound" to JsonObject(
+                            journal + ("operationGeneration" to JsonPrimitive(0)),
+                        )
+                    ),
+                ),
+            ),
+        )
+        val malformed = requireNotNull(dao.snapshot)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking { repository.load() }
+        }
+        assertEquals(malformed, dao.snapshot)
+
+        val futureCreated = validOutboundJournal(
+            stage = GoogleCalendarOutboundStage.INTENT,
+            createdAt = "2026-09-02T12:05:01Z",
+            intentExpiresAt = "2026-09-02T12:30:00Z",
+            previewExpiresAt = "2026-09-02T12:20:00Z",
+            approvalExpiresAt = "2026-09-02T12:15:00Z",
+        )
+        val directDao = FakePlannerSnapshotDao()
+        assertThrows(SerializationException::class.java) {
+            runBlocking {
+                RoomPlannerStateRepository(directDao) { now }.save(
+                    outboundState(futureCreated),
+                )
+            }
+        }
+        assertEquals(null, directDao.snapshot)
+    }
+
+    @Test
+    fun outboundJournalCannotCrossCanonicalApiBindingOnSaveOrLoad() = runBlocking {
+        val now = Instant.parse("2026-09-02T12:10:00Z").toEpochMilli()
+        val journal = validOutboundJournal()
+        val directDao = FakePlannerSnapshotDao()
+        assertThrows(SerializationException::class.java) {
+            runBlocking {
+                RoomPlannerStateRepository(directDao) { now }.save(
+                    outboundState(journal).copy(canonicalConfigurationId = "other-binding"),
+                )
+            }
+        }
+        assertEquals(null, directDao.snapshot)
+
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { now }
+        repository.save(outboundState(journal))
+        val stored = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(stored.payload).jsonObject
+        dao.snapshot = stored.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(root + ("canonicalSyncOrigin" to JsonPrimitive("https://other.test/"))),
+            ),
+        )
+        val mismatched = requireNotNull(dao.snapshot)
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        assertEquals(mismatched, dao.snapshot)
     }
 
     @Test
@@ -165,7 +323,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun staleReorderedV10ProvenanceIsQuarantinedBeforeOneCanonicalRewrite() = runBlocking {
+    fun staleReorderedV11ProvenanceIsQuarantinedBeforeOneCanonicalRewrite() = runBlocking {
         val dao = FakePlannerSnapshotDao()
         val repository = RoomPlannerStateRepository(dao) { 6 }
         val valid = localProvenanceState()
@@ -203,7 +361,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun v8SnapshotWithoutNotificationReceiptsUpgradesToV10WithNoSuppressionAuthority() =
+    fun v8SnapshotWithoutNotificationReceiptsUpgradesToV11WithNoSuppressionAuthority() =
         runBlocking {
             val dao = FakePlannerSnapshotDao()
             val repository = RoomPlannerStateRepository(dao) { 4 }
@@ -230,7 +388,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
             assertTrue(requireNotNull(dao.snapshot).payload.contains(
                 "\"lastBreakEndNotificationAttemptDigest\":null",
             ))
@@ -261,12 +419,12 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         }
     }
 
     @Test
-    fun v10MissingAnySafetyReceiptFailsClosedWithoutRewritingFixture() = runBlocking {
+    fun v11MissingAnySafetyReceiptFailsClosedWithoutRewritingFixture() = runBlocking {
         val dao = FakePlannerSnapshotDao()
         val repository = RoomPlannerStateRepository(dao) { 8 }
         repository.save(DayWeaveUiState())
@@ -324,7 +482,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV10() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV11() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -339,7 +497,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -377,7 +535,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -430,7 +588,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -643,7 +801,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -672,7 +830,7 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matches(restored.schedule.single()),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
 
         dao.snapshot = requireNotNull(dao.snapshot).copy(
             payload = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -825,7 +983,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(null, restored.publishedScheduleProof)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
@@ -895,7 +1053,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -1003,7 +1161,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -1027,7 +1185,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V10, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 
@@ -1077,6 +1235,104 @@ class PlannerStateRepositoryTest {
         }
         assertTrue(requireNotNull(failure.message).contains("does not match its exact replacement"))
         assertEquals(31L, dao.snapshot?.updatedAtEpochMillis)
+    }
+
+    private fun outboundState(journal: GoogleCalendarOutboundJournal) = DayWeaveUiState(
+        canonicalSyncOrigin = OUTBOUND_API_BASE_URL,
+        canonicalConfigurationId = OUTBOUND_CONFIGURATION_ID,
+        canonicalDeltaCursor = "cursor-1",
+        pendingGoogleCalendarOutbound = journal,
+    )
+
+    private fun validOutboundJournal(
+        stage: GoogleCalendarOutboundStage = GoogleCalendarOutboundStage.APPROVED,
+        createdAt: String = "2026-09-02T12:00:00Z",
+        intentExpiresAt: String = "2026-09-02T12:30:00Z",
+        previewExpiresAt: String = "2026-09-02T12:20:00Z",
+        approvalExpiresAt: String = "2026-09-02T12:15:00Z",
+    ): GoogleCalendarOutboundJournal {
+        val intent = GoogleCalendarOutboundJournal(
+            recoveryId = "11111111-1111-4111-8111-111111111111",
+            operationGeneration = 1,
+            configurationId = OUTBOUND_CONFIGURATION_ID,
+            apiBaseUrl = OUTBOUND_API_BASE_URL,
+            accountId = "22222222-2222-4222-8222-222222222222",
+            collectionId = "33333333-3333-4333-8333-333333333333",
+            itemId = "44444444-4444-4444-8444-444444444444",
+            expectedItemRevision = 7,
+            intentExpiresAt = intentExpiresAt,
+            createdAt = createdAt,
+        )
+        if (stage == GoogleCalendarOutboundStage.INTENT) return intent
+        val previewed = intent.recordingPreview(
+            GoogleCalendarOutboundPreviewSnapshot(
+                id = "55555555-5555-4555-8555-555555555555",
+                accountId = intent.accountId,
+                collectionId = intent.collectionId,
+                collectionRevision = 4,
+                collectionDisplayName = "Private calendar",
+                itemId = intent.itemId,
+                itemRevision = intent.expectedItemRevision,
+                entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+                operation = GoogleCalendarOutboundOperation.UPSERT,
+                previewHash = "a".repeat(64),
+                providerPayload = validOutboundProviderPayload(),
+                expiresAt = previewExpiresAt,
+            ),
+        )
+        if (stage == GoogleCalendarOutboundStage.PREVIEWED) return previewed
+        val attempted = previewed.recordingApprovalAttempt()
+        if (stage == GoogleCalendarOutboundStage.APPROVAL_ATTEMPTED) return attempted
+        return attempted.recordingApproval(
+            RemoteGoogleOutboundApproval(
+                previewId = requireNotNull(attempted.preview).id,
+                approvalCapability = OUTBOUND_CAPABILITY,
+                expiresAt = approvalExpiresAt,
+            ),
+        )
+    }
+
+    private fun validOutboundProviderPayload(): JsonObject {
+        fun boundary(dateTime: String) = JsonObject(
+            mapOf(
+                "date" to JsonNull,
+                "dateTime" to JsonPrimitive(dateTime),
+                "timeZone" to JsonPrimitive("Europe/Paris"),
+            ),
+        )
+        return JsonObject(
+            mapOf(
+                "id" to JsonPrimitive("d1" + "a".repeat(64)),
+                "etag" to JsonNull,
+                "summary" to JsonPrimitive("Private focus"),
+                "description" to JsonPrimitive("Private notes"),
+                "location" to JsonNull,
+                "status" to JsonPrimitive("confirmed"),
+                "transparency" to JsonPrimitive("opaque"),
+                "visibility" to JsonPrimitive("private"),
+                "eventType" to JsonPrimitive("default"),
+                "start" to boundary("2026-09-02T10:00:00+02:00"),
+                "end" to boundary("2026-09-02T11:00:00+02:00"),
+                "attendees" to JsonArray(emptyList()),
+                "attachments" to JsonArray(emptyList()),
+                "recurrence" to JsonArray(emptyList()),
+                "conferenceData" to JsonNull,
+                "recurringEventId" to JsonNull,
+                "originalStartTime" to JsonNull,
+                "updated" to JsonNull,
+                "sequence" to JsonNull,
+                "extendedProperties" to JsonObject(
+                    mapOf(
+                        "private" to JsonObject(
+                            mapOf(
+                                "dayweaveOwnershipProof" to JsonPrimitive(OWNERSHIP_PROOF),
+                            ),
+                        ),
+                        "shared" to JsonObject(emptyMap()),
+                    ),
+                ),
+            ),
+        )
     }
 
     private fun localProvenanceState(): DayWeaveUiState {
@@ -1310,6 +1566,11 @@ class PlannerStateRepositoryTest {
     private companion object {
         const val EXECUTION_SESSION_ID = "44444444-4444-4444-8444-444444444444"
         const val EXECUTION_DEVICE_ID = "55555555-5555-4555-8555-555555555555"
+        const val OUTBOUND_API_BASE_URL = "https://api.example.test/"
+        const val OUTBOUND_CONFIGURATION_ID = "connection-1"
+        const val OUTBOUND_CAPABILITY =
+            "dw_ga1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        const val OWNERSHIP_PROOF = "[server-managed]"
         const val LEGACY_V2_PAYLOAD = """
             {
               "schedule": [{

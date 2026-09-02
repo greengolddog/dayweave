@@ -300,7 +300,7 @@ fun GoogleSourcesCard(
         }
 
         Text(
-            "Android imports calendars and task lists only. Publishing changes back to Google is never enabled from these controls.",
+            "These controls are inbound-only. A writable Publish calendar configured on macOS can be used separately from an exact event review in Items.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)

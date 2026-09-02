@@ -60,6 +60,8 @@ data class GoogleImportCollectionState(
     val calendarPolicy: RemoteGoogleCalendarPolicy,
     val revision: Long,
     val lastImportAt: String?,
+    /** Provider authority is required to prove an outbound Calendar target is owner/writer. */
+    val providerAccessRole: String? = null,
 ) {
     /** Calendar names and server identifiers are private even though they are not credentials. */
     override fun toString(): String =
@@ -1767,6 +1769,7 @@ private fun RemoteGoogleSyncCollection.toState(): GoogleImportCollectionState =
         calendarPolicy = calendarPolicy,
         revision = revision,
         lastImportAt = lastImportAt,
+        providerAccessRole = providerAccessRole,
     )
 
 private fun RemoteGoogleSyncRunStatus.toState(): GoogleImportRunState = GoogleImportRunState(

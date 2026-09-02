@@ -160,6 +160,44 @@ plus Google account pause and disconnect are fenced while import recovery is out
 a paused account remains available so the saved import can finish. Only the existing explicitly
 confirmed local-destruction flow can abandon an irrecoverable marker.
 
+## Explicit Google Calendar publication
+
+Android can publish one exact synced DayWeave event from **Inbox → Items → Publish**. This first
+outbound slice is deliberately narrower than import: the event must be app-authored, planned,
+non-recurring, non-all-day, confirmed, busy, timed, indivisible, current, and free of any pending
+canonical edit. The destination must be a selected Calendar that Google still reports as
+`owner` or `writer`, the account must retain full Calendar write scope, and the source must already
+have the **Writable / Publish** role configured on macOS. Android's **Google sources** controls
+remain inbound-only and cannot silently grant or select a write destination.
+
+The Publish action opens a screenshot-protected review surface. Multiple eligible calendars require
+an explicit destination choice. Android asks the server for the exact private Calendar payload and
+independently rejects all-day, tentative, free, recurring, attendee, organizer, conferencing,
+attachment, aliased collaboration, or any extra provider field. The accepted wire shape is the
+server's exact 20-field event projection with inert provider metadata and one redacted
+`dayweaveOwnershipProof`; missing, renamed, non-null, shared, or additional metadata fails closed.
+It shows only sanitized account-qualified destination, create/update,
+title, description, start, end, status, availability, and expiry values; server ownership proof,
+extended properties, hashes, identifiers, bearer tokens, and approval capabilities never enter the
+display or diagnostics. **Approve & Queue** is the only approval path. Success means the durable
+server outbox accepted the exact upsert—it does not claim that Google has published it yet. Android
+does not expose Calendar deletion, Google Tasks writes, or automatic schedule-block publication in
+this slice.
+
+The encrypted Room snapshot journals `INTENT → PREVIEWED → APPROVAL_ATTEMPTED → APPROVED` before
+each consequential request. An interrupted intent may replay only after the canonical revision,
+credential binding, account authority, selected Calendar, role, and collection revision are all
+current. A preview is never approved automatically. Because approval issuance is one-shot, an
+ambiguous or cancelled approval remains at `APPROVAL_ATTEMPTED` and is never retried. An approved
+capability is persisted before enqueue and replays only the exact enqueue until a validated HTTP
+202 receipt clears it. The approval request body is marked one-shot, authenticated refresh cannot
+replay it, and the outbound HTTP client disables automatic connection retries. Credential
+replacement, account pause/disconnect, canonical writes, and a
+second publication remain fenced while recovery exists. After the active authority plus the
+five-minute clock-skew margin expires, only the explicit **Discard expired recovery** action may
+remove it. JSON snapshot v11 and Room migration 10→11 introduce this recovery field without a
+plaintext schema column or backup surface.
+
 ## Canonical authoring and recovery
 
 Android has a typed, encrypted, offline-first path for canonical create, replace, trash, and restore

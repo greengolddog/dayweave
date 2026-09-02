@@ -57,12 +57,19 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V10 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V11 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V10 -> {
+                decodeCurrentSnapshot(
+                    payload = snapshot.payload,
+                    requireGoogleCalendarOutboundField = false,
+                ).copy(pendingGoogleCalendarOutbound = null)
+            }
             PlannerSnapshotFormats.JSON_V9 -> {
                 decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
+                    requireGoogleCalendarOutboundField = false,
                 ).withoutLocalScheduleCompositionState()
             }
             PlannerSnapshotFormats.JSON_V8 -> {
@@ -71,6 +78,7 @@ class RoomPlannerStateRepository(
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
+                    requireGoogleCalendarOutboundField = false,
                 ).withoutTimedBreakNotificationReceipts()
                     .withoutLocalScheduleCompositionState()
             }
@@ -81,6 +89,7 @@ class RoomPlannerStateRepository(
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
+                    requireGoogleCalendarOutboundField = false,
                 ).withoutTimedBreakNotificationReceipts()
                     .withoutLocalScheduleCompositionState()
                     .copy(publishedScheduleProof = null)
@@ -93,6 +102,7 @@ class RoomPlannerStateRepository(
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
+                    requireGoogleCalendarOutboundField = false,
                 ).withoutTimedBreakNotificationReceipts()
                     .withoutLocalScheduleCompositionState()
                     .copy(publishedScheduleProof = null)
@@ -106,6 +116,7 @@ class RoomPlannerStateRepository(
                     requireTimedBreakNotificationFields = false,
                     requireLocalScheduleCompositionField = false,
                     requireScheduleCompositionProfileField = false,
+                    requireGoogleCalendarOutboundField = false,
                 ).withoutTimedBreakNotificationReceipts()
                     .withoutLocalScheduleCompositionState()
                     .copy(publishedScheduleProof = null)
@@ -146,7 +157,14 @@ class RoomPlannerStateRepository(
             }
             else -> error("Unsupported planner snapshot format")
         }
-        val notificationHardened = decoded.withInvalidTimedBreakNotificationAttemptAbandoned()
+        val outboundHardened = if (snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11) {
+            decoded
+        } else {
+            // No predecessor format can mint or retain Google provider-mutation authority.
+            decoded.copy(pendingGoogleCalendarOutbound = null)
+        }
+        val notificationHardened =
+            outboundHardened.withInvalidTimedBreakNotificationAttemptAbandoned()
         val hardened = notificationHardened.localScheduleCompositionProvenance?.let { provenance ->
             if (provenance.matchesState(notificationHardened)) {
                 notificationHardened
@@ -155,7 +173,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V10 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V11 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -176,12 +194,13 @@ class RoomPlannerStateRepository(
         validateSchedulePublicationState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
+        validateGoogleCalendarOutboundState(retainedState)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V10,
+                payloadFormat = PlannerSnapshotFormats.JSON_V11,
             ),
         )
     }
@@ -194,6 +213,7 @@ class RoomPlannerStateRepository(
         requireTimedBreakNotificationFields: Boolean = true,
         requireLocalScheduleCompositionField: Boolean = true,
         requireScheduleCompositionProfileField: Boolean = true,
+        requireGoogleCalendarOutboundField: Boolean = true,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -215,11 +235,17 @@ class RoomPlannerStateRepository(
             // V9 and predecessors cannot gain local-plan provenance from an injected newer field.
             JsonObject(timedBreakSafeRoot - "localScheduleCompositionProvenance")
         }
-        val root = if (requireScheduleCompositionProfileField) {
+        val scheduleProfileSafeRoot = if (requireScheduleCompositionProfileField) {
             localCompositionSafeRoot
         } else {
             // An older label cannot opt into a newer scheduling policy by injecting a known field.
             JsonObject(localCompositionSafeRoot - "scheduleCompositionProfile")
+        }
+        val root = if (requireGoogleCalendarOutboundField) {
+            scheduleProfileSafeRoot
+        } else {
+            // V10 and predecessors cannot gain provider-mutation authority from an injected field.
+            JsonObject(scheduleProfileSafeRoot - "pendingGoogleCalendarOutbound")
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -245,6 +271,12 @@ class RoomPlannerStateRepository(
             !root.containsKey("scheduleCompositionProfile")
         ) {
             throw SerializationException("Current schedule composition profile is required")
+        }
+        if (
+            requireGoogleCalendarOutboundField &&
+            !root.containsKey("pendingGoogleCalendarOutbound")
+        ) {
+            throw SerializationException("Current Google Calendar outbound recovery is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -295,6 +327,7 @@ class RoomPlannerStateRepository(
                 validateSchedulePublicationState(it)
                 validateProposalApplicationState(it)
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
+                validateGoogleCalendarOutboundState(it)
             }
     }
 
@@ -777,6 +810,23 @@ class RoomPlannerStateRepository(
         val parsed = runCatching { UUID.fromString(value) }.getOrNull()
         if (parsed == null || parsed == UUID(0L, 0L) || parsed.toString() != value) {
             throw SerializationException("Invalid $description")
+        }
+    }
+
+    /** The one-time provider capability must stay inside one exact canonical API binding. */
+    private fun validateGoogleCalendarOutboundState(state: DayWeaveUiState) {
+        val journal = state.pendingGoogleCalendarOutbound ?: return
+        try {
+            journal.requireValidShape()
+            require(journal.isValidAt(Instant.ofEpochMilli(nowEpochMillis())))
+            require(
+                state.canonicalSyncOrigin == journal.apiBaseUrl &&
+                    state.canonicalConfigurationId == journal.configurationId,
+            ) { "Google Calendar outbound recovery crosses the canonical binding" }
+        } catch (error: SerializationException) {
+            throw error
+        } catch (error: Exception) {
+            throw SerializationException("Google Calendar outbound recovery is invalid", error)
         }
     }
 

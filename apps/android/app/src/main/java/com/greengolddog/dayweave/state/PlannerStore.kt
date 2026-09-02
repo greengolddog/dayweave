@@ -18,6 +18,8 @@ import com.greengolddog.dayweave.model.DerivedEnergySnapshot
 import com.greengolddog.dayweave.model.EnergyLevel
 import com.greengolddog.dayweave.model.EnergySignalSource
 import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
+import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
+import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
@@ -57,6 +59,7 @@ import com.greengolddog.dayweave.model.isApplicationReady
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.hasValidRecurrenceSourceFor
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
+import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
 import com.greengolddog.dayweave.model.recurrenceIdentityType
 import com.greengolddog.dayweave.model.requireCanonicalUuid
 import com.greengolddog.dayweave.model.usesReservedChangeSetNamespace
@@ -3430,10 +3433,108 @@ class PlannerStore(
             current.pendingExecutionCommand != null ||
             current.pendingExecutionDeferIntent != null ||
             current.pendingProposalApplicationMutation != null ||
+            current.pendingGoogleCalendarOutbound != null ||
             current.pendingCanonicalAuthoringMutations.any {
                 it.id !in preservableAuthoringIds
             } ||
             current.hasUnresolvedTerminalProjection()
+    }
+
+    /**
+     * Compare-and-saves one exact outbound recovery stage before its consequential network call.
+     * A fresh intent must still name the current synced fixed event; later responses may only
+     * advance the immutable saved intent through the model's audited state machine.
+     */
+    suspend fun replaceGoogleCalendarOutboundJournal(
+        expected: GoogleCalendarOutboundJournal?,
+        replacement: GoogleCalendarOutboundJournal,
+    ): Boolean {
+        val receipt = try {
+            mutateDurably { current ->
+                require(current.pendingGoogleCalendarOutbound == expected) {
+                    "Google Calendar outbound recovery changed"
+                }
+                if (expected == null) {
+                    require(replacement.stage == GoogleCalendarOutboundStage.INTENT)
+                    require(
+                        current.canonicalSyncOrigin == replacement.apiBaseUrl &&
+                            current.canonicalConfigurationId == replacement.configurationId,
+                    ) { "Google Calendar outbound recovery crosses the canonical binding" }
+                    val candidate = current.googleCalendarOutboundCandidate(replacement.itemId)
+                    require(
+                        candidate?.expectedItemRevision == replacement.expectedItemRevision,
+                    ) { "Google Calendar outbound item is no longer publishable" }
+                    require(
+                        current.pendingSchedulePublication == null &&
+                            current.pendingProposalApplicationMutation == null &&
+                            current.pendingCanonicalMutation == null &&
+                            current.pendingExecutionCommand == null &&
+                            current.pendingExecutionDeferIntent == null,
+                    ) { "Another canonical write must finish before Google publication" }
+                } else {
+                    require(expected.canTransitionTo(replacement)) {
+                        "Google Calendar outbound recovery transition is invalid"
+                    }
+                    if (
+                        replacement.stage == GoogleCalendarOutboundStage.PREVIEWED ||
+                        replacement.stage == GoogleCalendarOutboundStage.APPROVAL_ATTEMPTED
+                    ) {
+                        val candidate = current.googleCalendarOutboundCandidate(replacement.itemId)
+                        require(
+                            candidate?.expectedItemRevision == replacement.expectedItemRevision,
+                        ) { "Google Calendar outbound item changed before approval" }
+                    }
+                }
+                current.copy(pendingGoogleCalendarOutbound = replacement)
+            }
+        } catch (_: IllegalArgumentException) {
+            null
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return false
+        return receipt.awaitDurable() &&
+            durableState.value?.pendingGoogleCalendarOutbound == replacement
+    }
+
+    /** Clears only an exact approved journal after a strictly validated durable-outbox 202. */
+    suspend fun clearGoogleCalendarOutboundAfterAcceptance(
+        expected: GoogleCalendarOutboundJournal,
+    ): Boolean {
+        if (expected.stage != GoogleCalendarOutboundStage.APPROVED) return false
+        val receipt = try {
+            mutateDurably { current ->
+                require(current.pendingGoogleCalendarOutbound == expected) {
+                    "Google Calendar outbound recovery changed"
+                }
+                current.copy(pendingGoogleCalendarOutbound = null)
+            }
+        } catch (_: IllegalArgumentException) {
+            null
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return false
+        return receipt.awaitDurable() && durableState.value?.pendingGoogleCalendarOutbound == null
+    }
+
+    /** User-authorized escape hatch after every possible server authority has safely expired. */
+    suspend fun discardExpiredGoogleCalendarOutbound(
+        expected: GoogleCalendarOutboundJournal,
+        now: Instant,
+    ): Boolean {
+        if (!expected.canDiscardExpiredAt(now)) return false
+        val receipt = try {
+            mutateDurably { current ->
+                require(current.pendingGoogleCalendarOutbound == expected) {
+                    "Google Calendar outbound recovery changed"
+                }
+                current.copy(pendingGoogleCalendarOutbound = null)
+            }
+        } catch (_: IllegalArgumentException) {
+            null
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return false
+        return receipt.awaitDurable() && durableState.value?.pendingGoogleCalendarOutbound == null
     }
 
     /**
@@ -3921,6 +4022,7 @@ class PlannerStore(
             canonicalConfigurationId = null,
             canonicalDeltaCursor = null,
             pendingSchedulePublication = null,
+            pendingGoogleCalendarOutbound = null,
             pendingProposalApplicationMutation = null,
             proposalApplications = emptyMap(),
             publishedScheduleRevision = null,
