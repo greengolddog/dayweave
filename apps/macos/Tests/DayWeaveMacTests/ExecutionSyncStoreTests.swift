@@ -3788,7 +3788,8 @@ struct ExecutionSyncStoreTests {
         let empty = DayWeaveExecutionSnapshot(revision: 0, activeSession: nil)
         let transport = ExecutionTransportDouble(
             snapshots: [empty, empty],
-            pages: [.init(sessions: [], nextOffset: nil)]
+            pages: [.init(sessions: [], nextOffset: nil)],
+            repeatsLastResponses: true
         )
         let stream = ExecutionStreamDouble(
             revisions: [],
@@ -3824,15 +3825,21 @@ struct ExecutionSyncStoreTests {
 
         connectionAvailability.isAvailable = true
         let recoveryDeadline = ContinuousClock.now.advanced(by: .seconds(5))
-        while await stream.requestedRevisions().isEmpty,
-              ContinuousClock.now < recoveryDeadline {
+        var requestedRevisions: [UInt64] = []
+        repeat {
+            requestedRevisions = await stream.requestedRevisions()
+            if requestedRevisions == [0],
+               planner.executionState.historyVerified,
+               sync.status.phase == .connected {
+                break
+            }
             try await Task.sleep(for: .milliseconds(10))
-        }
+        } while ContinuousClock.now < recoveryDeadline
         sync.stopForegroundPolling()
 
         #expect(planner.executionState.bindingIdentifier == Self.binding)
         #expect(planner.executionState.historyVerified)
-        #expect(await stream.requestedRevisions() == [0])
+        #expect(requestedRevisions == [0])
         #expect(sync.status.phase == .connected)
     }
 
@@ -4956,6 +4963,7 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
     private var assessmentRequests: [DayWeaveDeferAssessmentRequest] = []
     private var snapshotCount = 0
     private var lastSnapshot: DayWeaveExecutionSnapshot?
+    private let repeatsLastResponses: Bool
     private let snapshotDelay: Duration?
     private let onCommandReceived: (@Sendable () -> Void)?
 
@@ -4964,6 +4972,7 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
         pages: [DayWeaveExecutionHistoryPage],
         commandReplies: [Reply] = [],
         assessmentReplies: [AssessmentReply] = [],
+        repeatsLastResponses: Bool = false,
         snapshotDelay: Duration? = nil,
         onCommandReceived: (@Sendable () -> Void)? = nil
     ) {
@@ -4971,6 +4980,7 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
         self.pages = pages
         self.commandReplies = commandReplies
         self.assessmentReplies = assessmentReplies
+        self.repeatsLastResponses = repeatsLastResponses
         self.snapshotDelay = snapshotDelay
         self.onCommandReceived = onCommandReceived
     }
@@ -4978,8 +4988,12 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
     func executionSnapshot() async throws -> DayWeaveExecutionSnapshot {
         snapshotCount += 1
         if let snapshotDelay { try await Task.sleep(for: snapshotDelay) }
-        guard !snapshots.isEmpty else { throw DayWeaveAPIError.responseDecodingFailed }
-        let snapshot = snapshots.removeFirst()
+        guard let snapshot = snapshots.first else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        if !repeatsLastResponses || snapshots.count > 1 {
+            snapshots.removeFirst()
+        }
         lastSnapshot = snapshot
         return snapshot
     }
@@ -4989,8 +5003,13 @@ private actor ExecutionTransportDouble: DayWeaveExecutionTransport {
     {
         offsets.append(offset)
         guard limit == DayWeaveAPIClient.maximumExecutionHistoryLimit,
-              !pages.isEmpty else { throw DayWeaveAPIError.responseDecodingFailed }
-        return pages.removeFirst()
+              let page = pages.first else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        if !repeatsLastResponses || pages.count > 1 {
+            pages.removeFirst()
+        }
+        return page
     }
 
     nonisolated func encodedExecutionCommand(
