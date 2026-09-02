@@ -2611,22 +2611,19 @@ async fn deferred_publication_requires_an_exact_pinned_binding_and_preserves_rec
     );
     let access = owner_access(scope, "auth0|deferred-publication-owner");
     let item_id = Uuid::new_v4();
-    items
-        .create(
-            task(
-                item_id,
-                "Keep the exact deferred promise",
-                false,
-                None,
-                json!({}),
-            ),
-            idempotency(141),
-        )
-        .await
-        .unwrap();
+    let fixture_day = future_fixture_day_start();
+    let move_start = fixture_day + chrono::Duration::hours(11);
+    let move_end = move_start + chrono::Duration::minutes(40);
+    let mut source_item = task(
+        item_id,
+        "Keep the exact deferred promise",
+        false,
+        None,
+        json!({}),
+    );
+    source_item.deadline_at = Some(fixture_day + chrono::Duration::hours(17));
+    items.create(source_item, idempotency(141)).await.unwrap();
     let item = items.get(item_id).await.unwrap();
-    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
-    let move_end: chrono::DateTime<Utc> = "2026-09-01T11:40:00Z".parse().unwrap();
 
     let exact_request = deferred_compose_request(item_id, item.revision, move_start, move_end);
     let pre_defer_preview = compose_canonical_schedule(&items, &schedules, exact_request.clone())
@@ -3158,19 +3155,18 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
     ));
     let access = owner_access(scope, "auth0|execution-precedence-owner");
     let item_id = Uuid::new_v4();
-    items
-        .create(
-            task(
-                item_id,
-                "Execution precedence fixture",
-                false,
-                None,
-                json!({}),
-            ),
-            idempotency(146),
-        )
-        .await
-        .unwrap();
+    let fixture_day = future_fixture_day_start();
+    let move_start = fixture_day + chrono::Duration::hours(11);
+    let move_end = move_start + chrono::Duration::minutes(40);
+    let mut source_item = task(
+        item_id,
+        "Execution precedence fixture",
+        false,
+        None,
+        json!({}),
+    );
+    source_item.deadline_at = Some(fixture_day + chrono::Duration::hours(17));
+    items.create(source_item, idempotency(146)).await.unwrap();
     let item = items.get(item_id).await.unwrap();
     let execution = Arc::new(ExecutionService::new(
         Arc::new(PostgresExecutionRepository::new(
@@ -3180,7 +3176,7 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         items.clone(),
         Arc::new(SystemClock),
     ));
-    let mut request = compose_request();
+    let mut request = compose_request_for_day(fixture_day);
     request.fixed_blocks.clear();
     let initial_preview = compose_canonical_schedule(&items, &schedules, request.clone())
         .await
@@ -3229,8 +3225,6 @@ async fn active_execution_precedes_a_newer_defer_and_publication_waits_for_execu
         )
         .await
         .expect("start the exact current block");
-    let move_start: chrono::DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
-    let move_end: chrono::DateTime<Utc> = "2026-09-01T11:40:00Z".parse().unwrap();
     let active_preview = compose_canonical_schedule(&items, &schedules, request.clone())
         .await
         .expect("compose with the exact in-flight reservation");
@@ -4816,13 +4810,41 @@ fn compose_request() -> ComposeScheduleRequest {
     .unwrap()
 }
 
+/// Keeps execution/defer integration fixtures ahead of the wall clock without weakening the
+/// production requirement that a defer target outlive its short-lived assessment capability.
+fn future_fixture_day_start() -> chrono::DateTime<Utc> {
+    (Utc::now() + chrono::Duration::days(2))
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("future fixture day is representable")
+        .and_utc()
+}
+
+fn compose_request_for_day(day_start: chrono::DateTime<Utc>) -> ComposeScheduleRequest {
+    let mut request = compose_request();
+    request.as_of = day_start + chrono::Duration::hours(6);
+    request.horizon_start = day_start;
+    request.horizon_end = day_start + chrono::Duration::days(1);
+    let [availability] = request.availability.as_mut_slice() else {
+        panic!("the schedule fixture must contain exactly one availability window");
+    };
+    availability.start = day_start + chrono::Duration::hours(7);
+    availability.end = day_start + chrono::Duration::hours(18);
+    request
+}
+
 fn deferred_compose_request(
     item_id: Uuid,
     item_revision: u64,
     move_start: chrono::DateTime<Utc>,
     move_end: chrono::DateTime<Utc>,
 ) -> ComposeScheduleRequest {
-    let mut request = compose_request();
+    let fixture_day = move_start
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("defer fixture day is representable")
+        .and_utc();
+    let mut request = compose_request_for_day(fixture_day);
     request.fixed_blocks.clear();
     request.previous_assignments = vec![PreviousAssignmentInput {
         item_id,
