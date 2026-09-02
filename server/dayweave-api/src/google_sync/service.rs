@@ -85,6 +85,27 @@ where
     send(prepared, authorization).await
 }
 
+async fn replay_or_accept_refresh<Lookup, LookupFuture, Gate, GateFuture, Accept, AcceptFuture>(
+    lookup: Lookup,
+    active_account_gate: Gate,
+    accept: Accept,
+) -> Result<GoogleSyncRefreshAccepted, GoogleSyncServiceError>
+where
+    Lookup: FnOnce() -> LookupFuture,
+    LookupFuture:
+        Future<Output = Result<Option<GoogleSyncRefreshAccepted>, GoogleSyncServiceError>>,
+    Gate: FnOnce() -> GateFuture,
+    GateFuture: Future<Output = Result<(), GoogleSyncServiceError>>,
+    Accept: FnOnce() -> AcceptFuture,
+    AcceptFuture: Future<Output = Result<GoogleSyncRefreshAccepted, GoogleSyncServiceError>>,
+{
+    if let Some(accepted) = lookup().await? {
+        return Ok(accepted);
+    }
+    active_account_gate().await?;
+    accept().await
+}
+
 pub(crate) enum ProviderWriteResponse {
     Event(Box<GoogleEvent>),
     Task(Box<GoogleTask>),
@@ -627,12 +648,25 @@ impl GoogleSyncService {
         if request_id.is_nil() {
             return Err(GoogleSyncServiceError::InvalidRequest);
         }
-        self.oauth.account_for_sync(account_id).await?;
-        let now = self.clock.now();
-        Ok(self
-            .repository
-            .request_refresh(account_id, request_id, now)
-            .await?)
+        replay_or_accept_refresh(
+            || async {
+                Ok(self
+                    .repository
+                    .refresh_request(account_id, request_id)
+                    .await?)
+            },
+            || async {
+                self.oauth.account_for_sync(account_id).await?;
+                Ok(())
+            },
+            || async {
+                Ok(self
+                    .repository
+                    .request_refresh(account_id, request_id, self.clock.now())
+                    .await?)
+            },
+        )
+        .await
     }
 
     pub(crate) async fn status(
@@ -3386,7 +3420,146 @@ enum NormalizationError {
 mod tests {
     use super::*;
     use dayweave_google::calendar::{EventAttachment, EventAttendee};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        },
+    };
+
+    const REFRESH_ACCOUNT_ACTIVE: u8 = 0;
+    const REFRESH_ACCOUNT_PAUSED: u8 = 1;
+    const REFRESH_ACCOUNT_DISCONNECTED: u8 = 2;
+
+    struct RefreshReplayLifecycle {
+        account_state: AtomicU8,
+        accepted: Mutex<HashMap<Uuid, GoogleSyncRefreshAccepted>>,
+        next_generation: AtomicU64,
+        gate_calls: AtomicUsize,
+        accept_calls: AtomicUsize,
+    }
+
+    impl RefreshReplayLifecycle {
+        fn new() -> Self {
+            Self {
+                account_state: AtomicU8::new(REFRESH_ACCOUNT_ACTIVE),
+                accepted: Mutex::new(HashMap::new()),
+                next_generation: AtomicU64::new(0),
+                gate_calls: AtomicUsize::new(0),
+                accept_calls: AtomicUsize::new(0),
+            }
+        }
+
+        async fn request(
+            &self,
+            account_id: Uuid,
+            request_id: Uuid,
+        ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncServiceError> {
+            replay_or_accept_refresh(
+                || async {
+                    Ok(self
+                        .accepted
+                        .lock()
+                        .expect("accepted refresh lock")
+                        .get(&request_id)
+                        .cloned())
+                },
+                || async {
+                    self.gate_calls.fetch_add(1, Ordering::SeqCst);
+                    if self.account_state.load(Ordering::SeqCst) == REFRESH_ACCOUNT_ACTIVE {
+                        Ok(())
+                    } else {
+                        Err(GoogleSyncServiceError::OAuth(
+                            GoogleOAuthServiceError::Repository(
+                                crate::google_oauth::GoogleOAuthRepositoryError::AccountStateConflict,
+                            ),
+                        ))
+                    }
+                },
+                || async {
+                    self.accept_calls.fetch_add(1, Ordering::SeqCst);
+                    let accepted = GoogleSyncRefreshAccepted {
+                        account_id,
+                        request_id,
+                        refresh_generation: self.next_generation.fetch_add(1, Ordering::SeqCst) + 1,
+                        requested_at: "2026-09-02T08:00:00Z"
+                            .parse()
+                            .expect("fixed refresh time"),
+                    };
+                    self.accepted
+                        .lock()
+                        .expect("accepted refresh lock")
+                        .insert(request_id, accepted.clone());
+                    Ok(accepted)
+                },
+            )
+            .await
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_refresh_replays_before_paused_and_disconnected_account_gates() {
+        let lifecycle = RefreshReplayLifecycle::new();
+        let account_id = Uuid::from_u128(0xacc0_0001);
+        let accepted_request_id = Uuid::from_u128(0xfeed_0001);
+
+        // Model an accepted request whose HTTP response never reached the
+        // client. The durable acceptance is the only recovery proof.
+        let original = lifecycle
+            .request(account_id, accepted_request_id)
+            .await
+            .expect("initial refresh accepted");
+        assert_eq!(original.refresh_generation, 1);
+        assert_eq!(lifecycle.gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.accept_calls.load(Ordering::SeqCst), 1);
+
+        lifecycle
+            .account_state
+            .store(REFRESH_ACCOUNT_PAUSED, Ordering::SeqCst);
+        let paused_replay = lifecycle
+            .request(account_id, accepted_request_id)
+            .await
+            .expect("exact accepted request replays while paused");
+        assert_eq!(paused_replay, original);
+        assert_eq!(lifecycle.gate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lifecycle.accept_calls.load(Ordering::SeqCst), 1);
+        let paused_new = lifecycle
+            .request(account_id, Uuid::from_u128(0xfeed_0002))
+            .await;
+        assert!(matches!(
+            paused_new,
+            Err(GoogleSyncServiceError::OAuth(
+                GoogleOAuthServiceError::Repository(
+                    crate::google_oauth::GoogleOAuthRepositoryError::AccountStateConflict
+                )
+            ))
+        ));
+        assert_eq!(lifecycle.accept_calls.load(Ordering::SeqCst), 1);
+
+        lifecycle
+            .account_state
+            .store(REFRESH_ACCOUNT_DISCONNECTED, Ordering::SeqCst);
+        let disconnected_replay = lifecycle
+            .request(account_id, accepted_request_id)
+            .await
+            .expect("exact accepted request replays while disconnected");
+        assert_eq!(disconnected_replay, original);
+        assert_eq!(lifecycle.gate_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(lifecycle.accept_calls.load(Ordering::SeqCst), 1);
+        let disconnected_new = lifecycle
+            .request(account_id, Uuid::from_u128(0xfeed_0003))
+            .await;
+        assert!(matches!(
+            disconnected_new,
+            Err(GoogleSyncServiceError::OAuth(
+                GoogleOAuthServiceError::Repository(
+                    crate::google_oauth::GoogleOAuthRepositoryError::AccountStateConflict
+                )
+            ))
+        ));
+        assert_eq!(lifecycle.accept_calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn active_execution_close_conflict_is_a_short_backoff() {

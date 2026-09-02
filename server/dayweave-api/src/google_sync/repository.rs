@@ -67,6 +67,17 @@ pub(crate) trait GoogleSyncRepository: Send + Sync {
 
     async fn recover_startup(&self, now: DateTime<Utc>) -> Result<(), GoogleSyncRepositoryError>;
 
+    /// Returns the immutable acceptance record for an exact manual-refresh
+    /// request identity. Implementations must scope the lookup to the current
+    /// workspace and user, but must not require the provider account to remain
+    /// active: response-loss recovery outlives later pause or disconnect
+    /// mutations.
+    async fn refresh_request(
+        &self,
+        account_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<GoogleSyncRefreshAccepted>, GoogleSyncRepositoryError>;
+
     async fn request_refresh(
         &self,
         account_id: Uuid,

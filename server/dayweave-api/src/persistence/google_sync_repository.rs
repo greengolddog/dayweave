@@ -741,6 +741,37 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         Ok(())
     }
 
+    async fn refresh_request(
+        &self,
+        account_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<GoogleSyncRefreshAccepted>, GoogleSyncRepositoryError> {
+        let existing = sqlx::query(
+            "SELECT refresh_generation, requested_at FROM google_sync_refresh_requests \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND request_id = $4",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(account_id)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(internal)?;
+        existing
+            .map(|row| {
+                Ok(GoogleSyncRefreshAccepted {
+                    account_id,
+                    request_id,
+                    refresh_generation: i64_to_u64(
+                        row.try_get("refresh_generation").map_err(internal)?,
+                    )?,
+                    requested_at: row.try_get("requested_at").map_err(internal)?,
+                })
+            })
+            .transpose()
+    }
+
     async fn request_refresh(
         &self,
         account_id: Uuid,
@@ -748,9 +779,6 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         now: DateTime<Utc>,
     ) -> Result<GoogleSyncRefreshAccepted, GoogleSyncRepositoryError> {
         let mut transaction = self.pool.begin().await.map_err(internal)?;
-        self.ensure_account(&mut transaction, account_id, true)
-            .await?;
-        ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
         if let Some(existing) = sqlx::query(
             "SELECT refresh_generation, requested_at FROM google_sync_refresh_requests \
              WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
@@ -775,6 +803,9 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
             transaction.commit().await.map_err(internal)?;
             return Ok(accepted);
         }
+        self.ensure_account(&mut transaction, account_id, true)
+            .await?;
+        ensure_run_row(&mut transaction, self.scope, account_id, now).await?;
         let row = sqlx::query(
             "UPDATE google_sync_runs SET requested_at = $4, \
              next_attempt_at = CASE WHEN state = 'running' THEN next_attempt_at \
@@ -10475,6 +10506,82 @@ mod tests {
         .await
         .expect("refresh request count");
         assert_eq!(request_count, 1);
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_refresh_acceptance_outlives_pause_and_disconnect_without_authorizing_new_requests()
+     {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; refresh replay lifecycle test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let request_id = Uuid::new_v4();
+        let accepted = fixture
+            .repository
+            .request_refresh(fixture.account_id, request_id, fixture.now)
+            .await
+            .expect("initial refresh is durably accepted");
+
+        for status in ["paused", "revoked"] {
+            sqlx::query(
+                "UPDATE provider_accounts SET status = $4, sync_enabled = false, \
+                 revision = revision + 1, updated_at = $5 \
+                 WHERE workspace_id = $1 AND user_id = $2 AND id = $3",
+            )
+            .bind(fixture.scope.workspace_id)
+            .bind(fixture.scope.user_id)
+            .bind(fixture.account_id)
+            .bind(status)
+            .bind(fixture.now + Duration::minutes(1))
+            .execute(&fixture.database.pool)
+            .await
+            .expect("account lifecycle mutation");
+
+            let lookup = fixture
+                .repository
+                .refresh_request(fixture.account_id, request_id)
+                .await
+                .expect("acceptance lookup succeeds")
+                .expect("accepted request remains durable");
+            assert_eq!(lookup, accepted);
+            let replay = fixture
+                .repository
+                .request_refresh(
+                    fixture.account_id,
+                    request_id,
+                    fixture.now + Duration::hours(1),
+                )
+                .await
+                .expect("exact request replays before account-state validation");
+            assert_eq!(replay, accepted);
+
+            let new_request = fixture
+                .repository
+                .request_refresh(
+                    fixture.account_id,
+                    Uuid::new_v4(),
+                    fixture.now + Duration::hours(1),
+                )
+                .await;
+            assert_eq!(new_request, Err(GoogleSyncRepositoryError::AccountNotFound));
+        }
+
+        let other_user = PostgresGoogleSyncRepository::new(
+            fixture.database.pool.clone(),
+            DatabaseScope {
+                workspace_id: fixture.scope.workspace_id,
+                user_id: Uuid::new_v4(),
+            },
+        );
+        assert_eq!(
+            other_user
+                .refresh_request(fixture.account_id, request_id)
+                .await
+                .expect("cross-user lookup is safely empty"),
+            None
+        );
         fixture.database.destroy().await;
     }
 
