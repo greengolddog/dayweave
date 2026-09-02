@@ -3938,7 +3938,7 @@ private enum LocalCompositionCoordinatorError: LocalizedError {
         case .pendingProposalApplication:
             "Recover the exact pending proposal application or undo before composing on this device."
         case .pendingGoogleRecovery:
-            "Recover the pending Google Calendar publication before composing on this device."
+            "Recover the pending Google publication before composing on this device."
         case .pendingStatusMutation:
             "Resolve the pending canonical status journal before composing on this device."
         case .pendingSensitivityMutation:

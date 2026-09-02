@@ -404,6 +404,41 @@ struct CanonicalInboxPresentationTests {
         #expect(presentation.trash[0].isSensitive == deleted.isSensitive)
     }
 
+    @Test("active and completed items remain reachable as read-only lifecycle rows")
+    func activeAndCompletedSections() throws {
+        let scheduled = try decodeItem(
+            id: UUID(),
+            revision: 2,
+            deleted: false,
+            status: "scheduled"
+        )
+        let paused = try decodeItem(
+            id: UUID(),
+            revision: 3,
+            deleted: false,
+            status: "paused"
+        )
+        let completed = try decodeItem(
+            id: UUID(),
+            revision: 4,
+            deleted: false,
+            status: "completed"
+        )
+
+        let presentation = CanonicalInboxPresentation.build(
+            activeItems: [scheduled, paused, completed],
+            pendingMutations: [],
+            trashEntries: []
+        )
+
+        #expect(Set(presentation.active.map(\.itemID)) == Set([scheduled.id, paused.id]))
+        #expect(presentation.active.allSatisfy { $0.isReadOnly })
+        #expect(presentation.completed.map(\.itemID) == [completed.id])
+        #expect(presentation.completed.allSatisfy { $0.isReadOnly })
+        #expect(presentation.inbox.isEmpty)
+        #expect(presentation.planned.isEmpty)
+    }
+
     @Test("an active cross-device restore conflict remains reviewable and discardable")
     func activeRestoreConflictPresentation() throws {
         let itemID = UUID()
@@ -493,6 +528,34 @@ struct CanonicalInboxPresentationTests {
         #expect(presentation.trash.isEmpty)
     }
 
+    @Test("Google Task deletion excludes provider-imported trash")
+    func googleTaskDeletionEligibilityRequiresAppAuthoredConstraints() throws {
+        let itemID = UUID()
+        let authored = try decodeItem(
+            id: itemID,
+            revision: 4,
+            deleted: true,
+            flexibleConstraintsJSON: "{}"
+        )
+        let imported = try decodeItem(
+            id: itemID,
+            revision: 4,
+            deleted: true,
+            flexibleConstraintsJSON: #"{"google_sync":{"remote_id":"task-1"}}"#
+        )
+        let active = try decodeItem(
+            id: itemID,
+            revision: 4,
+            deleted: false,
+            flexibleConstraintsJSON: "{}"
+        )
+
+        #expect(authored.isEligibleForGoogleTaskPublication(deleted: true))
+        #expect(!imported.isEligibleForGoogleTaskPublication(deleted: true))
+        #expect(!active.isEligibleForGoogleTaskPublication(deleted: true))
+        #expect(active.isEligibleForGoogleTaskPublication(deleted: false))
+    }
+
     @Test("sensitivity is inherited through pending hierarchy and missing ancestry fails closed")
     func inheritedSensitivityPresentation() throws {
         let parentID = UUID()
@@ -541,19 +604,24 @@ struct CanonicalInboxPresentationTests {
     private func decodeItem(
         id: UUID,
         revision: UInt64,
-        deleted: Bool
+        deleted: Bool,
+        status: String = "inbox",
+        flexibleConstraintsJSON: String = "{}"
     ) throws -> DayWeaveCanonicalItem {
         let deletedAt = deleted
             ? ",\"deleted_at\":\"2026-08-30T10:00:00Z\""
             : ",\"deleted_at\":null"
+        let completedAt = status == "completed"
+            ? "\"2026-08-30T09:30:00Z\""
+            : "null"
         let json = """
         {"id":"\(id.uuidString.lowercased())","is_sensitive":true,"kind":"task",
-        "status":"inbox","title":"Deleted task","notes":null,"timezone_name":"Europe/Madrid",
+        "status":"\(status)","title":"Lifecycle task","notes":null,"timezone_name":"Europe/Madrid",
         "duration_seconds":null,"deadline_at":null,"earliest_start_at":null,"recurrence":null,
-        "flexible_constraints":{},"split_policy":{"type":"indivisible"},"importance":50,
+        "flexible_constraints":\(flexibleConstraintsJSON),"split_policy":{"type":"indivisible"},"importance":50,
         "urgency":50,"parent_id":null,"sibling_order":0,"is_executable":false,"revision":\(revision),
         "created_at":"2026-08-30T09:00:00Z","updated_at":"2026-08-30T10:00:00Z",
-        "completed_at":null\(deletedAt)}
+        "completed_at":\(completedAt)\(deletedAt)}
         """
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601

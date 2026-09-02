@@ -49,9 +49,9 @@ unrelated project.
    a restore-blocking incident, not routine key retirement.
 5. Request offline access and incremental authorization. The backend owns the
    encrypted refresh token; macOS and Android receive only a DayWeave session.
-6. Start with Calendar read access during import/onboarding. Request write
-   access when the owner enables the dedicated DayWeave calendar, and request
-   Tasks write access only when Google Tasks sync is enabled.
+6. Start with Calendar and Tasks read access during import/onboarding. Request
+   each service's write access separately and only when the owner enables a
+   selected Calendar or Task list for publication.
 
 The complete product needs these effective capabilities:
 
@@ -78,7 +78,7 @@ responses.
 
 #### macOS owner flow
 
-The native Mac client exposes import and explicitly reviewed Calendar
+The native Mac client exposes import and explicitly reviewed Calendar and Tasks
 publication after durable DayWeave device enrollment is active:
 
 1. Open **Settings → Accounts → Google** and choose **Connect Calendar & Tasks**.
@@ -92,7 +92,8 @@ publication after durable DayWeave device enrollment is active:
    browser attempt, so the client keeps that attempt's recovery journal until
    expiry. The authorization URL is never persisted.
 3. Choose **Discover sources** for an active account. Select Calendar sources as
-   reference-only or blocking and select Task lists as reference-only.
+   reference-only or blocking and select Task lists as reference-only. Task
+   lists never block calendar time.
 4. Choose **Refresh import**. The returned `202` is only durable queue
    acceptance. DayWeave polls sync status and pulls/recomposes canonical items
    only after the accepted monotonic refresh generation is completed by an idle
@@ -109,25 +110,33 @@ publication after durable DayWeave device enrollment is active:
    the retry completed. If sync status requires reauthorization while the
    provider account still appears active, the Reauthorize action remains
    available and preserves the pending completion marker.
-5. To publish, choose **Enable Calendar publishing** for that existing account.
-   The Mac requests exactly the broad Calendar service with forced incremental
-   consent; it does not request Tasks write scope. After the authoritative
-   account snapshot reports the grant, mark a selected Calendar **Publish**.
-   The Mac offers this role only when Google reports `owner` or `writer` access.
-   Confirmed busy timed events are enabled by default; all-day, tentative, and
-   free event publication are separate collection switches. Task lists remain
-   read-only in this client.
-6. In the Items Inbox, select a synced, app-authored fixed event and choose
-   **Publish Calendar**. The client accepts only an owned `dayweave_firm_block` (or
-   its recoverably trashed mapped event for deletion), requests the exact
-   preview, and displays the reviewed provider payload. Server-managed private
-   ownership-proof values are redacted from that view. **Approve & Queue** is the sole
-   path that creates approval authority. Preview, approval, and enqueue require
-   exact HTTP `200`, `200`, and `202` responses and validate every bound ID,
-   revision, operation, hash, entity kind, and expiry. Expiry validation tolerates
-   the supported five-minute device clock skew while locally elapsed authority
-   remains non-actionable.
-7. Android uses the same server preview/approval/outbox contract for a strict
+5. To publish Calendar events, choose **Enable Calendar publishing** for that
+   existing account. The Mac requests exactly the broad Calendar service with
+   forced incremental consent; it does not request Tasks write scope. After the
+   authoritative account snapshot reports the grant, mark a selected Calendar
+   **Publish**. The Mac offers this role only when Google reports `owner` or
+   `writer` access. Confirmed busy timed events are enabled by default; all-day,
+   tentative, and free event publication are separate collection switches.
+6. To publish tasks, separately choose **Enable Tasks publishing**. This requests
+   exactly the broad Tasks service against the existing account and does not
+   expand Calendar access. After the authoritative account snapshot reports the
+   grant, mark a selected Task list **Publish**. Blocking is never available for
+   a Task list, and a Calendar-only grant cannot make one writable.
+7. In the Items Inbox, select a supported synced, app-authored fixed event or
+   task and choose its Google publication action. The client accepts only an
+   owned `dayweave_firm_block` for Calendar, or a non-recurring Task whose
+   canonical fields can round-trip safely. Imported, unsupported, skipped, and
+   canceled Tasks remain local/import-only. A recoverably trashed mapped event
+   or Task may be reviewed for deletion. The client requests the exact preview
+   and displays the reviewed provider payload; DayWeave-only Task planning
+   metadata is not sent, and server-managed Calendar ownership-proof values are
+   redacted. **Approve & Queue** is the sole path that creates approval
+   authority. Preview, approval, and enqueue require exact HTTP `200`, `200`,
+   and `202` responses and validate every bound ID, revision, operation, hash,
+   entity kind, and expiry. Expiry validation tolerates the supported
+   five-minute device clock skew while locally elapsed authority remains
+   non-actionable.
+8. Android uses the same server preview/approval/outbox contract for a strict
    upsert-only subset. Configure the account's full Calendar grant and writable
    **Publish** destination on macOS first, refresh **More → Google sources** on
    Android, then use **Inbox → Items → Publish**. Android accepts only a current

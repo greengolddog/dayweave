@@ -6393,6 +6393,7 @@ extension PlannerStore: GoogleOutboundRecoveryStoring {
               existing.collectionID == replacement.collectionID,
               existing.itemID == replacement.itemID,
               existing.expectedItemRevision == replacement.expectedItemRevision,
+              existing.entityKind == replacement.entityKind,
               existing.operation == replacement.operation,
               existing.intentExpiresAt == replacement.intentExpiresAt,
               existing.createdAt == replacement.createdAt else {

@@ -308,6 +308,182 @@ struct GoogleIntegrationStoreTests {
         #expect(store.canOpenAuthorization)
     }
 
+    @Test("Tasks publishing scope upgrade is explicit and crash recoverable")
+    func tasksPublishingScopeUpgradeIsExplicit() async throws {
+        let account = try Self.account()
+        let snapshot = try Self.accountsSnapshot(accounts: [account])
+        let authorization = try Self.authorization()
+        let journalStore = InMemoryGoogleOAuthStartJournalStore()
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(snapshot), .value(snapshot)],
+            oauthStarts: [.value(authorization)],
+            collections: [.value([])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: account.id))]
+        )
+        let store = Self.store(transport: transport, journalStore: journalStore)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        #expect(!store.hasTasksPublishingScope(for: account))
+        #expect(store.canEnableTasksPublishing(for: account))
+        await store.enableTasksPublishing(for: account)
+
+        let record = try #require((await transport.oauthStartRecords()).last)
+        #expect(record.request.services == [.tasks])
+        #expect(record.request.forceConsent)
+        #expect(record.request.accountID == account.id)
+        #expect(!record.request.connectNew)
+        #expect(record.request.makeDefault)
+        #expect(journalStore.journal?.request == record.request)
+        #expect(store.canOpenAuthorization)
+    }
+
+    @Test("Tasks publishing uses its exact scope when reauthorization is required")
+    func tasksPublishingReauthorizationPreservesScope() async throws {
+        let account = try Self.account(
+            status: .reauthorizationRequired,
+            tasksWrite: true
+        )
+        let snapshot = try Self.accountsSnapshot(accounts: [account])
+        let authorization = try Self.authorization()
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(snapshot), .value(snapshot)],
+            oauthStarts: [.value(authorization)]
+        )
+        let store = Self.store(transport: transport)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        #expect(store.hasTasksPublishingScope(for: account))
+        #expect(store.canEnableTasksPublishing(for: account))
+        await store.enableTasksPublishing(for: account)
+
+        let record = try #require((await transport.oauthStartRecords()).last)
+        #expect(record.request.services == [.tasks])
+        #expect(record.request.forceConsent)
+        #expect(record.request.accountID == account.id)
+        #expect(!record.request.connectNew)
+        #expect(store.canOpenAuthorization)
+    }
+
+    @Test("Task list with full Tasks scope can become writable without a Calendar role")
+    func writableTaskListRequiresOnlyTasksWriteScope() async throws {
+        let account = try Self.account(tasksWrite: true)
+        let initial = try Self.collection(
+            accountID: account.id,
+            kind: .taskList,
+            providerAccessRole: nil
+        )
+        let updated = try Self.collection(
+            accountID: account.id,
+            kind: .taskList,
+            selected: true,
+            role: .writable,
+            revision: 2,
+            providerAccessRole: nil
+        )
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
+            collections: [.value([initial])],
+            configurations: [.value(updated)],
+            syncStatuses: [.value(try Self.syncStatus(accountID: account.id))]
+        )
+        let store = Self.store(transport: transport)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        #expect(store.hasTasksPublishingScope(for: account))
+        await store.configureSource(
+            initial,
+            selected: true,
+            visible: true,
+            role: .writable
+        )
+
+        let record = try #require((await transport.configureRecords()).last)
+        #expect(record.role == .writable)
+        #expect(record.selected)
+        #expect(record.calendarPolicy.isReadOnlySafe)
+        #expect(store.collectionsByAccount[account.id] == [updated])
+        #expect(!store.status.isFailure)
+    }
+
+    @Test("Task list writable role rejects Calendar-only grants and Calendar policy")
+    func writableTaskListFailsClosedWithoutExactTasksGrant() async throws {
+        let calendarOnlyAccount = try Self.account(calendarWrite: true)
+        let taskList = try Self.collection(
+            accountID: calendarOnlyAccount.id,
+            kind: .taskList,
+            providerAccessRole: nil
+        )
+        let missingScopeTransport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [calendarOnlyAccount]))],
+            collections: [.value([taskList])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: calendarOnlyAccount.id))]
+        )
+        let missingScopeStore = Self.store(transport: missingScopeTransport)
+        missingScopeStore.activate(automaticallyReload: false)
+        await missingScopeStore.reload()
+
+        #expect(!missingScopeStore.hasTasksPublishingScope(for: calendarOnlyAccount))
+        await missingScopeStore.configureSource(
+            taskList,
+            selected: true,
+            visible: true,
+            role: .writable
+        )
+        #expect(await missingScopeTransport.configureRecords().isEmpty)
+
+        let tasksAccount = try Self.account(tasksWrite: true)
+        let tasksList = try Self.collection(
+            accountID: tasksAccount.id,
+            kind: .taskList,
+            providerAccessRole: nil
+        )
+        let policyTransport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [tasksAccount]))],
+            collections: [.value([tasksList])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: tasksAccount.id))]
+        )
+        let policyStore = Self.store(transport: policyTransport)
+        policyStore.activate(automaticallyReload: false)
+        await policyStore.reload()
+        await policyStore.configureSource(
+            tasksList,
+            selected: true,
+            visible: true,
+            role: .writable,
+            calendarPolicy: GoogleCalendarPolicy(publishAllDay: true)
+        )
+
+        #expect(await policyTransport.configureRecords().isEmpty)
+        #expect(policyStore.status.isFailure)
+    }
+
+    @Test("Task lists still reject blocking with full Tasks scope")
+    func taskListWithWriteScopeStillRejectsBlocking() async throws {
+        let account = try Self.account(tasksWrite: true)
+        let taskList = try Self.collection(accountID: account.id, kind: .taskList)
+        let transport = FakeGoogleIntegrationTransport(
+            accounts: [.value(try Self.accountsSnapshot(accounts: [account]))],
+            collections: [.value([taskList])],
+            syncStatuses: [.value(try Self.syncStatus(accountID: account.id))]
+        )
+        let store = Self.store(transport: transport)
+        store.activate(automaticallyReload: false)
+        await store.reload()
+
+        await store.configureSource(
+            taskList,
+            selected: true,
+            visible: true,
+            role: .blocking
+        )
+
+        #expect(await transport.configureRecords().isEmpty)
+        #expect(store.status.isFailure)
+    }
+
     @Test("owner Calendar with full scope can become writable with exact policy")
     func writableCalendarConfigurationPreservesPublicationPolicy() async throws {
         let account = try Self.account(calendarWrite: true)
@@ -1779,16 +1955,20 @@ struct GoogleIntegrationStoreTests {
         label: String = "owner@example.com",
         revision: UInt64 = 1,
         status: GoogleAccountStatus = .active,
-        calendarWrite: Bool = false
+        calendarWrite: Bool = false,
+        tasksWrite: Bool = false
     ) throws -> GoogleAccount {
         let syncEnabled = status == .active ? "true" : "false"
         let isDefault = status == .revoked ? "false" : "true"
         let calendarScope = calendarWrite
             ? "https://www.googleapis.com/auth/calendar"
             : "https://www.googleapis.com/auth/calendar.readonly"
+        let tasksScope = tasksWrite
+            ? "https://www.googleapis.com/auth/tasks"
+            : "https://www.googleapis.com/auth/tasks.readonly"
         let scopes = status == .revoked
             ? "[]"
-            : "[\"openid\",\"\(calendarScope)\",\"https://www.googleapis.com/auth/tasks.readonly\"]"
+            : "[\"openid\",\"\(calendarScope)\",\"\(tasksScope)\"]"
         let tokenExpiresAt = status == .revoked
             ? "null"
             : "\"\(timestamp(now.addingTimeInterval(3_600)))\""

@@ -216,8 +216,9 @@ enum GoogleService: String, Codable, Equatable, Sendable {
 
 /// The default macOS connection deliberately sends an explicit empty service
 /// array. The server contract interprets that exact value as Calendar and Tasks
-/// read-only. A single Calendar write scope is the only supported upgrade; Tasks
-/// write access and mixed/full-scope requests remain outside this client surface.
+/// read-only. Calendar and Tasks write access are separate, existing-account
+/// incremental upgrades; mixed/full-scope requests remain outside this client
+/// surface.
 struct GoogleOAuthStartRequest: Codable, Equatable, Sendable {
     let services: [GoogleService]
     let forceConsent: Bool
@@ -246,7 +247,7 @@ struct GoogleOAuthStartRequest: Codable, Equatable, Sendable {
         let serviceSelectionIsValid = if services.isEmpty {
             true
         } else {
-            services == [.calendar]
+            (services == [.calendar] || services == [.tasks])
                 && accountID != nil
                 && forceConsent
                 && !connectNew
@@ -551,6 +552,37 @@ extension GoogleOutboundEnqueueRequest: CustomStringConvertible, CustomDebugStri
 enum GoogleOutboundEntityKind: String, Codable, Equatable, Sendable {
     case calendarEvent = "calendar_event"
     case task
+}
+
+extension DayWeaveCanonicalItem {
+    /// Client-side eligibility is deliberately narrower than the server's
+    /// authoritative mapping check. In particular, imported Google Tasks
+    /// carry `google_sync` constraints and must never be offered as DayWeave-
+    /// owned deletions. The server still verifies the exact destination,
+    /// ownership mapping, revision, and retained ETag before minting a preview.
+    func isEligibleForGoogleTaskPublication(deleted: Bool) -> Bool {
+        guard kind == .task,
+              (deletedAt != nil) == deleted,
+              revision > 0,
+              revision <= UInt64(Int64.max),
+              flexibleConstraints.supportsCanonicalAuthoringConstraints else {
+            return false
+        }
+        // Deletion sends no canonical fields. Do not strand a DayWeave-
+        // authored Task merely because fields added after its publication are
+        // now read-only; the server mapping remains the ownership authority.
+        if deleted { return true }
+
+        let supportedStatus = switch status {
+        case .inbox, .planned, .scheduled, .inProgress, .paused, .completed: true
+        case .skipped, .cancelled, .unknown: false
+        }
+        return recurrence == nil
+            && supportedStatus
+            && unsupportedFields.isEmpty
+            && !hasNonRoundTrippableJSONNumber
+            && splitPolicy.isSupportedForWrite
+    }
 }
 
 struct GoogleOutboundPreview: Codable, Equatable, Sendable {
@@ -1526,7 +1558,15 @@ private func validateGoogleOutboundPreview(
         && preview.providerPayload.keys.allSatisfy {
             validGoogleText($0, maximumUTF8Bytes: 1_024)
         }
-        && validGoogleOutboundProviderPayload(preview.providerPayload)
+        && validGoogleOutboundProviderPayload(
+            preview.providerPayload,
+            maximumValueStringBytes: preview.entityKind == .task ? 400_000 : 256 * 1_024
+        )
+        && validGoogleOutboundProviderProjection(
+            preview.providerPayload,
+            entityKind: preview.entityKind,
+            operation: preview.operation
+        )
     let operationPayloadIsValid = switch preview.operation {
     case .upsert: !preview.providerPayload.isEmpty
     case .delete: preview.providerPayload.isEmpty
@@ -1556,8 +1596,137 @@ private func validateGoogleOutboundPreview(
     }
 }
 
+private enum GoogleTaskPreviewPayloadKey: String, CaseIterable {
+    case id
+    case etag
+    case title
+    case notes
+    case status
+    case due
+    case completed
+    case updated
+    case parent
+    case position
+    case links
+    case deleted
+    case hidden
+}
+
+/// The Tasks preview is a review-only serialization of the server's
+/// `GoogleTask`, not an arbitrary Google API resource. Exact keys and inert
+/// provider-managed fields keep a changed server projection from silently
+/// gaining approval through an older client.
+private func validGoogleOutboundProviderProjection(
+    _ payload: [String: JSONValue],
+    entityKind: GoogleOutboundEntityKind,
+    operation: GoogleOutboundOperation
+) -> Bool {
+    guard operation == .upsert else { return payload.isEmpty }
+    switch entityKind {
+    case .calendarEvent:
+        // Calendar retains its existing bounded provider projection contract.
+        return !payload.isEmpty
+    case .task:
+        return validGoogleTaskPreviewPayload(payload)
+    }
+}
+
+private func validGoogleTaskPreviewPayload(_ payload: [String: JSONValue]) -> Bool {
+    let expectedKeys = Set(GoogleTaskPreviewPayloadKey.allCases.map(\.rawValue))
+    guard Set(payload.keys) == expectedKeys,
+          case let .string(id)? = payload[GoogleTaskPreviewPayloadKey.id.rawValue],
+          id.isEmpty,
+          case .null? = payload[GoogleTaskPreviewPayloadKey.etag.rawValue],
+          case let .string(title)? = payload[GoogleTaskPreviewPayloadKey.title.rawValue],
+          validGoogleTaskTitle(title),
+          validGoogleTaskNotes(payload[GoogleTaskPreviewPayloadKey.notes.rawValue]),
+          case let .string(status)? = payload[GoogleTaskPreviewPayloadKey.status.rawValue],
+          status == "needsAction" || status == "completed",
+          validGoogleTaskTimestamp(payload[GoogleTaskPreviewPayloadKey.due.rawValue], required: false),
+          validGoogleTaskTimestamp(
+              payload[GoogleTaskPreviewPayloadKey.completed.rawValue],
+              required: status == "completed"
+          ),
+          (status == "completed")
+              == (payload[GoogleTaskPreviewPayloadKey.completed.rawValue] != .null),
+          case .null? = payload[GoogleTaskPreviewPayloadKey.updated.rawValue],
+          case .null? = payload[GoogleTaskPreviewPayloadKey.parent.rawValue],
+          case .null? = payload[GoogleTaskPreviewPayloadKey.position.rawValue],
+          case .null? = payload[GoogleTaskPreviewPayloadKey.links.rawValue],
+          case .bool(false)? = payload[GoogleTaskPreviewPayloadKey.deleted.rawValue],
+          case .bool(false)? = payload[GoogleTaskPreviewPayloadKey.hidden.rawValue] else {
+        return false
+    }
+    return true
+}
+
+private func validGoogleTaskTitle(_ value: String) -> Bool {
+    !value.isEmpty
+        && value.unicodeScalars.count <= 500
+        && value == value.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+private func validGoogleTaskNotes(_ value: JSONValue?) -> Bool {
+    switch value {
+    case .null?:
+        return true
+    case let .string(notes)?:
+        guard !notes.isEmpty,
+              notes.unicodeScalars.count <= 100_000,
+              notes == notes.trimmingCharacters(in: .whitespacesAndNewlines),
+              !notes.unicodeScalars.contains(where: { scalar in
+                  CharacterSet.controlCharacters.contains(scalar) && scalar != "\n"
+              }),
+              notes.split(separator: "\n", omittingEmptySubsequences: false).allSatisfy({ line in
+                  !line.isEmpty
+                      && line == line.trimmingCharacters(in: .whitespacesAndNewlines)
+              }),
+              !containsLegacyGoogleTaskMarker(notes) else {
+            return false
+        }
+        return true
+    case .object?, .array?, .number?, .bool?, nil:
+        return false
+    }
+}
+
+private func containsLegacyGoogleTaskMarker(_ value: String) -> Bool {
+    let lower = value.lowercased()
+    var searchStart = lower.startIndex
+    while let marker = lower.range(
+        of: "[dayweave",
+        range: searchStart..<lower.endIndex
+    ) {
+        var suffix = marker.upperBound
+        while suffix < lower.endIndex, lower[suffix].isWhitespace {
+            suffix = lower.index(after: suffix)
+        }
+        if lower[suffix...].hasPrefix("item:") { return true }
+        searchStart = marker.upperBound
+    }
+    return false
+}
+
+private func validGoogleTaskTimestamp(_ value: JSONValue?, required: Bool) -> Bool {
+    switch value {
+    case .null?:
+        return !required
+    case let .string(timestamp)?:
+        guard !timestamp.isEmpty, timestamp.utf8.count <= 64 else { return false }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if fractional.date(from: timestamp) != nil { return true }
+        let wholeSeconds = ISO8601DateFormatter()
+        wholeSeconds.formatOptions = [.withInternetDateTime]
+        return wholeSeconds.date(from: timestamp) != nil
+    case .object?, .array?, .number?, .bool?, nil:
+        return false
+    }
+}
+
 private func validGoogleOutboundProviderPayload(
-    _ payload: [String: JSONValue]
+    _ payload: [String: JSONValue],
+    maximumValueStringBytes: Int
 ) -> Bool {
     struct Budget {
         var nodes = 0
@@ -1567,7 +1736,8 @@ private func validGoogleOutboundProviderPayload(
     let maximumNodes = 20_000
     let maximumStringBytes = 1_048_576
     let maximumContainerEntries = 10_000
-    let maximumValueStringBytes = 256 * 1_024
+    // A Task note may contain 100,000 Unicode scalars, requiring up to 400,000
+    // UTF-8 bytes. Calendar retains its narrower historical per-string bound.
     var budget = Budget()
 
     func validate(_ value: JSONValue, depth: Int, budget: inout Budget) -> Bool {

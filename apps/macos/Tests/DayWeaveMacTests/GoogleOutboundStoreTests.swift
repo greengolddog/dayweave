@@ -311,6 +311,51 @@ struct GoogleOutboundStoreTests {
         #expect(relaunched.approvalConfirmation != nil)
     }
 
+    @Test("definitive preview rejection clears only its inert intent")
+    func rejectedPreviewDoesNotFencePublication() async throws {
+        let recovery = TestGoogleOutboundRecoveryStore()
+        let transport = TestGoogleOutboundTransport(
+            configurationIdentifier: Self.configuration,
+            previewSteps: [
+                .failure(.api(.server(
+                    statusCode: 409,
+                    code: "conflict",
+                    message: "only DayWeave-owned provider records can be changed by this endpoint",
+                    requestID: nil
+                ))),
+                .value(try Self.taskPreview()),
+            ]
+        )
+        let store = Self.makeStore(recovery: recovery, transport: transport)
+
+        #expect(!(await store.preparePreview(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 7,
+            entityKind: .task,
+            operation: .delete
+        )))
+        #expect(recovery.value == nil)
+        #expect(recovery.saved.map(\.stage) == [.intent])
+        #expect(recovery.cleared.map(\.stage) == [.intent])
+        #expect(!store.hasPendingRecovery)
+        #expect(store.recoveryContext == nil)
+        #expect(store.status.isWorking == false)
+        #expect((await transport.approvalCallsSnapshot()).isEmpty)
+        #expect((await transport.enqueueCallsSnapshot()).isEmpty)
+
+        #expect(await store.preparePreview(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 7,
+            entityKind: .task,
+            operation: .upsert
+        ))
+        #expect(recovery.value?.stage == .previewed)
+    }
+
     @Test("approval timeout records one attempt and recovery never approves implicitly")
     func approvalTimeoutNeverAutoApproves() async throws {
         let recovery = TestGoogleOutboundRecoveryStore()
@@ -429,23 +474,75 @@ struct GoogleOutboundStoreTests {
         #expect((await transport.approvalCallsSnapshot()).isEmpty)
     }
 
-    @Test("a non-Calendar preview never becomes durable or approvable")
-    func taskPreviewIsRejected() async throws {
-        let recovery = TestGoogleOutboundRecoveryStore()
-        let taskPreview = try Self.preview(entityKind: "task")
+    @Test("preview entity must match the exact persisted intent")
+    func previewEntityMismatchIsRejected() async throws {
+        let cases: [(GoogleOutboundEntityKind, GoogleOutboundPreview)] = [
+            (.calendarEvent, try Self.taskPreview()),
+            (.task, try Self.preview()),
+        ]
+        for (expectedEntityKind, response) in cases {
+            let recovery = TestGoogleOutboundRecoveryStore()
+            let transport = TestGoogleOutboundTransport(
+                configurationIdentifier: Self.configuration,
+                previewSteps: [.value(response)]
+            )
+            let store = Self.makeStore(recovery: recovery, transport: transport)
+
+            #expect(!(await store.preparePreview(
+                accountID: Self.accountID,
+                collectionID: Self.collectionID,
+                itemID: Self.itemID,
+                expectedItemRevision: 7,
+                entityKind: expectedEntityKind,
+                operation: .upsert
+            )))
+            #expect(recovery.value?.stage == .intent)
+            #expect(recovery.value?.entityKind == expectedEntityKind)
+            #expect(recovery.saved.map(\.stage) == [.intent])
+            #expect(store.preview == nil)
+            #expect(store.approvalConfirmation == nil)
+            #expect((await transport.approvalCallsSnapshot()).isEmpty)
+            #expect((await transport.enqueueCallsSnapshot()).isEmpty)
+        }
+    }
+
+    @Test("Task publication preserves its entity binding through approval and acceptance")
+    func taskPublicationIsEntityBoundEndToEnd() async throws {
+        let events = OutboundEventLog()
+        let recovery = TestGoogleOutboundRecoveryStore(events: events)
         let transport = TestGoogleOutboundTransport(
             configurationIdentifier: Self.configuration,
-            previewSteps: [.value(taskPreview)]
+            events: events,
+            previewSteps: [.value(try Self.taskPreview())],
+            approvalSteps: [.value(try Self.approval())],
+            enqueueSteps: [.value(try Self.accepted())]
         )
         let store = Self.makeStore(recovery: recovery, transport: transport)
 
-        #expect(!(await Self.prepare(store)))
-        #expect(recovery.value?.stage == .intent)
-        #expect(recovery.saved.map(\.stage) == [.intent])
-        #expect(store.preview == nil)
-        #expect(store.approvalConfirmation == nil)
-        #expect((await transport.approvalCallsSnapshot()).isEmpty)
-        #expect((await transport.enqueueCallsSnapshot()).isEmpty)
+        #expect(await store.preparePreview(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 7,
+            entityKind: .task,
+            operation: .upsert
+        ))
+        #expect(recovery.saved.map(\.entityKind) == [.task, .task])
+        #expect(store.preview?.entityKind == .task)
+        #expect(store.recoveryContext?.entityKind == .task)
+        let confirmation = try #require(store.approvalConfirmation)
+
+        #expect(await store.approveAndEnqueue(confirmation))
+        #expect(recovery.saved.map(\.entityKind) == [.task, .task, .task, .task])
+        #expect(recovery.cleared.first?.entityKind == .task)
+        #expect(recovery.value == nil)
+        #expect(store.accepted?.outboxID == Self.outboxID)
+        #expect(!store.status.message.localizedCaseInsensitiveContains("Calendar"))
+        #expect(events.snapshot() == [
+            "save:intent", "preview", "save:previewed",
+            "save:approval_attempted", "approve",
+            "save:approved", "enqueue", "clear",
+        ])
     }
 
     @Test("timeout cancellation and authentication or generic conflicts never clear")
@@ -796,10 +893,36 @@ struct GoogleOutboundStoreTests {
         let encoder = JSONEncoder()
         let data = try encoder.encode(journal)
         #expect(try JSONDecoder().decode(GoogleOutboundRecoveryJournal.self, from: data) == journal)
-
-        var object = try #require(
+        let encodedObject = try #require(
             JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
+        #expect(encodedObject["version"] as? Int == GoogleOutboundRecoveryJournal.currentVersion)
+        #expect(encodedObject["entity_kind"] as? String == "calendar_event")
+
+        var legacyObject = encodedObject
+        legacyObject["version"] = 1
+        legacyObject.removeValue(forKey: "entity_kind")
+        let migrated = try JSONDecoder().decode(
+            GoogleOutboundRecoveryJournal.self,
+            from: JSONSerialization.data(withJSONObject: legacyObject)
+        )
+        #expect(migrated == journal)
+        #expect(migrated.version == GoogleOutboundRecoveryJournal.currentVersion)
+        #expect(migrated.entityKind == .calendarEvent)
+
+        var forgedLegacyTask = legacyObject
+        forgedLegacyTask["preview"] = try #require(
+            JSONSerialization.jsonObject(with: encoder.encode(try Self.taskPreview()))
+                as? [String: Any]
+        )
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                GoogleOutboundRecoveryJournal.self,
+                from: JSONSerialization.data(withJSONObject: forgedLegacyTask)
+            )
+        }
+
+        var object = encodedObject
         object["unexpected"] = true
         #expect(throws: DecodingError.self) {
             try JSONDecoder().decode(
@@ -809,6 +932,15 @@ struct GoogleOutboundStoreTests {
         }
 
         object.removeValue(forKey: "unexpected")
+        object.removeValue(forKey: "entity_kind")
+        #expect(throws: DecodingError.self) {
+            try JSONDecoder().decode(
+                GoogleOutboundRecoveryJournal.self,
+                from: JSONSerialization.data(withJSONObject: object)
+            )
+        }
+
+        object["entity_kind"] = "calendar_event"
         object["approval_expires_at"] = NSNull()
         #expect(throws: DecodingError.self) {
             try JSONDecoder().decode(
@@ -847,7 +979,8 @@ struct GoogleOutboundStoreTests {
         itemRevision: UInt64 = 7,
         expiresAt: Date = now.addingTimeInterval(10 * 60),
         hashCharacter: Character = "a",
-        entityKind: String = "calendar_event"
+        entityKind: String = "calendar_event",
+        providerPayload: [String: Any]? = nil
     ) throws -> GoogleOutboundPreview {
         let object: [String: Any] = [
             "id": id.uuidString.lowercased(),
@@ -862,7 +995,7 @@ struct GoogleOutboundStoreTests {
             "provider_resource_id": NSNull(),
             "provider_etag": NSNull(),
             "preview_hash": String(repeating: String(hashCharacter), count: 64),
-            "provider_payload": [
+            "provider_payload": providerPayload ?? [
                 "summary": "Private title",
                 "start": ["dateTime": "2026-08-31T08:00:00Z"],
             ],
@@ -872,6 +1005,24 @@ struct GoogleOutboundStoreTests {
             GoogleOutboundPreview.self,
             from: JSONSerialization.data(withJSONObject: object)
         )
+    }
+
+    private static func taskPreview() throws -> GoogleOutboundPreview {
+        try preview(entityKind: "task", providerPayload: [
+            "id": "",
+            "etag": NSNull(),
+            "title": "Private task",
+            "notes": "First line\nSecond line",
+            "status": "completed",
+            "due": "2026-09-01T18:00:00+00:00",
+            "completed": "2026-08-31T09:15:00Z",
+            "updated": NSNull(),
+            "parent": NSNull(),
+            "position": NSNull(),
+            "links": NSNull(),
+            "deleted": false,
+            "hidden": false,
+        ])
     }
 
     private static func approval(
@@ -1024,6 +1175,7 @@ private enum TestOutboundStep<Value: Sendable>: Sendable {
     func resolve() async throws -> Value {
         switch self {
         case let .value(value): return value
+        case let .failure(.api(error)): throw error
         case let .failure(error): throw error
         case let .gated(gate, value):
             await gate.enterAndWait()

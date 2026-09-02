@@ -65,6 +65,8 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
 
     let inbox: [Row]
     let planned: [Row]
+    let active: [Row]
+    let completed: [Row]
     let conflicts: [Row]
     let trash: [Row]
 
@@ -92,6 +94,8 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         let hierarchy = Hierarchy(nodes: nodes)
         var inbox: [Row] = []
         var planned: [Row] = []
+        var active: [Row] = []
+        var completed: [Row] = []
         var conflicts: [Row] = []
         var trash: [Row] = []
 
@@ -110,7 +114,9 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
             switch row.status {
             case .inbox: inbox.append(row)
             case .planned: planned.append(row)
-            default: break
+            case .scheduled, .inProgress, .paused: active.append(row)
+            case .completed: completed.append(row)
+            case .skipped, .cancelled, .unknown: break
             }
         }
 
@@ -180,6 +186,8 @@ struct CanonicalInboxPresentation: Equatable, Sendable {
         return Self(
             inbox: inbox,
             planned: planned,
+            active: active,
+            completed: completed,
             conflicts: deduplicated(conflicts),
             trash: deduplicated(trash)
         )
@@ -227,6 +235,7 @@ private extension CanonicalInboxPresentation {
             revision = item.revision
             activeCanonicalItem = item
             readOnly = !item.supportsCanonicalAuthoringReplacement
+                || (item.status != .inbox && item.status != .planned)
                 || mutation?.hasBeenSubmitted == true
                 || mutation?.disposition == .conflicted
                 || mutation?.operation == .restore

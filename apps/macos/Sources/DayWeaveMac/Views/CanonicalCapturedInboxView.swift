@@ -27,12 +27,16 @@ struct CanonicalCapturedInboxView: View {
                         .frame(width: 42, height: 42)
                         .background(.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 11))
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Captured items").font(.headline)
-                        Text("Inbox items wait for a decision. Planned items are eligible for composition after sync.")
+                        Text("Your items").font(.headline)
+                        Text("Capture, prepare, and review work across its synced lifecycle.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
+                    Toggle("Show completed", isOn: $store.showCompleted)
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .accessibilityIdentifier("canonical-inbox.show-completed")
                     Button("Quick Capture") { isQuickCapturePresented = true }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut("n", modifiers: .command)
@@ -66,6 +70,21 @@ struct CanonicalCapturedInboxView: View {
                 rows: presentation.planned,
                 emptyMessage: "Move an item to Planned when it is ready for composition."
             )
+            rowsSection(
+                title: "Active",
+                symbol: "play.circle",
+                rows: presentation.active,
+                emptyMessage: "Scheduled, running, and paused items appear here."
+            )
+            if store.showCompleted {
+                rowsSection(
+                    title: "Completed",
+                    symbol: "checkmark.circle.fill",
+                    rows: presentation.completed,
+                    emptyMessage: "Completed items remain available for review.",
+                    dimmed: true
+                )
+            }
             rowsSection(
                 title: "Conflicts",
                 symbol: "exclamationmark.triangle",
@@ -129,7 +148,8 @@ struct CanonicalCapturedInboxView: View {
         title: String,
         symbol: String,
         rows: [CanonicalInboxPresentation.Row],
-        emptyMessage: String
+        emptyMessage: String,
+        dimmed: Bool = false
     ) -> some View {
         Section {
             if rows.isEmpty {
@@ -155,6 +175,7 @@ struct CanonicalCapturedInboxView: View {
                         },
                         duplicateConflictedDraft: duplicateAction(for: row)
                     )
+                    .opacity(dimmed ? 0.58 : 1)
                 }
             }
         } header: {

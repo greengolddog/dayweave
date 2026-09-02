@@ -64,10 +64,11 @@ struct GoogleIntegrationAPIClientTests {
         }
     }
 
-    @Test("OAuth permits only the bounded Calendar write-scope upgrade")
-    func oauthCalendarWriteUpgradeUsesExactServiceShape() async throws {
+    @Test("OAuth permits only separate bounded Calendar or Tasks write-scope upgrades")
+    func oauthWriteUpgradesUseExactServiceShapes() async throws {
         URLProtocolStub.storage.enqueue(
             key: Self.apiToken,
+            .init(statusCode: 201, body: Self.authorizationEnvelope()),
             .init(statusCode: 201, body: Self.authorizationEnvelope())
         )
         let client = makeClient()
@@ -76,18 +77,35 @@ struct GoogleIntegrationAPIClientTests {
             .init(services: [.calendar], forceConsent: true, accountID: Self.accountID),
             idempotencyKey: "google.calendar-upgrade_01"
         )
+        _ = try await client.startGoogleOAuth(
+            .init(services: [.tasks], forceConsent: true, accountID: Self.accountID),
+            idempotencyKey: "google.tasks-upgrade_01"
+        )
 
-        let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
-        #expect(request.url.path == "/gateway/v1/integrations/google/oauth/start")
-        #expect(request.jsonBody?["services"] as? [String] == ["calendar"])
-        #expect(request.jsonBody?["account_id"] as? String == Self.accountID.uuidString)
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        #expect(requests.count == 2)
+        #expect(requests.allSatisfy {
+            $0.url.path == "/gateway/v1/integrations/google/oauth/start"
+        })
+        #expect(requests[0].jsonBody?["services"] as? [String] == ["calendar"])
+        #expect(requests[1].jsonBody?["services"] as? [String] == ["tasks"])
+        #expect(requests.allSatisfy {
+            $0.jsonBody?["account_id"] as? String == Self.accountID.uuidString
+                && $0.jsonBody?["force_consent"] as? Bool == true
+                && $0.jsonBody?["connect_new"] as? Bool == false
+        })
 
         for services: [GoogleService] in [
-            [.calendarReadOnly], [.tasks], [.calendar, .tasks], [.calendar, .calendar],
+            [.calendarReadOnly], [.tasksReadOnly], [.calendar, .tasks],
+            [.calendar, .calendar], [.tasks, .tasks],
         ] {
             do {
                 _ = try await client.startGoogleOAuth(
-                    .init(services: services),
+                    .init(
+                        services: services,
+                        forceConsent: true,
+                        accountID: Self.accountID
+                    ),
                     idempotencyKey: "google.calendar-upgrade_02"
                 )
                 Issue.record("An unsupported Google scope combination was accepted")
@@ -97,10 +115,19 @@ struct GoogleIntegrationAPIClientTests {
         }
         for request in [
             GoogleOAuthStartRequest(services: [.calendar]),
+            GoogleOAuthStartRequest(services: [.tasks]),
             GoogleOAuthStartRequest(services: [.calendar], accountID: Self.accountID),
+            GoogleOAuthStartRequest(services: [.tasks], accountID: Self.accountID),
             GoogleOAuthStartRequest(services: [.calendar], forceConsent: true),
+            GoogleOAuthStartRequest(services: [.tasks], forceConsent: true),
             GoogleOAuthStartRequest(
                 services: [.calendar],
+                forceConsent: true,
+                accountID: Self.accountID,
+                connectNew: true
+            ),
+            GoogleOAuthStartRequest(
+                services: [.tasks],
                 forceConsent: true,
                 accountID: Self.accountID,
                 connectNew: true
@@ -111,12 +138,12 @@ struct GoogleIntegrationAPIClientTests {
                     request,
                     idempotencyKey: "google.calendar-upgrade_03"
                 )
-                Issue.record("A Calendar scope request without an explicit existing-account upgrade was accepted")
+                Issue.record("A write scope request without an explicit existing-account upgrade was accepted")
             } catch let error as DayWeaveAPIError {
                 #expect(error == .requestEncodingFailed)
             }
         }
-        #expect(URLProtocolStub.storage.requests(for: Self.apiToken).count == 1)
+        #expect(URLProtocolStub.storage.requests(for: Self.apiToken).count == 2)
     }
 
     @Test("account lifecycle binds identity, revision, status, and retry headers")
@@ -442,6 +469,149 @@ struct GoogleIntegrationAPIClientTests {
             "approval_capability",
         ]))
         #expect(enqueueBody["approval_capability"] as? String == Self.approvalCapability)
+    }
+
+    @Test("Task outbound previews require the exact inert server projection")
+    func taskOutboundPreviewUsesExactProviderProjection() async throws {
+        let validPayload = Self.validTaskProviderPayload()
+        var maximumScalarPayload = validPayload
+        maximumScalarPayload["notes"] = String(repeating: "😀", count: 100_000)
+        var invalidPayloads: [[String: Any]] = []
+
+        var missingTitle = validPayload
+        missingTitle.removeValue(forKey: "title")
+        invalidPayloads.append(missingTitle)
+
+        var extraField = validPayload
+        extraField["kind"] = "tasks#task"
+        invalidPayloads.append(extraField)
+
+        let fieldMutations: [(String, Any)] = [
+            ("id", "provider-task-id"),
+            ("etag", "provider-etag"),
+            ("status", "cancelled"),
+            ("due", "tomorrow"),
+            ("updated", "2026-09-02T09:00:00Z"),
+            ("parent", "provider-parent"),
+            ("position", "0001"),
+            ("links", [["type": "email"]]),
+            ("deleted", true),
+            ("hidden", true),
+            ("notes", "ordinary\n[DayWeave item:visible-marker]"),
+            ("title", "   "),
+            ("title", String(repeating: "e\u{301}", count: 251)),
+            ("notes", String(repeating: "e\u{301}", count: 50_001)),
+        ]
+        for (key, value) in fieldMutations {
+            var payload = validPayload
+            payload[key] = value
+            invalidPayloads.append(payload)
+        }
+
+        var completedWithoutTimestamp = validPayload
+        completedWithoutTimestamp["completed"] = NSNull()
+        invalidPayloads.append(completedWithoutTimestamp)
+
+        var activeWithCompletion = validPayload
+        activeWithCompletion["status"] = "needsAction"
+        invalidPayloads.append(activeWithCompletion)
+
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: try Self.outboundTaskPreviewEnvelope(payload: validPayload)
+            ),
+            .init(
+                statusCode: 200,
+                body: try Self.outboundTaskPreviewEnvelope(payload: maximumScalarPayload)
+            )
+        )
+        for payload in invalidPayloads {
+            URLProtocolStub.storage.enqueue(
+                key: Self.apiToken,
+                .init(
+                    statusCode: 200,
+                    body: try Self.outboundTaskPreviewEnvelope(payload: payload)
+                )
+            )
+        }
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: try Self.outboundTaskPreviewEnvelope(
+                    payload: [:],
+                    operation: "delete",
+                    existing: true
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: try Self.outboundTaskPreviewEnvelope(
+                    payload: validPayload,
+                    operation: "delete",
+                    existing: true
+                )
+            )
+        )
+
+        let client = makeClient()
+        let upsertRequest = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .upsert
+        )
+        let preview = try await client.previewGoogleOutbound(
+            accountID: Self.accountID,
+            request: upsertRequest
+        )
+        #expect(preview.entityKind == .task)
+        #expect(preview.providerPayload["title"] == .string("Private task"))
+        #expect(preview.providerPayload["status"] == .string("completed"))
+        #expect(preview.providerPayload["id"] == .string(""))
+        #expect(preview.providerPayload["etag"] == .null)
+
+        let maximumScalarPreview = try await client.previewGoogleOutbound(
+            accountID: Self.accountID,
+            request: upsertRequest
+        )
+        guard case let .string(maximumNotes)? = maximumScalarPreview.providerPayload["notes"] else {
+            Issue.record("The maximum valid Unicode-scalar Task notes were not retained")
+            return
+        }
+        #expect(maximumNotes.unicodeScalars.count == 100_000)
+
+        for _ in invalidPayloads {
+            await expectResponseDecodingFailure {
+                _ = try await client.previewGoogleOutbound(
+                    accountID: Self.accountID,
+                    request: upsertRequest
+                )
+            }
+        }
+
+        let deleteRequest = GoogleOutboundPreviewRequest(
+            collectionID: Self.collectionID,
+            itemID: Self.itemID,
+            expectedItemRevision: 9,
+            operation: .delete
+        )
+        let deletion = try await client.previewGoogleOutbound(
+            accountID: Self.accountID,
+            request: deleteRequest
+        )
+        #expect(deletion.entityKind == .task)
+        #expect(deletion.providerPayload.isEmpty)
+        #expect(deletion.providerResourceID == "provider-task-id")
+        #expect(deletion.providerETag == "provider-etag")
+        await expectResponseDecodingFailure {
+            _ = try await client.previewGoogleOutbound(
+                accountID: Self.accountID,
+                request: deleteRequest
+            )
+        }
     }
 
     @Test("outbound expiry validation tolerates the supported device clock skew")
@@ -946,7 +1116,7 @@ struct GoogleIntegrationAPIClientTests {
         }
     }
 
-    @Test("writable configuration is Calendar-only while writable inventory remains representable")
+    @Test("writable Task-list responses require a read-only-safe Calendar policy")
     func collectionRoleResponsesFailClosed() async throws {
         URLProtocolStub.storage.enqueue(
             key: Self.apiToken,
@@ -979,6 +1149,16 @@ struct GoogleIntegrationAPIClientTests {
                     role: "writable",
                     kind: "task_list",
                     publicationEnabled: true
+                )
+            ),
+            .init(
+                statusCode: 200,
+                body: Self.collectionEnvelope(
+                    revision: 4,
+                    selected: true,
+                    visible: true,
+                    role: "writable",
+                    kind: "task_list"
                 )
             ),
             .init(
@@ -1028,10 +1208,22 @@ struct GoogleIntegrationAPIClientTests {
                 role: .writable,
                 calendarPolicy: publicationPolicy
             )
-            Issue.record("A writable task list response was accepted")
+            Issue.record("A writable Task-list response with Calendar publication policy was accepted")
         } catch let error as DayWeaveAPIError {
             #expect(error == .responseDecodingFailed)
         }
+        let writableTaskList = try await client.configureGoogleCollection(
+            accountID: Self.accountID,
+            collectionID: Self.collectionID,
+            expectedRevision: 3,
+            selected: true,
+            visible: true,
+            role: .writable,
+            calendarPolicy: .init()
+        )
+        #expect(writableTaskList.kind == .taskList)
+        #expect(writableTaskList.syncRole == .writable)
+        #expect(writableTaskList.calendarPolicy.isReadOnlySafe)
         let existingWritable = try await client.googleCollections(accountID: Self.accountID)
         #expect(existingWritable.first?.syncRole == .writable)
     }
@@ -1309,6 +1501,44 @@ struct GoogleIntegrationAPIClientTests {
             }
             """.utf8
         )
+    }
+
+    private static func validTaskProviderPayload() -> [String: Any] {
+        [
+            "id": "",
+            "etag": NSNull(),
+            "title": "Private task",
+            "notes": "First line\nSecond line",
+            "status": "completed",
+            "due": "2026-09-03T18:00:00+00:00",
+            "completed": "2026-09-02T09:30:00Z",
+            "updated": NSNull(),
+            "parent": NSNull(),
+            "position": NSNull(),
+            "links": NSNull(),
+            "deleted": false,
+            "hidden": false,
+        ]
+    }
+
+    private static func outboundTaskPreviewEnvelope(
+        payload: [String: Any],
+        operation: String = "upsert",
+        existing: Bool = false
+    ) throws -> Data {
+        var envelope = try #require(
+            JSONSerialization.jsonObject(with: outboundPreviewEnvelope())
+                as? [String: Any]
+        )
+        var preview = try #require(envelope["preview"] as? [String: Any])
+        preview["collection_display_name"] = "Personal tasks"
+        preview["entity_kind"] = "task"
+        preview["operation"] = operation
+        preview["provider_resource_id"] = existing ? "provider-task-id" : NSNull()
+        preview["provider_etag"] = existing ? "provider-etag" : NSNull()
+        preview["provider_payload"] = payload
+        envelope["preview"] = preview
+        return try JSONSerialization.data(withJSONObject: envelope)
     }
 
     private static func outboundApprovalEnvelope(

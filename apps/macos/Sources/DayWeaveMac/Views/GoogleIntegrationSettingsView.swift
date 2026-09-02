@@ -26,7 +26,7 @@ struct GoogleIntegrationSettingsView: View {
             if outbound.hasPendingRecovery {
                 VStack(alignment: .leading, spacing: 7) {
                     Label(
-                        "Recover the encrypted Calendar publication from its Inbox item before changing Google accounts or source policies.",
+                        "Recover the encrypted Google publication from its Inbox item before changing Google accounts or source policies.",
                         systemImage: "arrow.up.circle.fill"
                     )
                     .font(.caption)
@@ -34,8 +34,8 @@ struct GoogleIntegrationSettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     if outbound.hasApprovedRecovery {
                         Button(outbound.status == .expired
-                            ? "Check Calendar acceptance"
-                            : "Recover approved Calendar change") {
+                            ? "Check Google acceptance"
+                            : "Recover approved Google change") {
                             Task { _ = await outbound.recoverPendingOperation() }
                         }
                         .controlSize(.small)
@@ -46,7 +46,7 @@ struct GoogleIntegrationSettingsView: View {
                     }
                     if outbound.status == .expired {
                         GoogleExpiredRecoveryDiscardButton(
-                            title: "Discard expired Calendar recovery",
+                            title: "Discard expired Google recovery",
                             accessibilityIdentifier: "google.outbound.settings-discard-expired"
                         )
                         .controlSize(.small)
@@ -82,7 +82,7 @@ struct GoogleIntegrationSettingsView: View {
             }
 
             if store.accounts.isEmpty {
-                Text("Connect Google Calendar and Google Tasks to choose which sources DayWeave may import. Calendar publishing can be enabled separately with an explicit Google approval.")
+                Text("Connect Google Calendar and Google Tasks to choose which sources DayWeave may import. Calendar and Tasks publishing are enabled separately, each with explicit Google approval.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -238,7 +238,7 @@ struct GoogleIntegrationSettingsView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(!canStartConnection)
-                    .help("Requests Google Calendar and Google Tasks read access; publishing is a separate approval")
+                    .help("Requests Google Calendar and Google Tasks read access; publishing for each service is a separate approval")
                     .accessibilityIdentifier("google.authorization.connect")
                 }
 
@@ -482,6 +482,15 @@ private struct GoogleAccountSettingsCard: View {
                     )
                 }
 
+                if store.canEnableTasksPublishing(for: account) {
+                    Button(tasksPublishingActionTitle) {
+                        Task { await store.enableTasksPublishing(for: account) }
+                    }
+                    .accessibilityIdentifier(
+                        "google.account.\(ordinal).enable-tasks-publishing"
+                    )
+                }
+
                 if canReauthorize
                     && (!pendingRefreshRecovery
                         || store.requiresReauthorization(for: account)) {
@@ -628,9 +637,19 @@ private struct GoogleAccountSettingsCard: View {
     private var accountDetail: String {
         switch account.status {
         case .active:
-            store.hasCalendarPublishingScope(for: account)
-                ? "Calendar publishing is authorized; only calendars explicitly marked Publish can receive reviewed DayWeave events. Tasks remain read-only."
-                : "Calendar and Tasks imports are enabled for selected sources. Calendar publishing needs a separate approval."
+            switch (
+                store.hasCalendarPublishingScope(for: account),
+                store.hasTasksPublishingScope(for: account)
+            ) {
+            case (true, true):
+                "Calendar and Tasks publishing are authorized. Only sources explicitly marked Publish can receive separately reviewed DayWeave items."
+            case (true, false):
+                "Calendar publishing is authorized. Tasks remain import-only until their separate Google approval is completed."
+            case (false, true):
+                "Tasks publishing is authorized. Calendars remain import-only until their separate Google approval is completed."
+            case (false, false):
+                "Calendar and Tasks imports are enabled for selected sources. Publishing for each service needs a separate approval."
+            }
         case .paused:
             "Imports are paused. Existing DayWeave data remains available."
         case .reauthorizationRequired:
@@ -642,6 +661,13 @@ private struct GoogleAccountSettingsCard: View {
         case .revoked:
             "This Google connection is no longer active."
         }
+    }
+
+    private var tasksPublishingActionTitle: String {
+        store.hasTasksPublishingScope(for: account)
+            && store.requiresReauthorization(for: account)
+            ? "Reauthorize Tasks publishing"
+            : "Enable Tasks publishing"
     }
 
     private var accountBorderColor: Color {
@@ -749,11 +775,26 @@ private struct GoogleSourceSettingsRow: View {
                         }
                         .accessibilityIdentifier(sourceIdentifier("publication-policy"))
                     }
+                } else if canPublishToCollection {
+                    Picker("Tasks", selection: roleBinding) {
+                        Text("Reference").tag(GoogleSyncRole.readOnly)
+                        Text("Publish").tag(GoogleSyncRole.writable)
+                    }
+                    .pickerStyle(.segmented)
+                    .controlSize(.small)
+                    .accessibilityIdentifier(sourceIdentifier("role"))
+                    .help("Reference Task lists import context, while Publish Task lists may receive separately reviewed DayWeave tasks; Task lists never block calendar time")
                 } else {
-                    LabeledContent("Scheduling", value: "Reference only")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier(sourceIdentifier("role-read-only"))
+                    VStack(alignment: .leading, spacing: 3) {
+                        LabeledContent("Tasks", value: "Reference only")
+                        if !accountHasTasksPublishingScope {
+                            Text("Enable Tasks publishing for this account before marking a Task list Publish.")
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier(sourceIdentifier("role-read-only"))
                 }
             }
 
@@ -834,18 +875,31 @@ private struct GoogleSourceSettingsRow: View {
     private var requiresReadOnlyDowngrade: Bool {
         (collection.syncRole == .writable && !canPublishToCollection)
             || (collection.syncRole != .writable && !collection.calendarPolicy.isReadOnlySafe)
-            || (collection.kind == .taskList && collection.syncRole != .readOnly)
+            || (collection.kind == .taskList && collection.syncRole == .blocking)
+            || (collection.kind == .taskList && !collection.calendarPolicy.isReadOnlySafe)
     }
 
     private var canPublishToCollection: Bool {
-        guard collection.kind == .calendar,
-              !collection.providerDeleted,
-              let account = store.accounts.first(where: { $0.id == collection.accountID }),
-              store.hasCalendarPublishingScope(for: account),
-              let access = collection.providerAccessRole?.lowercased() else {
+        guard !collection.providerDeleted,
+              let account = store.accounts.first(where: { $0.id == collection.accountID }) else {
             return false
         }
-        return access == "owner" || access == "writer"
+        switch collection.kind {
+        case .calendar:
+            guard store.hasCalendarPublishingScope(for: account),
+                  let access = collection.providerAccessRole?.lowercased() else {
+                return false
+            }
+            return access == "owner" || access == "writer"
+        case .taskList:
+            return store.hasTasksPublishingScope(for: account)
+        }
+    }
+
+    private var accountHasTasksPublishingScope: Bool {
+        store.accounts.first(where: { $0.id == collection.accountID }).map {
+            store.hasTasksPublishingScope(for: $0)
+        } == true
     }
 
     private var publishAllDayBinding: Binding<Bool> {
@@ -982,7 +1036,7 @@ private struct GoogleSyncSummaryView: View {
 
             if sync.pendingOutbound > 0 {
                 Label(
-                    "\(sync.pendingOutbound) reviewed Calendar change\(sync.pendingOutbound == 1 ? " is" : "s are") queued for delivery.",
+                    "\(sync.pendingOutbound) reviewed Google change\(sync.pendingOutbound == 1 ? " is" : "s are") queued for delivery.",
                     systemImage: "arrow.up.circle"
                 )
                 .font(.caption2)
@@ -994,7 +1048,7 @@ private struct GoogleSyncSummaryView: View {
 
             if outboundIssueCount > 0 {
                 Label(
-                    "\(outboundIssueCount) Calendar publication\(outboundIssueCount == 1 ? " needs" : "s need") review. Provider details remain hidden.",
+                    "\(outboundIssueCount) Google publication\(outboundIssueCount == 1 ? " needs" : "s need") review. Provider details remain hidden.",
                     systemImage: "exclamationmark.arrow.triangle.2.circlepath"
                 )
                 .font(.caption2)
@@ -1005,7 +1059,7 @@ private struct GoogleSyncSummaryView: View {
             } else if let nextAttempt = sync.nextOutboundAttemptAt,
                       sync.pendingOutbound > 0 {
                 Label(
-                    "Next safe Calendar delivery attempt \(nextAttempt.formatted(date: .abbreviated, time: .shortened)).",
+                    "Next safe Google delivery attempt \(nextAttempt.formatted(date: .abbreviated, time: .shortened)).",
                     systemImage: "clock.arrow.circlepath"
                 )
                 .font(.caption2)

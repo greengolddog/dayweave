@@ -360,7 +360,7 @@ private enum GoogleIntegrationLocalError: LocalizedError {
         case .recoveryBelongsToAnotherConfiguration:
             "A Google connection request belongs to another DayWeave API session. Restore that session or wait for the request to expire."
         case .invalidCollectionRole:
-            "Publishing requires an active Google Calendar write grant and an owner or writer calendar. Google Tasks remain read-only."
+            "Publishing requires the matching full Google write grant. Calendars also require owner or writer access, and Task lists cannot block time."
         case .publicationPolicyForbidden:
             "Publication options are available only on a writable Google Calendar."
         case .invalidMutationResponse:
@@ -374,6 +374,7 @@ private enum GoogleIntegrationLocalError: LocalizedError {
 @MainActor
 final class GoogleIntegrationStore: ObservableObject {
     static let googleCalendarWriteScope = "https://www.googleapis.com/auth/calendar"
+    static let googleTasksWriteScope = "https://www.googleapis.com/auth/tasks"
     typealias TransportProvider = () throws -> any GoogleIntegrationTransport
     typealias AuthorizationOpener = (URL) -> Bool
     typealias Sleep = @Sendable (Duration) async throws -> Void
@@ -936,9 +937,8 @@ final class GoogleIntegrationStore: ObservableObject {
     }
 
     /// Requests only the additional Calendar write scope for an existing
-    /// account. Google Tasks stay read-only in this client slice, and the
-    /// returned provider grant still has to be observed authoritatively before
-    /// any calendar may be configured as writable.
+    /// account. The returned provider grant still has to be observed
+    /// authoritatively before any calendar may be configured as writable.
     func enableCalendarPublishing(for account: GoogleAccount) async {
         guard mutationRecoveryIsClear() else { return }
         guard !authorizationStartIsFenced else {
@@ -976,8 +976,58 @@ final class GoogleIntegrationStore: ObservableObject {
         await startAuthorization(request: request, existingJournal: nil)
     }
 
+    /// Requests only the additional Tasks write scope for an existing account.
+    /// This explicit flow is also used to renew a previously granted Tasks
+    /// capability when Google requires reauthorization. The authoritative
+    /// account snapshot must still report the full scope before a Task list may
+    /// be configured as writable.
+    func enableTasksPublishing(for account: GoogleAccount) async {
+        guard mutationRecoveryIsClear() else { return }
+        guard !authorizationStartIsFenced else {
+            status = .failed(
+                "Google cleanup must finish before expanding Tasks access."
+            )
+            return
+        }
+        guard accountIsCurrent(account),
+              account.status == .active
+                || account.status == .paused
+                || account.status == .reauthorizationRequired else {
+            status = .failed(GoogleIntegrationLocalError.invalidMutationResponse.localizedDescription)
+            return
+        }
+        guard !hasPendingRefreshCompletion(for: account)
+                || requiresReauthorization(for: account) else {
+            status = .failed(
+                "Finish the accepted import and canonical recomposition before expanding Tasks access."
+            )
+            return
+        }
+        guard !hasTasksPublishingScope(for: account)
+                || requiresReauthorization(for: account) else {
+            status = .connected(
+                updatedAt: now(),
+                message: "Tasks publishing access is already enabled"
+            )
+            return
+        }
+        let request = GoogleOAuthStartRequest(
+            services: [.tasks],
+            forceConsent: true,
+            loginHint: nil,
+            accountID: account.id,
+            connectNew: false,
+            makeDefault: account.isDefault
+        )
+        await startAuthorization(request: request, existingJournal: nil)
+    }
+
     func hasCalendarPublishingScope(for account: GoogleAccount) -> Bool {
         account.grantedScopes.contains(Self.googleCalendarWriteScope)
+    }
+
+    func hasTasksPublishingScope(for account: GoogleAccount) -> Bool {
+        account.grantedScopes.contains(Self.googleTasksWriteScope)
     }
 
     func canEnableCalendarPublishing(for account: GoogleAccount) -> Bool {
@@ -986,6 +1036,19 @@ final class GoogleIntegrationStore: ObservableObject {
             && !hasCalendarPublishingScope(for: account)
             && !authorizationStartIsFenced
             && !hasPendingRefreshCompletion(for: account)
+    }
+
+    func canEnableTasksPublishing(for account: GoogleAccount) -> Bool {
+        let accountCanAuthorize = account.status == .active
+            || account.status == .paused
+            || account.status == .reauthorizationRequired
+        return accountIsCurrent(account)
+            && accountCanAuthorize
+            && (!hasTasksPublishingScope(for: account)
+                || requiresReauthorization(for: account))
+            && !authorizationStartIsFenced
+            && (!hasPendingRefreshCompletion(for: account)
+                || requiresReauthorization(for: account))
     }
 
     func requiresReauthorization(for account: GoogleAccount) -> Bool {
@@ -1030,9 +1093,11 @@ final class GoogleIntegrationStore: ObservableObject {
             status = .failed(GoogleIntegrationLocalError.invalidMutationResponse.localizedDescription)
             return
         }
-        let authorizationPurpose = request.services == [.calendar]
-            ? "Preparing Google Calendar publishing access…"
-            : "Preparing a Google connection…"
+        let authorizationPurpose = switch request.services {
+        case [.calendar]: "Preparing Google Calendar publishing access…"
+        case [.tasks]: "Preparing Google Tasks publishing access…"
+        default: "Preparing a Google connection…"
+        }
         guard let operation = beginOperation(message: authorizationPurpose)
         else { return }
 
@@ -1527,18 +1592,20 @@ final class GoogleIntegrationStore: ObservableObject {
         }
         guard Self.roleIsSupported(role, for: collection.kind),
               role != .writable || selected,
-              role != .writable || collection.providerAccessRole.map({
-                  $0.caseInsensitiveCompare("owner") == .orderedSame
-                      || $0.caseInsensitiveCompare("writer") == .orderedSame
-              }) == true,
-              role != .writable || accounts.first(where: {
-                  $0.id == collection.accountID
-              }).map({ hasCalendarPublishingScope(for: $0) }) == true else {
+              writableRoleIsAuthorized(role, for: collection) else {
             status = .failed(GoogleIntegrationLocalError.invalidCollectionRole.localizedDescription)
             return
         }
         let targetPolicy: GoogleCalendarPolicy
-        if role == .writable {
+        if collection.kind == .taskList {
+            guard calendarPolicy == nil || calendarPolicy?.isReadOnlySafe == true else {
+                status = .failed(
+                    GoogleIntegrationLocalError.publicationPolicyForbidden.localizedDescription
+                )
+                return
+            }
+            targetPolicy = (calendarPolicy ?? collection.calendarPolicy).withoutPublication
+        } else if role == .writable {
             targetPolicy = calendarPolicy ?? collection.calendarPolicy
         } else {
             guard calendarPolicy == nil || calendarPolicy?.isReadOnlySafe == true else {
@@ -2892,6 +2959,27 @@ final class GoogleIntegrationStore: ObservableObject {
         accounts.contains { $0.id == account.id && $0.revision == account.revision }
     }
 
+    private func writableRoleIsAuthorized(
+        _ role: GoogleSyncRole,
+        for collection: GoogleSyncCollection
+    ) -> Bool {
+        guard role == .writable,
+              let account = accounts.first(where: { $0.id == collection.accountID }) else {
+            return role != .writable
+        }
+        switch collection.kind {
+        case .calendar:
+            guard hasCalendarPublishingScope(for: account),
+                  let providerAccessRole = collection.providerAccessRole else {
+                return false
+            }
+            return providerAccessRole.caseInsensitiveCompare("owner") == .orderedSame
+                || providerAccessRole.caseInsensitiveCompare("writer") == .orderedSame
+        case .taskList:
+            return hasTasksPublishingScope(for: account)
+        }
+    }
+
     private func sourceIsCurrent(_ collection: GoogleSyncCollection) -> Bool {
         collectionsByAccount[collection.accountID]?.contains {
             $0.id == collection.id && $0.revision == collection.revision
@@ -2938,8 +3026,8 @@ final class GoogleIntegrationStore: ObservableObject {
     ) -> Bool {
         switch (kind, role) {
         case (.calendar, .readOnly), (.calendar, .blocking), (.calendar, .writable),
-             (.taskList, .readOnly): true
-        case (.taskList, .writable), (.taskList, .blocking): false
+             (.taskList, .readOnly), (.taskList, .writable): true
+        case (.taskList, .blocking): false
         }
     }
 

@@ -286,12 +286,13 @@ DayWeave session; legacy static bearers are not used by the live Google client.
 
 Connected accounts expose discovery, pause/resume, reauthorization, and an
 explicitly confirmed disconnect. Calendars can be imported as visible reference
-data or complete blocking constraints. Task lists remain reference-only on the
-Mac. **Enable Calendar publishing** performs an incremental consent upgrade for
-an existing account; only a selected Calendar for which Google reports
-`owner` or `writer` access can then be marked **Publish**. Writable Task lists,
-blocking Task lists, and unsupported provider-publication policies are rejected
-locally.
+data or complete blocking constraints. Task lists import as reference data and
+never block calendar time. **Enable Calendar publishing** and **Enable Tasks
+publishing** are separate incremental-consent upgrades for an existing account.
+Only a selected Calendar for which Google reports `owner` or `writer` access,
+or a selected Task list under an account with the full Tasks grant, can then be
+marked **Publish**. A grant for one service never unlocks the other. Blocking
+Task lists and unsupported provider-publication policies are rejected locally.
 Collection changes use optimistic revisions; a lost response or conflict is
 reconciled with an authoritative GET before the app permits another conclusion.
 Disconnect persists its exact account, revision, and idempotency key before the
@@ -327,11 +328,16 @@ offline state, and still-queued work remain visible without displaying provider
 IDs, scopes, tokens, or raw error codes. Server cleanup fences block new OAuth
 starts before a local request journal is created.
 
-The Inbox inspector can publish only a synced, app-authored event containing an
-owned `dayweave_firm_block`, or delete its recoverably trashed mapped event. It
-first requests and displays the reviewed private Google Calendar payload; the
-server redacts its managed ownership-proof values from that view. Nothing
-is queued until the owner chooses **Approve & Queue** on that exact preview.
+The Inbox inspector can publish a synced, app-authored event containing an owned
+`dayweave_firm_block`, or a supported synced, app-authored task. A recoverably
+trashed mapped event or task can instead produce a reviewed deletion. Imported,
+recurring, unsupported, unsynchronized, skipped, or canceled tasks are not
+offered as outbound candidates. DayWeave-only hierarchy, recurrence, split, and
+scheduling metadata remains local rather than being flattened into Google
+Tasks. The client first requests and displays the exact reviewed Calendar or
+Tasks payload; the server redacts Calendar ownership-proof values from that
+view. Nothing is queued until the owner chooses **Approve & Queue** on that
+exact preview.
 The client then obtains one expiring, preview-bound capability and submits the
 same account, collection, item revision, and operation to the durable server
 outbox. Preview, approval, and enqueue accept exactly HTTP `200`, `200`, and
@@ -351,14 +357,24 @@ clock skew while locally elapsed authority stays non-actionable. Once authority
 has expired, destructive discard waits another five-minute skew window and then
 requires an explicit warning confirmation and exact-record comparison so canonical
 sync cannot remain stranded. Approved-stage recovery warns that a prior enqueue
-response may have been lost before the owner retries.
-Google Tasks publication is intentionally disabled.
+response may have been lost before the owner retries. Every recovery record is
+bound to its entity kind, so a Calendar intent cannot be recovered or approved
+as a Task intent, or vice versa. Google Tasks create, update/completion, and
+delete use the same reviewed outbox flow. Because Google Tasks does not support
+a client-selected resource identifier, a new Task is attempted only once; an
+ambiguous provider result is retained for reconciliation and is never blindly
+posted again.
 
 The unified Inbox separates **Items** from **Suggestions**. Items are canonical,
 encrypted local drafts: Quick Capture needs only a title, while the detailed
 editor supports Inbox/Planned state, type, recurrence, constraints, hierarchy,
-privacy, deletion, restore, and explicit conflict recovery. Suggestions fetches
-pending proposals and supports refresh, edit, accept, and reject with the
+privacy, deletion, restore, and explicit conflict recovery. The Items lifecycle
+also keeps
+scheduled/running/paused rows reachable as read-only **Active** entries and
+shows completed rows dimmed by default behind the persisted **Show completed**
+switch, so reviewed Google Tasks updates do not disappear when execution state
+changes. Suggestions fetches pending proposals and supports refresh, edit,
+accept, and reject with the
 proposal's optimistic `expected_revision`. Remote proposals remain a separate,
 in-memory review feed. Accepting an ordinary advisory
 proposal records the decision at the API and intentionally does **not** create

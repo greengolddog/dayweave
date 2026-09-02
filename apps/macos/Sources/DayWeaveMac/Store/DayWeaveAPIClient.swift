@@ -1038,6 +1038,14 @@ struct DayWeaveAPIClient: Sendable {
             requiresDurableAuthorization: true
         )
         let collection = snapshot.collection
+        let collectionRoleIsValid = switch (collection.kind, role) {
+        case (.calendar, .readOnly), (.calendar, .blocking), (.calendar, .writable):
+            true
+        case (.taskList, .readOnly), (.taskList, .writable):
+            calendarPolicy.isReadOnlySafe
+        case (.taskList, .blocking):
+            false
+        }
         guard collection.accountID == accountID,
               collection.id == collectionID,
               collection.revision == expectedRevision + 1,
@@ -1045,7 +1053,7 @@ struct DayWeaveAPIClient: Sendable {
               collection.visible == visible,
               collection.syncRole == role,
               collection.calendarPolicy == calendarPolicy,
-              role == .readOnly || collection.kind == .calendar else {
+              collectionRoleIsValid else {
             throw DayWeaveAPIError.responseDecodingFailed
         }
         return collection

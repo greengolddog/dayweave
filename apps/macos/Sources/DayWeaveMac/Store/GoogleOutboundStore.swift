@@ -12,7 +12,8 @@ enum GoogleOutboundRecoveryStage: String, Codable, Equatable, Sendable {
 /// `GoogleOutboundRecoveryStoring` must keep this value inside encrypted app
 /// state. Reflection and string conversion deliberately reveal no fields.
 struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 2
+    private static let legacyCalendarVersion = 1
     static let maximumIntentLifetime: TimeInterval = 35 * 60
     static let maximumClockSkew: TimeInterval = 5 * 60
 
@@ -24,6 +25,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
     let collectionID: UUID
     let itemID: UUID
     let expectedItemRevision: UInt64
+    let entityKind: GoogleOutboundEntityKind
     let operation: GoogleOutboundOperation
     let intentExpiresAt: Date
     let preview: GoogleOutboundPreview?
@@ -40,6 +42,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
         collectionID: UUID,
         itemID: UUID,
         expectedItemRevision: UInt64,
+        entityKind: GoogleOutboundEntityKind = .calendarEvent,
         operation: GoogleOutboundOperation,
         intentExpiresAt: Date,
         preview: GoogleOutboundPreview? = nil,
@@ -56,6 +59,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
         self.collectionID = collectionID
         self.itemID = itemID
         self.expectedItemRevision = expectedItemRevision
+        self.entityKind = entityKind
         self.operation = operation
         self.intentExpiresAt = intentExpiresAt
         self.preview = preview
@@ -110,6 +114,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
             collectionID: collectionID,
             itemID: itemID,
             expectedItemRevision: expectedItemRevision,
+            entityKind: entityKind,
             operation: operation,
             intentExpiresAt: intentExpiresAt,
             preview: preview,
@@ -133,6 +138,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
             collectionID: collectionID,
             itemID: itemID,
             expectedItemRevision: expectedItemRevision,
+            entityKind: entityKind,
             operation: operation,
             intentExpiresAt: intentExpiresAt,
             preview: preview,
@@ -157,6 +163,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
             collectionID: collectionID,
             itemID: itemID,
             expectedItemRevision: expectedItemRevision,
+            entityKind: entityKind,
             operation: operation,
             intentExpiresAt: intentExpiresAt,
             preview: preview,
@@ -237,7 +244,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
                   preview.itemRevision == expectedItemRevision,
                   preview.collectionRevision > 0,
                   preview.collectionRevision <= UInt64(Int64.max),
-                  preview.entityKind == .calendarEvent,
+                  preview.entityKind == entityKind,
                   preview.operation == operation,
                   Self.isValidPreviewHash(preview.previewHash),
                   Self.isFinite(preview.expiresAt),
@@ -278,6 +285,25 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
         case collectionID = "collection_id"
         case itemID = "item_id"
         case expectedItemRevision = "expected_item_revision"
+        case entityKind = "entity_kind"
+        case operation
+        case intentExpiresAt = "intent_expires_at"
+        case preview
+        case approvalAttempted = "approval_attempted"
+        case approvalCapability = "approval_capability"
+        case approvalExpiresAt = "approval_expires_at"
+        case createdAt = "created_at"
+    }
+
+    private enum LegacyCodingKeys: String, CodingKey, CaseIterable {
+        case version
+        case recoveryID = "recovery_id"
+        case operationGeneration = "operation_generation"
+        case configurationIdentifier = "configuration_identifier"
+        case accountID = "account_id"
+        case collectionID = "collection_id"
+        case itemID = "item_id"
+        case expectedItemRevision = "expected_item_revision"
         case operation
         case intentExpiresAt = "intent_expires_at"
         case preview
@@ -288,10 +314,20 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
     }
 
     init(from decoder: any Decoder) throws {
-        try requireExactGoogleJournalKeys(CodingKeys.self, from: decoder)
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let decodedVersion = try container.decode(Int.self, forKey: .version)
-        guard decodedVersion == Self.currentVersion else {
+        let decodedEntityKind: GoogleOutboundEntityKind
+        switch decodedVersion {
+        case Self.legacyCalendarVersion:
+            try requireExactGoogleJournalKeys(LegacyCodingKeys.self, from: decoder)
+            decodedEntityKind = .calendarEvent
+        case Self.currentVersion:
+            try requireExactGoogleJournalKeys(CodingKeys.self, from: decoder)
+            decodedEntityKind = try container.decode(
+                GoogleOutboundEntityKind.self,
+                forKey: .entityKind
+            )
+        default:
             throw googleJournalDecodingError(
                 codingPath: decoder.codingPath,
                 description: "The Google outbound recovery version is invalid"
@@ -315,6 +351,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
                     UInt64.self,
                     forKey: .expectedItemRevision
                 ),
+                entityKind: decodedEntityKind,
                 operation: container.decode(
                     GoogleOutboundOperation.self,
                     forKey: .operation
@@ -367,6 +404,7 @@ struct GoogleOutboundRecoveryJournal: Codable, Equatable, Sendable {
         try container.encode(collectionID, forKey: .collectionID)
         try container.encode(itemID, forKey: .itemID)
         try container.encode(expectedItemRevision, forKey: .expectedItemRevision)
+        try container.encode(entityKind, forKey: .entityKind)
         try container.encode(operation, forKey: .operation)
         try container.encode(intentExpiresAt, forKey: .intentExpiresAt)
         if let preview {
@@ -454,6 +492,7 @@ struct GoogleOutboundApprovalConfirmation: Equatable, Sendable {
     fileprivate let operationGeneration: UInt64
     fileprivate let configurationIdentifier: String
     fileprivate let accountID: UUID
+    fileprivate let entityKind: GoogleOutboundEntityKind
     fileprivate let previewID: UUID
     fileprivate let previewHash: String
 }
@@ -461,6 +500,7 @@ struct GoogleOutboundApprovalConfirmation: Equatable, Sendable {
 struct GoogleOutboundRecoveryContext: Equatable, Sendable {
     let itemID: UUID
     let expectedItemRevision: UInt64
+    let entityKind: GoogleOutboundEntityKind
     let operation: GoogleOutboundOperation
     let stage: GoogleOutboundRecoveryStage
 }
@@ -493,15 +533,15 @@ enum GoogleOutboundWorkflowStatus: Equatable, Sendable {
         case .privacyProtected:
             "Google publication details are hidden while DayWeave is locked."
         case .idle:
-            "Choose an exact calendar item and review its Google publication preview."
+            "Choose an exact item and review its Google publication preview."
         case .previewing:
-            "Preparing the exact Google Calendar change for review…"
+            "Preparing the exact Google change for review…"
         case let .awaitingApproval(expiresAt):
             "Review the provider change and approve it explicitly before \(expiresAt.formatted(date: .omitted, time: .shortened))."
         case .approving:
-            "Creating one expiring approval for the reviewed Google Calendar change…"
+            "Creating one expiring approval for the reviewed Google change…"
         case .enqueueing:
-            "Saving the approved Google Calendar change to the durable outbox…"
+            "Saving the approved Google change to the durable outbox…"
         case let .expirySafetyDelay(discardAfter):
             "This Mac's saved-authority expiry time passed. If the operation was already approved, its exact result can still be recovered safely. To tolerate device clock skew, this recovery can be discarded after \(discardAfter.formatted(date: .omitted, time: .shortened))."
         case .expired:
@@ -510,8 +550,8 @@ enum GoogleOutboundWorkflowStatus: Equatable, Sendable {
             message
         case let .accepted(_, replayed):
             replayed
-                ? "The previously accepted Google Calendar change was recovered."
-                : "The Google Calendar change was accepted into the durable outbox."
+                ? "The previously accepted Google change was recovered."
+                : "The Google change was accepted into the durable outbox."
         }
     }
 
@@ -669,6 +709,7 @@ final class GoogleOutboundStore: ObservableObject {
             operationGeneration: journal.operationGeneration,
             configurationIdentifier: journal.configurationIdentifier,
             accountID: journal.accountID,
+            entityKind: journal.entityKind,
             previewID: preview.id,
             previewHash: preview.previewHash
         )
@@ -755,6 +796,7 @@ final class GoogleOutboundStore: ObservableObject {
         collectionID: UUID,
         itemID: UUID,
         expectedItemRevision: UInt64,
+        entityKind: GoogleOutboundEntityKind = .calendarEvent,
         operation: GoogleOutboundOperation
     ) async -> Bool {
         guard privacyAvailable else {
@@ -805,6 +847,7 @@ final class GoogleOutboundStore: ObservableObject {
                 collectionID: collectionID,
                 itemID: itemID,
                 expectedItemRevision: expectedItemRevision,
+                entityKind: entityKind,
                 operation: operation,
                 intentExpiresAt: intentExpiry,
                 createdAt: currentDate
@@ -816,7 +859,16 @@ final class GoogleOutboundStore: ObservableObject {
             recoveryContext = Self.context(for: journal)
             preview = nil
             accepted = nil
-            return try await performPreview(journal, using: context)
+            do {
+                return try await performPreview(journal, using: context)
+            } catch {
+                try clearDefinitivelyRejectedPreviewIntent(
+                    error,
+                    journal: journal,
+                    operation: context
+                )
+                throw error
+            }
         } catch {
             handleFailure(error, operation: operationContext)
             return false
@@ -985,7 +1037,7 @@ final class GoogleOutboundStore: ObservableObject {
               response.itemRevision == journal.expectedItemRevision,
               response.collectionRevision > 0,
               response.collectionRevision <= UInt64(Int64.max),
-              response.entityKind == .calendarEvent,
+              response.entityKind == journal.entityKind,
               response.operation == journal.operation,
               response.expiresAt.timeIntervalSinceReferenceDate.isFinite,
               response.expiresAt >= journal.createdAt.addingTimeInterval(
@@ -1067,6 +1119,7 @@ final class GoogleOutboundStore: ObservableObject {
             operationGeneration: journal.operationGeneration,
             configurationIdentifier: journal.configurationIdentifier,
             accountID: journal.accountID,
+            entityKind: journal.entityKind,
             previewID: preview.id,
             previewHash: preview.previewHash
         )
@@ -1209,6 +1262,7 @@ final class GoogleOutboundStore: ObservableObject {
         GoogleOutboundRecoveryContext(
             itemID: journal.itemID,
             expectedItemRevision: journal.expectedItemRevision,
+            entityKind: journal.entityKind,
             operation: journal.operation,
             stage: journal.stage
         )
@@ -1220,6 +1274,36 @@ final class GoogleOutboundStore: ObservableObject {
         guard try recoveryStore.loadGoogleOutboundRecoveryJournal() == expected else {
             throw GoogleOutboundWorkflowError.recoveryChanged
         }
+    }
+
+    /// A 4xx response from the preview endpoint is definitive rejection of a
+    /// read-only operation: no approval capability or provider mutation could
+    /// have been issued. Clear only the exact still-current intent so a stale
+    /// item or wrong Task list cannot fence all publication until expiry.
+    /// Transport failures and every approval/enqueue failure remain replayed
+    /// from the durable journal because their outcomes can be ambiguous.
+    private func clearDefinitivelyRejectedPreviewIntent(
+        _ error: Error,
+        journal: GoogleOutboundRecoveryJournal,
+        operation: ActiveGoogleOutboundOperation
+    ) throws {
+        guard let apiError = error as? DayWeaveAPIError,
+              case let .server(statusCode, _, _, _) = apiError,
+              (400..<500).contains(statusCode) else {
+            return
+        }
+        try requireCurrent(operation)
+        guard journal.stage == .intent else {
+            throw GoogleOutboundWorkflowError.invalidRecoveryTransition
+        }
+        try requireCurrentRecoveryJournal(journal)
+        try recoveryStore.clearGoogleOutboundRecoveryJournal(journal)
+        cancelExpiryObservation()
+        hasPendingRecovery = false
+        presentedJournal = nil
+        recoveryContext = nil
+        preview = nil
+        accepted = nil
     }
 
     private func handleFailure(

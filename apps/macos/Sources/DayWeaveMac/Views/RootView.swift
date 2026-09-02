@@ -559,14 +559,14 @@ private struct SidebarView: View {
                 .foregroundStyle(googleOutboundStatusColor)
                 if googleOutbound.hasPendingRecovery {
                     if googleOutbound.preview != nil {
-                        Button("Review Calendar change") {
+                        Button("Review \(googleRecoveryServiceName) change") {
                             googleReviewIsPresented = true
                         }
                         .accessibilityIdentifier("google.outbound.sidebar-review")
                     } else if googleOutbound.hasApprovedRecovery {
                         Button(googleOutbound.status == .expired
-                            ? "Check Calendar acceptance"
-                            : "Recover approved Calendar change") {
+                            ? "Check \(googleRecoveryServiceName) acceptance"
+                            : "Recover approved \(googleRecoveryServiceName) change") {
                             Task {
                                 _ = await googleOutbound.recoverPendingOperation()
                             }
@@ -575,17 +575,17 @@ private struct SidebarView: View {
                         .accessibilityIdentifier("google.outbound.sidebar-check-acceptance")
                         if googleOutbound.status == .expired {
                             GoogleExpiredRecoveryDiscardButton(
-                                title: "Discard expired Calendar recovery",
+                                title: "Discard expired \(googleRecoveryServiceName) recovery",
                                 accessibilityIdentifier: "google.outbound.sidebar-discard"
                             )
                         }
                     } else if googleOutbound.status == .expired {
                         GoogleExpiredRecoveryDiscardButton(
-                            title: "Discard expired Calendar recovery",
+                            title: "Discard expired \(googleRecoveryServiceName) recovery",
                             accessibilityIdentifier: "google.outbound.sidebar-discard"
                         )
                     } else if !googleOutbound.status.isWaitingForSafeDiscard {
-                        Button("Recover Calendar change") {
+                        Button("Recover \(googleRecoveryServiceName) change") {
                             Task {
                                 _ = await googleOutbound.recoverPendingOperation()
                                 if googleOutbound.preview != nil {
@@ -634,11 +634,23 @@ private struct SidebarView: View {
 
     private var googleRecoveryFallbackTitle: String {
         guard let itemID = googleOutbound.recoveryContext?.itemID else {
-            return "Saved DayWeave event"
+            return googleRecoveryEntityKind == .task
+                ? "Saved DayWeave task" : "Saved DayWeave event"
         }
         return store.canonicalItems.first(where: { $0.id == itemID })?.title
             ?? store.canonicalTrash.first(where: { $0.id == itemID })?.title
-            ?? "Saved DayWeave event"
+            ?? (googleRecoveryEntityKind == .task
+                ? "Saved DayWeave task" : "Saved DayWeave event")
+    }
+
+    private var googleRecoveryEntityKind: GoogleOutboundEntityKind {
+        googleOutbound.preview?.entityKind
+            ?? googleOutbound.recoveryContext?.entityKind
+            ?? .calendarEvent
+    }
+
+    private var googleRecoveryServiceName: String {
+        googleRecoveryEntityKind == .task ? "Google Tasks" : "Google Calendar"
     }
 
     private var googleOutboundStatusColor: Color {
@@ -2644,7 +2656,7 @@ private struct InspectorView: View {
     }
 }
 
-private struct GoogleCalendarPublicationTarget: Identifiable {
+private struct GooglePublicationTarget: Identifiable {
     let accountID: UUID
     let collectionID: UUID
     let displayName: String
@@ -2652,13 +2664,22 @@ private struct GoogleCalendarPublicationTarget: Identifiable {
     var id: String { "\(accountID.uuidString):\(collectionID.uuidString)" }
 }
 
-private struct GoogleCalendarPublicationCandidate {
+private struct GooglePublicationCandidate {
     let itemID: UUID
     let revision: UInt64
+    let entityKind: GoogleOutboundEntityKind
     let operation: GoogleOutboundOperation
     let isAllDay: Bool
     let isTentative: Bool
     let isBusy: Bool
+
+    var serviceTitle: String {
+        entityKind == .calendarEvent ? "Google Calendar" : "Google Tasks"
+    }
+
+    var itemTitle: String {
+        entityKind == .calendarEvent ? "event" : "task"
+    }
 }
 
 private extension JSONValue {
@@ -2719,6 +2740,8 @@ private struct CanonicalInboxInspector: View {
         return (presentation.conflicts
             + presentation.inbox
             + presentation.planned
+            + presentation.active
+            + presentation.completed
             + presentation.trash)
             .first { $0.itemID == selectedID }
     }
@@ -2785,8 +2808,10 @@ private struct CanonicalInboxInspector: View {
                         }
                     }
 
-                    if row.kind == .event {
-                        InspectorSection(title: "Google Calendar") {
+                    if row.kind == .event || row.kind == .task {
+                        InspectorSection(
+                            title: row.kind == .event ? "Google Calendar" : "Google Tasks"
+                        ) {
                             googlePublicationControls(for: row)
                         }
                     }
@@ -2915,19 +2940,20 @@ private struct CanonicalInboxInspector: View {
         for row: CanonicalInboxPresentation.Row
     ) -> some View {
         if let candidate = googlePublicationCandidate(for: row) {
-            let eligibleTargets = writableCalendarTargets(for: candidate)
+            let eligibleTargets = writableGoogleTargets(for: candidate)
             if let preview = googleOutbound.preview,
                preview.itemID == candidate.itemID,
                preview.itemRevision == candidate.revision,
+               preview.entityKind == candidate.entityKind,
                preview.operation == candidate.operation {
-                Button("Review prepared Calendar change") {
+                Button("Review prepared \(candidate.serviceTitle) change") {
                     googleReviewIsPresented = true
                 }
                 .buttonStyle(.borderedProminent)
                 .accessibilityIdentifier("google.outbound.review-open")
             } else if googleOutbound.hasPendingRecovery {
                 Label(
-                    "A saved Calendar operation must be recovered from the sidebar before another event can be published.",
+                    "A saved Google operation must be recovered from the sidebar before another item can be published.",
                     systemImage: "arrow.up.circle.fill"
                 )
                     .font(.caption)
@@ -2935,8 +2961,11 @@ private struct CanonicalInboxInspector: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else if eligibleTargets.isEmpty {
                 Label(
-                    "No selected Publish calendar permits this event type. Check Calendar ownership and the all-day, tentative, or free publication switches in Settings.",
-                    systemImage: "calendar.badge.exclamationmark"
+                    candidate.entityKind == .calendarEvent
+                        ? "No selected Publish calendar permits this event type. Check Calendar ownership and the all-day, tentative, or free publication switches in Settings."
+                        : "No selected Publish task list is available. Enable Google Tasks publishing, then choose a writable list in Settings.",
+                    systemImage: candidate.entityKind == .calendarEvent
+                        ? "calendar.badge.exclamationmark" : "checklist"
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2944,7 +2973,7 @@ private struct CanonicalInboxInspector: View {
             } else {
                 Menu(candidate.operation == .delete
                     ? "Preview removal from Google"
-                    : "Preview in Google Calendar") {
+                    : "Preview in \(candidate.serviceTitle)") {
                     ForEach(eligibleTargets) { target in
                         Button(target.displayName) {
                             prepareGooglePreview(candidate, target: target)
@@ -2957,8 +2986,10 @@ private struct CanonicalInboxInspector: View {
             }
 
             Text(candidate.operation == .delete
-                ? "Only a recoverably deleted canonical event can remove its DayWeave-owned Google event. The exact removal is reviewed first."
-                : "Only this app-authored fixed event is eligible. DayWeave shows the exact private Google payload and asks again before queueing it.")
+                ? "The server permits removal only when this exact trashed DayWeave \(candidate.itemTitle) still has a DayWeave-owned mapping and retained version in the selected destination. The provider deletion is reviewed first."
+                : candidate.entityKind == .calendarEvent
+                    ? "Only this app-authored fixed event is eligible. DayWeave shows the exact private Google payload and asks again before queueing it."
+                    : "Only a synced, app-authored, non-recurring task is eligible. Title, notes, completion state, and due date may be sent; DayWeave-only planning metadata stays local.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2970,7 +3001,9 @@ private struct CanonicalInboxInspector: View {
                 .accessibilityIdentifier("google.outbound.status")
         } else {
             Label(
-                "Sync this app-authored fixed event before publishing it. Imported, flexible, locally queued, or unrestorable events cannot be sent to Google.",
+                row.kind == .task
+                    ? "Sync an app-authored, non-recurring task before publishing it. Imported, skipped, cancelled, locally queued, or unsupported tasks cannot be sent."
+                    : "Sync this app-authored fixed event before publishing it. Imported, flexible, locally queued, or unrestorable events cannot be sent to Google.",
                 systemImage: "lock.shield"
             )
             .font(.caption)
@@ -2979,33 +3012,40 @@ private struct CanonicalInboxInspector: View {
         }
     }
 
-    private func writableCalendarTargets(
-        for candidate: GoogleCalendarPublicationCandidate
-    ) -> [GoogleCalendarPublicationTarget] {
+    private func writableGoogleTargets(
+        for candidate: GooglePublicationCandidate
+    ) -> [GooglePublicationTarget] {
         googleIntegration.accounts
             .filter {
                 $0.status == .active
-                    && googleIntegration.hasCalendarPublishingScope(for: $0)
+                    && (candidate.entityKind == .calendarEvent
+                        ? googleIntegration.hasCalendarPublishingScope(for: $0)
+                        : googleIntegration.hasTasksPublishingScope(for: $0))
             }
             .flatMap { account in
                 (googleIntegration.collectionsByAccount[account.id] ?? []).compactMap {
                     collection in
-                    guard collection.kind == .calendar,
+                    guard collection.kind == (candidate.entityKind == .calendarEvent
+                            ? .calendar : .taskList),
                           collection.selected,
                           collection.syncRole == .writable,
-                          !collection.providerDeleted,
-                          candidate.operation == .delete
-                            || ((!candidate.isAllDay
-                                    || collection.calendarPolicy.publishAllDay)
-                                && (!candidate.isTentative
-                                    || collection.calendarPolicy.publishTentative)
-                                && (candidate.isBusy
-                                    || collection.calendarPolicy.publishFree)),
-                          let access = collection.providerAccessRole?.lowercased(),
-                          access == "owner" || access == "writer" else {
+                          !collection.providerDeleted else {
                         return nil
                     }
-                    return GoogleCalendarPublicationTarget(
+                    if candidate.entityKind == .calendarEvent {
+                        guard candidate.operation == .delete
+                                || ((!candidate.isAllDay
+                                        || collection.calendarPolicy.publishAllDay)
+                                    && (!candidate.isTentative
+                                        || collection.calendarPolicy.publishTentative)
+                                    && (candidate.isBusy
+                                        || collection.calendarPolicy.publishFree)),
+                              let access = collection.providerAccessRole?.lowercased(),
+                              access == "owner" || access == "writer" else {
+                            return nil
+                        }
+                    }
+                    return GooglePublicationTarget(
                         accountID: account.id,
                         collectionID: collection.id,
                         displayName: "\(account.displayLabel) · \(collection.displayName)"
@@ -3018,16 +3058,17 @@ private struct CanonicalInboxInspector: View {
 
     private func googlePublicationCandidate(
         for row: CanonicalInboxPresentation.Row
-    ) -> GoogleCalendarPublicationCandidate? {
+    ) -> GooglePublicationCandidate? {
         if row.source == .canonical,
            row.syncState == .synced,
            let item = store.canonicalItems.first(where: { $0.id == row.itemID }),
            item.deletedAt == nil,
            item.kind == .event,
            let traits = item.flexibleConstraints.googleFirmBlockPublicationTraits {
-            return GoogleCalendarPublicationCandidate(
+            return GooglePublicationCandidate(
                 itemID: item.id,
                 revision: item.revision,
+                entityKind: .calendarEvent,
                 operation: .upsert,
                 isAllDay: traits.isAllDay,
                 isTentative: traits.isTentative,
@@ -3040,21 +3081,51 @@ private struct CanonicalInboxInspector: View {
            let item = entry.lastKnownItem,
            item.kind == .event,
            let traits = item.flexibleConstraints.googleFirmBlockPublicationTraits {
-            return GoogleCalendarPublicationCandidate(
+            return GooglePublicationCandidate(
                 itemID: entry.id,
                 revision: entry.revision,
+                entityKind: .calendarEvent,
                 operation: .delete,
                 isAllDay: traits.isAllDay,
                 isTentative: traits.isTentative,
                 isBusy: traits.isBusy
             )
         }
+        if row.source == .canonical,
+           row.syncState == .synced,
+           let item = store.canonicalItems.first(where: { $0.id == row.itemID }),
+           item.isEligibleForGoogleTaskPublication(deleted: false) {
+            return GooglePublicationCandidate(
+                itemID: item.id,
+                revision: item.revision,
+                entityKind: .task,
+                operation: .upsert,
+                isAllDay: false,
+                isTentative: false,
+                isBusy: false
+            )
+        }
+        if row.source == .recentTrash,
+           row.syncState == .synced,
+           let entry = store.canonicalTrash.first(where: { $0.id == row.itemID }),
+           let item = entry.lastKnownItem,
+           item.isEligibleForGoogleTaskPublication(deleted: true) {
+            return GooglePublicationCandidate(
+                itemID: entry.id,
+                revision: entry.revision,
+                entityKind: .task,
+                operation: .delete,
+                isAllDay: false,
+                isTentative: false,
+                isBusy: false
+            )
+        }
         return nil
     }
 
     private func prepareGooglePreview(
-        _ candidate: GoogleCalendarPublicationCandidate,
-        target: GoogleCalendarPublicationTarget
+        _ candidate: GooglePublicationCandidate,
+        target: GooglePublicationTarget
     ) {
         Task {
             let prepared = await googleOutbound.preparePreview(
@@ -3062,6 +3133,7 @@ private struct CanonicalInboxInspector: View {
                 collectionID: target.collectionID,
                 itemID: candidate.itemID,
                 expectedItemRevision: candidate.revision,
+                entityKind: candidate.entityKind,
                 operation: candidate.operation
             )
             if prepared, googleOutbound.preview != nil {
@@ -3167,21 +3239,21 @@ private struct GoogleOutboundReviewSheet: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 18) {
                             Label(
-                                preview.operation == .delete
-                                    ? "Remove one DayWeave event from Google Calendar"
-                                    : "Publish one private event to Google Calendar",
-                                systemImage: preview.operation == .delete
-                                    ? "calendar.badge.minus" : "calendar.badge.plus"
+                                reviewHeading(preview),
+                                systemImage: reviewSymbol(preview)
                             )
                             .font(.title3.weight(.semibold))
 
-                            Text("The preview request has reached your DayWeave server, but no Google Calendar provider change has been queued or sent. Review the exact change below; Approve & Queue creates one short-lived approval and saves the operation to the durable server outbox.")
+                            Text("The preview request reached your DayWeave server, but no Google provider change has been queued or sent. Review the exact change below; Approve & Queue creates one short-lived approval and saves the operation to the durable server outbox.")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
 
                             InspectorSection(title: "Destination") {
-                                LabeledContent("Calendar", value: preview.collectionDisplayName)
+                                LabeledContent(
+                                    preview.entityKind == .calendarEvent ? "Calendar" : "Task list",
+                                    value: preview.collectionDisplayName
+                                )
                                 LabeledContent(
                                     "Change",
                                     value: preview.operation == .delete ? "Delete" : "Create or update"
@@ -3189,7 +3261,11 @@ private struct GoogleOutboundReviewSheet: View {
                                 LabeledContent(
                                     "Provider item",
                                     value: preview.providerResourceID == nil
-                                        ? "New private event" : "Existing DayWeave-owned event"
+                                        ? (preview.entityKind == .calendarEvent
+                                            ? "New private event" : "New task")
+                                        : (preview.entityKind == .calendarEvent
+                                            ? "Existing DayWeave-owned event"
+                                            : "Existing DayWeave-owned task")
                                 )
                                 LabeledContent(
                                     "Approval expires",
@@ -3200,34 +3276,60 @@ private struct GoogleOutboundReviewSheet: View {
                                 )
                             }
 
-                            InspectorSection(title: "Visible event details") {
-                                LabeledContent("Title", value: payloadString("summary") ?? fallbackTitle)
+                            InspectorSection(
+                                title: preview.entityKind == .calendarEvent
+                                    ? "Visible event details" : "Visible task details"
+                            ) {
+                                LabeledContent(
+                                    "Title",
+                                    value: payloadString(
+                                        preview.entityKind == .calendarEvent ? "summary" : "title"
+                                    ) ?? fallbackTitle
+                                )
                                     .privacySensitive(true)
-                                if let description = payloadString("description"),
-                                   !description.isEmpty {
+                                if let details = payloadString(
+                                    preview.entityKind == .calendarEvent ? "description" : "notes"
+                                ), !details.isEmpty {
                                     VStack(alignment: .leading, spacing: 4) {
-                                        Text("Description")
+                                        Text(preview.entityKind == .calendarEvent
+                                            ? "Description" : "Notes")
                                             .font(.caption)
                                             .foregroundStyle(.secondary)
-                                        Text(description)
+                                        Text(details)
                                             .textSelection(.enabled)
                                             .privacySensitive(true)
                                     }
                                 }
-                                if let start = providerBound("start") {
-                                    LabeledContent("Start", value: start)
-                                }
-                                if let end = providerBound("end") {
-                                    LabeledContent("End", value: end)
+                                if preview.entityKind == .calendarEvent {
+                                    if let start = providerBound("start") {
+                                        LabeledContent("Start", value: start)
+                                    }
+                                    if let end = providerBound("end") {
+                                        LabeledContent("End", value: end)
+                                    }
+                                } else {
+                                    if let due = payloadString("due") {
+                                        LabeledContent("Due", value: due)
+                                    }
+                                    if let completed = payloadString("completed") {
+                                        LabeledContent("Completed", value: completed)
+                                    }
                                 }
                                 if let status = payloadString("status") {
-                                    LabeledContent("Status", value: status.capitalized)
+                                    LabeledContent(
+                                        "Status",
+                                        value: status == "needsAction"
+                                            ? "Needs action" : status.capitalized
+                                    )
                                 }
-                                if let transparency = payloadString("transparency") {
+                                if preview.entityKind == .calendarEvent,
+                                   let transparency = payloadString("transparency") {
                                     LabeledContent("Availability", value: transparency.capitalized)
                                 }
                                 if preview.operation == .delete {
-                                    Text("Google will delete only the mapped event whose private ownership proof and retained ETag still match this reviewed DayWeave item.")
+                                    Text(preview.entityKind == .calendarEvent
+                                        ? "Google will delete only the mapped event whose private ownership proof and retained ETag still match this reviewed DayWeave item."
+                                        : "Google will delete only the mapped task whose retained identity and ETag still match this reviewed DayWeave item.")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .fixedSize(horizontal: false, vertical: true)
@@ -3242,13 +3344,18 @@ private struct GoogleOutboundReviewSheet: View {
                                     .padding(.top, 8)
                             }
 
-                            Text("Server-managed private ownership proof values are redacted from this reviewed payload.")
+                            Text(preview.entityKind == .calendarEvent
+                                ? "Server-managed private ownership proof values are redacted from this reviewed payload."
+                                : "Task identifiers, versions, hierarchy, ordering, and DayWeave-only planning metadata are not included in this reviewed write payload.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
 
                             Label(
-                                "DayWeave keeps an encrypted local recovery copy. The server stores the preview and only a hash of the short-lived approval capability; provider credentials remain server-only. Google Tasks publishing remains disabled.",
+                                preview.entityKind == .task && preview.operation == .upsert
+                                    && preview.providerResourceID == nil
+                                    ? "DayWeave keeps an encrypted local recovery copy. A new Google Task is attempted only once; an ambiguous provider result is never repeated blindly and requires reconciliation. Provider credentials remain server-only."
+                                    : "DayWeave keeps an encrypted local recovery copy. The server stores the preview and only a hash of the short-lived approval capability; provider credentials remain server-only.",
                                 systemImage: "lock.shield.fill"
                             )
                             .font(.caption)
@@ -3266,7 +3373,11 @@ private struct GoogleOutboundReviewSheet: View {
                     }
                 } else {
                     ContentUnavailableView {
-                        Label("Preview unavailable", systemImage: "calendar.badge.exclamationmark")
+                        Label(
+                            "Preview unavailable",
+                            systemImage: presentedEntityKind == .calendarEvent
+                                ? "calendar.badge.exclamationmark" : "checklist"
+                        )
                     } description: {
                         Text(googleOutbound.status.message)
                     } actions: {
@@ -3298,7 +3409,10 @@ private struct GoogleOutboundReviewSheet: View {
                     }
                 }
             }
-            .navigationTitle("Review Google Calendar change")
+            .navigationTitle(
+                presentedEntityKind == .calendarEvent
+                    ? "Review Google Calendar change" : "Review Google Tasks change"
+            )
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Close") { dismiss() }
@@ -3327,6 +3441,30 @@ private struct GoogleOutboundReviewSheet: View {
         }
         .frame(minWidth: 620, minHeight: 620)
         .accessibilityIdentifier("google.outbound.review")
+    }
+
+    private var presentedEntityKind: GoogleOutboundEntityKind {
+        googleOutbound.preview?.entityKind
+            ?? googleOutbound.recoveryContext?.entityKind
+            ?? .calendarEvent
+    }
+
+    private func reviewHeading(_ preview: GoogleOutboundPreview) -> String {
+        switch (preview.entityKind, preview.operation) {
+        case (.calendarEvent, .upsert): "Publish one private event to Google Calendar"
+        case (.calendarEvent, .delete): "Remove one DayWeave event from Google Calendar"
+        case (.task, .upsert): "Publish one task to Google Tasks"
+        case (.task, .delete): "Remove one DayWeave task from Google Tasks"
+        }
+    }
+
+    private func reviewSymbol(_ preview: GoogleOutboundPreview) -> String {
+        switch (preview.entityKind, preview.operation) {
+        case (.calendarEvent, .upsert): "calendar.badge.plus"
+        case (.calendarEvent, .delete): "calendar.badge.minus"
+        case (.task, .upsert): "checklist"
+        case (.task, .delete): "checkmark.circle.badge.xmark"
+        }
     }
 
     private func payloadString(_ key: String) -> String? {
@@ -3399,7 +3537,7 @@ struct GoogleExpiredRecoveryDiscardButton: View {
         }
         .accessibilityIdentifier(accessibilityIdentifier)
         .confirmationDialog(
-            "Discard expired Calendar recovery?",
+            "Discard expired \(serviceName) recovery?",
             isPresented: $confirmationIsPresented,
             titleVisibility: .visible
         ) {
@@ -3416,12 +3554,17 @@ struct GoogleExpiredRecoveryDiscardButton: View {
 
     private var discardMessage: String {
         if googleOutbound.recoveryContext?.stage == .approved {
-            return "The approval is expired and cannot authorize a new enqueue. However, a prior enqueue response may have been lost, so the server could already be delivering this exact Calendar change. Discarding removes only this Mac's local recovery; verify Calendar or server status before trying the change again."
+            return "The approval is expired and cannot authorize a new enqueue. However, a prior enqueue response may have been lost, so the server could already be delivering this exact \(serviceName) change. Discarding removes only this Mac's local recovery; verify \(serviceName) or server status before trying the change again."
         }
         if googleOutbound.recoveryContext?.stage == .approvalAttempted {
-            return "The one-shot approval response may have been lost, so DayWeave did not request another capability or queue this change. Approval alone does not modify Google Calendar. Discarding removes only this Mac's expired local recovery."
+            return "The one-shot approval response may have been lost, so DayWeave did not request another capability or queue this change. Approval alone does not modify \(serviceName). Discarding removes only this Mac's expired local recovery."
         }
-        return "No Google Calendar provider change was approved by this recovery. Discarding removes only the exact expired local preview record and allows planner sync to continue."
+        return "No \(serviceName) provider change was approved by this recovery. Discarding removes only the exact expired local preview record and allows planner sync to continue."
+    }
+
+    private var serviceName: String {
+        googleOutbound.recoveryContext?.entityKind == .task
+            ? "Google Tasks" : "Google Calendar"
     }
 }
 
@@ -4113,8 +4256,13 @@ private struct UnifiedInboxView: View {
 
     private var capturedItemCount: Int {
         let presentation = canonicalPresentation
+        let completed = store.showCompleted ? presentation.completed : []
         return Set(
-            (presentation.inbox + presentation.planned + presentation.trash).map(\.itemID)
+            (presentation.inbox
+                + presentation.planned
+                + presentation.active
+                + completed
+                + presentation.trash).map(\.itemID)
         ).count
     }
 
@@ -4262,7 +4410,7 @@ private struct UnifiedInboxView: View {
     private var sectionDescription: String {
         switch section {
         case .items:
-            "Capture and prepare your own work before it becomes schedulable."
+            "Capture, plan, and review your canonical work across its lifecycle."
         case .suggestions:
             "Review local and external proposals before any canonical change is applied."
         }
@@ -6602,7 +6750,9 @@ struct SettingsView: View {
                         .foregroundStyle(.orange)
                 }
                 if googleOutbound.hasPendingRecovery {
-                    Text("A Google Calendar preview or approved publication is preserved in encrypted local recovery. Recover it from the Inbox inspector before replacing authentication, changing the API origin, or resetting canonical state.")
+                    Text(googleOutbound.recoveryContext?.entityKind == .task
+                        ? "A Google Tasks preview or approved publication is preserved in encrypted local recovery. Recover it from the Items inspector before replacing authentication, changing the API origin, or resetting canonical state."
+                        : "A Google Calendar preview or approved publication is preserved in encrypted local recovery. Recover it from the Items inspector before replacing authentication, changing the API origin, or resetting canonical state.")
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
@@ -6855,7 +7005,7 @@ struct SettingsView: View {
 
     private func allowGoogleCredentialTransition(allowSameAPIBaseRepair: Bool = false) -> Bool {
         guard !googleOutbound.hasPendingRecovery else {
-            apiSettingsError = "Recover the saved Google Calendar publication before changing DayWeave authentication."
+            apiSettingsError = "Recover the saved Google publication before changing DayWeave authentication."
             return false
         }
         if allowSameAPIBaseRepair,
