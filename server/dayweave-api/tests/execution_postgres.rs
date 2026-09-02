@@ -2378,7 +2378,10 @@ async fn assert_occurrence_scoped_physical_indices(pool: &PgPool) {
             )
             .await
             .expect("Pause occurrence-scoped execution");
-        let move_start = source_start + Duration::hours(2);
+        // Reuse the published start as a known-valid target inside this exact
+        // occurrence window. A fixed offset can cross a clipped first window
+        // when the fixture runs late in the workspace-local day.
+        let move_start = source_start;
         let assessment = execution
             .assess_defer(DeferAssessmentRequest {
                 expected_revision: expected_revision + 2,
