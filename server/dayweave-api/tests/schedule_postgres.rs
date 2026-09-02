@@ -5970,12 +5970,21 @@ async fn next_schedule_stream_chunk(
     response: &mut axum::response::Response,
     wait: StdDuration,
 ) -> Option<String> {
-    let frame = timeout(wait, response.body_mut().frame())
-        .await
-        .expect("schedule stream produced or ended before timeout")?;
-    let frame = frame.expect("valid schedule stream frame");
-    let data = frame.into_data().expect("schedule stream data frame");
-    Some(String::from_utf8(data.to_vec()).expect("UTF-8 schedule stream frame"))
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, response.body_mut().frame())
+            .await
+            .expect("schedule stream produced or ended before timeout")?;
+        let frame = frame.expect("valid schedule stream frame");
+        let data = frame.into_data().expect("schedule stream data frame");
+        let chunk = String::from_utf8(data.to_vec()).expect("UTF-8 schedule stream frame");
+        // A heartbeat may legitimately win the race while a cross-process publication is still
+        // committing. It is transport liveness, not the invalidation this helper is awaiting.
+        if chunk == ": heartbeat\n\n" {
+            continue;
+        }
+        return Some(chunk);
+    }
 }
 
 fn assert_schedule_revision_frame(frame: &str, revision: u64) {
