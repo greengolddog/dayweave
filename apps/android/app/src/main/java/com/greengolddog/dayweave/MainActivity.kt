@@ -65,6 +65,11 @@ class MainActivity : FragmentActivity() {
             authenticator = AndroidBiometricAppUnlockAuthenticator(this),
             processFence = (application as DayWeaveApplication).appAuthenticationProcessFence,
         )
+        if (appLockController.state.value.isLocked) {
+            (application as DayWeaveApplication).onAppPrivacyBoundaryLocked()
+        } else {
+            (application as DayWeaveApplication).onAppPrivacyBoundaryUnlocked()
+        }
         // MainActivity is non-exported. The launcher never forwards extras, so a valid route here
         // is the app-created immutable notification PendingIntent capability.
         setIntent(
@@ -80,6 +85,8 @@ class MainActivity : FragmentActivity() {
             appLockController.state.collectLatest { state ->
                 if (state.isLocked) {
                     (application as DayWeaveApplication).onAppPrivacyBoundaryLocked()
+                } else {
+                    (application as DayWeaveApplication).onAppPrivacyBoundaryUnlocked()
                 }
                 AppLockWindowSecurity.apply(window, state)
             }

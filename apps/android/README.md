@@ -137,6 +137,26 @@ Android Keystore key; they are never placed in the Room planner snapshot, WorkMa
 or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from
 backup and device transfer.
 
+## Google Calendar import
+
+**More → Calendar sources** exposes Android's inbound-only Google Calendar configuration. After a
+read-only Google connection is active, the app discovers every calendar and lets each source be
+**Off**, **Show only**, or **Block time**. Existing writable source settings created on another
+DayWeave client remain visible as **Writable · managed on another device**, but Android never
+offers or sends the writable role. Google Tasks selection and outbound Calendar publication are
+separate planned surfaces and are not implied by these controls.
+
+Import refresh is crash-safe. Android writes a credential-bound request UUID outside backup before
+the refresh POST, records the exact accepted server generation, and requires an authoritative idle
+status at or beyond that generation. It then refreshes canonical items, composes and publishes the
+schedule, and waits for the encrypted planner generation before removing the exact import marker.
+A timeout, cancellation, process death, server backoff, or lost response retains the marker for a
+bounded **Check import** recovery with the same identity. The marker contains no bearer token,
+calendar name, event payload, or calendar identifier. Ordinary API credential replacement plus
+Google account pause and disconnect are fenced while import recovery is outstanding; resuming a
+paused account remains available so the saved import can finish. Only the existing explicitly
+confirmed local-destruction flow can abandon an irrecoverable marker.
+
 ## Canonical authoring and recovery
 
 Android has a typed, encrypted, offline-first path for canonical create, replace, trash, and restore

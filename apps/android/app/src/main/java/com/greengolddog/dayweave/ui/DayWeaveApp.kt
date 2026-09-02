@@ -258,6 +258,8 @@ private fun DayWeaveRoot(
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
     val googleAccountState by viewModel.googleAccountState.collectAsStateWithLifecycle()
+    val googleCalendarImportState by
+        viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
     val timedBreakNotificationPermissionRequestDigest by
@@ -648,6 +650,7 @@ private fun DayWeaveRoot(
                 suggestionSyncState = suggestionSyncState,
                 canonicalSyncState = effectiveCanonicalSyncState,
                 googleAccountState = googleAccountState,
+                googleCalendarImportState = googleCalendarImportState,
                 energySignalState = energySignalState,
                 appLockState = appLockState,
                 onConfigureApiConnection = { showApiConnection = true },
@@ -662,6 +665,9 @@ private fun DayWeaveRoot(
                 onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
                 onSetGooglePaused = viewModel::setGoogleAccountPaused,
                 onRequestGoogleDisconnect = { disconnectingGoogleAccount = it },
+                onDiscoverGoogleCalendars = viewModel::discoverGoogleCalendars,
+                onRefreshGoogleCalendarImport = viewModel::refreshGoogleCalendarImport,
+                onConfigureGoogleCalendar = viewModel::configureGoogleCalendar,
                 onToggleHealthConnect = { enabled ->
                     when {
                         !enabled -> viewModel.disableHealthConnect()

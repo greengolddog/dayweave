@@ -21,6 +21,7 @@ import com.greengolddog.dayweave.network.OkHttpExecutionInvalidationStreamTransp
 import com.greengolddog.dayweave.network.OkHttpScheduleInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpExecutionTransport
 import com.greengolddog.dayweave.network.OkHttpGoogleAccountsTransport
+import com.greengolddog.dayweave.network.OkHttpGoogleCalendarInboundTransport
 import com.greengolddog.dayweave.network.OkHttpProposalApplicationsTransport
 import com.greengolddog.dayweave.network.OkHttpSuggestionsTransport
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationCoordinator
@@ -39,6 +40,7 @@ import com.greengolddog.dayweave.state.PlannerLoadState
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
+import com.greengolddog.dayweave.sync.AtomicGoogleCalendarImportJournalStore
 import com.greengolddog.dayweave.sync.DurableCanonicalItemInvalidationCursor
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
@@ -48,6 +50,9 @@ import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.DurableScheduleInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundScheduleInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
+import com.greengolddog.dayweave.sync.GoogleCalendarImportCompletionPipeline
+import com.greengolddog.dayweave.sync.GoogleCalendarImportCoordinator
+import com.greengolddog.dayweave.sync.GoogleCalendarImportPersistenceReceipt
 import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -55,6 +60,7 @@ import com.greengolddog.dayweave.sync.SuggestionSyncSchedulingCoordinator
 import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateCoordinator
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -68,6 +74,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val canonicalActionGate = CanonicalActionGate()
+    private val privatePresentationAllowed = AtomicBoolean(false)
     private val localScheduleCompositionLauncher = LocalScheduleCompositionLauncher(
         scope = persistenceScope,
         actionGate = canonicalActionGate,
@@ -137,7 +144,10 @@ class DayWeaveApplication : Application() {
                     val loaded = plannerStore.loadState.first { it != PlannerLoadState.LOADING }
                     if (
                         loaded != PlannerLoadState.READY ||
-                        !allowAmbiguousJournal && plannerStore.hasCredentialReplacementBlocker()
+                        !allowAmbiguousJournal && (
+                            plannerStore.hasCredentialReplacementBlocker() ||
+                                googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
+                        )
                     ) {
                         return false
                     }
@@ -159,6 +169,15 @@ class DayWeaveApplication : Application() {
                         // successful one confirms the cancellation against empty canonical state.
                         reconcileTimedBreakNotificationAfterAuthoritativeTransition()
                     }
+                    if (
+                        quarantined && allowAmbiguousJournal &&
+                        !googleCalendarImportCoordinator
+                            .abandonPendingForConfirmedLocalDestruction()
+                    ) {
+                        // Keep the credentials when the final destructive recovery fence fails.
+                        // Planner abandonment is idempotent, so an explicit retry remains safe.
+                        return false
+                    }
                     if (quarantined) {
                         if (suggestionSyncManagerDelegate.isInitialized()) {
                             suggestionSyncManager.quarantineBindingState()
@@ -175,6 +194,7 @@ class DayWeaveApplication : Application() {
                         if (googleAccountManagerDelegate.isInitialized()) {
                             googleAccountManager.quarantineBindingState()
                         }
+                        googleCalendarImportCoordinator.quarantineBindingState()
                     }
                     return quarantined
                 }
@@ -317,9 +337,40 @@ class DayWeaveApplication : Application() {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
             transport = OkHttpGoogleAccountsTransport(),
+            operationAllowed = privatePresentationAllowed::get,
         )
     }
     val googleAccountManager: GoogleAccountManager get() = googleAccountManagerDelegate.value
+
+    private val googleCalendarImportCoordinatorDelegate = lazy {
+        GoogleCalendarImportCoordinator(
+            credentialStore = apiCredentialStore,
+            transport = OkHttpGoogleCalendarInboundTransport(),
+            journalStore = AtomicGoogleCalendarImportJournalStore(this),
+            completionPipeline = GoogleCalendarImportCompletionPipeline { input ->
+                val outcome = refreshCanonicalState()
+                val durable = plannerStore.durableState.value
+                val durableProof = durable?.publishedScheduleProof?.takeIf { proof ->
+                    proof.hasCurrentImmutablePlanSeal() &&
+                        proof.matchesStateBinding(durable) &&
+                        proof.matchesPublishedPlan(durable.schedule)
+                }
+                GoogleCalendarImportPersistenceReceipt(
+                    configurationId = input.configurationId,
+                    apiBaseUrl = input.apiBaseUrl,
+                    accountId = input.accountId,
+                    completedRefreshGeneration = input.acceptedRefreshGeneration,
+                    durablyPersisted = durableProof != null &&
+                        outcome == CanonicalRefreshOutcome.SUCCESS &&
+                        durableProof.configurationId == input.configurationId &&
+                        durableProof.syncOrigin == input.apiBaseUrl,
+                )
+            },
+            operationAllowed = privatePresentationAllowed::get,
+        )
+    }
+    val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator
+        get() = googleCalendarImportCoordinatorDelegate.value
 
     val energySignalManager: EnergySignalManager by lazy {
         EnergySignalManager(
@@ -396,6 +447,18 @@ class DayWeaveApplication : Application() {
         return true
     }
 
+    /** Queues mandatory recovery behind any active canonical mutation instead of dropping it. */
+    fun enqueueCanonicalRecovery(action: suspend () -> Unit) {
+        persistenceScope.launch {
+            canonicalActionGate.enter()
+            try {
+                action()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+    }
+
     /** Starts the only device-local composition and retains it across transient recomposition. */
     fun launchLocalScheduleComposition(): Boolean = localScheduleCompositionLauncher.launch()
 
@@ -410,6 +473,10 @@ class DayWeaveApplication : Application() {
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        privatePresentationAllowed.set(false)
+        if (googleAccountManagerDelegate.isInitialized()) {
+            googleAccountManager.quarantineBindingState()
+        }
         ScheduleCompositionProfileDraftMemory.clear()
         setLocalScheduleCompositionForegroundActive(false)
         if (canonicalItemInvalidationManagerDelegate.isInitialized()) {
@@ -424,6 +491,14 @@ class DayWeaveApplication : Application() {
         if (proposalApplicationManagerDelegate.isInitialized()) {
             proposalApplicationManager.discardReviewForPrivacyBoundary()
         }
+        if (googleCalendarImportCoordinatorDelegate.isInitialized()) {
+            googleCalendarImportCoordinator.quarantineBindingState()
+        }
+    }
+
+    /** Re-enables private provider reads only after the lock controller exposes unlocked UI. */
+    fun onAppPrivacyBoundaryUnlocked() {
+        privatePresentationAllowed.set(true)
     }
 
     /** Collected only by the unlocked STARTED UI; cancellation closes the response body. */

@@ -17,6 +17,8 @@ import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
+import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
+import com.greengolddog.dayweave.network.GoogleCalendarInboundRole
 import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationRouteAccess
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteConsumption
 import com.greengolddog.dayweave.sync.SuggestionSyncState
@@ -24,6 +26,9 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
 import com.greengolddog.dayweave.sync.GoogleAccountState
+import com.greengolddog.dayweave.sync.GoogleCalendarImportCoordinator
+import com.greengolddog.dayweave.sync.GoogleCalendarImportState
+import com.greengolddog.dayweave.sync.GoogleImportConfigurationOutcome
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
@@ -44,6 +49,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
     private val googleAccountManager = dayWeaveApplication.googleAccountManager
+    private val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator =
+        dayWeaveApplication.googleCalendarImportCoordinator
     private val energySignalManager = dayWeaveApplication.energySignalManager
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
     private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
@@ -64,6 +71,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
     val executionSyncState: StateFlow<ExecutionSyncState> = executionSyncManager.state
     val googleAccountState: StateFlow<GoogleAccountState> = googleAccountManager.state
+    val googleCalendarImportState: StateFlow<GoogleCalendarImportState> =
+        googleCalendarImportCoordinator.state
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
     val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
@@ -407,7 +416,75 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun refreshGoogleAccounts() {
-        viewModelScope.launch { googleAccountManager.refresh() }
+        viewModelScope.launch {
+            googleAccountManager.refresh()
+            val calendarAccounts = googleAccountManager.state.value.accounts.filter {
+                it.hasCalendar && it.syncEnabled && it.status == "active"
+            }
+            calendarAccounts.forEach { account ->
+                googleCalendarImportCoordinator.loadCollections(account.id)
+            }
+            if (calendarAccounts.isNotEmpty()) {
+                dayWeaveApplication.enqueueCanonicalRecovery {
+                    calendarAccounts.forEach { account ->
+                        googleCalendarImportCoordinator.recoverPending(account.id)
+                    }
+                }
+            }
+        }
+    }
+
+    fun discoverGoogleCalendars(accountId: String) {
+        if (googleCalendarImportCoordinator.state.value.isBusy) return
+        viewModelScope.launch {
+            googleCalendarImportCoordinator.discoverCollections(accountId)
+        }
+    }
+
+    fun configureGoogleCalendar(
+        accountId: String,
+        collectionId: String,
+        expectedRevision: Long,
+        role: GoogleCalendarInboundRole,
+    ) {
+        if (
+            isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy ||
+            googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
+        ) return
+        dayWeaveApplication.launchCanonicalAction {
+            val current = googleCalendarImportCoordinator.state.value.accounts[accountId]
+                ?.collections
+                ?.singleOrNull { collection ->
+                    collection.id == collectionId && collection.revision == expectedRevision
+                } ?: return@launchCanonicalAction
+            val inboundPolicy = current.calendarPolicy.copy(
+                publishAllDay = false,
+                publishTentative = false,
+                publishFree = false,
+            )
+            val outcome = googleCalendarImportCoordinator.configureCollection(
+                accountId = accountId,
+                collectionId = collectionId,
+                request = ConfigureGoogleCollectionRequest(
+                    expectedRevision = expectedRevision,
+                    role = role,
+                    calendarPolicy = inboundPolicy,
+                ),
+            )
+            if (
+                outcome == GoogleImportConfigurationOutcome.CONFIGURED ||
+                outcome == GoogleImportConfigurationOutcome.RECONCILED
+            ) {
+                googleCalendarImportCoordinator.refresh(accountId)
+            }
+        }
+    }
+
+    fun refreshGoogleCalendarImport(accountId: String) {
+        if (isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction {
+            googleCalendarImportCoordinator.refresh(accountId)
+        }
     }
 
     fun connectGoogleAccount() {
@@ -423,11 +500,29 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setGoogleAccountPaused(accountId: String, paused: Boolean) {
-        viewModelScope.launch { googleAccountManager.setPaused(accountId, paused) }
+        if (isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction {
+            if (
+                googleCalendarImportCoordinator.state.value.isBusy ||
+                paused && googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
+            ) {
+                return@launchCanonicalAction
+            }
+            googleAccountManager.setPaused(accountId, paused)
+        }
     }
 
     fun disconnectGoogleAccount(accountId: String) {
-        viewModelScope.launch { googleAccountManager.disconnect(accountId) }
+        if (isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy) return
+        dayWeaveApplication.launchCanonicalAction {
+            if (
+                googleCalendarImportCoordinator.state.value.isBusy ||
+                googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
+            ) {
+                return@launchCanonicalAction
+            }
+            googleAccountManager.disconnect(accountId)
+        }
     }
 
     fun openGoogleAuthorization(candidate: String, opener: (String) -> Unit) {

@@ -56,6 +56,7 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
+import com.greengolddog.dayweave.network.GoogleCalendarInboundRole
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
@@ -65,6 +66,7 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.sync.GoogleCalendarImportState
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
@@ -81,6 +83,7 @@ fun MoreScreen(
     suggestionSyncState: SuggestionSyncState,
     canonicalSyncState: CanonicalSyncState,
     googleAccountState: GoogleAccountState,
+    googleCalendarImportState: GoogleCalendarImportState,
     energySignalState: EnergySignalState,
     appLockState: AppLockState,
     onConfigureApiConnection: () -> Unit,
@@ -91,6 +94,9 @@ fun MoreScreen(
     onReauthorizeGoogle: (String) -> Unit,
     onSetGooglePaused: (String, Boolean) -> Unit,
     onRequestGoogleDisconnect: (GoogleAccountSummary) -> Unit,
+    onDiscoverGoogleCalendars: (String) -> Unit,
+    onRefreshGoogleCalendarImport: (String) -> Unit,
+    onConfigureGoogleCalendar: (String, String, Long, GoogleCalendarInboundRole) -> Unit,
     onToggleHealthConnect: (Boolean) -> Unit,
     onRefreshHealthConnect: () -> Unit,
     onManageHealthConnectAccess: () -> Unit,
@@ -240,6 +246,20 @@ fun MoreScreen(
                 onReauthorize = onReauthorizeGoogle,
                 onSetPaused = onSetGooglePaused,
                 onRequestDisconnect = onRequestGoogleDisconnect,
+                calendarImportBusy = googleCalendarImportState.isBusy,
+                calendarImportHasRecovery =
+                    googleCalendarImportState.pendingRecoveryCount > 0,
+            )
+        }
+
+        item {
+            GoogleCalendarSourcesCard(
+                googleAccountState = googleAccountState,
+                importState = googleCalendarImportState,
+                onDiscover = onDiscoverGoogleCalendars,
+                onRefreshOrCheck = onRefreshGoogleCalendarImport,
+                onConfigure = onConfigureGoogleCalendar,
+                actionsEnabled = !canonicalSyncState.isBusy,
             )
         }
 
@@ -582,6 +602,8 @@ private fun GoogleConnectionCard(
     onReauthorize: (String) -> Unit,
     onSetPaused: (String, Boolean) -> Unit,
     onRequestDisconnect: (GoogleAccountSummary) -> Unit,
+    calendarImportBusy: Boolean,
+    calendarImportHasRecovery: Boolean,
 ) {
     Card {
         ListItem(
@@ -662,14 +684,17 @@ private fun GoogleConnectionCard(
                     } else if (account.status in setOf("active", "paused")) {
                         TextButton(
                             onClick = { onSetPaused(account.id, account.status == "active") },
-                            enabled = !state.isBusy,
+                            enabled = !state.isBusy && !calendarImportBusy &&
+                                (!calendarImportHasRecovery || account.status == "paused"),
                         ) {
                             Text(if (account.status == "active") "Pause sync" else "Resume sync")
                         }
                     }
                     TextButton(
                         onClick = { onRequestDisconnect(account) },
-                        enabled = !state.isBusy && account.status != "disconnecting",
+                        enabled = !state.isBusy && !calendarImportBusy &&
+                            !calendarImportHasRecovery &&
+                            account.status != "disconnecting",
                     ) {
                         Text("Disconnect")
                     }

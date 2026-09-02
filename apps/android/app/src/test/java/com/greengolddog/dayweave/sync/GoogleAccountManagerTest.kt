@@ -15,6 +15,7 @@ import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -31,6 +32,111 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GoogleAccountManagerTest {
+    @Test
+    fun appPrivacyLockFencesInFlightRefreshEvenWhenUiUnlocksBeforeResponse() = runBlocking {
+        val presentationAllowed = AtomicBoolean(true)
+        val credentials = FakeGoogleCredentials()
+        val responseStarted = CompletableDeferred<Unit>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account(label = "Private owner"))
+            accountsStarted = responseStarted
+            accountsGate = releaseResponse
+        }
+        val manager = manager(credentials, transport, presentationAllowed::get)
+
+        val refresh = async { manager.refresh() }
+        withTimeout(3_000) { responseStarted.await() }
+        presentationAllowed.set(false)
+        manager.quarantineBindingState()
+        presentationAllowed.set(true)
+        releaseResponse.complete(Unit)
+        withTimeout(3_000) { refresh.await() }
+
+        assertTrue(manager.state.value.accounts.isEmpty())
+        assertNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+
+        transport.accountsStarted = null
+        transport.accountsGate = null
+        manager.refresh()
+        assertEquals("Private owner", manager.state.value.accounts.single().label)
+    }
+
+    @Test
+    fun appPrivacyLockFencesInFlightAuthorizationAcrossUnlock() = runBlocking {
+        val presentationAllowed = AtomicBoolean(true)
+        val authorizationStarted = CompletableDeferred<Unit>()
+        val releaseAuthorization = CompletableDeferred<Unit>()
+        val transport = FakeGoogleAccountsTransport().apply {
+            this.authorizationStarted = authorizationStarted
+            authorizationGate = releaseAuthorization
+        }
+        val manager = manager(FakeGoogleCredentials(), transport, presentationAllowed::get)
+
+        val authorization = async { manager.connectNew() }
+        withTimeout(3_000) { authorizationStarted.await() }
+        presentationAllowed.set(false)
+        manager.quarantineBindingState()
+        presentationAllowed.set(true)
+        releaseAuthorization.complete(Unit)
+        withTimeout(3_000) { authorization.await() }
+
+        assertTrue(manager.state.value.accounts.isEmpty())
+        assertNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+
+        transport.authorizationStarted = null
+        transport.authorizationGate = null
+        manager.connectNew()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+    }
+
+    @Test
+    fun appPrivacyLockFencesInFlightAccountMutationAcrossUnlock() = runBlocking {
+        val presentationAllowed = AtomicBoolean(true)
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account(label = "Private owner"))
+        }
+        val manager = manager(credentials, transport, presentationAllowed::get)
+        manager.refresh()
+        val mutationStarted = CompletableDeferred<Unit>()
+        val releaseMutation = CompletableDeferred<Unit>()
+        transport.pauseStarted = mutationStarted
+        transport.pauseGate = releaseMutation
+
+        val mutation = async { manager.setPaused(ACCOUNT_ID, paused = true) }
+        withTimeout(3_000) { mutationStarted.await() }
+        presentationAllowed.set(false)
+        manager.quarantineBindingState()
+        presentationAllowed.set(true)
+        releaseMutation.complete(Unit)
+        withTimeout(3_000) { mutation.await() }
+
+        assertEquals(1, transport.accountsCalls)
+        assertTrue(manager.state.value.accounts.isEmpty())
+        assertNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
+
+    @Test
+    fun lockedManagerDoesNotStartProviderOperations() = runBlocking {
+        val presentationAllowed = AtomicBoolean(false)
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(FakeGoogleCredentials(), transport, presentationAllowed::get)
+
+        manager.refresh()
+        manager.connectNew()
+        manager.reauthorize(ACCOUNT_ID)
+
+        assertEquals(0, transport.accountsCalls)
+        assertTrue(transport.authorizationRequests.isEmpty())
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+    }
+
     @Test
     fun delayedOldBindingAccountsCannotReappearAfterGenerationFence() = runBlocking {
         val credentials = GenerationBoundCredentialStore()
@@ -655,11 +761,13 @@ class GoogleAccountManagerTest {
     private fun manager(
         credentials: ApiCredentialStore,
         transport: FakeGoogleAccountsTransport,
+        operationAllowed: () -> Boolean = { true },
     ) = GoogleAccountManager(
         credentialStore = credentials,
         transport = transport,
         now = { NOW },
         newUuid = { UUID.fromString(IDEMPOTENCY_KEY) },
+        operationAllowed = operationAllowed,
     )
 
     private fun accounts(vararg accounts: RemoteGoogleAccount) = RemoteGoogleAccounts(
@@ -765,6 +873,10 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
     var accountsHook: (() -> Unit)? = null
     var accountsStarted: CompletableDeferred<Unit>? = null
     var accountsGate: CompletableDeferred<Unit>? = null
+    var authorizationStarted: CompletableDeferred<Unit>? = null
+    var authorizationGate: CompletableDeferred<Unit>? = null
+    var pauseStarted: CompletableDeferred<Unit>? = null
+    var pauseGate: CompletableDeferred<Unit>? = null
     var accountsCalls = 0
     val authorizationRequests = mutableListOf<StartGoogleAuthorizationRequest>()
 
@@ -785,6 +897,8 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         request: StartGoogleAuthorizationRequest,
     ): RemoteGoogleAuthorization {
         authorizationRequests += request
+        authorizationStarted?.complete(Unit)
+        authorizationGate?.await()
         return authorizationResult
     }
 
@@ -795,6 +909,8 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         paused: Boolean,
         idempotencyKey: String,
     ): RemoteGoogleAccount {
+        pauseStarted?.complete(Unit)
+        pauseGate?.await()
         pauseError?.let { throw it }
         return accountsResult.accounts.single()
     }
