@@ -25,6 +25,7 @@ import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationRouteAccess
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteConsumption
 import com.greengolddog.dayweave.sync.SuggestionSyncState
+import com.greengolddog.dayweave.sync.AssistantState
 import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncState
 import com.greengolddog.dayweave.sync.ExecutionSyncOutcome
@@ -52,6 +53,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     private val dayWeaveApplication = application as DayWeaveApplication
     private val plannerStore = dayWeaveApplication.plannerStore
     private val suggestionSyncManager = dayWeaveApplication.suggestionSyncManager
+    private val assistantManager = dayWeaveApplication.assistantManager
     private val proposalApplicationManager = dayWeaveApplication.proposalApplicationManager
     private val canonicalSyncManager = dayWeaveApplication.canonicalSyncManager
     private val executionSyncManager = dayWeaveApplication.executionSyncManager
@@ -75,6 +77,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         plannerStore.durableState
     val loadState: StateFlow<PlannerLoadState> = plannerStore.loadState
     val suggestionSyncState: StateFlow<SuggestionSyncState> = suggestionSyncManager.state
+    val assistantState: StateFlow<AssistantState> = assistantManager.state
     val proposalApplicationState: StateFlow<ProposalApplicationState> =
         proposalApplicationManager.state
     val canonicalSyncState: StateFlow<CanonicalSyncState> = canonicalSyncManager.state
@@ -379,50 +382,76 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
 
     fun upgradeDeviceAuthentication(baseUrl: String, bootstrapToken: String) {
         dayWeaveApplication.launchCanonicalAction {
-            val result = deviceAuthCoordinator.upgradeWithBootstrap(baseUrl, bootstrapToken)
-            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
-            if (result == DeviceAuthActionResult.SUCCESS) {
-                dayWeaveApplication.refreshCanonicalState()
-                googleAccountManager.refresh()
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                val result = deviceAuthCoordinator.upgradeWithBootstrap(baseUrl, bootstrapToken)
+                dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+                if (result == DeviceAuthActionResult.SUCCESS) {
+                    dayWeaveApplication.refreshCanonicalState()
+                    googleAccountManager.refresh()
+                }
+            } finally {
+                assistantManager.restoreForegroundState()
             }
         }
     }
 
     fun consumeDeviceEnrollmentCode(baseUrl: String, enrollmentCode: String) {
         dayWeaveApplication.launchCanonicalAction {
-            val result = deviceAuthCoordinator.consumeOneTimeEnrollmentCode(baseUrl, enrollmentCode)
-            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
-            if (result == DeviceAuthActionResult.SUCCESS) {
-                dayWeaveApplication.refreshCanonicalState()
-                googleAccountManager.refresh()
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                val result =
+                    deviceAuthCoordinator.consumeOneTimeEnrollmentCode(baseUrl, enrollmentCode)
+                dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+                if (result == DeviceAuthActionResult.SUCCESS) {
+                    dayWeaveApplication.refreshCanonicalState()
+                    googleAccountManager.refresh()
+                }
+            } finally {
+                assistantManager.restoreForegroundState()
             }
         }
     }
 
     fun retryDeviceAuthentication() {
         dayWeaveApplication.launchCanonicalAction {
-            val result = deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
-            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
-            if (result == DeviceAuthActionResult.SUCCESS) {
-                dayWeaveApplication.refreshCanonicalState()
-                googleAccountManager.refresh()
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                val result = deviceAuthCoordinator.recoverPendingOrUpgradeLegacy()
+                dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+                if (result == DeviceAuthActionResult.SUCCESS) {
+                    dayWeaveApplication.refreshCanonicalState()
+                    googleAccountManager.refresh()
+                }
+            } finally {
+                assistantManager.restoreForegroundState()
             }
         }
     }
 
     fun signOutDeviceSession() {
         dayWeaveApplication.launchCanonicalAction {
-            deviceAuthCoordinator.signOutRevokeFirst()
-            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
-            googleAccountManager.refresh()
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                deviceAuthCoordinator.signOutRevokeFirst()
+                dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+                googleAccountManager.refresh()
+            } finally {
+                assistantManager.restoreForegroundState()
+            }
         }
     }
 
     fun destroyLocalDeviceAuthentication(confirmed: Boolean) {
         dayWeaveApplication.launchCanonicalAction {
-            deviceAuthCoordinator.destroyLocalOnly(confirmed)
-            dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
-            googleAccountManager.refresh()
+            assistantManager.cancelForPrivacyBoundary()
+            try {
+                deviceAuthCoordinator.destroyLocalOnly(confirmed)
+                dayWeaveApplication.suggestionSyncSchedulingCoordinator.onConfigurationSaved()
+                googleAccountManager.refresh()
+            } finally {
+                assistantManager.restoreForegroundState()
+            }
         }
     }
 
@@ -611,7 +640,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun sendAssistantMessage(text: String): Boolean = plannerStore.sendAssistantMessage(text)
+    fun sendAssistantMessage(text: String): Boolean = assistantManager.send(text)
+    fun cancelAssistantTurn() = assistantManager.cancelActiveTurn()
     fun toggleCompleted() = plannerStore.toggleCompleted()
     fun toggleQuietSuggestions() = plannerStore.toggleQuietSuggestions()
     fun toggleDynamicColor() = plannerStore.toggleDynamicColor()

@@ -5,6 +5,7 @@
 //! repository for isolated tests and a durable `PostgreSQL` adapter in deployed
 //! environments without changing the HTTP contract.
 
+pub mod assistant;
 pub mod auth;
 pub mod config;
 pub mod credential_auth;
@@ -25,6 +26,7 @@ pub mod scheduling;
 
 use std::sync::Arc;
 
+use assistant::{AssistantProvider, OpenAiAssistantProvider, UnavailableAssistantProvider};
 use auth::{Authenticator, RuntimeAuthenticator, StaticTokenAuthenticator};
 use config::{AuthMode, Config};
 use credential_auth::CredentialRepository;
@@ -169,6 +171,7 @@ pub struct AppState {
     pub authenticator: Arc<dyn Authenticator>,
     pub credential_repository: Option<Arc<dyn CredentialRepository>>,
     pub auth_mode: AuthMode,
+    pub(crate) assistant: Arc<dyn AssistantProvider>,
     pub readiness: Readiness,
     pub mcp: Arc<McpService>,
     pub mcp_oauth: Option<Arc<McpOAuthVerifier>>,
@@ -339,6 +342,18 @@ impl AppState {
         if let Some(repository) = scheduling.as_ref() {
             repository.spawn_simulation_maintenance_worker();
         }
+        let assistant: Arc<dyn AssistantProvider> = config.assistant.as_ref().map_or_else(
+            || {
+                Ok::<Arc<dyn AssistantProvider>, PersistenceError>(Arc::new(
+                    UnavailableAssistantProvider,
+                ))
+            },
+            |assistant| {
+                OpenAiAssistantProvider::new(assistant)
+                    .map(|provider| Arc::new(provider) as Arc<dyn AssistantProvider>)
+                    .map_err(|_| PersistenceError::IntegrationInitializationFailed)
+            },
+        )?;
         Ok(Self {
             proposals,
             items,
@@ -346,6 +361,7 @@ impl AppState {
             authenticator,
             credential_repository,
             auth_mode: config.auth_mode,
+            assistant,
             readiness,
             mcp,
             mcp_oauth,
@@ -391,6 +407,7 @@ impl AppState {
             authenticator,
             credential_repository: None,
             auth_mode: AuthMode::LegacyStatic,
+            assistant: Arc::new(UnavailableAssistantProvider),
             readiness,
             mcp,
             mcp_oauth: None,
@@ -409,6 +426,15 @@ impl AppState {
         // memory lease with PostgreSQL item state), so execution deliberately retains its
         // original paired ItemService and fails closed for items that exist only in `items`.
         self.items = items;
+        self
+    }
+
+    /// Installs an advisory provider in an explicitly assembled dependency
+    /// graph. Primarily used by API tests; the provider receives no mutation
+    /// services through this hook.
+    #[must_use]
+    pub fn with_assistant_provider(mut self, provider: Arc<dyn AssistantProvider>) -> Self {
+        self.assistant = provider;
         self
     }
 

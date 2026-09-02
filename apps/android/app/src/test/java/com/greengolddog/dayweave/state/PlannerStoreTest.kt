@@ -6,6 +6,8 @@ import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalExecutionSessionSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
+import com.greengolddog.dayweave.model.ChatMessage
+import com.greengolddog.dayweave.model.ChatRole
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
@@ -63,6 +65,71 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlannerStoreTest {
+    @Test
+    fun assistantTurnsPersistOnlyBoundedRealMessagesAndRequireAUserAnchor() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState())
+        val userId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val assistantId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+
+        assertTrue(
+            requireNotNull(store.appendAssistantUserMessageDurably(userId, "  Help plan today  "))
+                .awaitDurable(),
+        )
+        assertEquals(
+            ChatMessage(userId, ChatRole.USER, "Help plan today"),
+            store.state.value.messages.single(),
+        )
+        assertTrue(
+            requireNotNull(
+                store.appendAssistantReplyDurably(userId, assistantId, "  Start with focus.  "),
+            ).awaitDurable(),
+        )
+        assertEquals(
+            listOf(ChatRole.USER, ChatRole.ASSISTANT),
+            store.state.value.messages.map(ChatMessage::role),
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            store.appendAssistantReplyDurably(
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "Orphan reply",
+            )
+        }
+        assertFalse(store.sendAssistantMessage(" "))
+        assertFalse(store.sendAssistantMessage("x".repeat(8 * 1024 + 1)))
+        assertFalse(store.sendAssistantMessage("spoofed\u202Etext"))
+        assertFalse(store.sendAssistantMessage("unpaired \uD800 surrogate"))
+        assertTrue(store.sendAssistantMessage("Valid emoji 😀"))
+        assertEquals("Valid emoji 😀", store.state.value.messages.last().text)
+    }
+
+    @Test
+    fun assistantTranscriptRestoreDropsInvalidRowsAndKeepsNewestBudget() {
+        val oversized = "x".repeat(32 * 1024 + 1)
+        val messages = buildList {
+            add(ChatMessage("", ChatRole.USER, "bad id"))
+            add(ChatMessage("oversized", ChatRole.ASSISTANT, oversized))
+            add(ChatMessage("directional", ChatRole.USER, "spoofed\u202Etext"))
+            add(ChatMessage("surrogate", ChatRole.USER, "unpaired \uD800 surrogate"))
+            repeat(205) { index ->
+                add(ChatMessage("message-$index", ChatRole.USER, "turn $index"))
+            }
+            add(ChatMessage("message-204", ChatRole.USER, "newest duplicate wins"))
+        }
+
+        val store = PlannerStore(DayWeaveUiState(messages = messages))
+
+        assertEquals(200, store.state.value.messages.size)
+        assertEquals("message-5", store.state.value.messages.first().id)
+        assertEquals("newest duplicate wins", store.state.value.messages.last().text)
+        assertTrue(
+            store.state.value.messages.none {
+                it.id.isBlank() || it.text == oversized ||
+                    it.id == "directional" || it.id == "surrogate"
+            },
+        )
+    }
+
     @Test
     fun proposalApplyAndUndoUseExactAtomicJournalWithoutManufacturingDraft() {
         val proposalId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

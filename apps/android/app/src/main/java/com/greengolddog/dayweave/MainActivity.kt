@@ -146,6 +146,10 @@ class MainActivity : FragmentActivity() {
         val stateBeforeForeground = appLockController.state.value
         appLockController.onForegrounded()
         appUnlockCoordinator.refreshAvailability()
+        (application as DayWeaveApplication).onAppForegroundAssistantActive()
+        if (!appLockController.state.value.isLocked) {
+            (application as DayWeaveApplication).onAppPrivacyBoundaryUnlocked()
+        }
         autoPromptPending = shouldAutoPromptOnStart(
             stateBeforeForeground = stateBeforeForeground,
             stateAfterForeground = appLockController.state.value,
@@ -174,6 +178,7 @@ class MainActivity : FragmentActivity() {
 
     override fun onStop() {
         if (!isChangingConfigurations) {
+            (application as DayWeaveApplication).onAppForegroundAssistantInactive()
             autoPromptPending = false
             backgroundLockJob?.cancel()
             backgroundLockJob = null

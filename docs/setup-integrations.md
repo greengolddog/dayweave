@@ -540,6 +540,54 @@ Apple Developer signing setup.
 
 Official reference: <https://learn.chatgpt.com/docs/app-server>.
 
+## Advisory assistant on Android
+
+Android uses the authenticated DayWeave API as a separate remote-provider boundary. It does not
+copy the macOS Codex runtime, ChatGPT browser state, managed OAuth tokens, or an OpenAI key onto the
+phone. `POST /v1/assistant/turns` accepts only a native device session with both schedule-read and
+item-read access (or the legacy owner credential during migration); MCP credentials are rejected.
+
+The endpoint is disabled by default. To enable it in a reviewed deployment, place the OpenAI API
+key only in the root-owned production environment or secret manager, optionally choose a bounded
+model name, and add `deploy/compose.assistant.yaml` to the normal Compose invocation. The overlay
+sets `DAYWEAVE_ASSISTANT_ENABLED=true`, requires `DAYWEAVE_OPENAI_API_KEY`, and defaults
+`DAYWEAVE_OPENAI_MODEL` to `gpt-5.6-luna`. It also defaults to six requests per minute per
+principal, two concurrent provider calls, a one-million-token rolling per-process daily budget,
+and bounded API CPU, memory, and process counts. Keep all subordinate OpenAI settings absent while
+the feature is disabled. Never put the key in an APK, Gradle property, repository file, shell
+output, issue, or chat transcript.
+
+Each manual turn is non-streaming and advisory-only in this milestone. Android first commits the
+user message to SQLCipher, then sends at most 8 KiB of input, up to 10 completed in-process turn
+pairs from the same native device binding, and a deterministic context of at most 64 KiB. Failed,
+stopped, or context-aborted prompts never become later history; history eligibility is cleared on
+lock, background, restart, or binding change. The encrypted transcript stays visible as local
+reference, and the Assistant tab explains that those boundaries start a new provider context.
+Public blocks and nonsensitive items use ephemeral references.
+Sensitive content becomes occupancy-only busy spans; sensitive titles, all notes, stable IDs,
+provider identities, revisions, raw recurrence, and raw constraints are omitted. The disclosure
+counts remain visible in the Assistant tab.
+
+The server calls the fixed official Responses API endpoint with response storage disabled,
+explicit prompt-cache mode and no cache breakpoints, no tools, no background mode, low reasoning,
+and a bounded output. It accepts exactly one completed assistant text result and reconciles its
+conservative preflight token reservation against the provider's validated usage totals. Provider
+credentials, upstream bodies, prompts, and planner content are not logged. Android does not
+schedule assistant work, automatically replay a failed call, or retain a partial response.
+Locking, backgrounding, stopping, or replacing the device binding cancels and generation-fences
+the turn. The provider has no item, schedule, proposal, Google, or execution mutation handle;
+existing reviewed proposal/application workflows remain the only mutation path.
+
+The in-process daily token budget is a fail-safe, not a currency-denominated billing guarantee and
+it resets when the API process restarts. Before enabling the overlay, set an OpenAI project budget
+and alert at or below the owner's spending limit and use a project with the required data-retention
+or Zero Data Retention policy. Keep the feature disabled until both controls are verified.
+
+Official references:
+
+- <https://developers.openai.com/api/reference/cli/resources/responses/methods/create>
+- <https://developers.openai.com/api/docs/models/gpt-5.6-luna>
+
 ## DayWeave MCP and ChatGPT/Codex plugin
 
 The private MCP endpoint uses Streamable HTTP. The checked-in development plugin

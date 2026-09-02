@@ -260,6 +260,7 @@ private fun DayWeaveRoot(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val durableState by viewModel.durableState.collectAsStateWithLifecycle()
     val suggestionSyncState by viewModel.suggestionSyncState.collectAsStateWithLifecycle()
+    val assistantState by viewModel.assistantState.collectAsStateWithLifecycle()
     val proposalApplicationState by viewModel.proposalApplicationState.collectAsStateWithLifecycle()
     val canonicalSyncState by viewModel.canonicalSyncState.collectAsStateWithLifecycle()
     val executionSyncState by viewModel.executionSyncState.collectAsStateWithLifecycle()
@@ -733,7 +734,10 @@ private fun DayWeaveRoot(
             )
             AppDestination.ASSISTANT -> AssistantScreen(
                 state = state,
+                assistantState = assistantState,
                 onSend = viewModel::sendAssistantMessage,
+                onStop = viewModel::cancelAssistantTurn,
+                onConfigureConnection = { showApiConnection = true },
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.MORE -> MoreScreen(

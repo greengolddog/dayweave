@@ -4,9 +4,12 @@ import java.io.IOException
 import java.time.Duration
 import java.time.Instant
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
@@ -1165,6 +1168,91 @@ class DeviceAuthCoordinatorTest {
     }
 
     @Test
+    fun cancelledTicketReleaseStillDrainsReaderThroughMutexContention() = runBlocking {
+        val gate = ApiBindingOperationGate()
+        val ticket = gate.beginOperation(gate.captureGeneration())
+        val stateMutex = gate.stateMutexForTest()
+        stateMutex.lock()
+        val release = launch(start = CoroutineStart.UNDISPATCHED) {
+            ticket.release()
+        }
+
+        try {
+            release.cancel()
+            yield()
+            assertFalse(release.isCompleted)
+        } finally {
+            stateMutex.unlock()
+        }
+        withTimeout(3_000) { release.join() }
+
+        var quarantineEntered = false
+        withTimeout(3_000) {
+            gate.invalidateBeforeQuarantine {
+                quarantineEntered = true
+            }
+        }
+        assertTrue(quarantineEntered)
+    }
+
+    @Test
+    fun cancelledWriterReleaseStillClearsWriterThroughMutexContention() = runBlocking {
+        val gate = ApiBindingOperationGate()
+        val stateMutex = gate.stateMutexForTest()
+        val writer = launch(start = CoroutineStart.UNDISPATCHED) {
+            gate.invalidateBeforeQuarantine {
+                stateMutex.lock()
+            }
+        }
+
+        try {
+            writer.cancel()
+            yield()
+            assertFalse(writer.isCompleted)
+        } finally {
+            stateMutex.unlock()
+        }
+        withTimeout(3_000) { writer.join() }
+
+        var operationEntered = false
+        withTimeout(3_000) {
+            gate.withOperation(gate.captureGeneration()) {
+                operationEntered = true
+            }
+        }
+        assertTrue(operationEntered)
+    }
+
+    @Test
+    fun cancelledQueuedWriterStillRemovesWaiterThroughMutexContention() = runBlocking {
+        val gate = ApiBindingOperationGate()
+        val ticket = gate.beginOperation(gate.captureGeneration())
+        val writer = launch(start = CoroutineStart.UNDISPATCHED) {
+            gate.invalidateBeforeQuarantine { }
+        }
+        val stateMutex = gate.stateMutexForTest()
+        stateMutex.lock()
+
+        try {
+            writer.cancel()
+            yield()
+            assertFalse(writer.isCompleted)
+        } finally {
+            stateMutex.unlock()
+        }
+        withTimeout(3_000) { writer.join() }
+        ticket.release()
+
+        var operationEntered = false
+        withTimeout(3_000) {
+            gate.withOperation(gate.captureGeneration()) {
+                operationEntered = true
+            }
+        }
+        assertTrue(operationEntered)
+    }
+
+    @Test
     fun secretBearingDiagnosticsAreRedacted() {
         val secret = syntheticDeviceToken(DEVICE_ACCESS_TOKEN_PREFIX, 42)
         val enrollment = DeviceEnrollmentIssuedResponse(
@@ -1216,4 +1304,9 @@ class DeviceAuthCoordinatorTest {
         now = { now },
         generator = generator,
     )
+
+    private fun ApiBindingOperationGate.stateMutexForTest(): Mutex =
+        javaClass.getDeclaredField("stateMutex")
+            .apply { isAccessible = true }
+            .get(this) as Mutex
 }

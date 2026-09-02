@@ -1,6 +1,6 @@
 # DayWeave for Android
 
-Native Jetpack Compose client for `com.greengolddog.dayweave`. The current client includes the Today timeline, five-destination navigation, canonical quick capture and detailed item authoring, active-session controls, assistant chat, and an authenticated Suggestions Inbox.
+Native Jetpack Compose client for `com.greengolddog.dayweave`. The current client includes the Today timeline, five-destination navigation, canonical quick capture and detailed item authoring, active-session controls, a real authenticated advisory assistant, and an authenticated Suggestions Inbox.
 
 Planner state, including the last server proposal cache, is stored offline in a Room database encrypted by SQLCipher. A random 256-bit database passphrase is AES-GCM wrapped by a non-exportable Android Keystore key; plaintext key material is never written to storage. Startup restores the last atomic snapshot, blocks edits until restore finishes, and autosaves subsequent intents through one serialized writer.
 

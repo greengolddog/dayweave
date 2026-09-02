@@ -16,8 +16,10 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
@@ -107,7 +109,7 @@ internal class ApiBindingOperationGate(initialGeneration: Long = 1) {
     }
 
     internal suspend fun releaseReader() {
-        stateMutex.withLock {
+        withStateLockForCleanup {
             check(activeReaders > 0)
             activeReaders -= 1
             if (activeReaders == 0) signalChangedLocked()
@@ -137,7 +139,7 @@ internal class ApiBindingOperationGate(initialGeneration: Long = 1) {
                 requireNotNull(waiter).await()
             }
         } catch (error: CancellationException) {
-            stateMutex.withLock {
+            withStateLockForCleanup {
                 if (waitingWriters > 0) {
                     waitingWriters -= 1
                     signalChangedLocked()
@@ -148,12 +150,17 @@ internal class ApiBindingOperationGate(initialGeneration: Long = 1) {
     }
 
     private suspend fun releaseWriter() {
-        stateMutex.withLock {
+        withStateLockForCleanup {
             check(writerActive)
             writerActive = false
             signalChangedLocked()
         }
     }
+
+    private suspend fun <T> withStateLockForCleanup(action: () -> T): T =
+        withContext(NonCancellable) {
+            stateMutex.withLock { action() }
+        }
 
     private fun signalChangedLocked() {
         val previous = changed

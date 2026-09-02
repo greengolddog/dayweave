@@ -64,6 +64,16 @@ impl ApiError {
     }
 
     #[must_use]
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
+    }
+
+    #[must_use]
+    pub fn rate_limited(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", message)
+    }
+
+    #[must_use]
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }

@@ -30,6 +30,17 @@ const DEFAULT_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 10;
 const MAX_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES: u64 = 30;
 const MAX_MCP_OAUTH_CLIENT_IDS: usize = 32;
 const MAX_MCP_OAUTH_VALUE_LENGTH: usize = 2_048;
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.6-luna";
+const MIN_OPENAI_API_KEY_LENGTH: usize = 20;
+const MAX_OPENAI_API_KEY_LENGTH: usize = 512;
+const MAX_OPENAI_MODEL_LENGTH: usize = 128;
+const DEFAULT_ASSISTANT_REQUESTS_PER_MINUTE: u32 = 6;
+const MAX_ASSISTANT_REQUESTS_PER_MINUTE: u32 = 60;
+const DEFAULT_ASSISTANT_MAX_CONCURRENT_REQUESTS: u32 = 2;
+const MAX_ASSISTANT_MAX_CONCURRENT_REQUESTS: u32 = 8;
+const DEFAULT_ASSISTANT_DAILY_TOKEN_BUDGET: u64 = 1_000_000;
+const MIN_ASSISTANT_DAILY_TOKEN_BUDGET: u64 = 10_000;
+const MAX_ASSISTANT_DAILY_TOKEN_BUDGET: u64 = 100_000_000;
 
 pub const GOOGLE_CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 pub const GOOGLE_TASKS_SCOPE: &str = "https://www.googleapis.com/auth/tasks";
@@ -136,6 +147,35 @@ impl std::fmt::Debug for GoogleOAuthConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct AssistantConfig {
+    pub(crate) api_key: SecretString,
+    pub(crate) model: String,
+    pub(crate) requests_per_minute: u32,
+    pub(crate) max_concurrent_requests: u32,
+    pub(crate) daily_token_budget: u64,
+}
+
+impl AssistantConfig {
+    #[must_use]
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl std::fmt::Debug for AssistantConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AssistantConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("requests_per_minute", &self.requests_per_minute)
+            .field("max_concurrent_requests", &self.max_concurrent_requests)
+            .field("daily_token_budget", &self.daily_token_budget)
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Environment {
     Development,
@@ -214,6 +254,7 @@ pub struct Config {
     pub proposal_ttl: Duration,
     pub mcp_allowed_origins: Arc<Vec<String>>,
     pub mcp_oauth: Option<McpOAuthConfig>,
+    pub assistant: Option<AssistantConfig>,
     pub database: Option<DatabaseConfig>,
     pub google_oauth: Option<GoogleOAuthConfig>,
     /// External Google writes require both this explicit deployment opt-in and
@@ -347,6 +388,7 @@ impl Config {
             database.as_ref(),
             mcp_allowed_origins.as_ref(),
         )?;
+        let assistant = assistant_config(values)?;
         if auth_mode != AuthMode::LegacyStatic && database.is_none() {
             return Err(ConfigError::AuthModeRequiresDatabase);
         }
@@ -386,6 +428,7 @@ impl Config {
             proposal_ttl: Duration::from_secs(ttl_seconds),
             mcp_allowed_origins,
             mcp_oauth,
+            assistant,
             database,
             google_oauth,
             google_outbound_enabled,
@@ -482,6 +525,110 @@ pub enum ConfigError {
     GoogleOutboundRequiresOAuth,
     #[error("invalid DAYWEAVE_GOOGLE_OUTBOUND_APPROVAL_TTL_MINUTES")]
     InvalidGoogleOutboundApprovalTtl,
+    #[error("DAYWEAVE_ASSISTANT_ENABLED must be true or false")]
+    InvalidAssistantEnabled,
+    #[error("OpenAI assistant settings were supplied while DAYWEAVE_ASSISTANT_ENABLED is not true")]
+    DisabledAssistantConfiguration,
+    #[error("DAYWEAVE_OPENAI_API_KEY is required when the assistant is enabled")]
+    MissingOpenAiApiKey,
+    #[error("DAYWEAVE_OPENAI_API_KEY is invalid")]
+    InvalidOpenAiApiKey,
+    #[error("DAYWEAVE_OPENAI_MODEL is invalid")]
+    InvalidOpenAiModel,
+    #[error("DAYWEAVE_ASSISTANT_REQUESTS_PER_MINUTE is invalid")]
+    InvalidAssistantRequestsPerMinute,
+    #[error("DAYWEAVE_ASSISTANT_MAX_CONCURRENT_REQUESTS is invalid")]
+    InvalidAssistantMaxConcurrentRequests,
+    #[error("DAYWEAVE_ASSISTANT_DAILY_TOKEN_BUDGET is invalid")]
+    InvalidAssistantDailyTokenBudget,
+}
+
+fn assistant_config(
+    values: &HashMap<String, String>,
+) -> Result<Option<AssistantConfig>, ConfigError> {
+    let enabled = match values.get("DAYWEAVE_ASSISTANT_ENABLED").map(String::as_str) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ConfigError::InvalidAssistantEnabled),
+    };
+    let settings_present = values.contains_key("DAYWEAVE_OPENAI_API_KEY")
+        || values.contains_key("DAYWEAVE_OPENAI_MODEL")
+        || values.contains_key("DAYWEAVE_ASSISTANT_REQUESTS_PER_MINUTE")
+        || values.contains_key("DAYWEAVE_ASSISTANT_MAX_CONCURRENT_REQUESTS")
+        || values.contains_key("DAYWEAVE_ASSISTANT_DAILY_TOKEN_BUDGET");
+    if !enabled {
+        if settings_present {
+            return Err(ConfigError::DisabledAssistantConfiguration);
+        }
+        return Ok(None);
+    }
+
+    let api_key = values
+        .get("DAYWEAVE_OPENAI_API_KEY")
+        .ok_or(ConfigError::MissingOpenAiApiKey)?;
+    if api_key.trim() != api_key
+        || !(MIN_OPENAI_API_KEY_LENGTH..=MAX_OPENAI_API_KEY_LENGTH).contains(&api_key.len())
+        || !api_key.is_ascii()
+        || api_key.chars().any(char::is_whitespace)
+        || api_key.chars().any(char::is_control)
+    {
+        return Err(ConfigError::InvalidOpenAiApiKey);
+    }
+    let model = values
+        .get("DAYWEAVE_OPENAI_MODEL")
+        .map_or(DEFAULT_OPENAI_MODEL, String::as_str);
+    if model.is_empty()
+        || model.len() > MAX_OPENAI_MODEL_LENGTH
+        || !model.starts_with("gpt-5.6-")
+        || !model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+    {
+        return Err(ConfigError::InvalidOpenAiModel);
+    }
+    let requests_per_minute = values
+        .get("DAYWEAVE_ASSISTANT_REQUESTS_PER_MINUTE")
+        .map_or(Ok(DEFAULT_ASSISTANT_REQUESTS_PER_MINUTE), |value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| ConfigError::InvalidAssistantRequestsPerMinute)
+        })?;
+    if requests_per_minute == 0 || requests_per_minute > MAX_ASSISTANT_REQUESTS_PER_MINUTE {
+        return Err(ConfigError::InvalidAssistantRequestsPerMinute);
+    }
+    let max_concurrent_requests = values
+        .get("DAYWEAVE_ASSISTANT_MAX_CONCURRENT_REQUESTS")
+        .map_or(Ok(DEFAULT_ASSISTANT_MAX_CONCURRENT_REQUESTS), |value| {
+            value
+                .parse::<u32>()
+                .map_err(|_| ConfigError::InvalidAssistantMaxConcurrentRequests)
+        })?;
+    if max_concurrent_requests == 0
+        || max_concurrent_requests > MAX_ASSISTANT_MAX_CONCURRENT_REQUESTS
+    {
+        return Err(ConfigError::InvalidAssistantMaxConcurrentRequests);
+    }
+    let daily_token_budget = values.get("DAYWEAVE_ASSISTANT_DAILY_TOKEN_BUDGET").map_or(
+        Ok(DEFAULT_ASSISTANT_DAILY_TOKEN_BUDGET),
+        |value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| ConfigError::InvalidAssistantDailyTokenBudget)
+        },
+    )?;
+    if !(MIN_ASSISTANT_DAILY_TOKEN_BUDGET..=MAX_ASSISTANT_DAILY_TOKEN_BUDGET)
+        .contains(&daily_token_budget)
+    {
+        return Err(ConfigError::InvalidAssistantDailyTokenBudget);
+    }
+
+    Ok(Some(AssistantConfig {
+        api_key: SecretString::from(api_key.to_owned()),
+        model: model.to_owned(),
+        requests_per_minute,
+        max_concurrent_requests,
+        daily_token_budget,
+    }))
 }
 
 fn mcp_oauth_config(
@@ -907,9 +1054,121 @@ mod tests {
         assert_eq!(config.api_token_hashes.len(), 1);
         assert!(config.mcp_allowed_origins.is_empty());
         assert!(config.mcp_oauth.is_none());
+        assert!(config.assistant.is_none());
         assert!(config.google_oauth.is_none());
         assert!(!config.google_outbound_enabled);
         assert_eq!(config.google_outbound_approval_ttl, Duration::from_mins(10));
+    }
+
+    #[test]
+    fn assistant_is_fail_closed_and_rejects_latent_configuration() {
+        let mut disabled = valid_values();
+        disabled.insert(
+            "DAYWEAVE_OPENAI_API_KEY".to_owned(),
+            "OPENAI_DISABLED_TEST_KEY".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&disabled).expect_err("disabled provider settings must fail"),
+            ConfigError::DisabledAssistantConfiguration
+        );
+
+        let mut disabled_limit = valid_values();
+        disabled_limit.insert(
+            "DAYWEAVE_ASSISTANT_DAILY_TOKEN_BUDGET".to_owned(),
+            "1000000".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&disabled_limit).expect_err("disabled limits must not be latent"),
+            ConfigError::DisabledAssistantConfiguration
+        );
+
+        let mut ambiguous = valid_values();
+        ambiguous.insert("DAYWEAVE_ASSISTANT_ENABLED".to_owned(), "yes".to_owned());
+        assert_eq!(
+            Config::from_map(&ambiguous).expect_err("switch must be exact"),
+            ConfigError::InvalidAssistantEnabled
+        );
+
+        let mut missing_secret = valid_values();
+        missing_secret.insert("DAYWEAVE_ASSISTANT_ENABLED".to_owned(), "true".to_owned());
+        assert_eq!(
+            Config::from_map(&missing_secret).expect_err("enabled provider needs a secret"),
+            ConfigError::MissingOpenAiApiKey
+        );
+    }
+
+    #[test]
+    fn assistant_uses_a_bounded_model_and_redacts_its_secret() {
+        let mut values = valid_values();
+        values.insert("DAYWEAVE_ASSISTANT_ENABLED".to_owned(), "true".to_owned());
+        values.insert(
+            "DAYWEAVE_OPENAI_API_KEY".to_owned(),
+            "OPENAI_TEST_KEY_DO_NOT_LOG".to_owned(),
+        );
+        let config = Config::from_map(&values).expect("enabled assistant");
+        let assistant = config.assistant.expect("assistant config");
+        assert_eq!(assistant.model(), "gpt-5.6-luna");
+        assert_eq!(assistant.requests_per_minute, 6);
+        assert_eq!(assistant.max_concurrent_requests, 2);
+        assert_eq!(assistant.daily_token_budget, 1_000_000);
+        let debug = format!("{assistant:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("OPENAI_TEST_KEY_DO_NOT_LOG"));
+
+        values.insert(
+            "DAYWEAVE_OPENAI_MODEL".to_owned(),
+            "gpt-5.6-luna-2026-08-01".to_owned(),
+        );
+        let configured = Config::from_map(&values).expect("bounded model");
+        assert_eq!(
+            configured.assistant.expect("assistant").model(),
+            "gpt-5.6-luna-2026-08-01"
+        );
+
+        values.insert("DAYWEAVE_OPENAI_MODEL".to_owned(), "bad model".to_owned());
+        assert_eq!(
+            Config::from_map(&values).expect_err("whitespace model must fail"),
+            ConfigError::InvalidOpenAiModel
+        );
+
+        values.insert("DAYWEAVE_OPENAI_MODEL".to_owned(), "gpt-4.1".to_owned());
+        assert_eq!(
+            Config::from_map(&values).expect_err("model must support explicit prompt caching"),
+            ConfigError::InvalidOpenAiModel
+        );
+
+        values.insert(
+            "DAYWEAVE_OPENAI_MODEL".to_owned(),
+            "gpt-5.6-luna".to_owned(),
+        );
+        values.insert(
+            "DAYWEAVE_ASSISTANT_REQUESTS_PER_MINUTE".to_owned(),
+            "12".to_owned(),
+        );
+        values.insert(
+            "DAYWEAVE_ASSISTANT_MAX_CONCURRENT_REQUESTS".to_owned(),
+            "3".to_owned(),
+        );
+        values.insert(
+            "DAYWEAVE_ASSISTANT_DAILY_TOKEN_BUDGET".to_owned(),
+            "500000".to_owned(),
+        );
+        let configured = Config::from_map(&values)
+            .expect("bounded assistant limits")
+            .assistant
+            .expect("assistant config");
+        assert_eq!(configured.requests_per_minute, 12);
+        assert_eq!(configured.max_concurrent_requests, 3);
+        assert_eq!(configured.daily_token_budget, 500_000);
+
+        values.insert(
+            "DAYWEAVE_ASSISTANT_REQUESTS_PER_MINUTE".to_owned(),
+            "0".to_owned(),
+        );
+        assert_eq!(
+            Config::from_map(&values).expect_err("zero request budget must fail"),
+            ConfigError::InvalidAssistantRequestsPerMinute
+        );
     }
 
     fn valid_mcp_oauth_values() -> HashMap<String, String> {

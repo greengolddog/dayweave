@@ -26,6 +26,14 @@ step.
 2. Run `docker compose -f compose.yaml -f compose.dev.yaml up --build`.
 3. Check `http://127.0.0.1:8080/health` and `/ready`.
 
+The Android assistant remains disabled in the base stack. For a reviewed local or production
+enablement, keep the provider key only in the untracked, root-owned environment and add
+`-f compose.assistant.yaml` to the Compose command. The overlay requires the key and selects the
+bounded default model, request/concurrency/token ceilings, and container resource limits; removing
+the overlay returns the service to the fail-closed disabled state. Also configure an OpenAI project
+budget and the required retention/ZDR policy before enablement—the process-local token ceiling is
+not a currency-denominated billing guarantee and resets on restart.
+
 The API is only bound to loopback on the host. PostgreSQL has no published port.
 
 ## Production outline

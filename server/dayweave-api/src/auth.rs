@@ -379,7 +379,8 @@ fn required_rest_scope(method: &Method, matched_path: Option<&str>) -> Option<Sc
         (
             &Method::GET,
             "/schedule/current" | "/schedule/stream" | "/schedule/manual-placements",
-        ) => Some(Scope::ScheduleRead),
+        )
+        | (&Method::POST, "/assistant/turns") => Some(Scope::ScheduleRead),
         (&Method::POST, "/schedule/preview") => Some(Scope::ScheduleSimulate),
         (&Method::POST, "/schedule/publish") => Some(Scope::SchedulePublish),
         (&Method::GET, "/execution" | "/execution/history" | "/execution/stream") => {
@@ -622,6 +623,10 @@ mod tests {
         assert_eq!(
             required_rest_scope(&Method::GET, Some("/v1/execution/stream")),
             Some(Scope::ExecutionRead)
+        );
+        assert_eq!(
+            required_rest_scope(&Method::POST, Some("/v1/assistant/turns")),
+            Some(Scope::ScheduleRead)
         );
         assert_eq!(
             required_rest_scope(&Method::POST, Some("/v1/unclassified")),

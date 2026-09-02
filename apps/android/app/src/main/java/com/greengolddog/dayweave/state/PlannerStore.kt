@@ -75,6 +75,7 @@ import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
 import com.greengolddog.dayweave.network.validateSchedulePublishHttpRequest
+import com.greengolddog.dayweave.assistant.isValidAssistantConversationText
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -178,6 +179,7 @@ class PlannerStore(
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
             .withInvalidTimedBreakNotificationAttemptAbandoned()
+            .withBoundedAssistantMessages()
             .withInvalidLocalScheduleCompositionAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) },
     )
@@ -4280,20 +4282,79 @@ class PlannerStore(
         )
     }
 
+    /**
+     * Legacy synchronous seam retained for isolated store callers.
+     *
+     * It records only the user's message. A provider reply may be appended solely through the
+     * durable assistant-turn boundary below; the store never fabricates an AI response.
+     */
     fun sendAssistantMessage(text: String): Boolean {
         val trimmed = text.trim()
-        if (trimmed.isEmpty()) return false
+        if (!isValidAssistantText(trimmed, MAX_ASSISTANT_USER_MESSAGE_BYTES)) return false
         val userMessageId = UUID.randomUUID().toString()
-        val assistantMessageId = UUID.randomUUID().toString()
         return mutate { current ->
             current.copy(
-                messages = current.messages + listOf(
+                messages = appendBoundedAssistantMessage(
+                    current.messages,
                     ChatMessage(userMessageId, ChatRole.USER, trimmed),
-                    ChatMessage(
-                        assistantMessageId,
-                        ChatRole.ASSISTANT,
-                        "I’ll check hard constraints, deadlines, energy, and protected free time. Any schedule change will arrive as a reviewable proposal.",
-                    ),
+                ),
+            )
+        }
+    }
+
+    /** Encrypts the exact user turn before any paid or privacy-sensitive provider request begins. */
+    fun appendAssistantUserMessageDurably(
+        messageId: String,
+        text: String,
+    ): PlannerPersistenceReceipt? {
+        val trimmed = text.trim()
+        requireValidAssistantMessageId(messageId)
+        require(isValidAssistantText(trimmed, MAX_ASSISTANT_USER_MESSAGE_BYTES)) {
+            "Assistant user message is empty or exceeds the byte limit"
+        }
+        return mutateDurably { current ->
+            require(current.messages.none { it.id == messageId }) {
+                "Assistant message identity already exists"
+            }
+            current.copy(
+                messages = appendBoundedAssistantMessage(
+                    current.messages,
+                    ChatMessage(messageId, ChatRole.USER, trimmed),
+                ),
+            )
+        }
+    }
+
+    /**
+     * Stores only a completed, request-bound provider reply.
+     *
+     * Network orchestration owns privacy/configuration generation checks. Requiring the durable
+     * user anchor here prevents an orphaned or replayed provider result from entering the transcript.
+     */
+    fun appendAssistantReplyDurably(
+        userMessageId: String,
+        messageId: String,
+        text: String,
+    ): PlannerPersistenceReceipt? {
+        val trimmed = text.trim()
+        requireValidAssistantMessageId(userMessageId)
+        requireValidAssistantMessageId(messageId)
+        require(isValidAssistantText(trimmed, MAX_ASSISTANT_REPLY_BYTES)) {
+            "Assistant reply is empty or exceeds the byte limit"
+        }
+        return mutateDurably { current ->
+            require(
+                current.messages.any {
+                    it.id == userMessageId && it.role == ChatRole.USER
+                },
+            ) { "Assistant reply has no durable user-message anchor" }
+            require(current.messages.none { it.id == messageId }) {
+                "Assistant message identity already exists"
+            }
+            current.copy(
+                messages = appendBoundedAssistantMessage(
+                    current.messages,
+                    ChatMessage(messageId, ChatRole.ASSISTANT, trimmed),
                 ),
             )
         }
@@ -5540,6 +5601,7 @@ class PlannerStore(
             .withInvalidRecurrenceMoveSourcesAbandoned()
             .withInvalidExecutionDeferIntentAbandoned()
             .withInvalidTimedBreakNotificationAttemptAbandoned()
+            .withBoundedAssistantMessages()
         // Kotlin data-class copy preserves unchanged input references but not body-property memos.
         // Transfer a verified digest/result only across an O(1) exact structural identity fence.
         transformed.inheritLocalScheduleCompositionMemo(previous)
@@ -5604,6 +5666,7 @@ class PlannerStore(
                 .withInvalidRecurrenceMoveSourcesAbandoned()
                 .withInvalidExecutionDeferIntentAbandoned()
                 .withInvalidTimedBreakNotificationAttemptAbandoned()
+                .withBoundedAssistantMessages()
                 .withInvalidLocalScheduleCompositionAbandoned()
                 .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
             mutableState.value = snapshot
@@ -5654,6 +5717,54 @@ class PlannerStore(
             }
         }
     }
+
+    /** Fail closed on legacy/corrupt transcript members and retain only the newest bounded suffix. */
+    private fun DayWeaveUiState.withBoundedAssistantMessages(): DayWeaveUiState {
+        val sanitized = messages.filter { message ->
+            isValidAssistantMessageId(message.id) && when (message.role) {
+                ChatRole.USER ->
+                    isValidAssistantText(message.text, MAX_ASSISTANT_USER_MESSAGE_BYTES)
+                ChatRole.ASSISTANT ->
+                    isValidAssistantText(message.text, MAX_ASSISTANT_REPLY_BYTES)
+            }
+        }
+        val uniqueNewest = sanitized.asReversed()
+            .distinctBy(ChatMessage::id)
+            .asReversed()
+        val retainedNewest = ArrayDeque<ChatMessage>()
+        var retainedBytes = 0
+        for (message in uniqueNewest.asReversed()) {
+            val bytes = message.text.toByteArray(Charsets.UTF_8).size
+            if (
+                retainedNewest.size >= MAX_ASSISTANT_MESSAGES ||
+                retainedBytes + bytes > MAX_ASSISTANT_TRANSCRIPT_BYTES
+            ) {
+                break
+            }
+            retainedNewest.addFirst(message)
+            retainedBytes += bytes
+        }
+        val retained = retainedNewest.toList()
+        return if (retained == messages) this else copy(messages = retained)
+    }
+
+    private fun appendBoundedAssistantMessage(
+        messages: List<ChatMessage>,
+        message: ChatMessage,
+    ): List<ChatMessage> = DayWeaveUiState(messages = messages + message)
+        .withBoundedAssistantMessages()
+        .messages
+
+    private fun requireValidAssistantMessageId(id: String) {
+        require(isValidAssistantMessageId(id)) { "Assistant message identity is invalid" }
+    }
+
+    private fun isValidAssistantMessageId(id: String): Boolean =
+        id.isNotBlank() && id.length <= MAX_ASSISTANT_MESSAGE_ID_CHARS &&
+            id.none(Char::isISOControl)
+
+    private fun isValidAssistantText(text: String, maximumBytes: Int): Boolean =
+        text.isValidAssistantConversationText(maximumBytes)
 
     private fun scheduleCanonicalTrashCleanupLocked(snapshot: DayWeaveUiState) {
         canonicalTrashCleanupCancellation?.cancel()
@@ -5753,6 +5864,11 @@ class PlannerStore(
         const val MAX_EXECUTION_DEFER_REFERENCES = 10_000
         const val MAX_EXECUTION_DEFER_MESSAGE_CHARS = 1_000
         const val MAX_EXECUTION_DEFER_TIMESTAMP_CHARS = 64
+        const val MAX_ASSISTANT_USER_MESSAGE_BYTES = 8 * 1024
+        const val MAX_ASSISTANT_REPLY_BYTES = 32 * 1024
+        const val MAX_ASSISTANT_MESSAGE_ID_CHARS = 128
+        const val MAX_ASSISTANT_MESSAGES = 200
+        const val MAX_ASSISTANT_TRANSCRIPT_BYTES = 512 * 1024
         val EXECUTION_DEFER_VIOLATION_CODES = setOf(
             "outside_availability",
             "earliest_start",

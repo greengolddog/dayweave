@@ -49,6 +49,7 @@ const MAX_LIST_LIMIT: usize = 200;
         health,
         readiness,
         version,
+        crate::assistant::http::create_turn,
         create_suggestion,
         list_suggestions,
         get_suggestion,
@@ -107,6 +108,15 @@ const MAX_LIST_LIMIT: usize = 200;
     components(schemas(
         HealthResponse,
         VersionResponse,
+        crate::assistant::AssistantTurnRequest,
+        crate::assistant::AssistantTurnResponse,
+        crate::assistant::AssistantHistoryEntry,
+        crate::assistant::AssistantHistoryRole,
+        crate::assistant::AssistantContext,
+        crate::assistant::AssistantContextSchema,
+        crate::assistant::AssistantScheduledBlock,
+        crate::assistant::AssistantPrivateBusySpan,
+        crate::assistant::AssistantPlannerItem,
         CreateSuggestionRequest,
         EditSuggestionRequest,
         DecisionRequest,
@@ -232,6 +242,7 @@ const MAX_LIST_LIMIT: usize = 200;
     modifiers(&SecurityAddon),
     tags(
         (name = "system", description = "Liveness, readiness, and build identity"),
+        (name = "assistant", description = "Bounded advisory-only planning conversations"),
         (name = "suggestions", description = "Reviewable proposals from AI and external tools"),
         (name = "items", description = "Canonical offline-first planner items and delta sync"),
         (name = "schedule", description = "Deterministic previews and explicit immutable publication"),
@@ -303,6 +314,7 @@ pub fn router(state: AppState) -> Router {
             "/suggestions/applications/{id}/undo",
             post(undo_suggestion_application),
         )
+        .merge(crate::assistant::http::routes())
         .merge(crate::items::http::routes())
         .merge(crate::scheduling::http::routes())
         .merge(crate::execution::http::routes())

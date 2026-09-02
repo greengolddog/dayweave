@@ -284,6 +284,23 @@ ordinary login and chat methods work.
 
 Assistant requests consist of an explicit, redacted context package, user request, allowed tool schema, model/reasoning preference, and confirmation policy. Tool calls target application commands or simulations—not database tables.
 
+The first Android remote-provider slice is implemented as a stricter advisory subset. A native
+device sends one manually initiated, non-streaming turn to `/v1/assistant/turns`; the server-held
+provider has no tools or application service handles and can return only bounded text. The client
+uses ephemeral block/item references and occupancy-only spans for sensitive time, commits the user
+message before network I/O, exposes a disclosure manifest, never invokes inference in background
+work, and never automatically replays an ambiguous or failed call. Only completed in-process turn
+pairs from the same native binding can become conversational history. App lock, backgrounding, and
+credential-binding changes cancel and generation-fence late results and clear that reusable history.
+The local encrypted transcript remains readable, with an explicit UI notice that these boundaries
+and process restart begin a fresh provider context.
+The paid provider boundary disables implicit prompt caching, limits requests per principal and
+global concurrency, reserves a conservative rolling token budget before dispatch, and reconciles
+successful reservations from validated provider usage. Deployment adds CPU, memory, and process
+ceilings; a provider-side project budget remains the authoritative currency cap.
+Structured assistant drafts, durable memory, provider selection, and streaming remain later layers
+over the existing proposal boundary.
+
 ### 9.2 Read, propose, apply
 
 All assistant behavior follows three stages:

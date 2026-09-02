@@ -242,6 +242,19 @@ invalid evidence rejects the transaction without consuming the capability.
 Tests for every new disclosure surface should use a recognizable canary title
 and notes value and assert that neither appears in the forbidden output.
 
+Android assistant turns enforce this policy before network I/O. The projector emits only bounded
+typed public facts with ephemeral references and anonymous private busy spans. The server validates
+that exact schema again, calls a fixed HTTPS provider endpoint with storage and tools disabled, and
+uses explicit prompt-cache mode without breakpoints. It returns only a completed bounded text
+answer. A per-principal token bucket, global concurrency semaphore, conservative rolling token
+budget, and container resource limits bound the paid path; validated provider usage reconciles
+successful reservations. A turn is foreground-only, not automatically retried, and its late
+callbacks are invalidated across lock, background, or credential-binding changes.
+Only completed user/reply pairs may be reused as history, and only in memory for the same native
+binding; aborted prompts and prior-binding transcripts never cross the provider boundary. The
+encrypted transcript may remain visible locally, so Android shows a persistent notice that lock,
+background, restart, and connection changes reset the provider context.
+
 ## External-effect and assistant policy
 
 Local, reversible, single-item changes may be applied with undo. Bulk,
@@ -296,8 +309,8 @@ ready:
   attachment analysis on both clients;
 - add server-side envelope encryption for provider tokens and especially
   sensitive fields with a key held separately from PostgreSQL and backups;
-- enforce ingress and per-principal rate limits and suspicious-authentication
-  alerts;
+- extend ingress and per-principal rate limits beyond the bounded assistant path and add
+  suspicious-authentication alerts;
 - provision and verify least-privilege PostgreSQL migration/runtime roles so no
   unrelated role can write canonical execution, assessment, or claim tables;
 - provision least-privilege Nebius identities, private versioned storage,

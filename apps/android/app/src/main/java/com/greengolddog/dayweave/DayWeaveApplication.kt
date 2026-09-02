@@ -14,6 +14,7 @@ import com.greengolddog.dayweave.network.DeviceAuthBindingFence
 import com.greengolddog.dayweave.network.ApiBindingOperationGate
 import com.greengolddog.dayweave.network.DurableDeviceAuthCoordinator
 import com.greengolddog.dayweave.network.KeystoreDeviceAuthEnvelopeStore
+import com.greengolddog.dayweave.network.OkHttpAssistantTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalPlannerTransport
 import com.greengolddog.dayweave.network.OkHttpCanonicalItemInvalidationStreamTransport
 import com.greengolddog.dayweave.network.OkHttpDeviceAuthTransport
@@ -38,6 +39,7 @@ import com.greengolddog.dayweave.security.MonotonicClock
 import com.greengolddog.dayweave.scheduler.RustScheduleComposer
 import com.greengolddog.dayweave.state.PlannerStore
 import com.greengolddog.dayweave.state.PlannerLoadState
+import com.greengolddog.dayweave.sync.AssistantManager
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
@@ -77,6 +79,7 @@ class DayWeaveApplication : Application() {
     private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val canonicalActionGate = CanonicalActionGate()
     private val privatePresentationAllowed = AtomicBoolean(false)
+    private val assistantForegroundActive = AtomicBoolean(false)
     private val localScheduleCompositionLauncher = LocalScheduleCompositionLauncher(
         scope = persistenceScope,
         actionGate = canonicalActionGate,
@@ -184,6 +187,9 @@ class DayWeaveApplication : Application() {
                         if (suggestionSyncManagerDelegate.isInitialized()) {
                             suggestionSyncManager.quarantineBindingState()
                         }
+                        if (assistantManagerDelegate.isInitialized()) {
+                            assistantManager.quarantineBindingState()
+                        }
                         if (proposalApplicationManagerDelegate.isInitialized()) {
                             proposalApplicationManager.quarantineBindingState()
                         }
@@ -220,6 +226,19 @@ class DayWeaveApplication : Application() {
     }
 
     private val apiCredentialStore by lazy { deviceAuthCoordinator }
+
+    private val assistantManagerDelegate = lazy {
+        AssistantManager(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpAssistantTransport(),
+            scope = persistenceScope,
+            operationAllowed = {
+                privatePresentationAllowed.get() && assistantForegroundActive.get()
+            },
+        )
+    }
+    val assistantManager: AssistantManager get() = assistantManagerDelegate.value
 
     private val suggestionSyncManagerDelegate = lazy {
         SuggestionSyncManager(
@@ -505,6 +524,9 @@ class DayWeaveApplication : Application() {
         if (proposalApplicationManagerDelegate.isInitialized()) {
             proposalApplicationManager.discardReviewForPrivacyBoundary()
         }
+        if (assistantManagerDelegate.isInitialized()) {
+            assistantManager.cancelForPrivacyBoundary()
+        }
         if (googleCalendarImportCoordinatorDelegate.isInitialized()) {
             googleCalendarImportCoordinator.quarantineBindingState()
         }
@@ -516,6 +538,25 @@ class DayWeaveApplication : Application() {
     /** Re-enables private provider reads only after the lock controller exposes unlocked UI. */
     fun onAppPrivacyBoundaryUnlocked() {
         privatePresentationAllowed.set(true)
+        if (assistantForegroundActive.get() && assistantManagerDelegate.isInitialized()) {
+            assistantManager.restoreForegroundState()
+        }
+    }
+
+    /** Opens the assistant gate only while the unlocked activity is STARTED. */
+    fun onAppForegroundAssistantActive() {
+        assistantForegroundActive.set(true)
+        if (privatePresentationAllowed.get() && assistantManagerDelegate.isInitialized()) {
+            assistantManager.restoreForegroundState()
+        }
+    }
+
+    /** AI inference is foreground-only even when delayed app locking is disabled. */
+    fun onAppForegroundAssistantInactive() {
+        assistantForegroundActive.set(false)
+        if (assistantManagerDelegate.isInitialized()) {
+            assistantManager.cancelForPrivacyBoundary()
+        }
     }
 
     /** Collected only by the unlocked STARTED UI; cancellation closes the response body. */
