@@ -56,6 +56,7 @@ import com.greengolddog.dayweave.scheduler.LocalScheduleComposer
 import com.greengolddog.dayweave.scheduler.LocalScheduleComposition
 import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestException
 import com.greengolddog.dayweave.scheduler.LocalScheduleCompositionRequestTooLargeException
+import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.io.IOException
@@ -169,6 +170,86 @@ class CanonicalSyncManagerTest {
             )
             assertEquals(DayWeaveUiState(), invalidStore.durableState.value)
         }
+    }
+
+    @Test
+    fun currentScheduleReplicaAcceptsEveryPositiveWireHorizonThroughNinetyDays() = runBlocking {
+        data class Case(
+            val name: String,
+            val asOf: Instant,
+            val start: Instant,
+            val end: Instant,
+            val zoneId: String,
+        )
+        val cases = listOf(
+            Case(
+                name = "cross-platform repeated midnight hour",
+                asOf = Instant.parse("2026-11-01T04:30:00Z"),
+                start = Instant.parse("2026-11-01T04:00:00Z"),
+                end = Instant.parse("2026-11-01T05:00:00Z"),
+                zoneId = "America/Havana",
+            ),
+            Case(
+                name = "thirty-one days",
+                asOf = clock,
+                start = Instant.parse("2026-08-31T22:00:00Z"),
+                end = Instant.parse("2026-10-01T22:00:00Z"),
+                zoneId = "Europe/Madrid",
+            ),
+            Case(
+                name = "ninety absolute days",
+                asOf = clock,
+                start = Instant.parse("2026-08-31T22:00:00Z"),
+                end = Instant.parse("2026-08-31T22:00:00Z").plus(Duration.ofDays(90)),
+                zoneId = "Europe/Madrid",
+            ),
+        )
+
+        cases.forEach { case ->
+            val schedule = emptyPreview().withWindow(
+                asOf = case.asOf,
+                horizonStart = case.start.toString(),
+                horizonEnd = case.end.toString(),
+            )
+            val transport = FakeCanonicalTransport().apply {
+                currentScheduleResult = currentSchedule(schedule).let { current ->
+                    current.copy(revision = current.revision.copy(timezoneName = case.zoneId))
+                }
+                pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-${case.name}", false)
+            }
+            val store = PlannerStore(DayWeaveUiState())
+
+            assertEquals(
+                case.name,
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(store, transport, currentInstant = case.asOf)
+                    .refreshCurrentPublishedSchedule(),
+            )
+            assertEquals(case.start.toString(), store.state.value.publishedScheduleRevision?.horizonStart)
+            assertEquals(case.end.toString(), store.state.value.publishedScheduleRevision?.horizonEnd)
+            assertTrue(requireNotNull(store.state.value.publishedScheduleProof).hasValidShape())
+        }
+    }
+
+    @Test
+    fun currentScheduleReplicaRejectsMoreThanNinetyAbsoluteDays() = runBlocking {
+        val start = Instant.parse("2026-08-31T22:00:00Z")
+        val schedule = emptyPreview().withWindow(
+            asOf = clock,
+            horizonStart = start.toString(),
+            horizonEnd = start.plus(Duration.ofDays(90)).plusSeconds(1).toString(),
+        )
+        val transport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(schedule)
+            pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-too-long", false)
+        }
+        val store = PlannerStore(DayWeaveUiState())
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(store, transport).refreshCurrentPublishedSchedule(),
+        )
+        assertEquals(DayWeaveUiState(), store.durableState.value)
     }
 
     @Test
@@ -827,6 +908,12 @@ class CanonicalSyncManagerTest {
         assertFalse(plannerStore.state.value.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
         assertEquals(1, transport.publicationRequests.size)
         val exactRequest = transport.publicationRequests.single()
+        val exactPublishedSchedule = Json.decodeFromString<SchedulePublishRequest>(
+            exactRequest.bodyJson,
+        ).schedule
+        assertEquals("2026-08-31T22:00:00Z", exactPublishedSchedule.horizonStart)
+        assertEquals("2026-09-07T22:00:00Z", exactPublishedSchedule.horizonEnd)
+        assertEquals(7, exactPublishedSchedule.availability.size)
 
         transport.publicationError = null
         val restarted = PlannerStore(plannerStore.state.value)
@@ -1478,16 +1565,542 @@ class CanonicalSyncManagerTest {
         assertEquals(ItemStatus.SCHEDULED, block.status)
         assertTrue(block.isSplittable)
         assertEquals("", block.note)
-        assertEquals(840, plannerStore.state.value.protectedFreeMinutes)
+        assertEquals(6_240, plannerStore.state.value.protectedFreeMinutes)
         assertEquals(100, plannerStore.state.value.dayScore)
 
         assertNotNull(transport.previewRequest)
         val request = requireNotNull(transport.previewRequest)
         assertEquals("Europe/Madrid", request.timezoneName)
         assertEquals("2026-08-31T22:00:00Z", request.horizonStart)
-        assertEquals("2026-09-01T22:00:00Z", request.horizonEnd)
-        assertEquals("2026-09-01T05:00:00Z", request.availability.single().start)
-        assertEquals("2026-09-01T20:00:00Z", request.availability.single().end)
+        assertEquals("2026-09-07T22:00:00Z", request.horizonEnd)
+        assertEquals(7, request.availability.size)
+        assertEquals("2026-09-01T05:00:00Z", request.availability.first().start)
+        assertEquals("2026-09-01T20:00:00Z", request.availability.first().end)
+        assertEquals("2026-09-07T05:00:00Z", request.availability.last().start)
+        assertEquals("2026-09-07T20:00:00Z", request.availability.last().end)
+    }
+
+    @Test
+    fun configuredFirmHorizonUsesExactCalendarBoundsAndOneWindowPerDate() = runBlocking {
+        val profile = ScheduleCompositionProfileSnapshot(
+            firmHorizonDays = 3,
+            dayStartMinute = 8 * 60,
+            dayEndMinute = 18 * 60,
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState(scheduleCompositionProfile = profile))
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().withWindow(
+                asOf = clock,
+                horizonStart = "2026-08-31T22:00:00Z",
+                horizonEnd = "2026-09-03T22:00:00Z",
+            )
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(plannerStore, transport).refreshAndCompose())
+
+        val request = transport.previewRequests.single()
+        assertEquals("2026-08-31T22:00:00Z", request.horizonStart)
+        assertEquals("2026-09-03T22:00:00Z", request.horizonEnd)
+        assertEquals(3, request.availability.size)
+        assertEquals(
+            listOf(
+                "2026-09-01T06:00:00Z" to "2026-09-01T16:00:00Z",
+                "2026-09-02T06:00:00Z" to "2026-09-02T16:00:00Z",
+                "2026-09-03T06:00:00Z" to "2026-09-03T16:00:00Z",
+            ),
+            request.availability.map { it.start to it.end },
+        )
+        assertEquals(1_740, plannerStore.state.value.protectedFreeMinutes)
+    }
+
+    @Test
+    fun protectedMinutesSubtractExactSubminuteBusyRangesBeforeConservativeRounding() = runBlocking {
+        data class Case(
+            val name: String,
+            val windows: List<Pair<String, String>>,
+            val expectedMinutes: Int,
+        )
+        val cases = listOf(
+            Case(
+                "fifty-nine seconds",
+                listOf("2026-09-01T09:00:00Z" to "2026-09-01T09:00:59Z"),
+                59,
+            ),
+            Case(
+                "separated subminute fragments",
+                listOf(
+                    "2026-09-01T09:00:00Z" to "2026-09-01T09:00:30Z",
+                    "2026-09-01T09:30:00Z" to "2026-09-01T09:30:30Z",
+                ),
+                58,
+            ),
+            Case(
+                "abutting fragments",
+                listOf(
+                    "2026-09-01T09:00:00Z" to "2026-09-01T09:00:30Z",
+                    "2026-09-01T09:00:30Z" to "2026-09-01T09:01:00Z",
+                ),
+                59,
+            ),
+            Case(
+                "overlapping nanosecond fragments",
+                listOf(
+                    "2026-09-01T09:00:00.000000001Z" to
+                        "2026-09-01T09:00:45.000000001Z",
+                    "2026-09-01T09:00:30.000000001Z" to
+                        "2026-09-01T09:01:00.000000001Z",
+                ),
+                58,
+            ),
+        )
+        val itemIds = listOf(
+            "11111111-1111-4111-8111-111111111111",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        val blockIds = listOf(
+            "22222222-2222-4222-8222-222222222222",
+            "99999999-9999-4999-8999-999999999999",
+        )
+
+        cases.forEach { case ->
+            val events = case.windows.indices.map { index ->
+                remoteItem(split = false).copy(
+                    id = itemIds[index],
+                    kind = "event",
+                    title = "Busy ${index + 1}",
+                    notes = null,
+                    timezoneName = "UTC",
+                    durationSeconds = null,
+                    deadlineAt = null,
+                    flexibleConstraints = buildJsonObject { },
+                    isExecutable = false,
+                )
+            }
+            val basePreview = itemsPreview(events).withWindow(
+                asOf = clock,
+                horizonStart = "2026-09-01T00:00:00Z",
+                horizonEnd = "2026-09-02T00:00:00Z",
+            )
+            val preview = basePreview.copy(
+                plan = basePreview.plan.copy(
+                    blocks = case.windows.mapIndexed { index, (start, end) ->
+                        RemoteScheduleBlock(
+                            id = blockIds[index],
+                            isSensitive = false,
+                            itemId = itemIds[index],
+                            title = events[index].title,
+                            start = start,
+                            end = end,
+                            sessionIndex = 0,
+                            kind = "calendar_event",
+                            explanations = emptyList(),
+                        )
+                    },
+                    score = RemotePlanScore(0, 0, 0uL, 0),
+                ),
+            )
+            val store = PlannerStore(
+                DayWeaveUiState(
+                    scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(
+                        firmHorizonDays = 1,
+                        dayStartMinute = 9 * 60,
+                        dayEndMinute = 10 * 60,
+                    ),
+                ),
+            )
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(
+                    events.map { RemoteItemDeltaChange(type = "upsert", item = it) },
+                    "cursor-${case.name}",
+                    false,
+                )
+                previewResult = preview
+            }
+
+            assertEquals(
+                case.name,
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(
+                    store,
+                    transport,
+                    zoneProvider = { ZoneId.of("UTC") },
+                ).refreshAndCompose(),
+            )
+            assertEquals(case.name, case.expectedMinutes, store.state.value.protectedFreeMinutes)
+        }
+    }
+
+    @Test
+    fun sevenCalendarDayHorizonHasDstAdjustedAbsoluteDuration() = runBlocking {
+        data class Case(
+            val asOf: Instant,
+            val horizonStart: String,
+            val horizonEnd: String,
+            val expectedHours: Long,
+            val transitionWindowStart: String,
+            val transitionWindowEnd: String,
+        )
+        val cases = listOf(
+            Case(
+                asOf = Instant.parse("2026-03-27T12:00:00Z"),
+                horizonStart = "2026-03-26T23:00:00Z",
+                horizonEnd = "2026-04-02T22:00:00Z",
+                expectedHours = 167,
+                transitionWindowStart = "2026-03-29T05:00:00Z",
+                transitionWindowEnd = "2026-03-29T20:00:00Z",
+            ),
+            Case(
+                asOf = Instant.parse("2026-10-23T12:00:00Z"),
+                horizonStart = "2026-10-22T22:00:00Z",
+                horizonEnd = "2026-10-29T23:00:00Z",
+                expectedHours = 169,
+                transitionWindowStart = "2026-10-25T06:00:00Z",
+                transitionWindowEnd = "2026-10-25T21:00:00Z",
+            ),
+        )
+
+        cases.forEach { case ->
+            val plannerStore = PlannerStore(DayWeaveUiState())
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-dst", false)
+                previewResult = emptyPreview().withWindow(
+                    asOf = case.asOf,
+                    horizonStart = case.horizonStart,
+                    horizonEnd = case.horizonEnd,
+                )
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(plannerStore, transport, currentInstant = case.asOf).refreshAndCompose(),
+            )
+
+            val request = transport.previewRequests.single()
+            assertEquals(case.horizonStart, request.horizonStart)
+            assertEquals(case.horizonEnd, request.horizonEnd)
+            assertEquals(
+                case.expectedHours,
+                Duration.between(
+                    Instant.parse(request.horizonStart),
+                    Instant.parse(request.horizonEnd),
+                ).toHours(),
+            )
+            assertEquals(7, request.availability.size)
+            assertTrue(
+                request.availability.any {
+                    it.start == case.transitionWindowStart && it.end == case.transitionWindowEnd
+                },
+            )
+        }
+    }
+
+    @Test
+    fun nonexistentLocalAvailabilityOrHorizonBoundaryFailsClosed() = runBlocking {
+        data class Case(
+            val asOf: Instant,
+            val zone: ZoneId,
+            val profile: ScheduleCompositionProfileSnapshot,
+        )
+        val cases = listOf(
+            Case(
+                asOf = Instant.parse("2026-03-29T10:00:00Z"),
+                zone = ZoneId.of("Europe/Madrid"),
+                profile = ScheduleCompositionProfileSnapshot(
+                    firmHorizonDays = 1,
+                    dayStartMinute = 2 * 60 + 30,
+                    dayEndMinute = 4 * 60,
+                ),
+            ),
+            Case(
+                asOf = Instant.parse("2026-03-08T16:00:00Z"),
+                zone = ZoneId.of("America/Havana"),
+                profile = ScheduleCompositionProfileSnapshot(firmHorizonDays = 1),
+            ),
+        )
+
+        cases.forEach { case ->
+            val initial = DayWeaveUiState(scheduleCompositionProfile = case.profile)
+            val plannerStore = PlannerStore(initial)
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-gap", false)
+            }
+
+            assertEquals(
+                CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+                manager(
+                    plannerStore,
+                    transport,
+                    currentInstant = case.asOf,
+                    zoneProvider = { case.zone },
+                ).refreshAndCompose(),
+            )
+            assertTrue(transport.previewRequests.isEmpty())
+            assertTrue(transport.publicationRequests.isEmpty())
+            assertEquals(initial, plannerStore.durableState.value)
+        }
+    }
+
+    @Test
+    fun ambiguousAvailabilityUsesConservativeBoundaryOffsets() = runBlocking {
+        suspend fun requestFor(profile: ScheduleCompositionProfileSnapshot): SchedulePreviewRequest {
+            val asOf = Instant.parse("2026-10-25T12:00:00Z")
+            val plannerStore = PlannerStore(DayWeaveUiState(scheduleCompositionProfile = profile))
+            val transport = FakeCanonicalTransport().apply {
+                pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-overlap", false)
+                previewResult = emptyPreview().withWindow(
+                    asOf = asOf,
+                    horizonStart = "2026-10-24T22:00:00Z",
+                    horizonEnd = "2026-10-25T23:00:00Z",
+                )
+            }
+            assertEquals(
+                CanonicalRefreshOutcome.SUCCESS,
+                manager(plannerStore, transport, currentInstant = asOf).refreshAndCompose(),
+            )
+            return transport.previewRequests.single()
+        }
+
+        val ambiguousStart = requestFor(
+            ScheduleCompositionProfileSnapshot(
+                firmHorizonDays = 1,
+                dayStartMinute = 2 * 60 + 30,
+                dayEndMinute = 3 * 60,
+            ),
+        ).availability.single()
+        assertEquals("2026-10-25T01:30:00Z", ambiguousStart.start)
+        assertEquals("2026-10-25T02:00:00Z", ambiguousStart.end)
+
+        val ambiguousEnd = requestFor(
+            ScheduleCompositionProfileSnapshot(
+                firmHorizonDays = 1,
+                dayStartMinute = 60,
+                dayEndMinute = 2 * 60 + 30,
+            ),
+        ).availability.single()
+        assertEquals("2026-10-24T23:00:00Z", ambiguousEnd.start)
+        assertEquals("2026-10-25T00:30:00Z", ambiguousEnd.end)
+    }
+
+    @Test
+    fun twentyFourHundredIsClippedAtTheEarlierFirmHorizonEnd() = runBlocking {
+        val asOf = Instant.parse("2026-10-31T16:00:00Z")
+        val profile = ScheduleCompositionProfileSnapshot(
+            firmHorizonDays = 1,
+            dayStartMinute = 23 * 60,
+            dayEndMinute = 24 * 60,
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState(scheduleCompositionProfile = profile))
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-midnight-overlap", false)
+            previewResult = emptyPreview().withWindow(
+                asOf = asOf,
+                horizonStart = "2026-10-31T04:00:00Z",
+                horizonEnd = "2026-11-01T04:00:00Z",
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(
+                plannerStore,
+                transport,
+                currentInstant = asOf,
+                zoneProvider = { ZoneId.of("America/Havana") },
+            ).refreshAndCompose(),
+        )
+
+        val request = transport.previewRequests.single()
+        assertEquals("2026-11-01T04:00:00Z", request.horizonEnd)
+        assertEquals("2026-11-01T03:00:00Z", request.availability.single().start)
+        assertEquals(request.horizonEnd, request.availability.single().end)
+    }
+
+    @Test
+    fun twentyFourHundredUsesTheNextStrictStartOnAnInteriorAmbiguousMidnight() = runBlocking {
+        val asOf = Instant.parse("2026-10-31T16:00:00Z")
+        val profile = ScheduleCompositionProfileSnapshot(
+            firmHorizonDays = 2,
+            dayStartMinute = 23 * 60,
+            dayEndMinute = 24 * 60,
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState(scheduleCompositionProfile = profile))
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(emptyList(), "cursor-interior-midnight", false)
+            previewResult = emptyPreview().withWindow(
+                asOf = asOf,
+                horizonStart = "2026-10-31T04:00:00Z",
+                horizonEnd = "2026-11-02T05:00:00Z",
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(
+                plannerStore,
+                transport,
+                currentInstant = asOf,
+                zoneProvider = { ZoneId.of("America/Havana") },
+            ).refreshAndCompose(),
+        )
+
+        val request = transport.previewRequests.single()
+        assertEquals(2, request.availability.size)
+        assertEquals("2026-11-01T03:00:00Z", request.availability.first().start)
+        assertEquals("2026-11-01T05:00:00Z", request.availability.first().end)
+        assertEquals("2026-11-02T04:00:00Z", request.availability.last().start)
+        assertEquals("2026-11-02T05:00:00Z", request.availability.last().end)
+    }
+
+    @Test
+    fun blockIntersectingDaySevenKeepsExactGeometryAndClipsOnlyItsPresentationSlice() = runBlocking {
+        val crossing = preview().plan.blocks.single().copy(
+            start = "2026-09-07T21:30:00Z",
+            end = "2026-09-07T22:30:00Z",
+            kind = "pinned",
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-day-seven",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(blocks = listOf(crossing)),
+            )
+        }
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager(plannerStore, transport).refreshAndCompose())
+
+        val block = plannerStore.state.value.schedule.single()
+        assertEquals(23 * 60 + 30, block.startMinute)
+        assertEquals(60, block.durationMinutes)
+        assertEquals("2026-09-07T21:30:00Z", block.absoluteStartAt)
+        assertEquals("2026-09-07T22:30:00Z", block.absoluteEndAt)
+        val slice = plannerStore.state.value.visibleScheduleSlicesForFirmHorizon(
+            reference = clock,
+            currentZone = ZoneId.of("Europe/Madrid"),
+        ).single()
+        assertEquals(30, slice.durationMinutes)
+        assertEquals(Instant.parse("2026-09-07T22:00:00Z"), slice.clippedEnd)
+    }
+
+    @Test
+    fun crossingPinnedGeometryAndPublicationProofAreIdenticalAfterReplicaRefresh() = runBlocking {
+        val crossing = preview().plan.blocks.single().copy(
+            start = "2026-09-07T21:30:00Z",
+            end = "2026-09-07T22:30:00Z",
+            kind = "pinned",
+        )
+        val crossingPreview = preview().copy(
+            plan = preview().plan.copy(blocks = listOf(crossing)),
+        )
+        val originStore = PlannerStore(DayWeaveUiState())
+        val originTransport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-origin-crossing",
+                false,
+            )
+            previewResult = crossingPreview
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(originStore, originTransport).refreshAndCompose(),
+        )
+        val origin = originStore.state.value
+        val replicaStore = PlannerStore(DayWeaveUiState())
+        val replicaTransport = FakeCanonicalTransport().apply {
+            currentScheduleResult = currentSchedule(crossingPreview)
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-replica-crossing",
+                false,
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.SUCCESS,
+            manager(replicaStore, replicaTransport).refreshCurrentPublishedSchedule(),
+        )
+        val replica = replicaStore.state.value
+
+        assertEquals(origin.schedule, replica.schedule)
+        assertEquals(origin.publishedScheduleProof?.blocks, replica.publishedScheduleProof?.blocks)
+        assertTrue(origin.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+        assertTrue(replica.isCanonicalPlanCurrent(clock, ZoneId.of("Europe/Madrid")))
+    }
+
+    @Test
+    fun automaticallyPlannedBlockCannotCrossTheExactFirmHorizon() = runBlocking {
+        val crossing = preview().plan.blocks.single().copy(
+            start = "2026-09-07T21:30:00Z",
+            end = "2026-09-07T22:30:00Z",
+            kind = "planned",
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-invalid-planned-crossing",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(blocks = listOf(crossing)),
+            )
+        }
+
+        assertEquals(
+            CanonicalRefreshOutcome.PROTOCOL_FAILURE,
+            manager(plannerStore, transport).refreshAndCompose(),
+        )
+        assertTrue(plannerStore.state.value.schedule.isEmpty())
+        assertEquals(null, plannerStore.state.value.publishedScheduleProof)
+    }
+
+    @Test
+    fun nextDayComposeReusesIntersectingExactAssignmentFromPriorGeneration() = runBlocking {
+        var instant = clock
+        val stableBlock = preview().plan.blocks.single().copy(
+            start = "2026-09-02T09:00:00+02:00",
+            end = "2026-09-02T10:00:00+02:00",
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState())
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-1",
+                false,
+            )
+            previewResult = preview().copy(
+                plan = preview().plan.copy(blocks = listOf(stableBlock)),
+            )
+        }
+        val manager = manager(plannerStore, transport, nowProvider = { instant })
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        instant = clock.plus(Duration.ofDays(1))
+        transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
+        transport.previewResult = preview().copy(
+            plan = preview().plan.copy(blocks = listOf(stableBlock)),
+        ).withWindow(
+            asOf = instant,
+            horizonStart = "2026-09-01T22:00:00Z",
+            horizonEnd = "2026-09-08T22:00:00Z",
+        )
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, manager.refreshAndCompose())
+
+        val assignment = transport.previewRequests.last().previousAssignments.single()
+        assertEquals("2026-09-02T07:00:00Z", assignment.blocks.single().start)
+        assertEquals("2026-09-02T08:00:00Z", assignment.blocks.single().end)
+        assertTrue(assignment.pinned)
     }
 
     @Test
@@ -3565,8 +4178,8 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
-    fun recurrenceMoveRejectsTomorrowAndFarTargetsWithoutATargetDayPreview() = runBlocking {
-        suspend fun verify(dayOffset: Long) {
+    fun recurrenceMoveAcceptsLaterHorizonDaysAndRejectsOutsideTheExactHorizon() = runBlocking {
+        suspend fun verify(dayOffset: Long, expectedSuccess: Boolean) {
             val recurringItem = remoteItem(split = false).copy(
                 kind = "habit",
                 deadlineAt = null,
@@ -3592,7 +4205,10 @@ class CanonicalSyncManagerTest {
                     occurrences = listOf(sourceOccurrence),
                 ),
             )
-            val plannerStore = PlannerStore(DayWeaveUiState())
+            val plannerStore = PlannerStore(
+                DayWeaveUiState(),
+                nowEpochMillis = { clock.toEpochMilli() },
+            )
             val transport = FakeCanonicalTransport().apply {
                 pages[null] = RemoteItemDeltaPage(
                     listOf(RemoteItemDeltaChange(type = "upsert", item = recurringItem)),
@@ -3605,18 +4221,32 @@ class CanonicalSyncManagerTest {
             assertEquals(CanonicalRefreshOutcome.SUCCESS, sourceManager.refreshAndCompose())
             val previewCount = transport.previewRequests.size
             val moveStart = clock.plusSeconds(dayOffset * 86_400L + 3 * 3_600L)
+            transport.pages["cursor-1"] = RemoteItemDeltaPage(emptyList(), "cursor-2", false)
 
-            assertEquals(
-                CanonicalRefreshOutcome.INVALID_LOCAL_STATE,
-                sourceManager.doLater(BLOCK_ID, moveStart),
-            )
-            assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
-            assertEquals(previewCount, transport.previewRequests.size)
-            assertTrue(sourceManager.state.value.message.contains("loaded planning day"))
+            val outcome = sourceManager.doLater(BLOCK_ID, moveStart)
+            if (expectedSuccess) {
+                assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
+                assertEquals(previewCount + 1, transport.previewRequests.size)
+                assertEquals(
+                    moveStart.toString(),
+                    plannerStore.state.value.recurrenceMoves.getValue(OCCURRENCE_ID).startAt,
+                )
+                val action = requireNotNull(
+                    transport.previewRequests.last().recurrenceContext["exceptions"],
+                ).jsonArray.single().jsonObject.getValue("action").jsonObject
+                assertEquals("move", action.getValue("type").jsonPrimitive.content)
+                assertEquals(moveStart.toString(), action.getValue("start").jsonPrimitive.content)
+            } else {
+                assertEquals(CanonicalRefreshOutcome.INVALID_LOCAL_STATE, outcome)
+                assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
+                assertEquals(previewCount, transport.previewRequests.size)
+                assertTrue(sourceManager.state.value.message.contains("exact firm horizon"))
+            }
         }
 
-        verify(dayOffset = 1)
-        verify(dayOffset = 3)
+        verify(dayOffset = 1, expectedSuccess = true)
+        verify(dayOffset = 6, expectedSuccess = true)
+        verify(dayOffset = 7, expectedSuccess = false)
     }
 
     @Test
@@ -3667,7 +4297,7 @@ class CanonicalSyncManagerTest {
 
         assertTrue(plannerStore.state.value.recurrenceMoves.isEmpty())
         assertEquals(previewCount, transport.previewRequests.size)
-        assertTrue(manager.state.value.message.contains("loaded planning day"))
+        assertTrue(manager.state.value.message.contains("planning-day boundary"))
     }
 
     @Test
@@ -4450,7 +5080,8 @@ class CanonicalSyncManagerTest {
             assertEquals(null, installed.publishedScheduleRevision)
             assertEquals(null, installed.publishedScheduleProof)
             assertEquals(7 * 60, installed.scheduleCompositionProfile.dayStartMinute)
-            assertEquals("2026-09-01T05:00:00Z", request?.availability?.single()?.start)
+            assertEquals(7, request?.availability?.size)
+            assertEquals("2026-09-01T05:00:00Z", request?.availability?.first()?.start)
             assertTrue(transport.deltaCursors.isEmpty())
             assertTrue(transport.previewRequests.isEmpty())
             assertTrue(transport.publicationRequests.isEmpty())
@@ -4618,7 +5249,7 @@ class CanonicalSyncManagerTest {
     @Test
     fun localRequestUsesCapturedSnapshotAcrossProfileABA() = runBlocking {
         val initial = localCompositionReadyState().copy(
-            scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
+            scheduleMessage = "Scheduling profile changed · recompose to refresh the firm horizon",
         )
         val originalProfile = initial.scheduleCompositionProfile
         val plannerStore = PlannerStore(initial)
@@ -4639,7 +5270,7 @@ class CanonicalSyncManagerTest {
                 ZoneId.of("Europe/Madrid")
             },
             localScheduleComposer = LocalScheduleComposer { _, request ->
-                requestedAvailabilityStart = request.availability.single().start
+                requestedAvailabilityStart = request.availability.first().start
                 assertTrue(plannerStore.updateScheduleCompositionProfile(originalProfile))
                 emptyLocalComposition(request)
             },
@@ -5175,6 +5806,18 @@ class CanonicalSyncManagerTest {
             acceptedItemCount = items.size,
         )
 
+    private fun RemoteSchedulePreview.withWindow(
+        asOf: Instant,
+        horizonStart: String,
+        horizonEnd: String,
+    ): RemoteSchedulePreview = copy(
+        plan = plan.copy(
+            asOf = asOf.toString(),
+            horizonStart = horizonStart,
+            horizonEnd = horizonEnd,
+        ),
+    )
+
     private fun preview(isSensitive: Boolean = false) = RemoteSchedulePreview(
         inputDigest = "sha256:${"a".repeat(64)}",
         sourceItemCount = 1,
@@ -5185,7 +5828,7 @@ class CanonicalSyncManagerTest {
         plan = RemoteSchedulePlan(
             asOf = clock.toString(),
             horizonStart = "2026-08-31T22:00:00Z",
-            horizonEnd = "2026-09-01T22:00:00Z",
+            horizonEnd = "2026-09-07T22:00:00Z",
             blocks = listOf(
                 RemoteScheduleBlock(
                     id = BLOCK_ID,

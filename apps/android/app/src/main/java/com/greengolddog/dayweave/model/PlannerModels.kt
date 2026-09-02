@@ -9,6 +9,7 @@ import java.time.Instant
 import java.time.LocalTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -175,10 +176,57 @@ data class ScheduleItemPresentationSlice(
     val continuationLabel: String? = null,
 )
 
+/** Exact validated interval and planning zone used by a firm-horizon Calendar projection. */
+data class ScheduleDisplayHorizon(
+    val start: Instant,
+    val end: Instant,
+    val timezone: ZoneId,
+)
+
 private const val PRESENTATION_MINUTES_PER_DAY = 24 * 60
 private val SLICE_TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
-private val SLICE_WEEK_FORMAT: DateTimeFormatter =
+private fun sliceWeekFormatter(): DateTimeFormatter =
     DateTimeFormatter.ofPattern("EEE HH:mm", Locale.getDefault())
+
+internal enum class StrictLocalDayBoundary {
+    START,
+    END,
+}
+
+/** Strict local day boundary: reject gaps and keep adjacent days disjoint at overlaps. */
+internal fun strictLocalDayBoundaryInstant(
+    date: java.time.LocalDate,
+    zone: ZoneId,
+    boundary: StrictLocalDayBoundary,
+): Instant? {
+    val midnight = date.atStartOfDay()
+    val offsets = zone.rules.getValidOffsets(midnight)
+    val offset = when (boundary) {
+        StrictLocalDayBoundary.START -> offsets.lastOrNull()
+        StrictLocalDayBoundary.END -> offsets.firstOrNull()
+    } ?: return null
+    return midnight.toInstant(offset)
+}
+
+internal fun strictLocalDayStartInstant(date: java.time.LocalDate, zone: ZoneId): Instant? =
+    strictLocalDayBoundaryInstant(date, zone, StrictLocalDayBoundary.START)
+
+internal fun strictLocalDayEndInstant(date: java.time.LocalDate, zone: ZoneId): Instant? =
+    strictLocalDayBoundaryInstant(date, zone, StrictLocalDayBoundary.END)
+
+internal fun exactFirmHorizonDayCount(start: Instant, end: Instant, zone: ZoneId): Int? =
+    runCatching {
+        val startDate = start.atZone(zone).toLocalDate()
+        val endDate = end.atZone(zone).toLocalDate()
+        require(start == strictLocalDayStartInstant(startDate, zone))
+        require(end == strictLocalDayEndInstant(endDate, zone))
+        ChronoUnit.DAYS.between(startDate, endDate).toInt().also { days ->
+            require(
+                days in ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS..
+                    ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS,
+            )
+        }
+    }.getOrNull()
 
 /**
  * Lossless encrypted cache of the canonical item wire contract.
@@ -633,8 +681,7 @@ data class LocalScheduleCompositionProvenanceSnapshot(
         val zone = ZoneId.of(timezoneName)
         val horizonDate = start.atZone(zone).toLocalDate()
         require(
-            start == horizonDate.atStartOfDay(zone).toInstant() &&
-                end == horizonDate.plusDays(1).atStartOfDay(zone).toInstant() &&
+            exactFirmHorizonDayCount(start, end, zone) != null &&
                 requestAsOf.atZone(zone).toLocalDate() == horizonDate,
         )
         require(sourceItemRevisions.size <= MAX_SOURCE_ITEMS)
@@ -648,6 +695,9 @@ data class LocalScheduleCompositionProvenanceSnapshot(
         if (state.hasMemoizedLocalScheduleCompositionValidation(this)) return true
         if (!hasValidShape()) return false
         if (!state.scheduleCompositionProfile.hasValidShape()) return false
+        if (validatedFirmHorizonDays() != state.scheduleCompositionProfile.firmHorizonDays) {
+            return false
+        }
         if (
             state.canonicalSyncOrigin != syncOrigin ||
             state.canonicalConfigurationId != configurationId ||
@@ -672,6 +722,13 @@ data class LocalScheduleCompositionProvenanceSnapshot(
         if (matchesBlocks) state.memoizeLocalScheduleCompositionValidation(this)
         return matchesBlocks
     }
+
+    private fun validatedFirmHorizonDays(): Int? = runCatching {
+        val zone = ZoneId.of(timezoneName)
+        val start = Instant.parse(horizonStart)
+        val end = Instant.parse(horizonEnd)
+        requireNotNull(exactFirmHorizonDayCount(start, end, zone))
+    }.getOrNull()
 
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
@@ -703,6 +760,7 @@ data class LocalScheduleCompositionProvenanceSnapshot(
 /** Encrypted scheduling policy used by both remote and bundled deterministic composition. */
 @Serializable
 data class ScheduleCompositionProfileSnapshot(
+    val firmHorizonDays: Int = DEFAULT_FIRM_HORIZON_DAYS,
     val dayStartMinute: Int = 7 * 60,
     val dayEndMinute: Int = 22 * 60,
     val slotGranularityMinutes: Int = 5,
@@ -710,14 +768,18 @@ data class ScheduleCompositionProfileSnapshot(
     val defaultSoftWeight: Int = 100,
 ) {
     fun hasValidShape(): Boolean =
-        dayStartMinute in 0 until MINUTES_PER_DAY &&
+        firmHorizonDays in MIN_FIRM_HORIZON_DAYS..MAX_FIRM_HORIZON_DAYS &&
+            dayStartMinute in 0 until MINUTES_PER_DAY &&
             dayEndMinute in 1..MINUTES_PER_DAY && dayEndMinute > dayStartMinute &&
             slotGranularityMinutes in 1..60 &&
             stabilityWeight in 0..1_000_000 &&
             defaultSoftWeight in 0..1_000_000
 
-    private companion object {
-        const val MINUTES_PER_DAY = 24 * 60
+    companion object {
+        const val DEFAULT_FIRM_HORIZON_DAYS = 7
+        const val MIN_FIRM_HORIZON_DAYS = 1
+        const val MAX_FIRM_HORIZON_DAYS = 30
+        private const val MINUTES_PER_DAY = 24 * 60
     }
 }
 
@@ -838,13 +900,17 @@ data class PublishedScheduleBlockProofSnapshot(
         }
         require(requireNotNull(sessionIndex) in 0..UShort.MAX_VALUE.toInt())
         require(kind.isNotBlank() && kind.length <= 128 && kind.none(Char::isISOControl))
+        require(kind in setOf("planned", "pinned", "calendar_event", "external_fixed"))
         if (requireFullSeal) requireScheduleDigest(requireNotNull(immutableDigest))
         val blockStart = Instant.parse(start)
         val blockEnd = Instant.parse(end)
         require(blockStart < blockEnd)
-        // Calendar and pinned blocks may retain their original overnight bounds. Publication
-        // authority therefore requires exact overlap with the receipt horizon, not containment.
-        require(blockStart < horizonEnd && horizonStart < blockEnd)
+        if (kind == "planned") {
+            require(blockStart >= horizonStart && blockEnd <= horizonEnd)
+        } else {
+            // Pinned and fixed Calendar context may retain their original overnight bounds.
+            require(blockStart < horizonEnd && horizonStart < blockEnd)
+        }
     }.isSuccess
 
     fun matches(block: ScheduleItem): Boolean =
@@ -989,6 +1055,8 @@ data class PublishedScheduleProofSnapshot(
         )
         require(revision.timezoneName in SERVER_NAMED_TIMEZONE_IDS)
         requireNotNull(runCatching { ZoneId.of(revision.timezoneName) }.getOrNull())
+        require(horizonStart < horizonEnd)
+        require(Duration.between(horizonStart, horizonEnd) <= MAX_PUBLISHED_HORIZON_DURATION)
         requireNotNull(runCatching { Instant.parse(revision.publishedAt) }.getOrNull())
         require(blocks.size <= MAX_PUBLISHED_BLOCKS)
         require(blocks.map { it.id }.distinct().size == blocks.size)
@@ -1009,8 +1077,10 @@ data class PublishedScheduleProofSnapshot(
         schemaVersion == CURRENT_SCHEMA_VERSION && hasValidShape()
 
     fun matchesStateBinding(state: DayWeaveUiState): Boolean =
-        hasValidShape() &&
-            state.canonicalSyncOrigin == syncOrigin &&
+        hasValidShape() && matchesStateBindingAfterValidation(state)
+
+    private fun matchesStateBindingAfterValidation(state: DayWeaveUiState): Boolean =
+        state.canonicalSyncOrigin == syncOrigin &&
             state.canonicalConfigurationId == configurationId &&
             state.publishedScheduleRevision == revision &&
             state.scheduleInputDigest == revision.inputDigest &&
@@ -1029,6 +1099,10 @@ data class PublishedScheduleProofSnapshot(
      */
     fun matchesPublishedPlan(schedule: List<ScheduleItem>): Boolean {
         if (!hasValidShape()) return false
+        return matchesPublishedPlanAfterValidation(schedule)
+    }
+
+    private fun matchesPublishedPlanAfterValidation(schedule: List<ScheduleItem>): Boolean {
         val publicationBacked = schedule.filter { block ->
             block.canonicalBlockKind != null &&
                 block.canonicalBlockKind != REMOTE_EXECUTION_LEASE_KIND &&
@@ -1038,6 +1112,21 @@ data class PublishedScheduleProofSnapshot(
         val scheduleById = publicationBacked.associateBy(ScheduleItem::id)
         if (scheduleById.size != publicationBacked.size) return false
         return blocks.all { proof -> scheduleById[proof.id]?.let(proof::matches) == true }
+    }
+
+    /** One full immutable-proof validation per state identity, regardless of UI clock ticks. */
+    internal fun matchesCurrentStateAndPlan(state: DayWeaveUiState): Boolean {
+        if (state.hasMemoizedPublishedScheduleValidation(this)) return true
+        PUBLISHED_SCHEDULE_VALIDATION_COMPUTATIONS.incrementAndGet()
+        if (
+            schemaVersion != CURRENT_SCHEMA_VERSION || !hasValidShape() ||
+            !matchesStateBindingAfterValidation(state) ||
+            !matchesPublishedPlanAfterValidation(state.schedule)
+        ) {
+            return false
+        }
+        state.memoizePublishedScheduleValidation(this)
+        return true
     }
 
     private fun sameInstant(left: String?, right: String): Boolean =
@@ -1050,9 +1139,15 @@ data class PublishedScheduleProofSnapshot(
         private const val FULL_PLAN_SCHEMA_VERSION = 2
         private const val MAX_PUBLISHED_BLOCKS = 10_000
         private const val REMOTE_EXECUTION_LEASE_KIND = "remote_execution_lease"
+        private val MAX_PUBLISHED_HORIZON_DURATION: Duration = Duration.ofDays(90)
         private val NIL_PUBLICATION_UUID = UUID(0L, 0L)
     }
 }
+
+internal fun publishedScheduleValidationComputationCount(): Long =
+    PUBLISHED_SCHEDULE_VALIDATION_COMPUTATIONS.get()
+
+private val PUBLISHED_SCHEDULE_VALIDATION_COMPUTATIONS = AtomicLong(0)
 
 /**
  * Crash-replay journal written before a schedule publication can leave the device.
@@ -1225,7 +1320,7 @@ data class DayWeaveUiState(
     val inbox: List<InboxItem> = emptyList(),
     val suggestions: List<PlanningSuggestion> = emptyList(),
     val messages: List<ChatMessage> = emptyList(),
-    val scheduleMessage: String = "Capture something to compose your first day",
+    val scheduleMessage: String = "Capture something to compose your first firm plan",
     val protectedFreeMinutes: Int = 90,
     val dayScore: Int = 0,
     val showCompleted: Boolean = true,
@@ -1323,6 +1418,9 @@ data class DayWeaveUiState(
     @Transient
     private val localScheduleCompositionValidationMemo =
         AtomicReference<LocalScheduleCompositionProvenanceSnapshot?>(null)
+    @Transient
+    private val publishedScheduleValidationMemo =
+        AtomicReference<PublishedScheduleProofSnapshot?>(null)
 
     internal fun inheritLocalScheduleCompositionMemo(previous: DayWeaveUiState) {
         if (!hasSameLocalScheduleCompositionInputsByReference(previous)) return
@@ -1333,6 +1431,23 @@ data class DayWeaveUiState(
             if (localScheduleCompositionProvenance === provenance) {
                 localScheduleCompositionValidationMemo.compareAndSet(null, provenance)
             }
+        }
+    }
+
+    internal fun inheritPublishedScheduleValidationMemo(previous: DayWeaveUiState) {
+        val proof = previous.publishedScheduleValidationMemo.get() ?: return
+        if (
+            publishedScheduleProof === proof &&
+            publishedScheduleProof === previous.publishedScheduleProof &&
+            schedule === previous.schedule &&
+            canonicalSyncOrigin == previous.canonicalSyncOrigin &&
+            canonicalConfigurationId == previous.canonicalConfigurationId &&
+            publishedScheduleRevision === previous.publishedScheduleRevision &&
+            scheduleInputDigest == previous.scheduleInputDigest &&
+            scheduleGeneratedAt == previous.scheduleGeneratedAt &&
+            schedulePlanningZoneId == previous.schedulePlanningZoneId
+        ) {
+            publishedScheduleValidationMemo.compareAndSet(null, proof)
         }
     }
 
@@ -1393,6 +1508,17 @@ data class DayWeaveUiState(
         }
     }
 
+    internal fun hasMemoizedPublishedScheduleValidation(
+        proof: PublishedScheduleProofSnapshot,
+    ): Boolean =
+        publishedScheduleProof === proof && publishedScheduleValidationMemo.get() === proof
+
+    internal fun memoizePublishedScheduleValidation(proof: PublishedScheduleProofSnapshot) {
+        if (publishedScheduleProof === proof) {
+            publishedScheduleValidationMemo.compareAndSet(null, proof)
+        }
+    }
+
     val visibleSchedule: List<ScheduleItem>
         get() = schedule
             .filter { showCompleted || it.status != ItemStatus.COMPLETED }
@@ -1418,6 +1544,9 @@ data class DayWeaveUiState(
         currentZone: ZoneId = ZoneId.systemDefault(),
     ): List<ScheduleItemPresentationSlice> {
         val date = reference.atZone(currentZone).toLocalDate()
+        // Presentation owns the complete civil day, including an earlier repeated midnight and
+        // the first valid instant after a midnight gap. Conservative START/END boundaries remain
+        // reserved for automatic placement and Move Later authority.
         val dayStart = date.atStartOfDay(currentZone).toInstant()
         val dayEnd = date.plusDays(1).atStartOfDay(currentZone).toInstant()
         return visibleScheduleSlicesIntersecting(
@@ -1428,7 +1557,7 @@ data class DayWeaveUiState(
         )
     }
 
-    /** Calendar renders the same Monday-based local week shown by its seven-day strip. */
+    /** Legacy Monday-based projection retained for non-firm-horizon callers. */
     fun visibleScheduleForWeek(
         reference: Instant = Instant.now(),
         currentZone: ZoneId = ZoneId.systemDefault(),
@@ -1454,6 +1583,51 @@ data class DayWeaveUiState(
             intervalStart = weekStart,
             intervalEnd = weekEnd,
             displayZone = currentZone,
+            isDaySlice = false,
+        )
+    }
+
+    /**
+     * Returns the exact validated display interval, never a device-zone approximation.
+     *
+     * Local compositions use their configured N-day provenance. Published replicas retain the
+     * server proof's exact horizon, including when viewed read-only from another device zone.
+     */
+    fun scheduleDisplayHorizon(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): ScheduleDisplayHorizon? {
+        if (isPublishedScheduleDisplayCurrent(reference, currentZone)) {
+            val proof = publishedScheduleProof ?: return null
+            val start = runCatching { Instant.parse(proof.revision.horizonStart) }.getOrNull()
+                ?: return null
+            val end = runCatching { Instant.parse(proof.revision.horizonEnd) }.getOrNull()
+                ?: return null
+            val zone = runCatching { ZoneId.of(proof.revision.timezoneName) }.getOrNull()
+                ?: return null
+            return ScheduleDisplayHorizon(start = start, end = end, timezone = zone)
+        }
+
+        val provenance = localScheduleCompositionProvenance ?: return null
+        if (!provenance.matchesState(this)) return null
+        val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return null
+        if (zone != currentZone) return null
+        val start = runCatching { Instant.parse(provenance.horizonStart) }.getOrNull() ?: return null
+        val end = runCatching { Instant.parse(provenance.horizonEnd) }.getOrNull() ?: return null
+        if (reference < start || reference >= end) return null
+        return ScheduleDisplayHorizon(start = start, end = end, timezone = zone)
+    }
+
+    /** Calendar-ready projection clipped to the exact local or published firm horizon. */
+    fun visibleScheduleSlicesForFirmHorizon(
+        reference: Instant = Instant.now(),
+        currentZone: ZoneId = ZoneId.systemDefault(),
+    ): List<ScheduleItemPresentationSlice> {
+        val horizon = scheduleDisplayHorizon(reference, currentZone) ?: return emptyList()
+        return visibleScheduleSlicesIntersecting(
+            intervalStart = horizon.start,
+            intervalEnd = horizon.end,
+            displayZone = horizon.timezone,
             isDaySlice = false,
         )
     }
@@ -1520,7 +1694,7 @@ data class DayWeaveUiState(
                 clippedStart = clippedStart,
                 clippedEnd = clippedEnd,
                 startTimeLabel = localStart.toLocalTime().format(SLICE_TIME_FORMAT),
-                weekStartLabel = localStart.format(SLICE_WEEK_FORMAT),
+                weekStartLabel = localStart.format(sliceWeekFormatter()),
                 durationMinutes = durationMinutes,
                 durationLabel = durationLabel,
                 continuationLabel = continuation,
@@ -1614,10 +1788,7 @@ data class DayWeaveUiState(
     ): Boolean {
         if (pendingSchedulePublication != null || canonicalSyncOrigin == null) return false
         val proof = publishedScheduleProof ?: return false
-        if (
-            !proof.hasCurrentImmutablePlanSeal() || !proof.matchesStateBinding(this) ||
-            !proof.matchesPublishedPlan(schedule)
-        ) {
+        if (!proof.matchesCurrentStateAndPlan(this)) {
             return false
         }
         val zone = schedulePlanningZoneId?.let { raw ->
@@ -1633,10 +1804,7 @@ data class DayWeaveUiState(
             Instant.parse(proof.revision.horizonEnd)
         }.getOrNull() ?: return false
         if (horizonStart >= horizonEnd) return false
-        val date = reference.atZone(currentZone).toLocalDate()
-        val dayStart = date.atStartOfDay(currentZone).toInstant()
-        val dayEnd = date.plusDays(1).atStartOfDay(currentZone).toInstant()
-        return horizonStart < dayEnd && dayStart < horizonEnd
+        return reference >= horizonStart && reference < horizonEnd
     }
 
     /** Allows a current bundled-core plan to remain visible while all server actions stay locked. */
@@ -1649,10 +1817,12 @@ data class DayWeaveUiState(
         val provenance = localScheduleCompositionProvenance ?: return false
         if (!provenance.matchesState(this)) return false
         val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return false
-        val horizonDate = runCatching {
-            Instant.parse(provenance.horizonStart).atZone(zone).toLocalDate()
-        }.getOrNull() ?: return false
-        return zone == currentZone && horizonDate == reference.atZone(currentZone).toLocalDate()
+        if (zone != currentZone) return false
+        val horizonStart = runCatching { Instant.parse(provenance.horizonStart) }.getOrNull()
+            ?: return false
+        val horizonEnd = runCatching { Instant.parse(provenance.horizonEnd) }.getOrNull()
+            ?: return false
+        return reference >= horizonStart && reference < horizonEnd
     }
 
     /** Exact publication authority for one unchanged canonical server block. */
@@ -1660,8 +1830,8 @@ data class DayWeaveUiState(
         if (pendingSchedulePublication != null || block.sessionIndex == null) return false
         val proof = publishedScheduleProof ?: return false
         if (
-            !proof.hasCurrentImmutablePlanSeal() || !proof.matchesStateBinding(this) ||
-            !proof.matchesPublishedPlan(schedule) || !proof.matches(block)
+            !proof.matchesCurrentStateAndPlan(this) ||
+            proof.blocks.singleOrNull { it.id == block.id }?.matches(block) != true
         ) {
             return false
         }

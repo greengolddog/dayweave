@@ -318,9 +318,7 @@ class DayWeaveApplication : Application() {
             durableCursor = {
                 val durable = plannerStore.durableState.value
                 val proof = durable?.publishedScheduleProof?.takeIf { candidate ->
-                    candidate.hasCurrentImmutablePlanSeal() &&
-                        candidate.matchesStateBinding(durable) &&
-                        candidate.matchesPublishedPlan(durable.schedule)
+                    candidate.matchesCurrentStateAndPlan(durable)
                 }
                 DurableScheduleInvalidationCursor(
                     syncOrigin = proof?.syncOrigin,
@@ -356,9 +354,7 @@ class DayWeaveApplication : Application() {
                 val outcome = refreshCanonicalState()
                 val durable = plannerStore.durableState.value
                 val durableProof = durable?.publishedScheduleProof?.takeIf { proof ->
-                    proof.hasCurrentImmutablePlanSeal() &&
-                        proof.matchesStateBinding(durable) &&
-                        proof.matchesPublishedPlan(durable.schedule)
+                    proof.matchesCurrentStateAndPlan(durable)
                 }
                 GoogleCalendarImportPersistenceReceipt(
                     configurationId = input.configurationId,

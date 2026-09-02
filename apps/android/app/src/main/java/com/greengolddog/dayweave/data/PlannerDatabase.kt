@@ -50,11 +50,13 @@ object PlannerSnapshotFormats {
     const val JSON_V10 = "json-v10-local-schedule-composition-provenance"
     /** Encrypted Google preview/approval authority; rollback must never ignore an open journal. */
     const val JSON_V11 = "json-v11-google-calendar-outbound-recovery"
+    /** Configurable firm-horizon policy; older labels must not accept an injected day count. */
+    const val JSON_V12 = "json-v12-configurable-firm-horizon"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 11,
+    version = 12,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -142,6 +144,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_10_11 = object : Migration(10, 11) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted scheduling profile gains an explicit bounded
+     * firm-horizon day count; the Room version prevents rollback from silently ignoring it.
+     */
+    val MIGRATION_11_12 = object : Migration(11, 12) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -192,6 +202,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_8_9,
                 PlannerDatabaseMigrations.MIGRATION_9_10,
                 PlannerDatabaseMigrations.MIGRATION_10_11,
+                PlannerDatabaseMigrations.MIGRATION_11_12,
             )
             .build()
     }

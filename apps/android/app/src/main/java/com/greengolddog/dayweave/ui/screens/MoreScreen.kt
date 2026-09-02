@@ -149,7 +149,7 @@ fun MoreScreen(
                                     CanonicalSyncPhase.CONNECTED ->
                                         "Canonical items and schedule connected"
                                     CanonicalSyncPhase.SYNCING ->
-                                        "Syncing items and composing Today"
+                                        "Syncing items and composing the firm horizon"
                                     CanonicalSyncPhase.AUTH_REQUIRED ->
                                         "Planner API authentication required"
                                     CanonicalSyncPhase.NOT_CONFIGURED ->

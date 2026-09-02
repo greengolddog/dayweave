@@ -15,9 +15,11 @@ import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
 import com.greengolddog.dayweave.model.PendingSchedulePublication
 import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
+import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
 import com.greengolddog.dayweave.model.assessMoveLater
+import com.greengolddog.dayweave.model.exactFirmHorizonDayCount
 import com.greengolddog.dayweave.model.hasOpenOrPendingExecutionForOccurrence
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
@@ -144,7 +146,7 @@ object UnfencedLocalCompositionLifecycle : LocalCompositionLifecycleFence {
     override fun isCurrent(generation: Long): Boolean = generation == 0L
 }
 
-/** Pulls canonical deltas, composes one local day server-side, then commits both atomically. */
+/** Pulls canonical deltas, composes the rolling firm horizon, then commits both atomically. */
 class CanonicalSyncManager(
     private val plannerStore: PlannerStore,
     private val credentialStore: ApiCredentialStore,
@@ -306,7 +308,7 @@ class CanonicalSyncManager(
             val configuration = (resolution as ConfigurationResolution.Ready).configuration
             mutableState.value = CanonicalSyncState(
                 phase = CanonicalSyncPhase.SYNCING,
-                message = "Syncing canonical items and composing today…",
+                message = "Syncing canonical items and composing the firm horizon…",
                 lastInputDigest = plannerStore.state.value.scheduleInputDigest,
                 sourceItemCount = plannerStore.state.value.canonicalItems.size,
                 scheduledBlockCount = plannerStore.state.value.schedule.size,
@@ -437,30 +439,27 @@ class CanonicalSyncManager(
                     )
                     val planningZone = ZoneId.of(revision.timezoneName)
                     val generatedAt = Instant.parse(requireNotNull(current).schedule.plan.asOf)
-                    val planningDate = generatedAt.atZone(planningZone).toLocalDate()
                     val profile = expected.scheduleCompositionProfile
                     if (!profile.hasValidShape()) throw RemotePlannerMappingException()
+                    val replicaHorizonStart = Instant.parse(revision.horizonStart)
+                    val replicaHorizonEnd = Instant.parse(revision.horizonEnd)
                     val update = mapPreview(
                         preview = requireNotNull(current).schedule,
                         canonicalItems = canonical.items,
                         syncOrigin = configuration.baseUrl.toString(),
                         deltaCursor = canonical.cursor,
                         generatedAt = generatedAt,
-                        planningDate = planningDate,
                         planningZone = planningZone,
-                        availabilityStart = localMinute(
-                            planningDate,
-                            planningZone,
-                            profile.dayStartMinute,
+                        expectedHorizonStart = replicaHorizonStart,
+                        expectedHorizonEnd = replicaHorizonEnd,
+                        availability = availabilityWithinHorizon(
+                            horizonStart = replicaHorizonStart,
+                            horizonEnd = replicaHorizonEnd,
+                            planningZone = planningZone,
+                            profile = profile,
                         ),
-                        availabilityEnd = localMinute(
-                            planningDate,
-                            planningZone,
-                            profile.dayEndMinute,
-                        ),
-                        replicaHorizonStart = Instant.parse(revision.horizonStart),
-                        replicaHorizonEnd = Instant.parse(revision.horizonEnd),
                         allowExternalFixed = true,
+                        requireExactConfiguredHorizon = false,
                         preservationState = expected,
                     ).copy(
                         configurationId = configuration.configurationId,
@@ -543,8 +542,9 @@ class CanonicalSyncManager(
     }
 
     /**
-     * Explicitly composes one current local day without any HTTP, cursor, publication, or proof
-     * mutation. The result is an encrypted display-only generation and remains execution-locked.
+     * Explicitly composes the current rolling firm horizon without any HTTP, cursor, publication,
+     * or proof mutation. The result is an encrypted display-only generation and remains
+     * execution-locked.
      */
     suspend fun composeLocally(
         admittedLifecycleGeneration: Long? = null,
@@ -599,7 +599,7 @@ class CanonicalSyncManager(
                     )
                     mutableState.value = CanonicalSyncState(
                         phase = CanonicalSyncPhase.SYNCING,
-                        message = "Composing today with the bundled scheduler…",
+                        message = "Composing the firm horizon with the bundled scheduler…",
                         lastInputDigest = null,
                         sourceItemCount = expected.canonicalItems.size,
                         scheduledBlockCount = expected.schedule.size,
@@ -622,18 +622,10 @@ class CanonicalSyncManager(
                         syncOrigin = origin,
                         deltaCursor = cursor,
                         generatedAt = instant,
-                        planningDate = planningDate,
                         planningZone = planningZone,
-                        availabilityStart = localMinute(
-                            planningDate,
-                            planningZone,
-                            expected.scheduleCompositionProfile.dayStartMinute,
-                        ),
-                        availabilityEnd = localMinute(
-                            planningDate,
-                            planningZone,
-                            expected.scheduleCompositionProfile.dayEndMinute,
-                        ),
+                        expectedHorizonStart = parseTimestamp(request.horizonStart).toInstant(),
+                        expectedHorizonEnd = parseTimestamp(request.horizonEnd).toInstant(),
+                        availability = request.availability,
                         inputDigestPattern = LOCAL_FINGERPRINT_PATTERN,
                         preservationState = expected,
                     ).copy(configurationId = configurationId)
@@ -789,7 +781,6 @@ class CanonicalSyncManager(
         planningZone: ZoneId,
         forceCanonicalRebuild: Boolean = false,
     ): AcceptedCanonicalPreview {
-        val planningDate = instant.atZone(planningZone).toLocalDate()
         for (attempt in 1..MAX_SNAPSHOT_ATTEMPTS) {
             val canonical = loadDelta(configuration, forceCanonicalRebuild)
             val profile = plannerStore.state.value.scheduleCompositionProfile
@@ -810,18 +801,10 @@ class CanonicalSyncManager(
                     syncOrigin = configuration.baseUrl.toString(),
                     deltaCursor = canonical.cursor,
                     generatedAt = instant,
-                    planningDate = planningDate,
                     planningZone = planningZone,
-                    availabilityStart = localMinute(
-                        planningDate,
-                        planningZone,
-                        profile.dayStartMinute,
-                    ),
-                    availabilityEnd = localMinute(
-                        planningDate,
-                        planningZone,
-                        profile.dayEndMinute,
-                    ),
+                    expectedHorizonStart = parseTimestamp(request.horizonStart).toInstant(),
+                    expectedHorizonEnd = parseTimestamp(request.horizonEnd).toInstant(),
+                    availability = request.availability,
                 ).copy(configurationId = configuration.configurationId)
                 return AcceptedCanonicalPreview(request, update)
             } catch (error: RemoteSnapshotChangedException) {
@@ -1349,7 +1332,7 @@ class CanonicalSyncManager(
     suspend fun start(blockId: String): CanonicalRefreshOutcome = focusTransitionMutex.withLock {
         val current = plannerStore.state.value
         if (!current.isCanonicalPlanCurrent(now(), zoneId())) {
-            updateError("This cached plan is not for today. Recompose before starting new work.")
+            updateError("This cached plan is not current. Recompose before starting new work.")
             return@withLock CanonicalRefreshOutcome.INVALID_LOCAL_STATE
         }
         val block = current.schedule.firstOrNull { it.id == blockId }
@@ -1554,10 +1537,10 @@ class CanonicalSyncManager(
             updateError("The exact move window could not be verified. Recompose and try again.")
             return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
         }
-        if (!assessment.fitsSinglePlanningDay) {
+        if (!assessment.fitsFirmHorizonDay) {
             updateError(
-                "That move is outside the currently loaded planning day. Choose a time that " +
-                    "stays within this day.",
+                "That move falls outside the exact firm horizon or crosses a planning-day " +
+                    "boundary. Keep the whole move inside one horizon day.",
             )
             return CanonicalRefreshOutcome.INVALID_LOCAL_STATE
         }
@@ -1977,7 +1960,7 @@ class CanonicalSyncManager(
             }
             val currentAssessment = initial.assessMoveLater(blockId, moveStart, now())
             if (
-                currentAssessment == null || !currentAssessment.fitsSinglePlanningDay ||
+                currentAssessment == null || !currentAssessment.fitsFirmHorizonDay ||
                 currentAssessment.crossesUnrelaxableHardDeadline ||
                 !currentAssessment.isCoveredBy(approval)
             ) {
@@ -2063,7 +2046,7 @@ class CanonicalSyncManager(
                 }
                 val moveAssessment = moveLaterStart?.let { moveStart ->
                     initial.assessMoveLater(blockId, moveStart, now())?.takeIf { assessment ->
-                        assessment.fitsSinglePlanningDay &&
+                        assessment.fitsFirmHorizonDay &&
                             !assessment.crossesUnrelaxableHardDeadline &&
                             assessment.isCoveredBy(moveLaterApproval)
                     } ?: throw MoveLaterRisksChangedException()
@@ -2837,6 +2820,63 @@ class CanonicalSyncManager(
             item.deletedAt,
         ).sumOf { it.length.toLong() }
 
+    private fun availabilityForLocalDates(
+        firstDate: LocalDate,
+        dayCount: Int,
+        planningZone: ZoneId,
+        profile: ScheduleCompositionProfileSnapshot,
+    ): List<ScheduleAvailabilityRequest> {
+        if (dayCount !in 1..MAX_REPLICA_HORIZON_LOCAL_DAYS) {
+            throw RemotePlannerMappingException()
+        }
+        return (0 until dayCount).map { dayOffset ->
+            val date = firstDate.plusDays(dayOffset.toLong())
+            val start = localMinute(
+                date = date,
+                zone = planningZone,
+                minute = profile.dayStartMinute,
+                boundary = AvailabilityBoundary.START,
+            ).toInstant()
+            val end = localMinute(
+                date = date,
+                zone = planningZone,
+                minute = profile.dayEndMinute,
+                boundary = AvailabilityBoundary.END,
+            ).toInstant()
+            if (start >= end) throw RemotePlannerMappingException()
+            ScheduleAvailabilityRequest(start = start.toString(), end = end.toString())
+        }
+    }
+
+    private fun availabilityWithinHorizon(
+        horizonStart: Instant,
+        horizonEnd: Instant,
+        planningZone: ZoneId,
+        profile: ScheduleCompositionProfileSnapshot,
+    ): List<ScheduleAvailabilityRequest> {
+        if (horizonStart >= horizonEnd) throw RemotePlannerMappingException()
+        val firstDate = horizonStart.atZone(planningZone).toLocalDate()
+        val lastDate = horizonEnd.minusNanos(1).atZone(planningZone).toLocalDate()
+        val dayCount = try {
+            Math.addExact(
+                java.time.temporal.ChronoUnit.DAYS.between(firstDate, lastDate).toInt(),
+                1,
+            )
+        } catch (error: ArithmeticException) {
+            throw RemotePlannerMappingException(error)
+        }
+        return availabilityForLocalDates(firstDate, dayCount, planningZone, profile)
+            .mapNotNull { window ->
+                val start = parseTimestamp(window.start).toInstant().coerceAtLeast(horizonStart)
+                val end = parseTimestamp(window.end).toInstant().coerceAtMost(horizonEnd)
+                if (start < end) {
+                    ScheduleAvailabilityRequest(start = start.toString(), end = end.toString())
+                } else {
+                    null
+                }
+            }
+    }
+
     private fun previewRequest(
         instant: Instant,
         planningZone: ZoneId,
@@ -2847,13 +2887,27 @@ class CanonicalSyncManager(
             plannerStore.state.value,
     ): SchedulePreviewRequest {
         val date = instant.atZone(planningZone).toLocalDate()
-        val horizonStart = date.atStartOfDay(planningZone)
-        val horizonEnd = date.plusDays(1).atStartOfDay(planningZone)
         val cached = cachedState
         val profile = cached.scheduleCompositionProfile
         if (!profile.hasValidShape()) throw RemotePlannerMappingException()
-        val availableStart = localMinute(date, planningZone, profile.dayStartMinute)
-        val availableEnd = localMinute(date, planningZone, profile.dayEndMinute)
+        val horizonStart = localMinute(
+            date = date,
+            zone = planningZone,
+            minute = 0,
+            boundary = AvailabilityBoundary.START,
+        )
+        val horizonEnd = localMinute(
+            date = date.plusDays(profile.firmHorizonDays.toLong()),
+            zone = planningZone,
+            minute = 0,
+            boundary = AvailabilityBoundary.END,
+        )
+        val availability = availabilityWithinHorizon(
+            horizonStart = horizonStart.toInstant(),
+            horizonEnd = horizonEnd.toInstant(),
+            planningZone = planningZone,
+            profile = profile,
+        )
         val itemsById = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         val revisions = canonicalItems.associate { it.id to it.revision }
         val sameOrigin = cached.canonicalSyncOrigin == syncOrigin &&
@@ -2938,12 +2992,8 @@ class CanonicalSyncManager(
             .map { (occurrenceId, _) -> occurrenceId }
         val skippedOccurrences = recurrenceOutcomes
             .filter { (_, outcome) -> outcome.status == ItemStatus.SKIPPED }
-        val generatedForPlanningDate = cached.scheduleGeneratedAt
-            ?.let { runCatching { Instant.parse(it).atZone(planningZone).toLocalDate() }.getOrNull() }
-            ?.let { it == date }
-            ?: false
         val previousSchedule = if (
-            generatedForPlanningDate && sameOrigin &&
+            sameOrigin &&
             cached.schedulePlanningZoneId == planningZone.id
         ) {
             cached.schedule
@@ -2974,9 +3024,17 @@ class CanonicalSyncManager(
                 }.mapNotNull { block ->
                     val start = block.absoluteStartAt ?: return@mapNotNull null
                     val end = block.absoluteEndAt ?: return@mapNotNull null
+                    val startInstant = parseTimestamp(start).toInstant()
+                    val endInstant = parseTimestamp(end).toInstant()
+                    if (
+                        startInstant >= endInstant || endInstant <= horizonStart.toInstant() ||
+                        startInstant >= horizonEnd.toInstant()
+                    ) {
+                        return@mapNotNull null
+                    }
                     PreviousScheduleBlockRequest(
-                        start = parseTimestamp(start).toInstant().toString(),
-                        end = parseTimestamp(end).toInstant().toString(),
+                        start = startInstant.toString(),
+                        end = endInstant.toString(),
                         sessionIndex = block.sessionIndex ?: return@mapNotNull null,
                     )
                 }
@@ -3001,12 +3059,7 @@ class CanonicalSyncManager(
             horizonStart = horizonStart.toInstant().toString(),
             horizonEnd = horizonEnd.toInstant().toString(),
             timezoneName = planningZone.id,
-            availability = listOf(
-                ScheduleAvailabilityRequest(
-                    start = availableStart.toInstant().toString(),
-                    end = availableEnd.toInstant().toString(),
-                ),
-            ),
+            availability = availability,
             config = ScheduleConfigRequest(
                 slotGranularityMinutes = profile.slotGranularityMinutes,
                 stabilityWeight = profile.stabilityWeight,
@@ -3106,15 +3159,14 @@ class CanonicalSyncManager(
         syncOrigin: String,
         deltaCursor: String,
         generatedAt: Instant,
-        planningDate: LocalDate,
         planningZone: ZoneId,
-        availabilityStart: ZonedDateTime,
-        availabilityEnd: ZonedDateTime,
+        expectedHorizonStart: Instant,
+        expectedHorizonEnd: Instant,
+        availability: List<ScheduleAvailabilityRequest>,
         inputDigestPattern: Regex = DIGEST_PATTERN,
         preservationState: com.greengolddog.dayweave.model.DayWeaveUiState? = null,
-        replicaHorizonStart: Instant? = null,
-        replicaHorizonEnd: Instant? = null,
         allowExternalFixed: Boolean = false,
+        requireExactConfiguredHorizon: Boolean = true,
     ): CanonicalPlanUpdate {
         val items = canonicalItems.associateBy(CanonicalItemSnapshot::id)
         if (
@@ -3156,11 +3208,19 @@ class CanonicalSyncManager(
             rejected.itemId
         }
         if (rejectedIds.distinct().size != rejectedIds.size) throw RemotePlannerMappingException()
-        val expectedHorizonStart = replicaHorizonStart
-            ?: planningDate.atStartOfDay(planningZone).toInstant()
-        val expectedHorizonEnd = replicaHorizonEnd
-            ?: planningDate.plusDays(1).atStartOfDay(planningZone).toInstant()
+        val horizonShapeIsValid = if (requireExactConfiguredHorizon) {
+            exactFirmHorizonDayCount(
+                expectedHorizonStart,
+                expectedHorizonEnd,
+                planningZone,
+            ) != null
+        } else {
+            expectedHorizonStart < expectedHorizonEnd &&
+                Duration.between(expectedHorizonStart, expectedHorizonEnd) <=
+                MAX_PUBLISHED_REPLICA_HORIZON_DURATION
+        }
         if (
+            !horizonShapeIsValid ||
             parseTimestamp(preview.plan.asOf).toInstant() != generatedAt ||
             parseTimestamp(preview.plan.horizonStart).toInstant() != expectedHorizonStart ||
             parseTimestamp(preview.plan.horizonEnd).toInstant() != expectedHorizonEnd
@@ -3277,10 +3337,9 @@ class CanonicalSyncManager(
             mapScheduleBlock(
                 block = block,
                 items = items,
-                planningDate = planningDate,
                 planningZone = planningZone,
-                replicaHorizonStart = replicaHorizonStart,
-                replicaHorizonEnd = replicaHorizonEnd,
+                horizonStart = expectedHorizonStart,
+                horizonEnd = expectedHorizonEnd,
                 allowExternalFixed = allowExternalFixed,
             )
         }.let {
@@ -3378,10 +3437,9 @@ class CanonicalSyncManager(
         val dayScore = (completionScore - penalty).coerceIn(0, 100)
         val protectedMinutes = protectedMinutes(
             schedule,
-            planningDate,
-            planningZone,
-            availabilityStart,
-            availabilityEnd,
+            availability,
+            expectedHorizonStart,
+            expectedHorizonEnd,
         )
         val message = when {
             preview.rejectedItems.isNotEmpty() ->
@@ -3466,7 +3524,8 @@ class CanonicalSyncManager(
                         ?: throw RemotePlannerMappingException()
                     if (
                         !item.isExecutable || block.externalBlockId != null ||
-                        start < horizonStart || end > horizonEnd ||
+                        block.kind == "planned" &&
+                        (start < horizonStart || end > horizonEnd) ||
                         block.kind == "planned" && latestAnyEnd?.let { it > start } == true ||
                         block.kind == "pinned" && latestPlannedEnd?.let { it > start } == true
                     ) {
@@ -3522,10 +3581,9 @@ class CanonicalSyncManager(
     private fun mapScheduleBlock(
         block: RemoteScheduleBlock,
         items: Map<String, CanonicalItemSnapshot>,
-        planningDate: LocalDate,
         planningZone: ZoneId,
-        replicaHorizonStart: Instant? = null,
-        replicaHorizonEnd: Instant? = null,
+        horizonStart: Instant,
+        horizonEnd: Instant,
         allowExternalFixed: Boolean = false,
     ): ScheduleItem {
         validateUuid(block.id)
@@ -3550,24 +3608,20 @@ class CanonicalSyncManager(
         }
         val actualStart = parseTimestamp(block.start).atZoneSameInstant(planningZone)
         val actualEnd = parseTimestamp(block.end).atZoneSameInstant(planningZone)
-        val replica = replicaHorizonStart != null || replicaHorizonEnd != null
-        if (replicaHorizonStart == null != (replicaHorizonEnd == null)) {
+        if (horizonStart >= horizonEnd) {
             throw RemotePlannerMappingException()
         }
-        val horizonStart = replicaHorizonStart?.atZone(planningZone)
-            ?: planningDate.atStartOfDay(planningZone)
-        val horizonEnd = replicaHorizonEnd?.atZone(planningZone)
-            ?: planningDate.plusDays(1).atStartOfDay(planningZone)
-        if (actualEnd <= horizonStart || actualStart >= horizonEnd) {
+        val actualStartInstant = actualStart.toInstant()
+        val actualEndInstant = actualEnd.toInstant()
+        if (actualEndInstant <= horizonStart || actualStartInstant >= horizonEnd) {
             throw RemotePlannerMappingException()
         }
-        val start = if (replica) actualStart else if (actualStart < horizonStart) horizonStart else actualStart
-        val end = if (replica) actualEnd else if (actualEnd > horizonEnd) horizonEnd else actualEnd
+        // Keep one immutable geometry across preview, publication, and replica refresh. Calendar
+        // presentation clips these exact bounds to the visible horizon without mutating authority.
+        val start = actualStart
+        val end = actualEnd
         val exactDuration = Duration.between(start.toInstant(), end.toInstant())
-        if (
-            exactDuration.isZero || exactDuration.isNegative || !replica &&
-            (start.toLocalDate() != planningDate || end > horizonEnd)
-        ) {
+        if (exactDuration.isZero || exactDuration.isNegative) {
             throw RemotePlannerMappingException()
         }
         val durationMinutesLong = try {
@@ -3579,11 +3633,9 @@ class CanonicalSyncManager(
         } catch (error: ArithmeticException) {
             throw RemotePlannerMappingException(error)
         }
-        val acceptsLongExactReplica = replica
         val startMinute = start.hour * 60 + start.minute
         if (
-            durationMinutesLong <= 0L || durationMinutesLong > Int.MAX_VALUE - startMinute ||
-            !acceptsLongExactReplica && durationMinutesLong > MAX_BLOCK_MINUTES
+            durationMinutesLong <= 0L || durationMinutesLong > Int.MAX_VALUE - startMinute
         ) {
             throw RemotePlannerMappingException()
         }
@@ -3649,8 +3701,9 @@ class CanonicalSyncManager(
             occurrenceId = block.occurrenceId.takeIf { canonical?.isExecutable == true },
             canonicalRevision = canonical?.takeIf { it.isExecutable }?.revision,
             sessionIndex = block.sessionIndex,
-            // The UI duration is clipped to today's visible lane, but publication/execution
-            // identity retains the server's exact bounds (including overnight pinned events).
+            // Fresh composition display geometry is clipped only to the complete captured firm
+            // horizon. Publication/execution identity always retains the server's exact bounds;
+            // replica display geometry also remains exact so its immutable proof is reproducible.
             absoluteStartAt = actualStart.toInstant().toString(),
             absoluteEndAt = actualEnd.toInstant().toString(),
             planningZoneId = planningZone.id,
@@ -3878,46 +3931,81 @@ class CanonicalSyncManager(
 
     private fun protectedMinutes(
         schedule: List<ScheduleItem>,
-        planningDate: LocalDate,
-        planningZone: ZoneId,
-        availabilityStart: ZonedDateTime,
-        availabilityEnd: ZonedDateTime,
+        availability: List<ScheduleAvailabilityRequest>,
+        horizonStart: Instant,
+        horizonEnd: Instant,
     ): Int {
-        val ranges = schedule.mapNotNull { block ->
+        val availableRanges = availability.mapNotNull { window ->
+            val exactStart = parseTimestamp(window.start).toInstant()
+            val exactEnd = parseTimestamp(window.end).toInstant()
+            if (exactStart >= exactEnd) throw RemotePlannerMappingException()
+            val start = exactStart.coerceAtLeast(horizonStart)
+            val end = exactEnd.coerceAtMost(horizonEnd)
+            if (start >= end) return@mapNotNull null
+            start to end
+        }.mergedInstantRanges()
+        val scheduledRanges = schedule.mapNotNull { block ->
             val exactStart = block.absoluteStartAt ?: return@mapNotNull null
             val exactEnd = block.absoluteEndAt ?: return@mapNotNull null
             val start = parseTimestamp(exactStart).toInstant()
-                .coerceAtLeast(availabilityStart.toInstant())
             val end = parseTimestamp(exactEnd).toInstant()
-                .coerceAtMost(availabilityEnd.toInstant())
             if (end > start) start to end else null
-        }.sortedBy { it.first }
-        var occupied = 0L
+        }.mergedInstantRanges()
+        var freeWholeMinutes = 0L
+        var firstRelevantScheduledRange = 0
+        availableRanges.forEach { (availableStart, availableEnd) ->
+            while (
+                firstRelevantScheduledRange < scheduledRanges.size &&
+                scheduledRanges[firstRelevantScheduledRange].second <= availableStart
+            ) {
+                firstRelevantScheduledRange += 1
+            }
+            var cursor = availableStart
+            var scheduledIndex = firstRelevantScheduledRange
+            while (
+                scheduledIndex < scheduledRanges.size &&
+                scheduledRanges[scheduledIndex].first < availableEnd
+            ) {
+                val (scheduledStart, scheduledEnd) = scheduledRanges[scheduledIndex]
+                val blockedStart = scheduledStart.coerceAtLeast(availableStart)
+                val blockedEnd = scheduledEnd.coerceAtMost(availableEnd)
+                if (cursor < blockedStart) {
+                    freeWholeMinutes += Duration.between(cursor, blockedStart).toMinutes()
+                }
+                if (blockedEnd > cursor) cursor = blockedEnd
+                if (cursor >= availableEnd) break
+                scheduledIndex += 1
+            }
+            if (cursor < availableEnd) {
+                freeWholeMinutes += Duration.between(cursor, availableEnd).toMinutes()
+            }
+        }
+        return freeWholeMinutes
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+            .toInt()
+    }
+
+    private fun List<Pair<Instant, Instant>>.mergedInstantRanges(): List<Pair<Instant, Instant>> {
+        if (isEmpty()) return emptyList()
+        val merged = mutableListOf<Pair<Instant, Instant>>()
         var activeStart: Instant? = null
         var activeEnd: Instant? = null
-        for ((start, end) in ranges) {
+        for ((start, end) in sortedWith(compareBy({ it.first }, { it.second }))) {
             if (activeStart == null) {
                 activeStart = start
                 activeEnd = end
             } else if (start <= requireNotNull(activeEnd)) {
                 if (end > requireNotNull(activeEnd)) activeEnd = end
             } else {
-                occupied += Duration.between(
-                    requireNotNull(activeStart),
-                    requireNotNull(activeEnd),
-                ).toMinutes()
+                merged += requireNotNull(activeStart) to requireNotNull(activeEnd)
                 activeStart = start
                 activeEnd = end
             }
         }
         if (activeStart != null) {
-            occupied += Duration.between(activeStart, requireNotNull(activeEnd)).toMinutes()
+            merged += requireNotNull(activeStart) to requireNotNull(activeEnd)
         }
-        val available = Duration.between(
-            availabilityStart.toInstant(),
-            availabilityEnd.toInstant(),
-        ).toMinutes()
-        return (available - occupied).coerceAtLeast(0).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        return merged
     }
 
     private fun authenticatedConfiguration(): ConfigurationResolution {
@@ -4140,7 +4228,7 @@ class CanonicalSyncManager(
             )
             else -> Triple(
                 CanonicalSyncPhase.ERROR,
-                "Today could not be recomposed; the encrypted cached plan was kept.",
+                "The firm horizon could not be recomposed; the encrypted cached plan was kept.",
                 CanonicalRefreshOutcome.UNEXPECTED_FAILURE,
             )
         }
@@ -4219,6 +4307,11 @@ class CanonicalSyncManager(
         DETERMINISTIC_REJECTION,
     }
 
+    private enum class AvailabilityBoundary {
+        START,
+        END,
+    }
+
     private class RemotePlannerMappingException(cause: Throwable? = null) :
         IllegalArgumentException("Invalid remote planner contract", cause)
 
@@ -4282,7 +4375,8 @@ class CanonicalSyncManager(
     companion object {
         private val TERMINAL_DISPLAY_STATUSES = setOf(ItemStatus.COMPLETED, ItemStatus.SKIPPED)
         private const val MINUTES_PER_DAY = 24 * 60
-        private const val MAX_BLOCK_MINUTES = 2 * MINUTES_PER_DAY
+        private const val MAX_REPLICA_HORIZON_LOCAL_DAYS = 92
+        private val MAX_PUBLISHED_REPLICA_HORIZON_DURATION: Duration = Duration.ofDays(90)
         private val SERVER_NAMED_TIMEZONE_IDS = ZoneId.getAvailableZoneIds()
         private const val MAX_CANONICAL_ITEMS = 10_000
         private const val MAX_SCHEDULE_PUBLICATION_RECOVERY_RECOMPOSITIONS = 1
@@ -4402,11 +4496,11 @@ class CanonicalSyncManager(
             )
             !snapshot.hasBearerToken -> CanonicalSyncState(
                 CanonicalSyncPhase.AUTH_REQUIRED,
-                "Add a bearer token to sync canonical items and compose Today.",
+                "Add a bearer token to sync canonical items and compose the firm horizon.",
             )
             else -> CanonicalSyncState(
                 CanonicalSyncPhase.READY,
-                "Ready to sync canonical items and compose Today.",
+                "Ready to sync canonical items and compose the firm horizon.",
             )
         }
 
@@ -4578,12 +4672,31 @@ class CanonicalSyncManager(
             cursor.isNotBlank() && cursor.length <= MAX_CURSOR_CHARS &&
                 cursor.none(Char::isISOControl)
 
-        private fun localMinute(date: LocalDate, zone: ZoneId, minute: Int): ZonedDateTime =
-            if (minute == MINUTES_PER_DAY) {
-                date.plusDays(1).atStartOfDay(zone)
+        private fun localMinute(
+            date: LocalDate,
+            zone: ZoneId,
+            minute: Int,
+            boundary: AvailabilityBoundary,
+        ): ZonedDateTime {
+            val isNextLocalStartOfDay = minute == MINUTES_PER_DAY
+            val localDateTime = if (isNextLocalStartOfDay) {
+                date.plusDays(1).atStartOfDay()
             } else {
-                date.atTime(LocalTime.of(minute / 60, minute % 60)).atZone(zone)
+                date.atTime(LocalTime.of(minute / 60, minute % 60))
             }
+            val validOffsets = zone.rules.getValidOffsets(localDateTime)
+            if (validOffsets.isEmpty()) throw RemotePlannerMappingException()
+            val effectiveBoundary = if (isNextLocalStartOfDay) {
+                AvailabilityBoundary.START
+            } else {
+                boundary
+            }
+            val offset = when (effectiveBoundary) {
+                AvailabilityBoundary.START -> validOffsets.last()
+                AvailabilityBoundary.END -> validOffsets.first()
+            }
+            return ZonedDateTime.ofStrict(localDateTime, offset, zone)
+        }
 
         private val SUPPORTED_ITEM_KINDS = setOf(
             "event",

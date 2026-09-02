@@ -17,6 +17,7 @@ class PlanningProfileFormTest {
         val profile = ScheduleCompositionProfileSnapshot(
             dayStartMinute = 0,
             dayEndMinute = 24 * 60,
+            firmHorizonDays = ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS,
             slotGranularityMinutes = 60,
             stabilityWeight = 0,
             defaultSoftWeight = MAX_SCHEDULER_WEIGHT,
@@ -28,6 +29,7 @@ class PlanningProfileFormTest {
         assertEquals("00", form.startMinute)
         assertEquals("24", form.endHour)
         assertEquals("00", form.endMinute)
+        assertEquals(ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS, form.firmHorizonDays)
         assertEquals(profile, form.validate().profile)
         assertEquals("24:00", formatPlanningProfileMinute(profile.dayEndMinute))
     }
@@ -63,6 +65,7 @@ class PlanningProfileFormTest {
     @Test
     fun validationAcceptsEveryNativeBoundaryAndRejectsOutOfRangeControls() {
         val minimum = PlanningProfileForm.from(ScheduleCompositionProfileSnapshot()).copy(
+            firmHorizonDays = ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS,
             slotGranularityMinutes = MIN_SLOT_GRANULARITY_MINUTES,
             stabilityWeight = MIN_SCHEDULER_WEIGHT.toString(),
             defaultSoftWeight = MIN_SCHEDULER_WEIGHT.toString(),
@@ -70,6 +73,7 @@ class PlanningProfileFormTest {
         assertTrue(minimum.isValid)
 
         val maximum = PlanningProfileForm.from(ScheduleCompositionProfileSnapshot()).copy(
+            firmHorizonDays = ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS,
             slotGranularityMinutes = MAX_SLOT_GRANULARITY_MINUTES,
             stabilityWeight = MAX_SCHEDULER_WEIGHT.toString(),
             defaultSoftWeight = MAX_SCHEDULER_WEIGHT.toString(),
@@ -77,11 +81,13 @@ class PlanningProfileFormTest {
         assertTrue(maximum.isValid)
 
         val invalid = PlanningProfileForm.from(ScheduleCompositionProfileSnapshot()).copy(
+            firmHorizonDays = ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS + 1,
             slotGranularityMinutes = MAX_SLOT_GRANULARITY_MINUTES + 1,
             stabilityWeight = (MAX_SCHEDULER_WEIGHT + 1).toString(),
             defaultSoftWeight = "",
         ).validate()
         assertFalse(invalid.isValid)
+        assertTrue(invalid.firmHorizonError != null)
         assertTrue(invalid.granularityError != null)
         assertTrue(invalid.stabilityWeightError != null)
         assertTrue(invalid.defaultSoftWeightError != null)
@@ -130,6 +136,7 @@ class PlanningProfileFormTest {
             startMinute = "17",
             endHour = "21",
             endMinute = "43",
+            firmHorizonDays = 19,
             slotGranularityMinutes = 13,
             stabilityWeight = "765",
             defaultSoftWeight = "4321",
@@ -156,7 +163,7 @@ class PlanningProfileFormTest {
         assertNull(planningProfileFormFromDraftMemoryValues(listOf("incomplete")))
         assertNull(
             planningProfileFormFromDraftMemoryValues(
-                draft.toDraftMemoryValues().toMutableList().also { it[4] = "not-a-number" },
+                draft.toDraftMemoryValues().toMutableList().also { it[5] = "not-a-number" },
             ),
         )
         ScheduleCompositionProfileDraftMemory.clear()

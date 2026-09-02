@@ -115,12 +115,12 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.localScheduleCompositionProvenance)
             assertEquals(ScheduleCompositionProfileSnapshot(), restored.scheduleCompositionProfile)
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         }
     }
 
     @Test
-    fun v11RequiresLocalProvenanceAndSchedulingProfileRootFields() = runBlocking {
+    fun v12RequiresLocalProvenanceAndSchedulingProfileRootFields() = runBlocking {
         listOf(
             "localScheduleCompositionProvenance",
             "scheduleCompositionProfile",
@@ -147,6 +147,218 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
+    fun v12RequiresExplicitNestedFirmHorizonDays() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 5 }
+        repository.save(DayWeaveUiState())
+        val current = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(current.payload).jsonObject
+        val profile = root.getValue("scheduleCompositionProfile").jsonObject
+        assertEquals(JsonPrimitive(7), profile["firmHorizonDays"])
+        val missingHorizon = current.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(
+                    root +
+                        ("scheduleCompositionProfile" to
+                            JsonObject(profile - "firmHorizonDays")),
+                ),
+            ),
+        )
+        dao.snapshot = missingHorizon
+
+        assertThrows(SerializationException::class.java) {
+            runBlocking { repository.load() }
+        }
+        assertEquals(missingHorizon, dao.snapshot)
+    }
+
+    @Test
+    fun v10AndV11DefaultOrIgnoreFirmHorizonAndPreserveExactPublicationJournal() = runBlocking {
+        listOf(PlannerSnapshotFormats.JSON_V10, PlannerSnapshotFormats.JSON_V11)
+            .forEach { predecessor ->
+                listOf<Int?>(null, 23).forEach { injectedDays ->
+                    val dao = FakePlannerSnapshotDao()
+                    val repository = RoomPlannerStateRepository(dao) { 7 }
+                    val original = pendingPublicationState().copy(
+                        scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(
+                            dayStartMinute = 10 * 60,
+                        ),
+                    )
+                    repository.save(original)
+                    val current = requireNotNull(dao.snapshot)
+                    val root = Json.parseToJsonElement(current.payload).jsonObject
+                    val exactPending = root.getValue("pendingSchedulePublication")
+                    val profile = root.getValue("scheduleCompositionProfile").jsonObject
+                    val predecessorProfile = JsonObject(
+                        (profile - "firmHorizonDays") +
+                            listOfNotNull(
+                                injectedDays?.let {
+                                    "firmHorizonDays" to JsonPrimitive(it)
+                                },
+                            ),
+                    )
+                    dao.snapshot = current.copy(
+                        payload = Json.encodeToString(
+                            JsonObject.serializer(),
+                            JsonObject(
+                                root +
+                                    ("scheduleCompositionProfile" to predecessorProfile),
+                            ),
+                        ),
+                        payloadFormat = predecessor,
+                    )
+
+                    val restored = requireNotNull(repository.load())
+                    val rewritten = requireNotNull(dao.snapshot)
+                    val rewrittenRoot = Json.parseToJsonElement(rewritten.payload).jsonObject
+
+                    assertEquals(10 * 60, restored.scheduleCompositionProfile.dayStartMinute)
+                    assertEquals(7, restored.scheduleCompositionProfile.firmHorizonDays)
+                    assertEquals(
+                        original.pendingSchedulePublication,
+                        restored.pendingSchedulePublication,
+                    )
+                    assertEquals(exactPending, rewrittenRoot["pendingSchedulePublication"])
+                    assertEquals(
+                        original.pendingSchedulePublication?.request?.bodyJson,
+                        restored.pendingSchedulePublication?.request?.bodyJson,
+                    )
+                    assertEquals(PlannerSnapshotFormats.JSON_V12, rewritten.payloadFormat)
+                    assertEquals(
+                        JsonPrimitive(7),
+                        rewrittenRoot.getValue("scheduleCompositionProfile")
+                            .jsonObject["firmHorizonDays"],
+                    )
+                }
+        }
+    }
+
+    @Test
+    fun v11PreservesPublishedHavanaProofUsingTheLegacyEarlierMidnightOffset() = runBlocking {
+        val origin = "https://api.example.test/"
+        val configurationId = "connection-1"
+        val start = "2026-11-01T04:00:00Z"
+        val end = "2026-11-08T05:00:00Z"
+        val digest = "sha256:${"c".repeat(64)}"
+        val revisionId = "33333333-3333-4333-8333-333333333333"
+        val revision = PublishedScheduleRevisionSnapshot(
+            id = revisionId,
+            revision = "4:$revisionId",
+            revisionNumber = 4uL,
+            inputDigest = digest,
+            horizonStart = start,
+            horizonEnd = end,
+            timezoneName = "America/Havana",
+            publishedAt = start,
+        )
+        val proof = PublishedScheduleProofSnapshot(
+            schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+            syncOrigin = origin,
+            configurationId = configurationId,
+            revision = revision,
+            asOf = start,
+            blocks = emptyList(),
+        )
+        val original = DayWeaveUiState(
+            canonicalSyncOrigin = origin,
+            canonicalConfigurationId = configurationId,
+            canonicalDeltaCursor = "cursor-havana",
+            publishedScheduleRevision = revision,
+            publishedScheduleProof = proof,
+            scheduleInputDigest = digest,
+            scheduleGeneratedAt = start,
+            schedulePlanningZoneId = revision.timezoneName,
+        )
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 11 }
+        repository.save(original)
+        val current = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(current.payload).jsonObject
+        val profile = root.getValue("scheduleCompositionProfile").jsonObject
+        dao.snapshot = current.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(
+                    root +
+                        ("scheduleCompositionProfile" to
+                            JsonObject(profile - "firmHorizonDays")),
+                ),
+            ),
+            payloadFormat = PlannerSnapshotFormats.JSON_V11,
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(proof, restored.publishedScheduleProof)
+        assertEquals(revision, restored.publishedScheduleRevision)
+        assertTrue(
+            restored.isPublishedScheduleDisplayCurrent(
+                Instant.parse("2026-11-01T04:30:00Z"),
+                ZoneId.of("America/Havana"),
+            ),
+        )
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
+    }
+
+    @Test
+    fun v11OneDayLocalProvenanceLosesDisplayAuthorityUnderDefaultProfile() = runBlocking {
+        val dao = FakePlannerSnapshotDao()
+        val repository = RoomPlannerStateRepository(dao) { 8 }
+        repository.save(localProvenanceState(horizonDays = 1, profileDays = 1))
+        val current = requireNotNull(dao.snapshot)
+        val root = Json.parseToJsonElement(current.payload).jsonObject
+        val profile = root.getValue("scheduleCompositionProfile").jsonObject
+        dao.snapshot = current.copy(
+            payload = Json.encodeToString(
+                JsonObject.serializer(),
+                JsonObject(
+                    root +
+                        ("scheduleCompositionProfile" to
+                            JsonObject(profile - "firmHorizonDays")),
+                ),
+            ),
+            payloadFormat = PlannerSnapshotFormats.JSON_V11,
+        )
+
+        val restored = requireNotNull(repository.load())
+
+        assertEquals(7, restored.scheduleCompositionProfile.firmHorizonDays)
+        assertEquals(null, restored.localScheduleCompositionProvenance)
+        assertFalse(
+            restored.isScheduleDisplayCurrent(
+                Instant.parse("2026-08-29T12:00:00Z"),
+                ZoneId.of("UTC"),
+            ),
+        )
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
+    }
+
+    @Test
+    fun v10AndV11CannotRetainInjectedMultiDayLocalDisplayAuthority() = runBlocking {
+        listOf(PlannerSnapshotFormats.JSON_V10, PlannerSnapshotFormats.JSON_V11)
+            .forEach { predecessor ->
+                val dao = FakePlannerSnapshotDao()
+                val repository = RoomPlannerStateRepository(dao) { 9 }
+                repository.save(localProvenanceState(horizonDays = 7, profileDays = 7))
+                val injected = requireNotNull(dao.snapshot).copy(payloadFormat = predecessor)
+                dao.snapshot = injected
+
+                val restored = requireNotNull(repository.load())
+
+                assertEquals(7, restored.scheduleCompositionProfile.firmHorizonDays)
+                assertEquals(null, restored.localScheduleCompositionProvenance)
+                assertFalse(
+                    restored.isScheduleDisplayCurrent(
+                        Instant.parse("2026-08-29T12:00:00Z"),
+                        ZoneId.of("UTC"),
+                    ),
+                )
+                assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
+            }
+    }
+
+    @Test
     fun v10CannotSmuggleOutboundAuthorityAndMigratesWithNullAuthority() = runBlocking {
         listOf(true, false).forEach { injectNewerField ->
             val now = Instant.parse("2026-09-02T12:10:00Z").toEpochMilli()
@@ -166,7 +378,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
             assertTrue(
                 requireNotNull(dao.snapshot).payload.contains(
                     "\"pendingGoogleCalendarOutbound\":null",
@@ -207,7 +419,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(journal, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -323,7 +535,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun staleReorderedV11ProvenanceIsQuarantinedBeforeOneCanonicalRewrite() = runBlocking {
+    fun staleReorderedV12ProvenanceIsQuarantinedBeforeOneCanonicalRewrite() = runBlocking {
         val dao = FakePlannerSnapshotDao()
         val repository = RoomPlannerStateRepository(dao) { 6 }
         val valid = localProvenanceState()
@@ -361,7 +573,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun v8SnapshotWithoutNotificationReceiptsUpgradesToV11WithNoSuppressionAuthority() =
+    fun v8SnapshotWithoutNotificationReceiptsUpgradesToV12WithNoSuppressionAuthority() =
         runBlocking {
             val dao = FakePlannerSnapshotDao()
             val repository = RoomPlannerStateRepository(dao) { 4 }
@@ -388,7 +600,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
             assertTrue(requireNotNull(dao.snapshot).payload.contains(
                 "\"lastBreakEndNotificationAttemptDigest\":null",
             ))
@@ -419,12 +631,12 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         }
     }
 
     @Test
-    fun v11MissingAnySafetyReceiptFailsClosedWithoutRewritingFixture() = runBlocking {
+    fun v12MissingAnySafetyReceiptFailsClosedWithoutRewritingFixture() = runBlocking {
         val dao = FakePlannerSnapshotDao()
         val repository = RoomPlannerStateRepository(dao) { 8 }
         repository.save(DayWeaveUiState())
@@ -482,7 +694,7 @@ class PlannerStateRepositoryTest {
     }
 
     @Test
-    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV11() = runBlocking {
+    fun legacyV2PayloadDefaultsSensitivityAndIsRewrittenAsV12() = runBlocking {
         val dao = FakePlannerSnapshotDao(
             PlannerSnapshotEntity(
                 singletonId = 1,
@@ -497,7 +709,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -535,7 +747,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -588,7 +800,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -801,7 +1013,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -830,7 +1042,7 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matches(restored.schedule.single()),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
 
         dao.snapshot = requireNotNull(dao.snapshot).copy(
             payload = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -983,7 +1195,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(null, restored.publishedScheduleProof)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
@@ -1053,7 +1265,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -1161,7 +1373,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -1185,7 +1397,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V11, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V12, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 
@@ -1335,11 +1547,17 @@ class PlannerStateRepositoryTest {
         )
     }
 
-    private fun localProvenanceState(): DayWeaveUiState {
+    private fun localProvenanceState(
+        horizonDays: Long = 7,
+        profileDays: Int = 7,
+    ): DayWeaveUiState {
         val origin = "https://api.example.test/"
         val configurationId = "connection-1"
         val generatedAt = "2026-08-29T08:00:00Z"
         val base = DayWeaveUiState(
+            scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(
+                firmHorizonDays = profileDays,
+            ),
             canonicalSyncOrigin = origin,
             canonicalConfigurationId = configurationId,
             canonicalDeltaCursor = "cursor-1",
@@ -1361,7 +1579,9 @@ class PlannerStateRepositoryTest {
             generatedAt = generatedAt,
             asOf = generatedAt,
             horizonStart = "2026-08-29T00:00:00Z",
-            horizonEnd = "2026-08-30T00:00:00Z",
+            horizonEnd = Instant.parse("2026-08-29T00:00:00Z")
+                .plusSeconds(horizonDays * 24 * 60 * 60)
+                .toString(),
             timezoneName = "UTC",
             sourceItemRevisions = emptyMap(),
         )

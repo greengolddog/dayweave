@@ -94,7 +94,7 @@ Requirement IDs are stable. “Must” and “shall” are acceptance requiremen
 - **SCH-002** Hard constraints, except explicitly acknowledged manual overrides, shall never be violated by automatic planning.
 - **SCH-003** Default optimization precedence shall be: immutable events/hard constraints; sleep; hard deadlines; goal progress; habits/routines; priority/soft deadlines; energy/context fit; reduced context switching; balance/free space.
 - **SCH-004** The precedence and objective weights shall be user-configurable and resettable to defaults.
-- **SCH-005** The scheduler shall maintain a rolling seven-day firm plan and ninety-day tentative plan.
+- **SCH-005** The scheduler shall maintain a rolling firm plan, defaulting to seven days and configurable within a safe bounded range, plus a ninety-day tentative plan.
 - **SCH-006** Firm blocks shall sync to the configured Google Calendar. Tentative blocks shall remain app-only and publish automatically when they enter the firm horizon.
 - **SCH-007** Freeze horizon, firm/tentative horizons, automatic publish, and automatic recomposition triggers shall be configurable.
 - **SCH-008** Recomposition triggers shall include imported calendar changes, early/late completion, pause, skip, new item, changed deadline, a configured daily time, and a manual command.

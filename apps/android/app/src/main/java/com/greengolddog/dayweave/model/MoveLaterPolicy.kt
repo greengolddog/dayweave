@@ -18,7 +18,8 @@ data class MoveLaterAssessment(
     /** Every exact per-item deadline crossed by that item's shifted final block. */
     val crossedDeadlines: List<MoveLaterDeadlineRisk>,
     val overlappingHardBlocks: List<ScheduleItem>,
-    val fitsSinglePlanningDay: Boolean,
+    /** The complete move fits one strict local day inside the current exact firm horizon. */
+    val fitsFirmHorizonDay: Boolean,
     val placementMode: MoveLaterPlacementMode,
     /** The source itself is publication-pinned and needs an explicit user override. */
     val sourceRequiresOverride: Boolean,
@@ -265,12 +266,14 @@ fun DayWeaveUiState.assessMoveLater(
     val zone = listOfNotNull(schedulePlanningZoneId, focused.planningZoneId)
         .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
         ?: return null
+    val firmHorizon = scheduleDisplayHorizon(referenceNow, zone) ?: return null
+    if (firmHorizon.timezone != zone) return null
     val targetDate = targetWindowStart.atZone(zone).toLocalDate()
-    val loadedPlanningDate = canonicalPlanningDate() ?: return null
-    val horizonStart = targetDate.atStartOfDay(zone).toInstant()
-    val horizonEnd = targetDate.plusDays(1).atStartOfDay(zone).toInstant()
-    val fitsSinglePlanningDay = targetDate == loadedPlanningDate &&
-        targetWindowStart >= horizonStart && targetWindowEnd <= horizonEnd
+    val targetDayStart = strictLocalDayStartInstant(targetDate, zone) ?: return null
+    val targetDayEnd = strictLocalDayEndInstant(targetDate.plusDays(1), zone) ?: return null
+    val fitsFirmHorizonDay =
+        targetWindowStart >= firmHorizon.start && targetWindowEnd <= firmHorizon.end &&
+            targetWindowStart >= targetDayStart && targetWindowEnd <= targetDayEnd
 
     val itemsById = canonicalItems.associateBy(CanonicalItemSnapshot::id)
     val crossedDeadlines = movedCanonicalItemIds.mapNotNull { movedItemId ->
@@ -313,7 +316,7 @@ fun DayWeaveUiState.assessMoveLater(
         targetEnd = targetWindowEnd,
         crossedDeadlines = crossedDeadlines,
         overlappingHardBlocks = hardOverlaps,
-        fitsSinglePlanningDay = fitsSinglePlanningDay,
+        fitsFirmHorizonDay = fitsFirmHorizonDay,
         placementMode = placementMode,
         sourceRequiresOverride = !focused.isFlexible || focused.isHardConstraint ||
             focused.canonicalBlockKind == "pinned",

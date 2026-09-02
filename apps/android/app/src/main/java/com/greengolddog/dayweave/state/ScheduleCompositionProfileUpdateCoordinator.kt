@@ -121,7 +121,7 @@ internal class ScheduleCompositionProfileUpdateCoordinator(
                 },
                 requestedProfile = profile,
                 message = if (saved) {
-                    "Planning profile saved. Recompose to refresh your day."
+                    "Planning profile saved. Recompose to refresh the firm horizon."
                 } else {
                     "The planning profile could not be saved securely. Try again after storage " +
                         "is available."

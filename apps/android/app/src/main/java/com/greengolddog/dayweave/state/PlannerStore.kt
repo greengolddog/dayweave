@@ -69,6 +69,8 @@ import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.model.localScheduleCompositionStateFingerprint
+import com.greengolddog.dayweave.model.strictLocalDayEndInstant
+import com.greengolddog.dayweave.model.strictLocalDayStartInstant
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
@@ -4487,13 +4489,14 @@ class PlannerStore(
         require(current.unscheduledWork.none { work ->
             work.occurrenceId == occurrenceId && work.remainingMinutes > 0
         }) { "An occurrence with unscheduled remaining work cannot move as a partial span" }
+        val assessedAt = Instant.ofEpochMilli(nowEpochMillis())
         val currentAssessment = current.assessMoveLater(
             focusedBlockId,
             moveStart,
-            Instant.ofEpochMilli(nowEpochMillis()),
+            assessedAt,
         )
         require(
-            currentAssessment != null && currentAssessment.fitsSinglePlanningDay &&
+            currentAssessment != null && currentAssessment.fitsFirmHorizonDay &&
                 !currentAssessment.crossesUnrelaxableHardDeadline &&
                 currentAssessment.isCoveredBy(approval),
         ) { "Move-later risks changed after the user's review" }
@@ -4515,11 +4518,19 @@ class PlannerStore(
         val planningZone = listOfNotNull(current.schedulePlanningZoneId, focused.planningZoneId)
             .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
             ?: throw IllegalArgumentException("The planning timezone is unavailable")
+        val firmHorizon = current.scheduleDisplayHorizon(assessedAt, planningZone)
+            ?: throw IllegalArgumentException("The exact firm horizon is unavailable")
         val targetDate = movedWindowStart.atZone(planningZone).toLocalDate()
-        val targetHorizonStart = targetDate.atStartOfDay(planningZone).toInstant()
-        val targetHorizonEnd = targetDate.plusDays(1).atStartOfDay(planningZone).toInstant()
-        require(movedWindowStart >= targetHorizonStart && movedWindowEnd <= targetHorizonEnd) {
-            "A recurrence move must fit wholly inside one planning-day preview"
+        val targetDayStart = strictLocalDayStartInstant(targetDate, planningZone)
+            ?: throw IllegalArgumentException("The target planning day has no exact start")
+        val targetDayEnd = strictLocalDayEndInstant(targetDate.plusDays(1), planningZone)
+            ?: throw IllegalArgumentException("The target planning day has no exact end")
+        require(
+            firmHorizon.timezone == planningZone &&
+                movedWindowStart >= firmHorizon.start && movedWindowEnd <= firmHorizon.end &&
+                movedWindowStart >= targetDayStart && movedWindowEnd <= targetDayEnd,
+        ) {
+            "A recurrence move must fit wholly inside one firm-horizon planning day"
         }
         val moves = current.recurrenceMoves + (
             occurrenceId to RecurrenceMoveSnapshot(
@@ -4527,7 +4538,7 @@ class PlannerStore(
                     ?: throw IllegalArgumentException("Occurrence owner is unavailable"),
                 startAt = movedWindowStart.toString(),
                 endAt = movedWindowEnd.toString(),
-                movedAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+                movedAt = assessedAt.toString(),
                 source = occurrenceSource,
             )
         )
@@ -4557,7 +4568,7 @@ class PlannerStore(
         mutate { it.copy(useDynamicColor = !it.useDynamicColor) }
     }
 
-    /** Persists work-window/weight changes and revokes old schedule authority. */
+    /** Persists firm-horizon/work-window/weight changes and revokes old schedule authority. */
     internal fun updateScheduleCompositionProfile(
         profile: ScheduleCompositionProfileSnapshot,
     ): Boolean {
@@ -4586,7 +4597,7 @@ class PlannerStore(
             publishedScheduleProof = null,
             scheduleInputDigest = null,
             localScheduleCompositionProvenance = null,
-            scheduleMessage = "Scheduling profile changed · recompose to refresh the day",
+            scheduleMessage = "Scheduling profile changed · recompose to refresh the firm horizon",
         )
     }
 
@@ -5528,6 +5539,7 @@ class PlannerStore(
         // Kotlin data-class copy preserves unchanged input references but not body-property memos.
         // Transfer a verified digest/result only across an O(1) exact structural identity fence.
         transformed.inheritLocalScheduleCompositionMemo(previous)
+        transformed.inheritPublishedScheduleValidationMemo(previous)
         val snapshot = transformed.withInvalidLocalScheduleCompositionAbandoned()
             .also { requireCanonicalAuthoringJournalBudget(it.pendingCanonicalAuthoringMutations) }
         mutableState.value = snapshot

@@ -1,6 +1,8 @@
 package com.greengolddog.dayweave.model
 
 import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -249,11 +251,8 @@ class MoveLaterPolicyTest {
             flexibleConstraintsJson =
                 """{"constraints":{"latest_finish":{"value":"2026-09-01T11:30:00Z","strength":{"level":"hard"}}}}""",
         )
-        val state = DayWeaveUiState(
-            schedule = listOf(leafA, leafB),
+        val state = state(leafA, leafB).copy(
             canonicalItems = listOf(softLeaf, hardLeaf),
-            scheduleGeneratedAt = "2026-09-01T07:00:00Z",
-            schedulePlanningZoneId = "UTC",
         )
 
         val assessment = requireNotNull(
@@ -341,7 +340,7 @@ class MoveLaterPolicyTest {
 
         assertEquals(Instant.parse("2026-09-01T10:45:00Z"), assessment.targetEnd)
         assertFalse(assessment.requiresConfirmation)
-        assertTrue(assessment.fitsSinglePlanningDay)
+        assertTrue(assessment.fitsFirmHorizonDay)
     }
 
     @Test
@@ -367,7 +366,7 @@ class MoveLaterPolicyTest {
         )
 
         assertEquals(Instant.parse("2026-09-02T01:30:00Z"), assessment.targetEnd)
-        assertFalse(assessment.fitsSinglePlanningDay)
+        assertFalse(assessment.fitsFirmHorizonDay)
     }
 
     @Test
@@ -404,7 +403,7 @@ class MoveLaterPolicyTest {
     }
 
     @Test
-    fun exactExecutionMoveCannotUseAnUnloadedTargetPlanningDay() {
+    fun exactExecutionMoveCanUseASecondDayInsideTheFirmHorizon() {
         val source = block(
             id = BLOCK_ID,
             start = "2026-09-01T08:00:00Z",
@@ -433,16 +432,209 @@ class MoveLaterPolicyTest {
             ),
         )
 
-        assertFalse(assessment.fitsSinglePlanningDay)
+        assertTrue(assessment.fitsFirmHorizonDay)
         assertEquals(MoveLaterPlacementMode.EXACT, assessment.placementMode)
     }
 
-    private fun state(vararg blocks: ScheduleItem) = DayWeaveUiState(
-        schedule = blocks.toList(),
-        canonicalItems = listOf(item()),
-        scheduleGeneratedAt = "2026-09-01T07:00:00Z",
-        schedulePlanningZoneId = "UTC",
-    )
+    @Test
+    fun lastFirmHorizonDayAllowsAnExactEndBoundaryButRejectsBeyondIt() {
+        val source = block(
+            id = BLOCK_ID,
+            start = "2026-09-01T08:00:00Z",
+            end = "2026-09-01T09:00:00Z",
+        )
+        val state = state(source)
+        val reference = Instant.parse("2026-09-01T07:00:00Z")
+
+        val exactEnd = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-07T23:00:00Z"),
+                reference,
+            ),
+        )
+        val beyondEnd = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-08T00:00:00Z"),
+                reference,
+            ),
+        )
+
+        assertEquals(Instant.parse("2026-09-08T00:00:00Z"), exactEnd.targetEnd)
+        assertTrue(exactEnd.fitsFirmHorizonDay)
+        assertFalse(beyondEnd.fitsFirmHorizonDay)
+    }
+
+    @Test
+    fun thirtyDayFirmHorizonAcceptsALaterSingleDayButRejectsCrossMidnight() {
+        val source = block(
+            id = BLOCK_ID,
+            start = "2026-09-01T08:00:00Z",
+            end = "2026-09-01T09:00:00Z",
+        )
+        val state = stateWithHorizon(
+            blocks = listOf(source),
+            horizonDays = 30,
+        )
+        val reference = Instant.parse("2026-09-01T07:00:00Z")
+
+        val laterDay = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-20T09:00:00Z"),
+                reference,
+            ),
+        )
+        val crossMidnight = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                Instant.parse("2026-09-20T23:30:00Z"),
+                reference,
+            ),
+        )
+
+        assertTrue(laterDay.fitsFirmHorizonDay)
+        assertFalse(crossMidnight.fitsFirmHorizonDay)
+    }
+
+    @Test
+    fun targetDayWithANonexistentMidnightFailsClosed() {
+        val zone = ZoneId.of("America/Santiago")
+        val horizonDate = LocalDate.parse("2026-09-04")
+        val sourceStart = horizonDate.atTime(10, 0).atZone(zone).toInstant()
+        val source = block(
+            id = BLOCK_ID,
+            start = sourceStart.toString(),
+            end = sourceStart.plusSeconds(3_600).toString(),
+        ).copy(planningZoneId = zone.id)
+        val state = stateWithHorizon(
+            blocks = listOf(source),
+            horizonDate = horizonDate,
+            horizonDays = 7,
+            zone = zone,
+        )
+
+        assertEquals(
+            null,
+            state.assessMoveLater(
+                BLOCK_ID,
+                LocalDate.parse("2026-09-06").atTime(2, 0).atZone(zone).toInstant(),
+                horizonDate.atTime(12, 0).atZone(zone).toInstant(),
+            ),
+        )
+    }
+
+    @Test
+    fun ambiguousMidnightUsesTheLaterOffsetAsThePlanningDayStart() {
+        val zone = ZoneId.of("America/Havana")
+        val horizonDate = LocalDate.parse("2026-10-30")
+        val sourceStart = horizonDate.atTime(10, 0).atZone(zone).toInstant()
+        val source = block(
+            id = BLOCK_ID,
+            start = sourceStart.toString(),
+            end = sourceStart.plusSeconds(3_600).toString(),
+        ).copy(planningZoneId = zone.id)
+        val state = stateWithHorizon(
+            blocks = listOf(source),
+            horizonDate = horizonDate,
+            horizonDays = 7,
+            zone = zone,
+        )
+        val reference = horizonDate.atTime(12, 0).atZone(zone).toInstant()
+
+        val earlierOffset = requireNotNull(
+            state.assessMoveLater(BLOCK_ID, Instant.parse("2026-11-01T04:00:00Z"), reference),
+        )
+        val laterOffset = requireNotNull(
+            state.assessMoveLater(BLOCK_ID, Instant.parse("2026-11-01T05:00:00Z"), reference),
+        )
+
+        assertFalse(earlierOffset.fitsFirmHorizonDay)
+        assertTrue(laterOffset.fitsFirmHorizonDay)
+    }
+
+    @Test
+    fun horizonEndingAtAmbiguousMidnightIncludesTheLastExactHourOnly() {
+        val zone = ZoneId.of("America/Havana")
+        val horizonDate = LocalDate.parse("2026-10-25")
+        val sourceStart = horizonDate.atTime(10, 0).atZone(zone).toInstant()
+        val source = block(
+            id = BLOCK_ID,
+            start = sourceStart.toString(),
+            end = sourceStart.plusSeconds(3_600).toString(),
+        ).copy(planningZoneId = zone.id)
+        val state = stateWithHorizon(
+            blocks = listOf(source),
+            horizonDate = horizonDate,
+            horizonDays = 7,
+            zone = zone,
+        )
+        val reference = horizonDate.atTime(12, 0).atZone(zone).toInstant()
+
+        val lastHour = requireNotNull(
+            state.assessMoveLater(
+                BLOCK_ID,
+                LocalDate.parse("2026-10-31").atTime(23, 0).atZone(zone).toInstant(),
+                reference,
+            ),
+        )
+        val repeatedMidnight = requireNotNull(
+            state.assessMoveLater(BLOCK_ID, Instant.parse("2026-11-01T04:00:00Z"), reference),
+        )
+
+        assertTrue(lastHour.fitsFirmHorizonDay)
+        assertEquals(Instant.parse("2026-11-01T04:00:00Z"), lastHour.targetEnd)
+        assertFalse(repeatedMidnight.fitsFirmHorizonDay)
+    }
+
+    private fun state(vararg blocks: ScheduleItem): DayWeaveUiState =
+        stateWithHorizon(blocks.toList())
+
+    private fun stateWithHorizon(
+        blocks: List<ScheduleItem>,
+        horizonDate: LocalDate = LocalDate.parse("2026-09-01"),
+        horizonDays: Int = 7,
+        zone: ZoneId = ZoneId.of("UTC"),
+    ): DayWeaveUiState {
+        val horizonStart = requireNotNull(strictLocalDayStartInstant(horizonDate, zone))
+        val horizonEnd = requireNotNull(
+            strictLocalDayEndInstant(horizonDate.plusDays(horizonDays.toLong()), zone),
+        )
+        val generatedAt = horizonStart.plusSeconds(7 * 60 * 60)
+        val revisionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        val revision = PublishedScheduleRevisionSnapshot(
+            id = revisionId,
+            revision = "1:$revisionId",
+            revisionNumber = 1uL,
+            inputDigest = "sha256:${"a".repeat(64)}",
+            horizonStart = horizonStart.toString(),
+            horizonEnd = horizonEnd.toString(),
+            timezoneName = zone.id,
+            publishedAt = generatedAt.toString(),
+        )
+        return DayWeaveUiState(
+            schedule = blocks,
+            canonicalItems = listOf(item()),
+            canonicalSyncOrigin = "https://api.example.test/",
+            canonicalConfigurationId = "connection-1",
+            publishedScheduleRevision = revision,
+            publishedScheduleProof = PublishedScheduleProofSnapshot(
+                schemaVersion = PublishedScheduleProofSnapshot.CURRENT_SCHEMA_VERSION,
+                syncOrigin = "https://api.example.test/",
+                configurationId = "connection-1",
+                revision = revision,
+                asOf = generatedAt.toString(),
+                blocks = blocks.map(PublishedScheduleBlockProofSnapshot::from),
+            ),
+            scheduleInputDigest = revision.inputDigest,
+            scheduleGeneratedAt = generatedAt.toString(),
+            schedulePlanningZoneId = zone.id,
+            scheduleCompositionProfile = ScheduleCompositionProfileSnapshot(
+                firmHorizonDays = horizonDays,
+            ),
+        )
+    }
 
     private fun block(id: String, start: String, end: String) = ScheduleItem(
         id = id,

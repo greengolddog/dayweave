@@ -409,7 +409,7 @@ class PlannerStoreTest {
 
         assertTrue(
             store.updateScheduleCompositionProfile(
-                ScheduleCompositionProfileSnapshot(dayStartMinute = 8 * 60),
+                original.scheduleCompositionProfile.copy(firmHorizonDays = 14),
             ),
         )
         assertEquals(listOf(block), store.state.value.schedule)
@@ -418,7 +418,7 @@ class PlannerStoreTest {
         assertNull(store.state.value.scheduleInputDigest)
         assertNull(store.state.value.localScheduleCompositionProvenance)
         assertEquals(
-            "Scheduling profile changed · recompose to refresh the day",
+            "Scheduling profile changed · recompose to refresh the firm horizon",
             store.state.value.scheduleMessage,
         )
         assertTrue(store.isCanonicalExecutionStartBlocked(block.id))
@@ -483,10 +483,13 @@ class PlannerStoreTest {
     @Test
     fun overlappingPublishedBlockRetainsExactProofAcrossHorizonBoundary() {
         val overlapping = canonicalBlock(ItemStatus.SCHEDULED, 8).copy(
-            startMinute = 0,
-            durationMinutes = 60,
+            startMinute = 23 * 60,
+            durationMinutes = 120,
             absoluteStartAt = "1969-12-31T23:00:00Z",
             absoluteEndAt = "1970-01-01T01:00:00Z",
+            isFlexible = false,
+            isHardConstraint = true,
+            canonicalBlockKind = "pinned",
         )
         val candidate = canonicalUpdate(
             item = canonicalItem("planned", 8),
@@ -931,19 +934,21 @@ class PlannerStoreTest {
             absoluteStartAt = "1970-01-01T03:00:00Z",
             absoluteEndAt = "1970-01-01T04:00:00Z",
         )
+        val item = canonicalItem("planned", 7).copy(
+            recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
+            splitPolicyJson = "{\"type\":\"splittable\"}",
+        )
+        val published = publishedCanonicalState(item, first)
+        val proof = requireNotNull(published.publishedScheduleProof)
         val store = PlannerStore(
-            DayWeaveUiState(
-                canonicalItems = listOf(
-                    canonicalItem("planned", 7).copy(
-                        recurrenceJson = "{\"type\":\"daily\",\"times_per_day\":1}",
-                        splitPolicyJson = "{\"type\":\"splittable\"}",
+            published.copy(
+                schedule = listOf(first, second),
+                publishedScheduleProof = proof.copy(
+                    blocks = listOf(
+                        PublishedScheduleBlockProofSnapshot.from(first),
+                        PublishedScheduleBlockProofSnapshot.from(second),
                     ),
                 ),
-                canonicalSyncOrigin = CANONICAL_ORIGIN,
-                canonicalConfigurationId = "connection-1",
-                schedule = listOf(first, second),
-                scheduleGeneratedAt = "1970-01-01T00:01:00Z",
-                schedulePlanningZoneId = "UTC",
                 occurrenceSeriesItemIds = mapOf(occurrenceId to CANONICAL_ITEM_ID),
                 recurrenceOccurrenceSources = mapOf(occurrenceId to occurrenceSource()),
             ),

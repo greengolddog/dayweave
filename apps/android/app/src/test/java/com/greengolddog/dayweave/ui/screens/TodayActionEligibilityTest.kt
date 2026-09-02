@@ -11,11 +11,38 @@ import com.greengolddog.dayweave.model.PublishedScheduleRevisionSnapshot
 import com.greengolddog.dayweave.model.RecurrenceOccurrenceSourceSnapshot
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.UnscheduledWorkSnapshot
+import java.time.Instant
+import java.time.ZoneId
+import java.util.Locale
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TodayActionEligibilityTest {
+    @Test
+    fun todayHeadingRollsOverAtTheInjectedLocalMidnight() {
+        val zone = ZoneId.of("Europe/Paris")
+
+        assertEquals(
+            "Tuesday, September 1",
+            todayHeading(Instant.parse("2026-09-01T21:59:59.999Z"), zone, Locale.US),
+        )
+        assertEquals(
+            "Wednesday, September 2",
+            todayHeading(Instant.parse("2026-09-01T22:00:00Z"), zone, Locale.US),
+        )
+    }
+
+    @Test
+    fun firmHorizonFreeTimeUsesACompactExplicitDuration() {
+        assertEquals("0m", formatFirmHorizonMinutes(0))
+        assertEquals("59m", formatFirmHorizonMinutes(59))
+        assertEquals("1h", formatFirmHorizonMinutes(60))
+        assertEquals("104h", formatFirmHorizonMinutes(6_240))
+        assertEquals("104h 5m", formatFirmHorizonMinutes(6_245))
+    }
+
     @Test
     fun laterIsAvailableOnlyForFlexibleActionableWork() {
         val task = item(ItemKind.TASK)

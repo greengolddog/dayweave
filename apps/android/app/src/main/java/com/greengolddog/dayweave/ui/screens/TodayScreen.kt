@@ -36,14 +36,18 @@ import com.greengolddog.dayweave.ui.components.EnergySignalCard
 import com.greengolddog.dayweave.ui.components.MetricCard
 import com.greengolddog.dayweave.ui.components.ScheduleItemCard
 import com.greengolddog.dayweave.sync.CanonicalSyncState
-import java.time.LocalDate
+import java.time.Instant
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.Locale
 
 @Composable
 fun TodayScreen(
     state: DayWeaveUiState,
     syncState: CanonicalSyncState,
     canonicalExecutionActionsEnabled: Boolean,
+    reference: Instant,
+    currentZone: ZoneId,
     onStart: (String) -> Unit,
     onPause: () -> Unit,
     onResume: () -> Unit,
@@ -58,14 +62,20 @@ fun TodayScreen(
     onClearManualEnergyCheckIn: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val isCurrentPlan = state.isCanonicalPlanCurrent()
-    val isDisplayCurrent = state.isScheduleDisplayCurrent()
-    val isPublishedReplica = state.isPublishedScheduleDisplayCurrent()
-    val isLocalPlan = isDisplayCurrent && !isPublishedReplica
+    val isCurrentPlan = state.isCanonicalPlanCurrent(reference, currentZone)
+    val isDisplayCurrent = state.isScheduleDisplayCurrent(reference, currentZone)
+    val isPublishedReplica = state.isPublishedScheduleDisplayCurrent(reference, currentZone)
+    val displayHorizon = if (isDisplayCurrent) {
+        state.scheduleDisplayHorizon(reference, currentZone)
+    } else {
+        null
+    }
+    val hasCurrentFirmHorizon = displayHorizon != null
+    val isLocalPlan = hasCurrentFirmHorizon && !isPublishedReplica
     val isReadOnlyPublishedReplica = isPublishedReplica && !isCurrentPlan
     val canonicalScheduleActionsEnabled = canonicalExecutionActionsEnabled && isCurrentPlan
-    val visibleTimeline = if (isDisplayCurrent) {
-        state.visibleScheduleSlicesForDay()
+    val visibleTimeline = if (hasCurrentFirmHorizon) {
+        state.visibleScheduleSlicesForDay(reference, currentZone)
     } else {
         emptyList()
     }
@@ -77,12 +87,12 @@ fun TodayScreen(
         item {
             Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(
-                    LocalDate.now().format(DateTimeFormatter.ofPattern("EEEE, MMMM d")),
+                    todayHeading(reference, currentZone),
                     style = MaterialTheme.typography.headlineSmall,
                 )
                 Text(
                     if (
-                        !isDisplayCurrent || !isLocalPlan && syncState.phase in setOf(
+                        !hasCurrentFirmHorizon || !isLocalPlan && syncState.phase in setOf(
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.AUTH_REQUIRED,
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.OFFLINE,
                             com.greengolddog.dayweave.sync.CanonicalSyncPhase.ERROR,
@@ -98,24 +108,42 @@ fun TodayScreen(
             }
         }
 
-        if (!isDisplayCurrent) {
+        if (!hasCurrentFirmHorizon) {
             item {
                 Card(
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                        containerColor = if (state.scheduleGeneratedAt == null) {
+                            MaterialTheme.colorScheme.surfaceVariant
+                        } else {
+                            MaterialTheme.colorScheme.errorContainer
+                        },
                     ),
                 ) {
                     Column(
                         modifier = Modifier.fillMaxWidth().padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
                     ) {
-                        Text("Today’s plan is not available", style = MaterialTheme.typography.titleMedium)
                         Text(
-                            state.canonicalPlanningDate()?.let { cachedDate ->
-                                "The encrypted plan is from $cachedDate and is hidden until today is recomposed."
-                            } ?: "No canonical plan has been composed for today yet.",
+                            if (state.scheduleGeneratedAt == null) {
+                                "Create your first firm plan"
+                            } else {
+                                "Today’s plan is not available"
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            if (state.scheduleGeneratedAt != null) {
+                                "The encrypted firm plan no longer covers today and is hidden " +
+                                    "until it is recomposed."
+                            } else {
+                                "No firm plan has been composed for today yet."
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = if (state.scheduleGeneratedAt == null) {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            } else {
+                                MaterialTheme.colorScheme.onErrorContainer
+                            },
                         )
                     }
                 }
@@ -253,13 +281,21 @@ fun TodayScreen(
                     modifier = Modifier.weight(1f),
                 )
                 MetricCard(
-                    value = if (isCurrentPlan) "${state.protectedFreeMinutes}m" else "—",
-                    label = "protected",
+                    value = if (isCurrentPlan && hasCurrentFirmHorizon) {
+                        formatFirmHorizonMinutes(state.protectedFreeMinutes)
+                    } else {
+                        "—"
+                    },
+                    label = "horizon free",
                     modifier = Modifier.weight(1f),
                 )
                 MetricCard(
-                    value = if (isCurrentPlan) state.dayScore.toString() else "—",
-                    label = "day score",
+                    value = if (isCurrentPlan && hasCurrentFirmHorizon) {
+                        state.dayScore.toString()
+                    } else {
+                        "—"
+                    },
+                    label = "plan score",
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -443,7 +479,7 @@ fun TodayScreen(
             )
         }
 
-        if (visibleTimeline.isEmpty() && isDisplayCurrent) {
+        if (visibleTimeline.isEmpty() && hasCurrentFirmHorizon) {
             item {
                 Card {
                     Row(
@@ -465,6 +501,21 @@ fun TodayScreen(
         }
     }
 }
+
+internal fun formatFirmHorizonMinutes(minutes: Int): String {
+    require(minutes >= 0)
+    if (minutes < 60) return "${minutes}m"
+    val hours = minutes / 60
+    val remainder = minutes % 60
+    return if (remainder == 0) "${hours}h" else "${hours}h ${remainder}m"
+}
+
+internal fun todayHeading(
+    reference: Instant,
+    zoneId: ZoneId,
+    locale: Locale = Locale.getDefault(),
+): String = reference.atZone(zoneId).toLocalDate()
+    .format(DateTimeFormatter.ofPattern("EEEE, MMMM d", locale))
 
 internal fun ScheduleItem.isMoveLaterEligible(): Boolean {
     return isRepresentableMoveLaterSource()

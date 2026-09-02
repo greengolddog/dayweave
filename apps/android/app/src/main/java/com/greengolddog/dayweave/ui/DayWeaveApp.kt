@@ -321,6 +321,7 @@ private fun DayWeaveRoot(
     }
     var showGooglePublicationReview by remember { mutableStateOf(false) }
     var googleOutboundClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var plannerClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
     var dismissedBreakKey by rememberSaveable { mutableStateOf<String?>(null) }
     var authorizedNotificationBreakDigest by rememberSaveable {
@@ -341,6 +342,27 @@ private fun DayWeaveRoot(
         sdkInt = Build.VERSION.SDK_INT,
         systemState = timedBreakNotificationSystemState,
     )
+    val plannerClockZone = ZoneId.systemDefault()
+    val plannerClockReference = Instant.ofEpochMilli(plannerClockMillis)
+    val plannerHorizonEnd = state.scheduleDisplayHorizon(
+        reference = plannerClockReference,
+        currentZone = plannerClockZone,
+    )?.end
+    LaunchedEffect(lifecycleOwner, plannerClockZone, plannerHorizonEnd) {
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (isActive) {
+                val reference = Instant.now()
+                plannerClockMillis = reference.toEpochMilli()
+                delay(
+                    plannerClockDelayMillis(
+                        reference = reference,
+                        zoneId = plannerClockZone,
+                        exactHorizonEnd = plannerHorizonEnd,
+                    ),
+                )
+            }
+        }
+    }
     LaunchedEffect(
         state.pendingGoogleCalendarOutbound?.recoveryId,
         state.pendingGoogleCalendarOutbound?.stage,
@@ -638,6 +660,8 @@ private fun DayWeaveRoot(
                 state = state,
                 syncState = effectiveCanonicalSyncState,
                 canonicalExecutionActionsEnabled = canonicalExecutionActionsEnabled,
+                reference = plannerClockReference,
+                currentZone = plannerClockZone,
                 onStart = viewModel::startItem,
                 onPause = { showPauseChooser = true },
                 onResume = viewModel::resumeActive,
@@ -658,6 +682,8 @@ private fun DayWeaveRoot(
             )
             AppDestination.CALENDAR -> CalendarScreen(
                 state = state,
+                reference = plannerClockReference,
+                currentZone = plannerClockZone,
                 modifier = Modifier.padding(innerPadding),
             )
             AppDestination.INBOX -> InboxScreen(
@@ -829,17 +855,47 @@ private fun DayWeaveRoot(
         )
     }
 
-    moveLaterTargetId?.let { targetId ->
-        state.schedule.firstOrNull { it.id == targetId }?.let { target ->
-            val loadedPlanningDate = state.canonicalPlanningDate() ?: return@let
-            val moveZone = if (target.canonicalItemId == null) {
-                ZoneId.systemDefault()
-            } else {
-                listOfNotNull(state.schedulePlanningZoneId, target.planningZoneId)
-                    .firstNotNullOfOrNull { raw ->
-                        runCatching { ZoneId.of(raw) }.getOrNull()
-                    } ?: return@let
-            }
+    val requestedMoveTarget = moveLaterTargetId?.let { targetId ->
+        state.schedule.firstOrNull { it.id == targetId }
+    }
+    val requestedMoveZone = requestedMoveTarget?.let { target ->
+        if (target.canonicalItemId == null) {
+            plannerClockZone
+        } else {
+            listOfNotNull(state.schedulePlanningZoneId, target.planningZoneId)
+                .firstNotNullOfOrNull { raw -> runCatching { ZoneId.of(raw) }.getOrNull() }
+        }
+    }
+    val requestedServerAuthoritativeExecution = requestedMoveTarget?.let { target ->
+        state.activeSession?.itemId == target.id &&
+            state.canonicalExecutionSession?.id ==
+            state.activeSession?.canonicalExecutionSessionId
+    } == true
+    val requestedPlanningHorizon = if (
+        requestedMoveTarget != null && requestedMoveZone != null &&
+        !requestedServerAuthoritativeExecution
+    ) {
+        state.scheduleDisplayHorizon(
+            reference = plannerClockReference,
+            currentZone = requestedMoveZone,
+        )
+    } else {
+        null
+    }
+    val canRenderMoveLater = requestedMoveTarget != null && requestedMoveZone != null &&
+        (requestedServerAuthoritativeExecution || requestedPlanningHorizon != null)
+    LaunchedEffect(
+        moveLaterTargetId,
+        requestedMoveTarget,
+        requestedMoveZone,
+        requestedServerAuthoritativeExecution,
+        requestedPlanningHorizon,
+    ) {
+        if (moveLaterTargetId != null && !canRenderMoveLater) moveLaterTargetId = null
+    }
+    moveLaterTargetId?.takeIf { canRenderMoveLater }?.let { targetId ->
+        val target = requireNotNull(requestedMoveTarget)
+        val moveZone = requireNotNull(requestedMoveZone)
             MoveLaterChooserDialog(
                 itemTitle = target.title,
                 itemIsSensitive = target.isSensitive,
@@ -850,12 +906,10 @@ private fun DayWeaveRoot(
                     else -> MoveLaterPlacementMode.EARLIEST_START
                 },
                 zoneId = moveZone,
-                loadedPlanningDate = loadedPlanningDate,
+                referenceNow = plannerClockReference,
+                planningHorizon = requestedPlanningHorizon,
                 notBefore = target.timelineInstant(),
-                serverAuthoritativeExecution =
-                    state.activeSession?.itemId == targetId &&
-                    state.canonicalExecutionSession?.id ==
-                    state.activeSession?.canonicalExecutionSessionId,
+                serverAuthoritativeExecution = requestedServerAuthoritativeExecution,
                 assessMove = { moveStart ->
                     state.assessMoveLater(targetId, moveStart)
                 },
@@ -869,7 +923,6 @@ private fun DayWeaveRoot(
                     moveLaterTargetId = null
                 },
             )
-        }
     }
 
     state.pendingExecutionDeferIntent?.let { intent ->
@@ -1242,6 +1295,25 @@ private fun DayWeaveRoot(
     }
 }
 
+internal fun plannerClockDelayMillis(
+    reference: Instant,
+    zoneId: ZoneId,
+    exactHorizonEnd: Instant?,
+): Long {
+    val nowMillis = reference.toEpochMilli()
+    val nextMinuteMillis = Math.addExact(
+        nowMillis - Math.floorMod(nowMillis, PLANNER_CLOCK_TICK_MILLIS),
+        PLANNER_CLOCK_TICK_MILLIS,
+    )
+    val nextLocalDayMillis = reference.atZone(zoneId).toLocalDate().plusDays(1)
+        .atStartOfDay(zoneId)
+        .toInstant()
+        .toEpochMilli()
+    val exactEdgeMillis = exactHorizonEnd?.toEpochMilli()?.takeIf { it > nowMillis }
+    val wakeAt = listOfNotNull(nextMinuteMillis, nextLocalDayMillis, exactEdgeMillis).min()
+    return (wakeAt - nowMillis).coerceIn(1L, PLANNER_CLOCK_TICK_MILLIS)
+}
+
 private class GoogleCalendarPublicationReview(
     val itemId: String,
     val selectedTarget: GoogleCalendarOutboundTargetOption?,
@@ -1249,6 +1321,7 @@ private class GoogleCalendarPublicationReview(
     override fun toString(): String = "GoogleCalendarPublicationReview(<redacted>)"
 }
 
+private const val PLANNER_CLOCK_TICK_MILLIS = 60_000L
 private const val EXECUTION_REFRESH_INTERVAL_MILLIS = 30_000L
 
 /** A stream bug or protocol failure can never cancel the independent polling fallback. */

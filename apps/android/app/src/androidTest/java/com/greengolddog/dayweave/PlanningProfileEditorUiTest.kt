@@ -2,6 +2,7 @@ package com.greengolddog.dayweave
 
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
@@ -14,6 +15,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
@@ -38,6 +40,7 @@ class PlanningProfileEditorUiTest {
             currentProfile = ScheduleCompositionProfileSnapshot(
                 dayStartMinute = 8 * 60 + 15,
                 dayEndMinute = 23 * 60 + 45,
+                firmHorizonDays = 12,
                 slotGranularityMinutes = 20,
                 stabilityWeight = 123,
                 defaultSoftWeight = 456,
@@ -53,6 +56,12 @@ class PlanningProfileEditorUiTest {
         composeRule.onNodeWithTag("planning_start_minute").assertTextContains("15")
         composeRule.onNodeWithTag("planning_end_hour").assertTextContains("23")
         composeRule.onNodeWithTag("planning_end_minute").assertTextContains("45")
+        composeRule.onNodeWithContentDescription("Firm horizon").assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.StateDescription,
+                "12 days",
+            ),
+        )
         composeRule.onNodeWithContentDescription("Slot size").assert(
             SemanticsMatcher.expectValue(
                 SemanticsProperties.StateDescription,
@@ -80,6 +89,10 @@ class PlanningProfileEditorUiTest {
         replaceText("planning_start_minute", "15")
         replaceText("planning_end_hour", "23")
         replaceText("planning_end_minute", "45")
+        composeRule.onNodeWithTag("planning_firm_horizon")
+            .performSemanticsAction(SemanticsActions.SetProgress) { setProgress ->
+                setProgress(12f)
+            }
         replaceText("planning_stability_weight", "123")
         replaceText("planning_soft_weight", "456")
 
@@ -91,6 +104,7 @@ class PlanningProfileEditorUiTest {
                 ScheduleCompositionProfileSnapshot(
                     dayStartMinute = 8 * 60 + 15,
                     dayEndMinute = 23 * 60 + 45,
+                    firmHorizonDays = 12,
                     slotGranularityMinutes = 5,
                     stabilityWeight = 123,
                     defaultSoftWeight = 456,
@@ -107,6 +121,7 @@ class PlanningProfileEditorUiTest {
             currentProfile = ScheduleCompositionProfileSnapshot(
                 dayStartMinute = 9 * 60 + 30,
                 dayEndMinute = 18 * 60,
+                firmHorizonDays = 16,
                 slotGranularityMinutes = 20,
                 stabilityWeight = 50,
                 defaultSoftWeight = 900,
@@ -122,6 +137,12 @@ class PlanningProfileEditorUiTest {
         composeRule.onNodeWithTag("planning_start_minute").assertTextContains("00")
         composeRule.onNodeWithTag("planning_end_hour").assertTextContains("22")
         composeRule.onNodeWithTag("planning_end_minute").assertTextContains("00")
+        composeRule.onNodeWithContentDescription("Firm horizon").assert(
+            SemanticsMatcher.expectValue(
+                SemanticsProperties.StateDescription,
+                "7 days",
+            ),
+        )
         composeRule.onNodeWithTag("planning_stability_weight").assertTextContains("4")
         composeRule.onNodeWithTag("planning_soft_weight").assertTextContains("100")
         composeRule.onNodeWithTag("save_planning_profile")
@@ -196,6 +217,7 @@ class PlanningProfileEditorUiTest {
             "planning_start_minute",
             "planning_end_hour",
             "planning_end_minute",
+            "planning_firm_horizon",
             "planning_slot_granularity",
             "planning_stability_weight",
             "planning_soft_weight",

@@ -40,6 +40,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -52,6 +56,7 @@ import com.greengolddog.dayweave.model.MoveLaterAssessment
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.ScheduleDisplayHorizon
 import com.greengolddog.dayweave.model.ScheduleItem
 import com.greengolddog.dayweave.model.toApprovalEnvelope
 import com.greengolddog.dayweave.network.DeviceAuthPhase
@@ -226,6 +231,50 @@ internal data class MoveLaterPreset(
     val moveStart: Instant,
 )
 
+internal data class MoveLaterDateBounds(
+    val firstDate: LocalDate,
+    val lastDateInclusive: LocalDate,
+) {
+    init {
+        require(!lastDateInclusive.isBefore(firstDate))
+    }
+
+    operator fun contains(date: LocalDate): Boolean =
+        !date.isBefore(firstDate) && !date.isAfter(lastDateInclusive)
+}
+
+internal fun moveLaterDateBounds(
+    horizon: ScheduleDisplayHorizon,
+    zoneId: ZoneId,
+): MoveLaterDateBounds? {
+    if (horizon.timezone != zoneId || horizon.start >= horizon.end) return null
+    val firstDate = horizon.start.atZone(zoneId).toLocalDate()
+    val lastDate = runCatching { horizon.end.minusNanos(1) }.getOrNull()
+        ?.atZone(zoneId)
+        ?.toLocalDate()
+        ?: return null
+    return runCatching { MoveLaterDateBounds(firstDate, lastDate) }.getOrNull()
+}
+
+internal fun moveLaterPickerDateBounds(
+    planningHorizon: ScheduleDisplayHorizon?,
+    moveAnchor: Instant,
+    zoneId: ZoneId,
+    serverAuthoritativeExecution: Boolean,
+): MoveLaterDateBounds? {
+    val anchorDate = moveAnchor.atZone(zoneId).toLocalDate()
+    if (serverAuthoritativeExecution) {
+        return MoveLaterDateBounds(anchorDate, anchorDate.plusDays(6))
+    }
+    val horizonBounds = planningHorizon?.let { moveLaterDateBounds(it, zoneId) } ?: return null
+    val firstSelectable = maxOf(horizonBounds.firstDate, anchorDate)
+    return if (firstSelectable <= horizonBounds.lastDateInclusive) {
+        MoveLaterDateBounds(firstSelectable, horizonBounds.lastDateInclusive)
+    } else {
+        null
+    }
+}
+
 internal data class MoveLaterConflictPresentation(
     val labels: List<String>,
     val requiresSecureWindow: Boolean,
@@ -249,7 +298,7 @@ internal fun moveLaterPresets(
     now: Instant,
     zoneId: ZoneId,
     use24HourFormat: Boolean,
-    loadedPlanningDate: LocalDate? = null,
+    allowedDateBounds: MoveLaterDateBounds? = null,
     serverAuthoritativeExecution: Boolean = false,
 ): List<MoveLaterPreset> {
     fun afterHours(hours: Long): Instant {
@@ -274,8 +323,7 @@ internal fun moveLaterPresets(
         MoveLaterPreset("In 3 hours", detail(inThreeHours), inThreeHours),
         MoveLaterPreset("Tomorrow morning", detail(tomorrowMorning), tomorrowMorning),
     ).filter { preset ->
-        loadedPlanningDate == null ||
-            preset.moveStart.atZone(zoneId).toLocalDate() == loadedPlanningDate
+        allowedDateBounds == null || preset.moveStart.atZone(zoneId).toLocalDate() in allowedDateBounds
     }
 }
 
@@ -319,7 +367,8 @@ internal fun moveLaterChooserExplanation(placementMode: MoveLaterPlacementMode):
         MoveLaterPlacementMode.RECOMPOSED_WINDOW ->
             "DayWeave will move this occurrence window and recompose its sessions inside it."
         MoveLaterPlacementMode.EARLIEST_START ->
-            "DayWeave will allow scheduling this work from the selected time, then recompose your day."
+            "DayWeave will allow scheduling this work from the selected time, then recompose " +
+                "the firm horizon."
     }
 
 internal fun moveLaterConfirmationPromise(placementMode: MoveLaterPlacementMode): String =
@@ -338,7 +387,8 @@ internal fun MoveLaterChooserDialog(
     itemIsSensitive: Boolean,
     placementMode: MoveLaterPlacementMode,
     zoneId: ZoneId,
-    loadedPlanningDate: LocalDate,
+    referenceNow: Instant = Instant.now(),
+    planningHorizon: ScheduleDisplayHorizon?,
     notBefore: Instant? = null,
     serverAuthoritativeExecution: Boolean = false,
     assessMove: (Instant) -> MoveLaterAssessment?,
@@ -346,23 +396,35 @@ internal fun MoveLaterChooserDialog(
     onMove: (Instant, MoveLaterApprovalEnvelope?) -> Unit,
 ) {
     val context = LocalContext.current
-    val referenceNow = remember { Instant.now() }
     val use24HourFormat = DateFormat.is24HourFormat(context)
     val moveAnchor = remember(referenceNow, notBefore) {
         maxOf(referenceNow, notBefore ?: referenceNow)
+    }
+    val pickerBounds = remember(
+        planningHorizon,
+        moveAnchor,
+        zoneId,
+        serverAuthoritativeExecution,
+    ) {
+        moveLaterPickerDateBounds(
+            planningHorizon = planningHorizon,
+            moveAnchor = moveAnchor,
+            zoneId = zoneId,
+            serverAuthoritativeExecution = serverAuthoritativeExecution,
+        )
     }
     val presets = remember(
         moveAnchor,
         zoneId,
         use24HourFormat,
-        loadedPlanningDate,
+        pickerBounds,
         serverAuthoritativeExecution,
     ) {
         moveLaterPresets(
             moveAnchor,
             zoneId,
             use24HourFormat,
-            loadedPlanningDate.takeUnless { serverAuthoritativeExecution },
+            allowedDateBounds = pickerBounds,
             serverAuthoritativeExecution = serverAuthoritativeExecution,
         )
     }
@@ -370,8 +432,15 @@ internal fun MoveLaterChooserDialog(
     var pendingConfirmation by remember {
         mutableStateOf<Pair<Instant, MoveLaterAssessment>?>(null)
     }
-    val initialCustom = presets.lastOrNull()?.moveStart?.atZone(zoneId)
-        ?: loadedPlanningDate.atTime(9, 0).atZone(zoneId)
+    val initialCustom = presets.lastOrNull()?.moveStart?.atZone(zoneId) ?: run {
+        val anchor = moveAnchor.atZone(zoneId)
+        val firstDate = pickerBounds?.firstDate
+        if (firstDate == null || firstDate == anchor.toLocalDate()) {
+            anchor
+        } else {
+            firstDate.atTime(9, 0).atZone(zoneId)
+        }
+    }
 
     fun requestMove(selected: Instant) {
         if (serverAuthoritativeExecution) {
@@ -384,10 +453,10 @@ internal fun MoveLaterChooserDialog(
             assessment == null -> {
                 customError = "The exact move window could not be verified. Recompose and try again."
             }
-            !assessment.fitsSinglePlanningDay -> {
+            !assessment.fitsFirmHorizonDay -> {
                 customError =
-                    "That move falls outside the currently loaded planning day. Choose a time " +
-                        "that stays within this day."
+                    "That move falls outside the exact firm horizon or crosses a planning-day " +
+                        "boundary. Choose a time that keeps the whole move inside one horizon day."
             }
             assessment.crossesUnrelaxableHardDeadline -> {
                 customError =
@@ -403,12 +472,25 @@ internal fun MoveLaterChooserDialog(
     }
 
     fun chooseCustomTime() {
+        val selectableBounds = pickerBounds
+        if (selectableBounds == null) {
+            customError = if (serverAuthoritativeExecution) {
+                "No safe future deferral date is available. Refresh and try again."
+            } else {
+                "The exact firm horizon is no longer available. Recompose and try again."
+            }
+            return
+        }
         DatePickerDialog(
             context,
             { _, year, zeroBasedMonth, day ->
                 val date = LocalDate.of(year, zeroBasedMonth + 1, day)
-                if (!serverAuthoritativeExecution && date != loadedPlanningDate) {
-                    customError = "Only the currently loaded planning day can be moved safely."
+                if (date !in selectableBounds) {
+                    customError = if (serverAuthoritativeExecution) {
+                        "Choose a date inside the available seven-day deferral window."
+                    } else {
+                        "Choose a date inside the current exact firm horizon."
+                    }
                     return@DatePickerDialog
                 }
                 TimePickerDialog(
@@ -452,11 +534,9 @@ internal fun MoveLaterChooserDialog(
             initialCustom.dayOfMonth,
         ).also { dialog ->
             val deviceZone = ZoneId.systemDefault()
-            dialog.datePicker.minDate = loadedPlanningDate.atStartOfDay(deviceZone)
+            dialog.datePicker.minDate = selectableBounds.firstDate.atStartOfDay(deviceZone)
                 .toInstant().toEpochMilli()
-            dialog.datePicker.maxDate = loadedPlanningDate.plusDays(
-                if (serverAuthoritativeExecution) 7 else 1,
-            )
+            dialog.datePicker.maxDate = selectableBounds.lastDateInclusive.plusDays(1)
                 .atStartOfDay(deviceZone).toInstant().toEpochMilli() - 1
         }.show()
     }
@@ -602,7 +682,12 @@ internal fun MoveLaterChooserDialog(
                 customError?.let { message ->
                     Text(
                         message,
-                        modifier = Modifier.testTag("move_later_error"),
+                        modifier = Modifier
+                            .semantics {
+                                liveRegion = LiveRegionMode.Assertive
+                                error(message)
+                            }
+                            .testTag("move_later_error"),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )

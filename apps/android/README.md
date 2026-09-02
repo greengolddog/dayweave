@@ -258,19 +258,26 @@ surfaces; those surfaces require their own tested policy gate before they can be
 
 ## On-device schedule composition
 
-**Compose on this device** creates one deterministic local-day composition from the exact
-encrypted canonical cache. It invokes the bounded Rust scheduler through a byte-array JNI boundary
-and never sends a composition request, advances a delta cursor, publishes a schedule, or changes an
-execution lease. The displayed composition is explicitly local-only: Start, skip, and move-later
-remain fail-closed until the day is synced and a server-published execution-authoritative plan is
-installed.
+**Compose on this device** creates one deterministic rolling firm-horizon composition from the
+exact encrypted canonical cache. The horizon defaults to seven local calendar days and is
+configurable from one through thirty days in the planning profile. Each date contributes one
+separately resolved availability interval, so daylight-saving transitions preserve the configured
+local clock boundaries instead of assuming that every day lasts 24 hours. The app invokes the
+bounded Rust scheduler through a byte-array JNI boundary and never sends a composition request,
+advances a delta cursor, publishes a schedule, or changes an execution lease. The displayed
+composition is explicitly local-only: Start, skip, and move-later remain fail-closed until the plan
+is synced and a server-published execution-authoritative plan is installed.
 
 The encrypted Room snapshot persists an exact local provenance record: the credential binding and
-cursor, source item revisions, local input fingerprint, request fingerprint, day/time zone, and
-the resulting block revisions. The app displays a local plan only while every one of those inputs
-still matches. Item, recurrence, availability, execution, binding, or time-zone changes invalidate
-it rather than reusing stale blocks. It also cancels local composition and discards a late native
-result whenever the UI stops, the app locks, or credential/binding state changes.
+cursor, source item revisions, local input fingerprint, request fingerprint, exact horizon and
+time zone, profile day count, and resulting block revisions. The Calendar renders that exact
+rolling interval rather than substituting a Monday-based week. The app displays a local plan only
+while every one of those inputs still matches. Item, recurrence, availability, execution, profile,
+binding, or time-zone changes invalidate it rather than reusing stale blocks. It also cancels local
+composition and discards a late native result whenever the UI stops, the app locks, or
+credential/binding state changes. JSON snapshot v12 and Room migration 11→12 add the bounded
+horizon setting without introducing a plaintext database column; older snapshots default to seven
+days and cannot acquire the new policy by injected fields.
 
 The JNI library is generated at build time and is not checked in. Android builds only
 `arm64-v8a` and `x86_64` scheduler libraries, with Android NDK `28.2.13676358`, Rust `1.95.0`, and

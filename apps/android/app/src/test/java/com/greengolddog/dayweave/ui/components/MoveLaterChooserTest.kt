@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.ExecutionDeferViolationSnapshot
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
+import com.greengolddog.dayweave.model.ScheduleDisplayHorizon
 import com.greengolddog.dayweave.model.ScheduleItem
 import java.time.Instant
 import java.time.LocalDate
@@ -41,7 +42,7 @@ class MoveLaterChooserTest {
     }
 
     @Test
-    fun loadedPlanningDayFiltersTomorrowAndAnyCrossDayPreset() {
+    fun oneDayFirmHorizonFiltersTomorrowAndAnyCrossDayPreset() {
         val zone = ZoneId.of("Europe/Madrid")
         val now = Instant.parse("2026-08-30T18:30:20Z")
 
@@ -49,10 +50,107 @@ class MoveLaterChooserTest {
             now = now,
             zoneId = zone,
             use24HourFormat = true,
-            loadedPlanningDate = LocalDate.of(2026, 8, 30),
+            allowedDateBounds = MoveLaterDateBounds(
+                firstDate = LocalDate.of(2026, 8, 30),
+                lastDateInclusive = LocalDate.of(2026, 8, 30),
+            ),
         )
 
         assertEquals(listOf("In 1 hour", "In 3 hours"), presets.map { it.label })
+    }
+
+    @Test
+    fun multiDayFirmHorizonKeepsTomorrowPresetButExcludesTheEndDate() {
+        val zone = ZoneId.of("Europe/Madrid")
+        val now = Instant.parse("2026-08-30T18:30:20Z")
+
+        val twoDayPresets = moveLaterPresets(
+            now = now,
+            zoneId = zone,
+            use24HourFormat = true,
+            allowedDateBounds = MoveLaterDateBounds(
+                firstDate = LocalDate.of(2026, 8, 30),
+                lastDateInclusive = LocalDate.of(2026, 8, 31),
+            ),
+        )
+        val oneDayPresets = moveLaterPresets(
+            now = now,
+            zoneId = zone,
+            use24HourFormat = true,
+            allowedDateBounds = moveLaterDateBounds(
+                ScheduleDisplayHorizon(
+                    start = LocalDate.of(2026, 8, 30).atStartOfDay(zone).toInstant(),
+                    end = LocalDate.of(2026, 8, 31).atStartOfDay(zone).toInstant(),
+                    timezone = zone,
+                ),
+                zone,
+            ),
+        )
+
+        assertEquals(
+            listOf("In 1 hour", "In 3 hours", "Tomorrow morning"),
+            twoDayPresets.map { it.label },
+        )
+        assertEquals(listOf("In 1 hour", "In 3 hours"), oneDayPresets.map { it.label })
+    }
+
+    @Test
+    fun exactHorizonBoundsSupportOneSevenAndThirtyDays() {
+        val zone = ZoneId.of("UTC")
+        val startDate = LocalDate.of(2026, 9, 1)
+
+        listOf(1L, 7L, 30L).forEach { days ->
+            val bounds = requireNotNull(
+                moveLaterDateBounds(
+                    ScheduleDisplayHorizon(
+                        start = startDate.atStartOfDay(zone).toInstant(),
+                        end = startDate.plusDays(days).atStartOfDay(zone).toInstant(),
+                        timezone = zone,
+                    ),
+                    zone,
+                ),
+            )
+
+            assertEquals(startDate, bounds.firstDate)
+            assertEquals(startDate.plusDays(days - 1), bounds.lastDateInclusive)
+        }
+    }
+
+    @Test
+    fun pickerMinimumAdvancesWithTheMoveAnchorInsideAThirtyDayHorizon() {
+        val zone = ZoneId.of("UTC")
+        val startDate = LocalDate.of(2026, 9, 1)
+        val bounds = requireNotNull(
+            moveLaterPickerDateBounds(
+                planningHorizon = ScheduleDisplayHorizon(
+                    start = startDate.atStartOfDay(zone).toInstant(),
+                    end = startDate.plusDays(30).atStartOfDay(zone).toInstant(),
+                    timezone = zone,
+                ),
+                moveAnchor = Instant.parse("2026-09-20T12:00:00Z"),
+                zoneId = zone,
+                serverAuthoritativeExecution = false,
+            ),
+        )
+
+        assertEquals(LocalDate.of(2026, 9, 20), bounds.firstDate)
+        assertEquals(LocalDate.of(2026, 9, 30), bounds.lastDateInclusive)
+    }
+
+    @Test
+    fun authoritativePickerUsesSevenDatesFromTheCurrentMoveAnchor() {
+        val zone = ZoneId.of("Europe/Madrid")
+        val bounds = requireNotNull(
+            moveLaterPickerDateBounds(
+                planningHorizon = null,
+                moveAnchor = Instant.parse("2026-09-20T22:30:00Z"),
+                zoneId = zone,
+                serverAuthoritativeExecution = true,
+            ),
+        )
+
+        assertEquals(LocalDate.of(2026, 9, 21), bounds.firstDate)
+        assertEquals(LocalDate.of(2026, 9, 27), bounds.lastDateInclusive)
     }
 
     @Test
@@ -173,7 +271,8 @@ class MoveLaterChooserTest {
     @Test
     fun oneShotCopyPromisesOnlyAnEarliestSchedulingTime() {
         assertEquals(
-            "DayWeave will allow scheduling this work from the selected time, then recompose your day.",
+            "DayWeave will allow scheduling this work from the selected time, then recompose " +
+                "the firm horizon.",
             moveLaterChooserExplanation(MoveLaterPlacementMode.EARLIEST_START),
         )
         assertEquals(

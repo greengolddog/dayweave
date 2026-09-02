@@ -22,6 +22,7 @@ internal data class PlanningProfileForm(
     val startMinute: String,
     val endHour: String,
     val endMinute: String,
+    val firmHorizonDays: Int,
     val slotGranularityMinutes: Int,
     val stabilityWeight: String,
     val defaultSoftWeight: String,
@@ -45,6 +46,16 @@ internal data class PlanningProfileForm(
         } else {
             null
         }
+        val horizonError = if (
+            firmHorizonDays !in ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS..
+            ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS
+        ) {
+            "Choose a firm horizon from " +
+                "${ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS} to " +
+                "${ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS} days."
+        } else {
+            null
+        }
         val stabilityError = if (
             stability == null || stability !in MIN_SCHEDULER_WEIGHT..MAX_SCHEDULER_WEIGHT
         ) {
@@ -60,12 +71,14 @@ internal data class PlanningProfileForm(
             null
         }
         val profile = if (
-            startError == null && endError == null && granularityError == null &&
+            startError == null && endError == null && horizonError == null &&
+            granularityError == null &&
             stabilityError == null && softError == null
         ) {
             ScheduleCompositionProfileSnapshot(
                 dayStartMinute = requireNotNull(start),
                 dayEndMinute = requireNotNull(end),
+                firmHorizonDays = firmHorizonDays,
                 slotGranularityMinutes = slotGranularityMinutes,
                 stabilityWeight = requireNotNull(stability),
                 defaultSoftWeight = requireNotNull(soft),
@@ -77,6 +90,7 @@ internal data class PlanningProfileForm(
             profile = profile,
             startError = startError,
             endError = endError,
+            firmHorizonError = horizonError,
             granularityError = granularityError,
             stabilityWeightError = stabilityError,
             defaultSoftWeightError = softError,
@@ -91,6 +105,7 @@ internal data class PlanningProfileForm(
                 startMinute = (profile.dayStartMinute % 60).twoDigits(),
                 endHour = (profile.dayEndMinute / 60).twoDigits(),
                 endMinute = (profile.dayEndMinute % 60).twoDigits(),
+                firmHorizonDays = profile.firmHorizonDays,
                 slotGranularityMinutes = profile.slotGranularityMinutes,
                 stabilityWeight = profile.stabilityWeight.toString(),
                 defaultSoftWeight = profile.defaultSoftWeight.toString(),
@@ -120,6 +135,7 @@ internal data class PlanningProfileFormValidation(
     val profile: ScheduleCompositionProfileSnapshot?,
     val startError: String?,
     val endError: String?,
+    val firmHorizonError: String?,
     val granularityError: String?,
     val stabilityWeightError: String?,
     val defaultSoftWeightError: String?,
@@ -147,20 +163,22 @@ internal fun PlanningProfileForm.toDraftMemoryValues(): List<String> = listOf(
     startMinute,
     endHour,
     endMinute,
+    firmHorizonDays.toString(),
     slotGranularityMinutes.toString(),
     stabilityWeight,
     defaultSoftWeight,
 )
 
 internal fun planningProfileFormFromDraftMemoryValues(values: List<String>): PlanningProfileForm? {
-    if (values.size != 7) return null
+    if (values.size != 8) return null
     return PlanningProfileForm(
         startHour = values[0],
         startMinute = values[1],
         endHour = values[2],
         endMinute = values[3],
-        slotGranularityMinutes = values[4].toIntOrNull() ?: return null,
-        stabilityWeight = values[5],
-        defaultSoftWeight = values[6],
+        firmHorizonDays = values[4].toIntOrNull() ?: return null,
+        slotGranularityMinutes = values[5].toIntOrNull() ?: return null,
+        stabilityWeight = values[6],
+        defaultSoftWeight = values[7],
     )
 }

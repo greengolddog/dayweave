@@ -57,12 +57,22 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
-            PlannerSnapshotFormats.JSON_V11 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V12 -> decodeCurrentSnapshot(snapshot.payload)
+            PlannerSnapshotFormats.JSON_V11 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireFirmHorizonDaysField = false,
+                // V11 provenance was one-day only; a relabeled newer record has no authority.
+            ).copy(localScheduleCompositionProvenance = null)
             PlannerSnapshotFormats.JSON_V10 -> {
                 decodeCurrentSnapshot(
                     payload = snapshot.payload,
                     requireGoogleCalendarOutboundField = false,
-                ).copy(pendingGoogleCalendarOutbound = null)
+                    requireFirmHorizonDaysField = false,
+                ).copy(
+                    pendingGoogleCalendarOutbound = null,
+                    // V10 provenance was also one-day and cannot authorize a new firm horizon.
+                    localScheduleCompositionProvenance = null,
+                )
             }
             PlannerSnapshotFormats.JSON_V9 -> {
                 decodeCurrentSnapshot(
@@ -157,7 +167,10 @@ class RoomPlannerStateRepository(
             }
             else -> error("Unsupported planner snapshot format")
         }
-        val outboundHardened = if (snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11) {
+        val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11 ||
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V12
+        ) {
             decoded
         } else {
             // No predecessor format can mint or retain Google provider-mutation authority.
@@ -173,7 +186,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V11 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V12 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -200,7 +213,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V11,
+                payloadFormat = PlannerSnapshotFormats.JSON_V12,
             ),
         )
     }
@@ -214,6 +227,7 @@ class RoomPlannerStateRepository(
         requireLocalScheduleCompositionField: Boolean = true,
         requireScheduleCompositionProfileField: Boolean = true,
         requireGoogleCalendarOutboundField: Boolean = true,
+        requireFirmHorizonDaysField: Boolean = true,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -241,11 +255,28 @@ class RoomPlannerStateRepository(
             // An older label cannot opt into a newer scheduling policy by injecting a known field.
             JsonObject(localCompositionSafeRoot - "scheduleCompositionProfile")
         }
-        val root = if (requireGoogleCalendarOutboundField) {
+        val firmHorizonSafeRoot = if (
+            requireFirmHorizonDaysField || !requireScheduleCompositionProfileField
+        ) {
             scheduleProfileSafeRoot
         } else {
+            // V11 and predecessors default to seven days even if a newer field was injected.
+            val profile = scheduleProfileSafeRoot["scheduleCompositionProfile"]
+            if (profile is JsonObject) {
+                JsonObject(
+                    scheduleProfileSafeRoot +
+                        ("scheduleCompositionProfile" to
+                            JsonObject(profile - "firmHorizonDays")),
+                )
+            } else {
+                scheduleProfileSafeRoot
+            }
+        }
+        val root = if (requireGoogleCalendarOutboundField) {
+            firmHorizonSafeRoot
+        } else {
             // V10 and predecessors cannot gain provider-mutation authority from an injected field.
-            JsonObject(scheduleProfileSafeRoot - "pendingGoogleCalendarOutbound")
+            JsonObject(firmHorizonSafeRoot - "pendingGoogleCalendarOutbound")
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -271,6 +302,13 @@ class RoomPlannerStateRepository(
             !root.containsKey("scheduleCompositionProfile")
         ) {
             throw SerializationException("Current schedule composition profile is required")
+        }
+        if (requireFirmHorizonDaysField && requireScheduleCompositionProfileField) {
+            val profile = root["scheduleCompositionProfile"] as? JsonObject
+                ?: throw SerializationException("Current schedule composition profile is invalid")
+            if (!profile.containsKey("firmHorizonDays")) {
+                throw SerializationException("Current firm horizon is required")
+            }
         }
         if (
             requireGoogleCalendarOutboundField &&

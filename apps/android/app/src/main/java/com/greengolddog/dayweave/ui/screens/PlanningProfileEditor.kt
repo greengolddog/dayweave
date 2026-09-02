@@ -57,7 +57,7 @@ internal fun PlanningProfileCard(
     val availabilityMessage = when {
         updateState.isSaving -> "Saving the encrypted planning profile…"
         editBlockedMessage != null -> editBlockedMessage
-        else -> "Changes take effect after the day is recomposed."
+        else -> "Changes take effect after the firm horizon is recomposed."
     }
     Card(
         modifier = Modifier
@@ -66,7 +66,7 @@ internal fun PlanningProfileCard(
             .semantics { stateDescription = availabilityMessage },
     ) {
         ListItem(
-            headlineContent = { Text("Daily planning profile") },
+            headlineContent = { Text("Planning profile") },
             supportingContent = {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(
@@ -77,6 +77,11 @@ internal fun PlanningProfileCard(
                     Text(
                         "Stability ${profile.stabilityWeight} · " +
                             "soft constraints ${profile.defaultSoftWeight}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        "Firm horizon: ${planningHorizonDayLabel(profile.firmHorizonDays)}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -132,15 +137,15 @@ internal fun PlanningProfileEditorDialog(
         modifier = Modifier.testTag("planning_profile_editor"),
         onDismissRequest = { if (!updateState.isSaving) onDismiss() },
         icon = { Icon(Icons.Outlined.Schedule, contentDescription = null) },
-        title = { Text("Daily planning profile") },
+        title = { Text("Planning profile") },
         text = {
             Column(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    "Set the usable day in 24-hour time. The scheduler keeps hard commitments " +
-                        "fixed inside this window.",
+                    "Set the daily usable window and how many local calendar days belong to " +
+                        "the rolling firm plan. The scheduler keeps hard commitments fixed.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 TimeInputRow(
@@ -171,6 +176,35 @@ internal fun PlanningProfileEditorDialog(
                         form = form.copy(endMinute = sanitizePlanningTimePart(it))
                     },
                 )
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Firm horizon", style = MaterialTheme.typography.titleSmall)
+                        Text(planningHorizonDayLabel(form.firmHorizonDays))
+                    }
+                    Slider(
+                        value = form.firmHorizonDays.toFloat(),
+                        onValueChange = {
+                            form = form.copy(firmHorizonDays = it.roundToInt())
+                        },
+                        valueRange = ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS
+                            .toFloat()..
+                            ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS.toFloat(),
+                        steps = ScheduleCompositionProfileSnapshot.MAX_FIRM_HORIZON_DAYS -
+                            ScheduleCompositionProfileSnapshot.MIN_FIRM_HORIZON_DAYS - 1,
+                        enabled = enabled,
+                        modifier = Modifier
+                            .testTag("planning_firm_horizon")
+                            .semantics {
+                                contentDescription = "Firm horizon"
+                                stateDescription = planningHorizonDayLabel(form.firmHorizonDays)
+                            },
+                    )
+                    validation.firmHorizonError?.let { FormError(it) }
+                }
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -274,6 +308,9 @@ internal fun PlanningProfileEditorDialog(
         },
     )
 }
+
+internal fun planningHorizonDayLabel(days: Int): String =
+    "$days ${if (days == 1) "day" else "days"}"
 
 @Composable
 private fun TimeInputRow(
