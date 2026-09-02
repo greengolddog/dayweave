@@ -436,6 +436,40 @@ delta drain from the still-durable cursor. App lock/background, configuration
 or credential replacement, and foreground-service shutdown cancel item stream,
 poll, drain, and any stream-originated reconciliation.
 
+The same foreground lifetime also maintains the trusted native schedule
+replica for durable device-v1 credentials. `GET /v1/schedule/current` accepts
+only the exact non-cacheable `{revision,schedule}` JSON contract (including
+duplicate-key rejection and the optional public manual-placement assessments),
+then validates the revision label, digest, horizon, timezone, complete canonical
+revision map, titles, inherited sensitivity, recurrence metadata, block
+identity, overlap, and score before rendering. Installation and the endpoint's
+exact typed `404 not_found` absence are separate atomic AES-GCM planner
+transitions; generic errors can neither replace nor clear a projection. An
+exact pending publication journal or another canonical/execution mutation
+fence always wins.
+
+Foreground activation is read-first: after recovering any genuine durable
+write journal, the Mac catches up canonical items and reads the exact current
+publication before starting schedule delivery. An exact authenticated `404`
+is a read-only empty-replica result; activation does not compose or publish,
+because the publish API has no expected-head precondition. Transient,
+malformed, or binding-invalid reads retain the encrypted prior replica and
+perform no schedule write. Explicit Sync, onboarding, import, and proposal
+workflows keep their fresh-composition behavior.
+
+`GET /v1/schedule/stream` carries only monotonically increasing
+`schedule-invalidation` revision hints. It resumes from the revision number in
+the encrypted publication proof (or canonical `0` before a first publication),
+requires the exact event-stream/no-store/no-buffering headers, uses the same
+bounded parser, authentication replay, 330-second watchdog, cancellation, and
+1-to-30-second reconnect behavior as the item/execution streams, and never
+persists an SSE value. Each hint coalesces into an authoritative current-schedule
+GET, while an independent 30-second GET supplies polling catch-up. A strict
+cursor-ahead `409` after an authoritative restore also recovers only through
+GET. If publication wins the independent item-invalidation race, that same
+fenced drain catches up `/v1/items/delta`, refetches the current immutable head,
+and installs it without waiting for the next poll.
+
 Canonical items, tombstone revision watermarks, the delta cursor, durable
 pending/conflicted edits, per-session recurrence outcomes, and rendered blocks
 live in the schema-v10 AES-GCM encrypted planner snapshot. Schema-v1 through v4

@@ -662,7 +662,9 @@ struct BreakAlternativePresentationTests {
         )
         let revisionID = id(900)
         let publishedBlocks = proofBlocks ?? blocks.compactMap { block in
-            block.syncOrigin == .canonicalPreview ? proof(for: block) : nil
+            block.syncOrigin == .canonicalPreview || block.syncOrigin == .externalPreview
+                ? proof(for: block)
+                : nil
         }
         let publicationProof = includeProof ? DayWeavePublishedScheduleProof(
             configurationIdentifier: configuration,
@@ -795,16 +797,7 @@ struct BreakAlternativePresentationTests {
     private static func proof(
         for block: ScheduleBlock
     ) -> DayWeavePublishedScheduleBlockProof {
-        DayWeavePublishedScheduleBlockProof(
-            id: block.id,
-            itemID: block.sourceItemID!,
-            itemRevision: block.sourceItemRevision!,
-            occurrenceID: block.occurrenceID,
-            sessionIndex: block.sessionIndex!,
-            start: block.start,
-            end: block.end,
-            kind: block.previewKind!
-        )
+        DayWeavePublishedScheduleBlockProof(block: block)!
     }
 
     private static func item(

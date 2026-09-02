@@ -333,8 +333,15 @@ struct LocalCompositionStoreTests {
 
         let publication = try Self.pendingSchedulePublication(item: item, now: now)
         try context.planner.persistPendingSchedulePublication(publication)
-        var serverBlock = try #require(context.planner.blocks.first { $0.sourceItemID == item.id })
-        serverBlock.syncOrigin = .canonicalPreview
+        let serverBlocks = context.planner.blocks.compactMap { block -> ScheduleBlock? in
+            guard block.syncOrigin == .localComposition else { return nil }
+            var serverBlock = block
+            serverBlock.syncOrigin = block.sourceItemID == nil
+                ? .externalPreview
+                : .canonicalPreview
+            return serverBlock
+        }
+        #expect(serverBlocks.count == publication.preview.plan.blocks.count)
         let revisionID = UUID(uuidString: "b3000000-0000-4000-8000-000000000003")!
         let request = publication.preparedRequest.request.schedule
         let revision = DayWeavePublishedScheduleRevision(
@@ -350,7 +357,7 @@ struct LocalCompositionStoreTests {
         #expect(throws: PlannerSchedulePublicationError.replayedReceiptCannotAuthorize) {
             try context.planner.commitPendingSchedulePublication(
                 publication,
-                blocks: [serverBlock],
+                blocks: serverBlocks,
                 response: .init(revision: revision, replayed: true)
             )
         }
@@ -358,7 +365,7 @@ struct LocalCompositionStoreTests {
         #expect(context.planner.publishedScheduleProof == nil)
         try context.planner.commitPendingSchedulePublication(
             publication,
-            blocks: [serverBlock],
+            blocks: serverBlocks,
             response: .init(revision: revision, replayed: false)
         )
 

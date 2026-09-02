@@ -10,6 +10,25 @@ protocol DayWeaveExecutionStreamTransport: Sendable {
     ) async throws -> DayWeaveExecutionStreamCompletion
 }
 
+/// Published-schedule invalidations carry only a numeric wake-up hint. The
+/// authoritative JSON resource remains the sole source permitted to install
+/// or clear an encrypted planner projection.
+protocol DayWeaveScheduleStreamTransport: Sendable {
+    func consumeScheduleInvalidations(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveScheduleStreamCompletion
+}
+
+enum DayWeaveScheduleStreamCompletion: Equatable, Sendable {
+    case endOfStream
+    case liveEndOfStream
+    /// The server head moved behind the durable local cursor (for example,
+    /// after an authoritative restore). Callers must recover with GET and may
+    /// never infer schedule content from this number.
+    case cursorAhead(headRevision: UInt64)
+}
+
 enum DayWeaveExecutionStreamCompletion: Equatable, Sendable {
     /// The peer closed without one complete heartbeat or invalidation. This is
     /// an early transient close and reconnects with exponential backoff.
@@ -39,6 +58,9 @@ enum DayWeaveExecutionStreamProtocolError: Error, Equatable, Sendable {
     case nonMonotonicRevision
     case invalidContentType
     case invalidContentEncoding
+    case invalidCacheControl
+    case invalidPragma
+    case invalidBufferingPolicy
 }
 
 /// Incremental, byte-level parser for DayWeave's intentionally narrow SSE
@@ -66,10 +88,15 @@ struct DayWeaveExecutionSSEParser: Sendable {
     private var eventData: String?
     private var eventCount = 0
     private var lastEventRevision: UInt64
+    private let expectedEventName: String
     private(set) var hasObservedLiveness = false
 
-    init(after revision: UInt64 = 0) {
+    init(
+        after revision: UInt64 = 0,
+        expectedEventName: String = "execution-invalidation"
+    ) {
         lastEventRevision = revision
+        self.expectedEventName = expectedEventName
     }
 
     mutating func consume(_ byte: UInt8) throws -> UInt64? {
@@ -151,7 +178,7 @@ struct DayWeaveExecutionSSEParser: Sendable {
                 return nil
             }
             guard let id = eventID,
-                  eventName == "execution-invalidation",
+                  eventName == expectedEventName,
                   let data = eventData,
                   let idRevision = Self.canonicalRevision(id),
                   data == "{\"revision\":\(idRevision)}" else {

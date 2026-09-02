@@ -699,7 +699,7 @@ private struct ActiveMiniPlayer: View {
                 Label(
                     scheduleTimeRange(
                         block,
-                        timezoneName: store.scheduleProfile.timezoneName
+                        timezoneName: store.schedulePresentationTimezoneName
                     ),
                     systemImage: "timer"
                 )
@@ -929,7 +929,7 @@ private struct BreakAlternativeHandoffView: View {
                     .lineLimit(2)
                 Text(scheduleTimeRange(
                     candidate.block,
-                    timezoneName: store.scheduleProfile.timezoneName
+                    timezoneName: store.schedulePresentationTimezoneName
                 ))
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -1310,7 +1310,7 @@ private struct TodayHeader: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text(scheduleDayLabel(
                     Date.now,
-                    timezoneName: store.scheduleProfile.timezoneName
+                    timezoneName: store.schedulePresentationTimezoneName
                 ))
                     .font(.title2.weight(.semibold))
                 Text(store.lastScheduleMessage)
@@ -1397,7 +1397,7 @@ private struct ScheduleBlockView: View {
             VStack(alignment: .trailing, spacing: 2) {
                 Text(scheduleTimeLabel(
                     block.start,
-                    timezoneName: store.scheduleProfile.timezoneName
+                    timezoneName: store.schedulePresentationTimezoneName
                 ))
                     .font(.system(.caption, design: .monospaced).weight(.medium))
                 Text("\(block.durationMinutes)m")
@@ -1927,7 +1927,7 @@ private struct WillDoLaterSheet: View {
     }
 
     private var profileTimeZone: TimeZone {
-        scheduleTimeZone(store.scheduleProfile.timezoneName)
+        scheduleTimeZone(store.schedulePresentationTimezoneName)
     }
 
     private func referenceDate(for block: ScheduleBlock) -> Date {
@@ -1962,7 +1962,7 @@ private struct WillDoLaterSheet: View {
         WillDoLaterTiming.tomorrowMorning(
             after: referenceDate(for: block),
             minimum: minimumMoveStart(for: block),
-            timezoneName: store.scheduleProfile.timezoneName
+            timezoneName: store.schedulePresentationTimezoneName
         )
     }
 
@@ -2032,7 +2032,7 @@ private struct WillDoLaterSheet: View {
             if let deadline = crossed.first ?? ordered.first {
                 let label = scheduleDateTimeLabel(
                     deadline.boundary.date,
-                    timezoneName: store.scheduleProfile.timezoneName
+                    timezoneName: store.schedulePresentationTimezoneName
                 )
                 let conflict = !crossed.isEmpty
                 let suffix = (conflict ? crossed.count : ordered.count) > 1
@@ -2116,7 +2116,7 @@ private struct WillDoLaterSheet: View {
         let names = conflicts.prefix(3).map { conflict in
             WillDoLaterTiming.conflictLabel(
                 conflict,
-                timezoneName: store.scheduleProfile.timezoneName
+                timezoneName: store.schedulePresentationTimezoneName
             )
         }.joined(separator: ", ")
         Label(
@@ -2294,7 +2294,7 @@ private struct WillDoLaterSheet: View {
                         Text(violation.message)
                             .font(.caption)
                         Text(
-                            "\(scheduleDateTimeLabel(violation.start, timezoneName: store.scheduleProfile.timezoneName)) – \(scheduleDateTimeLabel(violation.end, timezoneName: store.scheduleProfile.timezoneName))"
+                            "\(scheduleDateTimeLabel(violation.start, timezoneName: store.schedulePresentationTimezoneName)) – \(scheduleDateTimeLabel(violation.end, timezoneName: store.schedulePresentationTimezoneName))"
                         )
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
@@ -3457,7 +3457,7 @@ private struct BlockInspector: View {
                         "Time",
                         value: scheduleTimeRange(
                             block,
-                            timezoneName: store.scheduleProfile.timezoneName
+                            timezoneName: store.schedulePresentationTimezoneName
                         )
                     )
                     LabeledContent("Duration", value: "\(block.durationMinutes) minutes")
@@ -3473,7 +3473,7 @@ private struct BlockInspector: View {
                                 "Deadline",
                                 value: scheduleDateTimeLabel(
                                     deadline,
-                                    timezoneName: store.scheduleProfile.timezoneName
+                                    timezoneName: store.schedulePresentationTimezoneName
                                 )
                             )
                         }
@@ -5435,7 +5435,7 @@ struct MenuBarView: View {
                     Text(active.title).font(.headline)
                     Text(scheduleTimeRange(
                         active,
-                        timezoneName: store.scheduleProfile.timezoneName
+                        timezoneName: store.schedulePresentationTimezoneName
                     ))
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -6241,7 +6241,7 @@ private struct ScheduleProfileSettingsEditor: View {
                         .foregroundStyle(.green)
                         .accessibilityIdentifier("schedule-profile.save-status")
                 }
-                Text("Saving is atomic, encrypted, and clears schedule blocks composed from the previous profile. Compose again to install a fresh plan.")
+                Text("Saving is atomic and encrypted. A proven published schedule stays in its publication timezone; this profile is used the next time you compose. Unpublished local schedule blocks are cleared.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

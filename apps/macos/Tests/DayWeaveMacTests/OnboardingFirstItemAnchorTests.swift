@@ -388,6 +388,26 @@ struct OnboardingFirstItemAnchorTests {
         itemRevision: UInt64
     ) -> DayWeavePublishedScheduleProof {
         let revisionID = UUID()
+        let block = ScheduleBlock(
+            id: UUID(),
+            title: "First planned task",
+            kind: .task,
+            start: now,
+            end: now.addingTimeInterval(1_800),
+            status: .scheduled,
+            project: nil,
+            notes: "",
+            energy: .medium,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: itemID,
+            sourceItemRevision: itemRevision,
+            occurrenceID: nil,
+            sessionIndex: 0,
+            syncOrigin: .canonicalPreview,
+            previewKind: "planned"
+        )
         return .init(
             configurationIdentifier: configurationIdentifier,
             revisionID: revisionID,
@@ -399,16 +419,7 @@ struct OnboardingFirstItemAnchorTests {
             horizonEnd: now.addingTimeInterval(86_400),
             timezoneName: "UTC",
             publishedAt: now,
-            publishedBlocks: [.init(
-                id: UUID(),
-                itemID: itemID,
-                itemRevision: itemRevision,
-                occurrenceID: nil,
-                sessionIndex: 0,
-                start: now,
-                end: now.addingTimeInterval(1_800),
-                kind: "planned"
-            )]
+            publishedBlocks: [DayWeavePublishedScheduleBlockProof(block: block)!]
         )
     }
 

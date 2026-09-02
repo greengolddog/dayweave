@@ -2978,6 +2978,7 @@ final class GoogleIntegrationStore: ObservableObject {
                 "The DayWeave API could not complete the Google request."
             }
         case .trustedSchedulePublicationStale,
+             .trustedCurrentScheduleAbsent,
              .trustedProposalApplicationAbsent,
              .trustedProposalApplicationNoEffect,
              .trustedCanonicalMutationInProgress,

@@ -42,7 +42,7 @@ struct DayWeaveServiceCoordinatorTests {
             "proposal.recover",
             "google-outbound.recover",
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
         ])
@@ -80,7 +80,7 @@ struct DayWeaveServiceCoordinatorTests {
         #expect(events.values == [
             "google-outbound.recover",
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
         ])
@@ -108,7 +108,7 @@ struct DayWeaveServiceCoordinatorTests {
         #expect(events.values == [
             "proposal.recover",
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
         ])
@@ -143,7 +143,7 @@ struct DayWeaveServiceCoordinatorTests {
             "proposal.recover",
             "proposal.recover",
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
         ])
@@ -173,7 +173,7 @@ struct DayWeaveServiceCoordinatorTests {
         #expect(!coordinator.servicesAreActive)
         #expect(events.values == [
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
             "canonical.stop",
@@ -203,7 +203,7 @@ struct DayWeaveServiceCoordinatorTests {
 
         #expect(events.values == [
             "execution.refresh",
-            "canonical.sync",
+            "canonical.bootstrap",
             "canonical.poll",
             "execution.poll",
         ])
@@ -302,6 +302,11 @@ private final class CanonicalServiceDouble: CanonicalServiceSynchronizing {
     init(events: ServiceEventLog, syncSucceeds: Bool = true) {
         self.events = events
         self.syncSucceeds = syncSucceeds
+    }
+
+    func bootstrapForegroundActivation() async -> Bool {
+        events.values.append("canonical.bootstrap")
+        return syncSucceeds
     }
 
     func syncThroughFreshComposition() async -> Bool {

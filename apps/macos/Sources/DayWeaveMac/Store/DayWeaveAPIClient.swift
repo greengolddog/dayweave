@@ -503,6 +503,9 @@ enum DayWeaveAPIError: Error, Equatable, Sendable {
     /// Emitted only for the exact, endpoint-bound stale-publication contract.
     /// Generic 409 errors never become a destructive local-state signal.
     case trustedSchedulePublicationStale
+    /// Exact authenticated `not_found` evidence from the native current-
+    /// schedule resource. Generic 404 responses never clear local state.
+    case trustedCurrentScheduleAbsent
     /// Emitted only for the exact authenticated proposal-application endpoint,
     /// media type, cache policy, and typed `not_found` envelope. Generic 404s
     /// never become evidence that an ambiguous mutation had no effect.
@@ -550,6 +553,8 @@ extension DayWeaveAPIError: LocalizedError {
             return "The DayWeave API response exceeded the safe \(limitBytes / 1_048_576) MiB limit."
         case .trustedSchedulePublicationStale:
             return "Canonical items changed before this schedule could be published."
+        case .trustedCurrentScheduleAbsent:
+            return "The authenticated server has no published schedule."
         case .trustedProposalApplicationAbsent:
             return "The exact proposal application resource is absent on the authenticated server."
         case .trustedProposalApplicationNoEffect:
@@ -1514,6 +1519,186 @@ struct DayWeaveAPIClient: Sendable {
         }
     }
 
+    /// Opens the content-free published-schedule invalidation stream. Every
+    /// revision remains an untrusted wake-up hint until the ordinary current
+    /// resource has been fetched and validated.
+    func consumeScheduleInvalidations(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveScheduleStreamCompletion {
+        try await withThrowingTaskGroup(
+            of: DayWeaveScheduleStreamCompletion.self
+        ) { group in
+            group.addTask {
+                try await consumeScheduleInvalidationsWithinLifetime(
+                    after: revision,
+                    receive
+                )
+            }
+            group.addTask {
+                try await executionStreamLifetimeSleep()
+                try Task.checkCancellation()
+                throw DayWeaveAPIError.transport(.timedOut)
+            }
+            do {
+                guard let result = try await group.next() else {
+                    throw DayWeaveAPIError.transport(.unknown)
+                }
+                group.cancelAll()
+                return result
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
+    private func consumeScheduleInvalidationsWithinLifetime(
+        after revision: UInt64,
+        _ receive: @escaping @Sendable (UInt64) async -> Void
+    ) async throws -> DayWeaveScheduleStreamCompletion {
+        guard revision <= UInt64(Int64.max) else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let endpoint: URL
+        do {
+            endpoint = try baseURL.endpoint(pathComponents: ["v1", "schedule", "stream"])
+        } catch {
+            throw DayWeaveAPIError.invalidEndpoint
+        }
+
+        var pristineRequest = URLRequest(url: endpoint)
+        pristineRequest.httpMethod = "GET"
+        pristineRequest.timeoutInterval = 330
+        pristineRequest.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        pristineRequest.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        pristineRequest.setValue(String(revision), forHTTPHeaderField: "Last-Event-ID")
+        pristineRequest.setValue("no-store", forHTTPHeaderField: "Cache-Control")
+        pristineRequest.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        pristineRequest.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+
+        let initialAuthorization: DurableAuthorization
+        if let authCoordinator {
+            do {
+                initialAuthorization = try await authCoordinator.authorization(boundTo: baseURL)
+            } catch let error as DurableAuthError {
+                throw DayWeaveAPIError.durableAuthentication(error)
+            } catch {
+                throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+            }
+        } else {
+            guard let bearerToken, !bearerToken.isEmpty else {
+                throw DayWeaveAPIError.credentialUnavailable
+            }
+            initialAuthorization = .init(
+                bearerToken: bearerToken,
+                bindingIdentifier: expectedBindingIdentifier,
+                isDurable: false
+            )
+        }
+        guard initialAuthorization.bindingIdentifier == expectedBindingIdentifier else {
+            throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+        }
+
+        var authorization = initialAuthorization
+        var tokensToRedact = [authorization.bearerToken]
+        for attemptIndex in 0...1 {
+            let result = try await performExecutionInvalidationStreamRequest(
+                pristineRequest,
+                bearer: authorization.bearerToken,
+                bindingIdentifier: initialAuthorization.bindingIdentifier,
+                initialRevision: revision,
+                expectedEventName: "schedule-invalidation",
+                requiresScheduleHeaders: true,
+                receive
+            )
+            switch result {
+            case let .endOfStream(wasLive):
+                return wasLive ? .liveEndOfStream : .endOfStream
+            case let .http(response, body):
+                let normalizedHeaders = Self.normalizedHeaders(response)
+                if attemptIndex == 0,
+                   response.statusCode == 401,
+                   let authCoordinator,
+                   DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+                       statusCode: response.statusCode,
+                       headers: normalizedHeaders,
+                       body: body
+                   ) {
+                    let recovered: DurableAuthorization
+                    do {
+                        recovered = try await authCoordinator.recoverFromUnauthorized(
+                            rejectedBearer: authorization.bearerToken,
+                            boundTo: baseURL
+                        )
+                    } catch let error as DurableAuthError {
+                        throw DayWeaveAPIError.durableAuthentication(error)
+                    } catch {
+                        throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+                    }
+                    guard recovered.bindingIdentifier == initialAuthorization.bindingIdentifier,
+                          recovered.bindingIdentifier == expectedBindingIdentifier else {
+                        throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+                    }
+                    authorization = recovered
+                    tokensToRedact.append(recovered.bearerToken)
+                    continue
+                }
+                if attemptIndex == 1,
+                   response.statusCode == 401,
+                   let authCoordinator,
+                   DayWeaveAuthResponseContract.isDefinitiveUnauthorized(
+                       statusCode: response.statusCode,
+                       headers: normalizedHeaders,
+                       body: body
+                   ) {
+                    do {
+                        try await authCoordinator.retireDefinitivelyRejectedAuthorization(
+                            authorization,
+                            boundTo: baseURL
+                        )
+                        throw DayWeaveAPIError.durableAuthentication(.reauthenticationRequired)
+                    } catch let error as DayWeaveAPIError {
+                        throw error
+                    } catch let error as DurableAuthError {
+                        throw DayWeaveAPIError.durableAuthentication(error)
+                    } catch {
+                        throw DayWeaveAPIError.durableAuthentication(.localStateUnavailable)
+                    }
+                }
+                try validatePostResponseBinding(initialAuthorization.bindingIdentifier)
+                if let head = Self.trustedScheduleCursorAhead(
+                    requestedRevision: revision,
+                    statusCode: response.statusCode,
+                    contentType: response.value(forHTTPHeaderField: "content-type"),
+                    cacheControl: response.value(forHTTPHeaderField: "cache-control"),
+                    pragma: response.value(forHTTPHeaderField: "pragma"),
+                    body: body
+                ) {
+                    return .cursorAhead(headRevision: head)
+                }
+                let envelope = try? makeDecoder().decode(ErrorEnvelope.self, from: body)
+                throw DayWeaveAPIError.server(
+                    statusCode: response.statusCode,
+                    code: DayWeaveDiagnosticSanitizer.code(
+                        envelope?.error.code,
+                        secrets: tokensToRedact
+                    ),
+                    message: DayWeaveDiagnosticSanitizer.text(
+                        envelope?.error.message,
+                        secrets: tokensToRedact,
+                        maximumCharacters: 500
+                    ),
+                    requestID: DayWeaveDiagnosticSanitizer.requestID(
+                        response.value(forHTTPHeaderField: "x-request-id"),
+                        secrets: tokensToRedact
+                    )
+                )
+            }
+        }
+        throw DayWeaveAPIError.durableAuthentication(.concurrentStateChange)
+    }
+
     private func consumeExecutionInvalidationsWithinLifetime(
         after revision: UInt64,
         _ receive: @escaping @Sendable (UInt64) async -> Void
@@ -2146,6 +2331,23 @@ struct DayWeaveAPIClient: Sendable {
         )
     }
 
+    /// Fetches the one authoritative immutable publication. A nil result is
+    /// returned only for the endpoint's exact typed 404 contract; malformed
+    /// errors, cacheable responses, duplicate keys, and widened JSON shapes
+    /// fail closed.
+    func currentPublishedSchedule() async throws -> DayWeaveCurrentPublishedSchedule? {
+        do {
+            let current: DayWeaveCurrentPublishedSchedule = try await send(
+                method: "GET",
+                pathComponents: ["v1", "schedule", "current"],
+                requiredStatusCode: 200
+            )
+            return current
+        } catch DayWeaveAPIError.trustedCurrentScheduleAbsent {
+            return nil
+        }
+    }
+
     func prepareSchedulePublication(
         _ request: DayWeaveSchedulePublishRequest
     ) throws -> DayWeavePreparedSchedulePublication {
@@ -2335,6 +2537,16 @@ struct DayWeaveAPIClient: Sendable {
             httpResponse.statusCode == $0
         } ?? (200..<300).contains(httpResponse.statusCode)
         guard hasAcceptedStatus else {
+            if pathComponents == ["v1", "schedule", "current"],
+               Self.isTrustedCurrentScheduleAbsent(
+                   statusCode: httpResponse.statusCode,
+                   contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                   cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                   pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                   body: data
+               ) {
+                throw DayWeaveAPIError.trustedCurrentScheduleAbsent
+            }
             if pathComponents == ["v1", "schedule", "publish"],
                Self.isTrustedSchedulePublicationStale(
                    statusCode: httpResponse.statusCode,
@@ -2396,6 +2608,16 @@ struct DayWeaveAPIClient: Sendable {
         }
 
         do {
+            if pathComponents == ["v1", "schedule", "current"],
+               !Self.isValidCurrentScheduleResponse(
+                   contentType: httpResponse.value(forHTTPHeaderField: "content-type"),
+                   cacheControl: httpResponse.value(forHTTPHeaderField: "cache-control"),
+                   pragma: httpResponse.value(forHTTPHeaderField: "pragma"),
+                   etag: httpResponse.value(forHTTPHeaderField: "etag"),
+                   body: data
+               ) {
+                throw DayWeaveAPIError.responseDecodingFailed
+            }
             if pathComponents.contains("outbound"),
                !StrictJSONObjectKeyScanner.hasUniqueKeys(in: data) {
                 throw DayWeaveAPIError.responseDecodingFailed
@@ -2681,6 +2903,580 @@ struct DayWeaveAPIClient: Sendable {
         return true
     }
 
+    private static func isTrustedCurrentScheduleAbsent(
+        statusCode: Int,
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> Bool {
+        guard statusCode == 404,
+              body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              isNoStoreZeroAge(cacheControl),
+              pragma?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              Set(error.keys) == ["code", "message"],
+              error["code"] as? String == "not_found",
+              error["message"] as? String == "Published schedule was not found" else {
+            return false
+        }
+        return true
+    }
+
+    private static func trustedScheduleCursorAhead(
+        requestedRevision: UInt64,
+        statusCode: Int,
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        body: Data
+    ) -> UInt64? {
+        guard statusCode == 409,
+              body.count <= 8 * 1_024,
+              isStrictJSONMediaType(contentType),
+              isNoStoreZeroAge(cacheControl),
+              pragma?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              Set(outer.keys) == ["error"],
+              let error = outer["error"] as? [String: Any],
+              Set(error.keys) == ["code", "message", "details"],
+              error["code"] as? String == "conflict",
+              error["message"] as? String
+                == "schedule stream cursor is ahead of authoritative state",
+              let details = error["details"] as? [String: Any],
+              Set(details.keys) == ["cursor_revision", "head_revision"],
+              let cursor = strictUnsignedJSONInteger(details["cursor_revision"]),
+              let head = strictUnsignedJSONInteger(details["head_revision"]),
+              cursor == requestedRevision,
+              head < cursor,
+              head <= UInt64(Int64.max) else { return nil }
+        return head
+    }
+
+    private static func strictUnsignedJSONInteger(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let parsed = UInt64(number.stringValue),
+              parsed <= UInt64(Int64.max),
+              number.stringValue == String(parsed) else { return nil }
+        return parsed
+    }
+
+    private static func isValidCurrentScheduleResponse(
+        contentType: String?,
+        cacheControl: String?,
+        pragma: String?,
+        etag: String?,
+        body: Data
+    ) -> Bool {
+        guard body.count <= Self.maximumResponseBytes,
+              isStrictJSONMediaType(contentType),
+              isNoStoreZeroAge(cacheControl),
+              pragma?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                == "no-cache",
+              StrictJSONObjectKeyScanner.hasUniqueKeys(in: body),
+              let outer = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              exactKeys(outer, required: ["revision", "schedule"]),
+              let revision = outer["revision"] as? [String: Any],
+              exactKeys(revision, required: [
+                  "id", "revision", "revision_number", "input_digest",
+                  "horizon_start", "horizon_end", "timezone_name", "published_at",
+              ]),
+              let revisionLabel = revision["revision"] as? String,
+              let timezoneName = revision["timezone_name"] as? String,
+              DayWeaveCanonicalItemDraft.supportedTimeZone(identifier: timezoneName) != nil,
+              etag == "\"\(revisionLabel)\"",
+              let schedule = outer["schedule"] as? [String: Any],
+              exactKeys(
+                  schedule,
+                  required: [
+                      "input_digest", "source_item_count", "accepted_item_count",
+                      "source_item_revisions", "rejected_items",
+                      "ignored_previous_assignments", "plan",
+                  ],
+                  optional: ["manual_placement_assessments"]
+              ),
+              schedule["source_item_revisions"] is [String: Any],
+              exactArrayObjects(
+                  schedule["rejected_items"],
+                  required: ["item_id", "is_sensitive", "title", "reason"]
+              ),
+              exactArrayObjects(
+                  schedule["ignored_previous_assignments"],
+                  required: ["item_id", "requested_revision", "current_revision", "reason"]
+              ),
+              let plan = schedule["plan"] as? [String: Any],
+              exactKeys(plan, required: [
+                  "as_of", "horizon_start", "horizon_end", "blocks", "unscheduled",
+                  "decisions", "violations", "score", "occurrences",
+              ]),
+              exactArrayObjects(
+                  plan["blocks"],
+                  required: [
+                      "id", "is_sensitive", "item_id", "occurrence_id",
+                      "external_block_id", "title", "start", "end", "session_index",
+                      "kind", "explanations",
+                  ]
+              ),
+              exactArrayObjects(
+                  plan["unscheduled"],
+                  required: ["item_id", "occurrence_id", "remaining", "reason", "message"]
+              ),
+              exactArrayObjects(
+                  plan["occurrences"],
+                  required: [
+                      "id", "series_item_id", "identity", "nominal_start", "nominal_end",
+                      "window_start", "window_end", "local_date", "ordinal", "state",
+                  ]
+              ),
+              let score = plan["score"] as? [String: Any],
+              exactKeys(score, required: [
+                  "scheduled_minutes", "unscheduled_minutes", "soft_penalty", "moved_minutes",
+              ]),
+              let references = strictCurrentScheduleReferences(schedule: schedule, plan: plan),
+              strictRejectedItems(schedule["rejected_items"], references: references),
+              strictIgnoredPreviousAssignments(
+                  schedule["ignored_previous_assignments"],
+                  references: references
+              ),
+              strictUnscheduledWork(plan["unscheduled"], references: references),
+              strictPlanDecisions(plan["decisions"], references: references),
+              strictPlanViolations(plan["violations"], references: references),
+              strictManualPlacementAssessments(
+                  schedule["manual_placement_assessments"],
+                  references: references
+              ),
+              strictBlockExplanations(plan["blocks"]) else { return false }
+        return true
+    }
+
+    private static func isNoStoreZeroAge(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } == ["no-store", "max-age=0"]
+    }
+
+    private static func isNoStoreNoCache(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return value.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        } == ["no-store", "no-cache"]
+    }
+
+    private static func exactKeys(
+        _ object: [String: Any],
+        required: Set<String>,
+        optional: Set<String> = []
+    ) -> Bool {
+        let keys = Set(object.keys)
+        return required.isSubset(of: keys) && keys.isSubset(of: required.union(optional))
+    }
+
+    private static func exactArrayObjects(
+        _ value: Any?,
+        required: Set<String>,
+        optional: Set<String> = []
+    ) -> Bool {
+        guard let values = value as? [Any] else { return false }
+        return values.allSatisfy {
+            guard let object = $0 as? [String: Any] else { return false }
+            return exactKeys(object, required: required, optional: optional)
+        }
+    }
+
+    private static func strictBlockExplanations(_ value: Any?) -> Bool {
+        let codes: Set<String> = [
+            "fixed_event", "pinned", "hard_deadline", "goal_progress", "habit_or_routine",
+            "priority", "preferred_window", "context_match", "energy_match", "dependency",
+            "stable_time", "earliest_available", "split_session",
+        ]
+        guard let blocks = value as? [Any] else { return false }
+        return blocks.allSatisfy { rawBlock in
+            guard let block = rawBlock as? [String: Any],
+                  let explanations = block["explanations"] as? [Any],
+                  explanations.count <= 64 else { return false }
+            return explanations.allSatisfy { rawExplanation in
+                guard let explanation = rawExplanation as? [String: Any],
+                      exactKeys(explanation, required: ["code", "message"]),
+                      let code = explanation["code"] as? String,
+                      codes.contains(code) else { return false }
+                return strictNonemptyText(explanation["message"], maximumScalars: 4_000)
+            }
+        }
+    }
+
+    private struct CurrentScheduleReferences {
+        let itemIDs: Set<UUID>
+        let occurrenceItems: [UUID: UUID]
+    }
+
+    private static func strictCurrentScheduleReferences(
+        schedule: [String: Any],
+        plan: [String: Any]
+    ) -> CurrentScheduleReferences? {
+        guard let rawRevisions = schedule["source_item_revisions"] as? [String: Any],
+              let rawOccurrences = plan["occurrences"] as? [Any] else { return nil }
+        var itemIDs = Set<UUID>()
+        for (rawID, rawRevision) in rawRevisions {
+            guard let id = strictCanonicalUUID(rawID),
+                  let revision = strictUnsignedJSONInteger(rawRevision),
+                  revision > 0,
+                  itemIDs.insert(id).inserted else { return nil }
+        }
+        var occurrenceItems: [UUID: UUID] = [:]
+        for rawOccurrence in rawOccurrences {
+            guard let occurrence = rawOccurrence as? [String: Any],
+                  let rawID = occurrence["id"] as? String,
+                  let id = strictCanonicalUUID(rawID),
+                  let rawSeriesID = occurrence["series_item_id"] as? String,
+                  let seriesID = strictCanonicalUUID(rawSeriesID),
+                  itemIDs.contains(seriesID),
+                  occurrenceItems.updateValue(seriesID, forKey: id) == nil else { return nil }
+        }
+        return .init(itemIDs: itemIDs, occurrenceItems: occurrenceItems)
+    }
+
+    private static func strictRejectedItems(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        guard let values = value as? [Any] else { return false }
+        var itemIDs = Set<UUID>()
+        return values.allSatisfy { rawItem in
+            guard let item = rawItem as? [String: Any],
+                  let rawItemID = item["item_id"] as? String,
+                  let itemID = strictCanonicalUUID(rawItemID),
+                  references.itemIDs.contains(itemID),
+                  itemIDs.insert(itemID).inserted,
+                  strictJSONBoolean(item["is_sensitive"]) != nil,
+                  strictNonemptyText(item["title"], maximumScalars: 500),
+                  strictNonemptyText(item["reason"], maximumScalars: 4_000)
+            else { return false }
+            return true
+        }
+    }
+
+    private static func strictIgnoredPreviousAssignments(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        guard let values = value as? [Any] else { return false }
+        // The wire form intentionally omits occurrence_id. Repeated item IDs
+        // can therefore represent distinct ignored recurrence assignments.
+        return values.allSatisfy { rawAssignment in
+            guard let assignment = rawAssignment as? [String: Any],
+                  let rawItemID = assignment["item_id"] as? String,
+                  let itemID = strictCanonicalUUID(rawItemID),
+                  references.itemIDs.contains(itemID),
+                  let requested = strictUnsignedJSONInteger(assignment["requested_revision"]),
+                  requested > 0,
+                  let current = strictOptionalUnsignedJSONInteger(
+                      assignment["current_revision"]
+                  ),
+                  current.value.map({ $0 > 0 }) ?? true,
+                  strictNonemptyText(assignment["reason"], maximumScalars: 4_000)
+            else { return false }
+            return true
+        }
+    }
+
+    private static func strictUnscheduledWork(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        let reasons: Set<String> = [
+            "missing_duration", "no_capacity", "hard_constraint", "blocked",
+            "dependency_unavailable", "dependency_cycle", "session_limit",
+        ]
+        guard let values = value as? [Any] else { return false }
+        var identities = Set<String>()
+        return values.allSatisfy { rawWork in
+            guard let work = rawWork as? [String: Any],
+                  let rawItemID = work["item_id"] as? String,
+                  let itemID = strictCanonicalUUID(rawItemID),
+                  references.itemIDs.contains(itemID),
+                  let occurrence = strictOptionalCanonicalUUID(work["occurrence_id"]),
+                  occurrence.value.map({ references.occurrenceItems[$0] != nil }) ?? true,
+                  strictFullUnsignedJSONInteger(work["remaining"]) != nil,
+                  let reason = work["reason"] as? String,
+                  reasons.contains(reason),
+                  strictNonemptyText(work["message"], maximumScalars: 4_000)
+            else { return false }
+            let identity = "\(rawItemID):\(occurrence.value?.uuidString.lowercased() ?? "-")"
+            return identities.insert(identity).inserted
+        }
+    }
+
+    private static func strictPlanDecisions(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        let kinds: Set<String> = [
+            "container_rolled_up", "terminal_item_ignored", "fixed_event_retained",
+            "scheduled", "partially_scheduled", "kept_pinned",
+        ]
+        guard let decisions = value as? [Any] else { return false }
+        return decisions.allSatisfy { rawDecision in
+            guard let decision = rawDecision as? [String: Any],
+                  exactKeys(
+                      decision,
+                      required: ["item_id", "occurrence_id", "kind", "message"]
+                  ),
+                  let rawItemID = decision["item_id"] as? String,
+                  let itemID = strictCanonicalUUID(rawItemID),
+                  references.itemIDs.contains(itemID),
+                  let kind = decision["kind"] as? String,
+                  kinds.contains(kind),
+                  strictNonemptyText(decision["message"], maximumScalars: 4_000),
+                  let occurrence = strictOptionalCanonicalUUID(decision["occurrence_id"])
+            else { return false }
+            return occurrence.value.map { references.occurrenceItems[$0] != nil } ?? true
+        }
+    }
+
+    private static func strictPlanViolations(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        let kinds: Set<String> = [
+            "soft_constraint", "fixed_overlap", "pinned_conflict", "deadline_risk",
+            "dependency", "buffer_compressed", "capacity",
+        ]
+        let severities: Set<String> = ["warning", "error"]
+        guard let violations = value as? [Any] else { return false }
+        return violations.allSatisfy { rawViolation in
+            guard let violation = rawViolation as? [String: Any],
+                  exactKeys(violation, required: [
+                      "kind", "severity", "item_ids", "occurrence_ids", "start", "end",
+                      "penalty", "message",
+                  ]),
+                  let kind = violation["kind"] as? String,
+                  kinds.contains(kind),
+                  let severity = violation["severity"] as? String,
+                  severities.contains(severity),
+                  let itemIDs = strictCanonicalUUIDArray(violation["item_ids"]),
+                  itemIDs.allSatisfy(references.itemIDs.contains),
+                  let occurrenceIDs = strictCanonicalUUIDArray(violation["occurrence_ids"]),
+                  occurrenceIDs.allSatisfy({ references.occurrenceItems[$0] != nil }),
+                  strictFullUnsignedJSONInteger(violation["penalty"]) != nil,
+                  strictNonemptyText(violation["message"], maximumScalars: 2_000),
+                  let start = strictOptionalTimestamp(violation["start"]),
+                  let end = strictOptionalTimestamp(violation["end"])
+            else { return false }
+            switch (start.value, end.value) {
+            case (nil, nil):
+                return true
+            case let (.some(start), .some(end)):
+                return start < end
+            default:
+                return false
+            }
+        }
+    }
+
+    private static func strictManualPlacementAssessments(
+        _ value: Any?,
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        guard let value else { return true }
+        guard let assessments = value as? [Any],
+              !assessments.isEmpty,
+              assessments.count <= 64 else { return false }
+        var placementIDs = Set<UUID>()
+        var totalViolations = 0
+        var totalConflictFacts = 0
+        return assessments.allSatisfy { rawAssessment in
+            guard let assessment = rawAssessment as? [String: Any],
+                  exactKeys(assessment, required: [
+                      "placement_id", "environment_digest", "approval_digest",
+                      "approval_required", "violations",
+                  ]),
+                  let rawPlacementID = assessment["placement_id"] as? String,
+                  let placementID = strictCanonicalUUID(rawPlacementID),
+                  placementIDs.insert(placementID).inserted,
+                  strictSHA256Digest(assessment["environment_digest"]),
+                  strictSHA256Digest(assessment["approval_digest"]),
+                  let approvalRequired = strictJSONBoolean(assessment["approval_required"]),
+                  let violations = assessment["violations"] as? [Any],
+                  !approvalRequired || !violations.isEmpty,
+                  totalViolations <= 4_096 - violations.count else { return false }
+            totalViolations += violations.count
+            return violations.allSatisfy { rawViolation in
+                guard let violation = rawViolation as? [String: Any],
+                      exactKeys(violation, required: [
+                          "code", "item_ids", "occurrence_ids", "conflicting_block_ids",
+                          "conflicting_blocks", "start", "end", "boundary_start",
+                          "boundary_end", "message",
+                      ]),
+                      let conflicts = violation["conflicting_blocks"] as? [Any],
+                      totalConflictFacts <= 4_096 - conflicts.count,
+                      strictManualPlacementViolation(violation, references: references)
+                else { return false }
+                totalConflictFacts += conflicts.count
+                return true
+            }
+        }
+    }
+
+    private static func strictManualPlacementViolation(
+        _ violation: [String: Any],
+        references: CurrentScheduleReferences
+    ) -> Bool {
+        let codes: Set<String> = [
+            "outside_availability", "earliest_start", "latest_finish", "minimum_notice",
+            "allowed_weekday", "preferred_daily_window", "preferred_absolute_window",
+            "forbidden_window", "required_context", "required_location",
+            "required_capabilities", "energy", "dependency", "maximum_daily_work",
+            "maximum_weekly_work", "buffer_compressed", "immutable_overlap",
+        ]
+        guard let code = violation["code"] as? String,
+              codes.contains(code),
+              let itemIDs = strictCanonicalUUIDArray(violation["item_ids"]),
+              itemIDs.allSatisfy(references.itemIDs.contains),
+              let occurrenceIDs = strictCanonicalUUIDArray(violation["occurrence_ids"]),
+              occurrenceIDs.allSatisfy({ references.occurrenceItems[$0] != nil }),
+              let conflictingBlockIDs = strictCanonicalUUIDArray(
+                  violation["conflicting_block_ids"]
+              ),
+              let start = strictTimestamp(violation["start"]),
+              let end = strictTimestamp(violation["end"]),
+              start < end,
+              strictOptionalTimestamp(violation["boundary_start"]) != nil,
+              strictOptionalTimestamp(violation["boundary_end"]) != nil,
+              strictNonemptyText(violation["message"], maximumScalars: 4_000),
+              let rawConflicts = violation["conflicting_blocks"] as? [Any] else { return false }
+        var conflictIDs = Set<UUID>()
+        for rawConflict in rawConflicts {
+            guard let conflict = rawConflict as? [String: Any],
+                  exactKeys(conflict, required: [
+                      "block_id", "item_id", "occurrence_id", "external_block_id", "kind",
+                      "start", "end",
+                  ]),
+                  let rawBlockID = conflict["block_id"] as? String,
+                  let blockID = strictCanonicalUUID(rawBlockID),
+                  conflictIDs.insert(blockID).inserted,
+                  let item = strictOptionalCanonicalUUID(conflict["item_id"]),
+                  let occurrence = strictOptionalCanonicalUUID(conflict["occurrence_id"]),
+                  let external = strictOptionalCanonicalUUID(conflict["external_block_id"]),
+                  let kind = conflict["kind"] as? String,
+                  ["planned", "pinned", "calendar_event", "external_fixed"].contains(kind),
+                  let conflictStart = strictTimestamp(conflict["start"]),
+                  let conflictEnd = strictTimestamp(conflict["end"]),
+                  conflictStart < conflictEnd else { return false }
+            if kind == "external_fixed" {
+                guard item.value == nil,
+                      occurrence.value == nil,
+                      external.value == blockID else {
+                    return false
+                }
+            } else {
+                guard external.value == nil,
+                      let itemID = item.value,
+                      references.itemIDs.contains(itemID),
+                      occurrence.value.map({ references.occurrenceItems[$0] != nil }) ?? true
+                else { return false }
+            }
+        }
+        return conflictIDs == Set(conflictingBlockIDs)
+    }
+
+    private static func strictCanonicalUUIDArray(_ value: Any?) -> [UUID]? {
+        guard let values = value as? [Any] else { return nil }
+        var result: [UUID] = []
+        var unique = Set<UUID>()
+        result.reserveCapacity(values.count)
+        for value in values {
+            guard let raw = value as? String,
+                  let id = strictCanonicalUUID(raw),
+                  unique.insert(id).inserted else { return nil }
+            result.append(id)
+        }
+        return result
+    }
+
+    private static func strictCanonicalUUID(_ value: String) -> UUID? {
+        guard value != "00000000-0000-0000-0000-000000000000",
+              let id = UUID(uuidString: value),
+              id.uuidString.lowercased() == value else { return nil }
+        return id
+    }
+
+    private static func strictOptionalCanonicalUUID(
+        _ value: Any?
+    ) -> (value: UUID?, valid: Bool)? {
+        guard let value else { return nil }
+        if value is NSNull { return (nil, true) }
+        guard let raw = value as? String,
+              let id = strictCanonicalUUID(raw) else { return nil }
+        return (id, true)
+    }
+
+    private static func strictTimestamp(_ value: Any?) -> Date? {
+        guard let raw = value as? String else { return nil }
+        return parseDate(raw)
+    }
+
+    private static func strictOptionalTimestamp(
+        _ value: Any?
+    ) -> (value: Date?, valid: Bool)? {
+        guard let value else { return nil }
+        if value is NSNull { return (nil, true) }
+        guard let date = strictTimestamp(value) else { return nil }
+        return (date, true)
+    }
+
+    private static func strictOptionalUnsignedJSONInteger(
+        _ value: Any?
+    ) -> (value: UInt64?, valid: Bool)? {
+        guard let value else { return nil }
+        if value is NSNull { return (nil, true) }
+        guard let parsed = strictUnsignedJSONInteger(value) else { return nil }
+        return (parsed, true)
+    }
+
+    /// Plan evidence is modeled as Rust `u64` and is not constrained by the
+    /// signed PostgreSQL revision domain used by cursors and entity revisions.
+    private static func strictFullUnsignedJSONInteger(_ value: Any?) -> UInt64? {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              let parsed = UInt64(number.stringValue),
+              number.stringValue == String(parsed) else { return nil }
+        return parsed
+    }
+
+    private static func strictSHA256Digest(_ value: Any?) -> Bool {
+        guard let value = value as? String,
+              value.utf8.count == 71,
+              value.hasPrefix("sha256:") else { return false }
+        return value.utf8.dropFirst(7).allSatisfy {
+            ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+        }
+    }
+
+    private static func strictJSONBoolean(_ value: Any?) -> Bool? {
+        guard let value = value as? NSNumber,
+              CFGetTypeID(value) == CFBooleanGetTypeID() else { return nil }
+        return value.boolValue
+    }
+
+    private static func strictNonemptyText(
+        _ value: Any?,
+        maximumScalars: Int = .max
+    ) -> Bool {
+        guard let value = value as? String,
+              !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              value.unicodeScalars.count <= maximumScalars else { return false }
+        return !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+    }
+
     private static func isStrictJSONMediaType(_ value: String?) -> Bool {
         guard let value else { return false }
         let components = value.split(separator: ";", omittingEmptySubsequences: false)
@@ -2767,6 +3563,8 @@ struct DayWeaveAPIClient: Sendable {
         bearer: String,
         bindingIdentifier: String,
         initialRevision: UInt64,
+        expectedEventName: String = "execution-invalidation",
+        requiresScheduleHeaders: Bool = false,
         _ receive: @escaping @Sendable (UInt64) async -> Void
     ) async throws -> DayWeaveExecutionStreamAttemptResult {
         var request = pristineRequest
@@ -2818,9 +3616,29 @@ struct DayWeaveAPIClient: Sendable {
                 ) else {
                     throw DayWeaveExecutionStreamProtocolError.invalidContentEncoding
                 }
+                if requiresScheduleHeaders {
+                    guard Self.isNoStoreNoCache(
+                        response.value(forHTTPHeaderField: "cache-control")
+                    ) else {
+                        throw DayWeaveExecutionStreamProtocolError.invalidCacheControl
+                    }
+                    guard response.value(forHTTPHeaderField: "pragma")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        == "no-cache" else {
+                        throw DayWeaveExecutionStreamProtocolError.invalidPragma
+                    }
+                    guard response.value(forHTTPHeaderField: "x-accel-buffering")?
+                        .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                        == "no" else {
+                        throw DayWeaveExecutionStreamProtocolError.invalidBufferingPolicy
+                    }
+                }
                 try validatePostResponseBinding(bindingIdentifier)
 
-                var parser = DayWeaveExecutionSSEParser(after: initialRevision)
+                var parser = DayWeaveExecutionSSEParser(
+                    after: initialRevision,
+                    expectedEventName: expectedEventName
+                )
                 for try await byte in bytes {
                     try Task.checkCancellation()
                     if let revision = try parser.consume(byte) {
@@ -3029,7 +3847,8 @@ struct DayWeaveAPIClient: Sendable {
 extension DayWeaveAPIClient:
     GoogleOutboundTransport,
     DayWeaveExecutionStreamTransport,
-    DayWeaveItemStreamTransport {}
+    DayWeaveItemStreamTransport,
+    DayWeaveScheduleStreamTransport {}
 
 private enum DayWeaveExecutionStreamAttemptResult: Sendable {
     case endOfStream(wasLive: Bool)

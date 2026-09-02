@@ -70,7 +70,7 @@ struct CalendarDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
     @State private var selectedDate = Date()
 
-    private var timezoneName: String { store.scheduleProfile.timezoneName }
+    private var timezoneName: String { store.schedulePresentationTimezoneName }
     private var calendar: Calendar {
         PlannerPresentation.calendar(timezoneName: timezoneName)
     }
@@ -231,7 +231,7 @@ struct HabitsDestinationView: View {
         PlannerPresentation.blocks(
             store.blocks,
             intersectingDayContaining: Date(),
-            timezoneName: store.scheduleProfile.timezoneName
+            timezoneName: store.schedulePresentationTimezoneName
         )
             .filter { $0.kind == .habit }
             .sorted { $0.start < $1.start }
@@ -254,7 +254,7 @@ struct HabitsDestinationView: View {
                     PlanningCard(
                         block: habit,
                         detail: habit.notes,
-                        timezoneName: store.scheduleProfile.timezoneName
+                        timezoneName: store.schedulePresentationTimezoneName
                     ) {
                         if habit.sourceItemID != nil {
                             AuthoritativeExecutionControls(
@@ -338,7 +338,7 @@ struct ProjectsDestinationView: View {
                                 Text(block.title).lineLimit(1)
                                 Spacer()
                                 Text(block.timeRange(
-                                    timezoneName: store.scheduleProfile.timezoneName
+                                    timezoneName: store.schedulePresentationTimezoneName
                                 ))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
@@ -375,7 +375,7 @@ struct GoalsDestinationView: View {
                     PlanningCard(
                         block: goal,
                         detail: goal.notes,
-                        timezoneName: store.scheduleProfile.timezoneName
+                        timezoneName: store.schedulePresentationTimezoneName
                     ) {
                         Button("Open") { store.select(goal) }
                         Button("Complete") { store.complete(goal.id) }
@@ -404,7 +404,7 @@ struct StatisticsDestinationView: View {
         PlannerPresentation.blocks(
             store.blocks,
             intersectingDayContaining: Date(),
-            timezoneName: store.scheduleProfile.timezoneName
+            timezoneName: store.schedulePresentationTimezoneName
         )
         .filter(\.contributesToExecutionPresentation)
     }

@@ -83,7 +83,7 @@ struct ScheduleProfileTests {
         }
     }
 
-    @Test("publication proof round-trips, accepts horizon overlap, and schema 13 gains no proof")
+    @Test("v2 publication proof seals item and external static fields across restart")
     func publicationProofPersistenceAndMigration() throws {
         let context = try Self.persistenceContext()
         defer { try? FileManager.default.removeItem(at: context.directory) }
@@ -95,6 +95,7 @@ struct ScheduleProfileTests {
         let revisionID = UUID(uuidString: "f4000000-0000-4000-8000-000000000004")!
         let block = ScheduleBlock(
             id: blockID,
+            isSensitive: item.isSensitive,
             title: item.title,
             kind: .task,
             start: Self.date("2026-08-29T23:30:00Z"),
@@ -114,6 +115,29 @@ struct ScheduleProfileTests {
             placementReason: nil,
             previewKind: "pinned"
         )
+        let externalBlockID = UUID(
+            uuidString: "f5000000-0000-4000-8000-000000000005"
+        )!
+        let externalBlock = ScheduleBlock(
+            id: externalBlockID,
+            isSensitive: true,
+            title: "Private fixed context",
+            kind: .breakTime,
+            start: Self.date("2026-08-30T01:00:00Z"),
+            end: Self.date("2026-08-30T02:00:00Z"),
+            status: .scheduled,
+            project: nil,
+            notes: "",
+            energy: .medium,
+            isFlexible: false,
+            isHardConstraint: true,
+            actualMinutes: nil,
+            externalBlockID: externalBlockID,
+            sessionIndex: 0,
+            syncOrigin: .externalPreview,
+            placementReason: "Fixed context",
+            previewKind: "external_fixed"
+        )
         let provenance = SchedulePreviewProvenance(
             configurationIdentifier: "fixture",
             generatedAt: savedAt,
@@ -121,6 +145,10 @@ struct ScheduleProfileTests {
             horizonStart: horizonStart,
             horizonEnd: horizonEnd,
             timezoneName: "UTC"
+        )
+        let blockProof = try #require(DayWeavePublishedScheduleBlockProof(block: block))
+        let externalProof = try #require(
+            DayWeavePublishedScheduleBlockProof(block: externalBlock)
         )
         let proof = DayWeavePublishedScheduleProof(
             configurationIdentifier: "fixture",
@@ -133,24 +161,17 @@ struct ScheduleProfileTests {
             horizonEnd: horizonEnd,
             timezoneName: "UTC",
             publishedAt: savedAt,
-            publishedBlocks: [.init(
-                id: blockID,
-                itemID: item.id,
-                itemRevision: item.revision,
-                occurrenceID: nil,
-                sessionIndex: 7,
-                start: block.start,
-                end: block.end,
-                kind: "pinned"
-            )]
+            publishedBlocks: [blockProof, externalProof]
         )
         #expect(proof.hasValidShape)
-        #expect(proof.matchesPublishedPlan([block]))
-        let current = PlannerSnapshot(
+        #expect(proof.hasCurrentImmutablePlanSeal)
+        #expect(proof.matchesPublishedPlan([block, externalBlock]))
+        func snapshot(blocks: [ScheduleBlock]) throws -> PlannerSnapshot {
+            PlannerSnapshot(
             savedAt: savedAt,
             destination: .today,
             selectedBlockID: block.id,
-            blocks: [block],
+            blocks: blocks,
             suggestions: [],
             assistantMessages: [],
             lastScheduleMessage: "published",
@@ -165,12 +186,28 @@ struct ScheduleProfileTests {
             canonicalConfigurationIdentifier: "fixture",
             schedulePreviewProvenance: provenance,
             publishedScheduleProof: proof
-        )
+            )
+        }
+        let current = try snapshot(blocks: [block, externalBlock])
 
         try context.persistence.save(current)
         let restored = try #require(try context.persistence.load())
         #expect(restored.publishedScheduleProof == proof)
-        #expect(restored.blocks == [block])
+        #expect(restored.blocks == [block, externalBlock])
+
+        var tamperedExternal = externalBlock
+        tamperedExternal.title = "Injected fixed context"
+        #expect(throws: PlannerPersistenceError.snapshotDecodingFailed) {
+            _ = try snapshot(blocks: [block, tamperedExternal]).migratedToCurrentSchema()
+        }
+        var tamperedItem = block
+        tamperedItem.energy = .deep
+        #expect(throws: PlannerPersistenceError.snapshotDecodingFailed) {
+            _ = try snapshot(blocks: [tamperedItem, externalBlock]).migratedToCurrentSchema()
+        }
+        #expect(throws: PlannerPersistenceError.snapshotDecodingFailed) {
+            _ = try snapshot(blocks: [block]).migratedToCurrentSchema()
+        }
 
         let legacy = PlannerSnapshot(
             schemaVersion: 13,
@@ -197,6 +234,121 @@ struct ScheduleProfileTests {
         #expect(migrated.schemaVersion == PlannerSnapshot.currentSchemaVersion)
         #expect(migrated.publishedScheduleProof == nil)
         #expect(migrated.blocks == [block])
+    }
+
+    @Test("published timezone owns Today and move-day boundaries across profile edits")
+    func authoritativeTimezoneSurvivesProfileEditAcrossMidnight() throws {
+        let context = try Self.persistenceContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let now = Self.date("2027-01-15T23:30:00Z")
+        let horizonStart = Self.date("2027-01-15T08:00:00Z")
+        let horizonEnd = Self.date("2027-01-16T08:00:00Z")
+        let item = try Self.canonicalItem()
+        let block = ScheduleBlock(
+            id: UUID(),
+            isSensitive: item.isSensitive,
+            title: item.title,
+            kind: .task,
+            start: Self.date("2027-01-15T10:00:00Z"),
+            end: Self.date("2027-01-15T10:30:00Z"),
+            status: .scheduled,
+            project: nil,
+            notes: item.notes ?? "",
+            energy: .medium,
+            isFlexible: true,
+            isHardConstraint: false,
+            actualMinutes: nil,
+            sourceItemID: item.id,
+            sourceItemRevision: item.revision,
+            occurrenceID: nil,
+            sessionIndex: 0,
+            syncOrigin: .canonicalPreview,
+            placementReason: "Remote publication",
+            previewKind: "planned"
+        )
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: "fixture",
+            generatedAt: now,
+            asOf: now,
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            timezoneName: "America/Los_Angeles"
+        )
+        let revisionID = UUID()
+        let proof = DayWeavePublishedScheduleProof(
+            configurationIdentifier: "fixture",
+            revisionID: revisionID,
+            revision: "1:\(revisionID.uuidString.lowercased())",
+            revisionNumber: 1,
+            inputDigest: "sha256:\(String(repeating: "d", count: 64))",
+            asOf: now,
+            horizonStart: horizonStart,
+            horizonEnd: horizonEnd,
+            timezoneName: provenance.timezoneName,
+            publishedAt: now,
+            publishedBlocks: [try #require(
+                DayWeavePublishedScheduleBlockProof(block: block)
+            )]
+        )
+        let initialProfile = try Self.profile(timezoneName: "Asia/Tokyo")
+        let planner = PlannerStore(
+            blocks: [block],
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: "fixture",
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: proof,
+            scheduleProfile: initialProfile,
+            previewValidatedForCurrentLaunch: true,
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            autosaveDelay: .seconds(60),
+            now: { now }
+        )
+        planner.flushPersistence()
+        try #require(planner.persistenceError == nil)
+
+        #expect(planner.schedulePresentationTimezoneName == "America/Los_Angeles")
+        #expect(planner.todaysBlocks.map(\.id) == [block.id])
+        #expect(planner.canonicalPreviewFreshnessIssue == nil)
+
+        let replacement = try Self.profile(timezoneName: "Pacific/Auckland")
+        try planner.updateScheduleProfile(
+            replacement,
+            expectedCurrentProfile: initialProfile
+        )
+
+        #expect(planner.scheduleProfile == replacement)
+        #expect(planner.blocks.map(\.id) == [block.id])
+        #expect(planner.publishedScheduleProof == proof)
+        #expect(planner.schedulePresentationTimezoneName == "America/Los_Angeles")
+        #expect(planner.todaysBlocks.map(\.id) == [block.id])
+        #expect(planner.canMutate(block))
+        #expect(planner.exactMoveWindowCoverageIssue(
+            for: block,
+            start: Self.date("2027-01-15T09:00:00Z"),
+            end: Self.date("2027-01-15T09:15:00Z")
+        ) == nil)
+
+        let unproven = PlannerSnapshot(
+            savedAt: now,
+            destination: .today,
+            selectedBlockID: block.id,
+            blocks: [block],
+            suggestions: [],
+            assistantMessages: [],
+            lastScheduleMessage: "unproven",
+            protectedFreeMinutes: replacement.protectedFreeMinutes,
+            scheduleProfile: replacement,
+            freezeHours: 2,
+            showCompleted: true,
+            canonicalItems: [item],
+            canonicalConfigurationIdentifier: "fixture",
+            schedulePreviewProvenance: provenance,
+            publishedScheduleProof: nil
+        )
+        #expect(throws: PlannerPersistenceError.snapshotDecodingFailed) {
+            _ = try unproven.migratedToCurrentSchema()
+        }
     }
 
     @Test("Madrid spring and fall horizons and overnight sleep use local calendar days")

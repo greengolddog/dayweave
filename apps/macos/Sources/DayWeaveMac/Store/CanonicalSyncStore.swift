@@ -75,6 +75,10 @@ final class CanonicalSyncStore: ObservableObject {
     private let itemStreamTransportProvider:
         @MainActor @Sendable (DayWeaveAPIClient) -> (any DayWeaveItemStreamTransport)?
     private let itemStreamSleep: @Sendable (Duration) async throws -> Void
+    private let scheduleStreamTransportProvider:
+        @MainActor @Sendable (DayWeaveAPIClient) -> (any DayWeaveScheduleStreamTransport)?
+    private let scheduleStreamSleep: @Sendable (Duration) async throws -> Void
+    private let scheduleReplicaRequiresDurableBinding: Bool
     private var configurationGeneration: UInt64 = 0
     private var activeSyncID: UUID?
     private var activeSyncTask: Task<Void, Never>?
@@ -96,6 +100,17 @@ final class CanonicalSyncStore: ObservableObject {
     private var foregroundItemStreamUnavailableForActivation = false
     private var foregroundItemImmediateAttempts = 0
     private var foregroundPublicationRepairRequired = false
+    private var foregroundScheduleStreamTask: Task<Void, Never>?
+    private var foregroundScheduleDrainTask: Task<Void, Never>?
+    private var foregroundScheduleLatestHintRevision: UInt64 = 0
+    private var foregroundScheduleReconciledRevision: UInt64 = 0
+    private var foregroundScheduleStreamUnavailableForActivation = false
+    private var foregroundScheduleImmediateAttempts = 0
+    private var foregroundScheduleRefreshInProgress = false
+    /// Set only after the server proves the SSE cursor is ahead. It remains
+    /// pending across an overlapping drain or transient GET and is cleared
+    /// only by a successful authoritative current-schedule response.
+    private var foregroundScheduleHintResetPending = false
 
     init(
         planner: PlannerStore,
@@ -114,6 +129,12 @@ final class CanonicalSyncStore: ObservableObject {
         itemStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
             try await Task.sleep(for: duration)
         },
+        scheduleStreamTransportProvider: @escaping @MainActor @Sendable
+            (DayWeaveAPIClient) -> (any DayWeaveScheduleStreamTransport)? = { $0 },
+        scheduleStreamSleep: @escaping @Sendable (Duration) async throws -> Void = { duration in
+            try await Task.sleep(for: duration)
+        },
+        scheduleReplicaRequiresDurableBinding: Bool = true,
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.planner = planner
@@ -129,6 +150,9 @@ final class CanonicalSyncStore: ObservableObject {
         self.previousAssignmentBlockLimit = max(0, previousAssignmentBlockLimit)
         self.itemStreamTransportProvider = itemStreamTransportProvider
         self.itemStreamSleep = itemStreamSleep
+        self.scheduleStreamTransportProvider = scheduleStreamTransportProvider
+        self.scheduleStreamSleep = scheduleStreamSleep
+        self.scheduleReplicaRequiresDurableBinding = scheduleReplicaRequiresDurableBinding
         self.now = now
         status = .ready
         reloadConfigurationStatus()
@@ -171,8 +195,9 @@ final class CanonicalSyncStore: ObservableObject {
     }
 
     /// Starts content-free foreground item delivery beside a lightweight
-    /// delta probe. The coordinator calls this only after one full activation
-    /// sync has durably installed the current URL/auth binding and cursor.
+    /// delta probe. The coordinator calls this only after the activation
+    /// bootstrap has attempted to establish the durable URL/auth binding and
+    /// item cursor; each delivery path independently rechecks that binding.
     func startForegroundItemInvalidations(every interval: Duration = .seconds(30)) {
         guard foregroundItemPollTask == nil else { return }
         foregroundItemStreamUnavailableForActivation = false
@@ -180,7 +205,13 @@ final class CanonicalSyncStore: ObservableObject {
         let generation = foregroundItemGeneration
         foregroundItemPollTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            if let configurationIdentifier = self.planner.canonicalConfigurationIdentifier,
+               self.configurationSupportsScheduleReplica(configurationIdentifier) {
+                await self.probeForegroundItemDelta(generation: generation)
+            }
+            await self.probeForegroundSchedule(generation: generation)
             self.startForegroundItemStreamIfReady()
+            self.startForegroundScheduleStreamIfReady()
             while self.foregroundItemIsCurrent(generation) {
                 do {
                     try await self.itemStreamSleep(interval)
@@ -189,7 +220,9 @@ final class CanonicalSyncStore: ObservableObject {
                 }
                 guard self.foregroundItemIsCurrent(generation) else { return }
                 await self.probeForegroundItemDelta(generation: generation)
+                await self.probeForegroundSchedule(generation: generation)
                 self.startForegroundItemStreamIfReady()
+                self.startForegroundScheduleStreamIfReady()
             }
         }
     }
@@ -212,6 +245,16 @@ final class CanonicalSyncStore: ObservableObject {
         foregroundItemStreamUnavailableForActivation = false
         foregroundItemImmediateAttempts = 0
         foregroundPublicationRepairRequired = false
+        foregroundScheduleStreamTask?.cancel()
+        foregroundScheduleStreamTask = nil
+        foregroundScheduleDrainTask?.cancel()
+        foregroundScheduleDrainTask = nil
+        foregroundScheduleLatestHintRevision = 0
+        foregroundScheduleReconciledRevision = 0
+        foregroundScheduleStreamUnavailableForActivation = false
+        foregroundScheduleImmediateAttempts = 0
+        foregroundScheduleRefreshInProgress = false
+        foregroundScheduleHintResetPending = false
     }
 
     private func startForegroundItemStreamIfReady() {
@@ -450,6 +493,391 @@ final class CanonicalSyncStore: ObservableObject {
         default:
             return false
         }
+    }
+
+    private func startForegroundScheduleStreamIfReady() {
+        guard foregroundItemPollTask != nil,
+              foregroundScheduleStreamTask == nil,
+              !foregroundScheduleStreamUnavailableForActivation,
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.pendingSchedulePublication == nil,
+              let client = makeClient(reportFailure: false),
+              planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+              configurationSupportsScheduleReplica(client.configurationIdentifier),
+              let transport = scheduleStreamTransportProvider(client),
+              canonicalClientIsCurrent(client) else { return }
+        let generation = foregroundItemGeneration
+        foregroundScheduleStreamTask = Task { @MainActor [weak self] in
+            await self?.runForegroundScheduleStream(
+                initialTransport: transport,
+                generation: generation
+            )
+        }
+    }
+
+    private func runForegroundScheduleStream(
+        initialTransport: any DayWeaveScheduleStreamTransport,
+        generation: UInt64
+    ) async {
+        var retrySeconds = 1
+        var nextTransport: (any DayWeaveScheduleStreamTransport)? = initialTransport
+        defer {
+            if generation == foregroundItemGeneration {
+                foregroundScheduleStreamTask = nil
+            }
+        }
+        while foregroundItemIsCurrent(generation) {
+            guard let client = makeClient(reportFailure: false),
+                  planner.hasEncryptedPersistence,
+                  planner.canPersistPlan,
+                  planner.pendingSchedulePublication == nil,
+                  planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  configurationSupportsScheduleReplica(client.configurationIdentifier),
+                  canonicalClientIsCurrent(client),
+                  let transport = nextTransport ?? scheduleStreamTransportProvider(client) else {
+                return
+            }
+            nextTransport = nil
+            foregroundScheduleImmediateAttempts = 0
+            let durableRevision = durablePublishedScheduleRevision(
+                configurationIdentifier: client.configurationIdentifier
+            )
+            var reconnectDelaySeconds = 1
+            do {
+                let completion = try await transport.consumeScheduleInvalidations(
+                    after: durableRevision
+                ) { [weak self] revision in
+                    await self?.acceptForegroundScheduleHint(
+                        revision,
+                        configurationIdentifier: client.configurationIdentifier,
+                        generation: generation
+                    )
+                }
+                guard foregroundItemIsCurrent(generation) else { return }
+                switch completion {
+                case .endOfStream:
+                    reconnectDelaySeconds = retrySeconds
+                    retrySeconds = min(retrySeconds * 2, 30)
+                case .liveEndOfStream:
+                    retrySeconds = 1
+                    reconnectDelaySeconds = 1
+                case .cursorAhead:
+                    // The numeric head is diagnostic only. An ordinary GET is
+                    // required before changing or lowering durable state.
+                    foregroundScheduleHintResetPending = true
+                    _ = await refreshForegroundSchedule(
+                        generation: generation,
+                        resetHintHighWater: true
+                    )
+                    retrySeconds = 1
+                    reconnectDelaySeconds = 1
+                }
+            } catch {
+                guard foregroundItemIsCurrent(generation) else { return }
+                guard itemStreamFailureIsTransient(error) else {
+                    foregroundScheduleStreamUnavailableForActivation = true
+                    return
+                }
+                reconnectDelaySeconds = retrySeconds
+                retrySeconds = min(retrySeconds * 2, 30)
+            }
+            do {
+                try await scheduleStreamSleep(.seconds(reconnectDelaySeconds))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func acceptForegroundScheduleHint(
+        _ revision: UInt64,
+        configurationIdentifier: String,
+        generation: UInt64
+    ) {
+        guard foregroundItemIsCurrent(generation),
+              revision > 0,
+              revision <= UInt64(Int64.max),
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.canonicalConfigurationIdentifier == configurationIdentifier,
+              makeClient(reportFailure: false)?.configurationIdentifier
+                == configurationIdentifier else { return }
+        let durable = durablePublishedScheduleRevision(
+            configurationIdentifier: configurationIdentifier
+        )
+        guard revision > durable else { return }
+        foregroundScheduleLatestHintRevision = max(
+            foregroundScheduleLatestHintRevision,
+            revision
+        )
+        enqueueForegroundScheduleDrain(generation: generation)
+    }
+
+    private func enqueueForegroundScheduleDrain(generation: UInt64) {
+        guard foregroundItemIsCurrent(generation),
+              foregroundScheduleDrainTask == nil else { return }
+        foregroundScheduleDrainTask = Task { @MainActor [weak self] in
+            await self?.drainForegroundScheduleObservations(generation: generation)
+        }
+    }
+
+    private func drainForegroundScheduleObservations(generation: UInt64) async {
+        var attempts = 0
+        defer {
+            if generation == foregroundItemGeneration {
+                foregroundScheduleDrainTask = nil
+            }
+        }
+        while foregroundItemIsCurrent(generation), attempts < 2 {
+            guard let configurationIdentifier = planner.canonicalConfigurationIdentifier else {
+                return
+            }
+            let target = foregroundScheduleLatestHintRevision
+            let durable = durablePublishedScheduleRevision(
+                configurationIdentifier: configurationIdentifier
+            )
+            if durable >= target {
+                foregroundScheduleReconciledRevision = durable
+                return
+            }
+            guard foregroundScheduleImmediateAttempts < 2 else { return }
+            attempts += 1
+            foregroundScheduleImmediateAttempts += 1
+            guard await refreshForegroundSchedule(generation: generation) else { return }
+        }
+    }
+
+    private func probeForegroundSchedule(generation: UInt64) async {
+        guard foregroundItemIsCurrent(generation),
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              planner.pendingSchedulePublication == nil,
+              activeSyncID == nil,
+              let configurationIdentifier = planner.canonicalConfigurationIdentifier,
+              configurationSupportsScheduleReplica(configurationIdentifier) else { return }
+        foregroundScheduleImmediateAttempts = 0
+        _ = await refreshForegroundSchedule(generation: generation)
+    }
+
+    private func refreshForegroundSchedule(
+        generation: UInt64,
+        resetHintHighWater: Bool = false
+    ) async -> Bool {
+        guard foregroundItemIsCurrent(generation),
+              !foregroundScheduleRefreshInProgress,
+              !hasPendingScheduleReplicaWrites,
+              await waitForCanonicalMutationFence(reportFailure: false) else { return false }
+        foregroundScheduleRefreshInProgress = true
+        defer {
+            foregroundScheduleRefreshInProgress = false
+            planner.endCanonicalSync()
+        }
+        guard foregroundItemIsCurrent(generation),
+              !hasPendingScheduleReplicaWrites,
+              planner.hasEncryptedPersistence,
+              planner.canPersistPlan,
+              let client = makeClient(reportFailure: false),
+              planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+              configurationSupportsScheduleReplica(client.configurationIdentifier),
+              canonicalClientIsCurrent(client) else { return false }
+        do {
+            var current = try await client.currentPublishedSchedule()
+            guard foregroundItemIsCurrent(generation),
+                  canonicalClientIsCurrent(client),
+                  planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  !hasPendingScheduleReplicaWrites else { return false }
+            guard let initialCurrent = current else {
+                try planner.clearCurrentPublishedSchedule(
+                    configurationIdentifier: client.configurationIdentifier
+                )
+                lastPreview = nil
+                foregroundScheduleReconciledRevision = 0
+                if resetHintHighWater || foregroundScheduleHintResetPending {
+                    foregroundScheduleLatestHintRevision = 0
+                    foregroundScheduleHintResetPending = false
+                }
+                return true
+            }
+            do {
+                try validateReplicatedSchedule(initialCurrent)
+            } catch CanonicalSyncError.sourceRevisionMismatch {
+                // Publication and item invalidations are independent hints.
+                // If the publication wins that race, drain the authoritative
+                // item delta under this same mutation fence and refetch the
+                // current head instead of waiting for the next 30-second poll.
+                try await pullCanonicalItemsForScheduleReplica(
+                    client: client,
+                    generation: generation
+                )
+                current = try await client.currentPublishedSchedule()
+                guard foregroundItemIsCurrent(generation),
+                      canonicalClientIsCurrent(client),
+                      planner.canonicalConfigurationIdentifier
+                        == client.configurationIdentifier,
+                      !hasPendingScheduleReplicaWrites else { return false }
+                guard let current else {
+                    try planner.clearCurrentPublishedSchedule(
+                        configurationIdentifier: client.configurationIdentifier
+                    )
+                    lastPreview = nil
+                    foregroundScheduleReconciledRevision = 0
+                    if resetHintHighWater || foregroundScheduleHintResetPending {
+                        foregroundScheduleLatestHintRevision = 0
+                        foregroundScheduleHintResetPending = false
+                    }
+                    return true
+                }
+                try validateReplicatedSchedule(current)
+            }
+            guard let current else { return false }
+            warnings = []
+            let rendered = render(current.schedule)
+            let message = "Recovered published schedule revision \(current.revision.revisionNumber) · \(Self.composedBlockSummary(current.schedule.plan.blocks))"
+            try planner.installCurrentPublishedSchedule(
+                current,
+                blocks: rendered,
+                configurationIdentifier: client.configurationIdentifier,
+                message: message
+            )
+            clearTransientLocalComposition()
+            lastPreview = current.schedule
+            foregroundScheduleReconciledRevision = current.revision.revisionNumber
+            if resetHintHighWater || foregroundScheduleHintResetPending {
+                foregroundScheduleLatestHintRevision = current.revision.revisionNumber
+                foregroundScheduleHintResetPending = false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func pullCanonicalItemsForScheduleReplica(
+        client: DayWeaveAPIClient,
+        generation: UInt64
+    ) async throws {
+        func ensureCurrent() throws {
+            guard foregroundItemIsCurrent(generation),
+                  canonicalClientIsCurrent(client),
+                  planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  !hasPendingScheduleReplicaWrites else {
+                throw CanonicalSyncError.operationSuperseded
+            }
+        }
+        do {
+            let result = try await loadDelta(
+                client: client,
+                from: planner.canonicalDeltaCursor,
+                enforceItemCursorContract: true
+            )
+            try ensureCurrent()
+            _ = try planner.applyCanonicalDeltaDurably(
+                result.changes,
+                nextCursor: result.cursor
+            )
+        } catch let error as DayWeaveAPIError {
+            guard case let .server(statusCode, _, _, _) = error,
+                  statusCode == 422,
+                  planner.canonicalDeltaCursor != nil else { throw error }
+            try ensureCurrent()
+            let result = try await loadDelta(
+                client: client,
+                from: nil,
+                enforceItemCursorContract: true
+            )
+            try ensureCurrent()
+            _ = try planner.replaceCanonicalStateDurably(
+                changes: result.changes,
+                nextCursor: result.cursor
+            )
+        }
+        if foregroundItemLatestHintCursor == planner.canonicalDeltaCursor {
+            foregroundItemReconciledGeneration = foregroundItemObservationGeneration
+            foregroundItemLatestHintCursor = nil
+        }
+    }
+
+    private var hasPendingScheduleReplicaWrites: Bool {
+        planner.pendingSchedulePublication != nil
+            || !planner.pendingCanonicalMutations.isEmpty
+            || !planner.pendingCanonicalSensitivityMutations.isEmpty
+            || !planner.pendingCanonicalAuthoringMutations.isEmpty
+            || planner.hasDeferredExecutionPublicationWork
+    }
+
+    private func durablePublishedScheduleRevision(
+        configurationIdentifier: String
+    ) -> UInt64 {
+        guard let proof = planner.publishedScheduleProof,
+              proof.hasCurrentImmutablePlanSeal,
+              proof.configurationIdentifier == configurationIdentifier else { return 0 }
+        return proof.revisionNumber
+    }
+
+    private func configurationSupportsScheduleReplica(_ identifier: String) -> Bool {
+        !scheduleReplicaRequiresDurableBinding || identifier.contains("|auth=device-v1:")
+    }
+
+    private func validateReplicatedSchedule(
+        _ publication: DayWeaveCurrentPublishedSchedule
+    ) throws {
+        let schedule = publication.schedule
+        let revision = publication.revision
+        let localRevisions = Dictionary(
+            uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0.revision) }
+        )
+        guard schedule.sourceItemCount == planner.canonicalItems.count,
+              schedule.sourceItemRevisions == localRevisions else {
+            throw CanonicalSyncError.sourceRevisionMismatch
+        }
+        guard schedule.acceptedItemCount + schedule.rejectedItems.count
+                == schedule.sourceItemCount,
+              schedule.ignoredPreviousAssignments.count <= 10_000,
+              schedule.manualPlacementAssessments.count <= 10_000,
+              revision.inputDigest == schedule.inputDigest,
+              sameInstant(revision.horizonStart, schedule.plan.horizonStart),
+              sameInstant(revision.horizonEnd, schedule.plan.horizonEnd),
+              revision.publishedAt.timeIntervalSinceReferenceDate.isFinite,
+              revision.publishedAt <= now().addingTimeInterval(5 * 60),
+              DayWeaveCanonicalItemDraft.supportedTimeZone(
+                  identifier: revision.timezoneName
+              ) != nil,
+              revision.revisionNumber > 0,
+              revision.revision
+                == "\(revision.revisionNumber):\(revision.id.uuidString.lowercased())" else {
+            throw CanonicalSyncError.invalidSchedulePublication
+        }
+        let fixedBlocks = schedule.plan.blocks.compactMap { block
+            -> DayWeaveSchedulePreviewRequest.FixedBlock? in
+            guard block.kind == "external_fixed", let sourceID = block.externalBlockID else {
+                return nil
+            }
+            return .init(
+                id: sourceID,
+                isSensitive: block.isSensitive,
+                title: block.title,
+                start: block.start,
+                end: block.end,
+                source: "published_schedule_replica"
+            )
+        }
+        let request = DayWeaveSchedulePreviewRequest(
+            asOf: schedule.plan.asOf,
+            horizonStart: schedule.plan.horizonStart,
+            horizonEnd: schedule.plan.horizonEnd,
+            timezoneName: revision.timezoneName,
+            availability: [],
+            fixedBlocks: fixedBlocks,
+            previousAssignments: [],
+            config: .init(
+                slotGranularityMinutes: 5,
+                stabilityWeight: 0,
+                defaultSoftWeight: 0
+            ),
+            recurrenceContext: [:]
+        )
+        try validate(preview: schedule, against: request)
     }
 
     func resetCanonicalSyncState() {
@@ -809,6 +1237,73 @@ final class CanonicalSyncStore: ObservableObject {
         return lastSuccessfulSyncID == operationID
     }
 
+    /// Foreground startup is read-first when no durable local write needs
+    /// recovery. This prevents a resumed Mac from superseding another device's
+    /// authoritative publication before it has read that immutable head.
+    /// Explicit user/import/proposal workflows continue to use
+    /// `syncThroughFreshComposition()` and therefore retain their requirement
+    /// to publish a newly composed schedule.
+    @discardableResult
+    func bootstrapForegroundActivation() async -> Bool {
+        guard await waitForCanonicalMutationFence() else { return false }
+        warnings = []
+        guard let client = makeClient(reportFailure: true) else {
+            planner.endCanonicalSync()
+            return false
+        }
+        if let pending = planner.pendingSchedulePublication,
+           pending.configurationIdentifier != client.configurationIdentifier {
+            planner.endCanonicalSync()
+            status = .failed(
+                "The exact schedule publication belongs to another API URL or credential session. Restore that original configuration and authentication, then sync to recover it; it was not discarded."
+            )
+            return false
+        }
+        do {
+            try planner.prepareCanonicalReplicaRead(
+                configurationIdentifier: client.configurationIdentifier
+            )
+        } catch {
+            planner.endCanonicalSync()
+            status = .failed(error.localizedDescription)
+            return false
+        }
+
+        let requiresWriteRecovery = hasPendingForegroundCanonicalWrites
+            || !configurationSupportsScheduleReplica(client.configurationIdentifier)
+        if requiresWriteRecovery {
+            clearTransientLocalComposition()
+            planner.invalidateCanonicalPreview()
+            lastPreview = nil
+        }
+
+        let operationID = UUID()
+        let generation = configurationGeneration
+        activeSyncID = operationID
+        activeSyncScheduleProfile = planner.scheduleProfile
+        isSyncing = true
+        let task = Task<Void, Never> { @MainActor [weak self] in
+            guard let self else { return }
+            if requiresWriteRecovery {
+                self.status = .syncing("Recovering pending canonical writes…")
+                await self.performSync(
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+            } else {
+                await self.performReadFirstActivationBootstrap(
+                    client: client,
+                    operationID: operationID,
+                    generation: generation
+                )
+            }
+        }
+        activeSyncTask = task
+        await task.value
+        return lastSuccessfulSyncID == operationID
+    }
+
     /// Import completion must survive an unrelated pending publication
     /// recovery. A recovered old receipt is successful work, but it does not
     /// prove that newly imported canonical items were pulled and recomposed.
@@ -1035,6 +1530,121 @@ final class CanonicalSyncStore: ObservableObject {
             )
             warnings.append("The server item stream changed; the encrypted cache was rebuilt safely.")
             return commit
+        }
+    }
+
+    private func performReadFirstActivationBootstrap(
+        client: DayWeaveAPIClient,
+        operationID: UUID,
+        generation: UInt64
+    ) async {
+        defer {
+            if activeSyncID == operationID {
+                activeSyncTask = nil
+                activeSyncID = nil
+                activeSyncScheduleProfile = nil
+                isSyncing = false
+                planner.endCanonicalSync()
+                if generation != configurationGeneration {
+                    reloadConfigurationStatus()
+                }
+            }
+        }
+
+        do {
+            status = .syncing("Catching up canonical item revisions…")
+            _ = try await pullCanonicalItemsDurably(
+                client: client,
+                operationID: operationID,
+                generation: generation
+            )
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+
+            status = .syncing("Checking the current published schedule…")
+            var current = try await client.currentPublishedSchedule()
+            try ensureOperationCurrent(operationID: operationID, generation: generation)
+            guard planner.canonicalConfigurationIdentifier == client.configurationIdentifier,
+                  canonicalClientIsCurrent(client),
+                  !hasPendingScheduleReplicaWrites else {
+                throw CanonicalSyncError.operationSuperseded
+            }
+
+            if let initialCurrent = current {
+                do {
+                    try validateReplicatedSchedule(initialCurrent)
+                } catch CanonicalSyncError.sourceRevisionMismatch {
+                    // A publication may advance after the initial item boundary.
+                    // Drain once more and prove the immutable head against that
+                    // exact durable item generation before installing it.
+                    _ = try await pullCanonicalItemsDurably(
+                        client: client,
+                        operationID: operationID,
+                        generation: generation
+                    )
+                    try ensureOperationCurrent(
+                        operationID: operationID,
+                        generation: generation
+                    )
+                    current = try await client.currentPublishedSchedule()
+                    try ensureOperationCurrent(
+                        operationID: operationID,
+                        generation: generation
+                    )
+                    guard planner.canonicalConfigurationIdentifier
+                            == client.configurationIdentifier,
+                          canonicalClientIsCurrent(client),
+                          !hasPendingScheduleReplicaWrites else {
+                        throw CanonicalSyncError.operationSuperseded
+                    }
+                    if let current {
+                        try validateReplicatedSchedule(current)
+                    }
+                }
+            }
+
+            if let current {
+                let rendered = render(current.schedule)
+                let message = "Recovered published schedule revision \(current.revision.revisionNumber) · \(Self.composedBlockSummary(current.schedule.plan.blocks))"
+                try planner.installCurrentPublishedSchedule(
+                    current,
+                    blocks: rendered,
+                    configurationIdentifier: client.configurationIdentifier,
+                    message: message
+                )
+                clearTransientLocalComposition()
+                lastPreview = current.schedule
+                foregroundScheduleLatestHintRevision = current.revision.revisionNumber
+                foregroundScheduleReconciledRevision = current.revision.revisionNumber
+                foregroundPublicationRepairRequired = false
+                lastSuccessfulSyncID = operationID
+                status = .online(updatedAt: now(), message: message)
+                return
+            }
+
+            // Only the transport's exact authenticated, non-cacheable typed 404
+            // reaches this branch. It may clear obsolete authority, but it does
+            // not authorize an activation-time write: without an expected-head
+            // publish precondition, another device could publish between this
+            // read and our POST. Onboarding and explicit sync remain the paths
+            // that deliberately compose and publish.
+            try planner.clearCurrentPublishedSchedule(
+                configurationIdentifier: client.configurationIdentifier
+            )
+            lastPreview = nil
+            foregroundScheduleLatestHintRevision = 0
+            foregroundScheduleReconciledRevision = 0
+            foregroundPublicationRepairRequired = false
+            lastSuccessfulSyncID = operationID
+            status = .online(
+                updatedAt: now(),
+                message: "No schedule is currently published on this workspace"
+            )
+        } catch {
+            planner.flushPersistence()
+            guard activeSyncID == operationID,
+                  generation == configurationGeneration,
+                  !Task.isCancelled else { return }
+            status = .failed((planner.persistenceError ?? error).localizedDescription)
         }
     }
 
@@ -1517,12 +2127,130 @@ final class CanonicalSyncStore: ObservableObject {
                 "The response has no server input digest."
             )
         }
+        try validateOccurrenceEvidenceOwnership(preview)
         try validate(
             plan: preview.plan,
             sourceItemRevisions: preview.sourceItemRevisions,
             rejectedItems: preview.rejectedItems,
             against: request
         )
+    }
+
+    /// The public transport can prove only that occurrence and item references
+    /// exist. Recurring hierarchies deliberately attach a leaf decision/block
+    /// to an occurrence owned by its recurring ancestor, so exact ownership is
+    /// checked here against the durable canonical parent graph.
+    private func validateOccurrenceEvidenceOwnership(
+        _ preview: DayWeaveSchedulePreview
+    ) throws {
+        let itemByID = Dictionary(
+            uniqueKeysWithValues: planner.canonicalItems.map { ($0.id, $0) }
+        )
+        let seriesByOccurrence = Dictionary(
+            uniqueKeysWithValues: preview.plan.occurrences.map {
+                ($0.id, $0.seriesItemID)
+            }
+        )
+        func belongs(_ itemID: UUID, to occurrenceID: UUID) -> Bool {
+            guard let seriesItemID = seriesByOccurrence[occurrenceID] else { return false }
+            return Self.item(itemID, belongsToSeries: seriesItemID, itemByID: itemByID)
+        }
+        func uuid(_ value: JSONValue?) -> UUID? {
+            guard case let .string(raw)? = value,
+                  let id = UUID(uuidString: raw),
+                  id.uuidString.lowercased() == raw else { return nil }
+            return id
+        }
+        func optionalUUID(_ value: JSONValue?) -> (UUID?, Bool) {
+            if value == .null { return (nil, true) }
+            guard let id = uuid(value) else { return (nil, false) }
+            return (id, true)
+        }
+        func uuidArray(_ value: JSONValue?) -> [UUID]? {
+            guard case let .array(values)? = value else { return nil }
+            let result = values.compactMap { uuid($0) }
+            return result.count == values.count ? result : nil
+        }
+        func validateEvidence(
+            itemIDs: [UUID],
+            occurrenceIDs: [UUID]
+        ) -> Bool {
+            occurrenceIDs.allSatisfy { occurrenceID in
+                itemIDs.contains { belongs($0, to: occurrenceID) }
+            }
+        }
+
+        for work in preview.plan.unscheduled {
+            if let occurrenceID = work.occurrenceID,
+               !belongs(work.itemID, to: occurrenceID) {
+                throw CanonicalSyncError.invalidPreview(
+                    "Unscheduled recurrence evidence does not belong to its source series."
+                )
+            }
+        }
+        for rawDecision in preview.plan.decisions {
+            guard case let .object(decision) = rawDecision,
+                  let itemID = uuid(decision["item_id"]) else {
+                throw CanonicalSyncError.invalidPreview("A plan decision has invalid identity evidence.")
+            }
+            let occurrence = optionalUUID(decision["occurrence_id"])
+            guard occurrence.1,
+                  occurrence.0.map({ belongs(itemID, to: $0) }) ?? true else {
+                throw CanonicalSyncError.invalidPreview(
+                    "A plan decision does not belong to its source recurrence series."
+                )
+            }
+        }
+        for rawViolation in preview.plan.violations {
+            guard case let .object(violation) = rawViolation,
+                  let itemIDs = uuidArray(violation["item_ids"]),
+                  let occurrenceIDs = uuidArray(violation["occurrence_ids"]),
+                  validateEvidence(itemIDs: itemIDs, occurrenceIDs: occurrenceIDs) else {
+                throw CanonicalSyncError.invalidPreview(
+                    "A plan violation does not belong to its source recurrence series."
+                )
+            }
+        }
+        for rawAssessment in preview.manualPlacementAssessments {
+            guard case let .object(assessment) = rawAssessment,
+                  case let .array(violations)? = assessment["violations"] else {
+                throw CanonicalSyncError.invalidPreview(
+                    "A manual placement assessment has invalid recurrence evidence."
+                )
+            }
+            for rawViolation in violations {
+                guard case let .object(violation) = rawViolation,
+                      let itemIDs = uuidArray(violation["item_ids"]),
+                      let occurrenceIDs = uuidArray(violation["occurrence_ids"]),
+                      validateEvidence(itemIDs: itemIDs, occurrenceIDs: occurrenceIDs),
+                      case let .array(conflicts)? = violation["conflicting_blocks"] else {
+                    throw CanonicalSyncError.invalidPreview(
+                        "Manual placement evidence does not belong to its source recurrence series."
+                    )
+                }
+                for rawConflict in conflicts {
+                    guard case let .object(conflict) = rawConflict else {
+                        throw CanonicalSyncError.invalidPreview(
+                            "A conflicting block has invalid recurrence evidence."
+                        )
+                    }
+                    let occurrence = optionalUUID(conflict["occurrence_id"])
+                    guard occurrence.1 else {
+                        throw CanonicalSyncError.invalidPreview(
+                            "A conflicting block has invalid recurrence evidence."
+                        )
+                    }
+                    if let occurrenceID = occurrence.0 {
+                        guard let itemID = uuid(conflict["item_id"]),
+                              belongs(itemID, to: occurrenceID) else {
+                            throw CanonicalSyncError.invalidPreview(
+                                "A conflicting block does not belong to its source recurrence series."
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func validate(
@@ -1598,7 +2326,7 @@ final class CanonicalSyncStore: ObservableObject {
             return $0.id.uuidString < $1.id.uuidString
         }
         var latestAnyEnd: Date?
-        var latestPlannableEnd: Date?
+        var latestPlannedEnd: Date?
         for block in orderedBlocks {
             guard blockIDs.insert(block.id).inserted else {
                 throw CanonicalSyncError.invalidPreview("The response contains a duplicate block identifier.")
@@ -1612,9 +2340,10 @@ final class CanonicalSyncStore: ObservableObject {
             }
             if let itemID = block.itemID {
                 guard itemByID[itemID] != nil,
+                      itemByID[itemID]?.title == block.title,
                       block.isSensitive == effectiveSensitivity(for: itemID) else {
                     throw CanonicalSyncError.invalidPreview(
-                        "A canonical block has inconsistent effective sensitivity."
+                        "A canonical block has inconsistent identity, title, or effective sensitivity."
                     )
                 }
                 if let occurrenceID = block.occurrenceID {
@@ -1632,7 +2361,10 @@ final class CanonicalSyncStore: ObservableObject {
             }
             switch block.kind {
             case "planned", "pinned":
-                if let latestAnyEnd, latestAnyEnd > block.start {
+                let overlappingEarlierEnd = block.kind == "planned"
+                    ? latestAnyEnd
+                    : latestPlannedEnd
+                if let overlappingEarlierEnd, overlappingEarlierEnd > block.start {
                     throw CanonicalSyncError.invalidPreview(
                         "A planned response block overlaps another block."
                     )
@@ -1677,7 +2409,7 @@ final class CanonicalSyncStore: ObservableObject {
                     ? UInt32.max
                     : scheduledMinutes &+ minutes
             case "calendar_event":
-                if let latestPlannableEnd, latestPlannableEnd > block.start {
+                if let latestPlannedEnd, latestPlannedEnd > block.start {
                     throw CanonicalSyncError.invalidPreview(
                         "A calendar block overlaps planned work."
                     )
@@ -1701,7 +2433,7 @@ final class CanonicalSyncStore: ObservableObject {
                     )
                 }
             case "external_fixed":
-                if let latestPlannableEnd, latestPlannableEnd > block.start {
+                if let latestPlannedEnd, latestPlannedEnd > block.start {
                     throw CanonicalSyncError.invalidPreview(
                         "An external fixed block overlaps planned work."
                     )
@@ -1709,6 +2441,7 @@ final class CanonicalSyncStore: ObservableObject {
                 guard block.itemID == nil,
                       block.occurrenceID == nil,
                       let externalBlockID = block.externalBlockID,
+                      block.id == externalBlockID,
                       let fixed = fixedByID[externalBlockID],
                       fixed.title == block.title,
                       fixed.isSensitive == block.isSensitive,
@@ -1727,9 +2460,9 @@ final class CanonicalSyncStore: ObservableObject {
             if latestAnyEnd == nil || block.end > latestAnyEnd! {
                 latestAnyEnd = block.end
             }
-            if block.kind == "planned" || block.kind == "pinned",
-               latestPlannableEnd == nil || block.end > latestPlannableEnd! {
-                latestPlannableEnd = block.end
+            if block.kind == "planned",
+               latestPlannedEnd == nil || block.end > latestPlannedEnd! {
+                latestPlannedEnd = block.end
             }
         }
         try Self.validateFixedBlockCoverage(
@@ -2882,6 +3615,7 @@ final class CanonicalSyncStore: ObservableObject {
                 sourceItemID: block.itemID,
                 sourceItemRevision: item?.revision,
                 occurrenceID: block.occurrenceID,
+                externalBlockID: block.externalBlockID,
                 recurrenceSeriesItemID: block.occurrenceID
                     .flatMap { occurrenceByID[$0]?.seriesItemID },
                 sessionIndex: block.sessionIndex,

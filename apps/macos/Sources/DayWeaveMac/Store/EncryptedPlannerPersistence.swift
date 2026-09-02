@@ -604,7 +604,14 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                   scheduleProfile.hasValidShape,
                   scheduleProfile.protectedFreeMinutes == protectedFreeMinutes,
                   schedulePreviewProvenance?.timezoneName == nil
-                    || schedulePreviewProvenance?.timezoneName == scheduleProfile.timezoneName,
+                    || schedulePreviewProvenance?.timezoneName == scheduleProfile.timezoneName
+                    || (publishedScheduleProof.map { proof in
+                        proof.hasCurrentImmutablePlanSeal
+                            && proof.configurationIdentifier
+                                == canonicalConfigurationIdentifier
+                            && schedulePreviewProvenance.map(proof.matches) == true
+                            && proof.matchesPublishedPlan(blocks)
+                    } == true),
                   localScheduleCompositionProvenance?.timezoneName == nil
                     || localScheduleCompositionProvenance?.timezoneName
                         == scheduleProfile.timezoneName,

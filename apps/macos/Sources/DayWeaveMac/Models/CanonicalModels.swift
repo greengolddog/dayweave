@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 extension CodingUserInfoKey {
@@ -760,6 +761,12 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
     let sourceItemRevisions: [UUID: UInt64]
     let rejectedItems: [RejectedItem]
     let ignoredPreviousAssignments: [IgnoredAssignment]
+    /// Public conflict evidence for retained manual placements. The planner
+    /// does not interpret this evidence while recovering another device's
+    /// immutable publication, but it must retain the exact public response
+    /// shape and reject malformed/unknown object fields at the transport
+    /// boundary. Empty assessments are omitted by the server.
+    let manualPlacementAssessments: [JSONValue]
     let plan: Plan
 
     private enum CodingKeys: String, CodingKey {
@@ -770,6 +777,27 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
         case sourceItemRevisions = "source_item_revisions"
         case rejectedItems = "rejected_items"
         case ignoredPreviousAssignments = "ignored_previous_assignments"
+        case manualPlacementAssessments = "manual_placement_assessments"
+    }
+
+    init(
+        inputDigest: String,
+        sourceItemCount: Int,
+        acceptedItemCount: Int,
+        sourceItemRevisions: [UUID: UInt64],
+        rejectedItems: [RejectedItem],
+        ignoredPreviousAssignments: [IgnoredAssignment],
+        manualPlacementAssessments: [JSONValue] = [],
+        plan: Plan
+    ) {
+        self.inputDigest = inputDigest
+        self.sourceItemCount = sourceItemCount
+        self.acceptedItemCount = acceptedItemCount
+        self.sourceItemRevisions = sourceItemRevisions
+        self.rejectedItems = rejectedItems
+        self.ignoredPreviousAssignments = ignoredPreviousAssignments
+        self.manualPlacementAssessments = manualPlacementAssessments
+        self.plan = plan
     }
 
     init(from decoder: any Decoder) throws {
@@ -782,6 +810,10 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
             [IgnoredAssignment].self,
             forKey: .ignoredPreviousAssignments
         )
+        manualPlacementAssessments = try container.decodeIfPresent(
+            [JSONValue].self,
+            forKey: .manualPlacementAssessments
+        ) ?? []
         plan = try container.decode(Plan.self, forKey: .plan)
 
         let raw = try container.decode([String: UInt64].self, forKey: .sourceItemRevisions)
@@ -816,6 +848,12 @@ struct DayWeaveSchedulePreview: Codable, Equatable, Sendable {
         try container.encode(acceptedItemCount, forKey: .acceptedItemCount)
         try container.encode(rejectedItems, forKey: .rejectedItems)
         try container.encode(ignoredPreviousAssignments, forKey: .ignoredPreviousAssignments)
+        if !manualPlacementAssessments.isEmpty {
+            try container.encode(
+                manualPlacementAssessments,
+                forKey: .manualPlacementAssessments
+            )
+        }
         try container.encode(plan, forKey: .plan)
         let revisions = Dictionary(uniqueKeysWithValues: sourceItemRevisions.map {
             ($0.key.uuidString.lowercased(), $0.value)
@@ -873,58 +911,97 @@ struct DayWeaveSchedulePublishResponse: Decodable, Equatable, Sendable {
     let replayed: Bool
 }
 
+/// Exact immutable publication returned by `/v1/schedule/current`.
+struct DayWeaveCurrentPublishedSchedule: Decodable, Equatable, Sendable {
+    let revision: DayWeavePublishedScheduleRevision
+    let schedule: DayWeaveSchedulePreview
+}
+
 struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
     let id: UUID
-    let itemID: UUID
-    let itemRevision: UInt64
+    let itemID: UUID?
+    let itemRevision: UInt64?
     let occurrenceID: UUID?
+    /// Identity of a non-item fixed constraint. Older proofs did not persist
+    /// this field; their plan match fails closed if an external block exists.
+    let externalBlockID: UUID?
     let sessionIndex: UInt16
     let start: Date
     let end: Date
     let kind: String
+    /// New proofs seal presentation/privacy metadata as well as execution
+    /// identity. Both fields are optional only for decoding legacy item proofs.
+    let title: String?
+    let isSensitive: Bool?
+    /// Version-2 proofs seal every publication-static rendered field. Status
+    /// and actual effort are deliberately excluded because execution mutates
+    /// them after publication.
+    let immutableBlockDigest: String?
 
-    init?(
-        block: DayWeaveSchedulePreview.Plan.Block,
-        sourceItemRevisions: [UUID: UInt64]
-    ) {
-        guard let itemID = block.itemID,
-              let itemRevision = sourceItemRevisions[itemID] else { return nil }
+    init?(block: ScheduleBlock) {
+        guard let immutableBlockDigest = Self.immutableDigest(for: block) else { return nil }
         self.init(
             id: block.id,
-            itemID: itemID,
-            itemRevision: itemRevision,
+            itemID: block.sourceItemID,
+            itemRevision: block.sourceItemRevision,
             occurrenceID: block.occurrenceID,
-            sessionIndex: block.sessionIndex,
+            externalBlockID: block.externalBlockID,
+            sessionIndex: block.sessionIndex ?? 0,
             start: block.start,
             end: block.end,
-            kind: block.kind
+            kind: block.previewKind ?? "",
+            title: block.title,
+            isSensitive: block.isSensitive,
+            immutableBlockDigest: immutableBlockDigest
         )
     }
 
     init(
         id: UUID,
-        itemID: UUID,
-        itemRevision: UInt64,
+        itemID: UUID?,
+        itemRevision: UInt64?,
         occurrenceID: UUID?,
+        externalBlockID: UUID? = nil,
         sessionIndex: UInt16,
         start: Date,
         end: Date,
-        kind: String
+        kind: String,
+        title: String? = nil,
+        isSensitive: Bool? = nil,
+        immutableBlockDigest: String? = nil
     ) {
         self.id = id
         self.itemID = itemID
         self.itemRevision = itemRevision
         self.occurrenceID = occurrenceID
+        self.externalBlockID = externalBlockID
         self.sessionIndex = sessionIndex
         self.start = start
         self.end = end
         self.kind = kind
+        self.title = title
+        self.isSensitive = isSensitive
+        self.immutableBlockDigest = immutableBlockDigest
     }
 
     var hasValidShape: Bool {
-        !id.isDayWeavePublicationNil
-            && !itemID.isDayWeavePublicationNil
-            && itemRevision > 0
+        let isCanonical = itemID.map { !$0.isDayWeavePublicationNil } == true
+            && itemRevision.map { $0 > 0 } == true
+            && externalBlockID == nil
+        let isExternal = itemID == nil
+            && itemRevision == nil
+            && occurrenceID == nil
+            && externalBlockID.map { !$0.isDayWeavePublicationNil } == true
+            && kind == "external_fixed"
+        let sealedPresentation = title.map { value in
+            !value.isEmpty
+                && value.utf8.count <= 16_384
+                && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        }
+        return !id.isDayWeavePublicationNil
+            && (isCanonical || isExternal)
+            && (title == nil && isSensitive == nil && immutableBlockDigest == nil
+                || (sealedPresentation == true && isSensitive != nil))
             && start.timeIntervalSinceReferenceDate.isFinite
             && end.timeIntervalSinceReferenceDate.isFinite
             && start < end
@@ -933,8 +1010,33 @@ struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
             && !kind.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
     }
 
+    var hasCurrentImmutableSeal: Bool {
+        hasValidShape && Self.isSHA256Digest(immutableBlockDigest)
+    }
+
     func matches(_ block: ScheduleBlock) -> Bool {
+        guard hasCurrentImmutableSeal,
+              block.id == id,
+              block.sourceItemID == itemID,
+              block.sourceItemRevision == itemRevision,
+              block.occurrenceID == occurrenceID,
+              block.externalBlockID == externalBlockID,
+              block.sessionIndex == sessionIndex,
+              block.previewKind == kind,
+              sameInstant(block.start, start),
+              sameInstant(block.end, end),
+              Self.immutableDigest(for: block) == immutableBlockDigest else { return false }
+        let originMatches = itemID == nil
+            ? block.syncOrigin == .externalPreview
+            : block.syncOrigin == .canonicalPreview
+        let presentationMatches = title.map { $0 == block.title } ?? true
+        let privacyMatches = isSensitive.map { $0 == block.isSensitive } ?? true
+        return originMatches && presentationMatches && privacyMatches
+    }
+
+    func matchesLegacy(_ block: ScheduleBlock) -> Bool {
         hasValidShape
+            && immutableBlockDigest == nil
             && block.id == id
             && block.sourceItemID == itemID
             && block.sourceItemRevision == itemRevision
@@ -944,6 +1046,76 @@ struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
             && block.previewKind == kind
             && sameInstant(block.start, start)
             && sameInstant(block.end, end)
+    }
+
+    private struct ImmutableFields: Encodable {
+        let id: String
+        let isSensitive: Bool
+        let title: String
+        let plannerKind: String
+        let startMicroseconds: Int64
+        let endMicroseconds: Int64
+        let project: String?
+        let notes: String
+        let energy: String
+        let isFlexible: Bool
+        let isHardConstraint: Bool
+        let sourceItemID: String?
+        let sourceItemRevision: UInt64?
+        let occurrenceID: String?
+        let externalBlockID: String?
+        let recurrenceSeriesItemID: String?
+        let sessionIndex: UInt16?
+        let syncOrigin: String?
+        let placementReason: String?
+        let previewKind: String?
+        let occurrenceFullyScheduled: Bool
+        let recurrenceMoveSource: RecurrenceMoveSource?
+    }
+
+    private static func immutableDigest(for block: ScheduleBlock) -> String? {
+        guard let startMicroseconds = dayWeavePostgresEpochMicroseconds(block.start),
+              let endMicroseconds = dayWeavePostgresEpochMicroseconds(block.end) else {
+            return nil
+        }
+        let fields = ImmutableFields(
+            id: block.id.uuidString.lowercased(),
+            isSensitive: block.isSensitive,
+            title: block.title,
+            plannerKind: block.kind.rawValue,
+            startMicroseconds: startMicroseconds,
+            endMicroseconds: endMicroseconds,
+            project: block.project,
+            notes: block.notes,
+            energy: block.energy.rawValue,
+            isFlexible: block.isFlexible,
+            isHardConstraint: block.isHardConstraint,
+            sourceItemID: block.sourceItemID?.uuidString.lowercased(),
+            sourceItemRevision: block.sourceItemRevision,
+            occurrenceID: block.occurrenceID?.uuidString.lowercased(),
+            externalBlockID: block.externalBlockID?.uuidString.lowercased(),
+            recurrenceSeriesItemID: block.recurrenceSeriesItemID?.uuidString.lowercased(),
+            sessionIndex: block.sessionIndex,
+            syncOrigin: block.syncOrigin?.rawValue,
+            placementReason: block.placementReason,
+            previewKind: block.previewKind,
+            occurrenceFullyScheduled: block.occurrenceFullyScheduled,
+            recurrenceMoveSource: block.recurrenceMoveSource
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(fields) else { return nil }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        return "sha256:\(digest)"
+    }
+
+    private static func isSHA256Digest(_ value: String?) -> Bool {
+        guard let value, value.hasPrefix("sha256:"), value.utf8.count == 71 else {
+            return false
+        }
+        return value.utf8.dropFirst(7).allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
+        }
     }
 
     private func sameInstant(_ left: Date, _ right: Date) -> Bool {
@@ -956,7 +1128,7 @@ struct DayWeavePublishedScheduleBlockProof: Codable, Equatable, Sendable {
 /// carry the compose `as_of` value or local API binding, so both are retained
 /// beside it instead of being inferred again after a restart.
 struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 2
 
     let version: Int
     let configurationIdentifier: String
@@ -973,14 +1145,13 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
 
     init?(
         publication: PendingSchedulePublication,
-        revision: DayWeavePublishedScheduleRevision
+        revision: DayWeavePublishedScheduleRevision,
+        renderedBlocks: [ScheduleBlock]
     ) {
         let request = publication.preparedRequest.request
-        let publishedBlocks = publication.preview.plan.blocks.compactMap {
-            DayWeavePublishedScheduleBlockProof(
-                block: $0,
-                sourceItemRevisions: publication.preview.sourceItemRevisions
-            )
+        let previewBlockIDs = Set(publication.preview.plan.blocks.map(\.id))
+        let publishedBlocks = renderedBlocks.compactMap {
+            DayWeavePublishedScheduleBlockProof(block: $0)
         }.sorted { $0.id.uuidString < $1.id.uuidString }
         self.init(
             configurationIdentifier: publication.configurationIdentifier,
@@ -995,16 +1166,51 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
             publishedAt: revision.publishedAt,
             publishedBlocks: publishedBlocks
         )
-        let canonicalPreviewBlockCount = publication.preview.plan.blocks.count {
-            $0.itemID != nil
-        }
-        guard publishedBlocks.count == canonicalPreviewBlockCount,
+        guard renderedBlocks.count == publication.preview.plan.blocks.count,
+              publishedBlocks.count == renderedBlocks.count,
+              Set(renderedBlocks.map(\.id)) == previewBlockIDs,
               inputDigest == request.expectedInputDigest,
               inputDigest == publication.preview.inputDigest,
               sameInstant(horizonStart, request.schedule.horizonStart),
               sameInstant(horizonEnd, request.schedule.horizonEnd),
               timezoneName == request.schedule.timezoneName,
               matches(publication.provenance) else { return nil }
+    }
+
+    /// Builds durable positive evidence from the authoritative native replica
+    /// resource. Unlike a publication response, this endpoint proves that the
+    /// returned immutable revision is the current server head, so a historical
+    /// idempotency replay is not involved.
+    init?(
+        current publication: DayWeaveCurrentPublishedSchedule,
+        configurationIdentifier: String,
+        renderedBlocks: [ScheduleBlock]
+    ) {
+        let schedule = publication.schedule
+        let revision = publication.revision
+        let previewBlockIDs = Set(schedule.plan.blocks.map(\.id))
+        let blocks = renderedBlocks.compactMap {
+            DayWeavePublishedScheduleBlockProof(block: $0)
+        }.sorted { $0.id.uuidString < $1.id.uuidString }
+        self.init(
+            configurationIdentifier: configurationIdentifier,
+            revisionID: revision.id,
+            revision: revision.revision,
+            revisionNumber: revision.revisionNumber,
+            inputDigest: revision.inputDigest,
+            asOf: schedule.plan.asOf,
+            horizonStart: revision.horizonStart,
+            horizonEnd: revision.horizonEnd,
+            timezoneName: revision.timezoneName,
+            publishedAt: revision.publishedAt,
+            publishedBlocks: blocks
+        )
+        guard renderedBlocks.count == schedule.plan.blocks.count,
+              blocks.count == renderedBlocks.count,
+              Set(renderedBlocks.map(\.id)) == previewBlockIDs,
+              inputDigest == schedule.inputDigest,
+              sameInstant(horizonStart, schedule.plan.horizonStart),
+              sameInstant(horizonEnd, schedule.plan.horizonEnd) else { return nil }
     }
 
     init(
@@ -1039,7 +1245,13 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
         let digestPrefix = "sha256:"
         let digest = inputDigest.dropFirst(digestPrefix.count)
         let expectedRevision = "\(revisionNumber):\(revisionID.uuidString.lowercased())"
-        return version == Self.currentVersion
+        let proofVersionIsValid = version == 1 || version == Self.currentVersion
+        let blocksHaveValidVersion = version == Self.currentVersion
+            ? publishedBlocks.allSatisfy(\.hasCurrentImmutableSeal)
+            : publishedBlocks.allSatisfy {
+                $0.hasValidShape && $0.immutableBlockDigest == nil
+            }
+        return proofVersionIsValid
             && !configurationIdentifier.isEmpty
             && configurationIdentifier.utf8.count <= 4_096
             && !configurationIdentifier.unicodeScalars.contains(
@@ -1059,14 +1271,23 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
             && publishedAt.timeIntervalSinceReferenceDate.isFinite
             && horizonStart <= asOf
             && asOf < horizonEnd
-            && TimeZone(identifier: timezoneName) != nil
+            && DayWeaveCanonicalItemDraft.supportedTimeZone(
+                identifier: timezoneName
+            ) != nil
             && publishedBlocks.count <= 10_000
             && publishedBlocks.allSatisfy {
-                $0.hasValidShape
+                blocksHaveValidVersion
                     && $0.start < horizonEnd
                     && horizonStart < $0.end
             }
             && Set(publishedBlocks.map(\.id)).count == publishedBlocks.count
+    }
+
+    /// Only a version-2 proof seals the complete publication-static rendered
+    /// plan. Version 1 remains decodable so an upgrade can retain encrypted
+    /// canonical data, but it grants no presentation or execution authority.
+    var hasCurrentImmutablePlanSeal: Bool {
+        version == Self.currentVersion && hasValidShape
     }
 
     func matches(_ provenance: SchedulePreviewProvenance) -> Bool {
@@ -1080,21 +1301,26 @@ struct DayWeavePublishedScheduleProof: Codable, Equatable, Sendable {
 
     func matchesPublishedPlan(_ blocks: [ScheduleBlock]) -> Bool {
         guard hasValidShape else { return false }
-        let canonicalBlocks = blocks.filter { $0.syncOrigin == .canonicalPreview }
-        guard canonicalBlocks.count == publishedBlocks.count else { return false }
+        let publishedPlanBlocks = blocks.filter { block in
+            if version == 1 { return block.syncOrigin == .canonicalPreview }
+            return block.syncOrigin == .canonicalPreview || block.syncOrigin == .externalPreview
+        }
+        guard publishedPlanBlocks.count == publishedBlocks.count else { return false }
         var blockByID: [UUID: ScheduleBlock] = [:]
-        for block in canonicalBlocks {
+        for block in publishedPlanBlocks {
             guard blockByID.updateValue(block, forKey: block.id) == nil else {
                 return false
             }
         }
         return publishedBlocks.allSatisfy { proof in
-            blockByID[proof.id].map(proof.matches) == true
+            blockByID[proof.id].map {
+                version == 1 ? proof.matchesLegacy($0) : proof.matches($0)
+            } == true
         }
     }
 
     func matches(_ block: ScheduleBlock) -> Bool {
-        guard hasValidShape,
+        guard hasCurrentImmutablePlanSeal,
               let proof = publishedBlocks.first(where: { $0.id == block.id }) else {
             return false
         }

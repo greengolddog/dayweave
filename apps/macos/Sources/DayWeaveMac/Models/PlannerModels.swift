@@ -179,6 +179,8 @@ struct ScheduleBlock: Identifiable, Hashable, Codable, Sendable {
     var sourceItemID: UUID? = nil
     var sourceItemRevision: UInt64? = nil
     var occurrenceID: UUID? = nil
+    /// Exact source identity for a published non-item fixed constraint.
+    var externalBlockID: UUID? = nil
     /// Root canonical item that owns this occurrence. A recurring hierarchy
     /// can emit executable descendant leaves with a different source item.
     var recurrenceSeriesItemID: UUID? = nil
@@ -644,7 +646,8 @@ extension ScheduleBlock {
         case id, title, kind, start, end, status, project, notes, energy
         case isSensitive
         case isFlexible, isHardConstraint, actualMinutes
-        case sourceItemID, sourceItemRevision, occurrenceID, recurrenceSeriesItemID, sessionIndex
+        case sourceItemID, sourceItemRevision, occurrenceID, externalBlockID
+        case recurrenceSeriesItemID, sessionIndex
         case syncOrigin, placementReason, previewKind, occurrenceFullyScheduled
         case recurrenceMoveSource
     }
@@ -671,6 +674,7 @@ extension ScheduleBlock {
         sourceItemID = try container.decodeIfPresent(UUID.self, forKey: .sourceItemID)
         sourceItemRevision = try container.decodeIfPresent(UInt64.self, forKey: .sourceItemRevision)
         occurrenceID = try container.decodeIfPresent(UUID.self, forKey: .occurrenceID)
+        externalBlockID = try container.decodeIfPresent(UUID.self, forKey: .externalBlockID)
         recurrenceSeriesItemID = try container.decodeIfPresent(
             UUID.self,
             forKey: .recurrenceSeriesItemID
@@ -939,7 +943,7 @@ struct DayWeaveOnboardingFirstItemAnchor: Equatable, Codable, Sendable {
                       && $0.isExecutable
               }),
               let publishedScheduleProof,
-              publishedScheduleProof.hasValidShape else { return false }
+              publishedScheduleProof.hasCurrentImmutablePlanSeal else { return false }
         return publishedScheduleProof.publishedBlocks.contains {
             $0.itemID == itemID && $0.itemRevision == canonicalRevision
         }

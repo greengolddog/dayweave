@@ -63,6 +63,29 @@ enum PlannerSchedulePublicationError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerScheduleReplicaError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case mutationFenceUnavailable
+    case publicationRecoveryPending
+    case configurationMismatch
+    case invalidPublication
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Healthy encrypted planner persistence is required before recovering a published schedule."
+        case .mutationFenceUnavailable:
+            "Another canonical or execution operation is active; the published schedule was not installed."
+        case .publicationRecoveryPending:
+            "Recover the exact pending schedule publication before replacing the local projection."
+        case .configurationMismatch:
+            "The published schedule belongs to another API credential binding."
+        case .invalidPublication:
+            "The current published schedule did not match the encrypted canonical cache."
+        }
+    }
+}
+
 enum PlannerLocalCompositionError: LocalizedError, Equatable, Sendable {
     case encryptedPersistenceRequired
     case mutationFenceUnavailable
@@ -704,9 +727,16 @@ final class PlannerStore: ObservableObject {
         if !initialScheduleProfile.hasValidShape
             || initialScheduleProfile.protectedFreeMinutes
                 != (restoredProtectedFreeMinutes ?? initialScheduleProfile.protectedFreeMinutes)
-            || initialSchedulePreviewProvenance.map({
-                $0.timezoneName != initialScheduleProfile.timezoneName
-            }) == true
+            || (initialSchedulePreviewProvenance.map { provenance in
+                provenance.timezoneName != initialScheduleProfile.timezoneName
+                    && initialPublishedScheduleProof.map { proof in
+                        proof.hasCurrentImmutablePlanSeal
+                            && proof.configurationIdentifier
+                                == initialCanonicalConfigurationIdentifier
+                            && proof.matches(provenance)
+                            && proof.matchesPublishedPlan(initialBlocks)
+                    } != true
+            } == true)
             || initialLocalScheduleCompositionProvenance.map({
                 $0.timezoneName != initialScheduleProfile.timezoneName
             }) == true {
@@ -910,19 +940,37 @@ final class PlannerStore: ObservableObject {
         let priorLocalProvenance = localScheduleCompositionProvenance
         let priorMessage = lastScheduleMessage
         let priorLaunchValidation = isCanonicalPreviewValidatedForCurrentLaunch
+        let preservesAuthoritativeReplica = schedulePreviewProvenance.map { provenance in
+            publishedScheduleProof.map { proof in
+                proof.hasCurrentImmutablePlanSeal
+                    && proof.configurationIdentifier == canonicalConfigurationIdentifier
+                    && proof.matches(provenance)
+                    && proof.matchesPublishedPlan(blocks)
+            } == true
+        } == true
 
         scheduleProfile = replacement
-        blocks.removeAll {
-            $0.syncOrigin == .canonicalPreview
-                || $0.syncOrigin == .externalPreview
-                || $0.syncOrigin == .localComposition
+        if preservesAuthoritativeReplica {
+            // Device-local profile settings govern the next composition. They
+            // cannot erase another device's immutable authoritative head.
+            blocks.removeAll { $0.syncOrigin == .localComposition }
+            localScheduleCompositionProvenance = nil
+            isCanonicalPreviewValidatedForCurrentLaunch = priorLaunchValidation
+            lastScheduleMessage =
+                "Schedule profile changed · current published schedule retained"
+        } else {
+            blocks.removeAll {
+                $0.syncOrigin == .canonicalPreview
+                    || $0.syncOrigin == .externalPreview
+                    || $0.syncOrigin == .localComposition
+            }
+            schedulePreviewProvenance = nil
+            publishedScheduleProof = nil
+            localScheduleCompositionProvenance = nil
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            selectedBlockID = blocks.first?.id
+            lastScheduleMessage = "Schedule profile changed · compose a fresh schedule"
         }
-        schedulePreviewProvenance = nil
-        publishedScheduleProof = nil
-        localScheduleCompositionProvenance = nil
-        isCanonicalPreviewValidatedForCurrentLaunch = false
-        selectedBlockID = blocks.first?.id
-        lastScheduleMessage = "Schedule profile changed · compose a fresh schedule"
 
         flushPersistence()
         if let persistenceError {
@@ -974,6 +1022,21 @@ final class PlannerStore: ObservableObject {
         // Invalidate before inspecting the identifier so an out-of-process
         // defaults change cannot leave an old server's preview actionable.
         invalidateCanonicalPreview()
+        try prepareCanonicalBinding(configurationIdentifier: configurationIdentifier)
+    }
+
+    /// Establishes or canonicalizes the durable API/auth binding for a
+    /// read-only schedule bootstrap without invalidating the currently
+    /// installed projection. Only a validated current resource, an exact typed
+    /// absence, or a subsequently recovered local write may change that plan.
+    func prepareCanonicalReplicaRead(configurationIdentifier: String) throws {
+        guard canPersistPlan else {
+            throw persistenceError ?? PlannerPersistenceError.snapshotEncodingFailed
+        }
+        try prepareCanonicalBinding(configurationIdentifier: configurationIdentifier)
+    }
+
+    private func prepareCanonicalBinding(configurationIdentifier: String) throws {
         guard let requestedIdentifier = Self.canonicalConfigurationIdentifier(
             configurationIdentifier
         ) else {
@@ -1098,6 +1161,7 @@ final class PlannerStore: ObservableObject {
         let horizonStart: Date
         let horizonEnd: Date
         let timezoneName: String
+        let requiresLocalProfileTimezone: Bool
         if let provenance = localScheduleCompositionProvenance {
             guard schedulePreviewProvenance == nil,
                   provenance.hasValidShape,
@@ -1115,6 +1179,7 @@ final class PlannerStore: ObservableObject {
             horizonStart = provenance.horizonStart
             horizonEnd = provenance.horizonEnd
             timezoneName = provenance.timezoneName
+            requiresLocalProfileTimezone = true
         } else if let provenance = schedulePreviewProvenance {
             guard provenance.configurationIdentifier == canonicalConfigurationIdentifier else {
                 return "The visible preview is not bound to the active API configuration."
@@ -1124,6 +1189,12 @@ final class PlannerStore: ObservableObject {
             horizonStart = provenance.horizonStart
             horizonEnd = provenance.horizonEnd
             timezoneName = provenance.timezoneName
+            requiresLocalProfileTimezone = publishedScheduleProof.map { proof in
+                proof.hasCurrentImmutablePlanSeal
+                    && proof.configurationIdentifier == canonicalConfigurationIdentifier
+                    && proof.matches(provenance)
+                    && proof.matchesPublishedPlan(blocks)
+            } != true
         } else {
             return "The visible canonical schedule has no trusted composition evidence."
         }
@@ -1134,7 +1205,7 @@ final class PlannerStore: ObservableObject {
         }
         guard let timezone = DayWeaveCanonicalItemDraft.supportedTimeZone(
             identifier: timezoneName
-        ), timezoneName == scheduleProfile.timezoneName else {
+        ), !requiresLocalProfileTimezone || timezoneName == scheduleProfile.timezoneName else {
             return "The planning timezone changed. Sync or compose again before changing canonical blocks."
         }
         var calendar = Calendar(identifier: .gregorian)
@@ -1177,6 +1248,24 @@ final class PlannerStore: ObservableObject {
             }
             return canMutate(block)
         }
+    }
+
+    /// A proven immutable replica carries its own planning timezone. The local
+    /// profile remains the input for the next composition, but cannot reinterpret
+    /// the calendar day of the currently authoritative published plan.
+    var schedulePresentationTimezoneName: String {
+        guard let provenance = schedulePreviewProvenance,
+              let proof = publishedScheduleProof,
+              proof.hasCurrentImmutablePlanSeal,
+              proof.configurationIdentifier == canonicalConfigurationIdentifier,
+              proof.matches(provenance),
+              proof.matchesPublishedPlan(blocks),
+              DayWeaveCanonicalItemDraft.supportedTimeZone(
+                  identifier: provenance.timezoneName
+              ) != nil else {
+            return scheduleProfile.timezoneName
+        }
+        return provenance.timezoneName
     }
 
     /// Checked while the shared mutation lock is held, so it deliberately does
@@ -1228,7 +1317,9 @@ final class PlannerStore: ObservableObject {
         guard start.timeIntervalSinceReferenceDate.isFinite,
               end.timeIntervalSinceReferenceDate.isFinite,
               start < end,
-              let timezone = TimeZone(identifier: scheduleProfile.timezoneName) else {
+              let timezone = DayWeaveCanonicalItemDraft.supportedTimeZone(
+                  identifier: schedulePresentationTimezoneName
+              ) else {
             return "The exact target window is invalid."
         }
 
@@ -1362,7 +1453,7 @@ final class PlannerStore: ObservableObject {
     var todaysBlocks: [ScheduleBlock] {
         var calendar = Calendar(identifier: .gregorian)
         if let timezone = DayWeaveCanonicalItemDraft.supportedTimeZone(
-            identifier: scheduleProfile.timezoneName
+            identifier: schedulePresentationTimezoneName
         ) {
             calendar.timeZone = timezone
         }
@@ -2903,8 +2994,9 @@ final class PlannerStore: ObservableObject {
         }
         guard let publicationProof = DayWeavePublishedScheduleProof(
             publication: publication,
-            revision: response.revision
-        ), publicationProof.hasValidShape,
+            revision: response.revision,
+            renderedBlocks: newBlocks
+        ), publicationProof.hasCurrentImmutablePlanSeal,
            publicationProof.matchesPublishedPlan(newBlocks) else {
             throw PlannerSchedulePublicationError.invalidJournal
         }
@@ -2943,6 +3035,134 @@ final class PlannerStore: ObservableObject {
             pendingSchedulePublication = publication
             // A failed atomic local commit must never leave either the prior
             // or newly published projection actionable in this process.
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            throw persistenceError
+        }
+    }
+
+    /// Atomically installs an authoritative native replica into the encrypted
+    /// planner snapshot. The caller must hold the shared canonical mutation
+    /// fence and must have validated the complete public schedule against the
+    /// current canonical cache before entering this transaction.
+    func installCurrentPublishedSchedule(
+        _ publication: DayWeaveCurrentPublishedSchedule,
+        blocks newBlocks: [ScheduleBlock],
+        configurationIdentifier: String,
+        message: String
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerScheduleReplicaError.encryptedPersistenceRequired
+        }
+        guard isCanonicalSyncLocked else {
+            throw PlannerScheduleReplicaError.mutationFenceUnavailable
+        }
+        guard pendingSchedulePublication == nil else {
+            throw PlannerScheduleReplicaError.publicationRecoveryPending
+        }
+        guard canonicalConfigurationIdentifier == configurationIdentifier else {
+            throw PlannerScheduleReplicaError.configurationMismatch
+        }
+        let currentRevisions = Dictionary(
+            uniqueKeysWithValues: canonicalItems.map { ($0.id, $0.revision) }
+        )
+        let provenance = SchedulePreviewProvenance(
+            configurationIdentifier: configurationIdentifier,
+            // Poll observation time must never renew execution authority for
+            // an old immutable publication. `as_of` is the composition clock
+            // sealed by the current resource and durable publication proof.
+            generatedAt: publication.schedule.plan.asOf,
+            asOf: publication.schedule.plan.asOf,
+            horizonStart: publication.schedule.plan.horizonStart,
+            horizonEnd: publication.schedule.plan.horizonEnd,
+            timezoneName: publication.revision.timezoneName
+        )
+        guard publication.schedule.sourceItemRevisions == currentRevisions,
+              let proof = DayWeavePublishedScheduleProof(
+                  current: publication,
+                  configurationIdentifier: configurationIdentifier,
+                  renderedBlocks: newBlocks
+              ),
+              proof.hasCurrentImmutablePlanSeal,
+              proof.matches(provenance),
+              proof.matchesPublishedPlan(newBlocks) else {
+            throw PlannerScheduleReplicaError.invalidPublication
+        }
+
+        let priorBlocks = blocks
+        let priorSelection = selectedBlockID
+        let priorProvenance = schedulePreviewProvenance
+        let priorProof = publishedScheduleProof
+        let priorLocalProvenance = localScheduleCompositionProvenance
+        let priorExecutionState = executionState
+        let priorDeferredSessionIDs = deferredExecutionPublicationSessionIDs
+        let priorMessage = lastScheduleMessage
+
+        applySchedulePreviewInMemory(
+            blocks: newBlocks,
+            message: message,
+            provenance: provenance
+        )
+        publishedScheduleProof = proof
+        reconcileOutstandingDeferredPublicationProof(
+            authorizedSessionIDs: deferredExecutionPublicationSessionIDs
+        )
+        flushPersistence()
+        if let persistenceError {
+            blocks = priorBlocks
+            selectedBlockID = priorSelection
+            schedulePreviewProvenance = priorProvenance
+            publishedScheduleProof = priorProof
+            localScheduleCompositionProvenance = priorLocalProvenance
+            executionState = priorExecutionState
+            deferredExecutionPublicationSessionIDs = priorDeferredSessionIDs
+            lastScheduleMessage = priorMessage
+            // A failed CAS cannot leave either projection actionable.
+            isCanonicalPreviewValidatedForCurrentLaunch = false
+            throw persistenceError
+        }
+    }
+
+    /// Applies the current endpoint's exact typed absence without disturbing
+    /// local-only captures or an on-device composition. Generic 404 responses
+    /// never reach this method.
+    func clearCurrentPublishedSchedule(
+        configurationIdentifier: String
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerScheduleReplicaError.encryptedPersistenceRequired
+        }
+        guard isCanonicalSyncLocked else {
+            throw PlannerScheduleReplicaError.mutationFenceUnavailable
+        }
+        guard pendingSchedulePublication == nil else {
+            throw PlannerScheduleReplicaError.publicationRecoveryPending
+        }
+        guard canonicalConfigurationIdentifier == configurationIdentifier else {
+            throw PlannerScheduleReplicaError.configurationMismatch
+        }
+        guard schedulePreviewProvenance != nil || publishedScheduleProof != nil else { return }
+
+        let priorBlocks = blocks
+        let priorSelection = selectedBlockID
+        let priorProvenance = schedulePreviewProvenance
+        let priorProof = publishedScheduleProof
+        let priorMessage = lastScheduleMessage
+
+        blocks.removeAll {
+            $0.syncOrigin == .canonicalPreview || $0.syncOrigin == .externalPreview
+        }
+        schedulePreviewProvenance = nil
+        publishedScheduleProof = nil
+        isCanonicalPreviewValidatedForCurrentLaunch = localScheduleCompositionProvenance != nil
+        selectedBlockID = blocks.first(where: { $0.id == priorSelection })?.id ?? blocks.first?.id
+        lastScheduleMessage = "No schedule is currently published on this workspace"
+        flushPersistence()
+        if let persistenceError {
+            blocks = priorBlocks
+            selectedBlockID = priorSelection
+            schedulePreviewProvenance = priorProvenance
+            publishedScheduleProof = priorProof
+            lastScheduleMessage = priorMessage
             isCanonicalPreviewValidatedForCurrentLaunch = false
             throw persistenceError
         }

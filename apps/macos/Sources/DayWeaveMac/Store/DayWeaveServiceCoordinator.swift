@@ -26,6 +26,8 @@ protocol CanonicalServiceSynchronizing: AnyObject {
     var isConfigured: Bool { get }
 
     @discardableResult
+    func bootstrapForegroundActivation() async -> Bool
+    @discardableResult
     func syncThroughFreshComposition() async -> Bool
     func startForegroundItemInvalidations(every interval: Duration)
     func stopForegroundItemInvalidations()
@@ -157,9 +159,9 @@ final class DayWeaveServiceCoordinator: ObservableObject {
         let executionOutcome = await executionSync.refresh()
         guard operationIsCurrent(generation) else { return false }
         if executionOutcome == .success, canonicalSync.isConfigured {
-            _ = await canonicalSync.syncThroughFreshComposition()
+            _ = await canonicalSync.bootstrapForegroundActivation()
             guard operationIsCurrent(generation) else { return false }
-            // Start the guarded delivery manager even when the activation sync
+            // Start the guarded delivery manager even when the read-first bootstrap
             // failed transiently. CanonicalSyncStore admits neither the stream
             // nor its fallback probe until the encrypted durable binding and
             // cursor match the current connection, so a failed persistence or

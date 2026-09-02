@@ -2218,10 +2218,8 @@ struct ExecutionSyncStoreTests {
         replacement.start = moveStart
         replacement.end = moveEnd
         replacement.previewKind = "pinned"
-        let replacementProof = DayWeavePublishedScheduleBlockProof(
-            id: replacementID, itemID: Self.itemID, itemRevision: 1,
-            occurrenceID: nil, sessionIndex: 1, start: moveStart, end: moveEnd,
-            kind: "pinned"
+        let replacementProof = try #require(
+            DayWeavePublishedScheduleBlockProof(block: replacement)
         )
         let planner = Self.planner(
             persistence: context.persistence,
@@ -2282,16 +2280,8 @@ struct ExecutionSyncStoreTests {
         sibling.end = Self.baseDate.addingTimeInterval(2_700)
         sibling.previewKind = "pinned"
         let source = Self.block()
-        let sourceProof = DayWeavePublishedScheduleBlockProof(
-            id: source.id, itemID: Self.itemID, itemRevision: 1,
-            occurrenceID: nil, sessionIndex: 0, start: source.start, end: source.end,
-            kind: "planned"
-        )
-        let siblingProof = DayWeavePublishedScheduleBlockProof(
-            id: sibling.id, itemID: Self.itemID, itemRevision: 1,
-            occurrenceID: nil, sessionIndex: 1, start: sibling.start, end: sibling.end,
-            kind: "pinned"
-        )
+        let sourceProof = try #require(DayWeavePublishedScheduleBlockProof(block: source))
+        let siblingProof = try #require(DayWeavePublishedScheduleBlockProof(block: sibling))
         let planner = Self.planner(
             persistence: context.persistence,
             blocks: [source, sibling], canonicalItems: [try Self.canonicalItem(splittable: true)],
@@ -4104,19 +4094,9 @@ struct ExecutionSyncStoreTests {
         )
         let revisionID = UUID(uuidString: "10000000-0000-4000-8000-000000000001")!
         let publishedBlocks = blocks.compactMap { block -> DayWeavePublishedScheduleBlockProof? in
-            guard block.syncOrigin == .canonicalPreview,
-                  let itemID = block.sourceItemID,
-                  let itemRevision = block.sourceItemRevision else { return nil }
-            return .init(
-                id: block.id,
-                itemID: itemID,
-                itemRevision: itemRevision,
-                occurrenceID: block.occurrenceID,
-                sessionIndex: block.sessionIndex ?? 0,
-                start: block.start,
-                end: block.end,
-                kind: block.previewKind ?? "planned"
-            )
+            guard block.syncOrigin == .canonicalPreview
+                    || block.syncOrigin == .externalPreview else { return nil }
+            return DayWeavePublishedScheduleBlockProof(block: block)
         }
         let proof = includePublicationProof ? DayWeavePublishedScheduleProof(
             configurationIdentifier: canonicalConfiguration,

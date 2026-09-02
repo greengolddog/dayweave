@@ -2261,7 +2261,7 @@ struct CanonicalSyncStoreTests {
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
         let itemID = UUID(uuidString: "27400000-2222-4333-8444-200000000000")!
         let blockID = UUID(uuidString: "27400000-2222-4333-8444-200000000001")!
-        for variant in ["overlap", "fixed", "score"] {
+        for variant in ["overlap", "fixed", "external-id", "score"] {
             let token = "canonical-invalid-preview-\(variant)"
             let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
             let planner = PlannerStore(
@@ -2298,6 +2298,13 @@ struct CanonicalSyncStoreTests {
                 var score = try #require(plan["score"] as? [String: Any])
                 score["scheduled_minutes"] = 90
                 plan["score"] = score
+            } else if variant == "external-id" {
+                var blocks = try #require(plan["blocks"] as? [[String: Any]])
+                let fixedIndex = try #require(blocks.firstIndex {
+                    $0["kind"] as? String == "external_fixed"
+                })
+                blocks[fixedIndex]["id"] = UUID().uuidString.lowercased()
+                plan["blocks"] = blocks
             } else {
                 var score = try #require(plan["score"] as? [String: Any])
                 score["scheduled_minutes"] = 44
@@ -2316,6 +2323,184 @@ struct CanonicalSyncStoreTests {
 
             #expect(sync.status.isFailure)
             #expect(sync.lastPreview == nil)
+        }
+    }
+
+    @Test("authorized pinned work may overlap immutable external context")
+    func pinnedMayOverlapExternalFixedContext() async throws {
+        let token = "canonical-pinned-external-overlap"
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let itemID = UUID(uuidString: "27410000-2222-4333-8444-200000000000")!
+        let blockID = UUID(uuidString: "27410000-2222-4333-8444-200000000001")!
+        let item = try Self.decodeItem(Self.itemObject(id: itemID, revision: 1))
+        let planner = PlannerStore(
+            canonicalItems: [item],
+            canonicalDeltaCursor: "pinned-overlap-before",
+            canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+            restoreFromPersistence: false,
+            now: { now }
+        )
+        var object = try #require(
+            JSONSerialization.jsonObject(
+                with: Data(Self.previewObject(itemID: itemID, blockID: blockID).utf8)
+            ) as? [String: Any]
+        )
+        var plan = try #require(object["plan"] as? [String: Any])
+        var blocks = try #require(plan["blocks"] as? [[String: Any]])
+        let fixed = try #require(blocks.first {
+            $0["kind"] as? String == "external_fixed"
+                && $0["title"] as? String == "Protected time"
+        })
+        blocks[0]["kind"] = "pinned"
+        blocks[0]["start"] = fixed["start"]
+        blocks[0]["end"] = fixed["end"]
+        plan["blocks"] = blocks
+        let startString = try #require(fixed["start"] as? String)
+        let endString = try #require(fixed["end"] as? String)
+        let start = try #require(ISO8601DateFormatter().date(from: startString))
+        let end = try #require(ISO8601DateFormatter().date(from: endString))
+        var score = try #require(plan["score"] as? [String: Any])
+        score["scheduled_minutes"] = Int(end.timeIntervalSince(start) / 60)
+        plan["score"] = score
+        object["plan"] = plan
+        URLProtocolStub.storage.reset(key: token)
+        URLProtocolStub.storage.enqueue(
+            key: token,
+            .init(
+                statusCode: 200,
+                body: Data(
+                    #"{"changes":[],"next_cursor":"pinned-overlap-after","has_more":false}"#.utf8
+                )
+            ),
+            .init(statusCode: 200, body: try JSONSerialization.data(withJSONObject: object))
+        )
+        let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+        await sync.sync()
+
+        if case .online = sync.status {} else {
+            Issue.record("A pinned/manual placement may overlap immutable fixed context")
+        }
+        #expect(planner.blocks.contains { $0.id == blockID && $0.previewKind == "pinned" })
+        #expect(planner.publishedScheduleProof?.hasCurrentImmutablePlanSeal == true)
+    }
+
+    @Test("recurrence evidence accepts descendants and rejects unrelated items")
+    func recurringHierarchyEvidenceUsesCanonicalParentGraph() async throws {
+        let now = try #require(ISO8601DateFormatter().date(from: "2026-08-29T08:00:00Z"))
+        let rootID = UUID(uuidString: "27420000-2222-4333-8444-200000000000")!
+        let leafID = UUID(uuidString: "27420000-2222-4333-8444-200000000001")!
+        let blockID = UUID(uuidString: "27420000-2222-4333-8444-200000000002")!
+        let occurrenceID = UUID(uuidString: "27420000-2222-5333-8444-200000000003")!
+        let rootObject = Self.itemObject(
+            id: rootID,
+            revision: 1,
+            isExecutable: false
+        ).replacingOccurrences(
+            of: #""recurrence":null"#,
+            with: #""recurrence":{"type":"daily","times_per_day":1}"#
+        )
+        let root = try Self.decodeItem(rootObject)
+
+        for isDescendant in [true, false] {
+            let token = "canonical-recurring-hierarchy-\(isDescendant)"
+            let leaf = try Self.decodeItem(Self.itemObject(
+                id: leafID,
+                revision: 1,
+                parentID: isDescendant ? rootID : nil
+            ))
+            let planner = PlannerStore(
+                canonicalItems: [root, leaf],
+                canonicalDeltaCursor: "hierarchy-before",
+                canonicalConfigurationIdentifier: Self.configurationIdentifier(token: token),
+                restoreFromPersistence: false,
+                now: { now }
+            )
+            var object = try #require(
+                JSONSerialization.jsonObject(
+                    with: Data(Self.previewObject(itemID: leafID, blockID: blockID).utf8)
+                ) as? [String: Any]
+            )
+            object["source_item_count"] = 2
+            object["accepted_item_count"] = 2
+            object["source_item_revisions"] = [
+                rootID.uuidString.lowercased(): 1,
+                leafID.uuidString.lowercased(): 1,
+            ]
+            var plan = try #require(object["plan"] as? [String: Any])
+            var blocks = try #require(plan["blocks"] as? [[String: Any]])
+            blocks[0]["occurrence_id"] = occurrenceID.uuidString.lowercased()
+            plan["blocks"] = blocks
+            let blockStart = try #require(blocks[0]["start"] as? String)
+            let blockEnd = try #require(blocks[0]["end"] as? String)
+            let localDate = String(blockStart.prefix(10))
+            plan["occurrences"] = [[
+                "id": occurrenceID.uuidString.lowercased(),
+                "series_item_id": rootID.uuidString.lowercased(),
+                "identity": [
+                    "type": "calendar_day",
+                    "date": localDate,
+                    "bucket_ordinal": 0,
+                ],
+                "nominal_start": blockStart,
+                "nominal_end": blockEnd,
+                "window_start": blockStart,
+                "window_end": blockEnd,
+                "local_date": localDate,
+                "ordinal": 0,
+                "state": "generated",
+            ]]
+            plan["unscheduled"] = [[
+                "item_id": leafID.uuidString.lowercased(),
+                "occurrence_id": occurrenceID.uuidString.lowercased(),
+                "remaining": 0,
+                "reason": "no_capacity",
+                "message": "No remaining work",
+            ]]
+            plan["decisions"] = [[
+                "item_id": leafID.uuidString.lowercased(),
+                "occurrence_id": occurrenceID.uuidString.lowercased(),
+                "kind": "scheduled",
+                "message": "Placed recurring leaf",
+            ]]
+            plan["violations"] = [[
+                "kind": "soft_constraint",
+                "severity": "warning",
+                "item_ids": [leafID.uuidString.lowercased()],
+                "occurrence_ids": [occurrenceID.uuidString.lowercased()],
+                "start": NSNull(),
+                "end": NSNull(),
+                "penalty": 0,
+                "message": "Recurring leaf evidence",
+            ]]
+            object["plan"] = plan
+            URLProtocolStub.storage.reset(key: token)
+            URLProtocolStub.storage.enqueue(
+                key: token,
+                .init(
+                    statusCode: 200,
+                    body: Data(
+                        #"{"changes":[],"next_cursor":"hierarchy-after","has_more":false}"#.utf8
+                    )
+                ),
+                .init(
+                    statusCode: 200,
+                    body: try JSONSerialization.data(withJSONObject: object)
+                )
+            )
+            let sync = Self.makeSync(planner: planner, token: token, now: now)
+
+            await sync.sync()
+
+            if isDescendant {
+                if case .online = sync.status {} else {
+                    Issue.record("A recurring descendant must retain the root occurrence")
+                }
+                #expect(planner.blocks.first { $0.id == blockID }?.occurrenceID == occurrenceID)
+            } else {
+                #expect(sync.status.isFailure)
+                #expect(sync.lastPreview == nil)
+            }
         }
     }
 
