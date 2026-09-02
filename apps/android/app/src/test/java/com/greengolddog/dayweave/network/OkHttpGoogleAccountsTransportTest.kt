@@ -59,7 +59,7 @@ class OkHttpGoogleAccountsTransportTest {
     }
 
     @Test
-    fun authorizationStartUsesExactBodyKeyAndDoesNotFollowRedirects() = runBlocking {
+    fun authorizationStartUsesExplicitReadOnlySentinelAndDoesNotFollowRedirects() = runBlocking {
         val server = MockWebServer()
         server.start()
         try {
@@ -73,9 +73,6 @@ class OkHttpGoogleAccountsTransportTest {
                 configuration(server),
                 IDEMPOTENCY_KEY,
                 StartGoogleAuthorizationRequest(
-                    services = setOf("calendar", "tasks"),
-                    forceConsent = false,
-                    connectNew = true,
                     makeDefault = true,
                 ),
             )
@@ -85,10 +82,19 @@ class OkHttpGoogleAccountsTransportTest {
             assertEquals(IDEMPOTENCY_KEY, request.headers["Idempotency-Key"])
             val body = Json.parseToJsonElement(requireNotNull(request.body).utf8()).jsonObject
             assertEquals(
-                setOf("calendar", "tasks"),
-                body.getValue("services").jsonArray.map { it.jsonPrimitive.content }.toSet(),
+                setOf(
+                    "services",
+                    "force_consent",
+                    "login_hint",
+                    "account_id",
+                    "connect_new",
+                    "make_default",
+                ),
+                body.keys,
             )
-            assertEquals("true", body.getValue("connect_new").jsonPrimitive.content)
+            assertTrue(body.getValue("services").jsonArray.isEmpty())
+            assertEquals("false", body.getValue("connect_new").jsonPrimitive.content)
+            assertEquals("true", body.getValue("make_default").jsonPrimitive.content)
 
             server.enqueue(
                 MockResponse.Builder()
@@ -100,6 +106,75 @@ class OkHttpGoogleAccountsTransportTest {
                 runBlocking { transport().accounts(configuration(server)) }
             }
             assertEquals(2, server.requestCount)
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test
+    fun authorizationPreservesServerSupportedIncrementalServiceSelections() = runBlocking {
+        val server = MockWebServer()
+        server.start()
+        try {
+            val serviceSelections = listOf(
+                listOf(GoogleService.CALENDAR_READ_ONLY),
+                listOf(GoogleService.CALENDAR),
+                listOf(GoogleService.TASKS_READ_ONLY),
+                listOf(GoogleService.TASKS),
+                GoogleService.entries,
+            )
+            val transport = transport()
+            val configuration = configuration(server)
+            serviceSelections.forEach { services ->
+                server.enqueue(
+                    jsonResponse(
+                        201,
+                        """{"authorization_url":"https://accounts.google.com/o/oauth2/v2/auth?state=opaque","expires_at":"2026-09-01T07:10:00Z"}""",
+                    ),
+                )
+                transport.startAuthorization(
+                    configuration,
+                    IDEMPOTENCY_KEY,
+                    StartGoogleAuthorizationRequest(
+                        services = services,
+                        forceConsent = true,
+                        accountId = ACCOUNT_ID,
+                    ),
+                )
+                val body = Json.parseToJsonElement(
+                    requireNotNull(server.takeRequest().body).utf8(),
+                ).jsonObject
+                assertEquals(
+                    services.map { service -> service.serializedName },
+                    body.getValue("services").jsonArray.map { it.jsonPrimitive.content },
+                )
+            }
+            listOf(
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.CALENDAR, GoogleService.CALENDAR),
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = GoogleService.entries + GoogleService.CALENDAR,
+                ),
+                StartGoogleAuthorizationRequest(
+                    accountId = ACCOUNT_ID,
+                    connectNew = true,
+                ),
+                StartGoogleAuthorizationRequest(loginHint = ""),
+                StartGoogleAuthorizationRequest(loginHint = "x".repeat(321)),
+                StartGoogleAuthorizationRequest(loginHint = "owner\n@example.com"),
+            ).forEach { invalidRequest ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    runBlocking {
+                        transport.startAuthorization(
+                            configuration,
+                            IDEMPOTENCY_KEY,
+                            invalidRequest,
+                        )
+                    }
+                }
+            }
+            assertEquals(serviceSelections.size, server.requestCount)
         } finally {
             server.close()
         }
@@ -157,8 +232,6 @@ class OkHttpGoogleAccountsTransportTest {
                         configuration,
                         "invalid:key",
                         StartGoogleAuthorizationRequest(
-                            services = setOf("calendar"),
-                            forceConsent = false,
                             connectNew = true,
                             makeDefault = true,
                         ),
@@ -176,8 +249,6 @@ class OkHttpGoogleAccountsTransportTest {
                         configuration,
                         "bad key",
                         StartGoogleAuthorizationRequest(
-                            services = setOf("calendar"),
-                            forceConsent = false,
                             connectNew = true,
                             makeDefault = true,
                         ),
@@ -191,6 +262,14 @@ class OkHttpGoogleAccountsTransportTest {
     }
 
     private fun transport() = OkHttpGoogleAccountsTransport()
+
+    private val GoogleService.serializedName: String
+        get() = when (this) {
+            GoogleService.CALENDAR_READ_ONLY -> "calendar_read_only"
+            GoogleService.CALENDAR -> "calendar"
+            GoogleService.TASKS_READ_ONLY -> "tasks_read_only"
+            GoogleService.TASKS -> "tasks"
+        }
 
     private fun configuration(server: MockWebServer) =
         AuthenticatedApiConfiguration.createForLoopbackTest(server.url("/").toString(), "test-secret")

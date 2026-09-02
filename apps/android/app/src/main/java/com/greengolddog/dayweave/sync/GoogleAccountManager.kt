@@ -37,8 +37,14 @@ data class GoogleAccountSummary(
     val status: String,
     val syncEnabled: Boolean,
     val isDefault: Boolean,
+    /** Calendar can be read with either the narrow or full provider scope. */
     val hasCalendar: Boolean,
+    /** Full Calendar scope required for the separately approved publishing flow. */
+    val hasCalendarWriteScope: Boolean,
+    /** Tasks can be imported with either the narrow or full provider scope. */
     val hasTasks: Boolean,
+    /** Full Tasks scope reserved for a later explicit sync upgrade. */
+    val hasTasksWriteScope: Boolean,
     val revision: Long,
 )
 
@@ -297,11 +303,14 @@ class GoogleAccountManager(
                     configuration = configuration,
                     idempotencyKey = newUuid().toString(),
                     request = StartGoogleAuthorizationRequest(
-                        services = setOf("calendar", "tasks"),
-                        forceConsent = account?.status == "reauthorization_required",
+                        // The explicit empty sentinel asks the server for Calendar and Tasks
+                        // read-only. Full scopes remain separate existing-account upgrades.
+                        services = emptyList(),
+                        forceConsent = account != null,
                         accountId = account?.id,
-                        connectNew = account == null,
-                        makeDefault = account == null && previous.accounts.none { it.isDefault },
+                        connectNew = account == null && previous.accounts.isNotEmpty(),
+                        makeDefault = account?.isDefault
+                            ?: previous.accounts.none { it.isDefault },
                     ),
                 )
                 if (!bindingStillCurrent(binding)) return@withLock
@@ -519,6 +528,12 @@ class GoogleAccountManager(
         configurationId: String?,
     ): GoogleAccountState {
         validateCleanup(response)
+        require(response.accounts.size <= MAX_ACCOUNTS)
+        require(response.accounts.map { it.id }.toSet().size == response.accounts.size)
+        require(
+            response.accounts.map { it.externalAccountId }.toSet().size == response.accounts.size,
+        )
+        require(response.accounts.count { it.isDefault } <= 1)
         val accounts = response.accounts.map(::validateAccount)
             .filter { it.status != "revoked" }
             .sortedWith(compareByDescending<GoogleAccountSummary> { it.isDefault }.thenBy { it.label })
@@ -589,17 +604,34 @@ class GoogleAccountManager(
         val updatedAt = Instant.parse(remote.updatedAt)
         require(updatedAt >= createdAt)
         remote.tokenExpiresAt?.let(Instant::parse)
-        require(remote.grantedScopes.size <= MAX_SCOPES && remote.grantedScopes.all { scope ->
-            scope.length in 1..MAX_SCOPE_CHARS && !scope.any(Char::isISOControl)
-        })
+        require(
+            remote.grantedScopes.size <= MAX_SCOPES &&
+                remote.grantedScopes.toSet().size == remote.grantedScopes.size &&
+                remote.grantedScopes.all { scope ->
+                    scope.length in 1..MAX_SCOPE_CHARS && !scope.any(Char::isISOControl)
+                },
+        )
+        require(remote.syncEnabled == (remote.status == "active"))
+        require(
+            if (remote.status == "revoked") {
+                remote.grantedScopes.isEmpty() && remote.tokenExpiresAt == null && !remote.isDefault
+            } else {
+                remote.grantedScopes.isNotEmpty()
+            },
+        )
+        val hasCalendarWriteScope = GOOGLE_CALENDAR_SCOPE in remote.grantedScopes
+        val hasTasksWriteScope = GOOGLE_TASKS_SCOPE in remote.grantedScopes
         return GoogleAccountSummary(
             id = remote.id,
             label = remote.displayLabel,
             status = remote.status,
             syncEnabled = remote.syncEnabled,
             isDefault = remote.isDefault,
-            hasCalendar = GOOGLE_CALENDAR_SCOPE in remote.grantedScopes,
-            hasTasks = GOOGLE_TASKS_SCOPE in remote.grantedScopes,
+            hasCalendar = hasCalendarWriteScope ||
+                GOOGLE_CALENDAR_READ_ONLY_SCOPE in remote.grantedScopes,
+            hasCalendarWriteScope = hasCalendarWriteScope,
+            hasTasks = hasTasksWriteScope || GOOGLE_TASKS_READ_ONLY_SCOPE in remote.grantedScopes,
+            hasTasksWriteScope = hasTasksWriteScope,
             revision = remote.revision,
         )
     }
@@ -722,9 +754,14 @@ class GoogleAccountManager(
         private const val MAX_AUTHORIZATION_SECONDS = 15 * 60L
         private const val MAX_AUTHORIZATION_URL_CHARS = 8 * 1024
         private const val MAX_LABEL_CHARS = 320
+        private const val MAX_ACCOUNTS = 10_000
         private const val MAX_SCOPES = 32
         private const val MAX_SCOPE_CHARS = 512
+        private const val GOOGLE_CALENDAR_READ_ONLY_SCOPE =
+            "https://www.googleapis.com/auth/calendar.readonly"
         private const val GOOGLE_CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
+        private const val GOOGLE_TASKS_READ_ONLY_SCOPE =
+            "https://www.googleapis.com/auth/tasks.readonly"
         private const val GOOGLE_TASKS_SCOPE = "https://www.googleapis.com/auth/tasks"
         private val GOOGLE_ACCOUNT_STATUSES = setOf(
             "active",

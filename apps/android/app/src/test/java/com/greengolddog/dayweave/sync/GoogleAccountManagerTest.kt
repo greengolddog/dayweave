@@ -111,10 +111,22 @@ class GoogleAccountManagerTest {
         assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
         val mapped = manager.state.value.accounts.single()
         assertTrue(mapped.hasCalendar)
+        assertFalse(mapped.hasCalendarWriteScope)
         assertTrue(mapped.hasTasks)
+        assertFalse(mapped.hasTasksWriteScope)
         assertTrue(mapped.isDefault)
 
-        transport.accountsResult = accounts(account()).copy(
+        transport.accountsResult = accounts(
+            account(calendarWrite = true, tasksWrite = true, revision = 8),
+        )
+        manager.refresh()
+        val upgraded = manager.state.value.accounts.single()
+        assertTrue(upgraded.hasCalendar)
+        assertTrue(upgraded.hasCalendarWriteScope)
+        assertTrue(upgraded.hasTasks)
+        assertTrue(upgraded.hasTasksWriteScope)
+
+        transport.accountsResult = accounts(account(revision = 9)).copy(
             cleanup = cleanup().copy(
                 operatorRecoveryRequired = true,
                 uncertainAuthorizations = 1,
@@ -142,8 +154,9 @@ class GoogleAccountManagerTest {
         assertNotNull(manager.state.value.authorization)
         assertFalse(manager.state.value.toString().contains("state=opaque"))
         val request = requireNotNull(transport.authorizationRequests.single())
-        assertEquals(setOf("calendar", "tasks"), request.services)
-        assertTrue(request.connectNew)
+        assertTrue(request.services.isEmpty())
+        assertFalse(request.forceConsent)
+        assertFalse(request.connectNew)
         assertTrue(request.makeDefault)
 
         transport.authorizationResult = transport.authorizationResult.copy(
@@ -151,6 +164,43 @@ class GoogleAccountManagerTest {
         )
         manager.connectNew()
         assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertNull(manager.state.value.authorization)
+    }
+
+    @Test
+    fun additionalAccountConnectionKeepsReadOnlySentinelAndUsesConnectNew() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(credentials, transport)
+        manager.refresh()
+
+        manager.connectNew()
+
+        val request = transport.authorizationRequests.single()
+        assertTrue(request.services.isEmpty())
+        assertFalse(request.forceConsent)
+        assertTrue(request.connectNew)
+        assertFalse(request.makeDefault)
+        assertNull(request.accountId)
+    }
+
+    @Test
+    fun duplicateScopeProjectionFailsClosedWithoutPublishingCapabilities() = runBlocking {
+        val credentials = FakeGoogleCredentials()
+        val duplicate = "https://www.googleapis.com/auth/calendar.readonly"
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(
+                account(grantedScopes = listOf("openid", "email", duplicate, duplicate)),
+            )
+        }
+        val manager = manager(credentials, transport)
+
+        manager.refresh()
+
+        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertTrue(manager.state.value.accounts.isEmpty())
         assertNull(manager.state.value.authorization)
     }
 
@@ -392,12 +442,19 @@ class GoogleAccountManagerTest {
         manager.refresh()
         manager.reauthorize(ACCOUNT_ID)
         assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        val firstRequest = transport.authorizationRequests.single()
+        assertTrue(firstRequest.services.isEmpty())
+        assertTrue(firstRequest.forceConsent)
+        assertEquals(ACCOUNT_ID, firstRequest.accountId)
+        assertFalse(firstRequest.connectNew)
+        assertTrue(firstRequest.makeDefault)
 
         // An unchanged authoritative account means denial/failure is not guessed as success.
         manager.refresh()
         assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
         manager.restartAuthorization()
         assertEquals(2, transport.authorizationRequests.size)
+        assertEquals(firstRequest, transport.authorizationRequests.last())
 
         transport.accountsResult = accounts(account(status = "active", revision = 8))
         manager.refresh()
@@ -631,18 +688,29 @@ class GoogleAccountManagerTest {
         status: String = "active",
         isDefault: Boolean = true,
         revision: Long = 7,
+        calendarWrite: Boolean = false,
+        tasksWrite: Boolean = false,
+        grantedScopes: List<String>? = null,
     ) = RemoteGoogleAccount(
         id = id,
-        externalAccountId = "google-owner",
+        externalAccountId = "google-$id",
         displayLabel = label,
         status = status,
         syncEnabled = status == "active",
         isDefault = isDefault,
-        grantedScopes = setOf(
+        grantedScopes = grantedScopes ?: listOf(
             "openid",
             "email",
-            "https://www.googleapis.com/auth/calendar",
-            "https://www.googleapis.com/auth/tasks",
+            if (calendarWrite) {
+                "https://www.googleapis.com/auth/calendar"
+            } else {
+                "https://www.googleapis.com/auth/calendar.readonly"
+            },
+            if (tasksWrite) {
+                "https://www.googleapis.com/auth/tasks"
+            } else {
+                "https://www.googleapis.com/auth/tasks.readonly"
+            },
         ),
         tokenExpiresAt = NOW.plusSeconds(3_600).toString(),
         revision = revision,

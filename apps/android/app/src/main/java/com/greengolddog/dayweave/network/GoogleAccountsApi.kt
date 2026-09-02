@@ -28,7 +28,7 @@ data class RemoteGoogleAccount(
     val status: String,
     @SerialName("sync_enabled") val syncEnabled: Boolean,
     @SerialName("is_default") val isDefault: Boolean,
-    @SerialName("granted_scopes") val grantedScopes: Set<String>,
+    @SerialName("granted_scopes") val grantedScopes: List<String>,
     @SerialName("token_expires_at") val tokenExpiresAt: String?,
     val revision: Long,
     @SerialName("created_at") val createdAt: String,
@@ -64,13 +64,28 @@ data class RemoteGoogleAuthorization(
 )
 
 @Serializable
+enum class GoogleService {
+    @SerialName("calendar_read_only")
+    CALENDAR_READ_ONLY,
+
+    @SerialName("calendar")
+    CALENDAR,
+
+    @SerialName("tasks_read_only")
+    TASKS_READ_ONLY,
+
+    @SerialName("tasks")
+    TASKS,
+}
+
+@Serializable
 data class StartGoogleAuthorizationRequest(
-    val services: Set<String>,
-    @SerialName("force_consent") val forceConsent: Boolean,
+    val services: List<GoogleService> = emptyList(),
+    @SerialName("force_consent") val forceConsent: Boolean = false,
     @SerialName("login_hint") val loginHint: String? = null,
     @SerialName("account_id") val accountId: String? = null,
-    @SerialName("connect_new") val connectNew: Boolean,
-    @SerialName("make_default") val makeDefault: Boolean,
+    @SerialName("connect_new") val connectNew: Boolean = false,
+    @SerialName("make_default") val makeDefault: Boolean = false,
 )
 
 @Serializable
@@ -144,9 +159,7 @@ class OkHttpGoogleAccountsTransport(
         request: StartGoogleAuthorizationRequest,
     ): RemoteGoogleAuthorization {
         validateIdempotencyKey(idempotencyKey)
-        require(request.services.isNotEmpty() && request.services.all { it in GOOGLE_SERVICES })
-        require(!(request.connectNew && request.accountId != null))
-        request.accountId?.let(::validateUuid)
+        validateAuthorizationRequest(request)
         val url = configuration.baseUrl.newBuilder()
             .addPathSegments("v1/integrations/google/oauth/start")
             .build()
@@ -246,7 +259,6 @@ class OkHttpGoogleAccountsTransport(
 
     companion object {
         private const val MAX_RESPONSE_CHARS = 2 * 1024 * 1024
-        private val GOOGLE_SERVICES = setOf("calendar", "tasks")
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
@@ -268,6 +280,20 @@ class OkHttpGoogleAccountsTransport(
 
         private fun validateRevision(revision: Long) {
             require(revision > 0) { "Google account revision must be positive" }
+        }
+
+        private fun validateAuthorizationRequest(request: StartGoogleAuthorizationRequest) {
+            request.accountId?.let(::validateUuid)
+            val serviceSelectionIsValid = request.services.size <= GoogleService.entries.size &&
+                request.services.distinct().size == request.services.size
+            val loginHintIsValid = request.loginHint?.let { hint ->
+                hint.isNotEmpty() && hint.toByteArray(Charsets.UTF_8).size <= 320 &&
+                    !hint.any(Char::isISOControl)
+            } ?: true
+            require(
+                serviceSelectionIsValid && loginHintIsValid &&
+                    !(request.connectNew && request.accountId != null),
+            ) { "Google authorization request is invalid" }
         }
 
         private fun validateUuid(value: String) {
