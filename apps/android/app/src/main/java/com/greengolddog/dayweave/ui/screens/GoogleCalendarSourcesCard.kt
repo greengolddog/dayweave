@@ -32,7 +32,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.greengolddog.dayweave.network.GoogleCalendarInboundRole
+import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRunState
@@ -43,14 +43,14 @@ import com.greengolddog.dayweave.sync.GoogleCalendarImportState
 import com.greengolddog.dayweave.sync.GoogleImportCollectionState
 
 /**
- * Inbound-only Google Calendar controls for the Android settings surface.
+ * Inbound-only Google Calendar and Tasks controls for the Android settings surface.
  *
  * The writable server role is intentionally display-only here. Every configuration callback is
- * constrained to [GoogleCalendarInboundRole], so this component cannot request outbound access.
+ * constrained to [GoogleInboundCollectionRole], so this component cannot request outbound access.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun GoogleCalendarSourcesCard(
+fun GoogleSourcesCard(
     googleAccountState: GoogleAccountState,
     importState: GoogleCalendarImportState,
     onDiscover: (accountId: String) -> Unit,
@@ -59,12 +59,13 @@ fun GoogleCalendarSourcesCard(
         accountId: String,
         collectionId: String,
         currentRevision: Long,
-        role: GoogleCalendarInboundRole,
+        kind: RemoteGoogleCollectionKind,
+        role: GoogleInboundCollectionRole,
     ) -> Unit,
     modifier: Modifier = Modifier,
     actionsEnabled: Boolean = true,
 ) {
-    val accounts = googleAccountState.accounts.filter(GoogleAccountSummary::isActiveCalendarAccount)
+    val accounts = googleAccountState.accounts.filter(GoogleAccountSummary::isActiveGoogleSourceAccount)
     val sameCredentialBinding = googleAccountState.configurationId != null &&
         googleAccountState.configurationId == importState.configurationId
     val controlsEnabled = actionsEnabled && sameCredentialBinding &&
@@ -78,7 +79,7 @@ fun GoogleCalendarSourcesCard(
             .semantics { stateDescription = importState.message },
     ) {
         ListItem(
-            headlineContent = { Text("Calendar sources") },
+            headlineContent = { Text("Google sources") },
             supportingContent = {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Text(importPhaseLabel(importState.phase))
@@ -119,7 +120,7 @@ fun GoogleCalendarSourcesCard(
         if (accounts.isEmpty()) {
             HorizontalDivider()
             Text(
-                "Activate a Google account with Calendar access to choose inbound sources.",
+                "Activate a Google account with Calendar or Tasks access to choose inbound sources.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 14.dp)
@@ -132,15 +133,31 @@ fun GoogleCalendarSourcesCard(
                     collection.accountId == account.id &&
                         collection.kind == RemoteGoogleCollectionKind.CALENDAR
                 }
+                val taskLists = accountState?.collections.orEmpty().filter { collection ->
+                    collection.accountId == account.id &&
+                        collection.kind == RemoteGoogleCollectionKind.TASK_LIST
+                }
                 val checkImport = shouldCheckImport(
                     accountId = account.id,
                     importState = importState,
                     runState = accountState?.run?.state,
                 )
-                var visibleCalendarCount by rememberSaveable(account.id, calendars.size) {
+                var visibleCalendarCount by rememberSaveable(
+                    account.id,
+                    "calendar",
+                    calendars.size,
+                ) {
                     mutableIntStateOf(minOf(CALENDAR_PAGE_SIZE, calendars.size))
                 }
                 val visibleCalendars = calendars.take(visibleCalendarCount)
+                var visibleTaskListCount by rememberSaveable(
+                    account.id,
+                    "task_list",
+                    taskLists.size,
+                ) {
+                    mutableIntStateOf(minOf(TASK_LIST_PAGE_SIZE, taskLists.size))
+                }
+                val visibleTaskLists = taskLists.take(visibleTaskListCount)
 
                 HorizontalDivider()
                 Column(
@@ -163,7 +180,7 @@ fun GoogleCalendarSourcesCard(
                                 overflow = TextOverflow.Ellipsis,
                             )
                             Text(
-                                "Inbound only · ${calendars.size} ${calendarCountNoun(calendars.size)}",
+                                sourceCountLabel(calendars.size, taskLists.size),
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -179,7 +196,13 @@ fun GoogleCalendarSourcesCard(
                             enabled = controlsEnabled,
                             modifier = Modifier.testTag("google_calendar_discover_$accountIndex"),
                         ) {
-                            Text(if (calendars.isEmpty()) "Discover calendars" else "Discover")
+                            Text(
+                                if (calendars.isEmpty() && taskLists.isEmpty()) {
+                                    "Discover sources"
+                                } else {
+                                    "Discover"
+                                },
+                            )
                         }
                         TextButton(
                             onClick = { onRefreshOrCheck(account.id) },
@@ -190,25 +213,30 @@ fun GoogleCalendarSourcesCard(
                         }
                     }
 
-                    if (calendars.isEmpty()) {
+                    if (calendars.isEmpty() && taskLists.isEmpty()) {
                         Text(
-                            "Discover calendars, then choose whether each one is shown or blocks planning time.",
+                            "Discover calendars and task lists, then choose which sources DayWeave imports.",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.testTag("google_calendar_empty_$accountIndex"),
                         )
                     } else {
+                        if (calendars.isNotEmpty()) {
+                            Text("Calendars", style = MaterialTheme.typography.labelLarge)
+                        }
                         visibleCalendars.forEachIndexed { sourceIndex, collection ->
                             if (sourceIndex > 0) HorizontalDivider()
-                            CalendarSourceControls(
+                            GoogleSourceControls(
                                 collection = collection,
                                 controlsEnabled = configurationEnabled,
                                 tagKey = "${accountIndex}_$sourceIndex",
+                                tagPrefix = "google_calendar",
                                 onConfigure = { role ->
                                     onConfigure(
                                         account.id,
                                         collection.id,
                                         collection.revision,
+                                        collection.kind,
                                         role,
                                     )
                                 },
@@ -229,13 +257,50 @@ fun GoogleCalendarSourcesCard(
                                 Text("Load more calendars")
                             }
                         }
+                        if (taskLists.isNotEmpty()) {
+                            if (calendars.isNotEmpty()) HorizontalDivider()
+                            Text("Task lists", style = MaterialTheme.typography.labelLarge)
+                        }
+                        visibleTaskLists.forEachIndexed { sourceIndex, collection ->
+                            if (sourceIndex > 0) HorizontalDivider()
+                            GoogleSourceControls(
+                                collection = collection,
+                                controlsEnabled = configurationEnabled,
+                                tagKey = "${accountIndex}_$sourceIndex",
+                                tagPrefix = "google_task",
+                                onConfigure = { role ->
+                                    onConfigure(
+                                        account.id,
+                                        collection.id,
+                                        collection.revision,
+                                        collection.kind,
+                                        role,
+                                    )
+                                },
+                            )
+                        }
+                        if (visibleTaskListCount < taskLists.size) {
+                            TextButton(
+                                onClick = {
+                                    visibleTaskListCount = minOf(
+                                        visibleTaskListCount + TASK_LIST_PAGE_SIZE,
+                                        taskLists.size,
+                                    )
+                                },
+                                modifier = Modifier.testTag(
+                                    "google_task_load_more_$accountIndex",
+                                ),
+                            ) {
+                                Text("Load more task lists")
+                            }
+                        }
                     }
                 }
             }
         }
 
         Text(
-            "Android imports calendars only. Publishing changes back to Google is never enabled from these controls.",
+            "Android imports calendars and task lists only. Publishing changes back to Google is never enabled from these controls.",
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
@@ -246,19 +311,21 @@ fun GoogleCalendarSourcesCard(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun CalendarSourceControls(
+private fun GoogleSourceControls(
     collection: GoogleImportCollectionState,
     controlsEnabled: Boolean,
     tagKey: String,
-    onConfigure: (GoogleCalendarInboundRole) -> Unit,
+    tagPrefix: String,
+    onConfigure: (GoogleInboundCollectionRole) -> Unit,
 ) {
     val selectedRole = collection.selectedRole()
-    val sourceControlsEnabled = controlsEnabled && !collection.providerDeleted
+    val sourceControlsEnabled = controlsEnabled && !collection.providerDeleted &&
+        collection.syncRole != RemoteGoogleSyncRole.WRITABLE
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .padding(vertical = 4.dp)
-            .testTag("google_calendar_collection_$tagKey"),
+            .testTag("${tagPrefix}_collection_$tagKey"),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Text(
@@ -276,7 +343,7 @@ private fun CalendarSourceControls(
                     MaterialTheme.colorScheme.tertiary
                 else -> MaterialTheme.colorScheme.onSurfaceVariant
             },
-            modifier = Modifier.testTag("google_calendar_collection_status_$tagKey"),
+            modifier = Modifier.testTag("${tagPrefix}_collection_status_$tagKey"),
         )
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -284,28 +351,37 @@ private fun CalendarSourceControls(
         ) {
             InboundRoleChip(
                 label = "Off",
-                role = GoogleCalendarInboundRole.OFF,
+                role = GoogleInboundCollectionRole.OFF,
                 selectedRole = selectedRole,
                 enabled = sourceControlsEnabled,
                 collectionTag = tagKey,
+                tagPrefix = tagPrefix,
                 onConfigure = onConfigure,
             )
             InboundRoleChip(
-                label = "Show only",
-                role = GoogleCalendarInboundRole.READ_ONLY,
+                label = if (collection.kind == RemoteGoogleCollectionKind.CALENDAR) {
+                    "Show only"
+                } else {
+                    "Import"
+                },
+                role = GoogleInboundCollectionRole.READ_ONLY,
                 selectedRole = selectedRole,
                 enabled = sourceControlsEnabled,
                 collectionTag = tagKey,
+                tagPrefix = tagPrefix,
                 onConfigure = onConfigure,
             )
-            InboundRoleChip(
-                label = "Block time",
-                role = GoogleCalendarInboundRole.BLOCKING,
-                selectedRole = selectedRole,
-                enabled = sourceControlsEnabled,
-                collectionTag = tagKey,
-                onConfigure = onConfigure,
-            )
+            if (collection.kind == RemoteGoogleCollectionKind.CALENDAR) {
+                InboundRoleChip(
+                    label = "Block time",
+                    role = GoogleInboundCollectionRole.BLOCKING,
+                    selectedRole = selectedRole,
+                    enabled = sourceControlsEnabled,
+                    collectionTag = tagKey,
+                    tagPrefix = tagPrefix,
+                    onConfigure = onConfigure,
+                )
+            }
         }
     }
 }
@@ -313,11 +389,12 @@ private fun CalendarSourceControls(
 @Composable
 private fun InboundRoleChip(
     label: String,
-    role: GoogleCalendarInboundRole,
-    selectedRole: GoogleCalendarInboundRole?,
+    role: GoogleInboundCollectionRole,
+    selectedRole: GoogleInboundCollectionRole?,
     enabled: Boolean,
     collectionTag: String,
-    onConfigure: (GoogleCalendarInboundRole) -> Unit,
+    tagPrefix: String,
+    onConfigure: (GoogleInboundCollectionRole) -> Unit,
 ) {
     val selected = selectedRole == role
     FilterChip(
@@ -326,31 +403,36 @@ private fun InboundRoleChip(
         enabled = enabled,
         label = { Text(label) },
         modifier = Modifier
-            .testTag("google_calendar_role_${collectionTag}_${role.name.lowercase()}")
+            .testTag("${tagPrefix}_role_${collectionTag}_${role.name.lowercase()}")
             .semantics {
                 stateDescription = if (selected) "$label selected" else "$label not selected"
             },
     )
 }
 
-private fun GoogleAccountSummary.isActiveCalendarAccount(): Boolean =
-    status == "active" && syncEnabled && hasCalendar
+private fun GoogleAccountSummary.isActiveGoogleSourceAccount(): Boolean =
+    status == "active" && syncEnabled && (hasCalendar || hasTasks)
 
-private fun GoogleImportCollectionState.selectedRole(): GoogleCalendarInboundRole? = when {
-    !selected -> GoogleCalendarInboundRole.OFF
+private fun GoogleImportCollectionState.selectedRole(): GoogleInboundCollectionRole? = when {
+    !selected -> GoogleInboundCollectionRole.OFF
     // Writable is a valid cross-device server state but is never an Android action.
     syncRole == RemoteGoogleSyncRole.WRITABLE -> null
-    syncRole == RemoteGoogleSyncRole.READ_ONLY -> GoogleCalendarInboundRole.READ_ONLY
-    syncRole == RemoteGoogleSyncRole.BLOCKING -> GoogleCalendarInboundRole.BLOCKING
+    syncRole == RemoteGoogleSyncRole.READ_ONLY -> GoogleInboundCollectionRole.READ_ONLY
+    syncRole == RemoteGoogleSyncRole.BLOCKING && kind == RemoteGoogleCollectionKind.CALENDAR ->
+        GoogleInboundCollectionRole.BLOCKING
     else -> null
 }
 
 private fun collectionModeLabel(collection: GoogleImportCollectionState): String = when {
-    collection.providerDeleted -> "Unavailable · removed from Google Calendar"
+    collection.providerDeleted -> when (collection.kind) {
+        RemoteGoogleCollectionKind.CALENDAR -> "Unavailable · removed from Google Calendar"
+        RemoteGoogleCollectionKind.TASK_LIST -> "Unavailable · removed from Google Tasks"
+    }
     !collection.selected -> "Off · not imported"
     collection.syncRole == RemoteGoogleSyncRole.WRITABLE ->
         "Writable · managed on another device"
     collection.syncRole == RemoteGoogleSyncRole.BLOCKING -> "Blocks planning time"
+    collection.kind == RemoteGoogleCollectionKind.TASK_LIST -> "Imported to Inbox"
     else -> "Show only · does not block planning time"
 }
 
@@ -374,8 +456,8 @@ private fun shouldCheckImport(
 private fun importPhaseLabel(phase: GoogleCalendarImportPhase): String = when (phase) {
     GoogleCalendarImportPhase.NOT_CONFIGURED -> "Import not configured"
     GoogleCalendarImportPhase.READY -> "Ready to import"
-    GoogleCalendarImportPhase.LOADING_COLLECTIONS -> "Loading calendars"
-    GoogleCalendarImportPhase.DISCOVERING_COLLECTIONS -> "Discovering calendars"
+    GoogleCalendarImportPhase.LOADING_COLLECTIONS -> "Loading Google sources"
+    GoogleCalendarImportPhase.DISCOVERING_COLLECTIONS -> "Discovering Google sources"
     GoogleCalendarImportPhase.CONFIGURING_COLLECTION -> "Saving source settings"
     GoogleCalendarImportPhase.PREPARING_REFRESH,
     GoogleCalendarImportPhase.REQUESTING_REFRESH,
@@ -408,6 +490,9 @@ private fun importPhaseColor(phase: GoogleCalendarImportPhase) = when (phase) {
 private fun savedImportLabel(count: Int): String =
     "$count saved ${if (count == 1) "import needs" else "imports need"} checking"
 
-private fun calendarCountNoun(count: Int): String = if (count == 1) "calendar" else "calendars"
+private fun sourceCountLabel(calendarCount: Int, taskListCount: Int): String =
+    "Inbound only · $calendarCount ${if (calendarCount == 1) "calendar" else "calendars"} · " +
+        "$taskListCount ${if (taskListCount == 1) "task list" else "task lists"}"
 
 private const val CALENDAR_PAGE_SIZE = 50
+private const val TASK_LIST_PAGE_SIZE = 50

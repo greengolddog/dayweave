@@ -17,8 +17,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-/** Android's deliberately inbound-only Calendar role surface. */
-enum class GoogleCalendarInboundRole {
+/** Android's deliberately inbound-only Google collection role surface. */
+enum class GoogleInboundCollectionRole {
     OFF,
     READ_ONLY,
     BLOCKING,
@@ -197,7 +197,9 @@ data class RemoteGoogleSyncRefreshAccepted(
 
 data class ConfigureGoogleCollectionRequest(
     val expectedRevision: Long,
-    val role: GoogleCalendarInboundRole,
+    /** Kind observed on the authoritative collection being configured. */
+    val kind: RemoteGoogleCollectionKind,
+    val role: GoogleInboundCollectionRole,
     val visible: Boolean = true,
     val calendarPolicy: RemoteGoogleCalendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault(),
 )
@@ -332,6 +334,9 @@ class OkHttpGoogleCalendarInboundTransport(
         require(request.calendarPolicy.isInboundOnly) {
             "Android inbound configuration cannot enable Calendar publication"
         }
+        require(request.hasSupportedInboundRole) {
+            "The selected Google collection kind does not support this inbound role"
+        }
         val wireRequest = request.toWireRequest()
         val body = json.encodeToString(wireRequest).toRequestBody(JSON_MEDIA_TYPE)
         val url = accountUrl(configuration, accountId)
@@ -346,7 +351,7 @@ class OkHttpGoogleCalendarInboundTransport(
         if (
             collection.id != collectionId ||
             collection.accountId != accountId ||
-            collection.kind != RemoteGoogleCollectionKind.CALENDAR ||
+            collection.kind != request.kind ||
             collection.revision != request.expectedRevision + 1 ||
             collection.selected != wireRequest.selected ||
             collection.visible != wireRequest.visible ||
@@ -496,7 +501,7 @@ class OkHttpGoogleCalendarInboundTransport(
 
 private fun ConfigureGoogleCollectionRequest.toWireRequest(): ConfigureGoogleCollectionWireRequest =
     when (role) {
-        GoogleCalendarInboundRole.OFF -> ConfigureGoogleCollectionWireRequest(
+        GoogleInboundCollectionRole.OFF -> ConfigureGoogleCollectionWireRequest(
             expectedRevision = expectedRevision,
             selected = false,
             visible = false,
@@ -504,7 +509,7 @@ private fun ConfigureGoogleCollectionRequest.toWireRequest(): ConfigureGoogleCol
             calendarPolicy = calendarPolicy,
         )
 
-        GoogleCalendarInboundRole.READ_ONLY -> ConfigureGoogleCollectionWireRequest(
+        GoogleInboundCollectionRole.READ_ONLY -> ConfigureGoogleCollectionWireRequest(
             expectedRevision = expectedRevision,
             selected = true,
             visible = visible,
@@ -512,13 +517,19 @@ private fun ConfigureGoogleCollectionRequest.toWireRequest(): ConfigureGoogleCol
             calendarPolicy = calendarPolicy,
         )
 
-        GoogleCalendarInboundRole.BLOCKING -> ConfigureGoogleCollectionWireRequest(
+        GoogleInboundCollectionRole.BLOCKING -> ConfigureGoogleCollectionWireRequest(
             expectedRevision = expectedRevision,
             selected = true,
             visible = visible,
             syncRole = RemoteGoogleSyncRole.BLOCKING,
             calendarPolicy = calendarPolicy,
         )
+    }
+
+internal val ConfigureGoogleCollectionRequest.hasSupportedInboundRole: Boolean
+    get() = when (kind) {
+        RemoteGoogleCollectionKind.CALENDAR -> true
+        RemoteGoogleCollectionKind.TASK_LIST -> role != GoogleInboundCollectionRole.BLOCKING
     }
 
 private fun validateCollections(response: RemoteGoogleCollections, accountId: String) {

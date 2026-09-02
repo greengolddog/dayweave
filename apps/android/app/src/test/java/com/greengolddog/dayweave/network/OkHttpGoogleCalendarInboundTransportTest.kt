@@ -61,7 +61,7 @@ class OkHttpGoogleCalendarInboundTransportTest {
     }
 
     @Test
-    fun configureMapsOnlyOffReadOnlyAndBlockingToTheRevisionedServerContract() = runBlocking {
+    fun configureMapsCalendarOffReadOnlyAndBlockingToTheRevisionedServerContract() = runBlocking {
         server.enqueue(
             jsonResponse(
                 200,
@@ -104,7 +104,12 @@ class OkHttpGoogleCalendarInboundTransportTest {
             configuration(),
             ACCOUNT_ID,
             COLLECTION_ID,
-            ConfigureGoogleCollectionRequest(7, GoogleCalendarInboundRole.OFF, visible = true),
+            ConfigureGoogleCollectionRequest(
+                7,
+                RemoteGoogleCollectionKind.CALENDAR,
+                GoogleInboundCollectionRole.OFF,
+                visible = true,
+            ),
         )
         transport.configure(
             configuration(),
@@ -112,7 +117,8 @@ class OkHttpGoogleCalendarInboundTransportTest {
             COLLECTION_ID,
             ConfigureGoogleCollectionRequest(
                 8,
-                GoogleCalendarInboundRole.READ_ONLY,
+                RemoteGoogleCollectionKind.CALENDAR,
+                GoogleInboundCollectionRole.READ_ONLY,
                 visible = false,
             ),
         )
@@ -122,7 +128,8 @@ class OkHttpGoogleCalendarInboundTransportTest {
             COLLECTION_ID,
             ConfigureGoogleCollectionRequest(
                 9,
-                GoogleCalendarInboundRole.BLOCKING,
+                RemoteGoogleCollectionKind.CALENDAR,
+                GoogleInboundCollectionRole.BLOCKING,
                 calendarPolicy = blockingPolicy,
             ),
         )
@@ -153,6 +160,73 @@ class OkHttpGoogleCalendarInboundTransportTest {
             bodies[2].getValue("calendar_policy").jsonObject
                 .getValue("tentative").jsonPrimitive.content,
         )
+        assertTrue(bodies.all { "kind" !in it })
+    }
+
+    @Test
+    fun configureEnablesAndDisablesTaskListsAsReadOnlyWithoutChangingTheWireSchema() = runBlocking {
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        kind = "task_list",
+                        revision = 8,
+                        selected = true,
+                        visible = false,
+                    ),
+                ),
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        kind = "task_list",
+                        revision = 9,
+                        selected = false,
+                        visible = false,
+                    ),
+                ),
+            ),
+        )
+
+        val enabled = transport.configure(
+            configuration(),
+            ACCOUNT_ID,
+            COLLECTION_ID,
+            ConfigureGoogleCollectionRequest(
+                expectedRevision = 7,
+                kind = RemoteGoogleCollectionKind.TASK_LIST,
+                role = GoogleInboundCollectionRole.READ_ONLY,
+                visible = false,
+            ),
+        )
+        val disabled = transport.configure(
+            configuration(),
+            ACCOUNT_ID,
+            COLLECTION_ID,
+            ConfigureGoogleCollectionRequest(
+                expectedRevision = 8,
+                kind = RemoteGoogleCollectionKind.TASK_LIST,
+                role = GoogleInboundCollectionRole.OFF,
+            ),
+        )
+
+        assertEquals(RemoteGoogleCollectionKind.TASK_LIST, enabled.kind)
+        assertTrue(enabled.selected)
+        assertFalse(disabled.selected)
+        val bodies = List(2) {
+            Json.parseToJsonElement(requireNotNull(server.takeRequest().body).utf8()).jsonObject
+        }
+        assertEquals("true", bodies[0].getValue("selected").jsonPrimitive.content)
+        assertEquals("false", bodies[0].getValue("visible").jsonPrimitive.content)
+        assertEquals("read_only", bodies[0].getValue("sync_role").jsonPrimitive.content)
+        assertEquals("false", bodies[1].getValue("selected").jsonPrimitive.content)
+        assertEquals("false", bodies[1].getValue("visible").jsonPrimitive.content)
+        assertEquals("read_only", bodies[1].getValue("sync_role").jsonPrimitive.content)
+        assertTrue(bodies.all { "kind" !in it })
     }
 
     @Test
@@ -168,7 +242,8 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
                         7,
-                        GoogleCalendarInboundRole.BLOCKING,
+                        RemoteGoogleCollectionKind.CALENDAR,
+                        GoogleInboundCollectionRole.BLOCKING,
                         calendarPolicy = publishingPolicy,
                     ),
                 )
@@ -180,7 +255,25 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     configuration(),
                     ACCOUNT_ID,
                     COLLECTION_ID,
-                    ConfigureGoogleCollectionRequest(0, GoogleCalendarInboundRole.READ_ONLY),
+                    ConfigureGoogleCollectionRequest(
+                        7,
+                        RemoteGoogleCollectionKind.TASK_LIST,
+                        GoogleInboundCollectionRole.BLOCKING,
+                    ),
+                )
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            runBlocking {
+                transport.configure(
+                    configuration(),
+                    ACCOUNT_ID,
+                    COLLECTION_ID,
+                    ConfigureGoogleCollectionRequest(
+                        0,
+                        RemoteGoogleCollectionKind.CALENDAR,
+                        GoogleInboundCollectionRole.READ_ONLY,
+                    ),
                 )
             }
         }
@@ -203,10 +296,108 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     configuration(),
                     ACCOUNT_ID,
                     COLLECTION_ID,
-                    ConfigureGoogleCollectionRequest(7, GoogleCalendarInboundRole.READ_ONLY),
+                    ConfigureGoogleCollectionRequest(
+                        7,
+                        RemoteGoogleCollectionKind.CALENDAR,
+                        GoogleInboundCollectionRole.READ_ONLY,
+                    ),
                 )
             }
         }
+
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        kind = "task_list",
+                        revision = 8,
+                        selected = true,
+                    ),
+                ),
+            ),
+        )
+        assertThrows(GoogleCalendarInboundApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.configure(
+                    configuration(),
+                    ACCOUNT_ID,
+                    COLLECTION_ID,
+                    ConfigureGoogleCollectionRequest(
+                        7,
+                        RemoteGoogleCollectionKind.CALENDAR,
+                        GoogleInboundCollectionRole.READ_ONLY,
+                    ),
+                )
+            }
+        }
+
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        kind = "task_list",
+                        revision = 8,
+                        selected = true,
+                        syncRole = "writable",
+                    ),
+                ),
+            ),
+        )
+        assertThrows(GoogleCalendarInboundApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.configure(
+                    configuration(),
+                    ACCOUNT_ID,
+                    COLLECTION_ID,
+                    ConfigureGoogleCollectionRequest(
+                        7,
+                        RemoteGoogleCollectionKind.TASK_LIST,
+                        GoogleInboundCollectionRole.READ_ONLY,
+                    ),
+                )
+            }
+        }
+        listOf(
+            collectionJson(
+                id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                revision = 8,
+                selected = true,
+            ),
+            collectionJson(
+                accountId = "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                revision = 8,
+                selected = true,
+            ),
+            collectionJson(
+                revision = 8,
+                selected = true,
+                policy = policyJson(tentative = "ignore"),
+            ),
+        ).forEach { mismatchedCollection ->
+            server.enqueue(
+                jsonResponse(200, collectionEnvelopeJson(mismatchedCollection)),
+            )
+            assertThrows(GoogleCalendarInboundApiException.InvalidResponse::class.java) {
+                runBlocking {
+                    transport.configure(
+                        configuration(),
+                        ACCOUNT_ID,
+                        COLLECTION_ID,
+                        ConfigureGoogleCollectionRequest(
+                            7,
+                            RemoteGoogleCollectionKind.CALENDAR,
+                            GoogleInboundCollectionRole.READ_ONLY,
+                        ),
+                    )
+                }
+            }
+        }
+        assertEquals(
+            setOf("OFF", "READ_ONLY", "BLOCKING"),
+            GoogleInboundCollectionRole.entries.map { it.name }.toSet(),
+        )
     }
 
     @Test

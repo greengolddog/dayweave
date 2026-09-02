@@ -56,7 +56,8 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
-import com.greengolddog.dayweave.network.GoogleCalendarInboundRole
+import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
+import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
@@ -94,9 +95,15 @@ fun MoreScreen(
     onReauthorizeGoogle: (String) -> Unit,
     onSetGooglePaused: (String, Boolean) -> Unit,
     onRequestGoogleDisconnect: (GoogleAccountSummary) -> Unit,
-    onDiscoverGoogleCalendars: (String) -> Unit,
-    onRefreshGoogleCalendarImport: (String) -> Unit,
-    onConfigureGoogleCalendar: (String, String, Long, GoogleCalendarInboundRole) -> Unit,
+    onDiscoverGoogleSources: (String) -> Unit,
+    onRefreshGoogleImport: (String) -> Unit,
+    onConfigureGoogleSource: (
+        String,
+        String,
+        Long,
+        RemoteGoogleCollectionKind,
+        GoogleInboundCollectionRole,
+    ) -> Unit,
     onToggleHealthConnect: (Boolean) -> Unit,
     onRefreshHealthConnect: () -> Unit,
     onManageHealthConnectAccess: () -> Unit,
@@ -253,12 +260,12 @@ fun MoreScreen(
         }
 
         item {
-            GoogleCalendarSourcesCard(
+            GoogleSourcesCard(
                 googleAccountState = googleAccountState,
                 importState = googleCalendarImportState,
-                onDiscover = onDiscoverGoogleCalendars,
-                onRefreshOrCheck = onRefreshGoogleCalendarImport,
-                onConfigure = onConfigureGoogleCalendar,
+                onDiscover = onDiscoverGoogleSources,
+                onRefreshOrCheck = onRefreshGoogleImport,
+                onConfigure = onConfigureGoogleSource,
                 actionsEnabled = !canonicalSyncState.isBusy,
             )
         }

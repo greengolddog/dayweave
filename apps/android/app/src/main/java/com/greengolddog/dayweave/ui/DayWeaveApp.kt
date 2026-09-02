@@ -665,9 +665,9 @@ private fun DayWeaveRoot(
                 onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
                 onSetGooglePaused = viewModel::setGoogleAccountPaused,
                 onRequestGoogleDisconnect = { disconnectingGoogleAccount = it },
-                onDiscoverGoogleCalendars = viewModel::discoverGoogleCalendars,
-                onRefreshGoogleCalendarImport = viewModel::refreshGoogleCalendarImport,
-                onConfigureGoogleCalendar = viewModel::configureGoogleCalendar,
+                onDiscoverGoogleSources = viewModel::discoverGoogleSources,
+                onRefreshGoogleImport = viewModel::refreshGoogleImport,
+                onConfigureGoogleSource = viewModel::configureGoogleSource,
                 onToggleHealthConnect = { enabled ->
                     when {
                         !enabled -> viewModel.disableHealthConnect()

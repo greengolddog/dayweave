@@ -7,6 +7,7 @@ import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.network.GoogleCalendarInboundApiException
 import com.greengolddog.dayweave.network.GoogleCalendarInboundTransport
+import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
 import com.greengolddog.dayweave.network.RemoteGoogleCalendarPolicy
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.network.RemoteGoogleSyncCollection
@@ -14,6 +15,7 @@ import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRunState
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRunStatus
 import com.greengolddog.dayweave.network.RemoteGoogleSyncStatus
+import com.greengolddog.dayweave.network.hasSupportedInboundRole
 import java.io.IOException
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -319,7 +321,42 @@ class GoogleCalendarImportCoordinator(
                     )
                     return@withLock GoogleImportConfigurationOutcome.FAILED
                 }
+                if (
+                    request.expectedRevision !in 1 until Long.MAX_VALUE ||
+                    !request.hasSupportedInboundRole ||
+                    !request.calendarPolicy.isInboundOnly
+                ) {
+                    updateFailure(
+                        lifecycle,
+                        binding,
+                        GoogleCalendarImportPhase.ERROR,
+                        CONFIGURATION_INVALID,
+                    )
+                    return@withLock GoogleImportConfigurationOutcome.FAILED
+                }
                 val previous = stateFor(binding)
+                val authoritativeMatches = previous.accounts[accountId]
+                    ?.collections
+                    ?.filter { collection ->
+                        collection.accountId == accountId && collection.id == collectionId
+                    }
+                    .orEmpty()
+                val cachedAuthoritative = authoritativeMatches.singleOrNull()
+                if (
+                    cachedAuthoritative == null ||
+                    cachedAuthoritative.revision != request.expectedRevision ||
+                    cachedAuthoritative.kind != request.kind ||
+                    cachedAuthoritative.providerDeleted ||
+                    cachedAuthoritative.syncRole == RemoteGoogleSyncRole.WRITABLE
+                ) {
+                    updateFailure(
+                        lifecycle,
+                        binding,
+                        GoogleCalendarImportPhase.ERROR,
+                        CONFIGURATION_INVALID,
+                    )
+                    return@withLock GoogleImportConfigurationOutcome.FAILED
+                }
                 setState(
                     lifecycle,
                     previous.copy(
@@ -1088,10 +1125,18 @@ class GoogleCalendarImportCoordinator(
         collectionId: String,
         request: ConfigureGoogleCollectionRequest,
     ) {
-        validateCollection(collection, accountId)
-        require(collection.id == collectionId)
-        require(collection.revision > request.expectedRevision)
-        require(collection.matches(request))
+        try {
+            validateCollection(collection, accountId)
+        } catch (cause: IllegalArgumentException) {
+            throw GoogleCalendarInboundApiException.InvalidResponse(cause)
+        }
+        if (
+            collection.id != collectionId ||
+            collection.revision != request.expectedRevision + 1 ||
+            !collection.matches(request)
+        ) {
+            throw GoogleCalendarInboundApiException.InvalidResponse()
+        }
     }
 
     private fun validateCollections(
@@ -1110,6 +1155,14 @@ class GoogleCalendarImportCoordinator(
         require(collection.id.isCanonicalGoogleUuid())
         require(collection.displayName.length in 1..MAX_COLLECTION_LABEL_LENGTH)
         require(collection.revision in 1 until Long.MAX_VALUE)
+        require(
+            collection.kind != RemoteGoogleCollectionKind.TASK_LIST ||
+                collection.syncRole != RemoteGoogleSyncRole.BLOCKING,
+        )
+        require(
+            collection.syncRole == RemoteGoogleSyncRole.WRITABLE ||
+                collection.calendarPolicy.isInboundOnly,
+        )
         // Another client (for example macOS) may have configured WRITABLE. Android displays that
         // authoritative state but its inbound-only ConfigureGoogleCollectionRequest can never send it.
     }
@@ -1685,18 +1738,16 @@ class GoogleCalendarImportCoordinator(
 }
 
 private fun RemoteGoogleSyncCollection.matches(request: ConfigureGoogleCollectionRequest): Boolean {
-    val expectedSelected = request.role != com.greengolddog.dayweave.network.GoogleCalendarInboundRole.OFF
+    val expectedSelected = request.role != GoogleInboundCollectionRole.OFF
     val expectedVisible =
-        request.role != com.greengolddog.dayweave.network.GoogleCalendarInboundRole.OFF &&
-            request.visible
+        request.role != GoogleInboundCollectionRole.OFF && request.visible
     val expectedRole = when (request.role) {
-        com.greengolddog.dayweave.network.GoogleCalendarInboundRole.OFF,
-        com.greengolddog.dayweave.network.GoogleCalendarInboundRole.READ_ONLY,
+        GoogleInboundCollectionRole.OFF,
+        GoogleInboundCollectionRole.READ_ONLY,
         -> RemoteGoogleSyncRole.READ_ONLY
-        com.greengolddog.dayweave.network.GoogleCalendarInboundRole.BLOCKING ->
-            RemoteGoogleSyncRole.BLOCKING
+        GoogleInboundCollectionRole.BLOCKING -> RemoteGoogleSyncRole.BLOCKING
     }
-    return kind == RemoteGoogleCollectionKind.CALENDAR &&
+    return kind == request.kind &&
         selected == expectedSelected &&
         visible == expectedVisible &&
         syncRole == expectedRole &&

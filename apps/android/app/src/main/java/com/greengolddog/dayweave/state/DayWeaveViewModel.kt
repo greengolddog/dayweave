@@ -18,7 +18,9 @@ import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.DeviceAuthActionResult
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
-import com.greengolddog.dayweave.network.GoogleCalendarInboundRole
+import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
+import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
+import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.notifications.PlannerTimedBreakNotificationRouteAccess
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationRouteConsumption
 import com.greengolddog.dayweave.sync.SuggestionSyncState
@@ -418,15 +420,15 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     fun refreshGoogleAccounts() {
         viewModelScope.launch {
             googleAccountManager.refresh()
-            val calendarAccounts = googleAccountManager.state.value.accounts.filter {
-                it.hasCalendar && it.syncEnabled && it.status == "active"
+            val sourceAccounts = googleAccountManager.state.value.accounts.filter {
+                (it.hasCalendar || it.hasTasks) && it.syncEnabled && it.status == "active"
             }
-            calendarAccounts.forEach { account ->
+            sourceAccounts.forEach { account ->
                 googleCalendarImportCoordinator.loadCollections(account.id)
             }
-            if (calendarAccounts.isNotEmpty()) {
+            if (sourceAccounts.isNotEmpty()) {
                 dayWeaveApplication.enqueueCanonicalRecovery {
-                    calendarAccounts.forEach { account ->
+                    sourceAccounts.forEach { account ->
                         googleCalendarImportCoordinator.recoverPending(account.id)
                     }
                 }
@@ -434,19 +436,24 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun discoverGoogleCalendars(accountId: String) {
+    fun discoverGoogleSources(accountId: String) {
         if (googleCalendarImportCoordinator.state.value.isBusy) return
         viewModelScope.launch {
             googleCalendarImportCoordinator.discoverCollections(accountId)
         }
     }
 
-    fun configureGoogleCalendar(
+    fun configureGoogleSource(
         accountId: String,
         collectionId: String,
         expectedRevision: Long,
-        role: GoogleCalendarInboundRole,
+        kind: RemoteGoogleCollectionKind,
+        role: GoogleInboundCollectionRole,
     ) {
+        if (
+            kind == RemoteGoogleCollectionKind.TASK_LIST &&
+            role == GoogleInboundCollectionRole.BLOCKING
+        ) return
         if (
             isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy ||
             googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
@@ -455,7 +462,9 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             val current = googleCalendarImportCoordinator.state.value.accounts[accountId]
                 ?.collections
                 ?.singleOrNull { collection ->
-                    collection.id == collectionId && collection.revision == expectedRevision
+                    collection.id == collectionId && collection.revision == expectedRevision &&
+                        collection.kind == kind && !collection.providerDeleted &&
+                        collection.syncRole != RemoteGoogleSyncRole.WRITABLE
                 } ?: return@launchCanonicalAction
             val inboundPolicy = current.calendarPolicy.copy(
                 publishAllDay = false,
@@ -467,6 +476,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
                 collectionId = collectionId,
                 request = ConfigureGoogleCollectionRequest(
                     expectedRevision = expectedRevision,
+                    kind = current.kind,
                     role = role,
                     calendarPolicy = inboundPolicy,
                 ),
@@ -480,7 +490,7 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun refreshGoogleCalendarImport(accountId: String) {
+    fun refreshGoogleImport(accountId: String) {
         if (isCanonicalBusy() || googleCalendarImportCoordinator.state.value.isBusy) return
         dayWeaveApplication.launchCanonicalAction {
             googleCalendarImportCoordinator.refresh(accountId)
