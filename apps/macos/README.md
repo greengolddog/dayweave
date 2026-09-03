@@ -368,15 +368,16 @@ posted again.
 The server also exposes a separate default-off preview → approve → enqueue →
 status batch contract for publishing not-yet-elapsed generated firm `planned`
 and `pinned` blocks from the exact current immutable published schedule to a
-writable Google Calendar. The macOS client does not invoke that contract yet:
-the Inbox action above publishes one explicitly selected canonical event or
-task, not the generated schedule. Published elapsed events are immutable
-Calendar history and are never rewritten, deleted, or reused. A native schedule
-review/recovery journal and trigger, automatic firm-horizon rolling/publication,
-and inbound interpretation of Google edits, moves, or deletions remain future
+writable Google Calendar. The macOS client invokes that contract from the
+generated-schedule publication review, with an encrypted exact recovery journal
+covering preview, one-shot approval, enqueue, and status polling. The Inbox
+action above remains the separate single-item event/task publication path.
+Published elapsed events are immutable Calendar history and are never rewritten,
+deleted, or reused. Automatic firm-horizon rolling/publication and inbound
+interpretation of Google edits, moves, or deletions remain future
 client/integration work. Tentative blocks remain app-only and are never accepted
-by this server path. Enabling the publisher therefore does not make macOS
-publish a schedule automatically or complete `SCH-006`.
+by this server path. Enabling the publisher therefore does not publish a
+schedule without explicit review or complete `SCH-006`.
 
 The unified Inbox separates **Items** from **Suggestions**. Items are canonical,
 encrypted local drafts: Quick Capture needs only a title, while the detailed

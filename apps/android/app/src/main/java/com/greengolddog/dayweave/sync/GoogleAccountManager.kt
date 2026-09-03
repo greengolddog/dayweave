@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.GoogleAccountsApiException
 import com.greengolddog.dayweave.network.GoogleAccountsTransport
+import com.greengolddog.dayweave.network.GoogleService
 import com.greengolddog.dayweave.network.RemoteGoogleAccount
 import com.greengolddog.dayweave.network.RemoteGoogleAccounts
 import com.greengolddog.dayweave.network.StartGoogleAuthorizationRequest
@@ -25,6 +26,7 @@ enum class GoogleAccountPhase {
     DISCONNECTED,
     CONNECTED,
     AWAITING_BROWSER,
+    AUTHORIZATION_RECOVERY,
     AUTH_REQUIRED,
     RECOVERY_REQUIRED,
     OFFLINE,
@@ -51,14 +53,48 @@ data class GoogleAccountSummary(
 data class PendingGoogleAuthorization(
     val url: String,
     val expiresAt: Instant,
+    val action: GoogleAuthorizationAction,
     /** Existing account being repaired; null means a new Google account is being connected. */
     val accountId: String? = null,
-    /** Accounts present before a connect-new ceremony, used to prove callback completion. */
-    val baselineAccountIds: Set<String> = emptySet(),
 ) {
     override fun toString(): String =
         "PendingGoogleAuthorization(url=<redacted>, expiresAt=$expiresAt, " +
-            "target=${if (accountId == null) "new-account" else "existing-account"})"
+            "action=$action, target=${if (accountId == null) "new-account" else "existing-account"})"
+}
+
+/** Non-secret presentation of the durable exact-retry record. */
+data class GoogleAuthorizationRecovery(
+    val action: GoogleAuthorizationAction,
+    val expiresAt: Instant,
+    val accountId: String?,
+    val browserOpened: Boolean,
+    val belongsToCurrentConfiguration: Boolean,
+    val browserWindowExpired: Boolean = false,
+) {
+    override fun toString(): String =
+        "GoogleAuthorizationRecovery(action=$action, expiresAt=$expiresAt, " +
+            "target=${if (accountId == null) "new-account" else "existing-account"}, " +
+            "browserOpened=$browserOpened, browserWindowExpired=$browserWindowExpired, " +
+            "currentBinding=$belongsToCurrentConfiguration)"
+}
+
+/** One-generation capability issued only for a currently surfaced unreadable-record warning. */
+class GoogleAuthorizationRecoveryResetConfirmation internal constructor(
+    internal val presentationGeneration: Long,
+    internal val binding: ApiConnectionSnapshot,
+    internal val expectedCorruptArtifact: GoogleAuthorizationCorruptArtifactIdentity,
+) {
+    override fun toString(): String = "GoogleAuthorizationRecoveryResetConfirmation(<redacted>)"
+}
+
+/** Exact one-generation capability for explicitly abandoning foreign/orphaned OAuth recovery. */
+class GoogleAuthorizationRecoveryDiscardConfirmation internal constructor(
+    internal val presentationGeneration: Long,
+    internal val binding: ApiConnectionSnapshot,
+    internal val expectedJournal: GoogleAuthorizationJournal?,
+    internal val expectedCorruptArtifact: GoogleAuthorizationCorruptArtifactIdentity?,
+) {
+    override fun toString(): String = "GoogleAuthorizationRecoveryDiscardConfirmation(<redacted>)"
 }
 
 data class GoogleAccountState(
@@ -68,6 +104,12 @@ data class GoogleAccountState(
     val message: String,
     val isBusy: Boolean = false,
     val requiresPlannerApiConfiguration: Boolean = false,
+    /** Durable exact request retained without persisting the one-use Google URL. */
+    val authorizationRecovery: GoogleAuthorizationRecovery? = null,
+    /** An unreadable record blocks every new OAuth start until explicitly reset. */
+    val authorizationRecoveryResetRequired: Boolean = false,
+    /** Content-free signal for a foreign, orphaned, or unreadable record. */
+    val authorizationRecoveryDiscardRequired: Boolean = false,
     /** Opaque API credential generation that owns every account and URL in this state. */
     val configurationId: String? = null,
 )
@@ -78,6 +120,13 @@ class GoogleAccountManager(
     private val now: () -> Instant = Instant::now,
     private val newUuid: () -> UUID = UUID::randomUUID,
     private val operationAllowed: () -> Boolean = { true },
+    /** Process-wide mutation admission; deliberately does not fence read-only [refresh]. */
+    private val authorizationMutationAllowed: (
+        action: GoogleAuthorizationAction,
+        targetAccountId: String?,
+    ) -> Boolean = { _, _ -> true },
+    private val authorizationJournalStore: GoogleAuthorizationJournalStore =
+        UnavailableGoogleAuthorizationJournalStore,
 ) {
     private val operationMutex = Mutex()
     private val presentationFence = Any()
@@ -89,6 +138,25 @@ class GoogleAccountManager(
     )
     val state: StateFlow<GoogleAccountState> = mutableState.asStateFlow()
 
+    /** Content-free synchronous admission signal for other process-wide mutation lanes. */
+    fun hasAuthorizationRecoveryBlocker(): Boolean = try {
+        val observedAt = now().toEpochMilli()
+        when (val loaded = authorizationJournalStore.load(observedAt)) {
+            GoogleAuthorizationJournalLoadResult.Empty -> false
+            is GoogleAuthorizationJournalLoadResult.Loaded,
+            is GoogleAuthorizationJournalLoadResult.Corrupt,
+            is GoogleAuthorizationJournalLoadResult.Expired,
+            -> true
+            is GoogleAuthorizationJournalLoadResult.Retirable -> {
+                !authorizationJournalStore.removeExact(loaded.journal, observedAt) ||
+                    authorizationJournalStore.load(observedAt) !=
+                    GoogleAuthorizationJournalLoadResult.Empty
+            }
+        }
+    } catch (_: RuntimeException) {
+        true
+    }
+
     /** Atomically invalidates in-flight presentation work and drops all private provider data. */
     internal fun quarantineBindingState() {
         invalidatePresentationState(QUARANTINED_SNAPSHOT)
@@ -99,22 +167,31 @@ class GoogleAccountManager(
         operationMutex.withLock {
         if (!presentationOperationCurrent(presentation)) return@withLock
         val binding = credentialStore.snapshot()
+        // Resolve the no-backup OAuth record before touching encrypted credentials. A lost or
+        // foreign API binding must still be able to surface a content-free explicit discard path.
+        val journalResolution = resolveAuthorizationJournal(binding)
         val configuration = try {
             credentialStore.authenticatedConfiguration()
         } catch (_: RuntimeException) {
             publishPresentationState(
                 presentation,
-                GoogleAccountState(
-                phase = GoogleAccountPhase.AUTH_REQUIRED,
-                message = "Planner credentials are unavailable · reconnect the DayWeave API",
-                requiresPlannerApiConfiguration = true,
-                configurationId = binding.configurationId,
+                configurationUnavailableState(
+                    binding = binding,
+                    journalResolution = journalResolution,
+                    credentialsUnreadable = true,
                 ),
             )
             return@withLock
         }
         if (configuration == null) {
-            publishPresentationState(presentation, initialState(binding))
+            publishPresentationState(
+                presentation,
+                configurationUnavailableState(
+                    binding = binding,
+                    journalResolution = journalResolution,
+                    credentialsUnreadable = false,
+                ),
+            )
             return@withLock
         }
         if (!configurationMatchesBinding(configuration, binding, presentation)) return@withLock
@@ -128,27 +205,87 @@ class GoogleAccountManager(
         try {
         if (!operationStillCurrent(binding, presentation)) return@withLock
         val previous = stateForBinding(binding, presentation) ?: return@withLock
-        if (!publishPresentationState(presentation, previous.copy(
+        val journalBlock = journalResolution as? AuthorizationJournalResolution.Blocked
+        val journal = (journalResolution as? AuthorizationJournalResolution.Available)?.journal
+        val journalBelongsToBinding =
+            (journalResolution as? AuthorizationJournalResolution.Available)
+                ?.belongsToCurrentConfiguration ?: true
+        // The authenticated configuration has now independently proved the binding metadata.
+        // Never expose the saved action/account for a merely URL-matching foreign record.
+        val recovery = journal?.takeIf { journalBelongsToBinding }?.toRecovery(true)
+        val retainedAuthorization = previous.authorization?.takeIf { authorization ->
+            journal != null && journalBelongsToBinding && !journal.browserOpened &&
+                authorization.matches(journal) && authorization.expiresAt > now()
+        }
+        val recoveryBase = previous.copy(
+            authorization = retainedAuthorization,
+            authorizationRecovery = recovery,
+            authorizationRecoveryResetRequired = false,
+            authorizationRecoveryDiscardRequired = false,
+        )
+        val recoveryAwarePrevious = when {
+            journalBlock != null -> authorizationRecoveryDiscardState(
+                previous = recoveryBase,
+                resetRequired = journalBlock.unreadable,
+                message = journalBlock.message,
+            )
+            journal != null && !journalBelongsToBinding -> authorizationRecoveryDiscardState(
+                previous = recoveryBase,
+                resetRequired = false,
+                message = FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE,
+            )
+            else -> recoveryBase
+        }
+        if (!publishPresentationState(presentation, recoveryAwarePrevious.copy(
             phase = GoogleAccountPhase.LOADING,
             isBusy = true,
             message = "Checking Google connection…",
         ))) return@withLock
         try {
             val response = transport.accounts(configuration)
-            val mapped = mapState(
+            var mapped = mapState(
                 response = response,
-                authorization = previous.authorization?.takeIf { it.expiresAt > now() },
+                authorization = retainedAuthorization,
+                authorizationRecovery = recovery,
                 configurationId = binding.configurationId,
             )
+            if (journalBlock != null) {
+                mapped = authorizationRecoveryDiscardState(
+                    previous = mapped,
+                    resetRequired = journalBlock.unreadable,
+                    message = journalBlock.message,
+                )
+            } else if (journal != null && !journalBelongsToBinding) {
+                mapped = authorizationRecoveryDiscardState(
+                    previous = mapped,
+                    resetRequired = false,
+                    message = FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE,
+                )
+            }
             if (!publishOperationState(binding, presentation, mapped)) return@withLock
         } catch (error: CancellationException) {
-            publishOperationState(binding, presentation, previous.copy(isBusy = false))
+            publishOperationState(binding, presentation, recoveryAwarePrevious.copy(isBusy = false))
             throw error
         } catch (error: Exception) {
             publishOperationState(
                 binding,
                 presentation,
-                failureState(error, previous.copy(isBusy = false)),
+                failureState(error, recoveryAwarePrevious.copy(isBusy = false)).let { failed ->
+                    when {
+                        journalBlock != null -> authorizationRecoveryDiscardState(
+                            previous = failed,
+                            resetRequired = journalBlock.unreadable,
+                            message = journalBlock.message,
+                        )
+                        journal != null && !journalBelongsToBinding ->
+                            authorizationRecoveryDiscardState(
+                                previous = failed,
+                                resetRequired = false,
+                                message = FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE,
+                            )
+                        else -> failed
+                    }
+                },
             )
         }
         } finally {
@@ -157,23 +294,260 @@ class GoogleAccountManager(
         }
     }
 
-    suspend fun connectNew() = beginAuthorization(accountId = null)
+    suspend fun connectNew() = beginAuthorization(accountId = null, service = null)
 
-    suspend fun reauthorize(accountId: String) = beginAuthorization(accountId)
+    suspend fun reauthorize(accountId: String) = beginAuthorization(accountId, service = null)
+
+    /** Requests only the full Calendar scope for the selected existing account. */
+    suspend fun enableCalendarPublishing(accountId: String) =
+        beginAuthorization(accountId, service = GoogleService.CALENDAR)
+
+    /** Requests only the full Tasks scope for the selected existing account. */
+    suspend fun enableTasksPublishing(accountId: String) =
+        beginAuthorization(accountId, service = GoogleService.TASKS)
 
     suspend fun restartAuthorization() {
-        val presentation = beginPresentationOperation() ?: return
-        val restart = operationMutex.withLock {
-            val current = presentationState(presentation) ?: return@withLock null
-            val pending = current.authorization ?: return@withLock null
-            RestartAuthorization(pending.accountId, current.configurationId, presentation)
-        } ?: return
         beginAuthorization(
-            accountId = restart.accountId,
-            expectedConfigurationId = restart.configurationId,
-            expectedPresentationGeneration = restart.presentationGeneration,
+            accountId = null,
+            service = null,
+            retrySavedRequest = true,
         )
     }
+
+    fun unreadableAuthorizationRecoveryResetConfirmation():
+        GoogleAuthorizationRecoveryResetConfirmation? {
+        val binding = credentialStore.snapshot()
+        val observedAt = try {
+            now().toEpochMilli()
+        } catch (_: RuntimeException) {
+            return null
+        }
+        val corrupt = try {
+            authorizationJournalStore.load(observedAt)
+                as? GoogleAuthorizationJournalLoadResult.Corrupt
+        } catch (_: RuntimeException) {
+            null
+        } ?: return null
+        return synchronized(presentationFence) {
+            mutableState.value.takeIf {
+                operationAllowed() && it.authorizationRecoveryResetRequired && !it.isBusy &&
+                    it.configurationId == binding.configurationId
+            }?.let {
+                GoogleAuthorizationRecoveryResetConfirmation(
+                    presentationGeneration = presentationGeneration,
+                    binding = binding,
+                    expectedCorruptArtifact = corrupt.artifactIdentity,
+                )
+            }
+        }
+    }
+
+    /** Explicitly removes only the unreadable record represented by [confirmation]. */
+    suspend fun resetUnreadableAuthorizationRecovery(
+        confirmation: GoogleAuthorizationRecoveryResetConfirmation,
+    ) {
+        val presentation = beginPresentationOperation(confirmation.presentationGeneration) ?: return
+        operationMutex.withLock {
+            val current = presentationState(presentation) ?: return@withLock
+            val binding = credentialStore.snapshot()
+            if (
+                !current.authorizationRecoveryResetRequired || current.isBusy ||
+                binding != confirmation.binding ||
+                current.configurationId != binding.configurationId
+            ) {
+                return@withLock
+            }
+            val observedAt = try {
+                now().toEpochMilli()
+            } catch (_: RuntimeException) {
+                return@withLock
+            }
+            val reset = try {
+                val loaded = authorizationJournalStore.load(observedAt)
+                loaded is GoogleAuthorizationJournalLoadResult.Corrupt &&
+                    loaded.artifactIdentity == confirmation.expectedCorruptArtifact &&
+                    authorizationRecoveryDestructionAllowed(presentation, confirmation.binding) &&
+                    authorizationJournalStore.clearCorruptExact(
+                        confirmation.expectedCorruptArtifact,
+                        observedAt,
+                    ) &&
+                    authorizationJournalStore.load(observedAt) ==
+                    GoogleAuthorizationJournalLoadResult.Empty
+            } catch (_: RuntimeException) {
+                false
+            }
+            if (reset) {
+                invalidatePresentationState(binding)
+            } else {
+                publishPresentationState(
+                    presentation,
+                    current.copy(
+                        phase = GoogleAccountPhase.ERROR,
+                        isBusy = false,
+                        message = "The saved Google authorization recovery could not be reset",
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Issues an opaque, one-presentation-generation capability for the exact recovery record and
+     * exact non-secret credential snapshot currently shown as foreign or orphaned.
+     */
+    fun authorizationRecoveryDiscardConfirmation():
+        GoogleAuthorizationRecoveryDiscardConfirmation? {
+        val binding = credentialStore.snapshot()
+        val observedAt = try {
+            now().toEpochMilli()
+        } catch (_: RuntimeException) {
+            return null
+        }
+        val loaded = try {
+            authorizationJournalStore.load(observedAt)
+        } catch (_: RuntimeException) {
+            return null
+        }
+        return synchronized(presentationFence) {
+            val current = mutableState.value
+            if (
+                !operationAllowed() || current.isBusy ||
+                !current.authorizationRecoveryDiscardRequired ||
+                current.configurationId != binding.configurationId
+            ) {
+                return@synchronized null
+            }
+            when (loaded) {
+                GoogleAuthorizationJournalLoadResult.Empty -> null
+                is GoogleAuthorizationJournalLoadResult.Corrupt ->
+                    GoogleAuthorizationRecoveryDiscardConfirmation(
+                        presentationGeneration = presentationGeneration,
+                        binding = binding,
+                        expectedJournal = null,
+                        expectedCorruptArtifact = loaded.artifactIdentity,
+                    )
+                is GoogleAuthorizationJournalLoadResult.Loaded ->
+                    GoogleAuthorizationRecoveryDiscardConfirmation(
+                        presentationGeneration = presentationGeneration,
+                        binding = binding,
+                        expectedJournal = loaded.journal,
+                        expectedCorruptArtifact = null,
+                    )
+                is GoogleAuthorizationJournalLoadResult.Expired ->
+                    GoogleAuthorizationRecoveryDiscardConfirmation(
+                        presentationGeneration = presentationGeneration,
+                        binding = binding,
+                        expectedJournal = loaded.journal,
+                        expectedCorruptArtifact = null,
+                    )
+                is GoogleAuthorizationJournalLoadResult.Retirable ->
+                    GoogleAuthorizationRecoveryDiscardConfirmation(
+                        presentationGeneration = presentationGeneration,
+                        binding = binding,
+                        expectedJournal = loaded.journal,
+                        expectedCorruptArtifact = null,
+                    )
+            }
+        }
+    }
+
+    /**
+     * Explicitly abandons only the foreign/orphaned recovery represented by [confirmation].
+     * Loaded and expired records use exact CAS removal; unreadable records use the distinct reset
+     * primitive and must verify empty before the warning is retired.
+     */
+    suspend fun discardAuthorizationRecovery(
+        confirmation: GoogleAuthorizationRecoveryDiscardConfirmation,
+    ): Boolean {
+        val presentation = beginPresentationOperation(confirmation.presentationGeneration)
+            ?: return false
+        return operationMutex.withLock {
+            val current = presentationState(presentation) ?: return@withLock false
+            val binding = credentialStore.snapshot()
+            if (
+                current.isBusy || !current.authorizationRecoveryDiscardRequired ||
+                binding != confirmation.binding || current.configurationId != binding.configurationId
+            ) {
+                return@withLock false
+            }
+            val observedAt = try {
+                now().toEpochMilli()
+            } catch (_: RuntimeException) {
+                return@withLock false
+            }
+            val loaded = try {
+                authorizationJournalStore.load(observedAt)
+            } catch (_: RuntimeException) {
+                return@withLock false
+            }
+            val removed = when {
+                confirmation.expectedCorruptArtifact != null ->
+                    confirmation.expectedJournal == null &&
+                        loaded is GoogleAuthorizationJournalLoadResult.Corrupt &&
+                        loaded.artifactIdentity == confirmation.expectedCorruptArtifact &&
+                        authorizationRecoveryDestructionAllowed(
+                            presentation,
+                            confirmation.binding,
+                        ) &&
+                        authorizationJournalStore.clearCorruptExact(
+                            confirmation.expectedCorruptArtifact,
+                            observedAt,
+                        )
+                confirmation.expectedJournal != null -> {
+                    val currentJournal = when (loaded) {
+                        is GoogleAuthorizationJournalLoadResult.Loaded -> loaded.journal
+                        is GoogleAuthorizationJournalLoadResult.Expired -> loaded.journal
+                        is GoogleAuthorizationJournalLoadResult.Retirable -> loaded.journal
+                        GoogleAuthorizationJournalLoadResult.Empty,
+                        is GoogleAuthorizationJournalLoadResult.Corrupt,
+                        -> null
+                    }
+                    currentJournal == confirmation.expectedJournal &&
+                        authorizationRecoveryDestructionAllowed(
+                            presentation,
+                            confirmation.binding,
+                        ) &&
+                        authorizationJournalStore.removeExact(
+                            confirmation.expectedJournal,
+                            observedAt,
+                        )
+                }
+                else -> false
+            }
+            val verifiedEmpty = removed && try {
+                authorizationJournalStore.load(observedAt) ==
+                    GoogleAuthorizationJournalLoadResult.Empty
+            } catch (_: RuntimeException) {
+                false
+            }
+            if (!verifiedEmpty) return@withLock false
+            invalidatePresentationState(binding)
+            true
+        }
+    }
+
+    /**
+     * Destructive credential-removal fence used only after the owner confirmed local teardown.
+     * Ordinary API binding replacement never calls this and remains blocked by any journal.
+     */
+    suspend fun abandonAuthorizationForConfirmedLocalDestruction(): Boolean =
+        operationMutex.withLock {
+            val observedAt = try {
+                now().toEpochMilli()
+            } catch (_: RuntimeException) {
+                return@withLock false
+            }
+            if (!authorizationJournalStore.clearForConfirmedReset(observedAt)) {
+                return@withLock false
+            }
+            if (authorizationJournalStore.load(observedAt) !=
+                GoogleAuthorizationJournalLoadResult.Empty
+            ) {
+                return@withLock false
+            }
+            invalidatePresentationState(credentialStore.snapshot())
+            true
+        }
 
     suspend fun setPaused(accountId: String, paused: Boolean) =
         mutateAccount(accountId, "Updating Google sync…") { configuration, account ->
@@ -224,7 +598,8 @@ class GoogleAccountManager(
         }
         val currentBinding = credentialStore.snapshot()
         try {
-            consumeAuthorizationIfCurrent(
+            val handoffAt = now()
+            val trusted = authorizationUrlIsCurrent(
                 presentation = presentation,
                 candidate = candidate,
                 binding = binding,
@@ -232,12 +607,140 @@ class GoogleAccountManager(
                 configurationMatches = bindingTicket != null && configuration != null &&
                     configurationMatchesBindingValue(configuration, binding),
                 expectedConfigurationId = current.configurationId,
-                consumer = consumer,
-            ).also { consumed ->
-                if (!consumed) {
+                handoffAt = handoffAt,
+            )
+            if (!trusted) {
+                if (!sameBinding(binding, currentBinding)) {
                     publishPresentationState(presentation, initialState(currentBinding))
+                } else if (
+                    current.authorization?.let {
+                        !authorizationMutationAllowed(it.action, it.accountId)
+                    } == true
+                ) {
+                    publishPresentationState(
+                        presentation,
+                        current.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            message =
+                                "Finish the current planner or Google recovery before opening authorization",
+                        ),
+                    )
                 }
+                return@withLock false
             }
+            val loadResult = try {
+                authorizationJournalStore.load(handoffAt.toEpochMilli())
+            } catch (_: RuntimeException) {
+                null
+            }
+            val journal = (loadResult as? GoogleAuthorizationJournalLoadResult.Loaded)?.journal
+            if (
+                journal == null || !journal.belongsTo(binding) || journal.browserOpened ||
+                current.authorization?.matches(journal) != true
+            ) {
+                val failure = when {
+                    loadResult == null ||
+                        loadResult is GoogleAuthorizationJournalLoadResult.Corrupt ->
+                        authorizationRecoveryDiscardState(
+                            previous = current,
+                            resetRequired = true,
+                            message =
+                                "The exact Google authorization recovery became unreadable · nothing was opened",
+                        )
+                    loadResult is GoogleAuthorizationJournalLoadResult.Expired ->
+                        authorizationRecoveryState(
+                            previous = current,
+                            journal = loadResult.journal,
+                            belongsToCurrentConfiguration = loadResult.journal.belongsTo(binding),
+                            message =
+                                "The Google browser window closed · waiting for any in-flight callback to settle",
+                        )
+                    loadResult is GoogleAuthorizationJournalLoadResult.Retirable ->
+                        authorizationRecoveryState(
+                            previous = current,
+                            journal = loadResult.journal,
+                            belongsToCurrentConfiguration = loadResult.journal.belongsTo(binding),
+                            message = "The saved Google authorization is ready for safe cleanup",
+                        )
+                    journal != null && !journal.belongsTo(binding) ->
+                        authorizationRecoveryDiscardState(
+                            previous = current,
+                            resetRequired = false,
+                            message = FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE,
+                        )
+                    journal?.browserOpened == true -> authorizationRecoveryState(
+                        previous = current,
+                        journal = journal,
+                        belongsToCurrentConfiguration = true,
+                        message =
+                            "Google was already opened for this exact request · refresh status",
+                    )
+                    else -> current.copy(
+                        phase = GoogleAccountPhase.ERROR,
+                        authorization = null,
+                        authorizationRecovery = null,
+                        authorizationRecoveryResetRequired = false,
+                        authorizationRecoveryDiscardRequired = false,
+                        isBusy = false,
+                        message =
+                            "The exact Google authorization recovery is unavailable · nothing was opened",
+                    )
+                }
+                publishPresentationState(
+                    presentation,
+                    failure,
+                )
+                return@withLock false
+            }
+            val handoffEpochMillis = handoffAt.toEpochMilli()
+            // A tolerated backward wall-clock adjustment must not make the durable marker violate
+            // the server-created journal interval. Both values remain strictly before expiry.
+            val durableOpenedAt = handoffEpochMillis.coerceAtLeast(journal.createdAtEpochMillis)
+            val openedJournal = journal.recordingBrowserOpened(durableOpenedAt)
+            if (!authorizationJournalStore.updateExact(
+                    expected = journal,
+                    replacement = openedJournal,
+                    nowEpochMillis = handoffEpochMillis,
+                )
+            ) {
+                publishPresentationState(
+                    presentation,
+                    current.copy(
+                        phase = GoogleAccountPhase.ERROR,
+                        authorization = null,
+                        authorizationRecovery = journal.toRecovery(true),
+                        authorizationRecoveryResetRequired = false,
+                        isBusy = false,
+                        message =
+                            "Google was not opened because its browser handoff could not be saved",
+                    ),
+                )
+                return@withLock false
+            }
+            val opened = consumeDurablyOpenedAuthorizationIfCurrent(
+                presentation,
+                candidate = candidate,
+                binding = binding,
+                currentBinding = credentialStore.snapshot(),
+                expectedConfigurationId = current.configurationId,
+                openedJournal = openedJournal,
+                consumer = consumer,
+            )
+            if (!opened) {
+                publishPresentationState(
+                    presentation,
+                    authorizationRecoveryState(
+                        previous = current,
+                        journal = openedJournal,
+                        belongsToCurrentConfiguration = openedJournal.belongsTo(
+                            credentialStore.snapshot(),
+                        ),
+                        message =
+                            "Browser opening was blocked after its durable handoff marker · refresh status",
+                    ),
+                )
+            }
+            opened
         } finally {
             bindingTicket?.release()
         }
@@ -273,26 +776,39 @@ class GoogleAccountManager(
                     message = "Google could not be opened · try the authorization button again",
                 ),
             )
+        } else if (current.authorizationRecovery?.browserOpened == true) {
+            publishPresentationState(
+                presentation,
+                current.copy(
+                    phase = GoogleAccountPhase.AUTHORIZATION_RECOVERY,
+                    message =
+                        "Google browser opening is uncertain · refresh status; do not replay the request",
+                ),
+            )
         }
         }
     }
 
     private suspend fun beginAuthorization(
         accountId: String?,
-        expectedConfigurationId: String? = null,
-        expectedPresentationGeneration: Long? = null,
+        service: GoogleService?,
+        retrySavedRequest: Boolean = false,
     ) {
-        val presentation = beginPresentationOperation(expectedPresentationGeneration) ?: return
+        require(service == null || service == GoogleService.CALENDAR || service == GoogleService.TASKS)
+        val requestedAction = when (service) {
+            GoogleService.CALENDAR -> GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING
+            GoogleService.TASKS -> GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING
+            null -> if (accountId == null) {
+                GoogleAuthorizationAction.CONNECT_READ_ONLY
+            } else {
+                GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY
+            }
+            else -> error("Unsupported Google authorization service")
+        }
+        val presentation = beginPresentationOperation() ?: return
         operationMutex.withLock {
             if (!presentationOperationCurrent(presentation)) return@withLock
             val binding = credentialStore.snapshot()
-            if (
-                expectedConfigurationId != null &&
-                expectedConfigurationId != binding.configurationId
-            ) {
-                publishPresentationState(presentation, initialState(binding))
-                return@withLock
-            }
             val configuration = try {
                 credentialStore.authenticatedConfiguration()
             } catch (_: RuntimeException) {
@@ -322,42 +838,312 @@ class GoogleAccountManager(
             try {
             if (!operationStillCurrent(binding, presentation)) return@withLock
             val previous = stateForBinding(binding, presentation) ?: return@withLock
-            val account = accountId?.let { requestedId ->
-                previous.accounts.firstOrNull { it.id == requestedId }
-            }
-            if (accountId != null && account == null) {
+            if (previous.phase == GoogleAccountPhase.RECOVERY_REQUIRED) {
                 publishPresentationState(
                     presentation,
-                    operationFailureStatePreservingRecovery(
-                        previous,
-                        "That Google account belongs to an older API connection · refresh status",
+                    previous.copy(
+                        authorization = null,
+                        isBusy = false,
+                        message =
+                            "Resolve Google credential cleanup recovery before changing authorization",
                     ),
                 )
                 return@withLock
             }
-            if (!publishPresentationState(presentation, previous.copy(
-                phase = GoogleAccountPhase.LOADING,
-                isBusy = true,
-                message = "Preparing private Google authorization…",
-            ))) return@withLock
-            try {
-                val started = transport.startAuthorization(
-                    configuration = configuration,
-                    idempotencyKey = newUuid().toString(),
-                    request = StartGoogleAuthorizationRequest(
-                        // The explicit empty sentinel asks the server for Calendar and Tasks
-                        // read-only. Full scopes remain separate existing-account upgrades.
-                        services = emptyList(),
-                        forceConsent = account != null,
-                        accountId = account?.id,
-                        connectNew = account == null && previous.accounts.isNotEmpty(),
-                        makeDefault = account?.isDefault
-                            ?: previous.accounts.none { it.isDefault },
+            val resolution = resolveAuthorizationJournal(binding)
+            if (resolution is AuthorizationJournalResolution.Blocked) {
+                publishPresentationState(
+                    presentation,
+                    authorizationRecoveryDiscardState(
+                        previous = previous,
+                        resetRequired = resolution.unreadable,
+                        message = resolution.message,
                     ),
                 )
+                return@withLock
+            }
+
+            val loaded = resolution as? AuthorizationJournalResolution.Available
+            val journal: GoogleAuthorizationJournal
+            if (retrySavedRequest) {
+                if (loaded == null) {
+                    publishPresentationState(
+                        presentation,
+                        previous.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            authorization = null,
+                            authorizationRecovery = null,
+                            isBusy = false,
+                            message = "There is no saved Google authorization request to retry",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (!loaded.belongsToCurrentConfiguration) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = loaded.journal,
+                            belongsToCurrentConfiguration = false,
+                            message =
+                                "Restore the Planner API connection that owns this saved Google authorization",
+                        ),
+                    )
+                    return@withLock
+                }
+                journal = loaded.journal
+                if (!journal.isValidAt(now().toEpochMilli())) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "The Google browser window closed · waiting for any in-flight callback to settle",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (!authorizationMutationAllowed(journal.action, journal.request.accountId)) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "Finish the current planner or Google recovery before retrying authorization",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (journal.browserOpened) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "Google was already opened for this exact request · refresh status to verify it",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (
+                    journal.request.accountId != null &&
+                    previous.accounts.none { it.id == journal.request.accountId }
+                ) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "The saved Google authorization target is not in the refreshed account list",
+                        ),
+                    )
+                    return@withLock
+                }
+            } else {
+                if (loaded != null) {
+                    publishPresentationState(
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = loaded.journal,
+                            belongsToCurrentConfiguration = loaded.belongsToCurrentConfiguration,
+                            message =
+                                "Finish or retry the exact saved Google authorization before starting another",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (!authorizationMutationAllowed(requestedAction, accountId)) {
+                    publishPresentationState(
+                        presentation,
+                        previous.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            authorization = null,
+                            isBusy = false,
+                            message =
+                                "Finish the current planner or Google recovery before changing authorization",
+                        ),
+                    )
+                    return@withLock
+                }
+                val account = accountId?.let { requestedId ->
+                    previous.accounts.firstOrNull { it.id == requestedId }
+                }
+                if (accountId != null && account == null) {
+                    publishPresentationState(
+                        presentation,
+                        operationFailureStatePreservingRecovery(
+                            previous,
+                            "That Google account belongs to an older API connection · refresh status",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (account != null && !authorizationIsAllowed(account, service)) {
+                    publishPresentationState(
+                        presentation,
+                        operationFailureStatePreservingRecovery(
+                            previous,
+                            "That Google account cannot grant the requested publishing access",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (account != null && authorizationAlreadySatisfied(account, service)) {
+                    publishPresentationState(
+                        presentation,
+                        previous.copy(
+                            phase = GoogleAccountPhase.CONNECTED,
+                            authorization = null,
+                            authorizationRecovery = null,
+                            isBusy = false,
+                            message = when (service) {
+                                GoogleService.CALENDAR ->
+                                    "Google Calendar publishing access is already enabled"
+                                GoogleService.TASKS ->
+                                    "Google Tasks publishing access is already enabled"
+                                else -> "Google authorization is already current"
+                            },
+                        ),
+                    )
+                    return@withLock
+                }
+                val request = StartGoogleAuthorizationRequest(
+                    // The explicit empty sentinel asks the server for Calendar and Tasks
+                    // read-only. Full scopes are singleton existing-account upgrades.
+                    services = service?.let(::listOf) ?: emptyList(),
+                    forceConsent = account != null,
+                    accountId = account?.id,
+                    connectNew = account == null && previous.accounts.isNotEmpty(),
+                    makeDefault = account?.isDefault ?: previous.accounts.none { it.isDefault },
+                )
+                val createdAt = now().toEpochMilli()
+                journal = GoogleAuthorizationJournal(
+                    configurationId = requireNotNull(binding.configurationId),
+                    apiBaseUrl = requireNotNull(binding.baseUrl),
+                    request = request,
+                    idempotencyKey = newUuid().toString(),
+                    createdAtEpochMillis = createdAt,
+                    expiresAtEpochMillis = Math.addExact(
+                        createdAt,
+                        GoogleAuthorizationJournal.MAXIMUM_LIFETIME_MILLIS,
+                    ),
+                )
+                if (!authorizationMutationAllowed(journal.action, journal.request.accountId)) {
+                    publishPresentationState(
+                        presentation,
+                        previous.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            authorization = null,
+                            isBusy = false,
+                            message =
+                                "Google authorization was not started because another recovery became active",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (!authorizationJournalStore.saveIfAbsent(journal, createdAt)) {
+                    publishPresentationState(
+                        presentation,
+                        previous.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            authorization = null,
+                            authorizationRecovery = null,
+                            isBusy = false,
+                            message =
+                                "Google authorization was not sent because its recovery request could not be saved",
+                        ),
+                    )
+                    return@withLock
+                }
+            }
+            if (!publishPresentationState(presentation, previous.copy(
+                phase = GoogleAccountPhase.LOADING,
+                authorization = null,
+                authorizationRecovery = journal.toRecovery(true),
+                authorizationRecoveryResetRequired = false,
+                isBusy = true,
+                message = journal.action.preparationMessage(),
+            ))) return@withLock
+            try {
+                if (
+                    !operationStillCurrent(binding, presentation) ||
+                    !authorizationMutationAllowed(journal.action, journal.request.accountId)
+                ) {
+                    publishOperationState(
+                        binding,
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "The exact Google authorization was saved but another recovery now blocks sending it",
+                        ),
+                    )
+                    return@withLock
+                }
+                val started = transport.startAuthorization(
+                    configuration = configuration,
+                    idempotencyKey = journal.idempotencyKey,
+                    request = journal.request,
+                )
                 val expiresAt = Instant.parse(started.expiresAt)
-                require(expiresAt > now() && expiresAt <= now().plusSeconds(MAX_AUTHORIZATION_SECONDS))
+                val responseObservedAt = now()
+                require(
+                    expiresAt > responseObservedAt &&
+                        expiresAt <= responseObservedAt.plusSeconds(MAX_AUTHORIZATION_SECONDS),
+                )
                 validateGoogleAuthorizationUrl(started.authorizationUrl)
+                val updatedJournal = journal.recordingServerExpiry(expiresAt.toEpochMilli())
+                if (!authorizationJournalStore.updateExact(
+                        expected = journal,
+                        replacement = updatedJournal,
+                        nowEpochMillis = responseObservedAt.toEpochMilli(),
+                    )
+                ) {
+                    publishOperationState(
+                        binding,
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = journal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "Google may have started authorization, but its refreshed recovery record could not be saved",
+                        ),
+                    )
+                    return@withLock
+                }
+                if (
+                    !operationStillCurrent(binding, presentation) ||
+                    !authorizationMutationAllowed(
+                        updatedJournal.action,
+                        updatedJournal.request.accountId,
+                    )
+                ) {
+                    publishOperationState(
+                        binding,
+                        presentation,
+                        authorizationRecoveryState(
+                            previous = previous,
+                            journal = updatedJournal,
+                            belongsToCurrentConfiguration = true,
+                            message =
+                                "Google authorization is saved, but another recovery blocks opening it",
+                        ),
+                    )
+                    return@withLock
+                }
                 publishOperationState(
                     binding,
                     presentation,
@@ -366,21 +1152,27 @@ class GoogleAccountManager(
                         authorization = PendingGoogleAuthorization(
                             url = started.authorizationUrl,
                             expiresAt = expiresAt,
-                            accountId = account?.id,
-                            baselineAccountIds = previous.accounts.mapTo(mutableSetOf()) { it.id },
+                            action = updatedJournal.action,
+                            accountId = updatedJournal.request.accountId,
                         ),
+                        authorizationRecovery = updatedJournal.toRecovery(true),
+                        authorizationRecoveryResetRequired = false,
                         isBusy = false,
-                        message = "Authorize in Google, return here, then refresh status",
+                        message = updatedJournal.action.browserReadyMessage(),
                     ),
                 )
             } catch (error: CancellationException) {
-                publishOperationState(binding, presentation, previous.copy(isBusy = false))
+                publishOperationState(
+                    binding,
+                    presentation,
+                    authorizationStartFailureState(previous, journal, error),
+                )
                 throw error
             } catch (error: Exception) {
                 publishOperationState(
                     binding,
                     presentation,
-                    failureState(error, previous.copy(isBusy = false)),
+                    authorizationStartFailureState(previous, journal, error),
                 )
             }
             } finally {
@@ -431,6 +1223,34 @@ class GoogleAccountManager(
         try {
         if (!operationStillCurrent(binding, presentation)) return@withLock
         val previous = stateForBinding(binding, presentation) ?: return@withLock
+        when (val authorizationJournal = resolveAuthorizationJournal(binding)) {
+            AuthorizationJournalResolution.None -> Unit
+            is AuthorizationJournalResolution.Available -> {
+                publishPresentationState(
+                    presentation,
+                    authorizationRecoveryState(
+                        previous = previous,
+                        journal = authorizationJournal.journal,
+                        belongsToCurrentConfiguration =
+                            authorizationJournal.belongsToCurrentConfiguration,
+                        message =
+                            "Finish the saved Google authorization before changing this account",
+                    ),
+                )
+                return@withLock
+            }
+            is AuthorizationJournalResolution.Blocked -> {
+                publishPresentationState(
+                    presentation,
+                    authorizationRecoveryDiscardState(
+                        previous = previous,
+                        resetRequired = authorizationJournal.unreadable,
+                        message = authorizationJournal.message,
+                    ),
+                )
+                return@withLock
+            }
+        }
         val account = previous.accounts.firstOrNull { it.id == accountId }
         if (account == null) {
             publishPresentationState(
@@ -448,6 +1268,20 @@ class GoogleAccountManager(
             message = progressMessage,
         ))) return@withLock
         try {
+            if (hasAuthorizationRecoveryBlocker()) {
+                publishOperationState(
+                    binding,
+                    presentation,
+                    previous.copy(
+                        phase = GoogleAccountPhase.ERROR,
+                        authorization = null,
+                        isBusy = false,
+                        message =
+                            "A Google authorization recovery became active before the account change",
+                    ),
+                )
+                return@withLock
+            }
             validateAccount(mutation(configuration, account))
             if (!operationStillCurrent(binding, presentation)) return@withLock
             val refreshed = transport.accounts(configuration)
@@ -601,6 +1435,225 @@ class GoogleAccountManager(
         }
     }
 
+    private fun resolveAuthorizationJournal(
+        binding: ApiConnectionSnapshot,
+    ): AuthorizationJournalResolution {
+        return try {
+            val observedAt = now().toEpochMilli()
+            when (val loaded = authorizationJournalStore.load(observedAt)) {
+                GoogleAuthorizationJournalLoadResult.Empty -> AuthorizationJournalResolution.None
+                is GoogleAuthorizationJournalLoadResult.Corrupt ->
+                    AuthorizationJournalResolution.Blocked(
+                        message = UNREADABLE_AUTHORIZATION_RECOVERY_MESSAGE,
+                        unreadable = true,
+                    )
+                is GoogleAuthorizationJournalLoadResult.Expired ->
+                    AuthorizationJournalResolution.Available(
+                        journal = loaded.journal,
+                        belongsToCurrentConfiguration = loaded.journal.belongsTo(binding),
+                    )
+                is GoogleAuthorizationJournalLoadResult.Retirable -> {
+                    if (
+                        authorizationJournalStore.removeExact(loaded.journal, observedAt) &&
+                        authorizationJournalStore.load(observedAt) ==
+                        GoogleAuthorizationJournalLoadResult.Empty
+                    ) {
+                        AuthorizationJournalResolution.None
+                    } else {
+                        AuthorizationJournalResolution.Blocked(
+                            message = EXPIRED_AUTHORIZATION_RECOVERY_MESSAGE,
+                            unreadable = false,
+                        )
+                    }
+                }
+                is GoogleAuthorizationJournalLoadResult.Loaded ->
+                    AuthorizationJournalResolution.Available(
+                        journal = loaded.journal,
+                        belongsToCurrentConfiguration = loaded.journal.belongsTo(binding),
+                    )
+            }
+        } catch (_: RuntimeException) {
+            AuthorizationJournalResolution.Blocked(
+                message = UNREADABLE_AUTHORIZATION_RECOVERY_MESSAGE,
+                unreadable = true,
+            )
+        }
+    }
+
+    private fun configurationUnavailableState(
+        binding: ApiConnectionSnapshot,
+        journalResolution: AuthorizationJournalResolution,
+        credentialsUnreadable: Boolean,
+    ): GoogleAccountState {
+        val base = if (credentialsUnreadable) {
+            GoogleAccountState(
+                phase = GoogleAccountPhase.AUTH_REQUIRED,
+                message = "Planner credentials are unavailable · reconnect the DayWeave API",
+                requiresPlannerApiConfiguration = true,
+                configurationId = binding.configurationId,
+            )
+        } else {
+            initialState(binding)
+        }
+        return when (journalResolution) {
+            AuthorizationJournalResolution.None -> base
+            is AuthorizationJournalResolution.Available -> authorizationRecoveryDiscardState(
+                previous = base,
+                resetRequired = false,
+                message = ORPHANED_AUTHORIZATION_RECOVERY_MESSAGE,
+            ).copy(requiresPlannerApiConfiguration = true)
+            is AuthorizationJournalResolution.Blocked -> authorizationRecoveryDiscardState(
+                previous = base,
+                resetRequired = journalResolution.unreadable,
+                message = journalResolution.message,
+            ).copy(requiresPlannerApiConfiguration = true)
+        }
+    }
+
+    private fun GoogleAuthorizationJournal.belongsTo(binding: ApiConnectionSnapshot): Boolean =
+        binding.hasBearerToken && configurationId == binding.configurationId &&
+            apiBaseUrl == binding.baseUrl
+
+    private fun GoogleAuthorizationJournal.toRecovery(
+        belongsToCurrentConfiguration: Boolean,
+    ): GoogleAuthorizationRecovery = GoogleAuthorizationRecovery(
+        action = action,
+        expiresAt = Instant.ofEpochMilli(expiresAtEpochMillis),
+        accountId = request.accountId,
+        browserOpened = browserOpened,
+        belongsToCurrentConfiguration = belongsToCurrentConfiguration,
+        browserWindowExpired = expiresAtEpochMillis <= now().toEpochMilli(),
+    )
+
+    private fun PendingGoogleAuthorization.matches(journal: GoogleAuthorizationJournal): Boolean =
+        action == journal.action && accountId == journal.request.accountId &&
+            expiresAt.toEpochMilli() == journal.expiresAtEpochMillis
+
+    private fun authorizationIsAllowed(
+        account: GoogleAccountSummary,
+        service: GoogleService?,
+    ): Boolean = when (service) {
+        GoogleService.CALENDAR -> account.status in setOf("active", "paused")
+        GoogleService.TASKS, null -> account.status in setOf(
+            "active",
+            "paused",
+            "reauthorization_required",
+        )
+        else -> false
+    }
+
+    private fun authorizationAlreadySatisfied(
+        account: GoogleAccountSummary,
+        service: GoogleService?,
+    ): Boolean = when (service) {
+        GoogleService.CALENDAR -> account.hasCalendarWriteScope
+        GoogleService.TASKS ->
+            account.hasTasksWriteScope && account.status != "reauthorization_required"
+        else -> false
+    }
+
+    private fun authorizationRecoveryState(
+        previous: GoogleAccountState,
+        journal: GoogleAuthorizationJournal,
+        belongsToCurrentConfiguration: Boolean,
+        message: String,
+    ): GoogleAccountState = if (belongsToCurrentConfiguration) {
+        previous.copy(
+            phase = GoogleAccountPhase.AUTHORIZATION_RECOVERY,
+            authorization = null,
+            authorizationRecovery = journal.toRecovery(true),
+            authorizationRecoveryResetRequired = false,
+            authorizationRecoveryDiscardRequired = false,
+            isBusy = false,
+            message = message,
+        )
+    } else {
+        authorizationRecoveryDiscardState(
+            previous = previous,
+            resetRequired = false,
+            message = FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE,
+        )
+    }
+
+    private fun authorizationRecoveryDiscardState(
+        previous: GoogleAccountState,
+        resetRequired: Boolean,
+        message: String,
+    ): GoogleAccountState = previous.copy(
+        phase = if (resetRequired) GoogleAccountPhase.ERROR else {
+            GoogleAccountPhase.AUTHORIZATION_RECOVERY
+        },
+        authorization = null,
+        authorizationRecovery = null,
+        authorizationRecoveryResetRequired = resetRequired,
+        authorizationRecoveryDiscardRequired = true,
+        isBusy = false,
+        message = message,
+    )
+
+    private fun authorizationStartFailureState(
+        previous: GoogleAccountState,
+        journal: GoogleAuthorizationJournal,
+        error: Exception,
+    ): GoogleAccountState {
+        val authenticationFailed = error is GoogleAccountsApiException.Authentication
+        return previous.copy(
+            phase = if (authenticationFailed) {
+                GoogleAccountPhase.AUTH_REQUIRED
+            } else {
+                GoogleAccountPhase.AUTHORIZATION_RECOVERY
+            },
+            accounts = if (authenticationFailed) emptyList() else previous.accounts,
+            authorization = null,
+            authorizationRecovery = journal.toRecovery(true),
+            authorizationRecoveryResetRequired = false,
+            authorizationRecoveryDiscardRequired = false,
+            isBusy = false,
+            message = when (error) {
+                is GoogleAccountsApiException.Authentication ->
+                    "Reconnect the Planner API, then retry the exact saved Google authorization"
+                is GoogleAccountsApiException.Conflict ->
+                    "Google authorization is already changing · keep and retry the exact saved request"
+                is GoogleAccountsApiException.Validation ->
+                    "Google rejected the request · the exact saved authorization was retained"
+                is CancellationException, is IOException ->
+                    "Google authorization outcome is unknown · retry only the exact saved request"
+                else ->
+                    "Google authorization was not confirmed · the exact saved request was retained"
+            },
+            requiresPlannerApiConfiguration = authenticationFailed,
+        )
+    }
+
+    private fun GoogleAuthorizationAction.preparationMessage(): String = when (this) {
+        GoogleAuthorizationAction.CONNECT_READ_ONLY -> "Preparing a private Google connection…"
+        GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY ->
+            "Preparing private Google reauthorization…"
+        GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING ->
+            "Preparing Google Calendar publishing access…"
+        GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING ->
+            "Preparing Google Tasks publishing access…"
+    }
+
+    private fun GoogleAuthorizationAction.browserReadyMessage(): String = when (this) {
+        GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING ->
+            "Authorize Calendar publishing in Google, then refresh status"
+        GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING ->
+            "Authorize Tasks publishing in Google, then refresh status"
+        else -> "Authorize in Google, return here, then refresh status"
+    }
+
+    private fun GoogleAuthorizationAction.retryMessage(): String = when (this) {
+        GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING ->
+            "Retry the exact saved Calendar publishing authorization"
+        GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING ->
+            "Retry the exact saved Tasks publishing authorization"
+        GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY ->
+            "Retry the exact saved Google reauthorization"
+        GoogleAuthorizationAction.CONNECT_READ_ONLY ->
+            "Retry the exact saved read-only Google connection"
+    }
+
     private fun operationFailureStatePreservingRecovery(
         previous: GoogleAccountState,
         message: String,
@@ -618,6 +1671,7 @@ class GoogleAccountManager(
     private fun mapState(
         response: RemoteGoogleAccounts,
         authorization: PendingGoogleAuthorization?,
+        authorizationRecovery: GoogleAuthorizationRecovery? = null,
         configurationId: String?,
     ): GoogleAccountState {
         validateCleanup(response)
@@ -630,15 +1684,6 @@ class GoogleAccountManager(
         val accounts = response.accounts.map(::validateAccount)
             .filter { it.status != "revoked" }
             .sortedWith(compareByDescending<GoogleAccountSummary> { it.isDefault }.thenBy { it.label })
-        val unresolvedAuthorization = authorization?.takeUnless { pending ->
-            if (pending.accountId != null) {
-                accounts.any { account ->
-                    account.id == pending.accountId && account.status in setOf("active", "paused")
-                }
-            } else {
-                accounts.any { it.id !in pending.baselineAccountIds }
-            }
-        }
         val operatorRecovery = response.cleanup.operatorRecoveryRequired ||
             response.cleanup.legacyRecoveryRequired > 0
         val recovery = operatorRecovery || response.cleanup.durabilityDegraded ||
@@ -650,17 +1695,44 @@ class GoogleAccountManager(
             recovery -> GoogleAccountState(
                 phase = GoogleAccountPhase.RECOVERY_REQUIRED,
                 accounts = accounts,
+                authorizationRecovery = authorizationRecovery,
                 message = if (operatorRecovery) {
                     "Google credential recovery needs owner attention on the server"
                 } else {
                     "Google credential cleanup is fenced · the server will retry safely"
                 },
             )
-            unresolvedAuthorization != null -> GoogleAccountState(
+            authorization != null && authorizationRecovery != null -> GoogleAccountState(
                 phase = GoogleAccountPhase.AWAITING_BROWSER,
                 accounts = accounts,
-                authorization = unresolvedAuthorization,
-                message = "Finish authorization in Google, then refresh status",
+                authorization = authorization,
+                authorizationRecovery = authorizationRecovery,
+                message = authorizationRecovery.action.browserReadyMessage(),
+            )
+            authorizationRecovery != null -> GoogleAccountState(
+                phase = GoogleAccountPhase.AUTHORIZATION_RECOVERY,
+                accounts = accounts,
+                authorizationRecovery = authorizationRecovery,
+                message = when {
+                    !authorizationRecovery.belongsToCurrentConfiguration ->
+                        "Restore the Planner API connection that owns this saved Google authorization"
+                    authorizationRecovery.browserWindowExpired ->
+                        "The Google browser window closed · waiting for any in-flight callback to settle"
+                    authorizationRecovery.browserOpened ->
+                        "Google was opened for the saved request · refresh to verify the grant"
+                    else -> authorizationRecovery.action.retryMessage()
+                },
+            )
+            accounts.any { it.status == "active" } -> GoogleAccountState(
+                phase = GoogleAccountPhase.CONNECTED,
+                accounts = accounts,
+                message = when {
+                    revocationFailed ->
+                        "Google connected · another account still needs Disconnect retried"
+                    needsAuthorization ->
+                        "Google connected · one or more accounts need authorization"
+                    else -> "Google Calendar and Tasks connected"
+                },
             )
             revocationFailed -> GoogleAccountState(
                 phase = GoogleAccountPhase.ERROR,
@@ -671,11 +1743,6 @@ class GoogleAccountManager(
                 phase = GoogleAccountPhase.AUTH_REQUIRED,
                 accounts = accounts,
                 message = "One or more Google accounts need authorization",
-            )
-            accounts.any { it.status == "active" } -> GoogleAccountState(
-                phase = GoogleAccountPhase.CONNECTED,
-                accounts = accounts,
-                message = "Google Calendar and Tasks connected",
             )
             accounts.isNotEmpty() -> GoogleAccountState(
                 phase = GoogleAccountPhase.CONNECTED,
@@ -690,9 +1757,11 @@ class GoogleAccountManager(
     }
 
     private fun validateAccount(remote: RemoteGoogleAccount): GoogleAccountSummary {
-        require(UUID.fromString(remote.id).toString() == remote.id)
+        val accountId = UUID.fromString(remote.id)
+        require(accountId.toString() == remote.id && accountId != UUID(0, 0))
         require(remote.externalAccountId.isSafeLabel() && remote.displayLabel.isSafeLabel())
-        require(remote.status in GOOGLE_ACCOUNT_STATUSES && remote.revision > 0)
+        // Leave room for the server's mandatory next revision.
+        require(remote.status in GOOGLE_ACCOUNT_STATUSES && remote.revision in 1 until Long.MAX_VALUE)
         val createdAt = Instant.parse(remote.createdAt)
         val updatedAt = Instant.parse(remote.updatedAt)
         require(updatedAt >= createdAt)
@@ -806,6 +1875,13 @@ class GoogleAccountManager(
         before.baseUrl == after.baseUrl && before.configurationId == after.configurationId &&
             before.hasBearerToken == after.hasBearerToken
 
+    /** Final privacy/generation/binding fence immediately before an explicit destructive clear. */
+    private fun authorizationRecoveryDestructionAllowed(
+        presentation: Long,
+        expectedBinding: ApiConnectionSnapshot,
+    ): Boolean = credentialStore.snapshot() == expectedBinding &&
+        presentationOperationCurrent(presentation)
+
     private fun beginPresentationOperation(expectedGeneration: Long? = null): Long? =
         synchronized(presentationFence) {
             presentationGeneration.takeIf { generation ->
@@ -881,25 +1957,69 @@ class GoogleAccountManager(
         mutableState.value = initialState(visibleSnapshot)
     }
 
-    private fun consumeAuthorizationIfCurrent(
+    private fun authorizationUrlIsCurrent(
         presentation: Long,
         candidate: String,
         binding: ApiConnectionSnapshot,
         currentBinding: ApiConnectionSnapshot,
         configurationMatches: Boolean,
         expectedConfigurationId: String?,
-        consumer: (String) -> Unit,
+        handoffAt: Instant,
     ): Boolean = synchronized(presentationFence) {
         if (!operationAllowed() || presentationGeneration != presentation) {
             return@synchronized false
         }
         val current = mutableState.value
         val authorization = current.authorization
+        if (
+            authorization == null ||
+            !authorizationMutationAllowed(authorization.action, authorization.accountId)
+        ) {
+            return@synchronized false
+        }
         val trusted = sameBinding(binding, currentBinding) && binding.hasBearerToken &&
             configurationMatches && current.configurationId == expectedConfigurationId &&
             current.configurationId == binding.configurationId && authorization?.url == candidate &&
-            authorization.expiresAt > now()
+            authorization.expiresAt > handoffAt
+        trusted
+    }
+
+    /** Final fence check and synchronous handoff after the opened marker is durable. */
+    private fun consumeDurablyOpenedAuthorizationIfCurrent(
+        presentation: Long,
+        candidate: String,
+        binding: ApiConnectionSnapshot,
+        currentBinding: ApiConnectionSnapshot,
+        expectedConfigurationId: String?,
+        openedJournal: GoogleAuthorizationJournal,
+        consumer: (String) -> Unit,
+    ): Boolean = synchronized(presentationFence) {
+        if (
+            !operationAllowed() || !authorizationMutationAllowed(
+                openedJournal.action,
+                openedJournal.request.accountId,
+            ) ||
+            presentationGeneration != presentation
+        ) {
+            return@synchronized false
+        }
+        val current = mutableState.value
+        val authorization = current.authorization
+        val trusted = sameBinding(binding, currentBinding) && binding.hasBearerToken &&
+            openedJournal.belongsTo(binding) &&
+            current.configurationId == expectedConfigurationId &&
+            current.configurationId == binding.configurationId &&
+            authorization?.url == candidate && authorization.matches(openedJournal)
         if (!trusted) return@synchronized false
+        mutableState.value = current.copy(
+            phase = GoogleAccountPhase.AUTHORIZATION_RECOVERY,
+            authorization = null,
+            authorizationRecovery = openedJournal.toRecovery(true),
+            authorizationRecoveryResetRequired = false,
+            isBusy = false,
+            message =
+                "Google browser handoff is recorded · return and refresh to verify the grant",
+        )
         consumer(candidate)
         true
     }
@@ -937,11 +2057,19 @@ class GoogleAccountManager(
         } ?: initialState(binding)
     }
 
-    private data class RestartAuthorization(
-        val accountId: String?,
-        val configurationId: String?,
-        val presentationGeneration: Long,
-    )
+    private sealed interface AuthorizationJournalResolution {
+        data object None : AuthorizationJournalResolution
+
+        data class Available(
+            val journal: GoogleAuthorizationJournal,
+            val belongsToCurrentConfiguration: Boolean,
+        ) : AuthorizationJournalResolution
+
+        data class Blocked(
+            val message: String,
+            val unreadable: Boolean,
+        ) : AuthorizationJournalResolution
+    }
 
     companion object {
         private const val MAX_AUTHORIZATION_SECONDS = 15 * 60L
@@ -956,6 +2084,18 @@ class GoogleAccountManager(
         private const val GOOGLE_TASKS_READ_ONLY_SCOPE =
             "https://www.googleapis.com/auth/tasks.readonly"
         private const val GOOGLE_TASKS_SCOPE = "https://www.googleapis.com/auth/tasks"
+        private const val FOREIGN_AUTHORIZATION_RECOVERY_MESSAGE =
+            "A saved Google authorization belongs to another API connection and may have " +
+                "reached Google · restore that exact connection or explicitly discard it"
+        private const val ORPHANED_AUTHORIZATION_RECOVERY_MESSAGE =
+            "A saved Google authorization may have reached Google · restore its exact Planner " +
+                "API connection or explicitly discard it"
+        private const val UNREADABLE_AUTHORIZATION_RECOVERY_MESSAGE =
+            "A saved Google authorization recovery is unreadable and may have reached Google · " +
+                "explicitly discard it before reconnecting"
+        private const val EXPIRED_AUTHORIZATION_RECOVERY_MESSAGE =
+            "An expired Google authorization recovery could not be cleared safely and may have " +
+                "reached Google · explicitly discard it"
         private val GOOGLE_ACCOUNT_STATUSES = setOf(
             "active",
             "paused",

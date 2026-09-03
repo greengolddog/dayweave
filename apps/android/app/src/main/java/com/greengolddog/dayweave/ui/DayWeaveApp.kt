@@ -827,6 +827,17 @@ private fun DayWeaveRoot(
                     }
                 },
                 onReauthorizeGoogle = viewModel::reauthorizeGoogleAccount,
+                onEnableGoogleCalendarPublishing =
+                    viewModel::enableGoogleCalendarPublishing,
+                onEnableGoogleTasksPublishing = viewModel::enableGoogleTasksPublishing,
+                authorizationRecoveryResetConfirmationProvider =
+                    viewModel::googleAuthorizationRecoveryResetConfirmation,
+                onResetGoogleAuthorizationRecovery =
+                    viewModel::resetGoogleAuthorizationRecovery,
+                authorizationRecoveryDiscardConfirmationProvider =
+                    viewModel::googleAuthorizationRecoveryDiscardConfirmation,
+                onDiscardGoogleAuthorizationRecovery =
+                    viewModel::discardOrphanedGoogleAuthorizationRecovery,
                 onSetGooglePaused = viewModel::setGoogleAccountPaused,
                 onRequestGoogleDisconnect = { disconnectingGoogleAccount = it },
                 onDiscoverGoogleSources = viewModel::discoverGoogleSources,
@@ -1269,6 +1280,8 @@ private fun DayWeaveRoot(
         ApiConnectionDialog(
             authState = deviceAuthState,
             credentialReplacementBlocked = viewModel.hasCredentialReplacementBlocker(),
+            googleAuthorizationRecoveryDiscardRequired =
+                googleAccountState.authorizationRecoveryDiscardRequired,
             onDismiss = { showApiConnection = false },
             onUpgradeWithBootstrap = viewModel::upgradeDeviceAuthentication,
             onConsumeEnrollmentCode = viewModel::consumeDeviceEnrollmentCode,
@@ -1277,6 +1290,10 @@ private fun DayWeaveRoot(
             onDestroyLocalOnly = {
                 viewModel.destroyLocalDeviceAuthentication(confirmed = true)
             },
+            googleAuthorizationRecoveryDiscardConfirmationProvider =
+                viewModel::googleAuthorizationRecoveryDiscardConfirmation,
+            onDiscardGoogleAuthorizationRecovery =
+                viewModel::discardOrphanedGoogleAuthorizationRecovery,
         )
     }
 

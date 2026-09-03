@@ -137,17 +137,21 @@ Android Keystore key; they are never placed in the Room planner snapshot, WorkMa
 or UI errors. The auth envelope, connection preference, and encrypted databases are excluded from
 backup and device transfer.
 
-## Google Calendar and Tasks import
+## Google Calendar and Tasks integration
 
-**More → Google sources** exposes Android's inbound-only Google Calendar and Google Tasks
-configuration. After a Google connection is active, the app discovers every calendar and task list.
-Calendars can be **Off**, **Show only**, or **Block time**. Task lists can be **Off** or **Import**;
+**More → Google connection** owns read-only connection, reauthorization, and separate Calendar
+and Tasks publishing-scope upgrades. The exact OAuth-start request is journaled outside backup
+without its one-use URL; browser handoff is recorded before Android opens Google. Account inventory
+cannot correlate a callback to that exact attempt, so recovery remains fenced through expiry,
+maximum clock skew, and the server exchange-settlement lease.
+
+**More → Google sources** discovers every calendar and task list. Calendars can be **Off**,
+**Show only**, **Block time**, or **Publish**. Task lists can be **Off**, **Import**, or **Publish**;
 imported tasks that still need duration or other planning details enter DayWeave's Inbox, and a
-task list never blocks planning time merely because its source is enabled. Existing writable
-source settings created on another DayWeave client remain visible as **Writable · managed on
-another device**, but Android never offers or sends the writable role. Refresh remains account-wide
-across both services. Outbound Calendar or Tasks publication is a separate surface and is not
-implied by these controls.
+task list never blocks planning time merely because its source is enabled. Calendar import
+dispositions and all-day/tentative/free publication policy are independently configurable. Publish
+requires the service's full write scope; Calendar additionally requires provider owner/writer
+authority. Refresh remains account-wide across both services.
 
 Import refresh is crash-safe. Android writes a credential-bound request UUID outside backup before
 the refresh POST, records the exact accepted server generation, and requires an authoritative idle
@@ -159,19 +163,23 @@ source name, event or task payload, or collection identifier. Ordinary API crede
 plus Google account pause and disconnect are fenced while import recovery is outstanding; resuming
 a paused account remains available so the saved import can finish. Only the existing explicitly
 confirmed local-destruction flow can abandon an irrecoverable marker.
+An accepted run that reports reauthorization required keeps its original marker and generation;
+the exact OAuth repair wakes that same run server-side, and Android only polls it to completion.
+Cached account state can never authorize a replacement refresh.
 
 ## Explicit Google Calendar and Tasks publication
 
 Android can publish one exact synced DayWeave event or task from **Inbox → Items → Publish**
 and can review removal of an exact recently deleted mapped event or task. Events must be
-app-authored, planned, non-recurring, non-all-day, confirmed, busy, timed, indivisible, current,
-and free of any pending canonical edit. Tasks must be app-authored and non-recurring; Inbox,
+app-authored, fixed, non-recurring, current, and free of any pending canonical edit. All-day,
+tentative, and free events are eligible only for destinations whose explicit publication policy
+permits each trait. Tasks must be app-authored and non-recurring; Inbox,
 Planned, Scheduled, Active, Paused, and Completed states are supported, while skipped, canceled,
 provider-imported, or otherwise non-round-trippable tasks are excluded. Rich DayWeave scheduling
 metadata remains local. Calendar destinations must still report `owner` or `writer`; task-list
-destinations require the account's full Tasks write scope. Every destination must already have the
-**Writable / Publish** role configured on macOS. Android's **Google sources** controls remain
-inbound-only and cannot silently grant or select a write destination.
+destinations require the account's full Tasks write scope. Every destination must have the
+**Publish** role configured on either native client; Android can grant and select it directly, but
+never does so implicitly.
 
 The Publish action opens a screenshot-protected review surface. Multiple eligible destinations
 require an explicit choice. Android asks the server for the exact provider payload and validates it
@@ -184,14 +192,15 @@ Only sanitized account-qualified destination, operation, user-visible fields, an
 review; ownership proof, hashes, identifiers, bearer tokens, and approval capabilities never enter
 display or diagnostics. **Approve & Queue** is the only approval path. Success means the durable
 server outbox accepted the exact mutation—it does not claim that Google has already applied it.
-The server now has a separate, default-off preview → approve → enqueue → status batch
-contract for explicitly publishing not-yet-elapsed generated firm `planned` and `pinned` blocks
-from the exact current immutable published schedule, but Android does not invoke it. This Inbox
-action remains single-item publication. Published elapsed events are immutable Calendar history:
-the batch path never rewrites, deletes, or reuses them. A native schedule review/recovery journal
-and trigger, automatic firm-horizon rolling/publication, and inbound interpretation of Google
-edits, moves, or deletions remain future Android/integration work. Tentative blocks remain app-only
-and are never accepted by this server path; the milestone does not complete `SCH-006`.
+Android also invokes the separate, default-off preview → approve → enqueue → status batch contract
+for explicitly publishing not-yet-elapsed generated firm `planned` and `pinned` blocks from the
+exact current immutable published schedule. The user selects a writable destination and reviews
+the bounded exact change set; a durable Android journal recovers preview, one-shot approval,
+enqueue, and status polling without claiming provider delivery early. The Inbox action remains
+single-item publication. Published elapsed events are immutable Calendar history: the batch path
+never rewrites, deletes, or reuses them. Automatic firm-horizon rolling/publication and inbound
+interpretation of Google edits, moves, or deletions remain future integration work. Tentative
+blocks remain app-only and are never accepted by this server path, so `SCH-006` remains open.
 
 The encrypted Room snapshot journals `INTENT → PREVIEWED → APPROVAL_ATTEMPTED → APPROVED` before
 each consequential request. The journal binds entity kind and operation as well as canonical

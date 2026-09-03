@@ -144,7 +144,10 @@ class GoogleSchedulePublicationCoordinator(
         val imports = googleImportState()
         if (
             snapshot.configurationId == null || accounts.phase != GoogleAccountPhase.CONNECTED ||
-            accounts.isBusy || accounts.authorization != null || imports.isBusy ||
+            accounts.isBusy || accounts.authorization != null ||
+            accounts.authorizationRecovery != null ||
+            accounts.authorizationRecoveryResetRequired ||
+            accounts.authorizationRecoveryDiscardRequired || imports.isBusy ||
             imports.pendingRecoveryCount != 0 ||
             accounts.configurationId != snapshot.configurationId ||
             imports.configurationId != snapshot.configurationId
@@ -689,7 +692,9 @@ class GoogleSchedulePublicationCoordinator(
         val imports = googleImportState()
         if (
             accounts.phase != GoogleAccountPhase.CONNECTED || accounts.isBusy ||
-            accounts.authorization != null || imports.isBusy ||
+            accounts.authorization != null || accounts.authorizationRecovery != null ||
+            accounts.authorizationRecoveryResetRequired ||
+            accounts.authorizationRecoveryDiscardRequired || imports.isBusy ||
             imports.pendingRecoveryCount != 0 ||
             accounts.configurationId != expectedConfigurationId ||
             imports.configurationId != expectedConfigurationId

@@ -6,8 +6,8 @@ import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundPreviewSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
-import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
+import com.greengolddog.dayweave.model.isPermittedBy
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -174,9 +174,7 @@ class GoogleCalendarOutboundCoordinator(
         val candidate = planner.googleCalendarOutboundCandidate(itemId) ?: return emptyList()
         if (
             planner.pendingGoogleCalendarOutbound != null ||
-            planner.pendingGoogleSchedulePublication?.stage?.let {
-                it != GoogleSchedulePublicationStage.ACCEPTED
-            } == true
+            planner.pendingGoogleSchedulePublication != null
         ) return emptyList()
         val snapshot = credentialStore.snapshot()
         val accounts = googleAccountState()
@@ -184,7 +182,11 @@ class GoogleCalendarOutboundCoordinator(
         if (
             snapshot.configurationId == null ||
             accounts.phase != GoogleAccountPhase.CONNECTED ||
-            accounts.isBusy || accounts.authorization != null || imports.isBusy ||
+            accounts.isBusy || accounts.authorization != null ||
+            accounts.authorizationRecovery != null ||
+            accounts.authorizationRecoveryResetRequired ||
+            accounts.authorizationRecoveryDiscardRequired || imports.isBusy ||
+            imports.pendingRecoveryCount > 0 ||
             accounts.configurationId != snapshot.configurationId ||
             imports.configurationId != snapshot.configurationId
         ) {
@@ -198,8 +200,7 @@ class GoogleCalendarOutboundCoordinator(
                     currentTarget(
                         account = account,
                         collection = collection,
-                        entityKind = candidate.entityKind,
-                        operation = candidate.operation,
+                        candidate = candidate,
                     )?.let { target ->
                         GoogleCalendarOutboundTargetOption(
                             target = target,
@@ -227,11 +228,17 @@ class GoogleCalendarOutboundCoordinator(
         val account = accounts.accounts.singleOrNull { it.id == journal.accountId } ?: return null
         val collection = imports.accounts[journal.accountId]
             ?.collections?.singleOrNull { it.id == journal.collectionId } ?: return null
+        val candidate = plannerStore.durableState.value
+            ?.googleCalendarOutboundCandidate(journal.itemId)
+            ?.takeIf {
+                it.expectedItemRevision == journal.expectedItemRevision &&
+                    it.entityKind == journal.entityKind &&
+                    it.operation == journal.operation
+            } ?: return null
         val target = currentTarget(
             account = account,
             collection = collection,
-            entityKind = journal.entityKind,
-            operation = journal.operation,
+            candidate = candidate,
         ) ?: return null
         if (journal.preview?.collectionRevision?.let { it != target.collectionRevision } == true) {
             return null
@@ -259,11 +266,7 @@ class GoogleCalendarOutboundCoordinator(
                 presentJournal(lifecycle, current.pendingGoogleCalendarOutbound)
                 return@withLock GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
             }
-            if (
-                current.pendingGoogleSchedulePublication?.stage?.let {
-                    it != GoogleSchedulePublicationStage.ACCEPTED
-                } == true
-            ) {
+            if (current.pendingGoogleSchedulePublication != null) {
                 return@withLock failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
@@ -281,8 +284,7 @@ class GoogleCalendarOutboundCoordinator(
             val target = requireCurrentTarget(
                 requested = requestedTarget,
                 expectedConfigurationId = binding.configurationId,
-                expectedEntityKind = candidate.entityKind,
-                expectedOperation = candidate.operation,
+                expectedCandidate = candidate,
             )
                 ?: return@withLock failure(
                     lifecycle,
@@ -336,6 +338,7 @@ class GoogleCalendarOutboundCoordinator(
             )
             requireCurrent(lifecycle, binding)
             if (
+                currentCandidateAndTarget(journal)?.second != target ||
                 remote.collectionRevision != target.collectionRevision ||
                 !now().isBefore(Instant.parse(remote.expiresAt))
             ) {
@@ -568,14 +571,17 @@ class GoogleCalendarOutboundCoordinator(
     private fun requireCurrentTarget(
         requested: GoogleCalendarOutboundTarget,
         expectedConfigurationId: String,
-        expectedEntityKind: GoogleCalendarOutboundEntityKind,
-        expectedOperation: GoogleCalendarOutboundOperation,
+        expectedCandidate: GoogleCalendarOutboundCandidate,
     ): GoogleCalendarOutboundTarget? {
         val accounts = googleAccountState()
         val imports = googleImportState()
         if (
             accounts.phase != GoogleAccountPhase.CONNECTED ||
-            accounts.isBusy || accounts.authorization != null || imports.isBusy ||
+            accounts.isBusy || accounts.authorization != null ||
+            accounts.authorizationRecovery != null ||
+            accounts.authorizationRecoveryResetRequired ||
+            accounts.authorizationRecoveryDiscardRequired || imports.isBusy ||
+            imports.pendingRecoveryCount > 0 ||
             accounts.configurationId != expectedConfigurationId ||
             imports.configurationId != expectedConfigurationId
         ) {
@@ -588,21 +594,19 @@ class GoogleCalendarOutboundCoordinator(
         return currentTarget(
             account = account,
             collection = collection,
-            entityKind = expectedEntityKind,
-            operation = expectedOperation,
+            candidate = expectedCandidate,
         )?.takeIf { it == requested }
     }
 
     private fun currentTarget(
         account: GoogleAccountSummary,
         collection: GoogleImportCollectionState,
-        entityKind: GoogleCalendarOutboundEntityKind,
-        operation: GoogleCalendarOutboundOperation,
+        candidate: GoogleCalendarOutboundCandidate,
     ): GoogleCalendarOutboundTarget? = runCatching {
-        require(account.hasWriteScopeFor(entityKind))
+        require(account.hasWriteScopeFor(candidate.entityKind))
         require(collection.accountId == account.id)
         require(
-            collection.kind == when (entityKind) {
+            collection.kind == when (candidate.entityKind) {
                 GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ->
                     RemoteGoogleCollectionKind.CALENDAR
                 GoogleCalendarOutboundEntityKind.TASK ->
@@ -612,17 +616,18 @@ class GoogleCalendarOutboundCoordinator(
         require(collection.selected && !collection.providerDeleted)
         require(collection.syncRole == RemoteGoogleSyncRole.WRITABLE)
         require(collection.revision > 0)
-        if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+        if (candidate.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
             require(
                 collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"),
             )
+            require(candidate.isPermittedBy(collection.calendarPolicy))
         }
         GoogleCalendarOutboundTarget(
             accountId = account.id,
             collectionId = collection.id,
             collectionRevision = collection.revision,
-            entityKind = entityKind,
-            operation = operation,
+            entityKind = candidate.entityKind,
+            operation = candidate.operation,
         )
     }.getOrNull()
 
@@ -638,7 +643,11 @@ class GoogleCalendarOutboundCoordinator(
         val imports = googleImportState()
         if (
             accounts.phase != GoogleAccountPhase.CONNECTED ||
-            accounts.isBusy || accounts.authorization != null || imports.isBusy ||
+            accounts.isBusy || accounts.authorization != null ||
+            accounts.authorizationRecovery != null ||
+            accounts.authorizationRecoveryResetRequired ||
+            accounts.authorizationRecoveryDiscardRequired || imports.isBusy ||
+            imports.pendingRecoveryCount > 0 ||
             accounts.configurationId != journal.configurationId ||
             imports.configurationId != journal.configurationId
         ) {
@@ -658,8 +667,7 @@ class GoogleCalendarOutboundCoordinator(
         val target = currentTarget(
             account = account,
             collection = collection,
-            entityKind = journal.entityKind,
-            operation = journal.operation,
+            candidate = candidate,
         ) ?: return null
         return candidate to target
     }

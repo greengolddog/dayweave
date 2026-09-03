@@ -44,6 +44,7 @@ import com.greengolddog.dayweave.sync.AssistantManager
 import com.greengolddog.dayweave.sync.CanonicalActionGate
 import com.greengolddog.dayweave.sync.CanonicalRefreshOutcome
 import com.greengolddog.dayweave.sync.CanonicalSyncManager
+import com.greengolddog.dayweave.sync.AtomicGoogleAuthorizationJournalStore
 import com.greengolddog.dayweave.sync.AtomicGoogleCalendarImportJournalStore
 import com.greengolddog.dayweave.sync.DurableCanonicalItemInvalidationCursor
 import com.greengolddog.dayweave.sync.ExecutionSyncManager
@@ -54,8 +55,11 @@ import com.greengolddog.dayweave.sync.ForegroundCanonicalItemInvalidationManager
 import com.greengolddog.dayweave.sync.DurableScheduleInvalidationCursor
 import com.greengolddog.dayweave.sync.ForegroundScheduleInvalidationManager
 import com.greengolddog.dayweave.sync.GoogleAccountManager
+import com.greengolddog.dayweave.sync.GoogleAuthorizationAction
+import com.greengolddog.dayweave.sync.GoogleAuthorizationJournalLoadResult
 import com.greengolddog.dayweave.sync.GoogleCalendarImportCompletionPipeline
 import com.greengolddog.dayweave.sync.GoogleCalendarImportCoordinator
+import com.greengolddog.dayweave.sync.GoogleCalendarImportJournalLoadResult
 import com.greengolddog.dayweave.sync.GoogleCalendarImportPersistenceReceipt
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundCoordinator
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationCoordinator
@@ -82,6 +86,12 @@ class DayWeaveApplication : Application() {
     private val canonicalActionGate = CanonicalActionGate()
     private val privatePresentationAllowed = AtomicBoolean(false)
     private val assistantForegroundActive = AtomicBoolean(false)
+    private val googleAuthorizationJournalStore by lazy {
+        AtomicGoogleAuthorizationJournalStore(this)
+    }
+    private val googleCalendarImportJournalStore by lazy {
+        AtomicGoogleCalendarImportJournalStore(this)
+    }
     private val localScheduleCompositionLauncher = LocalScheduleCompositionLauncher(
         scope = persistenceScope,
         actionGate = canonicalActionGate,
@@ -153,7 +163,8 @@ class DayWeaveApplication : Application() {
                         loaded != PlannerLoadState.READY ||
                         !allowAmbiguousJournal && (
                             plannerStore.hasCredentialReplacementBlocker() ||
-                                googleCalendarImportCoordinator.hasCredentialRecoveryBlocker()
+                                hasGoogleAuthorizationRecoveryBlocker() ||
+                                hasGoogleCalendarImportRecoveryBlocker()
                         )
                     ) {
                         return false
@@ -183,6 +194,14 @@ class DayWeaveApplication : Application() {
                     ) {
                         // Keep the credentials when the final destructive recovery fence fails.
                         // Planner abandonment is idempotent, so an explicit retry remains safe.
+                        return false
+                    }
+                    if (
+                        quarantined && allowAmbiguousJournal &&
+                        !googleAccountManager.abandonAuthorizationForConfirmedLocalDestruction()
+                    ) {
+                        // The credential writer must not strand an old OAuth ceremony behind a
+                        // new binding. Retain the credentials until this explicit cleanup works.
                         return false
                     }
                     if (quarantined) {
@@ -364,7 +383,9 @@ class DayWeaveApplication : Application() {
         GoogleAccountManager(
             credentialStore = apiCredentialStore,
             transport = OkHttpGoogleAccountsTransport(),
+            authorizationJournalStore = googleAuthorizationJournalStore,
             operationAllowed = privatePresentationAllowed::get,
+            authorizationMutationAllowed = ::googleAuthorizationMutationAllowed,
         )
     }
     val googleAccountManager: GoogleAccountManager get() = googleAccountManagerDelegate.value
@@ -373,7 +394,7 @@ class DayWeaveApplication : Application() {
         GoogleCalendarImportCoordinator(
             credentialStore = apiCredentialStore,
             transport = OkHttpGoogleCalendarInboundTransport(),
-            journalStore = AtomicGoogleCalendarImportJournalStore(this),
+            journalStore = googleCalendarImportJournalStore,
             completionPipeline = GoogleCalendarImportCompletionPipeline { input ->
                 val outcome = refreshCanonicalState()
                 val durable = plannerStore.durableState.value
@@ -391,11 +412,13 @@ class DayWeaveApplication : Application() {
                         durableProof.syncOrigin == input.apiBaseUrl,
                 )
             },
-            operationAllowed = privatePresentationAllowed::get,
+            operationAllowed = {
+                privatePresentationAllowed.get() &&
+                    !googleAccountManager.hasAuthorizationRecoveryBlocker()
+            },
             importAllowed = {
-                plannerStore.state.value.pendingGoogleSchedulePublication?.stage?.let {
-                    it != GoogleSchedulePublicationStage.ACCEPTED
-                } != true
+                plannerStore.state.value.pendingGoogleCalendarOutbound == null &&
+                    plannerStore.state.value.pendingGoogleSchedulePublication == null
             },
         )
     }
@@ -409,7 +432,10 @@ class DayWeaveApplication : Application() {
             transport = OkHttpGoogleCalendarOutboundTransport(),
             googleAccountState = { googleAccountManager.state.value },
             googleImportState = { googleCalendarImportCoordinator.state.value },
-            operationAllowed = privatePresentationAllowed::get,
+            operationAllowed = {
+                privatePresentationAllowed.get() &&
+                    !googleAccountManager.hasAuthorizationRecoveryBlocker()
+            },
         )
     }
     val googleCalendarOutboundCoordinator: GoogleCalendarOutboundCoordinator
@@ -422,11 +448,116 @@ class DayWeaveApplication : Application() {
             transport = OkHttpGoogleCalendarOutboundTransport(),
             googleAccountState = { googleAccountManager.state.value },
             googleImportState = { googleCalendarImportCoordinator.state.value },
-            operationAllowed = privatePresentationAllowed::get,
+            operationAllowed = {
+                privatePresentationAllowed.get() &&
+                    !googleAccountManager.hasAuthorizationRecoveryBlocker()
+            },
         )
     }
     val googleSchedulePublicationCoordinator: GoogleSchedulePublicationCoordinator
         get() = googleSchedulePublicationCoordinatorDelegate.value
+
+    /** OAuth starts are additive, but still wait for every other exact write/recovery lane. */
+    private fun googleAuthorizationMutationAllowed(
+        action: GoogleAuthorizationAction,
+        targetAccountId: String?,
+    ): Boolean {
+        if (
+            !privatePresentationAllowed.get() ||
+            plannerStore.loadState.value != PlannerLoadState.READY
+        ) {
+            return false
+        }
+        val planner = plannerStore.state.value
+        if (
+            planner.requiresStartupWriteRecovery() ||
+            planner.pendingProposalApplicationMutation != null ||
+            planner.pendingGoogleCalendarOutbound != null ||
+            planner.pendingGoogleSchedulePublication?.stage?.let {
+                it != GoogleSchedulePublicationStage.ACCEPTED
+            } == true
+        ) {
+            return false
+        }
+        if (canonicalSyncManagerDelegate.isInitialized() && canonicalSyncManager.state.value.isBusy) {
+            return false
+        }
+        if (executionSyncManagerDelegate.isInitialized() && executionSyncManager.state.value.isBusy) {
+            return false
+        }
+        if (
+            proposalApplicationManagerDelegate.isInitialized() &&
+            proposalApplicationManager.state.value.isBusy
+        ) {
+            return false
+        }
+        if (
+            googleCalendarImportCoordinatorDelegate.isInitialized() &&
+            googleCalendarImportCoordinator.state.value.isBusy
+        ) {
+            return false
+        }
+        if (
+            googleAuthorizationBlockedByImportRecovery(action, targetAccountId)
+        ) {
+            return false
+        }
+        if (
+            googleCalendarOutboundCoordinatorDelegate.isInitialized() &&
+            (
+                googleCalendarOutboundCoordinator.state.value.isBusy ||
+                    googleCalendarOutboundCoordinator.hasCredentialRecoveryBlocker()
+            )
+        ) {
+            return false
+        }
+        if (
+            googleSchedulePublicationCoordinatorDelegate.isInitialized() &&
+            (
+                googleSchedulePublicationCoordinator.state.value.isBusy ||
+                    googleSchedulePublicationCoordinator.hasCredentialRecoveryBlocker()
+            )
+        ) {
+            return false
+        }
+        return true
+    }
+
+    private fun hasGoogleAuthorizationRecoveryBlocker(): Boolean = runCatching {
+        val observedAt = System.currentTimeMillis()
+        when (val loaded = googleAuthorizationJournalStore.load(observedAt)) {
+            GoogleAuthorizationJournalLoadResult.Empty -> false
+            is GoogleAuthorizationJournalLoadResult.Loaded,
+            is GoogleAuthorizationJournalLoadResult.Corrupt,
+            is GoogleAuthorizationJournalLoadResult.Expired,
+            -> true
+            is GoogleAuthorizationJournalLoadResult.Retirable ->
+                !googleAuthorizationJournalStore.removeExact(loaded.journal, observedAt) ||
+                    googleAuthorizationJournalStore.load(observedAt) !=
+                    GoogleAuthorizationJournalLoadResult.Empty
+        }
+    }.getOrDefault(true)
+
+    private fun hasGoogleCalendarImportRecoveryBlocker(): Boolean = runCatching {
+        when (val loaded = googleCalendarImportJournalStore.load(System.currentTimeMillis())) {
+            is GoogleCalendarImportJournalLoadResult.Loaded -> loaded.journals.isNotEmpty()
+            GoogleCalendarImportJournalLoadResult.Corrupt -> true
+        }
+    }.getOrDefault(true)
+
+    private fun googleAuthorizationBlockedByImportRecovery(
+        action: GoogleAuthorizationAction,
+        targetAccountId: String?,
+    ): Boolean = runCatching {
+        val binding = apiCredentialStore.snapshot()
+        blocksGoogleAuthorizationForImportRecovery(
+            action = action,
+            targetAccountId = targetAccountId,
+            bindingConfigurationId = binding.configurationId,
+            bindingBaseUrl = binding.baseUrl,
+            recovery = googleCalendarImportJournalStore.load(System.currentTimeMillis()),
+        )
+    }.getOrDefault(true)
 
     val energySignalManager: EnergySignalManager by lazy {
         EnergySignalManager(
@@ -492,10 +623,11 @@ class DayWeaveApplication : Application() {
 
     /** Canonical actions outlive a transient screen/ViewModel so responses are always reconciled. */
     fun launchCanonicalAction(action: suspend () -> Unit): Boolean {
+        if (hasGoogleAuthorizationRecoveryBlocker()) return false
         if (!canonicalActionGate.tryEnter()) return false
         persistenceScope.launch {
             try {
-                action()
+                if (!hasGoogleAuthorizationRecoveryBlocker()) action()
             } finally {
                 canonicalActionGate.leave()
             }
@@ -503,12 +635,85 @@ class DayWeaveApplication : Application() {
         return true
     }
 
+    /** OAuth is the only lane allowed to own its persisted authorization journal. */
+    fun launchGoogleAuthorizationAction(
+        action: GoogleAuthorizationAction,
+        targetAccountId: String?,
+        operation: suspend () -> Unit,
+    ): Boolean {
+        if (
+            !googleAuthorizationMutationAllowed(action, targetAccountId) ||
+            !canonicalActionGate.tryEnter()
+        ) {
+            return false
+        }
+        persistenceScope.launch {
+            try {
+                if (googleAuthorizationMutationAllowed(action, targetAccountId)) operation()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+        return true
+    }
+
+    /** Explicit local credential destruction owns every recovery cleanup under one gate. */
+    fun launchConfirmedLocalCredentialDestruction(
+        confirmed: Boolean,
+        operation: suspend () -> Unit,
+    ): Boolean {
+        if (!confirmed || !canonicalActionGate.tryEnter()) return false
+        persistenceScope.launch {
+            try {
+                operation()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+        return true
+    }
+
+    /** Explicit OAuth-journal recovery may clear its own blocker, but no active lane may race it. */
+    fun launchGoogleAuthorizationRecoveryAction(operation: suspend () -> Unit): Boolean {
+        if (!privatePresentationAllowed.get() || !canonicalActionGate.tryEnter()) return false
+        persistenceScope.launch {
+            try {
+                if (privatePresentationAllowed.get()) operation()
+            } finally {
+                canonicalActionGate.leave()
+            }
+        }
+        return true
+    }
+
+    /** Keeps the durable pre-browser CAS and UI handoff on the caller's main dispatcher. */
+    suspend fun runGoogleAuthorizationActionInCaller(
+        action: GoogleAuthorizationAction,
+        targetAccountId: String?,
+        operation: suspend () -> Unit,
+    ): Boolean {
+        if (
+            !googleAuthorizationMutationAllowed(action, targetAccountId) ||
+            !canonicalActionGate.tryEnter()
+        ) {
+            return false
+        }
+        return try {
+            if (!googleAuthorizationMutationAllowed(action, targetAccountId)) false else {
+                operation()
+                true
+            }
+        } finally {
+            canonicalActionGate.leave()
+        }
+    }
+
     /** Queues mandatory recovery behind any active canonical mutation instead of dropping it. */
     fun enqueueCanonicalRecovery(action: suspend () -> Unit) {
         persistenceScope.launch {
             canonicalActionGate.enter()
             try {
-                action()
+                if (!hasGoogleAuthorizationRecoveryBlocker()) action()
             } finally {
                 canonicalActionGate.leave()
             }
@@ -516,7 +721,8 @@ class DayWeaveApplication : Application() {
     }
 
     /** Starts the only device-local composition and retains it across transient recomposition. */
-    fun launchLocalScheduleComposition(): Boolean = localScheduleCompositionLauncher.launch()
+    fun launchLocalScheduleComposition(): Boolean =
+        !hasGoogleAuthorizationRecoveryBlocker() && localScheduleCompositionLauncher.launch()
 
     /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
     fun cancelLocalScheduleComposition() = localScheduleCompositionLauncher.cancel()
@@ -602,6 +808,7 @@ class DayWeaveApplication : Application() {
 
     /** Startup recovery installs the immutable head without creating a competing publication. */
     suspend fun recoverCurrentPublishedSchedule(): CanonicalRefreshOutcome? {
+        if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
         return recoverCurrentPublishedScheduleSequence(
@@ -619,6 +826,7 @@ class DayWeaveApplication : Application() {
 
     /** Reconciles an old/remote lease both before and after replacing today's composition. */
     suspend fun refreshCanonicalState(): CanonicalRefreshOutcome? {
+        if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
         return refreshCanonicalStateSequence(
@@ -629,6 +837,7 @@ class DayWeaveApplication : Application() {
 
     /** Foreground polling promotes a newly observed eligible terminal fact without periodic churn. */
     suspend fun refreshForegroundExecution() {
+        if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,
             canonicalRefreshNeeded = {
@@ -710,6 +919,28 @@ private val EXECUTION_REFRESH_SUCCESSES = setOf(
     ExecutionSyncOutcome.SUCCESS,
     ExecutionSyncOutcome.RECOVERED_COMMAND,
 )
+
+/** The narrow import-repair exception is bound to one account and credential generation. */
+internal fun blocksGoogleAuthorizationForImportRecovery(
+    action: GoogleAuthorizationAction,
+    targetAccountId: String?,
+    bindingConfigurationId: String?,
+    bindingBaseUrl: String?,
+    recovery: GoogleCalendarImportJournalLoadResult,
+): Boolean = when (recovery) {
+    GoogleCalendarImportJournalLoadResult.Corrupt -> true
+    is GoogleCalendarImportJournalLoadResult.Loaded -> {
+        val journals = recovery.journals
+        journals.isNotEmpty() && (
+            action != GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY ||
+                targetAccountId == null || bindingConfigurationId == null ||
+                bindingBaseUrl == null || journals.any { journal ->
+                    journal.configurationId != bindingConfigurationId ||
+                        journal.apiBaseUrl != bindingBaseUrl
+                } || journals.any { journal -> journal.accountId != targetAccountId }
+            )
+    }
+}
 
 /** A remote Defer must replace and republish its exact source block before execution can restart. */
 internal fun DayWeaveUiState.deferredExecutionRecompositionNeeded(): Boolean {

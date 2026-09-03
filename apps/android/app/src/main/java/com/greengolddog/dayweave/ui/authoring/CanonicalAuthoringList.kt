@@ -612,9 +612,10 @@ private fun CanonicalAuthoringCard(
                             googlePublicationCandidate.entityKind ==
                             GoogleCalendarOutboundEntityKind.CALENDAR_EVENT
                         ) {
-                            "Choose a writable Publish calendar on macOS, then refresh Google sources."
+                            "Choose a writable Publish calendar that allows this event's " +
+                                "all-day, tentative, and availability settings, then refresh."
                         } else {
-                            "Choose a writable Publish task list on macOS, then refresh Google sources."
+                            "Choose a writable Publish task list in Google sources, then refresh."
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,

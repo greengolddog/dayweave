@@ -100,7 +100,8 @@ selected Google account/calendar target, and requires a later positive
 authenticated observation. This checkpoint exposes no schedule-specific
 operator-reconciliation API or supported database-intervention runbook.
 
-No native client invokes this batch contract yet, no scheduler or firm-horizon
-automation enqueues it, and inbound edits, moves, or deletions of its generated
-Google events are not interpreted. Tentative blocks remain app-only as
-required, and `SCH-006` remains open.
+The macOS and Android clients invoke this batch contract only after native
+exact-change review; neither a scheduler nor firm-horizon automation enqueues
+it, and inbound edits, moves, or deletions of its generated Google events are
+not interpreted. Tentative blocks remain app-only as required, and `SCH-006`
+remains open.

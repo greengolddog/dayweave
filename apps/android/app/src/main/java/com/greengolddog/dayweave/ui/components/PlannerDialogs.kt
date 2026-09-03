@@ -63,6 +63,7 @@ import com.greengolddog.dayweave.network.DeviceAuthPhase
 import com.greengolddog.dayweave.network.DeviceAuthUiState
 import com.greengolddog.dayweave.network.RemoteProposalCanonicalItem
 import com.greengolddog.dayweave.network.RemoteProposalItemField
+import com.greengolddog.dayweave.sync.GoogleAuthorizationRecoveryDiscardConfirmation
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
 import java.time.Instant
@@ -1253,18 +1254,67 @@ private fun Enum<*>.displayLabel(): String =
 fun ApiConnectionDialog(
     authState: DeviceAuthUiState,
     credentialReplacementBlocked: Boolean,
+    googleAuthorizationRecoveryDiscardRequired: Boolean = false,
     onDismiss: () -> Unit,
     onUpgradeWithBootstrap: (baseUrl: String, bootstrapToken: String) -> Unit,
     onConsumeEnrollmentCode: (baseUrl: String, enrollmentCode: String) -> Unit,
     onRetryPending: () -> Unit,
     onRevokeAndSignOut: () -> Unit,
     onDestroyLocalOnly: () -> Unit,
+    googleAuthorizationRecoveryDiscardConfirmationProvider:
+        () -> GoogleAuthorizationRecoveryDiscardConfirmation? = { null },
+    onDiscardGoogleAuthorizationRecovery:
+        (GoogleAuthorizationRecoveryDiscardConfirmation) -> Unit = {},
 ) {
     var baseUrl by remember(authState.baseUrl) { mutableStateOf(authState.baseUrl.orEmpty()) }
     var secret by remember { mutableStateOf("") }
     var entryMode by remember { mutableStateOf(DeviceAuthEntryMode.ONE_TIME_CODE) }
     var confirmSignOut by remember { mutableStateOf(false) }
     var confirmLocalOnly by remember { mutableStateOf(false) }
+    var pendingGoogleAuthorizationRecoveryDiscard by remember {
+        mutableStateOf<GoogleAuthorizationRecoveryDiscardConfirmation?>(null)
+    }
+
+    LaunchedEffect(googleAuthorizationRecoveryDiscardRequired) {
+        if (!googleAuthorizationRecoveryDiscardRequired) {
+            pendingGoogleAuthorizationRecoveryDiscard = null
+        }
+    }
+
+    pendingGoogleAuthorizationRecoveryDiscard?.let { confirmation ->
+        AlertDialog(
+            onDismissRequest = { pendingGoogleAuthorizationRecoveryDiscard = null },
+            title = { Text("Discard this saved Google authorization?") },
+            text = {
+                Text(
+                    "Google may already have accepted this exact authorization. Verify the " +
+                        "Google account and server state first. Discarding removes only the " +
+                        "local recovery record and cannot revoke a Google grant.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingGoogleAuthorizationRecoveryDiscard = null
+                        onDiscardGoogleAuthorizationRecovery(confirmation)
+                    },
+                    modifier = Modifier.testTag(
+                        "api_confirm_google_authorization_discard",
+                    ),
+                ) {
+                    Text("Discard local record")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingGoogleAuthorizationRecoveryDiscard = null },
+                ) {
+                    Text("Keep it")
+                }
+            },
+        )
+        return
+    }
 
     if (confirmSignOut) {
         AlertDialog(
@@ -1329,7 +1379,8 @@ fun ApiConnectionDialog(
         DeviceAuthPhase.REFRESH_PENDING,
     )
     val activeSession = authState.phase == DeviceAuthPhase.ACTIVE
-    val bindingChangeBlocked = credentialReplacementBlocked || authState.isBusy
+    val bindingChangeBlocked = credentialReplacementBlocked ||
+        googleAuthorizationRecoveryDiscardRequired || authState.isBusy
 
     AlertDialog(
         onDismissRequest = {
@@ -1356,6 +1407,27 @@ fun ApiConnectionDialog(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.error,
                     )
+                }
+                if (googleAuthorizationRecoveryDiscardRequired) {
+                    Text(
+                        "A saved Google authorization belongs to a different or unavailable " +
+                            "Planner API connection. Google may already have accepted it. " +
+                            "Review that recovery before enrollment, retry, or sign-out.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                    TextButton(
+                        onClick = {
+                            pendingGoogleAuthorizationRecoveryDiscard =
+                                googleAuthorizationRecoveryDiscardConfirmationProvider()
+                        },
+                        enabled = !authState.isBusy,
+                        modifier = Modifier.testTag(
+                            "api_review_google_authorization_discard",
+                        ),
+                    ) {
+                        Text("Review Google recovery")
+                    }
                 }
 
                 authState.baseUrl?.let { endpoint ->
@@ -1454,6 +1526,7 @@ fun ApiConnectionDialog(
                 exactRetryAvailable -> TextButton(
                     onClick = onRetryPending,
                     enabled = !authState.isBusy &&
+                        !googleAuthorizationRecoveryDiscardRequired &&
                         (
                             authState.phase == DeviceAuthPhase.REFRESH_PENDING ||
                                 !credentialReplacementBlocked

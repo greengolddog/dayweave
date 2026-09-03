@@ -2319,6 +2319,134 @@ async fn refresh_schedule_publication_batch(
     Ok(())
 }
 
+/**
+ * Replaces the parent-run credential boundary after one exact existing-account authorization.
+ *
+ * A provider request may still be in flight with the previous credential when OAuth completion
+ * commits. Retiring that run identity first makes every stale completion fail its existing
+ * parent/child claim checks. Rows that already proved an authorization failure are made due under
+ * the replacement credential; unrelated provider backoff remains untouched.
+ */
+#[allow(clippy::too_many_lines)] // Keeps the parent and both child lanes in one atomic transition.
+async fn reactivate_google_sync_after_authorization(
+    transaction: &mut Transaction<'_, Postgres>,
+    scope: DatabaseScope,
+    account_id: Uuid,
+    staged_at: DateTime<Utc>,
+) -> Result<(), GoogleOAuthRepositoryError> {
+    // Take the parent exclusively before choosing the transition timestamp. A child operation
+    // already committing under FOR SHARE finishes first; every later stale child is then fenced.
+    sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+         AND provider_account_id = $3 FOR UPDATE",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT GREATEST($1, clock_timestamp())")
+        .bind(staged_at)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(internal)?;
+
+    reconcile_schedule_publications_for_account_transition(
+        transaction,
+        scope,
+        account_id,
+        SchedulePublicationAccountTransition::Retry,
+        "authorization_replaced_parent_claim",
+        now,
+    )
+    .await?;
+
+    sqlx::query(
+        "UPDATE google_sync_outbox SET \
+         state = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                            AND remote_resource_id IS NULL AND provider_post_may_have_started \
+                       THEN 'conflict' ELSE 'backoff' END, \
+         claim_id = NULL, claimed_at = NULL, run_claim_id = NULL, \
+         run_claim_generation = NULL, dispatch_nonce = NULL, \
+         dispatch_authorized_at = NULL, dispatch_expires_at = NULL, available_at = $4, \
+         last_error_code = CASE WHEN entity_kind = 'task' AND operation = 'upsert' \
+                                     AND remote_resource_id IS NULL \
+                                     AND provider_post_may_have_started \
+                                THEN 'provider_identity_unresolved' \
+                                ELSE 'authorization_replaced_parent_claim' END, updated_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND state = 'delivering'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "UPDATE google_sync_outbox SET available_at = LEAST(available_at, $4), updated_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND state = 'backoff' AND last_error_code = 'reauthorization_required'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    sqlx::query(
+        "UPDATE google_schedule_publication_outbox outbox SET \
+         available_at = LEAST(outbox.available_at, $4), updated_at = $4 \
+         FROM google_schedule_publication_batches batch \
+         WHERE outbox.workspace_id = $1 AND outbox.user_id = $2 \
+           AND batch.workspace_id = outbox.workspace_id AND batch.user_id = outbox.user_id \
+           AND batch.id = outbox.publication_id AND batch.provider_account_id = $3 \
+           AND outbox.state = 'backoff' \
+           AND outbox.last_error_code = 'reauthorization_required'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+
+    sqlx::query(
+        "UPDATE google_sync_runs SET \
+         state = CASE WHEN state IN ('running', 'reauthorization_required') \
+                      THEN 'idle' ELSE state END, \
+         claim_id = CASE WHEN state = 'running' THEN NULL ELSE claim_id END, \
+         lease_until = CASE WHEN state = 'running' THEN NULL ELSE lease_until END, \
+         requested_at = $4, \
+         started_at = CASE WHEN state IN ('running', 'reauthorization_required') \
+                           THEN NULL ELSE started_at END, \
+         completed_at = CASE WHEN state IN ('running', 'reauthorization_required') \
+                             THEN NULL ELSE completed_at END, \
+         next_attempt_at = LEAST(next_attempt_at, $4), \
+         consecutive_failures = CASE WHEN state = 'reauthorization_required' \
+                                     THEN 0 ELSE consecutive_failures END, \
+         last_error_code = CASE WHEN state = 'reauthorization_required' \
+                                THEN NULL ELSE last_error_code END, \
+         last_error_at = CASE WHEN state = 'reauthorization_required' THEN NULL ELSE last_error_at END, \
+         revision = revision + 1, updated_at = $4 \
+         WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+           AND state <> 'failed'",
+    )
+    .bind(scope.workspace_id)
+    .bind(scope.user_id)
+    .bind(account_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await
+    .map_err(internal)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn complete_staged(
     transaction: &mut Transaction<'_, Postgres>,
@@ -2468,6 +2596,9 @@ async fn complete_staged(
             .map_err(|error| map_authorization_write_error(&error))?;
         account_from_row(&account_row)?.account
     };
+    if expected_revision.is_some() {
+        reactivate_google_sync_after_authorization(transaction, scope, account_id, now).await?;
+    }
     let generation_changed = sqlx::query(
         "UPDATE google_oauth_scope_state SET credential_generation = credential_generation + 1 \
          WHERE workspace_id = $1 AND user_id = $2 AND revocation_owner_id IS NULL",

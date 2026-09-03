@@ -213,7 +213,7 @@ internal fun GoogleSchedulePublicationReviewSheet(
                         ) {
                             Icon(Icons.Outlined.CheckCircle, null, Modifier.size(18.dp))
                             Spacer(Modifier.size(8.dp))
-                            Text("Approve & publish")
+                            Text("Approve & queue")
                         }
                     }
                 }

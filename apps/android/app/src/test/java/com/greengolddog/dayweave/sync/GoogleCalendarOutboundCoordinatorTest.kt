@@ -10,7 +10,10 @@ import com.greengolddog.dayweave.model.GoogleCalendarOutboundApprovalCapability
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationAcceptedSnapshot
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationJournal
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationPreviewSnapshot
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -35,7 +38,9 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -44,6 +49,25 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GoogleCalendarOutboundCoordinatorTest {
+    @Test
+    fun pendingImportRecoveryCountAloneBlocksTargetsAndPreviewTransport() = runBlocking {
+        val store = PlannerStore(outboundState())
+        val transport = FakeGoogleOutboundTransport()
+        val imports = importState().copy(
+            pendingRecoveryCount = 1,
+            pendingRecoveryAccountIds = setOf(ACCOUNT_ID),
+        )
+        val coordinator = coordinator(store, transport, imports = imports)
+
+        assertTrue(coordinator.targetsFor(ITEM_ID).isEmpty())
+        assertEquals(
+            GoogleCalendarOutboundOutcome.FAILED,
+            coordinator.preparePreview(ITEM_ID, TARGET),
+        )
+        assertNoNetworkCalls(transport)
+        assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
+    }
+
     @Test
     fun liveSchedulePublicationAuthorityBlocksFreshGenericOutboundAndStoreRace() = runBlocking {
         val scheduleAuthority = GoogleSchedulePublicationJournal(
@@ -71,6 +95,27 @@ class GoogleCalendarOutboundCoordinatorTest {
         assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
         assertEquals(
             scheduleAuthority,
+            store.durableState.value?.pendingGoogleSchedulePublication,
+        )
+    }
+
+    @Test
+    fun acceptedSchedulePublicationJournalBlocksTargetsAndPreviewTransport() = runBlocking {
+        val acceptedPublication = acceptedSchedulePublicationJournal()
+        assertEquals(GoogleSchedulePublicationStage.ACCEPTED, acceptedPublication.stage)
+        val store = PlannerStore(outboundState(schedulePending = acceptedPublication))
+        val transport = FakeGoogleOutboundTransport()
+        val coordinator = coordinator(store, transport)
+
+        assertTrue(coordinator.targetsFor(ITEM_ID).isEmpty())
+        assertEquals(
+            GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
+            coordinator.preparePreview(ITEM_ID, TARGET),
+        )
+        assertNoNetworkCalls(transport)
+        assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
+        assertEquals(
+            acceptedPublication,
             store.durableState.value?.pendingGoogleSchedulePublication,
         )
     }
@@ -175,7 +220,7 @@ class GoogleCalendarOutboundCoordinatorTest {
     fun retainedCalendarAndTaskDeletionBindDeleteThroughPreviewAndEnqueue() = runBlocking {
         val cases = listOf(
             DeletionCase(
-                item = canonicalEvent().asDeleted(),
+                item = canonicalEvent(allDay = true, tentative = true, busy = false).asDeleted(),
                 entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
                 target = TARGET.copy(operation = GoogleCalendarOutboundOperation.DELETE),
                 account = accountSummary(),
@@ -252,23 +297,6 @@ class GoogleCalendarOutboundCoordinatorTest {
 
     @Test
     fun prepareRequiresCurrentEligibleCandidateAndExactAuthoritativeWritableTarget() = runBlocking {
-        val invalidCandidateStore = PlannerStore(
-            outboundState(item = canonicalEvent(tentative = true)),
-        )
-        val invalidCandidateTransport = FakeGoogleOutboundTransport()
-        val invalidCandidateCoordinator = coordinator(
-            store = invalidCandidateStore,
-            transport = invalidCandidateTransport,
-        )
-
-        assertTrue(invalidCandidateCoordinator.targetsFor(ITEM_ID).isEmpty())
-        assertEquals(
-            GoogleCalendarOutboundOutcome.FAILED,
-            invalidCandidateCoordinator.preparePreview(ITEM_ID, TARGET),
-        )
-        assertNull(invalidCandidateStore.state.value.pendingGoogleCalendarOutbound)
-        assertTrue(invalidCandidateTransport.previewCalls.isEmpty())
-
         val unsafeCases = listOf(
             outboundContext(
                 account = accountSummary().copy(hasCalendarWriteScope = false),
@@ -320,6 +348,162 @@ class GoogleCalendarOutboundCoordinatorTest {
         )
         assertNull(staleRevisionStore.state.value.pendingGoogleCalendarOutbound)
         assertTrue(staleRevisionTransport.previewCalls.isEmpty())
+    }
+
+    @Test
+    fun targetsAndPrepareEnforceEachCalendarPublicationPolicyTrait() = runBlocking {
+        val cases = listOf(
+            PublicationPolicyCase(
+                item = canonicalEvent(allDay = true),
+                permittedPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishAllDay = true,
+                ),
+                payload = calendarPayload(allDay = true),
+            ),
+            PublicationPolicyCase(
+                item = canonicalEvent(tentative = true),
+                permittedPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishTentative = true,
+                ),
+                payload = calendarPayload(tentative = true),
+            ),
+            PublicationPolicyCase(
+                item = canonicalEvent(busy = false),
+                permittedPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishFree = true,
+                ),
+                payload = calendarPayload(busy = false),
+            ),
+            PublicationPolicyCase(
+                item = canonicalEvent(allDay = true, tentative = true, busy = false),
+                permittedPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishAllDay = true,
+                    publishTentative = true,
+                    publishFree = true,
+                ),
+                payload = calendarPayload(allDay = true, tentative = true, busy = false),
+            ),
+        )
+
+        cases.forEachIndexed { index, case ->
+            val deniedStore = PlannerStore(outboundState(item = case.item))
+            val deniedTransport = FakeGoogleOutboundTransport()
+            val deniedCoordinator = coordinator(deniedStore, deniedTransport)
+            assertTrue("default policy case $index", deniedCoordinator.targetsFor(ITEM_ID).isEmpty())
+            assertEquals(
+                "explicit target case $index",
+                GoogleCalendarOutboundOutcome.FAILED,
+                deniedCoordinator.preparePreview(ITEM_ID, TARGET),
+            )
+            assertNoNetworkCalls(deniedTransport)
+            assertNull(deniedStore.durableState.value?.pendingGoogleCalendarOutbound)
+
+            val allowedStore = PlannerStore(outboundState(item = case.item))
+            val allowedTransport = FakeGoogleOutboundTransport().apply {
+                onPreview = { validPreview(providerPayload = case.payload) }
+            }
+            val allowedCoordinator = coordinator(
+                store = allowedStore,
+                transport = allowedTransport,
+                imports = importState(
+                    writableCollection().copy(calendarPolicy = case.permittedPolicy),
+                ),
+            )
+            assertEquals(
+                "permitted targets case $index",
+                listOf(TARGET),
+                allowedCoordinator.targetsFor(ITEM_ID).map { it.target },
+            )
+            assertEquals(
+                "permitted preview case $index",
+                GoogleCalendarOutboundOutcome.PREVIEW_READY,
+                allowedCoordinator.preparePreview(ITEM_ID, TARGET),
+            )
+            assertNotNull("permitted confirmation case $index", allowedCoordinator.approvalConfirmation())
+            assertEquals(1, allowedTransport.previewCalls.size)
+        }
+    }
+
+    @Test
+    fun combinedCalendarTraitsRequireEveryFlagAndPolicyTighteningInvalidatesApproval() = runBlocking {
+        val item = canonicalEvent(allDay = true, tentative = true, busy = false)
+        val incompletePolicies = listOf(
+            RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                publishAllDay = true,
+                publishTentative = true,
+            ),
+            RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                publishAllDay = true,
+                publishFree = true,
+            ),
+            RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                publishTentative = true,
+                publishFree = true,
+            ),
+        )
+        incompletePolicies.forEachIndexed { index, policy ->
+            val transport = FakeGoogleOutboundTransport()
+            val coordinator = coordinator(
+                store = PlannerStore(outboundState(item = item)),
+                transport = transport,
+                imports = importState(writableCollection().copy(calendarPolicy = policy)),
+            )
+            assertTrue("incomplete policy case $index", coordinator.targetsFor(ITEM_ID).isEmpty())
+            assertEquals(
+                GoogleCalendarOutboundOutcome.FAILED,
+                coordinator.preparePreview(ITEM_ID, TARGET),
+            )
+            assertNoNetworkCalls(transport)
+        }
+
+        val store = PlannerStore(outboundState(item = item))
+        val transport = FakeGoogleOutboundTransport().apply {
+            onPreview = {
+                validPreview(
+                    providerPayload = calendarPayload(
+                        allDay = true,
+                        tentative = true,
+                        busy = false,
+                    ),
+                )
+            }
+        }
+        var imports = importState(
+            writableCollection().copy(
+                calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishAllDay = true,
+                    publishTentative = true,
+                    publishFree = true,
+                ),
+            ),
+        )
+        val coordinator = GoogleCalendarOutboundCoordinator(
+            plannerStore = store,
+            credentialStore = FakeGoogleOutboundCredentials(),
+            transport = transport,
+            googleAccountState = { accountState() },
+            googleImportState = { imports },
+            now = { NOW },
+            newUuid = { UUID.fromString(RECOVERY_ID) },
+        )
+        assertEquals(
+            GoogleCalendarOutboundOutcome.PREVIEW_READY,
+            coordinator.preparePreview(ITEM_ID, TARGET),
+        )
+        val confirmation = requireNotNull(coordinator.approvalConfirmation())
+
+        imports = importState()
+
+        assertNull(coordinator.pendingDestinationOption())
+        assertNull(coordinator.approvalConfirmation())
+        assertEquals(
+            GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
+            coordinator.approveAndEnqueue(confirmation),
+        )
+        assertEquals(GoogleCalendarOutboundStage.PREVIEWED, store.durableState.value
+            ?.pendingGoogleCalendarOutbound?.stage)
+        assertTrue(transport.approvalCalls.isEmpty())
+        assertTrue(transport.enqueueCalls.isEmpty())
     }
 
     @Test
@@ -991,18 +1175,27 @@ class GoogleCalendarOutboundCoordinatorTest {
         pendingGoogleSchedulePublication = schedulePending,
     )
 
-    private fun canonicalEvent(tentative: Boolean = false): CanonicalItemSnapshot {
+    private fun canonicalEvent(
+        allDay: Boolean = false,
+        tentative: Boolean = false,
+        busy: Boolean = true,
+        status: String = "planned",
+    ): CanonicalItemSnapshot {
+        val startsAt = if (allDay) "2026-09-01T22:00:00Z" else "2026-09-02T10:00:00Z"
+        val endsAt = if (allDay) "2026-09-02T22:00:00Z" else "2026-09-02T11:00:00Z"
         val timing = CanonicalEventTimingDraft(
-            startsAt = "2026-09-02T10:00:00Z",
-            endsAt = "2026-09-02T11:00:00Z",
+            startsAt = startsAt,
+            endsAt = endsAt,
+            allDay = allDay,
             tentative = tentative,
+            busy = busy,
         )
         val draft = CanonicalItemDraft(
             placement = CanonicalDraftPlacement.PLANNED,
             kind = ItemKind.EVENT,
             title = "Private focus",
             timezoneName = "Europe/Paris",
-            durationSeconds = 3_600,
+            durationSeconds = if (allDay) 24 * 60 * 60 else 3_600,
             earliestStartAt = timing.startsAt,
             deadlineAt = timing.endsAt,
             eventTiming = timing,
@@ -1010,7 +1203,7 @@ class GoogleCalendarOutboundCoordinatorTest {
         return CanonicalItemSnapshot(
             id = ITEM_ID,
             kind = "event",
-            status = "planned",
+            status = status,
             title = draft.title,
             timezoneName = draft.timezoneName,
             durationSeconds = draft.durationSeconds,
@@ -1152,13 +1345,48 @@ class GoogleCalendarOutboundCoordinatorTest {
         createdAt = NOW.toString(),
     )
 
+    private fun acceptedSchedulePublicationJournal() = GoogleSchedulePublicationJournal(
+        recoveryId = OTHER_RECOVERY_ID,
+        operationGeneration = 2,
+        configurationId = CONFIGURATION_A,
+        apiBaseUrl = API_BASE_URL,
+        accountId = ACCOUNT_ID,
+        collectionId = COLLECTION_ID,
+        expectedScheduleRevisionId = SCHEDULE_REVISION_ID,
+        intentExpiresAt = "2026-09-02T12:30:00Z",
+        preview = GoogleSchedulePublicationPreviewSnapshot(
+            id = OTHER_PREVIEW_ID,
+            accountId = ACCOUNT_ID,
+            collectionId = COLLECTION_ID,
+            collectionRevision = COLLECTION_REVISION,
+            collectionDisplayName = "Planning",
+            scheduleRevisionId = SCHEDULE_REVISION_ID,
+            scheduleRevisionNumber = 9,
+            previewHash = PREVIEW_HASH,
+            createCount = 0,
+            updateCount = 0,
+            deleteCount = 0,
+            noopCount = 0,
+            changes = emptyList(),
+            expiresAt = "2026-09-02T12:20:00Z",
+        ),
+        approvalAttempted = true,
+        accepted = GoogleSchedulePublicationAcceptedSnapshot(
+            publicationId = OUTBOX_ID,
+            replayed = false,
+        ),
+        createdAt = NOW.toString(),
+    )
+
     private fun previewedJournal() = intentJournal().recordingPreview(validPreview())
 
     private fun attemptedJournal() = previewedJournal().recordingApprovalAttempt()
 
     private fun approvedJournal() = attemptedJournal().recordingApproval(validApproval())
 
-    private fun validPreview() = RemoteGoogleOutboundPreview(
+    private fun validPreview(
+        providerPayload: JsonObject = VALID_PAYLOAD,
+    ) = RemoteGoogleOutboundPreview(
         id = PREVIEW_ID,
         accountId = ACCOUNT_ID,
         collectionId = COLLECTION_ID,
@@ -1171,8 +1399,37 @@ class GoogleCalendarOutboundCoordinatorTest {
         providerResourceId = null,
         providerEtag = null,
         previewHash = PREVIEW_HASH,
-        providerPayload = VALID_PAYLOAD,
+        providerPayload = providerPayload,
         expiresAt = "2026-09-02T12:20:00Z",
+    )
+
+    private fun calendarPayload(
+        allDay: Boolean = false,
+        tentative: Boolean = false,
+        busy: Boolean = true,
+    ): JsonObject {
+        val payload = VALID_PAYLOAD + mapOf(
+            "status" to JsonPrimitive(if (tentative) "tentative" else "confirmed"),
+            "transparency" to JsonPrimitive(if (busy) "opaque" else "transparent"),
+        )
+        return if (allDay) {
+            JsonObject(
+                payload + mapOf(
+                    "start" to allDayBoundary("2026-09-02"),
+                    "end" to allDayBoundary("2026-09-03"),
+                ),
+            )
+        } else {
+            JsonObject(payload)
+        }
+    }
+
+    private fun allDayBoundary(date: String) = JsonObject(
+        mapOf(
+            "date" to JsonPrimitive(date),
+            "dateTime" to JsonNull,
+            "timeZone" to JsonPrimitive("Europe/Paris"),
+        ),
     )
 
     private fun validTaskPreview() = RemoteGoogleOutboundPreview(
@@ -1258,6 +1515,12 @@ class GoogleCalendarOutboundCoordinatorTest {
         val preview: RemoteGoogleOutboundPreview,
     )
 
+    private data class PublicationPolicyCase(
+        val item: CanonicalItemSnapshot,
+        val permittedPolicy: RemoteGoogleCalendarPolicy,
+        val payload: JsonObject,
+    )
+
     private enum class LateResponseFence {
         PRIVACY,
         BINDING,
@@ -1277,6 +1540,7 @@ class GoogleCalendarOutboundCoordinatorTest {
         const val PREVIEW_ID = "55555555-5555-4555-8555-555555555555"
         const val OTHER_PREVIEW_ID = "66666666-6666-4666-8666-666666666666"
         const val OUTBOX_ID = "77777777-7777-4777-8777-777777777777"
+        const val SCHEDULE_REVISION_ID = "89898989-8989-4989-8989-898989898989"
         const val ITEM_REVISION = 7L
         const val COLLECTION_REVISION = 4L
         const val PREVIEW_HASH =

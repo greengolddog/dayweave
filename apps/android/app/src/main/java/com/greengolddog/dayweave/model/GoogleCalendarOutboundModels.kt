@@ -2,6 +2,7 @@ package com.greengolddog.dayweave.model
 
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundEntityKind
 import com.greengolddog.dayweave.network.GoogleCalendarOutboundOperation
+import com.greengolddog.dayweave.network.RemoteGoogleCalendarPolicy
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.network.RemoteGoogleOutboundApproval
 import com.greengolddog.dayweave.network.RemoteGoogleOutboundPreview
@@ -11,6 +12,7 @@ import com.greengolddog.dayweave.network.normalizedHttpsApiBaseUrl
 import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -324,6 +326,9 @@ data class GoogleCalendarOutboundJournal(
 data class GoogleCalendarOutboundCandidate(
     val itemId: String,
     val expectedItemRevision: Long,
+    val isAllDay: Boolean,
+    val isTentative: Boolean,
+    val isBusy: Boolean,
     val entityKind: GoogleCalendarOutboundEntityKind =
         GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
     val operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
@@ -331,6 +336,11 @@ data class GoogleCalendarOutboundCandidate(
     init {
         requireCanonicalOutboundUuid(itemId)
         require(expectedItemRevision > 0)
+        if (entityKind == GoogleCalendarOutboundEntityKind.TASK) {
+            require(!isAllDay && !isTentative && !isBusy) {
+                "Google Task candidates cannot carry Calendar publication traits"
+            }
+        }
     }
 
     override fun toString(): String =
@@ -396,16 +406,16 @@ private fun CanonicalItemSnapshot.googleOutboundCandidate(
     require(revision > 0 && expectedItemRevision >= revision)
     return when (kind) {
         "event" -> {
-            if (operation == GoogleCalendarOutboundOperation.UPSERT) require(status == "planned")
+            require(status in GOOGLE_CALENDAR_PUBLISHABLE_STATUSES)
             val draft = copy(status = "planned", deletedAt = null).toCanonicalDraft()
             val timing = requireNotNull(draft.eventTiming)
             require(draft.kind == ItemKind.EVENT)
-            if (operation == GoogleCalendarOutboundOperation.UPSERT) {
-                require(!timing.allDay && !timing.tentative && timing.busy)
-            }
             GoogleCalendarOutboundCandidate(
                 itemId = id,
                 expectedItemRevision = expectedItemRevision,
+                isAllDay = timing.allDay,
+                isTentative = timing.tentative,
+                isBusy = timing.busy,
                 entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
                 operation = operation,
             )
@@ -431,6 +441,9 @@ private fun CanonicalItemSnapshot.googleOutboundCandidate(
             GoogleCalendarOutboundCandidate(
                 itemId = id,
                 expectedItemRevision = expectedItemRevision,
+                isAllDay = false,
+                isTentative = false,
+                isBusy = false,
                 entityKind = GoogleCalendarOutboundEntityKind.TASK,
                 operation = operation,
             )
@@ -448,15 +461,13 @@ fun googleCalendarOutboundTarget(
     accountSyncEnabled: Boolean,
     accountHasCalendarWriteScope: Boolean,
     collection: RemoteGoogleSyncCollection,
-    entityKind: GoogleCalendarOutboundEntityKind =
-        GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
-    operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
+    candidate: GoogleCalendarOutboundCandidate,
     accountHasTasksWriteScope: Boolean = false,
 ): GoogleCalendarOutboundTarget? = runCatching {
     requireCanonicalOutboundUuid(accountId)
     require(accountStatus == "active" && accountSyncEnabled)
     require(
-        when (entityKind) {
+        when (candidate.entityKind) {
             GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> accountHasCalendarWriteScope
             GoogleCalendarOutboundEntityKind.TASK -> accountHasTasksWriteScope
         },
@@ -464,7 +475,7 @@ fun googleCalendarOutboundTarget(
     require(collection.accountId == accountId)
     requireCanonicalOutboundUuid(collection.id)
     require(
-        collection.kind == when (entityKind) {
+        collection.kind == when (candidate.entityKind) {
             GoogleCalendarOutboundEntityKind.CALENDAR_EVENT -> RemoteGoogleCollectionKind.CALENDAR
             GoogleCalendarOutboundEntityKind.TASK -> RemoteGoogleCollectionKind.TASK_LIST
         },
@@ -472,19 +483,28 @@ fun googleCalendarOutboundTarget(
     require(collection.selected && !collection.providerDeleted)
     require(collection.syncRole == RemoteGoogleSyncRole.WRITABLE)
     require(collection.revision > 0)
-    if (entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
+    if (candidate.entityKind == GoogleCalendarOutboundEntityKind.CALENDAR_EVENT) {
         require(
             collection.providerAccessRole?.lowercase(Locale.ROOT) in setOf("owner", "writer"),
         )
+        require(candidate.isPermittedBy(collection.calendarPolicy))
     }
     GoogleCalendarOutboundTarget(
         accountId = accountId,
         collectionId = collection.id,
         collectionRevision = collection.revision,
-        entityKind = entityKind,
-        operation = operation,
+        entityKind = candidate.entityKind,
+        operation = candidate.operation,
     )
 }.getOrNull()
+
+internal fun GoogleCalendarOutboundCandidate.isPermittedBy(
+    policy: RemoteGoogleCalendarPolicy,
+): Boolean = entityKind != GoogleCalendarOutboundEntityKind.CALENDAR_EVENT ||
+    operation == GoogleCalendarOutboundOperation.DELETE ||
+    (!isAllDay || policy.publishAllDay) &&
+    (!isTentative || policy.publishTentative) &&
+    (isBusy || policy.publishFree)
 
 private fun requireCanonicalOutboundUuid(value: String) {
     val parsed = runCatching { UUID.fromString(value) }.getOrNull()
@@ -682,8 +702,9 @@ private fun JsonObject.isValidPrivateFixedCalendarEvent(): Boolean {
         summary.content.codePointCount(0, summary.content.length) <= MAX_CALENDAR_SUMMARY_CODE_POINTS &&
         this["description"].isValidCalendarDescription() &&
         this["location"] == JsonNull &&
-        status?.isString == true && status.content == "confirmed" &&
-        transparency?.isString == true && transparency.content == "opaque" &&
+        status?.isString == true && status.content in CALENDAR_EVENT_STATUSES &&
+        transparency?.isString == true &&
+        transparency.content in CALENDAR_EVENT_TRANSPARENCIES &&
         visibility?.isString == true && visibility.content == "private" &&
         eventType?.isString == true && eventType.content == "default" &&
         start != null && end != null && haveValidCalendarBoundaries(start, end)
@@ -743,6 +764,11 @@ private fun haveValidCalendarBoundaries(start: JsonObject, end: JsonObject): Boo
             val parsedEnd = offsetDateTimeOrNull(endTime)
             parsedStart != null && parsedEnd != null && parsedStart.isBefore(parsedEnd)
         }
+        startDate != null && endDate != null && startTime == null && endTime == null -> {
+            val parsedStart = localDateOrNull(startDate)
+            val parsedEnd = localDateOrNull(endDate)
+            parsedStart != null && parsedEnd != null && parsedStart.isBefore(parsedEnd)
+        }
         else -> false
     }
 }
@@ -758,6 +784,12 @@ private fun JsonElement?.outboundBooleanOrNull(): Boolean? =
 
 private fun offsetDateTimeOrNull(value: String): OffsetDateTime? = try {
     OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+} catch (_: DateTimeParseException) {
+    null
+}
+
+private fun localDateOrNull(value: String): LocalDate? = try {
+    LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE).takeIf { it.toString() == value }
 } catch (_: DateTimeParseException) {
     null
 }
@@ -816,6 +848,18 @@ private val CALENDAR_EVENT_ROOT_KEYS = setOf(
 )
 private val CALENDAR_EXTENDED_PROPERTY_KEYS = setOf("private", "shared")
 private val CALENDAR_PRIVATE_PROPERTY_KEYS = setOf(DAYWEAVE_OWNERSHIP_PROOF_KEY)
+private val CALENDAR_EVENT_STATUSES = setOf("confirmed", "tentative")
+private val CALENDAR_EVENT_TRANSPARENCIES = setOf("opaque", "transparent")
+private val GOOGLE_CALENDAR_PUBLISHABLE_STATUSES = setOf(
+    "inbox",
+    "planned",
+    "scheduled",
+    "in_progress",
+    "paused",
+    "completed",
+    "skipped",
+    "cancelled",
+)
 private val GOOGLE_TASK_ROOT_KEYS = setOf(
     "id",
     "etag",

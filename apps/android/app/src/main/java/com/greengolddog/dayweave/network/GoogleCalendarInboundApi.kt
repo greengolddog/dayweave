@@ -17,13 +17,6 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 
-/** Android's deliberately inbound-only Google collection role surface. */
-enum class GoogleInboundCollectionRole {
-    OFF,
-    READ_ONLY,
-    BLOCKING,
-}
-
 @Serializable
 enum class RemoteGoogleCollectionKind {
     @SerialName("calendar")
@@ -33,7 +26,6 @@ enum class RemoteGoogleCollectionKind {
     TASK_LIST,
 }
 
-/** Complete server enum. Android never sends [WRITABLE] from this inbound-only transport. */
 @Serializable
 enum class RemoteGoogleSyncRole {
     @SerialName("read_only")
@@ -73,8 +65,14 @@ data class RemoteGoogleCalendarPolicy(
     @SerialName("publish_free")
     val publishFree: Boolean,
 ) {
-    internal val isInboundOnly: Boolean
+    internal val hasNoPublication: Boolean
         get() = !publishAllDay && !publishTentative && !publishFree
+
+    internal fun withoutPublication(): RemoteGoogleCalendarPolicy = copy(
+        publishAllDay = false,
+        publishTentative = false,
+        publishFree = false,
+    )
 
     companion object {
         fun inboundDefault(): RemoteGoogleCalendarPolicy = RemoteGoogleCalendarPolicy(
@@ -199,10 +197,26 @@ data class ConfigureGoogleCollectionRequest(
     val expectedRevision: Long,
     /** Kind observed on the authoritative collection being configured. */
     val kind: RemoteGoogleCollectionKind,
-    val role: GoogleInboundCollectionRole,
+    val selected: Boolean,
     val visible: Boolean = true,
+    val syncRole: RemoteGoogleSyncRole,
     val calendarPolicy: RemoteGoogleCalendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault(),
-)
+) {
+    /**
+     * Calendar publication flags have no meaning for Task lists and are forbidden for every
+     * non-writable collection. Keep the caller's inbound dispositions while clearing only those
+     * outbound flags before encoding and response reconciliation.
+     */
+    internal val effectiveCalendarPolicy: RemoteGoogleCalendarPolicy
+        get() = if (
+            kind == RemoteGoogleCollectionKind.TASK_LIST ||
+            syncRole != RemoteGoogleSyncRole.WRITABLE
+        ) {
+            calendarPolicy.withoutPublication()
+        } else {
+            calendarPolicy
+        }
+}
 
 @Serializable
 private data class ConfigureGoogleCollectionWireRequest(
@@ -331,11 +345,11 @@ class OkHttpGoogleCalendarInboundTransport(
         require(request.expectedRevision in 1 until Long.MAX_VALUE) {
             "Google collection revision is outside the supported range"
         }
-        require(request.calendarPolicy.isInboundOnly) {
-            "Android inbound configuration cannot enable Calendar publication"
+        require(request.hasSupportedRole) {
+            "The selected Google collection kind does not support this role"
         }
-        require(request.hasSupportedInboundRole) {
-            "The selected Google collection kind does not support this inbound role"
+        require(request.syncRole != RemoteGoogleSyncRole.WRITABLE || request.selected) {
+            "A writable Google collection must also be selected"
         }
         val wireRequest = request.toWireRequest()
         val body = json.encodeToString(wireRequest).toRequestBody(JSON_MEDIA_TYPE)
@@ -353,6 +367,7 @@ class OkHttpGoogleCalendarInboundTransport(
             collection.accountId != accountId ||
             collection.kind != request.kind ||
             collection.revision != request.expectedRevision + 1 ||
+            collection.configuredAt == null ||
             collection.selected != wireRequest.selected ||
             collection.visible != wireRequest.visible ||
             collection.syncRole != wireRequest.syncRole ||
@@ -500,36 +515,18 @@ class OkHttpGoogleCalendarInboundTransport(
 }
 
 private fun ConfigureGoogleCollectionRequest.toWireRequest(): ConfigureGoogleCollectionWireRequest =
-    when (role) {
-        GoogleInboundCollectionRole.OFF -> ConfigureGoogleCollectionWireRequest(
-            expectedRevision = expectedRevision,
-            selected = false,
-            visible = false,
-            syncRole = RemoteGoogleSyncRole.READ_ONLY,
-            calendarPolicy = calendarPolicy,
-        )
+    ConfigureGoogleCollectionWireRequest(
+        expectedRevision = expectedRevision,
+        selected = selected,
+        visible = visible,
+        syncRole = syncRole,
+        calendarPolicy = effectiveCalendarPolicy,
+    )
 
-        GoogleInboundCollectionRole.READ_ONLY -> ConfigureGoogleCollectionWireRequest(
-            expectedRevision = expectedRevision,
-            selected = true,
-            visible = visible,
-            syncRole = RemoteGoogleSyncRole.READ_ONLY,
-            calendarPolicy = calendarPolicy,
-        )
-
-        GoogleInboundCollectionRole.BLOCKING -> ConfigureGoogleCollectionWireRequest(
-            expectedRevision = expectedRevision,
-            selected = true,
-            visible = visible,
-            syncRole = RemoteGoogleSyncRole.BLOCKING,
-            calendarPolicy = calendarPolicy,
-        )
-    }
-
-internal val ConfigureGoogleCollectionRequest.hasSupportedInboundRole: Boolean
+internal val ConfigureGoogleCollectionRequest.hasSupportedRole: Boolean
     get() = when (kind) {
         RemoteGoogleCollectionKind.CALENDAR -> true
-        RemoteGoogleCollectionKind.TASK_LIST -> role != GoogleInboundCollectionRole.BLOCKING
+        RemoteGoogleCollectionKind.TASK_LIST -> syncRole != RemoteGoogleSyncRole.BLOCKING
     }
 
 private fun validateCollections(response: RemoteGoogleCollections, accountId: String) {
@@ -578,8 +575,6 @@ private fun validateCollection(collection: RemoteGoogleSyncCollection) {
         collection.kind != RemoteGoogleCollectionKind.CALENDAR ||
             collection.syncRole != RemoteGoogleSyncRole.WRITABLE ||
             collection.providerAccessRole in setOf("owner", "writer")
-    val publicationPolicyIsValid =
-        collection.syncRole == RemoteGoogleSyncRole.WRITABLE || collection.calendarPolicy.isInboundOnly
     val projectionRevisionIsValid = collection.planningCollectionRevision?.let {
         it > 0
     } ?: true
@@ -603,7 +598,8 @@ private fun validateCollection(collection: RemoteGoogleSyncCollection) {
         (collection.lastImportAt == null || lastImportAt != null) &&
         (collection.planningWindowRefreshedAt == null || windowRefreshedAt != null) &&
         createdAt != null && updatedAt != null && !createdAt.isAfter(updatedAt) &&
-        roleIsValid && writableCalendarAccessIsValid && publicationPolicyIsValid && windowIsValid
+        (!collection.providerDeleted || !collection.selected) &&
+        roleIsValid && writableCalendarAccessIsValid && windowIsValid
     if (!valid) throw GoogleCalendarInboundApiException.InvalidResponse()
 }
 

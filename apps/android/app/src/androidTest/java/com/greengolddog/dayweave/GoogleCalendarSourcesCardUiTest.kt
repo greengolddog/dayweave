@@ -10,9 +10,10 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
+import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.network.RemoteGoogleCalendarPolicy
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
+import com.greengolddog.dayweave.network.RemoteGoogleEventDisposition
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
@@ -24,7 +25,8 @@ import com.greengolddog.dayweave.sync.GoogleImportCollectionState
 import com.greengolddog.dayweave.ui.screens.GoogleSourcesCard
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -35,10 +37,15 @@ class GoogleCalendarSourcesCardUiTest {
     val composeRule = createComposeRule()
 
     @Test
-    fun showsActiveCalendarAndTaskSourcesWhileKeepingCalendarControls() {
+    fun showsFullCalendarAndTaskModesWhileGatingPublishByExactGrant() {
         showCard(
             googleAccounts = listOf(
-                account(id = ACTIVE_ACCOUNT, label = "Personal", hasTasks = false),
+                account(
+                    id = ACTIVE_ACCOUNT,
+                    label = "Personal",
+                    hasCalendarWriteScope = true,
+                    hasTasks = false,
+                ),
                 account(
                     id = PAUSED_ACCOUNT,
                     label = "Paused",
@@ -50,6 +57,7 @@ class GoogleCalendarSourcesCardUiTest {
                     label = "Tasks only",
                     hasCalendar = false,
                     hasTasks = true,
+                    hasTasksWriteScope = true,
                 ),
             ),
             collections = listOf(
@@ -57,6 +65,7 @@ class GoogleCalendarSourcesCardUiTest {
                     id = WRITABLE_CALENDAR,
                     name = "Shared family",
                     syncRole = RemoteGoogleSyncRole.WRITABLE,
+                    providerAccessRole = "owner",
                 ),
                 collection(
                     id = TASK_LIST,
@@ -73,19 +82,27 @@ class GoogleCalendarSourcesCardUiTest {
         composeRule.onNodeWithText("Paused").assertDoesNotExist()
         composeRule.onNodeWithText("Tasks only").assertIsDisplayed()
         composeRule.onNodeWithTag("google_calendar_collection_0_0").assertIsDisplayed()
-        composeRule.onNodeWithTag("google_task_collection_1_0").assertIsDisplayed()
-        composeRule.onNodeWithText("Google Tasks").assertIsDisplayed()
-        composeRule.onNodeWithText("Writable · managed on another device").assertIsDisplayed()
-        composeRule.onNodeWithTag("google_calendar_role_0_0_off").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_task_collection_1_0").assertExists()
+        composeRule.onNodeWithText("Google Tasks").assertExists()
+        composeRule.onNodeWithText("Publish · writable Calendar destination").assertExists()
+        composeRule.onNodeWithTag("google_calendar_role_0_0_off").assertIsEnabled()
         composeRule.onNodeWithTag("google_calendar_role_0_0_read_only")
-            .assertIsNotEnabled()
+            .assertIsEnabled()
         composeRule.onNodeWithTag("google_calendar_role_0_0_blocking")
-            .assertIsNotEnabled()
+            .assertIsEnabled()
         composeRule.onNodeWithTag("google_calendar_role_0_0_writable")
-            .assertDoesNotExist()
+            .assertIsEnabled()
+            .assertIsSelected()
+        composeRule.onNodeWithTag("google_calendar_visible_0_0").assertIsEnabled()
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_confirmed_busy_blocking")
+            .assertExists()
+        composeRule.onNodeWithTag("google_calendar_publish_0_0_all_day").assertExists()
         composeRule.onNodeWithTag("google_task_role_1_0_off").assertIsEnabled()
         composeRule.onNodeWithTag("google_task_role_1_0_read_only").assertIsEnabled()
+        composeRule.onNodeWithTag("google_task_role_1_0_writable").assertIsEnabled()
         composeRule.onNodeWithTag("google_task_role_1_0_blocking").assertDoesNotExist()
+        composeRule.onNodeWithTag("google_task_policy_1_0_confirmed_busy_blocking")
+            .assertDoesNotExist()
     }
 
     @Test
@@ -105,29 +122,43 @@ class GoogleCalendarSourcesCardUiTest {
         composeRule.onNodeWithTag("google_calendar_role_0_0_off").assertIsNotEnabled()
         composeRule.onNodeWithTag("google_calendar_role_0_0_read_only").assertIsNotEnabled()
         composeRule.onNodeWithTag("google_calendar_role_0_0_blocking").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_role_0_0_writable").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_visible_0_0").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_all_day_reference")
+            .assertIsNotEnabled()
     }
 
     @Test
-    fun unselectedWritableCalendarIsLabeledAndSelectedAsOff() {
+    fun offModeDoesNotForceVisibilityOff() {
+        val configured = AtomicReference<ConfigurationAction?>()
         showCard(
             collections = listOf(
                 collection(
                     id = WRITABLE_CALENDAR,
-                    name = "Former writable calendar",
-                    syncRole = RemoteGoogleSyncRole.WRITABLE,
-                    selected = false,
+                    name = "Optional calendar",
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                    selected = true,
+                    visible = true,
                 ),
             ),
+            onConfigure = { accountId, collectionId, request ->
+                configured.set(ConfigurationAction(accountId, collectionId, request))
+            },
         )
 
-        composeRule.onNodeWithText("Off · not imported").assertIsDisplayed()
-        composeRule.onNodeWithTag("google_calendar_role_0_0_off").assertIsSelected()
-        composeRule.onNodeWithText("Writable · managed on another device").assertDoesNotExist()
+        composeRule.onNodeWithTag("google_calendar_role_0_0_off").performClick()
+
+        composeRule.runOnIdle {
+            val request = requireNotNull(configured.get()).request
+            assertFalse(request.selected)
+            assertTrue(request.visible)
+            assertEquals(RemoteGoogleSyncRole.READ_ONLY, request.syncRole)
+        }
     }
 
     @Test
-    fun routesExactAccountCollectionRevisionAndInboundRole() {
-        val configured = AtomicReference<ConfigurationAction?>()
+    fun routesExactRequestAndKeepsVisibilityIndependentFromMode() {
+        val configured = mutableListOf<ConfigurationAction>()
         val discoveredAccount = AtomicReference<String?>()
         val refreshedAccount = AtomicReference<String?>()
         showCard(
@@ -141,38 +172,173 @@ class GoogleCalendarSourcesCardUiTest {
             ),
             onDiscover = discoveredAccount::set,
             onRefreshOrCheck = refreshedAccount::set,
-            onConfigure = { accountId, collectionId, revision, kind, role ->
-                configured.set(
-                    ConfigurationAction(accountId, collectionId, revision, kind, role),
-                )
+            onConfigure = { accountId, collectionId, request ->
+                configured += ConfigurationAction(accountId, collectionId, request)
             },
         )
 
         composeRule.onNodeWithTag("google_calendar_role_0_0_read_only")
             .assertIsSelected()
             .performClick()
-        composeRule.runOnIdle { assertNull(configured.get()) }
+        composeRule.runOnIdle { assertTrue(configured.isEmpty()) }
 
         composeRule.onNodeWithTag("google_calendar_role_0_0_blocking")
             .performClick()
+        composeRule.onNodeWithTag("google_calendar_visible_0_0").performClick()
         composeRule.onNodeWithTag("google_calendar_discover_0").performClick()
         composeRule.onNodeWithTag("google_calendar_refresh_0").performClick()
 
         composeRule.runOnIdle {
             assertEquals(
-                ConfigurationAction(
-                    accountId = ACTIVE_ACCOUNT,
-                    collectionId = READ_ONLY_CALENDAR,
-                    revision = 37,
-                    kind = RemoteGoogleCollectionKind.CALENDAR,
-                    role = GoogleInboundCollectionRole.BLOCKING,
-                ),
-                configured.get(),
+                2,
+                configured.size,
             )
+            val blocking = configured[0]
+            assertEquals(ACTIVE_ACCOUNT, blocking.accountId)
+            assertEquals(READ_ONLY_CALENDAR, blocking.collectionId)
+            assertEquals(37, blocking.request.expectedRevision)
+            assertEquals(RemoteGoogleCollectionKind.CALENDAR, blocking.request.kind)
+            assertTrue(blocking.request.selected)
+            assertTrue(blocking.request.visible)
+            assertEquals(RemoteGoogleSyncRole.BLOCKING, blocking.request.syncRole)
+            val hidden = configured[1].request
+            assertTrue(hidden.selected)
+            assertFalse(hidden.visible)
+            assertEquals(RemoteGoogleSyncRole.READ_ONLY, hidden.syncRole)
             assertEquals(ACTIVE_ACCOUNT, discoveredAccount.get())
             assertEquals(ACTIVE_ACCOUNT, refreshedAccount.get())
         }
         composeRule.onNodeWithText("Refresh import").assertIsDisplayed()
+    }
+
+    @Test
+    fun calendarPolicyEditorRoutesEveryDispositionAndWritablePublicationOption() {
+        val configured = mutableListOf<ConfigurationAction>()
+        showCard(
+            googleAccounts = listOf(
+                account(
+                    id = ACTIVE_ACCOUNT,
+                    label = "Personal",
+                    hasCalendarWriteScope = true,
+                ),
+            ),
+            collections = listOf(
+                collection(
+                    id = WRITABLE_CALENDAR,
+                    name = "Publish calendar",
+                    syncRole = RemoteGoogleSyncRole.WRITABLE,
+                    providerAccessRole = "writer",
+                    calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault(),
+                    revision = 41,
+                ),
+            ),
+            onConfigure = { accountId, collectionId, request ->
+                configured += ConfigurationAction(accountId, collectionId, request)
+            },
+        )
+
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_confirmed_busy_ignore")
+            .performClick()
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_tentative_blocking")
+            .performClick()
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_free_ignore").performClick()
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_all_day_blocking")
+            .performClick()
+        composeRule.onNodeWithTag("google_calendar_publish_0_0_all_day").performClick()
+        composeRule.onNodeWithTag("google_calendar_publish_0_0_tentative").performClick()
+        composeRule.onNodeWithTag("google_calendar_publish_0_0_free").performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(7, configured.size)
+            configured.forEach { action ->
+                assertEquals(ACTIVE_ACCOUNT, action.accountId)
+                assertEquals(WRITABLE_CALENDAR, action.collectionId)
+                assertEquals(41, action.request.expectedRevision)
+                assertTrue(action.request.selected)
+                assertEquals(RemoteGoogleSyncRole.WRITABLE, action.request.syncRole)
+            }
+            assertEquals(
+                RemoteGoogleEventDisposition.IGNORE,
+                configured[0].request.calendarPolicy.confirmedBusy,
+            )
+            assertEquals(
+                RemoteGoogleEventDisposition.BLOCKING,
+                configured[1].request.calendarPolicy.tentative,
+            )
+            assertEquals(
+                RemoteGoogleEventDisposition.IGNORE,
+                configured[2].request.calendarPolicy.free,
+            )
+            assertEquals(
+                RemoteGoogleEventDisposition.BLOCKING,
+                configured[3].request.calendarPolicy.allDay,
+            )
+            assertTrue(configured[4].request.calendarPolicy.publishAllDay)
+            assertTrue(configured[5].request.calendarPolicy.publishTentative)
+            assertTrue(configured[6].request.calendarPolicy.publishFree)
+        }
+    }
+
+    @Test
+    fun nonWritableCalendarPolicyEditStripsEveryPublicationFlag() {
+        val configured = AtomicReference<ConfigurationAction?>()
+        showCard(
+            collections = listOf(
+                collection(
+                    id = READ_ONLY_CALENDAR,
+                    name = "Legacy policy",
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                    calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                        publishAllDay = true,
+                        publishTentative = true,
+                        publishFree = true,
+                    ),
+                ),
+            ),
+            onConfigure = { accountId, collectionId, request ->
+                configured.set(ConfigurationAction(accountId, collectionId, request))
+            },
+        )
+
+        composeRule.onNodeWithTag("google_calendar_policy_0_0_tentative_ignore")
+            .performClick()
+
+        composeRule.runOnIdle {
+            val policy = requireNotNull(configured.get()).request.calendarPolicy
+            assertEquals(RemoteGoogleEventDisposition.IGNORE, policy.tentative)
+            assertFalse(policy.publishAllDay)
+            assertFalse(policy.publishTentative)
+            assertFalse(policy.publishFree)
+        }
+        composeRule.onNodeWithTag("google_calendar_publish_0_0_all_day").assertDoesNotExist()
+    }
+
+    @Test
+    fun calendarPublishRequiresFullScopeAndOwnerOrWriterProviderRole() {
+        showCard(
+            googleAccounts = listOf(
+                account(
+                    id = ACTIVE_ACCOUNT,
+                    label = "Personal",
+                    hasCalendarWriteScope = true,
+                ),
+            ),
+            collections = listOf(
+                collection(
+                    id = READ_ONLY_CALENDAR,
+                    name = "Reader",
+                    providerAccessRole = "reader",
+                ),
+                collection(
+                    id = BLOCKING_CALENDAR,
+                    name = "Writer",
+                    providerAccessRole = "writer",
+                ),
+            ),
+        )
+
+        composeRule.onNodeWithTag("google_calendar_role_0_0_writable").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_role_0_1_writable").assertIsEnabled()
     }
 
     @Test
@@ -206,8 +372,8 @@ class GoogleCalendarSourcesCardUiTest {
                     revision = 13,
                 ),
             ),
-            onConfigure = { accountId, collectionId, revision, kind, role ->
-                configured += ConfigurationAction(accountId, collectionId, revision, kind, role)
+            onConfigure = { accountId, collectionId, request ->
+                configured += ConfigurationAction(accountId, collectionId, request)
             },
         )
 
@@ -220,16 +386,24 @@ class GoogleCalendarSourcesCardUiTest {
                     ConfigurationAction(
                         TASKS_ONLY_ACCOUNT,
                         TASK_LIST,
-                        12,
-                        RemoteGoogleCollectionKind.TASK_LIST,
-                        GoogleInboundCollectionRole.READ_ONLY,
+                        ConfigureGoogleCollectionRequest(
+                            expectedRevision = 12,
+                            kind = RemoteGoogleCollectionKind.TASK_LIST,
+                            selected = true,
+                            visible = true,
+                            syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                        ),
                     ),
                     ConfigurationAction(
                         TASKS_ONLY_ACCOUNT,
                         SECOND_TASK_LIST,
-                        13,
-                        RemoteGoogleCollectionKind.TASK_LIST,
-                        GoogleInboundCollectionRole.OFF,
+                        ConfigureGoogleCollectionRequest(
+                            expectedRevision = 13,
+                            kind = RemoteGoogleCollectionKind.TASK_LIST,
+                            selected = false,
+                            visible = true,
+                            syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                        ),
                     ),
                 ),
                 configured,
@@ -240,7 +414,7 @@ class GoogleCalendarSourcesCardUiTest {
     }
 
     @Test
-    fun writableTaskListIsDisplayOnly() {
+    fun taskPublishNeedsTasksScopeButDowngradeRemainsAvailable() {
         showCard(
             googleAccounts = listOf(
                 account(
@@ -253,7 +427,7 @@ class GoogleCalendarSourcesCardUiTest {
             collections = listOf(
                 collection(
                     id = TASK_LIST,
-                    name = "Managed elsewhere",
+                    name = "Publishing list",
                     accountId = TASKS_ONLY_ACCOUNT,
                     kind = RemoteGoogleCollectionKind.TASK_LIST,
                     syncRole = RemoteGoogleSyncRole.WRITABLE,
@@ -261,9 +435,10 @@ class GoogleCalendarSourcesCardUiTest {
             ),
         )
 
-        composeRule.onNodeWithText("Writable · managed on another device").assertIsDisplayed()
-        composeRule.onNodeWithTag("google_task_role_0_0_off").assertIsNotEnabled()
-        composeRule.onNodeWithTag("google_task_role_0_0_read_only").assertIsNotEnabled()
+        composeRule.onNodeWithText("Publish · writable Tasks destination").assertIsDisplayed()
+        composeRule.onNodeWithTag("google_task_role_0_0_off").assertIsEnabled()
+        composeRule.onNodeWithTag("google_task_role_0_0_read_only").assertIsEnabled()
+        composeRule.onNodeWithTag("google_task_role_0_0_writable").assertIsNotEnabled()
         composeRule.onNodeWithTag("google_task_role_0_0_blocking").assertDoesNotExist()
     }
 
@@ -313,6 +488,50 @@ class GoogleCalendarSourcesCardUiTest {
         composeRule.onNodeWithTag("google_calendar_role_0_0_blocking").assertIsNotEnabled()
     }
 
+    @Test
+    fun googleOperatorRecoveryDisablesCachedSourceControls() {
+        showCard(
+            collections = listOf(collection(id = BLOCKING_CALENDAR, name = "Focus")),
+            googlePhase = GoogleAccountPhase.RECOVERY_REQUIRED,
+        )
+
+        composeRule.onNodeWithTag("google_calendar_discover_0").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_refresh_0").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_role_0_0_read_only").assertIsNotEnabled()
+    }
+
+    @Test
+    fun orphanedAuthorizationFlagDisablesCachedSourceControlsIndependently() {
+        showCard(
+            collections = listOf(collection(id = BLOCKING_CALENDAR, name = "Focus")),
+            authorizationRecoveryDiscardRequired = true,
+        )
+
+        composeRule.onNodeWithTag("google_calendar_discover_0").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_refresh_0").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_calendar_role_0_0_read_only").assertIsNotEnabled()
+    }
+
+    @Test
+    fun schedulePublicationRequiresCurrentScheduleUnlessRecoveryExists() {
+        showCard(schedulePublicationHasCurrentSchedule = false)
+
+        composeRule.onNodeWithTag("google_publish_generated_schedule").assertIsNotEnabled()
+        composeRule.onNodeWithTag("google_schedule_publication_unavailable").assertIsDisplayed()
+    }
+
+    @Test
+    fun savedSchedulePublicationRemainsAccessibleWithoutCurrentSchedule() {
+        showCard(
+            schedulePublicationHasCurrentSchedule = false,
+            schedulePublicationHasRecovery = true,
+        )
+
+        composeRule.onNodeWithTag("google_publish_generated_schedule").assertIsEnabled()
+        composeRule.onNodeWithText("Review saved publication").assertIsDisplayed()
+        composeRule.onNodeWithTag("google_schedule_publication_unavailable").assertDoesNotExist()
+    }
+
     private fun showCard(
         googleAccounts: List<GoogleAccountSummary> = listOf(
             account(id = ACTIVE_ACCOUNT, label = "Personal"),
@@ -322,23 +541,27 @@ class GoogleCalendarSourcesCardUiTest {
         pendingRecoveryCount: Int = 0,
         importBusy: Boolean = false,
         actionsEnabled: Boolean = true,
+        schedulePublicationHasCurrentSchedule: Boolean = true,
+        schedulePublicationHasRecovery: Boolean = false,
+        googlePhase: GoogleAccountPhase = GoogleAccountPhase.CONNECTED,
+        authorizationRecoveryDiscardRequired: Boolean = false,
         onDiscover: (String) -> Unit = {},
         onRefreshOrCheck: (String) -> Unit = {},
         onConfigure: (
             String,
             String,
-            Long,
-            RemoteGoogleCollectionKind,
-            GoogleInboundCollectionRole,
-        ) -> Unit = { _, _, _, _, _ -> },
+            ConfigureGoogleCollectionRequest,
+        ) -> Unit = { _, _, _ -> },
     ) {
         composeRule.setContent {
             MaterialTheme {
                 GoogleSourcesCard(
                     googleAccountState = GoogleAccountState(
-                        phase = GoogleAccountPhase.CONNECTED,
+                        phase = googlePhase,
                         accounts = googleAccounts,
                         message = "Google connected",
+                        authorizationRecoveryDiscardRequired =
+                            authorizationRecoveryDiscardRequired,
                         configurationId = CONFIGURATION_ID,
                     ),
                     importState = GoogleCalendarImportState(
@@ -363,6 +586,9 @@ class GoogleCalendarSourcesCardUiTest {
                     onRefreshOrCheck = onRefreshOrCheck,
                     onConfigure = onConfigure,
                     actionsEnabled = actionsEnabled,
+                    schedulePublicationHasCurrentSchedule =
+                        schedulePublicationHasCurrentSchedule,
+                    schedulePublicationHasRecovery = schedulePublicationHasRecovery,
                 )
             }
         }
@@ -371,9 +597,7 @@ class GoogleCalendarSourcesCardUiTest {
     private data class ConfigurationAction(
         val accountId: String,
         val collectionId: String,
-        val revision: Long,
-        val kind: RemoteGoogleCollectionKind,
-        val role: GoogleInboundCollectionRole,
+        val request: ConfigureGoogleCollectionRequest,
     )
 
     private companion object {
@@ -393,7 +617,9 @@ class GoogleCalendarSourcesCardUiTest {
             status: String = "active",
             syncEnabled: Boolean = true,
             hasCalendar: Boolean = true,
+            hasCalendarWriteScope: Boolean = false,
             hasTasks: Boolean = true,
+            hasTasksWriteScope: Boolean = false,
         ) = GoogleAccountSummary(
             id = id,
             label = label,
@@ -401,9 +627,9 @@ class GoogleCalendarSourcesCardUiTest {
             syncEnabled = syncEnabled,
             isDefault = id == ACTIVE_ACCOUNT,
             hasCalendar = hasCalendar,
-            hasCalendarWriteScope = false,
+            hasCalendarWriteScope = hasCalendarWriteScope,
             hasTasks = hasTasks,
-            hasTasksWriteScope = false,
+            hasTasksWriteScope = hasTasksWriteScope,
             revision = 1,
         )
 
@@ -415,19 +641,24 @@ class GoogleCalendarSourcesCardUiTest {
             syncRole: RemoteGoogleSyncRole = RemoteGoogleSyncRole.BLOCKING,
             revision: Long = 1,
             selected: Boolean = true,
+            visible: Boolean = true,
             providerDeleted: Boolean = false,
+            providerAccessRole: String? = null,
+            calendarPolicy: RemoteGoogleCalendarPolicy =
+                RemoteGoogleCalendarPolicy.inboundDefault(),
         ) = GoogleImportCollectionState(
             id = id,
             accountId = accountId,
             displayName = name,
             kind = kind,
             selected = selected,
-            visible = true,
+            visible = visible,
             syncRole = syncRole,
-            calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault(),
+            calendarPolicy = calendarPolicy,
             revision = revision,
             lastImportAt = null,
             providerDeleted = providerDeleted,
+            providerAccessRole = providerAccessRole,
         )
     }
 }

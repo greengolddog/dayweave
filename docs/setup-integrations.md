@@ -76,21 +76,25 @@ All routes below require the normal DayWeave bearer token. Provider access and
 refresh tokens never leave the server and must never appear in logs or API
 responses.
 
-#### macOS owner flow
+#### Native owner flows
 
-The native Mac client exposes import and explicitly reviewed Calendar and Tasks
-publication after durable DayWeave device enrollment is active:
+The native macOS and Android clients expose import and explicitly reviewed
+Calendar and Tasks publication after durable DayWeave device enrollment is
+active:
 
-1. Open **Settings → Accounts → Google** and choose **Connect Calendar & Tasks**.
+1. On macOS, open **Settings → Accounts → Google** and choose **Connect Calendar
+   & Tasks**. On Android, open **More → Google connection** and choose **Connect
+   Google**.
    The client explicitly sends `"services":[]`; by server contract this requests
    Calendar read-only and Tasks read-only together. No Google client secret,
-   provider token, callback code, or callback state belongs on the Mac.
+   provider token, callback code, or callback state belongs on either client.
 2. Choose **Open Google**, complete consent in the external browser, then leave
    DayWeave unlocked while it checks the account or choose **Check connection**.
    Browser launch is not considered success. The protected accounts endpoint is
    authoritative account inventory, but it cannot bind a change to one exact
-   browser attempt, so the client keeps that attempt's recovery journal until
-   expiry. The authorization URL is never persisted.
+   browser attempt. The client therefore keeps that attempt's recovery journal
+   through provider expiry, maximum supported device-clock skew, and the server's
+   bounded callback-exchange settlement lease. The authorization URL is never persisted.
 3. Choose **Discover sources** for an active account. Select Calendar sources as
    reference-only or blocking and select Task lists as reference-only. Task
    lists never block calendar time.
@@ -102,19 +106,21 @@ publication after durable DayWeave device enrollment is active:
    reports success. Backoff or a still-running import can be checked later
    without replaying the mutation. If acceptance was never proved, the UI may
    safely replay the exact persisted request UUID; the server returns its
-   original generation without queuing duplicate work. A terminal failed
-   run—or a reauthorization-required run after
-   authorization is repaired—can also be retried: before transport, the client
-   replaces the marker with a new durable request UUID. Completion uses only
-   monotonic generations, so API/client/worker clock skew cannot falsely prove
-   the retry completed. If sync status requires reauthorization while the
-   provider account still appears active, the Reauthorize action remains
-   available and preserves the pending completion marker.
+   original generation without queuing duplicate work. A terminal failed run
+   can also be retried: before transport, the client replaces the marker with a
+   new durable request UUID. A reauthorization-required run is different: the
+   accepted marker is never replaced. Completing the exact OAuth repair wakes
+   that same run on the server, and **Check import** continues polling until its
+   accepted generation completes. Completion uses only monotonic generations,
+   so API/client/worker clock skew cannot falsely prove the retry completed. If
+   sync status requires reauthorization while the provider account still
+   appears active, the Reauthorize action remains available and preserves the
+   pending completion marker.
 5. To publish Calendar events, choose **Enable Calendar publishing** for that
-   existing account. The Mac requests exactly the broad Calendar service with
+   existing account. The client requests exactly the broad Calendar service with
    forced incremental consent; it does not request Tasks write scope. After the
    authoritative account snapshot reports the grant, mark a selected Calendar
-   **Publish**. The Mac offers this role only when Google reports `owner` or
+   **Publish**. The clients offer this role only when Google reports `owner` or
    `writer` access. Confirmed busy timed events are enabled by default; all-day,
    tentative, and free event publication are separate collection switches.
 6. To publish tasks, separately choose **Enable Tasks publishing**. This requests
@@ -136,21 +142,23 @@ publication after durable DayWeave device enrollment is active:
    entity kind, and expiry. Expiry validation tolerates the supported
    five-minute device clock skew while locally elapsed authority remains
    non-actionable.
-8. Android uses the same server preview/approval/outbox contract for a strict
-   upsert-only subset. Configure the account's full Calendar grant and writable
-   **Publish** destination on macOS first, refresh **More → Google sources** on
-   Android, then use **Inbox → Items → Publish**. Android accepts only a current
-   app-owned, non-all-day, confirmed, busy timed event; it never publishes task
-   schedule blocks, recurrence, guests, meetings, attachments, Google Tasks, or
-   deletion from this surface. Its secure review says **queued** after HTTP 202,
-   while provider delivery remains asynchronous.
+8. Android uses the same server preview/approval/outbox contract for supported
+   Calendar and Tasks creates, updates, and eligible deletes. Enable each
+   service's publishing grant independently in **More → Google connection**,
+   choose a compatible **Publish** destination in **More → Google sources**,
+   then use **Inbox → Items → Publish**. Calendar publication remains limited
+   to supported app-owned fixed events, and Tasks publication remains limited to
+   supported non-recurring tasks; recurrence, guests, meetings, attachments, and
+   task schedule blocks are not exported from this surface. Every mutation uses
+   the secure exact-review flow. **Queued** after HTTP 202 means only that the
+   durable outbox accepted it; provider delivery remains asynchronous.
 
-Before preview transport, the Mac synchronously saves the exact intent to its
-encrypted planner snapshot. It persists the returned preview before display and
-persists the expiring approval capability before enqueue. Relaunch recovery may
+Before preview transport, each native client synchronously saves the exact
+intent to its encrypted planner snapshot. It persists the returned preview
+before display and persists the expiring approval capability before enqueue. Relaunch recovery may
 replay an intent or approved enqueue exactly, but it never approves a preview
-automatically. Because capability issuance is one-shot, the Mac also persists an
-approval-attempt fence before that request. If its response is lost, it does not
+automatically. Because capability issuance is one-shot, each client also
+persists an approval-attempt fence before that request. If its response is lost, it does not
 offer approval again or enqueue anything; recovery remains until the reviewed
 preview expires. The record is cleared only after authoritative outbox acceptance.
 Lock/sleep redacts the preview and fences late results. API credential changes,
@@ -160,13 +168,20 @@ server-unusable; destructive discard waits one additional five-minute skew windo
 and requires a separate warning confirmation plus exact journal comparison. An
 approved-stage warning also explains that a prior enqueue response may have been
 lost and asks the owner to verify Calendar or server state before retrying. This
-recovery can be discarded after its old authentication binding is unavailable. No Google token,
-approval capability, callback material, or provider credential belongs in this
-public repository or in plaintext planner state.
+recovery can be discarded after its old authentication binding is unavailable.
+No Google token, approval capability, callback material, or provider credential
+belongs in this public repository or in plaintext planner state.
 
 OAuth start keeps only a non-secret, expiring request/idempotency journal for an
-exact lost-response retry. Disconnect separately retains its exact account,
-revision, and idempotency identity until authoritative revocation; it never
+exact lost-response retry. Android stores that journal outside backup and device
+transfer, persists the browser-open marker before browser handoff, and never
+stores the one-use authorization URL. A foreign, orphaned, or unreadable journal
+blocks account mutation and new device enrollment. The UI warns that Google may
+already have accepted the request; discard requires a separately reviewed,
+one-presentation capability and exact journal removal, while confirmed local-only
+credential destruction remains the explicit last-resort cleanup path.
+Disconnect separately retains its exact account, revision, and idempotency
+identity until authoritative revocation; it never
 ages that identity out while the server's revocation fence exists, and it is
 cleared only after a verified fresh canonical composition removes retired
 imports. An exact, endpoint-bound revision-conflict response proves a stale
@@ -447,9 +462,9 @@ transports instead of creating a review neither client can load.
 The mutation routes require a DayWeave device principal with both Google write
 authority and `schedule_read`; status requires Google read authority plus the
 same device/schedule scope and exact user/workspace binding. All responses use
-`Cache-Control: no-store`. This API currently has no native macOS or Android
-trigger, so it is directly API/test accessible to an eligible device credential
-rather than an owner-facing workflow.
+`Cache-Control: no-store`. Both native clients expose an owner-facing generated
+schedule review, explicit approval, durable enqueue recovery, and aggregate
+delivery-status workflow for an eligible device credential.
 
 Each generated session has a stable logical slot derived from workspace, item,
 occurrence, and session index rather than from its placement-dependent schedule
@@ -499,12 +514,11 @@ A success response with an unusable identity or a body over the processing cap
 stays in active backoff, preserves that reason through worker/account recovery,
 and continues to block successor publication until reconciled.
 
-This server milestone does not complete `SCH-006`. Neither native client has a
-review/recovery journal or trigger for this API, no scheduler or firm-horizon
-automation enqueues it, and inbound edits to these generated Google events are
-not supported. Google move → local pin and delete → local unschedule
-interpretation plus the firm/tentative transition model are still required.
-Tentative blocks remain app-only.
+The native review/recovery flows do not by themselves complete `SCH-006`. No
+scheduler or firm-horizon automation enqueues publication, and inbound edits to
+these generated Google events are not supported. Google move → local pin and
+delete → local unschedule interpretation plus the firm/tentative transition
+model are still required. Tentative blocks remain app-only.
 
 Calendar planning policy is stored per collection. Safe defaults block only
 confirmed opaque busy events; tentative, transparent/free, birthdays, and

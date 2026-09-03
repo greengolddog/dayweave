@@ -191,12 +191,13 @@ remain active reconciliation evidence rather than terminal failures.
 
 This path is disabled unless both `DAYWEAVE_GOOGLE_OUTBOUND_ENABLED=true` and
 the narrower `DAYWEAVE_GOOGLE_SCHEDULE_OUTBOUND_ENABLED=true` deployment gates
-are set; the schedule-specific gate defaults off. No native client invokes it,
-no scheduler or firm-horizon automation enqueues it, and inbound edits, moves,
-and deletions of its Google events are not interpreted yet. Those client,
-automation, rolling tentative-to-firm promotion, and bidirectional paths remain
-required follow-on work; tentative blocks remain app-only. This slice therefore
-does not complete `SCH-006`.
+are set; the schedule-specific gate defaults off. Both native clients expose
+explicit review, approval, enqueue, exact recovery, and aggregate delivery
+status. No scheduler or firm-horizon automation enqueues it, and inbound edits,
+moves, and deletions of its Google events are not interpreted yet. Automation,
+rolling tentative-to-firm promotion, and bidirectional paths remain required
+follow-on work; tentative blocks remain app-only. This slice therefore does not
+complete `SCH-006`.
 
 ## 6. Client architecture
 

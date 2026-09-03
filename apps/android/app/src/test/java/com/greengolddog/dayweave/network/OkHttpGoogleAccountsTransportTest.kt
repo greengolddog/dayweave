@@ -112,16 +112,13 @@ class OkHttpGoogleAccountsTransportTest {
     }
 
     @Test
-    fun authorizationPreservesServerSupportedIncrementalServiceSelections() = runBlocking {
+    fun authorizationAllowsOnlyExactExistingAccountPublishingUpgrades() = runBlocking {
         val server = MockWebServer()
         server.start()
         try {
             val serviceSelections = listOf(
-                listOf(GoogleService.CALENDAR_READ_ONLY),
                 listOf(GoogleService.CALENDAR),
-                listOf(GoogleService.TASKS_READ_ONLY),
                 listOf(GoogleService.TASKS),
-                GoogleService.entries,
             )
             val transport = transport()
             val configuration = configuration(server)
@@ -148,17 +145,48 @@ class OkHttpGoogleAccountsTransportTest {
                     services.map { service -> service.serializedName },
                     body.getValue("services").jsonArray.map { it.jsonPrimitive.content },
                 )
+                assertEquals("true", body.getValue("force_consent").jsonPrimitive.content)
+                assertEquals(ACCOUNT_ID, body.getValue("account_id").jsonPrimitive.content)
+                assertEquals("false", body.getValue("connect_new").jsonPrimitive.content)
             }
             listOf(
                 StartGoogleAuthorizationRequest(
-                    services = listOf(GoogleService.CALENDAR, GoogleService.CALENDAR),
+                    services = listOf(GoogleService.CALENDAR_READ_ONLY),
+                    forceConsent = true,
+                    accountId = ACCOUNT_ID,
                 ),
                 StartGoogleAuthorizationRequest(
-                    services = GoogleService.entries + GoogleService.CALENDAR,
+                    services = listOf(GoogleService.TASKS_READ_ONLY),
+                    forceConsent = true,
+                    accountId = ACCOUNT_ID,
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.CALENDAR, GoogleService.TASKS),
+                    forceConsent = true,
+                    accountId = ACCOUNT_ID,
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.CALENDAR),
+                    accountId = ACCOUNT_ID,
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.TASKS),
+                    forceConsent = true,
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.CALENDAR),
+                    forceConsent = true,
+                    accountId = ACCOUNT_ID,
+                    connectNew = true,
                 ),
                 StartGoogleAuthorizationRequest(
                     accountId = ACCOUNT_ID,
                     connectNew = true,
+                ),
+                StartGoogleAuthorizationRequest(
+                    services = listOf(GoogleService.CALENDAR),
+                    forceConsent = true,
+                    accountId = "00000000-0000-0000-0000-000000000000",
                 ),
                 StartGoogleAuthorizationRequest(loginHint = ""),
                 StartGoogleAuthorizationRequest(loginHint = "x".repeat(321)),

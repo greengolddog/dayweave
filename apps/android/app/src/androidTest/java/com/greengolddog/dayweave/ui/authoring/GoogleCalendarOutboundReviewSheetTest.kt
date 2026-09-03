@@ -28,7 +28,9 @@ import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -260,6 +262,30 @@ class GoogleCalendarOutboundReviewSheetTest {
     }
 
     @Test
+    fun allDayTentativeFreeReviewProducesCompleteApprovalPresentation() {
+        val timed = preview()
+        val allDayPayload = JsonObject(
+            timed.providerPayload + mapOf(
+                "status" to JsonPrimitive("tentative"),
+                "transparency" to JsonPrimitive("transparent"),
+                "start" to allDayBoundary("2030-09-02"),
+                "end" to allDayBoundary("2030-09-03"),
+            ),
+        )
+
+        val presentation = requireNotNull(
+            timed.copy(providerPayload = allDayPayload).toSanitizedOutboundPresentation(),
+        )
+
+        assertEquals("Tentative", presentation.status)
+        assertEquals("Free", presentation.transparency)
+        assertTrue(requireNotNull(presentation.starts).contains("All day"))
+        assertTrue(requireNotNull(presentation.ends).contains("All day"))
+        assertTrue(presentation.starts.contains("2030"))
+        assertTrue(presentation.ends.contains("2030"))
+    }
+
+    @Test
     fun recoveryAndDiscardActionsExistOnlyWhenHostAllowsThem() {
         val recoverAllowed = mutableStateOf(false)
         val discardAllowed = mutableStateOf(false)
@@ -334,6 +360,14 @@ class GoogleCalendarOutboundReviewSheetTest {
             collectionRevision = 4,
         ),
         displayName = displayName,
+    )
+
+    private fun allDayBoundary(date: String) = JsonObject(
+        mapOf(
+            "date" to JsonPrimitive(date),
+            "dateTime" to JsonNull,
+            "timeZone" to JsonPrimitive("Europe/Paris"),
+        ),
     )
 
     private fun preview() = GoogleCalendarOutboundPreviewSnapshot(

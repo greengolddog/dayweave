@@ -284,20 +284,32 @@ class OkHttpGoogleAccountsTransport(
 
         private fun validateAuthorizationRequest(request: StartGoogleAuthorizationRequest) {
             request.accountId?.let(::validateUuid)
-            val serviceSelectionIsValid = request.services.size <= GoogleService.entries.size &&
-                request.services.distinct().size == request.services.size
+            // Android deliberately exposes only the server's read-only default sentinel and
+            // one-service, existing-account publishing upgrades. Keeping this client surface
+            // narrower than the server prevents an accidental mixed/full-scope connection.
+            val serviceSelectionIsValid = if (request.services.isEmpty()) {
+                true
+            } else {
+                request.services == listOf(GoogleService.CALENDAR) ||
+                    request.services == listOf(GoogleService.TASKS)
+            }
+            val publishingUpgradeIsValid = request.services.isEmpty() ||
+                request.accountId != null && request.forceConsent && !request.connectNew
             val loginHintIsValid = request.loginHint?.let { hint ->
                 hint.isNotEmpty() && hint.toByteArray(Charsets.UTF_8).size <= 320 &&
                     !hint.any(Char::isISOControl)
             } ?: true
             require(
-                serviceSelectionIsValid && loginHintIsValid &&
+                serviceSelectionIsValid && publishingUpgradeIsValid && loginHintIsValid &&
                     !(request.connectNew && request.accountId != null),
             ) { "Google authorization request is invalid" }
         }
 
         private fun validateUuid(value: String) {
-            require(UUID.fromString(value).toString() == value) { "Google account ID is invalid" }
+            val parsed = UUID.fromString(value)
+            require(parsed.toString() == value && parsed != UUID(0, 0)) {
+                "Google account ID is invalid"
+            }
         }
 
         private fun validateIdempotencyKey(value: String) {

@@ -128,14 +128,8 @@ class GoogleCalendarOutboundModelsTest {
             validPayload().replacing("etag", JsonPrimitive("provider-etag")),
             validPayload().replacing("visibility", JsonPrimitive("public")),
             validPayload().replacing("eventType", JsonPrimitive("focusTime")),
-            validPayload().replacing("status", JsonPrimitive("tentative")),
-            validPayload().replacing("transparency", JsonPrimitive("transparent")),
-            JsonObject(
-                validPayload() + mapOf(
-                    "start" to allDayCalendarBoundary("2026-09-02"),
-                    "end" to allDayCalendarBoundary("2026-09-03"),
-                ),
-            ),
+            validPayload().replacing("status", JsonPrimitive("cancelled")),
+            validPayload().replacing("transparency", JsonPrimitive("default")),
             validPayload().replacing("attendees", JsonArray(listOf(JsonObject(emptyMap())))),
             validPayload().replacing("attachments", JsonArray(listOf(JsonObject(emptyMap())))),
             validPayload().replacing("recurrence", JsonArray(listOf(JsonPrimitive("RRULE:FREQ=DAILY")))),
@@ -165,6 +159,18 @@ class GoogleCalendarOutboundModelsTest {
                 "end",
                 calendarBoundary("2026-09-02T09:59:59+02:00"),
             ),
+            JsonObject(
+                validPayload() + mapOf(
+                    "start" to allDayCalendarBoundary("2026-09-03"),
+                    "end" to allDayCalendarBoundary("2026-09-03"),
+                ),
+            ),
+            JsonObject(
+                validPayload() + mapOf(
+                    "start" to allDayCalendarBoundary("2026-09-02"),
+                    "end" to calendarBoundary("2026-09-03T10:00:00+02:00"),
+                ),
+            ),
         )
         invalidPayloads.forEachIndexed { index, payload ->
             assertThrows("payload case $index", IllegalArgumentException::class.java) {
@@ -172,6 +178,35 @@ class GoogleCalendarOutboundModelsTest {
                     remote.copy(providerPayload = payload),
                 )
             }
+        }
+
+        listOf(
+            validPayload().replacing("status", JsonPrimitive("tentative")),
+            validPayload().replacing("transparency", JsonPrimitive("transparent")),
+            validPayload()
+                .replacing("status", JsonPrimitive("tentative"))
+                .replacing("transparency", JsonPrimitive("transparent")),
+            JsonObject(
+                validPayload() + mapOf(
+                    "start" to allDayCalendarBoundary("2026-09-02"),
+                    "end" to allDayCalendarBoundary("2026-09-03"),
+                ),
+            ),
+            JsonObject(
+                validPayload()
+                    .replacing("status", JsonPrimitive("tentative"))
+                    .replacing("transparency", JsonPrimitive("transparent")) + mapOf(
+                    "start" to allDayCalendarBoundary("2026-09-02"),
+                    "end" to allDayCalendarBoundary("2026-09-03"),
+                ),
+            ),
+        ).forEachIndexed { index, payload ->
+            assertNotNull(
+                "supported payload case $index",
+                GoogleCalendarOutboundPreviewSnapshot.fromRemote(
+                    remote.copy(providerPayload = payload),
+                ),
+            )
         }
     }
 
@@ -247,10 +282,20 @@ class GoogleCalendarOutboundModelsTest {
             GoogleCalendarOutboundApprovalCapability("dw_ga1_not-a-capability")
         }
         assertThrows(IllegalArgumentException::class.java) {
-            GoogleCalendarOutboundCandidate(ZERO_UUID, 1)
+            calendarCandidate(itemId = ZERO_UUID)
         }
         assertThrows(IllegalArgumentException::class.java) {
-            GoogleCalendarOutboundCandidate(ITEM_ID, 0)
+            calendarCandidate(expectedItemRevision = 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            GoogleCalendarOutboundCandidate(
+                itemId = ITEM_ID,
+                expectedItemRevision = 1,
+                isAllDay = true,
+                isTentative = false,
+                isBusy = false,
+                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+            )
         }
         assertThrows(IllegalArgumentException::class.java) {
             GoogleCalendarOutboundTarget(ACCOUNT_ID, ZERO_UUID, 1)
@@ -261,13 +306,46 @@ class GoogleCalendarOutboundModelsTest {
     }
 
     @Test
-    fun candidateParserAcceptsOnlyCurrentOwnedConfirmedBusyTimedEvent() {
+    fun candidateParserAcceptsCurrentOwnedEventStatusesAndPublicationTraits() {
         val item = canonicalEvent()
         val state = syncedState(item)
         assertEquals(
-            GoogleCalendarOutboundCandidate(ITEM_ID, 7),
+            calendarCandidate(),
             state.googleCalendarOutboundCandidate(ITEM_ID),
         )
+
+        listOf(
+            Triple(true, false, true),
+            Triple(false, true, true),
+            Triple(false, false, false),
+            Triple(true, true, false),
+        ).forEach { (allDay, tentative, busy) ->
+            assertEquals(
+                calendarCandidate(
+                    isAllDay = allDay,
+                    isTentative = tentative,
+                    isBusy = busy,
+                ),
+                syncedState(canonicalEvent(allDay, tentative, busy))
+                    .googleCalendarOutboundCandidate(ITEM_ID),
+            )
+        }
+        listOf(
+            "inbox",
+            "planned",
+            "scheduled",
+            "in_progress",
+            "paused",
+            "completed",
+            "skipped",
+            "cancelled",
+        ).forEach { status ->
+            assertNotNull(
+                status,
+                syncedState(canonicalEvent().copy(status = status))
+                    .googleCalendarOutboundCandidate(ITEM_ID),
+            )
+        }
 
         val pendingOtherItem = PendingCanonicalMutation(
             idempotencyKey = "other-write",
@@ -301,7 +379,7 @@ class GoogleCalendarOutboundModelsTest {
             "deleted" to syncedState(item.copy(deletedAt = "2026-09-02T12:01:00Z")),
             "zero revision" to syncedState(item.copy(revision = 0)),
             "wrong kind" to syncedState(item.copy(kind = "task")),
-            "not planned" to syncedState(item.copy(status = "inbox")),
+            "unknown status" to syncedState(item.copy(status = "future_status")),
             "unowned block" to syncedState(
                 item.copy(
                     flexibleConstraintsJson = item.flexibleConstraintsJson.replace(
@@ -310,9 +388,6 @@ class GoogleCalendarOutboundModelsTest {
                     ),
                 ),
             ),
-            "all day" to syncedState(canonicalEvent(allDay = true)),
-            "tentative" to syncedState(canonicalEvent(tentative = true)),
-            "free" to syncedState(canonicalEvent(busy = false)),
             "invalid bounds" to syncedState(
                 canonicalEvent().copy(deadlineAt = "2026-09-02T09:59:00Z"),
             ),
@@ -329,6 +404,9 @@ class GoogleCalendarOutboundModelsTest {
             GoogleCalendarOutboundCandidate(
                 itemId = ITEM_ID,
                 expectedItemRevision = 7,
+                isAllDay = false,
+                isTentative = false,
+                isBusy = false,
                 entityKind = GoogleCalendarOutboundEntityKind.TASK,
                 operation = GoogleCalendarOutboundOperation.UPSERT,
             ),
@@ -347,6 +425,9 @@ class GoogleCalendarOutboundModelsTest {
             GoogleCalendarOutboundCandidate(
                 itemId = ITEM_ID,
                 expectedItemRevision = 8,
+                isAllDay = false,
+                isTentative = false,
+                isBusy = false,
                 entityKind = GoogleCalendarOutboundEntityKind.TASK,
                 operation = GoogleCalendarOutboundOperation.DELETE,
             ),
@@ -361,6 +442,9 @@ class GoogleCalendarOutboundModelsTest {
             GoogleCalendarOutboundCandidate(
                 itemId = ITEM_ID,
                 expectedItemRevision = 8,
+                isAllDay = true,
+                isTentative = false,
+                isBusy = true,
                 entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
                 operation = GoogleCalendarOutboundOperation.DELETE,
             ),
@@ -382,6 +466,7 @@ class GoogleCalendarOutboundModelsTest {
     @Test
     fun targetParserRequiresActiveWriteScopeAndSelectedWritableOwnerOrWriter() {
         val collection = writableCollection()
+        val candidate = calendarCandidate()
         assertNotNull(
             googleCalendarOutboundTarget(
                 accountId = ACCOUNT_ID,
@@ -389,6 +474,7 @@ class GoogleCalendarOutboundModelsTest {
                 accountSyncEnabled = true,
                 accountHasCalendarWriteScope = true,
                 collection = collection,
+                candidate = candidate,
             ),
         )
 
@@ -420,6 +506,7 @@ class GoogleCalendarOutboundModelsTest {
                     accountSyncEnabled = case.accountSyncEnabled,
                     accountHasCalendarWriteScope = case.accountHasCalendarWriteScope,
                     collection = case.collection,
+                    candidate = candidate,
                 ),
             )
         }
@@ -443,8 +530,15 @@ class GoogleCalendarOutboundModelsTest {
                 accountSyncEnabled = true,
                 accountHasCalendarWriteScope = false,
                 collection = taskList,
-                entityKind = GoogleCalendarOutboundEntityKind.TASK,
-                operation = GoogleCalendarOutboundOperation.DELETE,
+                candidate = GoogleCalendarOutboundCandidate(
+                    itemId = ITEM_ID,
+                    expectedItemRevision = 7,
+                    isAllDay = false,
+                    isTentative = false,
+                    isBusy = false,
+                    entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                    operation = GoogleCalendarOutboundOperation.DELETE,
+                ),
                 accountHasTasksWriteScope = true,
             ),
         )
@@ -455,7 +549,14 @@ class GoogleCalendarOutboundModelsTest {
                 accountSyncEnabled = true,
                 accountHasCalendarWriteScope = true,
                 collection = taskList,
-                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                candidate = GoogleCalendarOutboundCandidate(
+                    itemId = ITEM_ID,
+                    expectedItemRevision = 7,
+                    isAllDay = false,
+                    isTentative = false,
+                    isBusy = false,
+                    entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                ),
                 accountHasTasksWriteScope = false,
             ),
         )
@@ -466,8 +567,69 @@ class GoogleCalendarOutboundModelsTest {
                 accountSyncEnabled = true,
                 accountHasCalendarWriteScope = true,
                 collection = collection,
-                entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                candidate = GoogleCalendarOutboundCandidate(
+                    itemId = ITEM_ID,
+                    expectedItemRevision = 7,
+                    isAllDay = false,
+                    isTentative = false,
+                    isBusy = false,
+                    entityKind = GoogleCalendarOutboundEntityKind.TASK,
+                ),
                 accountHasTasksWriteScope = true,
+            ),
+        )
+    }
+
+    @Test
+    fun targetParserAppliesEveryCalendarPublicationFlagButNeverBlocksDeletes() {
+        val collection = writableCollection()
+        val traits = listOf(
+            calendarCandidate(isAllDay = true) to
+                collection.calendarPolicy.copy(publishAllDay = true),
+            calendarCandidate(isTentative = true) to
+                collection.calendarPolicy.copy(publishTentative = true),
+            calendarCandidate(isBusy = false) to
+                collection.calendarPolicy.copy(publishFree = true),
+            calendarCandidate(isAllDay = true, isTentative = true, isBusy = false) to
+                collection.calendarPolicy.copy(
+                    publishAllDay = true,
+                    publishTentative = true,
+                    publishFree = true,
+                ),
+        )
+        traits.forEachIndexed { index, (candidate, permittedPolicy) ->
+            assertNull(
+                "default policy case $index",
+                target(collection = collection, candidate = candidate),
+            )
+            assertNotNull(
+                "permitted policy case $index",
+                target(
+                    collection = collection.copy(calendarPolicy = permittedPolicy),
+                    candidate = candidate,
+                ),
+            )
+        }
+
+        val combined = calendarCandidate(isAllDay = true, isTentative = true, isBusy = false)
+        listOf(
+            collection.calendarPolicy.copy(publishAllDay = true, publishTentative = true),
+            collection.calendarPolicy.copy(publishAllDay = true, publishFree = true),
+            collection.calendarPolicy.copy(publishTentative = true, publishFree = true),
+        ).forEachIndexed { index, incompletePolicy ->
+            assertNull(
+                "incomplete combined policy case $index",
+                target(
+                    collection = collection.copy(calendarPolicy = incompletePolicy),
+                    candidate = combined,
+                ),
+            )
+        }
+
+        assertNotNull(
+            target(
+                collection = collection,
+                candidate = combined.copy(operation = GoogleCalendarOutboundOperation.DELETE),
             ),
         )
     }
@@ -484,6 +646,35 @@ class GoogleCalendarOutboundModelsTest {
         entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
         intentExpiresAt = "2026-09-02T12:30:00Z",
         createdAt = "2026-09-02T12:00:00Z",
+    )
+
+    private fun calendarCandidate(
+        itemId: String = ITEM_ID,
+        expectedItemRevision: Long = 7,
+        isAllDay: Boolean = false,
+        isTentative: Boolean = false,
+        isBusy: Boolean = true,
+        operation: GoogleCalendarOutboundOperation = GoogleCalendarOutboundOperation.UPSERT,
+    ) = GoogleCalendarOutboundCandidate(
+        itemId = itemId,
+        expectedItemRevision = expectedItemRevision,
+        isAllDay = isAllDay,
+        isTentative = isTentative,
+        isBusy = isBusy,
+        entityKind = GoogleCalendarOutboundEntityKind.CALENDAR_EVENT,
+        operation = operation,
+    )
+
+    private fun target(
+        collection: RemoteGoogleSyncCollection,
+        candidate: GoogleCalendarOutboundCandidate,
+    ) = googleCalendarOutboundTarget(
+        accountId = ACCOUNT_ID,
+        accountStatus = "active",
+        accountSyncEnabled = true,
+        accountHasCalendarWriteScope = true,
+        collection = collection,
+        candidate = candidate,
     )
 
     private fun validRemotePreview() = RemoteGoogleOutboundPreview(

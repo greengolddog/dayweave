@@ -55,6 +55,7 @@ import com.greengolddog.dayweave.sync.GoogleCalendarOutboundPhase
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundState
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
 import java.time.Instant
+import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -759,8 +760,9 @@ internal fun GoogleCalendarOutboundPreviewSnapshot.toSanitizedOutboundPresentati
             "transparent" -> "Free"
             else -> error("Unsupported Calendar transparency")
         }
-        val start = payload.requiredTimedBoundary("start")
-        val end = payload.requiredTimedBoundary("end")
+        val start = payload.requiredCalendarBoundary("start")
+        val end = payload.requiredCalendarBoundary("end")
+        require(start.isAllDay == end.isAllDay)
         GoogleCalendarOutboundPreviewPresentation(
             entityKind = entityKind,
             operation = operation,
@@ -803,20 +805,34 @@ internal fun GoogleCalendarOutboundPreviewSnapshot.toSanitizedOutboundPresentati
     }
 }.getOrNull()
 
-private data class TimedBoundary(
-    val dateTime: OffsetDateTime,
+private data class CalendarBoundary(
+    val date: LocalDate?,
+    val dateTime: OffsetDateTime?,
     val timeZone: ZoneId,
 ) {
-    fun displayLabel(): String =
-        "${dateTime.toInstant().atZone(timeZone).format(eventTimeFormatter())} · ${timeZone.id}"
+    val isAllDay: Boolean
+        get() = date != null
+
+    init {
+        require((date == null) != (dateTime == null))
+    }
+
+    fun displayLabel(): String = if (date != null) {
+        "${date.format(allDayDateFormatter())} · All day · ${timeZone.id}"
+    } else {
+        "${requireNotNull(dateTime).toInstant().atZone(timeZone).format(eventTimeFormatter())} · " +
+            timeZone.id
+    }
 }
 
-private fun JsonObject.requiredTimedBoundary(key: String): TimedBoundary {
+private fun JsonObject.requiredCalendarBoundary(key: String): CalendarBoundary {
     val boundary = this[key] as? JsonObject ?: error("Missing Calendar boundary")
-    val dateTime = boundary.requiredDisplayString("dateTime")
+    val date = boundary.displayString("date")?.let(LocalDate::parse)
+    val dateTime = boundary.displayString("dateTime")?.let(OffsetDateTime::parse)
     val timeZone = boundary.requiredDisplayString("timeZone")
-    return TimedBoundary(
-        dateTime = OffsetDateTime.parse(dateTime),
+    return CalendarBoundary(
+        date = date,
+        dateTime = dateTime,
         timeZone = ZoneId.of(timeZone),
     )
 }
@@ -883,6 +899,9 @@ private const val MAX_GENERAL_DISPLAY_CHARS = 1_024
 // truncated title, description, or destination while the full provider payload stays private.
 private const val MAX_DESCRIPTION_DISPLAY_CHARS = 256 * 1_024
 private const val MAX_DESTINATION_DISPLAY_CHARS = 4_420
+private fun allDayDateFormatter(): DateTimeFormatter =
+    DateTimeFormatter.ofPattern("EEE, MMM d, uuuu", Locale.getDefault())
+
 private fun eventTimeFormatter(): DateTimeFormatter =
     DateTimeFormatter.ofPattern("EEE, MMM d · HH:mm", Locale.getDefault())
 

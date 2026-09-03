@@ -5,7 +5,6 @@ import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.network.GoogleCalendarInboundApiException
-import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
 import com.greengolddog.dayweave.network.GoogleCalendarInboundTransport
 import com.greengolddog.dayweave.network.RemoteGoogleCalendarPolicy
 import com.greengolddog.dayweave.network.RemoteGoogleCalendarProjectionState
@@ -476,6 +475,163 @@ class GoogleCalendarImportCoordinatorTest {
     }
 
     @Test
+    fun operationGateClosingAfterConfigurationJournalCheckStopsTransportMutation() = runBlocking {
+        val operationAllowed = AtomicBoolean(true)
+        val journals = InMemoryGoogleImportJournalStore()
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, accountId ->
+                RemoteGoogleCollections(
+                    listOf(
+                        collection(
+                            accountId = accountId,
+                            id = COLLECTION_A,
+                        ),
+                    ),
+                )
+            }
+        }
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = journals,
+            pipeline = FakeGoogleImportPipeline(),
+            operationAllowed = operationAllowed::get,
+        )
+        assertEquals(
+            GoogleImportCollectionsOutcome.LOADED,
+            coordinator.loadCollections(ACCOUNT_A),
+        )
+        transport.collectionsCalls = 0
+        journals.beforeLoad = { operationAllowed.set(false) }
+
+        assertEquals(
+            GoogleImportConfigurationOutcome.RECOVERY_REQUIRED,
+            coordinator.configureCollection(
+                accountId = ACCOUNT_A,
+                collectionId = COLLECTION_A,
+                request = ConfigureGoogleCollectionRequest(
+                    expectedRevision = 1,
+                    kind = RemoteGoogleCollectionKind.CALENDAR,
+                    selected = true,
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
+            ),
+        )
+        assertEquals(0, transport.configureCalls)
+        assertEquals(0, transport.collectionsCalls)
+    }
+
+    @Test
+    fun successfulConfigurationResponseCannotReturnAProviderDeletedCollection() = runBlocking {
+        val original = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_A,
+            selected = false,
+            revision = 1,
+        )
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, _ -> RemoteGoogleCollections(listOf(original)) }
+            onConfigure = { _, _, _, request ->
+                collection(
+                    accountId = ACCOUNT_A,
+                    id = COLLECTION_A,
+                    kind = request.kind,
+                    role = request.syncRole,
+                    selected = request.selected,
+                    visible = request.visible,
+                    providerDeleted = true,
+                    revision = request.expectedRevision + 1,
+                    policy = request.effectiveCalendarPolicy,
+                )
+            }
+        }
+        val coordinator = coordinator(
+            FakeGoogleImportCredentials(),
+            transport,
+            InMemoryGoogleImportJournalStore(),
+            FakeGoogleImportPipeline(),
+        )
+        assertEquals(
+            GoogleImportCollectionsOutcome.LOADED,
+            coordinator.loadCollections(ACCOUNT_A),
+        )
+
+        assertEquals(
+            GoogleImportConfigurationOutcome.OFFLINE,
+            coordinator.configureCollection(
+                accountId = ACCOUNT_A,
+                collectionId = COLLECTION_A,
+                request = ConfigureGoogleCollectionRequest(
+                    expectedRevision = 1,
+                    kind = RemoteGoogleCollectionKind.CALENDAR,
+                    selected = false,
+                    visible = false,
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
+            ),
+        )
+        assertEquals(1, transport.configureCalls)
+        assertEquals(1L, coordinator.state.value.accounts[ACCOUNT_A]
+            ?.collections?.single()?.revision)
+    }
+
+    @Test
+    fun lostConfigurationResponseCannotReconcileThroughAProviderDeletedCollection() = runBlocking {
+        val original = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_A,
+            selected = false,
+            revision = 1,
+        )
+        val deleted = original.copy(
+            providerDeleted = true,
+            visible = false,
+            revision = 2,
+        )
+        val reads = ArrayDeque(listOf(original, deleted))
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, _ -> RemoteGoogleCollections(listOf(reads.removeFirst())) }
+            onConfigure = { _, _, _, _ -> throw IOException("synthetic lost response") }
+        }
+        val coordinator = coordinator(
+            FakeGoogleImportCredentials(),
+            transport,
+            InMemoryGoogleImportJournalStore(),
+            FakeGoogleImportPipeline(),
+        )
+        assertEquals(
+            GoogleImportCollectionsOutcome.LOADED,
+            coordinator.loadCollections(ACCOUNT_A),
+        )
+        transport.collectionsCalls = 0
+
+        assertEquals(
+            GoogleImportConfigurationOutcome.OFFLINE,
+            coordinator.configureCollection(
+                accountId = ACCOUNT_A,
+                collectionId = COLLECTION_A,
+                request = ConfigureGoogleCollectionRequest(
+                    expectedRevision = 1,
+                    kind = RemoteGoogleCollectionKind.CALENDAR,
+                    selected = false,
+                    visible = false,
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
+            ),
+        )
+        assertEquals(1, transport.configureCalls)
+        assertEquals(1, transport.collectionsCalls)
+        assertEquals(1L, coordinator.state.value.accounts[ACCOUNT_A]
+            ?.collections?.single()?.revision)
+    }
+
+    @Test
     fun configurationConflictAndLostResponseReconcileOnlyThroughAuthoritativeGet() = runBlocking {
         for (failure in listOf<Exception>(
             GoogleCalendarInboundApiException.Conflict(),
@@ -522,8 +678,11 @@ class GoogleCalendarImportCoordinatorTest {
                     request = ConfigureGoogleCollectionRequest(
                         expectedRevision = 1,
                         kind = RemoteGoogleCollectionKind.CALENDAR,
-                        role = GoogleInboundCollectionRole.BLOCKING,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.BLOCKING,
                     ),
+                    hasCalendarWriteScope = false,
+                    hasTasksWriteScope = false,
                 ),
             )
             assertEquals(1, transport.configureCalls)
@@ -534,7 +693,78 @@ class GoogleCalendarImportCoordinatorTest {
     }
 
     @Test
-    fun taskListsCanBeEnabledAndDisabledOnlyAsReadOnlySources() = runBlocking {
+    fun lostWritableResponseReconcilesOnlyTheExactPublicationPolicyAndFlags() = runBlocking {
+        val policy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+            confirmedBusy = RemoteGoogleEventDisposition.VISIBLE_NONBLOCKING,
+            tentative = RemoteGoogleEventDisposition.BLOCKING,
+            free = RemoteGoogleEventDisposition.IGNORE,
+            allDay = RemoteGoogleEventDisposition.BLOCKING,
+            publishAllDay = true,
+            publishTentative = true,
+            publishFree = true,
+        )
+        val cached = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_A,
+            role = RemoteGoogleSyncRole.READ_ONLY,
+            selected = true,
+            providerAccessRole = "writer",
+            revision = 1,
+        )
+        val authoritative = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_A,
+            role = RemoteGoogleSyncRole.WRITABLE,
+            selected = true,
+            visible = false,
+            providerAccessRole = "writer",
+            revision = 2,
+            policy = policy,
+        )
+        val reads = ArrayDeque(listOf(cached, authoritative))
+        val transport = FakeGoogleInboundTransport().apply {
+            onConfigure = { _, _, _, _ -> throw IOException("synthetic lost response") }
+            onCollections = { _, _ -> RemoteGoogleCollections(listOf(reads.removeFirst())) }
+        }
+        val coordinator = coordinator(
+            FakeGoogleImportCredentials(),
+            transport,
+            InMemoryGoogleImportJournalStore(),
+            FakeGoogleImportPipeline(),
+        )
+        assertEquals(
+            GoogleImportCollectionsOutcome.LOADED,
+            coordinator.loadCollections(ACCOUNT_A),
+        )
+        transport.collectionsCalls = 0
+
+        assertEquals(
+            GoogleImportConfigurationOutcome.RECONCILED,
+            coordinator.configureCollection(
+                accountId = ACCOUNT_A,
+                collectionId = COLLECTION_A,
+                request = ConfigureGoogleCollectionRequest(
+                    expectedRevision = 1,
+                    kind = RemoteGoogleCollectionKind.CALENDAR,
+                    selected = true,
+                    visible = false,
+                    syncRole = RemoteGoogleSyncRole.WRITABLE,
+                    calendarPolicy = policy,
+                ),
+                hasCalendarWriteScope = true,
+                hasTasksWriteScope = false,
+            ),
+        )
+        val installed = coordinator.state.value.accounts[ACCOUNT_A]?.collections?.single()
+        assertEquals(RemoteGoogleSyncRole.WRITABLE, installed?.syncRole)
+        assertEquals(policy, installed?.calendarPolicy)
+        assertFalse(installed?.visible == true)
+        assertEquals(1, transport.configureCalls)
+        assertEquals(1, transport.collectionsCalls)
+    }
+
+    @Test
+    fun taskListsKeepSelectionAndVisibilityIndependentWhenImportIsToggled() = runBlocking {
         val transport = FakeGoogleInboundTransport()
         val coordinator = coordinator(
             FakeGoogleImportCredentials(),
@@ -568,9 +798,12 @@ class GoogleCalendarImportCoordinatorTest {
                 request = ConfigureGoogleCollectionRequest(
                     expectedRevision = 1,
                     kind = RemoteGoogleCollectionKind.TASK_LIST,
-                    role = GoogleInboundCollectionRole.READ_ONLY,
+                    selected = true,
                     visible = false,
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
                 ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
             ),
         )
         val enabled = coordinator.state.value.accounts[ACCOUNT_A]?.collections?.single()
@@ -587,14 +820,18 @@ class GoogleCalendarImportCoordinatorTest {
                 request = ConfigureGoogleCollectionRequest(
                     expectedRevision = 2,
                     kind = RemoteGoogleCollectionKind.TASK_LIST,
-                    role = GoogleInboundCollectionRole.OFF,
+                    selected = false,
+                    visible = true,
+                    syncRole = RemoteGoogleSyncRole.READ_ONLY,
                 ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
             ),
         )
         val disabled = coordinator.state.value.accounts[ACCOUNT_A]?.collections?.single()
         assertEquals(RemoteGoogleCollectionKind.TASK_LIST, disabled?.kind)
         assertFalse(disabled?.selected == true)
-        assertFalse(disabled?.visible == true)
+        assertTrue(disabled?.visible == true)
         assertEquals(2, transport.configureCalls)
         assertEquals(0, transport.collectionsCalls)
     }
@@ -617,14 +854,224 @@ class GoogleCalendarImportCoordinatorTest {
                 request = ConfigureGoogleCollectionRequest(
                     expectedRevision = 1,
                     kind = RemoteGoogleCollectionKind.TASK_LIST,
-                    role = GoogleInboundCollectionRole.BLOCKING,
+                    selected = true,
+                    syncRole = RemoteGoogleSyncRole.BLOCKING,
                 ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
             ),
         )
         assertEquals(0, transport.configureCalls)
         assertEquals(0, transport.collectionsCalls)
         assertEquals(GoogleCalendarImportPhase.ERROR, coordinator.state.value.phase)
     }
+
+    @Test
+    fun writableConfigurationRequiresSelectionExactScopeAndCalendarProviderAuthority() =
+        runBlocking {
+            data class WritableCase(
+                val label: String,
+                val kind: RemoteGoogleCollectionKind,
+                val providerAccessRole: String?,
+                val selected: Boolean,
+                val calendarScope: Boolean,
+                val tasksScope: Boolean,
+                val succeeds: Boolean,
+            )
+
+            val cases = listOf(
+                WritableCase(
+                    "calendar owner with scope",
+                    RemoteGoogleCollectionKind.CALENDAR,
+                    "owner",
+                    true,
+                    calendarScope = true,
+                    tasksScope = false,
+                    succeeds = true,
+                ),
+                WritableCase(
+                    "calendar writer with scope",
+                    RemoteGoogleCollectionKind.CALENDAR,
+                    "writer",
+                    true,
+                    calendarScope = true,
+                    tasksScope = false,
+                    succeeds = true,
+                ),
+                WritableCase(
+                    "calendar owner without scope",
+                    RemoteGoogleCollectionKind.CALENDAR,
+                    "owner",
+                    true,
+                    calendarScope = false,
+                    tasksScope = true,
+                    succeeds = false,
+                ),
+                WritableCase(
+                    "calendar reader with scope",
+                    RemoteGoogleCollectionKind.CALENDAR,
+                    "reader",
+                    true,
+                    calendarScope = true,
+                    tasksScope = true,
+                    succeeds = false,
+                ),
+                WritableCase(
+                    "task list with scope",
+                    RemoteGoogleCollectionKind.TASK_LIST,
+                    null,
+                    true,
+                    calendarScope = false,
+                    tasksScope = true,
+                    succeeds = true,
+                ),
+                WritableCase(
+                    "task list without scope",
+                    RemoteGoogleCollectionKind.TASK_LIST,
+                    null,
+                    true,
+                    calendarScope = true,
+                    tasksScope = false,
+                    succeeds = false,
+                ),
+                WritableCase(
+                    "writable but unselected",
+                    RemoteGoogleCollectionKind.CALENDAR,
+                    "owner",
+                    false,
+                    calendarScope = true,
+                    tasksScope = true,
+                    succeeds = false,
+                ),
+            )
+
+            cases.forEach { case ->
+                val transport = FakeGoogleInboundTransport().apply {
+                    onCollections = { _, _ ->
+                        RemoteGoogleCollections(
+                            listOf(
+                                collection(
+                                    accountId = ACCOUNT_A,
+                                    id = COLLECTION_A,
+                                    kind = case.kind,
+                                    selected = true,
+                                    providerAccessRole = case.providerAccessRole,
+                                ),
+                            ),
+                        )
+                    }
+                }
+                val coordinator = coordinator(
+                    FakeGoogleImportCredentials(),
+                    transport,
+                    InMemoryGoogleImportJournalStore(),
+                    FakeGoogleImportPipeline(),
+                )
+                assertEquals(
+                    case.label,
+                    GoogleImportCollectionsOutcome.LOADED,
+                    coordinator.loadCollections(ACCOUNT_A),
+                )
+                transport.collectionsCalls = 0
+
+                val outcome = coordinator.configureCollection(
+                    accountId = ACCOUNT_A,
+                    collectionId = COLLECTION_A,
+                    request = ConfigureGoogleCollectionRequest(
+                        expectedRevision = 1,
+                        kind = case.kind,
+                        selected = case.selected,
+                        visible = false,
+                        syncRole = RemoteGoogleSyncRole.WRITABLE,
+                        calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                            publishFree = true,
+                        ),
+                    ),
+                    hasCalendarWriteScope = case.calendarScope,
+                    hasTasksWriteScope = case.tasksScope,
+                )
+
+                assertEquals(
+                    case.label,
+                    if (case.succeeds) {
+                        GoogleImportConfigurationOutcome.CONFIGURED
+                    } else {
+                        GoogleImportConfigurationOutcome.FAILED
+                    },
+                    outcome,
+                )
+                assertEquals(case.label, if (case.succeeds) 1 else 0, transport.configureCalls)
+                assertEquals(case.label, 0, transport.collectionsCalls)
+                if (case.succeeds) {
+                    val configured = coordinator.state.value.accounts[ACCOUNT_A]
+                        ?.collections?.single()
+                    assertEquals(RemoteGoogleSyncRole.WRITABLE, configured?.syncRole)
+                    assertTrue(configured?.selected == true)
+                    assertFalse(configured?.visible == true)
+                    assertEquals(
+                        case.kind == RemoteGoogleCollectionKind.CALENDAR,
+                        configured?.calendarPolicy?.publishFree,
+                    )
+                }
+            }
+        }
+
+    @Test
+    fun writableSourceCanBeDowngradedWithoutWriteScopeAndPublicationFlagsAreStripped() =
+        runBlocking {
+            val writablePolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                publishAllDay = true,
+                publishTentative = true,
+                publishFree = true,
+            )
+            val transport = FakeGoogleInboundTransport().apply {
+                onCollections = { _, _ ->
+                    RemoteGoogleCollections(
+                        listOf(
+                            collection(
+                                accountId = ACCOUNT_A,
+                                id = COLLECTION_A,
+                                role = RemoteGoogleSyncRole.WRITABLE,
+                                selected = true,
+                                providerAccessRole = "owner",
+                                policy = writablePolicy,
+                            ),
+                        ),
+                    )
+                }
+            }
+            val coordinator = coordinator(
+                FakeGoogleImportCredentials(),
+                transport,
+                InMemoryGoogleImportJournalStore(),
+                FakeGoogleImportPipeline(),
+            )
+            assertEquals(
+                GoogleImportCollectionsOutcome.LOADED,
+                coordinator.loadCollections(ACCOUNT_A),
+            )
+
+            assertEquals(
+                GoogleImportConfigurationOutcome.CONFIGURED,
+                coordinator.configureCollection(
+                    accountId = ACCOUNT_A,
+                    collectionId = COLLECTION_A,
+                    request = ConfigureGoogleCollectionRequest(
+                        expectedRevision = 1,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = true,
+                        visible = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                        calendarPolicy = writablePolicy,
+                    ),
+                    hasCalendarWriteScope = false,
+                    hasTasksWriteScope = false,
+                ),
+            )
+            val configured = coordinator.state.value.accounts[ACCOUNT_A]?.collections?.single()
+            assertEquals(RemoteGoogleSyncRole.READ_ONLY, configured?.syncRole)
+            assertTrue(configured?.calendarPolicy?.hasNoPublication == true)
+        }
 
     @Test
     fun configurationRequiresExactMutableCachedAuthoritativeSourceWithoutNetworkPreflight() =
@@ -642,14 +1089,6 @@ class GoogleCalendarImportCoordinatorTest {
                     id = COLLECTION_A,
                     kind = RemoteGoogleCollectionKind.TASK_LIST,
                     revision = 2,
-                ),
-                "writable" to collection(
-                    accountId = ACCOUNT_A,
-                    id = COLLECTION_A,
-                    kind = RemoteGoogleCollectionKind.TASK_LIST,
-                    role = RemoteGoogleSyncRole.WRITABLE,
-                    selected = true,
-                    revision = 1,
                 ),
                 "provider deleted" to collection(
                     accountId = ACCOUNT_A,
@@ -690,8 +1129,11 @@ class GoogleCalendarImportCoordinatorTest {
                         request = ConfigureGoogleCollectionRequest(
                             expectedRevision = 1,
                             kind = RemoteGoogleCollectionKind.TASK_LIST,
-                            role = GoogleInboundCollectionRole.READ_ONLY,
+                            selected = true,
+                            syncRole = RemoteGoogleSyncRole.READ_ONLY,
                         ),
+                        hasCalendarWriteScope = false,
+                        hasTasksWriteScope = false,
                     ),
                 )
                 assertEquals("$caseName mutation calls", 0, transport.configureCalls)
@@ -758,10 +1200,13 @@ class GoogleCalendarImportCoordinatorTest {
                     request = ConfigureGoogleCollectionRequest(
                         expectedRevision = 1,
                         kind = RemoteGoogleCollectionKind.TASK_LIST,
-                        role = GoogleInboundCollectionRole.READ_ONLY,
+                        selected = true,
                         visible = false,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                         calendarPolicy = policy,
                     ),
+                    hasCalendarWriteScope = false,
+                    hasTasksWriteScope = false,
                 ),
             )
             val installed = coordinator.state.value.accounts[ACCOUNT_A]?.collections?.single()
@@ -838,9 +1283,12 @@ class GoogleCalendarImportCoordinatorTest {
                     request = ConfigureGoogleCollectionRequest(
                         expectedRevision = 1,
                         kind = RemoteGoogleCollectionKind.TASK_LIST,
-                        role = GoogleInboundCollectionRole.READ_ONLY,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                         calendarPolicy = policy,
                     ),
+                    hasCalendarWriteScope = false,
+                    hasTasksWriteScope = false,
                 ),
             )
             assertEquals(1, transport.configureCalls)
@@ -883,6 +1331,7 @@ class GoogleCalendarImportCoordinatorTest {
             displayName = "Private work calendar",
             role = RemoteGoogleSyncRole.WRITABLE,
             providerDeleted = true,
+            selected = false,
             policy = RemoteGoogleCalendarPolicy.inboundDefault().copy(publishAllDay = true),
         )
         val second = collection(
@@ -918,7 +1367,15 @@ class GoogleCalendarImportCoordinatorTest {
             "owner",
             state.accounts[ACCOUNT_A]?.collections?.single()?.providerAccessRole,
         )
-        assertTrue(state.accounts[ACCOUNT_A]?.collections?.single()?.providerDeleted == true)
+        val retained = state.accounts[ACCOUNT_A]?.collections?.single()
+        assertTrue(retained?.providerDeleted == true)
+        assertEquals(writable.configuredAt, retained?.configuredAt)
+        assertEquals(writable.planningProjectionState, retained?.planningProjectionState)
+        assertEquals(writable.planningGeneration, retained?.planningGeneration)
+        assertEquals(writable.planningCollectionRevision, retained?.planningCollectionRevision)
+        assertEquals(writable.planningWindowStart, retained?.planningWindowStart)
+        assertEquals(writable.planningWindowEnd, retained?.planningWindowEnd)
+        assertEquals(writable.planningWindowRefreshedAt, retained?.planningWindowRefreshedAt)
         val diagnostic = state.toString() + writable.toStateForDiagnostic().toString()
         assertFalse(diagnostic.contains(ACCOUNT_A))
         assertFalse(diagnostic.contains(CONFIGURATION_A))
@@ -1040,7 +1497,7 @@ class GoogleCalendarImportCoordinatorTest {
     }
 
     @Test
-    fun disabledOperationGateSuppressesPublicationBeforeQuarantineAdvancesGeneration() =
+    fun disabledOperationGateRejectsPublicationBeforeQuarantineAdvancesGeneration() =
         runBlocking {
             val journals = InMemoryGoogleImportJournalStore()
             val operationAllowed = AtomicBoolean(true)
@@ -1085,7 +1542,7 @@ class GoogleCalendarImportCoordinatorTest {
             }
 
             assertEquals(
-                GoogleImportCollectionsOutcome.LOADED,
+                GoogleImportCollectionsOutcome.RECOVERY_REQUIRED,
                 withTimeout(5_000) { operation.await() },
             )
             assertEquals(GoogleCalendarImportPhase.READY, coordinator.state.value.phase)
@@ -1157,6 +1614,78 @@ class GoogleCalendarImportCoordinatorTest {
     }
 
     @Test
+    fun reauthorizationRequiredRunKeepsAcceptedIdentityUntilServerWakesIt() = runBlocking {
+        val acceptedJournal = preparedJournal().recordingAcceptance(4, NOW.toEpochMilli())
+        val journals = InMemoryGoogleImportJournalStore().apply {
+            this.journals += acceptedJournal
+        }
+        val statuses = ArrayDeque(
+            listOf(
+                status(run(ACCOUNT_A, RemoteGoogleSyncRunState.REAUTHORIZATION_REQUIRED, 4, 0)),
+                status(run(ACCOUNT_A, RemoteGoogleSyncRunState.IDLE, 4, 4)),
+            ),
+        )
+        val transport = FakeGoogleInboundTransport().apply {
+            onStatus = { _, _ -> statuses.removeFirst() }
+        }
+        val pipeline = FakeGoogleImportPipeline()
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = journals,
+            pipeline = pipeline,
+        )
+
+        assertEquals(GoogleCalendarImportOutcome.AUTH_REQUIRED, coordinator.refresh(ACCOUNT_A))
+        assertTrue(transport.refreshRequestIds.isEmpty())
+        assertEquals(listOf(acceptedJournal), journals.journals)
+        assertEquals(
+            RemoteGoogleSyncRunState.REAUTHORIZATION_REQUIRED,
+            coordinator.state.value.accounts[ACCOUNT_A]?.run?.state,
+        )
+
+        assertEquals(GoogleCalendarImportOutcome.COMPLETED, coordinator.refresh(ACCOUNT_A))
+        assertTrue(transport.refreshRequestIds.isEmpty())
+        assertTrue(journals.journals.isEmpty())
+        assertEquals(1, pipeline.inputs.size)
+    }
+
+    @Test
+    fun listAcceptsInactivePublicationPolicyAndUnselectedWritableDestination() = runBlocking {
+        val unselectedWritable = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_A,
+            role = RemoteGoogleSyncRole.WRITABLE,
+            selected = false,
+        )
+        val downgraded = collection(
+            accountId = ACCOUNT_A,
+            id = COLLECTION_B,
+            role = RemoteGoogleSyncRole.READ_ONLY,
+            selected = true,
+            providerAccessRole = "reader",
+            policy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                publishAllDay = true,
+                publishTentative = true,
+                publishFree = true,
+            ),
+        )
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = FakeGoogleInboundTransport().apply {
+                onCollections = { _, _ ->
+                    RemoteGoogleCollections(listOf(unselectedWritable, downgraded))
+                }
+            },
+            journals = InMemoryGoogleImportJournalStore(),
+            pipeline = FakeGoogleImportPipeline(),
+        )
+
+        assertEquals(GoogleImportCollectionsOutcome.LOADED, coordinator.loadCollections(ACCOUNT_A))
+        assertEquals(2, coordinator.state.value.accounts[ACCOUNT_A]?.collections?.size)
+    }
+
+    @Test
     fun sourceConfigurationIsFencedUntilSavedImportFinishes() = runBlocking {
         val journals = InMemoryGoogleImportJournalStore().apply {
             this.journals += preparedJournal()
@@ -1178,8 +1707,11 @@ class GoogleCalendarImportCoordinatorTest {
                 request = ConfigureGoogleCollectionRequest(
                     expectedRevision = 1,
                     kind = RemoteGoogleCollectionKind.CALENDAR,
-                    role = GoogleInboundCollectionRole.BLOCKING,
+                    selected = true,
+                    syncRole = RemoteGoogleSyncRole.BLOCKING,
                 ),
+                hasCalendarWriteScope = false,
+                hasTasksWriteScope = false,
             ),
         )
         assertEquals(setOf(ACCOUNT_A), coordinator.state.value.pendingRecoveryAccountIds)
@@ -1287,6 +1819,13 @@ class GoogleCalendarImportCoordinatorTest {
             selected: Boolean = role != RemoteGoogleSyncRole.READ_ONLY,
             visible: Boolean = true,
             providerDeleted: Boolean = false,
+            providerAccessRole: String? = if (
+                role == RemoteGoogleSyncRole.WRITABLE
+            ) {
+                "owner"
+            } else {
+                "reader"
+            },
             revision: Long = 1,
             policy: RemoteGoogleCalendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault(),
         ): RemoteGoogleSyncCollection = RemoteGoogleSyncCollection(
@@ -1295,7 +1834,7 @@ class GoogleCalendarImportCoordinatorTest {
             kind = kind,
             remoteCollectionId = "remote-$id",
             displayName = displayName,
-            providerAccessRole = if (role == RemoteGoogleSyncRole.WRITABLE) "owner" else "reader",
+            providerAccessRole = providerAccessRole,
             providerPrimary = true,
             providerSelected = true,
             providerHidden = false,
@@ -1505,16 +2044,11 @@ private class FakeGoogleInboundTransport : GoogleCalendarInboundTransport {
             accountId = accountId,
             id = collectionId,
             kind = request.kind,
-            role = when (request.role) {
-                GoogleInboundCollectionRole.BLOCKING -> RemoteGoogleSyncRole.BLOCKING
-                GoogleInboundCollectionRole.OFF,
-                GoogleInboundCollectionRole.READ_ONLY,
-                -> RemoteGoogleSyncRole.READ_ONLY
-            },
-            selected = request.role != GoogleInboundCollectionRole.OFF,
-            visible = request.role != GoogleInboundCollectionRole.OFF && request.visible,
+            role = request.syncRole,
+            selected = request.selected,
+            visible = request.visible,
             revision = request.expectedRevision + 1,
-            policy = request.calendarPolicy,
+            policy = request.effectiveCalendarPolicy,
         )
     }
     var onStatus: suspend (

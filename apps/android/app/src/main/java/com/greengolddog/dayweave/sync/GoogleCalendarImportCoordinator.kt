@@ -7,15 +7,15 @@ import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.network.GoogleCalendarInboundApiException
 import com.greengolddog.dayweave.network.GoogleCalendarInboundTransport
-import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
 import com.greengolddog.dayweave.network.RemoteGoogleCalendarPolicy
+import com.greengolddog.dayweave.network.RemoteGoogleCalendarProjectionState
 import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
 import com.greengolddog.dayweave.network.RemoteGoogleSyncCollection
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRole
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRunState
 import com.greengolddog.dayweave.network.RemoteGoogleSyncRunStatus
 import com.greengolddog.dayweave.network.RemoteGoogleSyncStatus
-import com.greengolddog.dayweave.network.hasSupportedInboundRole
+import com.greengolddog.dayweave.network.hasSupportedRole
 import java.io.IOException
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -62,6 +62,15 @@ data class GoogleImportCollectionState(
     val lastImportAt: String?,
     /** Provider authority is required to prove an outbound Calendar target is owner/writer. */
     val providerAccessRole: String? = null,
+    /** Exact server evidence retained for onboarding and post-refresh completion checks. */
+    val configuredAt: String? = null,
+    val planningProjectionState: RemoteGoogleCalendarProjectionState =
+        RemoteGoogleCalendarProjectionState.UNINITIALIZED,
+    val planningGeneration: Long = 0,
+    val planningCollectionRevision: Long? = null,
+    val planningWindowStart: String? = null,
+    val planningWindowEnd: String? = null,
+    val planningWindowRefreshedAt: String? = null,
 ) {
     /** Calendar names and server identifiers are private even though they are not credentials. */
     override fun toString(): String =
@@ -289,6 +298,8 @@ class GoogleCalendarImportCoordinator(
         accountId: String,
         collectionId: String,
         request: ConfigureGoogleCollectionRequest,
+        hasCalendarWriteScope: Boolean,
+        hasTasksWriteScope: Boolean,
     ): GoogleImportConfigurationOutcome {
         val lifecycle = lifecycleGeneration.get()
         val binding = authenticatedBinding(lifecycle)
@@ -326,8 +337,8 @@ class GoogleCalendarImportCoordinator(
                 }
                 if (
                     request.expectedRevision !in 1 until Long.MAX_VALUE ||
-                    !request.hasSupportedInboundRole ||
-                    !request.calendarPolicy.isInboundOnly
+                    !request.hasSupportedRole ||
+                    request.syncRole == RemoteGoogleSyncRole.WRITABLE && !request.selected
                 ) {
                     updateFailure(
                         lifecycle,
@@ -350,7 +361,11 @@ class GoogleCalendarImportCoordinator(
                     cachedAuthoritative.revision != request.expectedRevision ||
                     cachedAuthoritative.kind != request.kind ||
                     cachedAuthoritative.providerDeleted ||
-                    cachedAuthoritative.syncRole == RemoteGoogleSyncRole.WRITABLE
+                    !request.hasAuthorizedWriteTarget(
+                        cachedAuthoritative,
+                        hasCalendarWriteScope,
+                        hasTasksWriteScope,
+                    )
                 ) {
                     updateFailure(
                         lifecycle,
@@ -369,6 +384,7 @@ class GoogleCalendarImportCoordinator(
                         activeAccountId = accountId,
                     ),
                 )
+                requireCurrent(lifecycle, binding)
                 val updated = try {
                     transport.configure(
                         configuration = binding.configuration,
@@ -390,7 +406,13 @@ class GoogleCalendarImportCoordinator(
                         request = request,
                     )
                     if (authoritative != null) {
-                        installCollections(lifecycle, binding, accountId, authoritative.second)
+                        installCollections(
+                            lifecycle,
+                            binding,
+                            accountId,
+                            authoritative.second,
+                            invalidateRun = true,
+                        )
                         setState(
                             lifecycle,
                             mutableState.value.copy(
@@ -879,14 +901,6 @@ class GoogleCalendarImportCoordinator(
                 }
 
                 RemoteGoogleSyncRunState.REAUTHORIZATION_REQUIRED -> {
-                    if (allowTerminalRestart) {
-                        return restartTerminalImport(
-                            lifecycle,
-                            binding,
-                            journal,
-                            onCanonicalCompletion,
-                        )
-                    }
                     updateFailure(
                         lifecycle,
                         binding,
@@ -1119,6 +1133,8 @@ class GoogleCalendarImportCoordinator(
             val candidate = collections.firstOrNull { it.id == collectionId } ?: return null
             return if (
                 candidate.revision > request.expectedRevision &&
+                candidate.configuredAt != null &&
+                !candidate.providerDeleted &&
                 candidate.matches(request)
             ) {
                 candidate to collections
@@ -1143,6 +1159,7 @@ class GoogleCalendarImportCoordinator(
         if (
             collection.id != collectionId ||
             collection.revision != request.expectedRevision + 1 ||
+            collection.configuredAt == null || collection.providerDeleted ||
             !collection.matches(request)
         ) {
             throw GoogleCalendarInboundApiException.InvalidResponse()
@@ -1169,12 +1186,23 @@ class GoogleCalendarImportCoordinator(
             collection.kind != RemoteGoogleCollectionKind.TASK_LIST ||
                 collection.syncRole != RemoteGoogleSyncRole.BLOCKING,
         )
+        require(!collection.providerDeleted || !collection.selected)
         require(
-            collection.syncRole == RemoteGoogleSyncRole.WRITABLE ||
-                collection.calendarPolicy.isInboundOnly,
+            collection.kind != RemoteGoogleCollectionKind.CALENDAR ||
+                collection.syncRole != RemoteGoogleSyncRole.WRITABLE ||
+                collection.providerAccessRole in setOf("owner", "writer"),
         )
-        // Another client (for example macOS) may have configured WRITABLE. Android displays that
-        // authoritative state but its inbound-only ConfigureGoogleCollectionRequest can never send it.
+        collection.configuredAt?.let(Instant::parse)
+        collection.lastImportAt?.let(Instant::parse)
+        require(collection.planningGeneration >= 0)
+        require(collection.planningCollectionRevision?.let { it > 0 } ?: true)
+        val windowStart = collection.planningWindowStart?.let(Instant::parse)
+        val windowEnd = collection.planningWindowEnd?.let(Instant::parse)
+        require(
+            windowStart == null && windowEnd == null ||
+                windowStart != null && windowEnd != null && windowStart.isBefore(windowEnd),
+        )
+        collection.planningWindowRefreshedAt?.let(Instant::parse)
     }
 
     private fun validateSyncStatus(
@@ -1222,7 +1250,9 @@ class GoogleCalendarImportCoordinator(
             lifecycle,
             current.copy(
                 accounts = current.accounts +
-                    (updated.accountId to account.copy(collections = collections)),
+                    // A selected configuration increments the authoritative refresh generation.
+                    // A cached run can no longer prove this collection revision was imported.
+                    (updated.accountId to account.copy(collections = collections, run = null)),
             ),
         )
     }
@@ -1232,14 +1262,17 @@ class GoogleCalendarImportCoordinator(
         binding: BoundGoogleImportConfiguration,
         accountId: String,
         collections: List<RemoteGoogleSyncCollection>,
+        invalidateRun: Boolean = false,
     ) {
         val current = stateFor(binding)
         val account = current.accounts[accountId] ?: GoogleImportAccountState()
         setState(
             lifecycle,
             current.copy(
-                accounts = current.accounts +
-                    (accountId to account.copy(collections = collections.map { it.toState() })),
+                accounts = current.accounts + (accountId to account.copy(
+                    collections = collections.map { it.toState() },
+                    run = if (invalidateRun) null else account.run,
+                )),
             ),
         )
     }
@@ -1302,7 +1335,7 @@ class GoogleCalendarImportCoordinator(
         binding: BoundGoogleImportConfiguration,
     ) {
         if (
-            !importAllowed() || lifecycleGeneration.get() != lifecycle ||
+            !operationAllowed() || !importAllowed() || lifecycleGeneration.get() != lifecycle ||
             !sameBinding(credentialStore.snapshot(), binding.snapshot)
         ) {
             throw StaleGoogleImportOperationException()
@@ -1667,18 +1700,18 @@ class GoogleCalendarImportCoordinator(
         const val COLLECTIONS_INVALID = "The selected Google account is invalid."
         const val COLLECTIONS_OFFLINE = "Google Calendar sources are unavailable while offline."
         const val COLLECTIONS_FAILED = "Google Calendar sources could not be loaded safely."
-        const val CONFIGURATION_SAVING = "Saving the Google Calendar import policy…"
-        const val CONFIGURATION_SAVED = "The Google Calendar import policy was saved."
+        const val CONFIGURATION_SAVING = "Saving the Google source settings…"
+        const val CONFIGURATION_SAVED = "The Google source settings were saved."
         const val CONFIGURATION_RECONCILED =
-            "The Google Calendar import policy was verified from authoritative state."
-        const val CONFIGURATION_INVALID = "The Google Calendar source request is invalid."
+            "The Google source settings were verified from authoritative state."
+        const val CONFIGURATION_INVALID = "The Google source request is invalid."
         const val CONFIGURATION_CONFLICT =
-            "The Google Calendar source changed elsewhere; reload before trying again."
+            "The Google source changed elsewhere; reload before trying again."
         const val CONFIGURATION_UNRESOLVED =
-            "The Google Calendar change is unconfirmed; authoritative state will be checked again."
-        const val CONFIGURATION_FAILED = "The Google Calendar import policy was not changed."
+            "The Google source change is unconfirmed; authoritative state will be checked again."
+        const val CONFIGURATION_FAILED = "The Google source settings were not changed."
         const val CONFIGURATION_IMPORT_PENDING =
-            "Finish the saved Google import before changing Calendar source settings."
+            "Finish the saved Google import before changing source settings."
         const val REFRESH_INVALID = "The selected Google account is invalid."
         const val REFRESH_PREPARING = "Saving a recoverable Google import request…"
         const val REFRESH_REQUESTING = "Requesting a Google Calendar import…"
@@ -1748,20 +1781,24 @@ class GoogleCalendarImportCoordinator(
 }
 
 private fun RemoteGoogleSyncCollection.matches(request: ConfigureGoogleCollectionRequest): Boolean {
-    val expectedSelected = request.role != GoogleInboundCollectionRole.OFF
-    val expectedVisible =
-        request.role != GoogleInboundCollectionRole.OFF && request.visible
-    val expectedRole = when (request.role) {
-        GoogleInboundCollectionRole.OFF,
-        GoogleInboundCollectionRole.READ_ONLY,
-        -> RemoteGoogleSyncRole.READ_ONLY
-        GoogleInboundCollectionRole.BLOCKING -> RemoteGoogleSyncRole.BLOCKING
-    }
     return kind == request.kind &&
-        selected == expectedSelected &&
-        visible == expectedVisible &&
-        syncRole == expectedRole &&
-        calendarPolicy == request.calendarPolicy
+        selected == request.selected &&
+        visible == request.visible &&
+        syncRole == request.syncRole &&
+        calendarPolicy == request.effectiveCalendarPolicy
+}
+
+private fun ConfigureGoogleCollectionRequest.hasAuthorizedWriteTarget(
+    collection: GoogleImportCollectionState,
+    hasCalendarWriteScope: Boolean,
+    hasTasksWriteScope: Boolean,
+): Boolean {
+    if (syncRole != RemoteGoogleSyncRole.WRITABLE) return true
+    return when (kind) {
+        RemoteGoogleCollectionKind.CALENDAR ->
+            hasCalendarWriteScope && collection.providerAccessRole in setOf("owner", "writer")
+        RemoteGoogleCollectionKind.TASK_LIST -> hasTasksWriteScope
+    }
 }
 
 private fun RemoteGoogleSyncCollection.toState(): GoogleImportCollectionState =
@@ -1778,6 +1815,13 @@ private fun RemoteGoogleSyncCollection.toState(): GoogleImportCollectionState =
         revision = revision,
         lastImportAt = lastImportAt,
         providerAccessRole = providerAccessRole,
+        configuredAt = configuredAt,
+        planningProjectionState = planningProjectionState,
+        planningGeneration = planningGeneration,
+        planningCollectionRevision = planningCollectionRevision,
+        planningWindowStart = planningWindowStart,
+        planningWindowEnd = planningWindowEnd,
+        planningWindowRefreshedAt = planningWindowRefreshedAt,
     )
 
 private fun RemoteGoogleSyncRunStatus.toState(): GoogleImportRunState = GoogleImportRunState(

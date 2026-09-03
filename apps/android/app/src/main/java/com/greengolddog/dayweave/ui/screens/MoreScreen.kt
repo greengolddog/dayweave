@@ -56,8 +56,7 @@ import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.effectiveCanonicalSensitivity
-import com.greengolddog.dayweave.network.GoogleInboundCollectionRole
-import com.greengolddog.dayweave.network.RemoteGoogleCollectionKind
+import com.greengolddog.dayweave.network.ConfigureGoogleCollectionRequest
 import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
@@ -67,7 +66,11 @@ import com.greengolddog.dayweave.sync.CanonicalSyncState
 import com.greengolddog.dayweave.sync.GoogleAccountPhase
 import com.greengolddog.dayweave.sync.GoogleAccountState
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.sync.GoogleAuthorizationAction
+import com.greengolddog.dayweave.sync.GoogleAuthorizationRecoveryDiscardConfirmation
+import com.greengolddog.dayweave.sync.GoogleAuthorizationRecoveryResetConfirmation
 import com.greengolddog.dayweave.sync.GoogleCalendarImportState
+import com.greengolddog.dayweave.network.RemoteGoogleSyncRunState
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.ui.components.AppLockSettingsCard
@@ -93,6 +96,15 @@ fun MoreScreen(
     onRestartGoogleAuthorization: () -> Unit,
     onOpenGoogleAuthorization: (String) -> Unit,
     onReauthorizeGoogle: (String) -> Unit,
+    onEnableGoogleCalendarPublishing: (String) -> Unit,
+    onEnableGoogleTasksPublishing: (String) -> Unit,
+    authorizationRecoveryResetConfirmationProvider:
+        () -> GoogleAuthorizationRecoveryResetConfirmation?,
+    onResetGoogleAuthorizationRecovery: (GoogleAuthorizationRecoveryResetConfirmation) -> Unit,
+    authorizationRecoveryDiscardConfirmationProvider:
+        () -> GoogleAuthorizationRecoveryDiscardConfirmation?,
+    onDiscardGoogleAuthorizationRecovery:
+        (GoogleAuthorizationRecoveryDiscardConfirmation) -> Unit,
     onSetGooglePaused: (String, Boolean) -> Unit,
     onRequestGoogleDisconnect: (GoogleAccountSummary) -> Unit,
     onDiscoverGoogleSources: (String) -> Unit,
@@ -100,9 +112,7 @@ fun MoreScreen(
     onConfigureGoogleSource: (
         String,
         String,
-        Long,
-        RemoteGoogleCollectionKind,
-        GoogleInboundCollectionRole,
+        ConfigureGoogleCollectionRequest,
     ) -> Unit,
     onPublishGeneratedSchedule: () -> Unit = {},
     schedulePublicationHasRecovery: Boolean = false,
@@ -122,6 +132,12 @@ fun MoreScreen(
         mutableStateOf<CanonicalItemSnapshot?>(null)
     }
     var showPlanningProfileEditor by rememberSaveable { mutableStateOf(false) }
+    var pendingGoogleAuthorizationRecoveryReset by remember {
+        mutableStateOf<GoogleAuthorizationRecoveryResetConfirmation?>(null)
+    }
+    var pendingGoogleAuthorizationRecoveryDiscard by remember {
+        mutableStateOf<GoogleAuthorizationRecoveryDiscardConfirmation?>(null)
+    }
     val profileEditBlockedMessage = planningProfileEditBlockedMessage(
         state = state,
         canonicalActionBusy = canonicalSyncState.isBusy,
@@ -134,6 +150,77 @@ fun MoreScreen(
             showPlanningProfileEditor = false
             onAcknowledgeScheduleCompositionProfileUpdate()
         }
+    }
+    LaunchedEffect(googleAccountState.authorizationRecoveryDiscardRequired) {
+        if (!googleAccountState.authorizationRecoveryDiscardRequired) {
+            pendingGoogleAuthorizationRecoveryDiscard = null
+        }
+    }
+    LaunchedEffect(googleAccountState.authorizationRecoveryResetRequired) {
+        if (!googleAccountState.authorizationRecoveryResetRequired) {
+            pendingGoogleAuthorizationRecoveryReset = null
+        }
+    }
+    pendingGoogleAuthorizationRecoveryReset?.let { confirmation ->
+        AlertDialog(
+            onDismissRequest = { pendingGoogleAuthorizationRecoveryReset = null },
+            title = { Text("Discard saved Google authorization?") },
+            text = {
+                Text(
+                    "The saved authorization record is unreadable. Discarding it cannot " +
+                        "revoke a request that Google may already have accepted. Check the " +
+                        "Google connection afterward before starting another request.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingGoogleAuthorizationRecoveryReset = null
+                        onResetGoogleAuthorizationRecovery(confirmation)
+                    },
+                ) {
+                    Text("Discard local record")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingGoogleAuthorizationRecoveryReset = null },
+                ) {
+                    Text("Keep it")
+                }
+            },
+        )
+    }
+    pendingGoogleAuthorizationRecoveryDiscard?.let { confirmation ->
+        AlertDialog(
+            onDismissRequest = { pendingGoogleAuthorizationRecoveryDiscard = null },
+            title = { Text("Discard this saved Google authorization?") },
+            text = {
+                Text(
+                    "Google may already have accepted this exact authorization. Verify the " +
+                        "Google account and Planner API first. Discarding removes only " +
+                        "DayWeave’s local recovery record and cannot revoke a Google grant.",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingGoogleAuthorizationRecoveryDiscard = null
+                        onDiscardGoogleAuthorizationRecovery(confirmation)
+                    },
+                    modifier = Modifier.testTag("google_confirm_authorization_discard"),
+                ) {
+                    Text("Discard local record")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingGoogleAuthorizationRecoveryDiscard = null },
+                ) {
+                    Text("Keep it")
+                }
+            },
+        )
     }
     LazyColumn(
         modifier = modifier,
@@ -253,11 +340,26 @@ fun MoreScreen(
                 onRestartAuthorization = onRestartGoogleAuthorization,
                 onOpenAuthorization = onOpenGoogleAuthorization,
                 onReauthorize = onReauthorizeGoogle,
+                onEnableCalendarPublishing = onEnableGoogleCalendarPublishing,
+                onEnableTasksPublishing = onEnableGoogleTasksPublishing,
+                onRequestAuthorizationRecoveryReset = {
+                    pendingGoogleAuthorizationRecoveryReset =
+                        authorizationRecoveryResetConfirmationProvider()
+                },
+                onRequestAuthorizationRecoveryDiscard = {
+                    pendingGoogleAuthorizationRecoveryDiscard =
+                        authorizationRecoveryDiscardConfirmationProvider()
+                },
                 onSetPaused = onSetGooglePaused,
                 onRequestDisconnect = onRequestGoogleDisconnect,
                 calendarImportBusy = googleCalendarImportState.isBusy,
                 calendarImportHasRecovery =
                     googleCalendarImportState.pendingRecoveryCount > 0,
+                calendarImportReauthorizationAccountIds = googleCalendarImportState.accounts
+                    .filterValues { account ->
+                        account.run?.state == RemoteGoogleSyncRunState.REAUTHORIZATION_REQUIRED
+                    }
+                    .keys,
             )
         }
 
@@ -270,7 +372,14 @@ fun MoreScreen(
                 onConfigure = onConfigureGoogleSource,
                 onPublishGeneratedSchedule = onPublishGeneratedSchedule,
                 schedulePublicationHasRecovery = schedulePublicationHasRecovery,
+                schedulePublicationHasCurrentSchedule =
+                    state.pendingSchedulePublication == null &&
+                        state.publishedScheduleRevision != null &&
+                        state.publishedScheduleProof?.matchesCurrentStateAndPlan(state) == true,
                 actionsEnabled = !canonicalSyncState.isBusy,
+                configurationActionsEnabled =
+                    state.pendingGoogleCalendarOutbound == null &&
+                    state.pendingGoogleSchedulePublication == null,
             )
         }
 
@@ -603,7 +712,7 @@ private fun HealthConnectCard(
 }
 
 @Composable
-private fun GoogleConnectionCard(
+internal fun GoogleConnectionCard(
     state: GoogleAccountState,
     onConfigureApiConnection: () -> Unit,
     onConnect: () -> Unit,
@@ -611,10 +720,15 @@ private fun GoogleConnectionCard(
     onRestartAuthorization: () -> Unit,
     onOpenAuthorization: (String) -> Unit,
     onReauthorize: (String) -> Unit,
+    onEnableCalendarPublishing: (String) -> Unit,
+    onEnableTasksPublishing: (String) -> Unit,
+    onRequestAuthorizationRecoveryReset: () -> Unit,
+    onRequestAuthorizationRecoveryDiscard: () -> Unit,
     onSetPaused: (String, Boolean) -> Unit,
     onRequestDisconnect: (GoogleAccountSummary) -> Unit,
     calendarImportBusy: Boolean,
     calendarImportHasRecovery: Boolean,
+    calendarImportReauthorizationAccountIds: Set<String> = emptySet(),
 ) {
     Card {
         ListItem(
@@ -662,10 +776,111 @@ private fun GoogleConnectionCard(
                 enabled = !state.isBusy,
                 modifier = Modifier.padding(horizontal = 8.dp),
             ) {
-                Text("Authorization failed? Start over")
+                Text("Retry saved request")
             }
         }
-        state.accounts.forEach { account ->
+        state.authorizationRecovery?.takeIf { state.authorization == null }?.let { recovery ->
+            HorizontalDivider()
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "Saved ${googleAuthorizationActionLabel(recovery.action)} request",
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    if (recovery.browserWindowExpired) {
+                        "The browser window has closed. DayWeave is retaining this exact " +
+                            "record briefly while any in-flight Google callback settles."
+                    } else if (recovery.browserOpened) {
+                        "Google may already have accepted this request. Check the connection " +
+                            "before retrying the exact saved request."
+                    } else {
+                        "The authorization URL is intentionally not stored. Resume the exact " +
+                            "saved request to obtain a new browser handoff."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(
+                    onClick = if (
+                        recovery.browserOpened || recovery.browserWindowExpired
+                    ) {
+                        onRefresh
+                    } else {
+                        onRestartAuthorization
+                    },
+                    enabled = !state.isBusy && recovery.belongsToCurrentConfiguration,
+                    modifier = Modifier.testTag("google_resume_authorization"),
+                ) {
+                    Text(
+                        if (recovery.browserOpened || recovery.browserWindowExpired) {
+                            "Check Google status"
+                        } else {
+                            "Resume saved authorization"
+                        },
+                    )
+                }
+            }
+        }
+        if (state.authorizationRecoveryResetRequired) {
+            HorizontalDivider()
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "Saved Google authorization is unreadable",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "DayWeave will not start another authorization until you explicitly " +
+                        "discard the local recovery record.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(
+                    onClick = onRequestAuthorizationRecoveryReset,
+                    enabled = !state.isBusy,
+                    modifier = Modifier.testTag("google_reset_authorization_recovery"),
+                ) {
+                    Text("Review discard")
+                }
+            }
+        }
+        if (
+            state.authorizationRecoveryDiscardRequired &&
+            !state.authorizationRecoveryResetRequired
+        ) {
+            HorizontalDivider()
+            Column(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(
+                    "Saved Google authorization needs review",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "It belongs to a different or unavailable Planner API connection. Google " +
+                        "may already have accepted it, so verify the account before discarding " +
+                        "the local recovery record.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(
+                    onClick = onRequestAuthorizationRecoveryDiscard,
+                    enabled = !state.isBusy,
+                    modifier = Modifier.testTag("google_review_authorization_discard"),
+                ) {
+                    Text("Review discard")
+                }
+            }
+        }
+        state.accounts.forEachIndexed { accountIndex, account ->
             HorizontalDivider()
             Column(
                 modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
@@ -676,19 +891,31 @@ private fun GoogleConnectionCard(
                     style = MaterialTheme.typography.titleSmall,
                 )
                 val capabilities = buildList {
-                    if (account.hasCalendar) add("Calendar")
-                    if (account.hasTasks) add("Tasks")
+                    if (account.hasCalendar) add("Calendar import")
+                    if (account.hasCalendarWriteScope) add("Calendar publish")
+                    if (account.hasTasks) add("Tasks import")
+                    if (account.hasTasksWriteScope) add("Tasks publish")
                 }.joinToString(" · ").ifEmpty { "Authorization incomplete" }
                 Text(
                     "$capabilities · ${account.status.replace('_', ' ')}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                val authorizationRecoveryBlocksMutation =
+                    state.phase != GoogleAccountPhase.RECOVERY_REQUIRED &&
+                    state.authorization == null && state.authorizationRecovery == null &&
+                    !state.authorizationRecoveryResetRequired &&
+                    !state.authorizationRecoveryDiscardRequired
+                val canStartAuthorization = !state.isBusy &&
+                    authorizationRecoveryBlocksMutation
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    if (account.status == "reauthorization_required") {
+                    if (
+                        account.status == "reauthorization_required" ||
+                        account.id in calendarImportReauthorizationAccountIds
+                    ) {
                         TextButton(
                             onClick = { onReauthorize(account.id) },
-                            enabled = !state.isBusy,
+                            enabled = canStartAuthorization,
                         ) {
                             Text("Reauthorize")
                         }
@@ -696,6 +923,7 @@ private fun GoogleConnectionCard(
                         TextButton(
                             onClick = { onSetPaused(account.id, account.status == "active") },
                             enabled = !state.isBusy && !calendarImportBusy &&
+                                authorizationRecoveryBlocksMutation &&
                                 (!calendarImportHasRecovery || account.status == "paused"),
                         ) {
                             Text(if (account.status == "active") "Pause sync" else "Resume sync")
@@ -704,10 +932,50 @@ private fun GoogleConnectionCard(
                     TextButton(
                         onClick = { onRequestDisconnect(account) },
                         enabled = !state.isBusy && !calendarImportBusy &&
+                            authorizationRecoveryBlocksMutation &&
                             !calendarImportHasRecovery &&
                             account.status != "disconnecting",
                     ) {
                         Text("Disconnect")
+                    }
+                }
+                if (account.status in setOf("active", "paused")) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        if (!account.hasCalendarWriteScope) {
+                            TextButton(
+                                onClick = { onEnableCalendarPublishing(account.id) },
+                                enabled = canStartAuthorization,
+                                modifier = Modifier.testTag(
+                                    "google_enable_calendar_publishing_$accountIndex",
+                                ),
+                            ) {
+                                Text("Enable Calendar publishing")
+                            }
+                        }
+                        if (!account.hasTasksWriteScope) {
+                            TextButton(
+                                onClick = { onEnableTasksPublishing(account.id) },
+                                enabled = canStartAuthorization,
+                                modifier = Modifier.testTag(
+                                    "google_enable_tasks_publishing_$accountIndex",
+                                ),
+                            ) {
+                                Text("Enable Tasks publishing")
+                            }
+                        }
+                    }
+                } else if (
+                    account.status == "reauthorization_required" &&
+                    account.hasTasksWriteScope
+                ) {
+                    TextButton(
+                        onClick = { onEnableTasksPublishing(account.id) },
+                        enabled = canStartAuthorization,
+                        modifier = Modifier.testTag(
+                            "google_renew_tasks_publishing_$accountIndex",
+                        ),
+                    ) {
+                        Text("Renew Tasks publishing")
                     }
                 }
             }
@@ -723,6 +991,9 @@ private fun GoogleConnectionCard(
             }
         } else if (
             state.authorization == null && state.phase != GoogleAccountPhase.RECOVERY_REQUIRED &&
+            state.authorizationRecovery == null &&
+            !state.authorizationRecoveryResetRequired &&
+            !state.authorizationRecoveryDiscardRequired &&
             state.phase != GoogleAccountPhase.NOT_CONFIGURED && state.accounts.none {
                 it.status in setOf("disconnecting", "revocation_failed")
             }
@@ -737,6 +1008,13 @@ private fun GoogleConnectionCard(
             }
         }
     }
+}
+
+private fun googleAuthorizationActionLabel(action: GoogleAuthorizationAction): String = when (action) {
+    GoogleAuthorizationAction.CONNECT_READ_ONLY -> "Google connection"
+    GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY -> "Google reauthorization"
+    GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING -> "Calendar publishing"
+    GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING -> "Tasks publishing"
 }
 
 @Composable

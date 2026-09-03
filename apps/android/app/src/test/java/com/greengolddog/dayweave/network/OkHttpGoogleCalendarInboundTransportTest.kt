@@ -61,26 +61,39 @@ class OkHttpGoogleCalendarInboundTransportTest {
     }
 
     @Test
-    fun configureMapsCalendarOffReadOnlyAndBlockingToTheRevisionedServerContract() = runBlocking {
-        server.enqueue(
-            jsonResponse(
-                200,
-                collectionEnvelopeJson(
-                    collectionJson(revision = 8, selected = false, visible = false),
-                ),
-            ),
-        )
-        server.enqueue(
-            jsonResponse(
-                200,
-                collectionEnvelopeJson(
-                    collectionJson(revision = 9, selected = true, visible = false),
-                ),
-            ),
-        )
-        val blockingPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+    fun configureSendsIndependentCalendarFlagsEveryRoleAndSanitizedPolicies() = runBlocking {
+        val outboundPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
             tentative = RemoteGoogleEventDisposition.BLOCKING,
             allDay = RemoteGoogleEventDisposition.IGNORE,
+            publishAllDay = true,
+            publishTentative = true,
+            publishFree = true,
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        revision = 8,
+                        selected = false,
+                        visible = true,
+                        policy = policyJson(tentative = "blocking", allDay = "ignore"),
+                    ),
+                ),
+            ),
+        )
+        server.enqueue(
+            jsonResponse(
+                200,
+                collectionEnvelopeJson(
+                    collectionJson(
+                        revision = 9,
+                        selected = true,
+                        visible = false,
+                        syncRole = "blocking",
+                    ),
+                ),
+            ),
         )
         server.enqueue(
             jsonResponse(
@@ -90,10 +103,14 @@ class OkHttpGoogleCalendarInboundTransportTest {
                         revision = 10,
                         selected = true,
                         visible = true,
-                        syncRole = "blocking",
+                        syncRole = "writable",
+                        providerAccessRole = "owner",
                         policy = policyJson(
                             tentative = "blocking",
                             allDay = "ignore",
+                            publishAllDay = true,
+                            publishTentative = true,
+                            publishFree = true,
                         ),
                     ),
                 ),
@@ -105,10 +122,12 @@ class OkHttpGoogleCalendarInboundTransportTest {
             ACCOUNT_ID,
             COLLECTION_ID,
             ConfigureGoogleCollectionRequest(
-                7,
-                RemoteGoogleCollectionKind.CALENDAR,
-                GoogleInboundCollectionRole.OFF,
+                expectedRevision = 7,
+                kind = RemoteGoogleCollectionKind.CALENDAR,
+                selected = false,
                 visible = true,
+                syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                calendarPolicy = outboundPolicy,
             ),
         )
         transport.configure(
@@ -116,10 +135,11 @@ class OkHttpGoogleCalendarInboundTransportTest {
             ACCOUNT_ID,
             COLLECTION_ID,
             ConfigureGoogleCollectionRequest(
-                8,
-                RemoteGoogleCollectionKind.CALENDAR,
-                GoogleInboundCollectionRole.READ_ONLY,
+                expectedRevision = 8,
+                kind = RemoteGoogleCollectionKind.CALENDAR,
+                selected = true,
                 visible = false,
+                syncRole = RemoteGoogleSyncRole.BLOCKING,
             ),
         )
         transport.configure(
@@ -127,10 +147,12 @@ class OkHttpGoogleCalendarInboundTransportTest {
             ACCOUNT_ID,
             COLLECTION_ID,
             ConfigureGoogleCollectionRequest(
-                9,
-                RemoteGoogleCollectionKind.CALENDAR,
-                GoogleInboundCollectionRole.BLOCKING,
-                calendarPolicy = blockingPolicy,
+                expectedRevision = 9,
+                kind = RemoteGoogleCollectionKind.CALENDAR,
+                selected = true,
+                visible = true,
+                syncRole = RemoteGoogleSyncRole.WRITABLE,
+                calendarPolicy = outboundPolicy,
             ),
         )
 
@@ -149,22 +171,32 @@ class OkHttpGoogleCalendarInboundTransportTest {
         }
         assertEquals("7", bodies[0].getValue("expected_revision").jsonPrimitive.content)
         assertEquals("false", bodies[0].getValue("selected").jsonPrimitive.content)
-        assertEquals("false", bodies[0].getValue("visible").jsonPrimitive.content)
+        assertEquals("true", bodies[0].getValue("visible").jsonPrimitive.content)
         assertEquals("read_only", bodies[0].getValue("sync_role").jsonPrimitive.content)
+        assertEquals(
+            "false",
+            bodies[0].getValue("calendar_policy").jsonObject
+                .getValue("publish_all_day").jsonPrimitive.content,
+        )
         assertEquals("true", bodies[1].getValue("selected").jsonPrimitive.content)
         assertEquals("false", bodies[1].getValue("visible").jsonPrimitive.content)
-        assertEquals("read_only", bodies[1].getValue("sync_role").jsonPrimitive.content)
-        assertEquals("blocking", bodies[2].getValue("sync_role").jsonPrimitive.content)
+        assertEquals("blocking", bodies[1].getValue("sync_role").jsonPrimitive.content)
+        assertEquals("writable", bodies[2].getValue("sync_role").jsonPrimitive.content)
         assertEquals(
             "blocking",
             bodies[2].getValue("calendar_policy").jsonObject
                 .getValue("tentative").jsonPrimitive.content,
         )
+        assertEquals(
+            "true",
+            bodies[2].getValue("calendar_policy").jsonObject
+                .getValue("publish_free").jsonPrimitive.content,
+        )
         assertTrue(bodies.all { "kind" !in it })
     }
 
     @Test
-    fun configureEnablesAndDisablesTaskListsAsReadOnlyWithoutChangingTheWireSchema() = runBlocking {
+    fun configureSupportsTaskImportAndPublishButAlwaysStripsCalendarPublication() = runBlocking {
         server.enqueue(
             jsonResponse(
                 200,
@@ -174,6 +206,7 @@ class OkHttpGoogleCalendarInboundTransportTest {
                         revision = 8,
                         selected = true,
                         visible = false,
+                        syncRole = "writable",
                     ),
                 ),
             ),
@@ -186,7 +219,7 @@ class OkHttpGoogleCalendarInboundTransportTest {
                         kind = "task_list",
                         revision = 9,
                         selected = false,
-                        visible = false,
+                        visible = true,
                     ),
                 ),
             ),
@@ -199,8 +232,12 @@ class OkHttpGoogleCalendarInboundTransportTest {
             ConfigureGoogleCollectionRequest(
                 expectedRevision = 7,
                 kind = RemoteGoogleCollectionKind.TASK_LIST,
-                role = GoogleInboundCollectionRole.READ_ONLY,
+                selected = true,
                 visible = false,
+                syncRole = RemoteGoogleSyncRole.WRITABLE,
+                calendarPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
+                    publishFree = true,
+                ),
             ),
         )
         val disabled = transport.configure(
@@ -210,7 +247,9 @@ class OkHttpGoogleCalendarInboundTransportTest {
             ConfigureGoogleCollectionRequest(
                 expectedRevision = 8,
                 kind = RemoteGoogleCollectionKind.TASK_LIST,
-                role = GoogleInboundCollectionRole.OFF,
+                selected = false,
+                visible = true,
+                syncRole = RemoteGoogleSyncRole.READ_ONLY,
             ),
         )
 
@@ -222,18 +261,20 @@ class OkHttpGoogleCalendarInboundTransportTest {
         }
         assertEquals("true", bodies[0].getValue("selected").jsonPrimitive.content)
         assertEquals("false", bodies[0].getValue("visible").jsonPrimitive.content)
-        assertEquals("read_only", bodies[0].getValue("sync_role").jsonPrimitive.content)
+        assertEquals("writable", bodies[0].getValue("sync_role").jsonPrimitive.content)
+        assertEquals(
+            "false",
+            bodies[0].getValue("calendar_policy").jsonObject
+                .getValue("publish_free").jsonPrimitive.content,
+        )
         assertEquals("false", bodies[1].getValue("selected").jsonPrimitive.content)
-        assertEquals("false", bodies[1].getValue("visible").jsonPrimitive.content)
+        assertEquals("true", bodies[1].getValue("visible").jsonPrimitive.content)
         assertEquals("read_only", bodies[1].getValue("sync_role").jsonPrimitive.content)
         assertTrue(bodies.all { "kind" !in it })
     }
 
     @Test
-    fun configureRejectsWritablePolicyBadIdentityAndMismatchedMutationResponseBeforeTrust() {
-        val publishingPolicy = RemoteGoogleCalendarPolicy.inboundDefault().copy(
-            publishFree = true,
-        )
+    fun configureRejectsInvalidRolesIdentityAndMismatchedMutationResponseBeforeTrust() {
         assertThrows(IllegalArgumentException::class.java) {
             runBlocking {
                 transport.configure(
@@ -241,10 +282,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        7,
-                        RemoteGoogleCollectionKind.CALENDAR,
-                        GoogleInboundCollectionRole.BLOCKING,
-                        calendarPolicy = publishingPolicy,
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = false,
+                        syncRole = RemoteGoogleSyncRole.WRITABLE,
                     ),
                 )
             }
@@ -256,9 +297,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        7,
-                        RemoteGoogleCollectionKind.TASK_LIST,
-                        GoogleInboundCollectionRole.BLOCKING,
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.TASK_LIST,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.BLOCKING,
                     ),
                 )
             }
@@ -270,9 +312,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        0,
-                        RemoteGoogleCollectionKind.CALENDAR,
-                        GoogleInboundCollectionRole.READ_ONLY,
+                        expectedRevision = 0,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                     ),
                 )
             }
@@ -297,9 +340,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        7,
-                        RemoteGoogleCollectionKind.CALENDAR,
-                        GoogleInboundCollectionRole.READ_ONLY,
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                     ),
                 )
             }
@@ -324,9 +368,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        7,
-                        RemoteGoogleCollectionKind.CALENDAR,
-                        GoogleInboundCollectionRole.READ_ONLY,
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                     ),
                 )
             }
@@ -352,9 +397,10 @@ class OkHttpGoogleCalendarInboundTransportTest {
                     ACCOUNT_ID,
                     COLLECTION_ID,
                     ConfigureGoogleCollectionRequest(
-                        7,
-                        RemoteGoogleCollectionKind.TASK_LIST,
-                        GoogleInboundCollectionRole.READ_ONLY,
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.TASK_LIST,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
                     ),
                 )
             }
@@ -386,17 +432,39 @@ class OkHttpGoogleCalendarInboundTransportTest {
                         ACCOUNT_ID,
                         COLLECTION_ID,
                         ConfigureGoogleCollectionRequest(
-                            7,
-                            RemoteGoogleCollectionKind.CALENDAR,
-                            GoogleInboundCollectionRole.READ_ONLY,
+                            expectedRevision = 7,
+                            kind = RemoteGoogleCollectionKind.CALENDAR,
+                            selected = true,
+                            syncRole = RemoteGoogleSyncRole.READ_ONLY,
                         ),
                     )
                 }
             }
         }
+        server.enqueue(
+            jsonResponse(
+                200,
+                "{\"collection\":${collectionJson(revision = 8, selected = true)}}",
+            ),
+        )
+        assertThrows(GoogleCalendarInboundApiException.InvalidResponse::class.java) {
+            runBlocking {
+                transport.configure(
+                    configuration(),
+                    ACCOUNT_ID,
+                    COLLECTION_ID,
+                    ConfigureGoogleCollectionRequest(
+                        expectedRevision = 7,
+                        kind = RemoteGoogleCollectionKind.CALENDAR,
+                        selected = true,
+                        syncRole = RemoteGoogleSyncRole.READ_ONLY,
+                    ),
+                )
+            }
+        }
         assertEquals(
-            setOf("OFF", "READ_ONLY", "BLOCKING"),
-            GoogleInboundCollectionRole.entries.map { it.name }.toSet(),
+            setOf("READ_ONLY", "BLOCKING", "WRITABLE"),
+            RemoteGoogleSyncRole.entries.map { it.name }.toSet(),
         )
     }
 
@@ -533,6 +601,15 @@ class OkHttpGoogleCalendarInboundTransportTest {
                 collectionJson(kind = "task_list", syncRole = "blocking"),
             ),
             collectionsJson(
+                collectionJson(providerDeleted = true, selected = true),
+            ),
+            collectionsJson(
+                collectionJson(
+                    syncRole = "writable",
+                    providerAccessRole = "reader",
+                ),
+            ),
+            collectionsJson(
                 collectionJson(planningGeneration = -1),
             ),
             "{\"collections\":[${collectionJson()},${collectionJson()}]}",
@@ -567,6 +644,38 @@ class OkHttpGoogleCalendarInboundTransportTest {
         )
         assertThrows(GoogleCalendarInboundApiException.InvalidResponse::class.java) {
             runBlocking { transport.collections(configuration(), ACCOUNT_ID) }
+        }
+    }
+
+    @Test
+    fun collectionListAcceptsServerRetainedPolicyAndUnselectedWritableStates() = runBlocking {
+        val validBodies = listOf(
+            collectionsJson(
+                collectionJson(
+                    syncRole = "writable",
+                    selected = false,
+                    providerAccessRole = "owner",
+                ),
+            ),
+            collectionsJson(
+                collectionJson(
+                    kind = "task_list",
+                    syncRole = "writable",
+                    policy = policyJson(publishFree = true),
+                ),
+            ),
+            collectionsJson(
+                collectionJson(
+                    syncRole = "read_only",
+                    providerAccessRole = "reader",
+                    policy = policyJson(publishAllDay = true),
+                ),
+            ),
+        )
+
+        validBodies.forEach { body ->
+            server.enqueue(jsonResponse(200, body))
+            assertEquals(1, transport.collections(configuration(), ACCOUNT_ID).collections.size)
         }
     }
 
@@ -611,13 +720,18 @@ class OkHttpGoogleCalendarInboundTransportTest {
         "{\"collections\":[$collection]}"
 
     private fun collectionEnvelopeJson(collection: String): String =
-        "{\"collection\":$collection}"
+        "{\"collection\":${collection.replace(
+            "\"configured_at\":null",
+            "\"configured_at\":\"2026-09-01T08:09:00Z\"",
+        )}}"
 
     private fun collectionJson(
         id: String = COLLECTION_ID,
         accountId: String = ACCOUNT_ID,
         kind: String = "calendar",
         displayName: String = "Primary calendar",
+        providerAccessRole: String? = null,
+        providerDeleted: Boolean = false,
         selected: Boolean = true,
         visible: Boolean = true,
         syncRole: String = "read_only",
@@ -625,14 +739,17 @@ class OkHttpGoogleCalendarInboundTransportTest {
         planningGeneration: Long = 5,
         policy: String = policyJson(),
     ): String = """
-        {"id":"$id","account_id":"$accountId","kind":"$kind","remote_collection_id":"primary","display_name":"$displayName","provider_access_role":null,"provider_primary":true,"provider_selected":true,"provider_hidden":false,"provider_deleted":false,"selected":$selected,"visible":$visible,"sync_role":"$syncRole","calendar_policy":$policy,"revision":$revision,"discovered_at":"2026-09-01T08:00:00Z","configured_at":null,"last_import_at":null,"planning_projection_state":"complete","planning_generation":$planningGeneration,"planning_collection_revision":7,"planning_window_start":"2026-08-25T00:00:00Z","planning_window_end":"2026-09-09T00:00:00Z","planning_window_refreshed_at":"2026-09-01T08:10:00Z","created_at":"2026-09-01T08:00:00Z","updated_at":"2026-09-01T08:10:00Z"}
+        {"id":"$id","account_id":"$accountId","kind":"$kind","remote_collection_id":"primary","display_name":"$displayName","provider_access_role":${providerAccessRole?.let { "\"$it\"" } ?: "null"},"provider_primary":true,"provider_selected":true,"provider_hidden":false,"provider_deleted":$providerDeleted,"selected":$selected,"visible":$visible,"sync_role":"$syncRole","calendar_policy":$policy,"revision":$revision,"discovered_at":"2026-09-01T08:00:00Z","configured_at":null,"last_import_at":null,"planning_projection_state":"complete","planning_generation":$planningGeneration,"planning_collection_revision":7,"planning_window_start":"2026-08-25T00:00:00Z","planning_window_end":"2026-09-09T00:00:00Z","planning_window_refreshed_at":"2026-09-01T08:10:00Z","created_at":"2026-09-01T08:00:00Z","updated_at":"2026-09-01T08:10:00Z"}
     """.trimIndent()
 
     private fun policyJson(
         tentative: String = "visible_nonblocking",
         allDay: String = "visible_nonblocking",
+        publishAllDay: Boolean = false,
+        publishTentative: Boolean = false,
+        publishFree: Boolean = false,
     ): String =
-        "{\"confirmed_busy\":\"blocking\",\"tentative\":\"$tentative\",\"free\":\"visible_nonblocking\",\"all_day\":\"$allDay\",\"publish_all_day\":false,\"publish_tentative\":false,\"publish_free\":false}"
+        "{\"confirmed_busy\":\"blocking\",\"tentative\":\"$tentative\",\"free\":\"visible_nonblocking\",\"all_day\":\"$allDay\",\"publish_all_day\":$publishAllDay,\"publish_tentative\":$publishTentative,\"publish_free\":$publishFree}"
 
     private fun syncStatusEnvelopeJson(): String = """
         {"sync":{"run":{"account_id":"$ACCOUNT_ID","state":"idle","requested_at":"2026-09-01T08:00:00Z","started_at":"2026-09-01T08:00:01Z","completed_at":"2026-09-01T08:00:02Z","next_attempt_at":"2026-09-01T08:15:00Z","consecutive_failures":4294967295,"last_error_code":null,"last_error_at":null,"imported_count":8,"updated_count":3,"deleted_count":1,"conflict_count":2,"rejected_count":0,"refresh_generation":6,"claimed_refresh_generation":5,"completed_refresh_generation":5,"revision":9},"import_conflicts":2,"pending_outbound":0,"conflicted_outbound":0,"failed_outbound":0,"last_outbound_error_code":null,"last_outbound_error_at":null,"next_outbound_attempt_at":null}}

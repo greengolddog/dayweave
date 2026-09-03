@@ -10321,7 +10321,7 @@ fn i16_to_u8(value: i16) -> Result<u8, GoogleSyncRepositoryError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::Arc, time::Duration as StdDuration};
+    use std::{collections::BTreeSet, str::FromStr, sync::Arc, time::Duration as StdDuration};
 
     use chrono::Duration;
     use serde_json::json;
@@ -10335,7 +10335,10 @@ mod tests {
             ExecutionCommand, ExecutionIdempotencyKey, ExecutionRepositoryError, ExecutionService,
             ExecutionServiceError, StartExecution,
         },
-        google_oauth::{GoogleOAuthRepository, OAuthIdempotency},
+        google_oauth::{
+            AuthorizationCompletion, CallbackClaim, EncryptedCredentials, GoogleOAuthRepository,
+            NewOAuthSession, OAuthIdempotency, SealedSecret,
+        },
         google_sync::{CalendarProjectionWindow, OutboundOperation, RejectedRemoteItem},
         items::{ItemKind, ItemService, NewItem},
         persistence::{
@@ -13083,6 +13086,408 @@ mod tests {
             request_fingerprint: [marker.wrapping_add(1); 32],
             expires_at: now + Duration::days(1),
         }
+    }
+
+    async fn complete_exact_reauthorization(fixture: &SyncFixture, now: DateTime<Utc>) {
+        let oauth =
+            PostgresGoogleOAuthRepository::new(fixture.database.pool.clone(), fixture.scope);
+        let before = oauth
+            .account_by_id(fixture.account_id)
+            .await
+            .expect("load account before reauthorization")
+            .expect("reauthorization account exists")
+            .account;
+        let session_id = Uuid::new_v4();
+        let owner_subject_hash = [201; 32];
+        let state_hash = [202; 32];
+        let requested_scopes = BTreeSet::from([
+            GOOGLE_CALENDAR_SCOPE.to_owned(),
+            GOOGLE_TASKS_SCOPE.to_owned(),
+        ]);
+        let started = oauth
+            .create_session(
+                NewOAuthSession {
+                    id: session_id,
+                    owner_subject_hash,
+                    state_hash,
+                    encrypted_verifier: SealedSecret {
+                        key_version: 1,
+                        ciphertext: vec![203; 64],
+                    },
+                    encrypted_authorization_url: SealedSecret {
+                        key_version: 1,
+                        ciphertext: vec![204; 64],
+                    },
+                    requested_scopes: requested_scopes.clone(),
+                    expected_account_id: Some(fixture.account_id),
+                    expected_account_revision: Some(before.revision),
+                    make_default: false,
+                    created_at: now - Duration::seconds(2),
+                    expires_at: now + Duration::minutes(10),
+                },
+                oauth_idempotency("google_oauth_reauthorization_wake", 205, now),
+                now - Duration::minutes(5),
+            )
+            .await
+            .expect("reauthorization session starts");
+        assert_eq!(started.id, session_id);
+        assert!(!started.replayed);
+        let claimed = match oauth
+            .claim_callback(
+                state_hash,
+                now - Duration::seconds(1),
+                now - Duration::minutes(5),
+            )
+            .await
+            .expect("reauthorization callback claims")
+        {
+            CallbackClaim::Exchange(claimed) => claimed,
+            CallbackClaim::Staged { .. } => panic!("new callback cannot already be staged"),
+        };
+        oauth
+            .stage_authorization(AuthorizationCompletion {
+                session_id,
+                owner_subject_hash: claimed.owner_subject_hash,
+                expected_account_revision: Some(before.revision),
+                account_id: fixture.account_id,
+                make_default: false,
+                external_account_id: before.external_account_id,
+                display_label: "Reauthorized Google owner".to_owned(),
+                credentials: EncryptedCredentials {
+                    sealed: SealedSecret {
+                        key_version: 1,
+                        ciphertext: vec![206; 64],
+                    },
+                },
+                granted_scopes: requested_scopes,
+                token_expires_at: now + Duration::hours(1),
+                now,
+            })
+            .await
+            .expect("reauthorization credentials stage");
+        let completed = oauth
+            .complete_staged_authorization(session_id)
+            .await
+            .expect("reauthorization completion commits");
+        assert_eq!(completed.id, fixture.account_id);
+        assert_eq!(
+            completed.status,
+            crate::google_oauth::GoogleAccountStatus::Active
+        );
+        assert!(completed.sync_enabled);
+        assert_eq!(completed.revision, before.revision + 1);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_reauthorization_completion_wakes_outbound_work() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; outbound reauthorization test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let repository = &fixture.repository;
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let item = local_firm_block(Uuid::new_v4(), "Reauthorization wake outbound", now);
+        let mut transaction = fixture
+            .database
+            .pool
+            .begin()
+            .await
+            .expect("reauthorization item transaction");
+        insert_imported_item(&mut transaction, fixture.scope, &item)
+            .await
+            .expect("reauthorization outbound item fixture");
+        transaction
+            .commit()
+            .await
+            .expect("reauthorization item commit");
+        let outbound = repository
+            .enqueue_test_outbound(
+                fixture.account_id,
+                PreparedOutbound {
+                    entity_kind: "calendar_event",
+                    item,
+                    operation: OutboundOperation::Upsert,
+                    payload: json!({"id": "reauthorization-wake-outbound"}),
+                },
+                fixture.collection.id,
+                now,
+            )
+            .await
+            .expect("reauthorization outbound queued");
+        let refresh_request_id = Uuid::new_v4();
+        let accepted_refresh = repository
+            .request_refresh(fixture.account_id, refresh_request_id, now)
+            .await
+            .expect("exact refresh accepted before authorization failure");
+        assert_eq!(accepted_refresh.request_id, refresh_request_id);
+        assert_eq!(
+            repository
+                .refresh_request(fixture.account_id, refresh_request_id)
+                .await
+                .expect("exact refresh acceptance lookup"),
+            Some(accepted_refresh.clone())
+        );
+        let claim = repository
+            .claim_due(now, now + Duration::minutes(10))
+            .await
+            .expect("replace expired fixture run")
+            .expect("reauthorization failure parent claim");
+        let outbound_work = repository
+            .claim_outbound(&claim, now + Duration::seconds(1))
+            .await
+            .expect("claim outbound before authorization failure")
+            .expect("outbound work exists");
+        assert_eq!(outbound_work.id, outbound.outbox_id);
+        let retry_at = now + Duration::hours(24);
+        repository
+            .fail_outbound(
+                &outbound_work,
+                "backoff",
+                "reauthorization_required",
+                retry_at,
+                now + Duration::seconds(2),
+            )
+            .await
+            .expect("outbound authorization failure persists");
+        repository
+            .fail_claim(
+                &claim,
+                SyncFailureKind::ReauthorizationRequired,
+                "reauthorization_required",
+                now + Duration::seconds(3),
+                retry_at,
+            )
+            .await
+            .expect("parent run requires reauthorization");
+        let blocked_status = repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("authorization-blocked status")
+            .expect("authorization-blocked run");
+        assert_eq!(
+            blocked_status.state,
+            GoogleSyncRunState::ReauthorizationRequired
+        );
+        assert_eq!(
+            blocked_status.claimed_refresh_generation,
+            accepted_refresh.refresh_generation
+        );
+        assert!(
+            blocked_status.completed_refresh_generation < accepted_refresh.refresh_generation,
+            "the authorization failure must not satisfy the accepted refresh"
+        );
+        assert!(
+            repository
+                .claim_due(now + Duration::seconds(4), now + Duration::minutes(10))
+                .await
+                .expect("blocked claim scan")
+                .is_none(),
+            "reauthorization-required runs must not be claimable before OAuth completion"
+        );
+
+        complete_exact_reauthorization(&fixture, now + Duration::seconds(5)).await;
+
+        let run: (String, DateTime<Utc>, Option<String>, i32) = sqlx::query_as(
+            "SELECT state, next_attempt_at, last_error_code, consecutive_failures \
+             FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+               AND provider_account_id = $3",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(fixture.scope.user_id)
+        .bind(fixture.account_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("reactivated parent run");
+        assert_eq!(run.0, "idle");
+        assert_eq!(run.2, None);
+        assert_eq!(run.3, 0);
+        let ordinary: (String, DateTime<Utc>, Option<String>) = sqlx::query_as(
+            "SELECT state, available_at, last_error_code FROM google_sync_outbox \
+             WHERE workspace_id = $1 AND id = $2",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(outbound.outbox_id)
+        .fetch_one(&fixture.database.pool)
+        .await
+        .expect("reactivated outbound row");
+        assert_eq!(ordinary.0, "backoff");
+        assert!(ordinary.1 <= run.1);
+        assert_eq!(ordinary.2.as_deref(), Some("reauthorization_required"));
+        let resumed_claim = repository
+            .claim_due(run.1, run.1 + Duration::minutes(10))
+            .await
+            .expect("reactivated run claim")
+            .expect("OAuth completion makes the run claimable");
+        let resumed_outbound = repository
+            .claim_outbound(&resumed_claim, run.1)
+            .await
+            .expect("reactivated outbound claim")
+            .expect("authorization-failed outbound is due");
+        assert_eq!(resumed_outbound.id, outbound.outbox_id);
+        let resumed_status = repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("resumed refresh status")
+            .expect("resumed refresh run");
+        assert_eq!(resumed_status.state, GoogleSyncRunState::Running);
+        assert_eq!(
+            resumed_status.claimed_refresh_generation,
+            accepted_refresh.refresh_generation
+        );
+        let permit = repository
+            .authorize_outbound_dispatch(&resumed_outbound, true, run.1)
+            .await
+            .expect("reactivated outbound dispatch is authorized");
+        repository
+            .complete_outbound(
+                &resumed_outbound,
+                OutboundResult {
+                    remote_resource_id: "reauthorization-wake-outbound".to_owned(),
+                    remote_etag: Some("reauthorization-wake-etag".to_owned()),
+                    remote_updated_at: Some(run.1),
+                    payload_hash: [208; 32],
+                    dispatch_nonce: permit.nonce,
+                },
+                run.1,
+            )
+            .await
+            .expect("reactivated outbound completes");
+        repository
+            .complete_claim(
+                &resumed_claim,
+                &SyncCounts::default(),
+                false,
+                run.1 + Duration::seconds(1),
+                run.1 + Duration::hours(1),
+            )
+            .await
+            .expect("reactivated refresh completes");
+        let completed_status = repository
+            .run_status(fixture.account_id)
+            .await
+            .expect("completed refresh status")
+            .expect("completed refresh run");
+        assert_eq!(completed_status.state, GoogleSyncRunState::Idle);
+        assert_eq!(
+            completed_status.completed_refresh_generation, accepted_refresh.refresh_generation,
+            "OAuth completion must let the exact accepted refresh reach completion"
+        );
+        assert_eq!(
+            repository
+                .refresh_request(fixture.account_id, refresh_request_id)
+                .await
+                .expect("completed exact refresh acceptance lookup"),
+            Some(accepted_refresh)
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_reauthorization_completion_wakes_schedule_publication() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule reauthorization test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let repository = &fixture.sync.repository;
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+        let publication_id = seed_accepted_schedule_change(
+            &fixture,
+            &fixture.source,
+            &fixture.source.blocks[0],
+            None,
+            ScheduleGooglePublicationOperation::Create,
+            "reauthorization-wake-schedule",
+            207,
+            now,
+        )
+        .await;
+        let claim = repository
+            .claim_due(now, now + Duration::minutes(10))
+            .await
+            .expect("replace expired fixture run")
+            .expect("schedule reauthorization failure parent claim");
+        let schedule_work = repository
+            .claim_schedule_publication(&claim, now + Duration::seconds(1))
+            .await
+            .expect("claim schedule before authorization failure")
+            .expect("schedule work exists");
+        assert_eq!(schedule_work.publication_id, publication_id);
+        let retry_at = now + Duration::hours(24);
+        repository
+            .fail_schedule_publication(
+                &schedule_work,
+                "backoff",
+                "reauthorization_required",
+                retry_at,
+                now + Duration::seconds(2),
+            )
+            .await
+            .expect("schedule authorization failure persists");
+        repository
+            .fail_claim(
+                &claim,
+                SyncFailureKind::ReauthorizationRequired,
+                "reauthorization_required",
+                now + Duration::seconds(3),
+                retry_at,
+            )
+            .await
+            .expect("parent run requires reauthorization");
+        assert!(
+            repository
+                .claim_due(now + Duration::seconds(4), now + Duration::minutes(10))
+                .await
+                .expect("blocked schedule claim scan")
+                .is_none()
+        );
+
+        complete_exact_reauthorization(&fixture.sync, now + Duration::seconds(5)).await;
+
+        let run: (String, DateTime<Utc>, Option<String>, i32) = sqlx::query_as(
+            "SELECT state, next_attempt_at, last_error_code, consecutive_failures \
+             FROM google_sync_runs WHERE workspace_id = $1 AND user_id = $2 \
+               AND provider_account_id = $3",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("reactivated schedule parent run");
+        assert_eq!(run.0, "idle");
+        assert_eq!(run.2, None);
+        assert_eq!(run.3, 0);
+        let schedule: (String, DateTime<Utc>, Option<String>) = sqlx::query_as(
+            "SELECT outbox.state, outbox.available_at, outbox.last_error_code \
+             FROM google_schedule_publication_outbox outbox \
+             WHERE outbox.workspace_id = $1 AND outbox.publication_id = $2",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(publication_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("reactivated schedule row");
+        assert_eq!(schedule.0, "backoff");
+        assert!(schedule.1 <= run.1);
+        assert_eq!(schedule.2.as_deref(), Some("reauthorization_required"));
+        let resumed_claim = repository
+            .claim_due(run.1, run.1 + Duration::minutes(10))
+            .await
+            .expect("reactivated schedule run claim")
+            .expect("OAuth completion makes the schedule run claimable");
+        let resumed_schedule = repository
+            .claim_schedule_publication(&resumed_claim, run.1)
+            .await
+            .expect("reactivated schedule claim")
+            .expect("authorization-failed schedule is due");
+        assert_eq!(resumed_schedule.publication_id, publication_id);
+        fixture.sync.database.destroy().await;
     }
 
     async fn seed_execution_lease(

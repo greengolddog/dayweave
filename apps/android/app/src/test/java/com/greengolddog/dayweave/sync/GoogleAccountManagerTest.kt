@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.network.ApiCredentialStore
 import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.GoogleAccountsApiException
 import com.greengolddog.dayweave.network.GoogleAccountsTransport
+import com.greengolddog.dayweave.network.GoogleService
 import com.greengolddog.dayweave.network.RemoteGoogleAccount
 import com.greengolddog.dayweave.network.RemoteGoogleAccounts
 import com.greengolddog.dayweave.network.RemoteGoogleAuthorization
@@ -68,11 +69,17 @@ class GoogleAccountManagerTest {
         val presentationAllowed = AtomicBoolean(true)
         val authorizationStarted = CompletableDeferred<Unit>()
         val releaseAuthorization = CompletableDeferred<Unit>()
+        val journals = InMemoryGoogleAuthorizationJournalStore()
         val transport = FakeGoogleAccountsTransport().apply {
             this.authorizationStarted = authorizationStarted
             authorizationGate = releaseAuthorization
         }
-        val manager = manager(FakeGoogleCredentials(), transport, presentationAllowed::get)
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            presentationAllowed::get,
+            journalStore = journals,
+        )
 
         val authorization = async { manager.connectNew() }
         withTimeout(3_000) { authorizationStarted.await() }
@@ -88,8 +95,9 @@ class GoogleAccountManagerTest {
 
         transport.authorizationStarted = null
         transport.authorizationGate = null
-        manager.connectNew()
+        manager.restartAuthorization()
         assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertEquals(2, transport.authorizationRequests.size)
     }
 
     @Test
@@ -244,6 +252,84 @@ class GoogleAccountManagerTest {
     }
 
     @Test
+    fun nilAccountIdentityFailsClosedBeforeAuthorizationCanStart() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val nilAccountId = "00000000-0000-0000-0000-000000000000"
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account(id = nilAccountId))
+        }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            journalStore = journals,
+        )
+
+        manager.refresh()
+        manager.enableCalendarPublishing(nilAccountId)
+
+        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertTrue(manager.state.value.accounts.isEmpty())
+        assertTrue(transport.authorizationRequests.isEmpty())
+        assertNull(journals.journal)
+    }
+
+    @Test
+    fun everyServerCleanupRecoveryFenceBlocksAuthorizationBeforeJournalOrHttp() = runBlocking {
+        val recoveryStatuses = listOf(
+            cleanup().copy(operatorRecoveryRequired = true),
+            cleanup().copy(durabilityDegraded = true),
+            cleanup().copy(revocationFenced = true),
+            cleanup().copy(exhausted = 1),
+            cleanup().copy(uncertainAuthorizations = 1),
+            cleanup().copy(legacyRecoveryRequired = 1),
+        )
+        recoveryStatuses.forEach { cleanupStatus ->
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account()).copy(cleanup = cleanupStatus)
+            }
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                journalStore = journals,
+            )
+            manager.refresh()
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+
+            manager.enableCalendarPublishing(ACCOUNT_ID)
+            manager.enableTasksPublishing(ACCOUNT_ID)
+            manager.reauthorize(ACCOUNT_ID)
+            manager.connectNew()
+            manager.restartAuthorization()
+
+            assertEquals(0, journals.saveCalls)
+            assertTrue(transport.authorizationRequests.isEmpty())
+            assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+        }
+    }
+
+    @Test
+    fun serverCleanupRecoveryAlsoBlocksAnAlreadySavedExactRetry() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        manager.refresh()
+        manager.enableTasksPublishing(ACCOUNT_ID)
+        assertEquals(1, transport.authorizationRequests.size)
+
+        transport.accountsResult = accounts(account()).copy(
+            cleanup = cleanup().copy(revocationFenced = true),
+        )
+        manager.refresh()
+        assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+        manager.restartAuthorization()
+
+        assertEquals(1, transport.authorizationRequests.size)
+        assertNotNull(journals.journal)
+        assertEquals(GoogleAccountPhase.RECOVERY_REQUIRED, manager.state.value.phase)
+    }
+
+    @Test
     fun connectNewExposesOnlyAnExactTrustedGoogleAuthorizationUrl() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
@@ -265,12 +351,16 @@ class GoogleAccountManagerTest {
         assertFalse(request.connectNew)
         assertTrue(request.makeDefault)
 
-        transport.authorizationResult = transport.authorizationResult.copy(
+        val unsafeTransport = FakeGoogleAccountsTransport().apply {
+            authorizationResult = authorizationResult.copy(
             authorizationUrl = "https://accounts.google.com.evil.example/o/oauth2/v2/auth?state=x",
-        )
-        manager.connectNew()
-        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
-        assertNull(manager.state.value.authorization)
+            )
+        }
+        val unsafeManager = manager(credentials, unsafeTransport)
+        unsafeManager.connectNew()
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, unsafeManager.state.value.phase)
+        assertNull(unsafeManager.state.value.authorization)
+        assertNotNull(unsafeManager.state.value.authorizationRecovery)
     }
 
     @Test
@@ -290,6 +380,727 @@ class GoogleAccountManagerTest {
         assertTrue(request.connectNew)
         assertFalse(request.makeDefault)
         assertNull(request.accountId)
+    }
+
+    @Test
+    fun calendarPublishingInventoryCannotRetireTheExactBrowserAttempt() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        manager.refresh()
+
+        manager.enableCalendarPublishing(ACCOUNT_ID)
+
+        val request = transport.authorizationRequests.single()
+        assertEquals(listOf(GoogleService.CALENDAR), request.services)
+        assertTrue(request.forceConsent)
+        assertEquals(ACCOUNT_ID, request.accountId)
+        assertFalse(request.connectNew)
+        assertEquals(
+            GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING,
+            requireNotNull(journals.journal).action,
+        )
+
+        // A projected scope without the callback's revision advance is not completion.
+        transport.accountsResult = accounts(account(calendarWrite = true, revision = 7))
+        manager.refresh()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertNotNull(journals.journal)
+
+        // Nor is a newer revision that granted a different service.
+        transport.accountsResult = accounts(account(tasksWrite = true, revision = 8))
+        manager.refresh()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertNotNull(journals.journal)
+
+        transport.accountsResult = accounts(account(calendarWrite = true, revision = 9))
+        manager.refresh()
+
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertTrue(manager.state.value.accounts.single().hasCalendarWriteScope)
+        assertNotNull(manager.state.value.authorizationRecovery)
+        assertNotNull(journals.journal)
+    }
+
+    @Test
+    fun upgradedResponseFromReplacedCredentialCannotRetireOldAuthorizationJournal() =
+        runBlocking {
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val credentials = FakeGoogleCredentials()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account())
+            }
+            val manager = manager(credentials, transport, journalStore = journals)
+            manager.refresh()
+            manager.enableCalendarPublishing(ACCOUNT_ID)
+
+            transport.accountsResult = accounts(account(calendarWrite = true, revision = 8))
+            transport.accountsHook = { credentials.configurationId = "configuration-b" }
+            manager.refresh()
+
+            assertNotNull(journals.journal)
+            assertEquals("configuration-b", manager.state.value.configurationId)
+            assertTrue(manager.state.value.accounts.isEmpty())
+        }
+
+    @Test
+    fun tasksPublishingCanRepairReauthorizationButCalendarUpgradeCannot() = runBlocking {
+        val tasksTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(
+                account(status = "reauthorization_required", tasksWrite = true),
+            )
+        }
+        val tasksManager = manager(FakeGoogleCredentials(), tasksTransport)
+        tasksManager.refresh()
+
+        tasksManager.enableTasksPublishing(ACCOUNT_ID)
+
+        val tasksRequest = tasksTransport.authorizationRequests.single()
+        assertEquals(listOf(GoogleService.TASKS), tasksRequest.services)
+        assertTrue(tasksRequest.forceConsent)
+        assertEquals(
+            GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING,
+            requireNotNull(tasksManager.state.value.authorizationRecovery).action,
+        )
+        tasksTransport.accountsResult = accounts(
+            account(status = "active", tasksWrite = true, revision = 8),
+        )
+        tasksManager.refresh()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, tasksManager.state.value.phase)
+        assertNotNull(tasksManager.state.value.authorizationRecovery)
+
+        val calendarTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account(status = "reauthorization_required"))
+        }
+        val calendarManager = manager(FakeGoogleCredentials(), calendarTransport)
+        calendarManager.refresh()
+        calendarManager.enableCalendarPublishing(ACCOUNT_ID)
+
+        assertTrue(calendarTransport.authorizationRequests.isEmpty())
+        assertEquals(GoogleAccountPhase.ERROR, calendarManager.state.value.phase)
+    }
+
+    @Test
+    fun lostStartResponseSurvivesProcessDeathAndRetriesExactServiceAndIdentity() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val firstTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+            authorizationError = IOException("lost response")
+        }
+        val firstManager = manager(
+            FakeGoogleCredentials(),
+            firstTransport,
+            journalStore = journals,
+        )
+        firstManager.refresh()
+        firstManager.enableTasksPublishing(ACCOUNT_ID)
+
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, firstManager.state.value.phase)
+        val saved = requireNotNull(journals.journal)
+        assertEquals(listOf(GoogleService.TASKS), saved.request.services)
+        assertEquals(firstTransport.authorizationIdempotencyKeys.single(), saved.idempotencyKey)
+
+        // A new manager models process death: no provider URL survives, but the exact request does.
+        val recoveredTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val recoveredManager = manager(
+            FakeGoogleCredentials(),
+            recoveredTransport,
+            journalStore = journals,
+        )
+        recoveredManager.refresh()
+        assertNull(recoveredManager.state.value.authorization)
+        assertEquals(
+            GoogleAuthorizationAction.ENABLE_TASKS_PUBLISHING,
+            requireNotNull(recoveredManager.state.value.authorizationRecovery).action,
+        )
+
+        recoveredManager.restartAuthorization()
+
+        assertEquals(listOf(GoogleService.TASKS), recoveredTransport.authorizationRequests.single().services)
+        assertEquals(saved.idempotencyKey, recoveredTransport.authorizationIdempotencyKeys.single())
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, recoveredManager.state.value.phase)
+
+        recoveredTransport.accountsResult = accounts(account(tasksWrite = true, revision = 8))
+        recoveredManager.refresh()
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, recoveredManager.state.value.phase)
+        assertNotNull(journals.journal)
+    }
+
+    @Test
+    fun persistBeforeSendAndActionAwareAdmissionFailClosed() = runBlocking {
+        val deniedActions = mutableListOf<Pair<GoogleAuthorizationAction, String?>>()
+        val deniedTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val deniedManager = manager(
+            FakeGoogleCredentials(),
+            deniedTransport,
+            authorizationMutationAllowed = { action, targetAccountId ->
+                deniedActions += action to targetAccountId
+                false
+            },
+        )
+        deniedManager.refresh()
+        deniedManager.enableCalendarPublishing(ACCOUNT_ID)
+        assertEquals(
+            listOf(GoogleAuthorizationAction.ENABLE_CALENDAR_PUBLISHING to ACCOUNT_ID),
+            deniedActions,
+        )
+        assertTrue(deniedTransport.authorizationRequests.isEmpty())
+
+        val unsaved = InMemoryGoogleAuthorizationJournalStore().apply { failSave = true }
+        val unsavedTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val unsavedManager = manager(
+            FakeGoogleCredentials(),
+            unsavedTransport,
+            journalStore = unsaved,
+        )
+        unsavedManager.refresh()
+        unsavedManager.enableTasksPublishing(ACCOUNT_ID)
+        assertTrue(unsavedTransport.authorizationRequests.isEmpty())
+        assertNull(unsaved.journal)
+
+        val allowed = AtomicBoolean(true)
+        val fenced = InMemoryGoogleAuthorizationJournalStore().apply {
+            saveHook = { allowed.set(false) }
+        }
+        val fencedTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val fencedManager = manager(
+            FakeGoogleCredentials(),
+            fencedTransport,
+            authorizationMutationAllowed = { _, _ -> allowed.get() },
+            journalStore = fenced,
+        )
+        fencedManager.refresh()
+        fencedManager.enableCalendarPublishing(ACCOUNT_ID)
+        assertNotNull(fenced.journal)
+        assertTrue(fencedTransport.authorizationRequests.isEmpty())
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, fencedManager.state.value.phase)
+    }
+
+    @Test
+    fun reauthorizationAdmissionCarriesExactTargetForFreshRetryAndBrowserHandoff() =
+        runBlocking {
+            val observed = mutableListOf<Pair<GoogleAuthorizationAction, String?>>()
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(
+                    account(status = "reauthorization_required"),
+                    account(
+                        id = SECOND_ACCOUNT_ID,
+                        label = "Other",
+                        status = "reauthorization_required",
+                        isDefault = false,
+                    ),
+                )
+            }
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                authorizationMutationAllowed = { action, targetAccountId ->
+                    observed += action to targetAccountId
+                    action == GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY &&
+                        targetAccountId == ACCOUNT_ID
+                },
+                journalStore = journals,
+            )
+            manager.refresh()
+
+            manager.reauthorize(SECOND_ACCOUNT_ID)
+
+            assertEquals(0, journals.saveCalls)
+            assertTrue(transport.authorizationRequests.isEmpty())
+            assertEquals(
+                GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY to SECOND_ACCOUNT_ID,
+                observed.single(),
+            )
+
+            manager.reauthorize(ACCOUNT_ID)
+            assertEquals(1, journals.saveCalls)
+            assertEquals(ACCOUNT_ID, transport.authorizationRequests.single().accountId)
+            manager.restartAuthorization()
+            assertEquals(2, transport.authorizationRequests.size)
+            assertTrue(transport.authorizationRequests.all { it.accountId == ACCOUNT_ID })
+
+            val url = requireNotNull(manager.state.value.authorization).url
+            var opened = false
+            assertTrue(manager.useAuthorizationUrlIfCurrent(url) { opened = true })
+            assertTrue(opened)
+            assertTrue(
+                observed.drop(1).all { (action, targetAccountId) ->
+                    action == GoogleAuthorizationAction.REAUTHORIZE_READ_ONLY &&
+                        targetAccountId == ACCOUNT_ID
+                },
+            )
+        }
+
+    @Test
+    fun browserHandoffPersistsOpenedBeforeFinalFenceAndNeverInvokesBlockedConsumer() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        var browserPhase = false
+        var browserAdmissionChecks = 0
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            authorizationMutationAllowed = { _, _ ->
+                if (!browserPhase) {
+                    true
+                } else {
+                    browserAdmissionChecks += 1
+                    browserAdmissionChecks == 1
+                }
+            },
+            journalStore = journals,
+        )
+        manager.refresh()
+        manager.enableCalendarPublishing(ACCOUNT_ID)
+        val url = requireNotNull(manager.state.value.authorization).url
+        browserPhase = true
+
+        // The first browser check passes. The callback closes before the post-CAS final check.
+        val opened = manager.useAuthorizationUrlIfCurrent(url) {
+            error("blocked consumer must not run")
+        }
+
+        assertFalse(opened)
+        assertEquals(2, browserAdmissionChecks)
+        assertTrue(requireNotNull(journals.journal).browserOpened)
+        assertNull(manager.state.value.authorization)
+    }
+
+    @Test
+    fun browserHandoffToleratesPermittedBackwardClockAdjustment() = runBlocking {
+        var observedNow = NOW
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            journalStore = journals,
+            nowProvider = { observedNow },
+        )
+        manager.refresh()
+        manager.enableCalendarPublishing(ACCOUNT_ID)
+        val url = requireNotNull(manager.state.value.authorization).url
+        observedNow = NOW.minusSeconds(120)
+        var openedUrl: String? = null
+
+        assertTrue(manager.useAuthorizationUrlIfCurrent(url) { openedUrl = it })
+
+        assertEquals(url, openedUrl)
+        assertEquals(NOW.toEpochMilli(), requireNotNull(journals.journal).browserOpenedAtEpochMillis)
+    }
+
+    @Test
+    fun authorizationRecoveryBlockerRetiresOnlySafelyExpiredRecords() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        manager.refresh()
+        manager.enableTasksPublishing(ACCOUNT_ID)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+
+        val active = requireNotNull(journals.journal)
+        journals.journal = active.copy(
+            createdAtEpochMillis = NOW.minusSeconds(1_800).toEpochMilli(),
+            expiresAtEpochMillis = NOW.minusSeconds(1).toEpochMilli(),
+        )
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+        assertNotNull(journals.journal)
+        journals.journal = requireNotNull(journals.journal).copy(
+            createdAtEpochMillis = NOW.minusSeconds(1_800).toEpochMilli(),
+            expiresAtEpochMillis = NOW.minusMillis(
+                GoogleAuthorizationJournal.SAFE_RETIREMENT_DELAY_MILLIS + 1,
+            ).toEpochMilli(),
+        )
+        assertFalse(manager.hasAuthorizationRecoveryBlocker())
+        assertNull(journals.journal)
+
+        journals.corrupt = true
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun rawServerExpiryCannotReleaseBindingDuringClockSkewOrCallbackSettlement() = runBlocking {
+        var observedNow = NOW
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            journalStore = journals,
+            nowProvider = { observedNow },
+        )
+        manager.refresh()
+        manager.enableCalendarPublishing(ACCOUNT_ID)
+        val serverExpiry = Instant.parse(transport.authorizationResult.expiresAt)
+
+        observedNow = serverExpiry
+        manager.refresh()
+
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+        assertNotNull(journals.journal)
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, manager.state.value.phase)
+        assertTrue(requireNotNull(manager.state.value.authorizationRecovery).browserWindowExpired)
+
+        observedNow = serverExpiry.plusMillis(
+            GoogleAuthorizationJournal.SAFE_RETIREMENT_DELAY_MILLIS,
+        )
+        manager.refresh()
+
+        assertFalse(manager.hasAuthorizationRecoveryBlocker())
+        assertNull(journals.journal)
+        assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
+    }
+
+    @Test
+    fun directPauseAndDisconnectFailClosedWhileAuthorizationJournalExists() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        manager.refresh()
+        manager.enableCalendarPublishing(ACCOUNT_ID)
+
+        manager.setPaused(ACCOUNT_ID, paused = true)
+        manager.disconnect(ACCOUNT_ID)
+
+        assertEquals(0, transport.pauseCalls)
+        assertEquals(0, transport.disconnectCalls)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, manager.state.value.phase)
+    }
+
+    @Test
+    fun unreadableRecoveryRequiresManagerIssuedExplicitResetConfirmation() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore().apply { corrupt = true }
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        assertNull(manager.unreadableAuthorizationRecoveryResetConfirmation())
+
+        manager.refresh()
+
+        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertTrue(manager.state.value.authorizationRecoveryResetRequired)
+        assertEquals(1, transport.accountsCalls)
+        val confirmation = requireNotNull(
+            manager.unreadableAuthorizationRecoveryResetConfirmation(),
+        )
+        manager.resetUnreadableAuthorizationRecovery(confirmation)
+        assertFalse(manager.hasAuthorizationRecoveryBlocker())
+        assertFalse(manager.state.value.authorizationRecoveryResetRequired)
+    }
+
+    @Test
+    fun confirmedLocalDestructionClearsExactlyOrFailsClosed() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) }
+        val manager = manager(FakeGoogleCredentials(), transport, journalStore = journals)
+        manager.refresh()
+        manager.enableTasksPublishing(ACCOUNT_ID)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+
+        journals.failClear = true
+        assertFalse(manager.abandonAuthorizationForConfirmedLocalDestruction())
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+        assertNotNull(journals.journal)
+
+        journals.failClear = false
+        assertTrue(manager.abandonAuthorizationForConfirmedLocalDestruction())
+        assertFalse(manager.hasAuthorizationRecoveryBlocker())
+        assertNull(journals.journal)
+        assertTrue(manager.state.value.accounts.isEmpty())
+    }
+
+    @Test
+    fun orphanedAuthorizationSurfacesWithoutCredentialsAndDiscardsOnlyAfterConfirmation() =
+        runBlocking {
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val credentials = FakeGoogleCredentials()
+            val initialTransport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account())
+            }
+            val initialManager = manager(
+                credentials,
+                initialTransport,
+                journalStore = journals,
+            )
+            initialManager.refresh()
+            initialManager.enableTasksPublishing(ACCOUNT_ID)
+            assertNotNull(journals.journal)
+
+            // Simulate process death followed by loss of the encrypted credential binding.
+            credentials.hasBearerToken = false
+            val recoveredTransport = FakeGoogleAccountsTransport()
+            val recoveredManager = manager(
+                credentials,
+                recoveredTransport,
+                journalStore = journals,
+            )
+            recoveredManager.refresh()
+
+            val state = recoveredManager.state.value
+            assertEquals(0, recoveredTransport.accountsCalls)
+            assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, state.phase)
+            assertTrue(state.requiresPlannerApiConfiguration)
+            assertTrue(state.authorizationRecoveryDiscardRequired)
+            assertFalse(state.authorizationRecoveryResetRequired)
+            assertNull(state.authorization)
+            assertNull(state.authorizationRecovery)
+            assertFalse(state.toString().contains(ACCOUNT_ID))
+            assertFalse(state.toString().contains("ENABLE_TASKS_PUBLISHING"))
+
+            val confirmation = requireNotNull(
+                recoveredManager.authorizationRecoveryDiscardConfirmation(),
+            )
+            assertEquals(
+                "GoogleAuthorizationRecoveryDiscardConfirmation(<redacted>)",
+                confirmation.toString(),
+            )
+            assertTrue(recoveredManager.discardAuthorizationRecovery(confirmation))
+            assertNull(journals.journal)
+            assertFalse(recoveredManager.hasAuthorizationRecoveryBlocker())
+            assertFalse(recoveredManager.state.value.authorizationRecoveryDiscardRequired)
+        }
+
+    @Test
+    fun sameBaseUrlDoesNotProveForeignJournalIdentityAndStaleExactDiscardFailsClosed() =
+        runBlocking {
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val credentials = FakeGoogleCredentials()
+            val initialTransport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account())
+            }
+            val initialManager = manager(
+                credentials,
+                initialTransport,
+                journalStore = journals,
+            )
+            initialManager.refresh()
+            initialManager.enableCalendarPublishing(ACCOUNT_ID)
+            val saved = requireNotNull(journals.journal)
+
+            // URL is unchanged, but this is a different credential generation.
+            credentials.configurationId = "configuration-b"
+            val recoveredTransport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account(label = "Current binding"))
+            }
+            val recoveredManager = manager(
+                credentials,
+                recoveredTransport,
+                journalStore = journals,
+            )
+            recoveredManager.refresh()
+
+            assertEquals(1, recoveredTransport.accountsCalls)
+            assertTrue(recoveredManager.state.value.authorizationRecoveryDiscardRequired)
+            assertNull(recoveredManager.state.value.authorizationRecovery)
+            assertTrue(credentials.hasBearerToken)
+            val confirmation = requireNotNull(
+                recoveredManager.authorizationRecoveryDiscardConfirmation(),
+            )
+
+            // A different exact record cannot be removed by the old capability.
+            journals.journal = saved.copy(
+                browserOpenedAtEpochMillis = NOW.plusSeconds(1).toEpochMilli(),
+            )
+            assertFalse(recoveredManager.discardAuthorizationRecovery(confirmation))
+            assertNotNull(journals.journal)
+            assertTrue(credentials.hasBearerToken)
+        }
+
+    @Test
+    fun discardConfirmationIsBoundToExactCredentialSnapshot() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val credentials = FakeGoogleCredentials()
+        val initialTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val initialManager = manager(credentials, initialTransport, journalStore = journals)
+        initialManager.refresh()
+        initialManager.enableCalendarPublishing(ACCOUNT_ID)
+
+        credentials.configurationId = "configuration-b"
+        val recoveredManager = manager(
+            credentials,
+            FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) },
+            journalStore = journals,
+        )
+        recoveredManager.refresh()
+        val confirmation = requireNotNull(
+            recoveredManager.authorizationRecoveryDiscardConfirmation(),
+        )
+
+        credentials.configurationId = "configuration-c"
+        assertFalse(recoveredManager.discardAuthorizationRecovery(confirmation))
+        assertNotNull(journals.journal)
+        assertTrue(recoveredManager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun corruptOrphanUsesDistinctVerifiedClearAndRetainsCredentialsOnFailure() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore().apply {
+            corrupt = true
+            failClear = true
+        }
+        val credentials = FakeGoogleCredentials().apply { hasBearerToken = false }
+        val transport = FakeGoogleAccountsTransport()
+        val manager = manager(credentials, transport, journalStore = journals)
+
+        manager.refresh()
+
+        assertEquals(0, transport.accountsCalls)
+        assertTrue(manager.state.value.authorizationRecoveryDiscardRequired)
+        assertTrue(manager.state.value.authorizationRecoveryResetRequired)
+        assertNull(manager.state.value.authorizationRecovery)
+        val confirmation = requireNotNull(manager.authorizationRecoveryDiscardConfirmation())
+        assertFalse(manager.discardAuthorizationRecovery(confirmation))
+        assertTrue(journals.corrupt)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+        assertFalse(credentials.hasBearerToken)
+
+        journals.failClear = false
+        assertTrue(manager.discardAuthorizationRecovery(confirmation))
+        assertFalse(journals.corrupt)
+        assertFalse(manager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun corruptOrphanDiscardCannotClearAReplacementArtifact() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore().apply { corrupt = true }
+        val credentials = FakeGoogleCredentials().apply { hasBearerToken = false }
+        val manager = manager(
+            credentials,
+            FakeGoogleAccountsTransport(),
+            journalStore = journals,
+        )
+        manager.refresh()
+        val stale = requireNotNull(manager.authorizationRecoveryDiscardConfirmation())
+        journals.corruptArtifactVersion += 1
+
+        assertFalse(manager.discardAuthorizationRecovery(stale))
+        assertTrue(journals.corrupt)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun expiredOrphanThatCannotAutoClearRequiresExactDiscardNotCorruptReset() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val credentials = FakeGoogleCredentials()
+        val initialTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val initialManager = manager(credentials, initialTransport, journalStore = journals)
+        initialManager.refresh()
+        initialManager.enableTasksPublishing(ACCOUNT_ID)
+        journals.journal = requireNotNull(journals.journal).copy(
+            createdAtEpochMillis = NOW.minusSeconds(1_800).toEpochMilli(),
+            expiresAtEpochMillis = NOW.minusSeconds(1).toEpochMilli(),
+            browserOpenedAtEpochMillis = null,
+        )
+        journals.failRemove = true
+        credentials.hasBearerToken = false
+        val recoveredManager = manager(
+            credentials,
+            FakeGoogleAccountsTransport(),
+            journalStore = journals,
+        )
+
+        recoveredManager.refresh()
+
+        assertTrue(recoveredManager.state.value.authorizationRecoveryDiscardRequired)
+        assertFalse(recoveredManager.state.value.authorizationRecoveryResetRequired)
+        assertNull(recoveredManager.unreadableAuthorizationRecoveryResetConfirmation())
+        val confirmation = requireNotNull(
+            recoveredManager.authorizationRecoveryDiscardConfirmation(),
+        )
+        assertFalse(recoveredManager.discardAuthorizationRecovery(confirmation))
+        assertNotNull(journals.journal)
+
+        journals.failRemove = false
+        assertTrue(recoveredManager.discardAuthorizationRecovery(confirmation))
+        assertNull(journals.journal)
+    }
+
+    @Test
+    fun exactDiscardRechecksPrivacyAfterJournalLoadBeforeRemoval() = runBlocking {
+        val allowed = AtomicBoolean(true)
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val credentials = FakeGoogleCredentials()
+        val initialTransport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account())
+        }
+        val initialManager = manager(credentials, initialTransport, journalStore = journals)
+        initialManager.refresh()
+        initialManager.enableTasksPublishing(ACCOUNT_ID)
+
+        credentials.hasBearerToken = false
+        val recoveredManager = manager(
+            credentials,
+            FakeGoogleAccountsTransport(),
+            operationAllowed = allowed::get,
+            journalStore = journals,
+        )
+        recoveredManager.refresh()
+        val confirmation = requireNotNull(
+            recoveredManager.authorizationRecoveryDiscardConfirmation(),
+        )
+        journals.loadHook = { allowed.set(false) }
+
+        assertFalse(recoveredManager.discardAuthorizationRecovery(confirmation))
+        assertNotNull(journals.journal)
+        assertTrue(recoveredManager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun corruptResetRechecksCredentialSnapshotAfterJournalLoadBeforeClear() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore().apply { corrupt = true }
+        val credentials = FakeGoogleCredentials()
+        val manager = manager(
+            credentials,
+            FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) },
+            journalStore = journals,
+        )
+        manager.refresh()
+        val confirmation = requireNotNull(
+            manager.unreadableAuthorizationRecoveryResetConfirmation(),
+        )
+        journals.loadHook = { credentials.configurationId = "configuration-b" }
+
+        manager.resetUnreadableAuthorizationRecovery(confirmation)
+
+        assertTrue(journals.corrupt)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
+    }
+
+    @Test
+    fun corruptResetConfirmationCannotClearAReplacementArtifact() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore().apply { corrupt = true }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            FakeGoogleAccountsTransport().apply { accountsResult = accounts(account()) },
+            journalStore = journals,
+        )
+        manager.refresh()
+        val stale = requireNotNull(manager.unreadableAuthorizationRecoveryResetConfirmation())
+        journals.corruptArtifactVersion += 1
+
+        manager.resetUnreadableAuthorizationRecovery(stale)
+
+        assertTrue(journals.corrupt)
+        assertTrue(manager.hasAuthorizationRecoveryBlocker())
     }
 
     @Test
@@ -358,6 +1169,50 @@ class GoogleAccountManagerTest {
         assertEquals(GoogleAccountPhase.AUTH_REQUIRED, manager.state.value.phase)
         assertTrue(manager.state.value.requiresPlannerApiConfiguration)
         assertFalse(manager.state.value.isBusy)
+    }
+
+    @Test
+    fun activeAccountRemainsUsableWhenAnotherAccountNeedsReauthorization() = runBlocking {
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(
+                account(id = ACCOUNT_ID, isDefault = true),
+                account(
+                    id = SECOND_ACCOUNT_ID,
+                    label = "Needs repair",
+                    status = "reauthorization_required",
+                    isDefault = false,
+                ),
+            )
+        }
+        val manager = manager(FakeGoogleCredentials(), transport)
+
+        manager.refresh()
+
+        assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
+        assertEquals(2, manager.state.value.accounts.size)
+        assertTrue(manager.state.value.message.contains("need authorization"))
+    }
+
+    @Test
+    fun activeAccountRemainsUsableWhenAnotherDisconnectNeedsRetry() = runBlocking {
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(
+                account(id = ACCOUNT_ID, isDefault = true),
+                account(
+                    id = SECOND_ACCOUNT_ID,
+                    label = "Disconnect pending",
+                    status = "revocation_failed",
+                    isDefault = false,
+                ),
+            )
+        }
+        val manager = manager(FakeGoogleCredentials(), transport)
+
+        manager.refresh()
+
+        assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
+        assertEquals(2, manager.state.value.accounts.size)
+        assertTrue(manager.state.value.message.contains("Disconnect"))
     }
 
     @Test
@@ -517,7 +1372,7 @@ class GoogleAccountManagerTest {
     }
 
     @Test
-    fun successfulConnectNewClearsOneUseAuthorizationFromAuthoritativeState() = runBlocking {
+    fun accountInventoryCannotCorrelateAndClearAConnectAttempt() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
             accountsResult = accounts(account())
@@ -533,13 +1388,49 @@ class GoogleAccountManagerTest {
         )
         manager.refresh()
 
-        assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
-        assertNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertNotNull(manager.state.value.authorization)
+        assertNotNull(manager.state.value.authorizationRecovery)
         assertEquals(2, manager.state.value.accounts.size)
     }
 
     @Test
-    fun successfulReauthorizationClearsPendingUrlAndFailedFlowCanStartOver() = runBlocking {
+    fun readOnlyConnectRequiresOneUnambiguousNewAccountWithBothServiceCapabilities() =
+        runBlocking {
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts()
+            }
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                journalStore = journals,
+            )
+            manager.refresh()
+            manager.connectNew()
+
+            transport.accountsResult = accounts(
+                account(),
+                account(
+                    id = SECOND_ACCOUNT_ID,
+                    label = "Concurrent account",
+                    isDefault = false,
+                ),
+            )
+            manager.refresh()
+
+            assertNotNull(journals.journal)
+            assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+
+            transport.accountsResult = accounts(account())
+            manager.refresh()
+
+            assertNotNull(journals.journal)
+            assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        }
+
+    @Test
+    fun reauthorizationInventoryChangeRetainsExactRecoveryAndCanRetry() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
             accountsResult = accounts(account(status = "reauthorization_required"))
@@ -564,12 +1455,57 @@ class GoogleAccountManagerTest {
 
         transport.accountsResult = accounts(account(status = "active", revision = 8))
         manager.refresh()
-        assertEquals(GoogleAccountPhase.CONNECTED, manager.state.value.phase)
-        assertNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        assertNotNull(manager.state.value.authorization)
+        assertNotNull(manager.state.value.authorizationRecovery)
     }
 
     @Test
-    fun browserOpenFailureRemainsRecoverableWithoutTrustingCompletion() = runBlocking {
+    fun readOnlyReauthorizationInventoryNeverCorrelatesTheBrowserAttempt() = runBlocking {
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val transport = FakeGoogleAccountsTransport().apply {
+            accountsResult = accounts(account(status = "reauthorization_required"))
+        }
+        val manager = manager(
+            FakeGoogleCredentials(),
+            transport,
+            journalStore = journals,
+        )
+        manager.refresh()
+        manager.reauthorize(ACCOUNT_ID)
+
+        transport.accountsResult = accounts(
+            account(
+                status = "active",
+                revision = 8,
+                grantedScopes = listOf("openid", "email"),
+            ),
+        )
+        manager.refresh()
+        assertNotNull(journals.journal)
+
+        transport.accountsResult = accounts(
+            account(
+                status = "active",
+                revision = 9,
+                grantedScopes = listOf(
+                    "openid",
+                    "email",
+                    "https://www.googleapis.com/auth/calendar.readonly",
+                ),
+            ),
+        )
+        manager.refresh()
+        assertNotNull(journals.journal)
+
+        transport.accountsResult = accounts(account(status = "active", revision = 10))
+        manager.refresh()
+        assertNotNull(journals.journal)
+        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+    }
+
+    @Test
+    fun browserOpenFailureAfterDurableHandoffCanOnlyCheckStatus() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
             accountsResult = accounts(account())
@@ -578,17 +1514,23 @@ class GoogleAccountManagerTest {
         manager.refresh()
         manager.connectNew()
 
+        val url = requireNotNull(manager.state.value.authorization).url
+        val openError = runCatching {
+            manager.useAuthorizationUrlIfCurrent(url) { throw IllegalStateException("no browser") }
+        }
+        assertTrue(openError.exceptionOrNull() is IllegalStateException)
         manager.browserOpenFailed()
 
-        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
-        assertNotNull(manager.state.value.authorization)
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, manager.state.value.phase)
+        assertNull(manager.state.value.authorization)
+        assertTrue(requireNotNull(manager.state.value.authorizationRecovery).browserOpened)
         manager.restartAuthorization()
-        assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
-        assertEquals(2, transport.authorizationRequests.size)
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, manager.state.value.phase)
+        assertEquals(1, transport.authorizationRequests.size)
     }
 
     @Test
-    fun expiredAuthorizationResponseNeverCreatesAnOpenableBrowserUrl() = runBlocking {
+    fun expiredAuthorizationResponseRetainsExactRecoveryWithoutOpenableUrl() = runBlocking {
         val credentials = FakeGoogleCredentials()
         val transport = FakeGoogleAccountsTransport().apply {
             authorizationResult = RemoteGoogleAuthorization(
@@ -600,8 +1542,9 @@ class GoogleAccountManagerTest {
 
         manager.connectNew()
 
-        assertEquals(GoogleAccountPhase.ERROR, manager.state.value.phase)
+        assertEquals(GoogleAccountPhase.AUTHORIZATION_RECOVERY, manager.state.value.phase)
         assertNull(manager.state.value.authorization)
+        assertNotNull(manager.state.value.authorizationRecovery)
     }
 
     @Test
@@ -762,12 +1705,19 @@ class GoogleAccountManagerTest {
         credentials: ApiCredentialStore,
         transport: FakeGoogleAccountsTransport,
         operationAllowed: () -> Boolean = { true },
+        authorizationMutationAllowed: (GoogleAuthorizationAction, String?) -> Boolean =
+            { _, _ -> true },
+        journalStore: InMemoryGoogleAuthorizationJournalStore =
+            InMemoryGoogleAuthorizationJournalStore(),
+        nowProvider: () -> Instant = { NOW },
     ) = GoogleAccountManager(
         credentialStore = credentials,
         transport = transport,
-        now = { NOW },
+        now = nowProvider,
         newUuid = { UUID.fromString(IDEMPOTENCY_KEY) },
         operationAllowed = operationAllowed,
+        authorizationMutationAllowed = authorizationMutationAllowed,
+        authorizationJournalStore = journalStore,
     )
 
     private fun accounts(vararg accounts: RemoteGoogleAccount) = RemoteGoogleAccounts(
@@ -870,6 +1820,7 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
     var pauseError: Exception? = null
     var disconnectError: Exception? = null
     var accountsError: Exception? = null
+    var authorizationError: Exception? = null
     var accountsHook: (() -> Unit)? = null
     var accountsStarted: CompletableDeferred<Unit>? = null
     var accountsGate: CompletableDeferred<Unit>? = null
@@ -878,7 +1829,10 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
     var pauseStarted: CompletableDeferred<Unit>? = null
     var pauseGate: CompletableDeferred<Unit>? = null
     var accountsCalls = 0
+    var pauseCalls = 0
+    var disconnectCalls = 0
     val authorizationRequests = mutableListOf<StartGoogleAuthorizationRequest>()
+    val authorizationIdempotencyKeys = mutableListOf<String>()
 
     override suspend fun accounts(
         configuration: AuthenticatedApiConfiguration,
@@ -897,8 +1851,10 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         request: StartGoogleAuthorizationRequest,
     ): RemoteGoogleAuthorization {
         authorizationRequests += request
+        authorizationIdempotencyKeys += idempotencyKey
         authorizationStarted?.complete(Unit)
         authorizationGate?.await()
+        authorizationError?.let { throw it }
         return authorizationResult
     }
 
@@ -909,6 +1865,7 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         paused: Boolean,
         idempotencyKey: String,
     ): RemoteGoogleAccount {
+        pauseCalls += 1
         pauseStarted?.complete(Unit)
         pauseGate?.await()
         pauseError?.let { throw it }
@@ -921,6 +1878,7 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         expectedRevision: Long,
         idempotencyKey: String,
     ): RemoteGoogleAccount {
+        disconnectCalls += 1
         disconnectError?.let { throw it }
         return accountsResult.accounts.single()
     }
@@ -940,5 +1898,89 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
             nextAttemptAt = null,
             lastFailureAt = null,
         )
+    }
+}
+
+private class InMemoryGoogleAuthorizationJournalStore : GoogleAuthorizationJournalStore {
+    var journal: GoogleAuthorizationJournal? = null
+    var corrupt = false
+    var corruptArtifactVersion = 1
+    var failSave = false
+    var failUpdate = false
+    var failRemove = false
+    var failClear = false
+    var saveHook: (() -> Unit)? = null
+    var loadHook: (() -> Unit)? = null
+    var saveCalls = 0
+
+    override fun load(nowEpochMillis: Long): GoogleAuthorizationJournalLoadResult {
+        loadHook?.also { loadHook = null }?.invoke()
+        if (corrupt) {
+            return GoogleAuthorizationJournalLoadResult.Corrupt(
+                GoogleAuthorizationCorruptArtifactIdentity("test-corrupt-$corruptArtifactVersion"),
+            )
+        }
+        val current = journal ?: return GoogleAuthorizationJournalLoadResult.Empty
+        return if (current.isValidAt(nowEpochMillis)) {
+            GoogleAuthorizationJournalLoadResult.Loaded(current)
+        } else if (current.isSafeToRetireAt(nowEpochMillis)) {
+            GoogleAuthorizationJournalLoadResult.Retirable(current)
+        } else {
+            GoogleAuthorizationJournalLoadResult.Expired(current)
+        }
+    }
+
+    override fun saveIfAbsent(
+        journal: GoogleAuthorizationJournal,
+        nowEpochMillis: Long,
+    ): Boolean {
+        saveCalls += 1
+        if (failSave || this.journal != null || !journal.isValidAt(nowEpochMillis)) return false
+        this.journal = journal
+        saveHook?.invoke()
+        return true
+    }
+
+    override fun updateExact(
+        expected: GoogleAuthorizationJournal,
+        replacement: GoogleAuthorizationJournal,
+        nowEpochMillis: Long,
+    ): Boolean {
+        if (failUpdate || journal != expected || !replacement.isValidAt(nowEpochMillis)) return false
+        journal = replacement
+        return true
+    }
+
+    override fun removeExact(
+        expected: GoogleAuthorizationJournal,
+        nowEpochMillis: Long,
+    ): Boolean {
+        if (failRemove || journal != expected) return false
+        journal = null
+        return true
+    }
+
+    override fun clearForConfirmedReset(nowEpochMillis: Long): Boolean {
+        if (failClear) return false
+        corrupt = false
+        journal = null
+        return true
+    }
+
+    override fun clearCorruptExact(
+        expected: GoogleAuthorizationCorruptArtifactIdentity,
+        nowEpochMillis: Long,
+    ): Boolean {
+        if (
+            failClear || !corrupt ||
+            expected != GoogleAuthorizationCorruptArtifactIdentity(
+                "test-corrupt-$corruptArtifactVersion",
+            )
+        ) {
+            return false
+        }
+        corrupt = false
+        journal = null
+        return true
     }
 }

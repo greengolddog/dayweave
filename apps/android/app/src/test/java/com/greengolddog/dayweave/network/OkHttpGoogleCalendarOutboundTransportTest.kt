@@ -391,6 +391,39 @@ class OkHttpGoogleCalendarOutboundTransportTest {
     }
 
     @Test
+    fun previewAcceptsTimedAllDayTentativeAndFreePrivateFixedEvents() {
+        val allDay = PROVIDER_PAYLOAD
+            .replace(
+                "\"date\":null,\"dateTime\":\"2026-09-02T12:00:00Z\"",
+                "\"date\":\"2026-09-02\",\"dateTime\":null",
+            )
+            .replace(
+                "\"date\":null,\"dateTime\":\"2026-09-02T12:30:00Z\"",
+                "\"date\":\"2026-09-03\",\"dateTime\":null",
+            )
+        val supportedPayloads = listOf(
+            PROVIDER_PAYLOAD,
+            PROVIDER_PAYLOAD.replace("\"status\":\"confirmed\"", "\"status\":\"tentative\""),
+            PROVIDER_PAYLOAD.replace(
+                "\"transparency\":\"opaque\"",
+                "\"transparency\":\"transparent\"",
+            ),
+            allDay,
+            allDay
+                .replace("\"status\":\"confirmed\"", "\"status\":\"tentative\"")
+                .replace(
+                    "\"transparency\":\"opaque\"",
+                    "\"transparency\":\"transparent\"",
+                ),
+        )
+
+        supportedPayloads.forEach { payload ->
+            server.enqueue(jsonResponse(200, previewEnvelopeJson(providerPayload = payload)))
+            runBlocking { preview() }
+        }
+    }
+
+    @Test
     fun previewRequiresPrivateDefaultOrderedFixedEventReviewFields() {
         val invalidPayloads = listOf(
             PROVIDER_PAYLOAD.dropLast(1) + ",\"reminders\":{}}",
@@ -399,11 +432,11 @@ class OkHttpGoogleCalendarOutboundTransportTest {
             PROVIDER_PAYLOAD.replace("\"etag\":null", "\"etag\":\"provider-etag\""),
             PROVIDER_PAYLOAD.replace("\"summary\":\"Private meeting\"", "\"summary\":null"),
             PROVIDER_PAYLOAD.replace("\"status\":\"confirmed\"", "\"status\":null"),
-            PROVIDER_PAYLOAD.replace("\"status\":\"confirmed\"", "\"status\":\"tentative\""),
+            PROVIDER_PAYLOAD.replace("\"status\":\"confirmed\"", "\"status\":\"cancelled\""),
             PROVIDER_PAYLOAD.replace("\"transparency\":\"opaque\"", "\"transparency\":null"),
             PROVIDER_PAYLOAD.replace(
                 "\"transparency\":\"opaque\"",
-                "\"transparency\":\"transparent\"",
+                "\"transparency\":\"default\"",
             ),
             PROVIDER_PAYLOAD.replace("\"visibility\":\"private\"", "\"visibility\":\"public\""),
             PROVIDER_PAYLOAD.replace("\"eventType\":\"default\"", "\"eventType\":\"focusTime\""),
@@ -416,6 +449,29 @@ class OkHttpGoogleCalendarOutboundTransportTest {
                 .replace(
                     "\"date\":null,\"dateTime\":\"2026-09-02T12:00:00Z\"",
                     "\"date\":\"2026-09-02\",\"dateTime\":null",
+                ),
+            PROVIDER_PAYLOAD
+                .replace(
+                    "\"date\":null,\"dateTime\":\"2026-09-02T12:00:00Z\"",
+                    "\"date\":\"2026-09-02\",\"dateTime\":null",
+                )
+                .replace(
+                    "\"date\":null,\"dateTime\":\"2026-09-02T12:30:00Z\"",
+                    "\"date\":\"2026-09-02\",\"dateTime\":null",
+                ),
+            PROVIDER_PAYLOAD
+                .replace(
+                    "\"date\":null,\"dateTime\":\"2026-09-02T12:00:00Z\"",
+                    "\"date\":\"2026-09-03\",\"dateTime\":null",
+                )
+                .replace(
+                    "\"date\":null,\"dateTime\":\"2026-09-02T12:30:00Z\"",
+                    "\"date\":\"2026-09-02\",\"dateTime\":null",
+                ),
+            PROVIDER_PAYLOAD
+                .replace(
+                    "\"date\":null,\"dateTime\":\"2026-09-02T12:00:00Z\"",
+                    "\"date\":\"2026-9-2\",\"dateTime\":null",
                 )
                 .replace(
                     "\"date\":null,\"dateTime\":\"2026-09-02T12:30:00Z\"",

@@ -115,10 +115,12 @@ Google Calendar. This server-first path is disabled by default behind both the
 general and schedule-specific outbound gates, uses stable logical
 slot/incarnation mappings, and publishes private/redacted events with reminders
 and attendee updates suppressed. Elapsed published events are never rewritten,
-deleted, or reused. No native client or automatic horizon process triggers this
-flow, and inbound Google edits, moves, or deletions are not interpreted yet;
-tentative blocks remain app-only as required. `SCH-006` remains open until the
-client, automation, and bidirectional behaviors satisfy the requirement.
+deleted, or reused. The macOS and Android clients now expose explicit owner
+review, approval, enqueue, recovery, and aggregate status for this flow. No
+automatic horizon process triggers it, and inbound Google edits, moves, or
+deletions are not interpreted yet; tentative blocks remain app-only as required.
+`SCH-006` remains open until automation and bidirectional behaviors satisfy the
+requirement.
 
 ### 4.6 Habits
 

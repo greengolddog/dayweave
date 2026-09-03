@@ -6,6 +6,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.time.LocalDate
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -1131,8 +1132,9 @@ private fun validPrivateFixedCalendarEvent(payload: JsonObject): Boolean {
         summary.content.codePointCount(0, summary.content.length) <= MAX_CALENDAR_SUMMARY_CODE_POINTS &&
         payload["description"].validCalendarDescription() &&
         payload["location"] == JsonNull &&
-        status?.isString == true && status.content == "confirmed" &&
-        transparency?.isString == true && transparency.content == "opaque" &&
+        status?.isString == true && status.content in CALENDAR_EVENT_STATUSES &&
+        transparency?.isString == true &&
+        transparency.content in CALENDAR_EVENT_TRANSPARENCIES &&
         visibility?.isString == true && visibility.content == "private" &&
         eventType?.isString == true && eventType.content == "default" && boundariesAreValid
     val collaborationFieldsAreInert =
@@ -1192,6 +1194,12 @@ private fun validCalendarBoundaries(start: JsonObject, end: JsonObject): Boolean
             parsedStart != null && parsedEnd != null && parsedStart.isBefore(parsedEnd)
         }
 
+        startDate != null && endDate != null && startTime == null && endTime == null -> {
+            val parsedStart = localDateOrNull(startDate)
+            val parsedEnd = localDateOrNull(endDate)
+            parsedStart != null && parsedEnd != null && parsedStart.isBefore(parsedEnd)
+        }
+
         else -> false
     }
 }
@@ -1207,6 +1215,12 @@ private fun JsonElement?.outboundBooleanOrNull(): Boolean? =
 
 private fun offsetDateTimeOrNull(value: String): OffsetDateTime? = try {
     OffsetDateTime.parse(value, DateTimeFormatter.ISO_OFFSET_DATE_TIME)
+} catch (_: DateTimeParseException) {
+    null
+}
+
+private fun localDateOrNull(value: String): LocalDate? = try {
+    LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE).takeIf { it.toString() == value }
 } catch (_: DateTimeParseException) {
     null
 }
@@ -1383,6 +1397,8 @@ private val CALENDAR_EVENT_ROOT_KEYS = setOf(
 )
 private val CALENDAR_EXTENDED_PROPERTY_KEYS = setOf("private", "shared")
 private val CALENDAR_PRIVATE_PROPERTY_KEYS = setOf(DAYWEAVE_OWNERSHIP_PROOF_KEY)
+private val CALENDAR_EVENT_STATUSES = setOf("confirmed", "tentative")
+private val CALENDAR_EVENT_TRANSPARENCIES = setOf("opaque", "transparent")
 private val GOOGLE_TASK_ROOT_KEYS = setOf(
     "id",
     "etag",
