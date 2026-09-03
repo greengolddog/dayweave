@@ -190,15 +190,13 @@ async fn publication_queries_and_simulations_are_durable_scoped_and_race_safe() 
         )
         .await
         .expect("create rejected-item control canary");
-    sqlx::query(
-        "UPDATE items SET scheduling_constraints = $3 WHERE workspace_id = $1 AND id = $2",
-    )
-    .bind(scope.workspace_id)
-    .bind(control_canary)
-    .bind(json!({"unknown_constraint": true}))
-    .execute(&test_database.pool)
-    .await
-    .expect("inject a corrupt stored-item control canary below the authoring boundary");
+    sqlx::query("UPDATE items SET scheduling_constraints = $3 WHERE workspace_id = $1 AND id = $2")
+        .bind(scope.workspace_id)
+        .bind(control_canary)
+        .bind(json!({"unknown_constraint": true}))
+        .execute(&test_database.pool)
+        .await
+        .expect("inject a corrupt stored-item control canary below the authoring boundary");
 
     let (app, device_access_token) =
         credential_publish_app(&test_database.pool, scope, items.clone(), schedules.clone()).await;
