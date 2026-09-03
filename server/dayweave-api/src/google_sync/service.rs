@@ -7141,7 +7141,7 @@ mod tests {
 
     #[test]
     fn outbound_calendar_requires_owned_firm_block_and_uses_stable_id() {
-        let now = Utc::now();
+        let now = truncate_to_microseconds(Utc::now()).expect("microsecond test clock");
         let input = NewItem {
             id: Uuid::from_u128(44),
             is_sensitive: false,

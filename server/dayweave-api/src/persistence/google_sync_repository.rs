@@ -19951,7 +19951,7 @@ mod tests {
                 title: "Stale queued block".to_owned(),
                 notes: None,
                 timezone_name: "UTC".to_owned(),
-                duration_seconds: Some(1800),
+                duration_seconds: Some(3600),
                 deadline_at: Some(now + Duration::hours(2)),
                 earliest_start_at: Some(now + Duration::hours(1)),
                 recurrence: None,
