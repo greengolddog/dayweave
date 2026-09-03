@@ -235,8 +235,13 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
         ))
         .await
         .unwrap();
-    assert_eq!(first.status(), StatusCode::OK);
+    let first_status = first.status();
     let first = body_json(first).await;
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "preview response body: {first}"
+    );
     assert_eq!(first["source_item_count"], 2);
     assert_eq!(first["source_item_revisions"][valid_id.to_string()], 1);
     assert_eq!(first["source_item_revisions"][incomplete_id.to_string()], 1);
@@ -342,8 +347,13 @@ async fn sensitive_ancestor_marks_child_preview_blocks_without_moving_them() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let response_status = response.status();
     let response = body_json(response).await;
+    assert_eq!(
+        response_status,
+        StatusCode::OK,
+        "preview response body: {response}"
+    );
     let block = &response["plan"]["blocks"][0];
     assert_eq!(block["item_id"], child_id.to_string());
     assert_eq!(block["is_sensitive"], true);
@@ -439,8 +449,13 @@ async fn fixed_block_publishability_is_rejected_before_a_client_can_journal() {
         ))
         .await
         .unwrap();
-    assert_eq!(maximum.status(), StatusCode::OK);
+    let maximum_status = maximum.status();
     let maximum = body_json(maximum).await;
+    assert_eq!(
+        maximum_status,
+        StatusCode::OK,
+        "preview response body: {maximum}"
+    );
 
     for invalid_title in ["é".repeat(501), "contains\0nul".to_owned(), "\n".to_owned()] {
         let mut invalid = body.clone();
