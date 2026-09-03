@@ -53,6 +53,106 @@ enum class GoogleCalendarOutboundEntityKind {
 }
 
 @Serializable
+enum class ScheduleGooglePublicationOperation {
+    @SerialName("create") CREATE,
+    @SerialName("update") UPDATE,
+    @SerialName("delete") DELETE,
+    @SerialName("noop") NOOP,
+}
+
+@Serializable
+enum class ScheduleGooglePublicationState {
+    @SerialName("pending") PENDING,
+    @SerialName("delivering") DELIVERING,
+    @SerialName("backoff") BACKOFF,
+    @SerialName("partially_published") PARTIALLY_PUBLISHED,
+    @SerialName("published") PUBLISHED,
+    @SerialName("conflict") CONFLICT,
+    @SerialName("failed") FAILED,
+    @SerialName("superseded") SUPERSEDED,
+}
+
+@Serializable
+data class RemoteScheduleGooglePublicationChange(
+    val ordinal: Int,
+    @SerialName("slot_id") val slotId: String,
+    @SerialName("source_block_id") val sourceBlockId: String?,
+    val operation: ScheduleGooglePublicationOperation,
+    @SerialName("provider_resource_id") val providerResourceId: String?,
+    @SerialName("provider_etag") val providerEtag: String?,
+    val summary: String,
+    @SerialName("starts_at") val startsAt: String,
+    @SerialName("ends_at") val endsAt: String,
+) {
+    override fun toString(): String =
+        "RemoteScheduleGooglePublicationChange(ordinal=$ordinal, operation=$operation, " +
+            "content=<redacted>)"
+}
+
+@Serializable
+data class RemoteScheduleGooglePublicationPreview(
+    val id: String,
+    @SerialName("account_id") val accountId: String,
+    @SerialName("collection_id") val collectionId: String,
+    @SerialName("collection_revision") val collectionRevision: Long,
+    @SerialName("collection_display_name") val collectionDisplayName: String,
+    @SerialName("schedule_revision_id") val scheduleRevisionId: String,
+    @SerialName("schedule_revision_number") val scheduleRevisionNumber: Long,
+    @SerialName("preview_hash") val previewHash: String,
+    @SerialName("create_count") val createCount: Int,
+    @SerialName("update_count") val updateCount: Int,
+    @SerialName("delete_count") val deleteCount: Int,
+    @SerialName("noop_count") val noopCount: Int,
+    val changes: List<RemoteScheduleGooglePublicationChange>,
+    @SerialName("expires_at") val expiresAt: String,
+) {
+    override fun toString(): String =
+        "RemoteScheduleGooglePublicationPreview(changeCount=${changes.size}, content=<redacted>)"
+}
+
+@Serializable
+data class RemoteScheduleGooglePublicationApproval(
+    @SerialName("preview_id") val previewId: String,
+    @SerialName("approval_capability") val approvalCapability: String,
+    @SerialName("expires_at") val expiresAt: String,
+) {
+    override fun toString(): String =
+        "RemoteScheduleGooglePublicationApproval(capability=<redacted>)"
+}
+
+@Serializable
+data class RemoteScheduleGooglePublicationAccepted(
+    @SerialName("publication_id") val publicationId: String,
+    val replayed: Boolean,
+) {
+    override fun toString(): String =
+        "RemoteScheduleGooglePublicationAccepted(replayed=$replayed, id=<redacted>)"
+}
+
+@Serializable
+data class RemoteScheduleGooglePublicationStatus(
+    @SerialName("publication_id") val publicationId: String,
+    @SerialName("account_id") val accountId: String,
+    @SerialName("collection_id") val collectionId: String,
+    @SerialName("schedule_revision_id") val scheduleRevisionId: String,
+    val state: ScheduleGooglePublicationState,
+    @SerialName("total_count") val totalCount: Int,
+    @SerialName("pending_count") val pendingCount: Int,
+    @SerialName("delivering_count") val deliveringCount: Int,
+    @SerialName("published_count") val publishedCount: Int,
+    @SerialName("conflicted_count") val conflictedCount: Int,
+    @SerialName("failed_count") val failedCount: Int,
+    @SerialName("superseded_count") val supersededCount: Int,
+    @SerialName("created_at") val createdAt: String,
+    @SerialName("completed_at") val completedAt: String?,
+    @SerialName("last_error_code") val lastErrorCode: String?,
+) {
+    override fun toString(): String =
+        "RemoteScheduleGooglePublicationStatus(state=$state, totalCount=$totalCount, " +
+            "binding=<redacted>)"
+}
+
+@Serializable
 data class RemoteGoogleOutboundPreview(
     val id: String,
     @SerialName("account_id") val accountId: String,
@@ -136,6 +236,28 @@ private data class RemoteGoogleOutboundAcceptedEnvelope(
     val outbound: RemoteGoogleOutboundAccepted,
 )
 
+@Serializable
+private data class ScheduleGooglePublicationPreviewRequest(
+    @SerialName("collection_id") val collectionId: String,
+    @SerialName("expected_schedule_revision_id") val expectedScheduleRevisionId: String,
+)
+
+@Serializable
+private data class ScheduleGooglePublicationApprovalRequest(
+    @SerialName("expected_preview_hash") val expectedPreviewHash: String,
+)
+
+@Serializable
+private data class ScheduleGooglePublicationEnqueueRequest(
+    @SerialName("preview_id") val previewId: String,
+    @SerialName("collection_id") val collectionId: String,
+    @SerialName("expected_schedule_revision_id") val expectedScheduleRevisionId: String,
+    @SerialName("approval_capability") val approvalCapability: String,
+) {
+    override fun toString(): String =
+        "ScheduleGooglePublicationEnqueueRequest(capability=<redacted>)"
+}
+
 sealed class GoogleCalendarOutboundApiException(message: String) : IOException(message) {
     class Authentication :
         GoogleCalendarOutboundApiException("The DayWeave API rejected the bearer token")
@@ -194,10 +316,41 @@ interface GoogleCalendarOutboundTransport {
     ): RemoteGoogleOutboundAccepted
 }
 
+interface GoogleSchedulePublicationTransport {
+    suspend fun previewSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        collectionId: String,
+        expectedScheduleRevisionId: String,
+    ): RemoteScheduleGooglePublicationPreview
+
+    suspend fun approveSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        previewId: String,
+        expectedPreviewHash: String,
+    ): RemoteScheduleGooglePublicationApproval
+
+    suspend fun enqueueSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        previewId: String,
+        collectionId: String,
+        expectedScheduleRevisionId: String,
+        approvalCapability: String,
+    ): RemoteScheduleGooglePublicationAccepted
+
+    suspend fun schedulePublicationStatus(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        publicationId: String,
+    ): RemoteScheduleGooglePublicationStatus
+}
+
 class OkHttpGoogleCalendarOutboundTransport(
     client: OkHttpClient = OkHttpGoogleAccountsTransport.defaultClient(),
     private val json: Json = defaultJson(),
-) : GoogleCalendarOutboundTransport {
+) : GoogleCalendarOutboundTransport, GoogleSchedulePublicationTransport {
     // Durable outbound recovery, not OkHttp, owns every retry decision. In particular, approval is
     // one-shot and must become RESPONSE_UNKNOWN after an ambiguous dispatch.
     private val client = client.newBuilder()
@@ -306,6 +459,120 @@ class OkHttpGoogleCalendarOutboundTransport(
         ).outbound
         validateAccepted(accepted)
         return accepted
+    }
+
+    override suspend fun previewSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        collectionId: String,
+        expectedScheduleRevisionId: String,
+    ): RemoteScheduleGooglePublicationPreview {
+        requireOutboundIdentity(accountId, "Google account ID")
+        requireOutboundIdentity(collectionId, "Google collection ID")
+        requireOutboundIdentity(expectedScheduleRevisionId, "published schedule revision ID")
+        val request = ScheduleGooglePublicationPreviewRequest(
+            collectionId = collectionId,
+            expectedScheduleRevisionId = expectedScheduleRevisionId,
+        )
+        val url = accountUrl(configuration, accountId)
+            .addPathSegments("schedule-publications/previews")
+            .build()
+        val preview = execute<RemoteScheduleGooglePublicationPreview>(
+            requestBuilder(configuration, url.toString())
+                .post(json.encodeToString(request).toRequestBody(JSON_MEDIA_TYPE))
+                .build(),
+            expectedStatus = 200,
+        )
+        validateSchedulePublicationPreview(preview)
+        if (
+            preview.accountId != accountId || preview.collectionId != collectionId ||
+            preview.scheduleRevisionId != expectedScheduleRevisionId
+        ) {
+            throw GoogleCalendarOutboundApiException.InvalidResponse()
+        }
+        return preview
+    }
+
+    override suspend fun approveSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        previewId: String,
+        expectedPreviewHash: String,
+    ): RemoteScheduleGooglePublicationApproval {
+        requireOutboundIdentity(accountId, "Google account ID")
+        requireOutboundIdentity(previewId, "schedule publication preview ID")
+        require(validOutboundHash(expectedPreviewHash))
+        val request = ScheduleGooglePublicationApprovalRequest(expectedPreviewHash)
+        val url = accountUrl(configuration, accountId)
+            .addPathSegments("schedule-publications/previews")
+            .addPathSegment(previewId)
+            .addPathSegment("approve")
+            .build()
+        val approval = execute<RemoteScheduleGooglePublicationApproval>(
+            requestBuilder(configuration, url.toString())
+                .post(json.encodeToString(request).toOneShotOutboundRequestBody(JSON_MEDIA_TYPE))
+                .build(),
+            expectedStatus = 200,
+        )
+        validateSchedulePublicationApproval(approval)
+        if (approval.previewId != previewId) {
+            throw GoogleCalendarOutboundApiException.InvalidResponse()
+        }
+        return approval
+    }
+
+    override suspend fun enqueueSchedulePublication(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        previewId: String,
+        collectionId: String,
+        expectedScheduleRevisionId: String,
+        approvalCapability: String,
+    ): RemoteScheduleGooglePublicationAccepted {
+        requireOutboundIdentity(accountId, "Google account ID")
+        requireOutboundIdentity(previewId, "schedule publication preview ID")
+        requireOutboundIdentity(collectionId, "Google collection ID")
+        requireOutboundIdentity(expectedScheduleRevisionId, "published schedule revision ID")
+        require(validSchedulePublicationCapability(approvalCapability))
+        val request = ScheduleGooglePublicationEnqueueRequest(
+            previewId = previewId,
+            collectionId = collectionId,
+            expectedScheduleRevisionId = expectedScheduleRevisionId,
+            approvalCapability = approvalCapability,
+        )
+        val url = accountUrl(configuration, accountId)
+            .addPathSegment("schedule-publications")
+            .build()
+        val accepted = execute<RemoteScheduleGooglePublicationAccepted>(
+            requestBuilder(configuration, url.toString())
+                .post(json.encodeToString(request).toRequestBody(JSON_MEDIA_TYPE))
+                .build(),
+            expectedStatus = 202,
+        )
+        validateSchedulePublicationAccepted(accepted)
+        return accepted
+    }
+
+    override suspend fun schedulePublicationStatus(
+        configuration: AuthenticatedApiConfiguration,
+        accountId: String,
+        publicationId: String,
+    ): RemoteScheduleGooglePublicationStatus {
+        requireOutboundIdentity(accountId, "Google account ID")
+        requireOutboundIdentity(publicationId, "schedule publication ID")
+        val url = accountUrl(configuration, accountId)
+            .addPathSegment("schedule-publications")
+            .addPathSegment(publicationId)
+            .build()
+        val status = execute<RemoteScheduleGooglePublicationStatus>(
+            requestBuilder(configuration, url.toString()).get().build(),
+            expectedStatus = 200,
+        )
+        validateSchedulePublicationStatus(status)
+        if (status.accountId != accountId || status.publicationId != publicationId) {
+            throw GoogleCalendarOutboundApiException.InvalidResponse()
+        }
+        return status
     }
 
     private fun accountUrl(
@@ -485,6 +752,157 @@ private fun validateAccepted(accepted: RemoteGoogleOutboundAccepted) {
     }
 }
 
+private fun validateSchedulePublicationPreview(preview: RemoteScheduleGooglePublicationPreview) {
+    val counts = listOf(
+        preview.createCount,
+        preview.updateCount,
+        preview.deleteCount,
+        preview.noopCount,
+    )
+    val valid = canonicalOutboundUuidOrNull(preview.id)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+        canonicalOutboundUuidOrNull(preview.accountId)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+        canonicalOutboundUuidOrNull(preview.collectionId)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+        canonicalOutboundUuidOrNull(preview.scheduleRevisionId)?.let {
+            it != ZERO_OUTBOUND_UUID
+        } == true &&
+        preview.collectionRevision > 0 && preview.scheduleRevisionNumber > 0 &&
+        validOutboundText(preview.collectionDisplayName, MAX_SCHEDULE_COLLECTION_NAME_BYTES) &&
+        validOutboundHash(preview.previewHash) &&
+        counts.all { it >= 0 } && counts.sum() == preview.changes.size &&
+        preview.changes.size <= MAX_SCHEDULE_PUBLICATION_CHANGES &&
+        preview.createCount == preview.changes.count {
+            it.operation == ScheduleGooglePublicationOperation.CREATE
+        } &&
+        preview.updateCount == preview.changes.count {
+            it.operation == ScheduleGooglePublicationOperation.UPDATE
+        } &&
+        preview.deleteCount == preview.changes.count {
+            it.operation == ScheduleGooglePublicationOperation.DELETE
+        } &&
+        preview.noopCount == preview.changes.count {
+            it.operation == ScheduleGooglePublicationOperation.NOOP
+        } &&
+        preview.changes.withIndex().all { (index, change) ->
+            validSchedulePublicationChange(change, index)
+        } && preview.changes.map { it.slotId }.distinct().size == preview.changes.size &&
+        outboundInstantOrNull(preview.expiresAt) != null
+    if (!valid) throw GoogleCalendarOutboundApiException.InvalidResponse()
+}
+
+private fun validSchedulePublicationChange(
+    change: RemoteScheduleGooglePublicationChange,
+    expectedOrdinal: Int,
+): Boolean {
+    val providerBindingValid = when (change.operation) {
+        ScheduleGooglePublicationOperation.CREATE ->
+            change.providerResourceId == null && change.providerEtag == null
+        ScheduleGooglePublicationOperation.UPDATE,
+        ScheduleGooglePublicationOperation.DELETE,
+        ScheduleGooglePublicationOperation.NOOP,
+        -> change.providerResourceId?.let { validOutboundText(it, MAX_PROVIDER_BINDING_BYTES) } == true &&
+            change.providerEtag?.let { validOutboundText(it, MAX_PROVIDER_BINDING_BYTES) } == true
+    }
+    val sourceBindingValid = when (change.operation) {
+        ScheduleGooglePublicationOperation.CREATE,
+        ScheduleGooglePublicationOperation.UPDATE,
+        ScheduleGooglePublicationOperation.NOOP,
+        -> change.sourceBlockId != null
+        ScheduleGooglePublicationOperation.DELETE -> change.sourceBlockId == null
+    }
+    val start = outboundInstantOrNull(change.startsAt)
+    val end = outboundInstantOrNull(change.endsAt)
+    return change.ordinal == expectedOrdinal &&
+        canonicalOutboundUuidOrNull(change.slotId)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+        (change.sourceBlockId == null || canonicalOutboundUuidOrNull(change.sourceBlockId)
+            ?.let { it != ZERO_OUTBOUND_UUID } == true) &&
+        sourceBindingValid && providerBindingValid &&
+        validOutboundText(change.summary, MAX_CALENDAR_SUMMARY_BYTES) &&
+        change.summary.codePointCount(0, change.summary.length) <=
+        MAX_CALENDAR_SUMMARY_CODE_POINTS &&
+        start != null && end != null && start < end
+}
+
+private fun validateSchedulePublicationApproval(
+    approval: RemoteScheduleGooglePublicationApproval,
+) {
+    if (
+        canonicalOutboundUuidOrNull(approval.previewId)?.let { it != ZERO_OUTBOUND_UUID } != true ||
+        !validSchedulePublicationCapability(approval.approvalCapability) ||
+        outboundInstantOrNull(approval.expiresAt) == null
+    ) {
+        throw GoogleCalendarOutboundApiException.InvalidResponse()
+    }
+}
+
+private fun validateSchedulePublicationAccepted(
+    accepted: RemoteScheduleGooglePublicationAccepted,
+) {
+    if (
+        canonicalOutboundUuidOrNull(accepted.publicationId)?.let {
+            it != ZERO_OUTBOUND_UUID
+        } != true
+    ) {
+        throw GoogleCalendarOutboundApiException.InvalidResponse()
+    }
+}
+
+private fun validateSchedulePublicationStatus(status: RemoteScheduleGooglePublicationStatus) {
+    val counts = listOf(
+        status.pendingCount,
+        status.deliveringCount,
+        status.publishedCount,
+        status.conflictedCount,
+        status.failedCount,
+        status.supersededCount,
+    )
+    val terminal = status.state in setOf(
+        ScheduleGooglePublicationState.PARTIALLY_PUBLISHED,
+        ScheduleGooglePublicationState.PUBLISHED,
+        ScheduleGooglePublicationState.CONFLICT,
+        ScheduleGooglePublicationState.FAILED,
+        ScheduleGooglePublicationState.SUPERSEDED,
+    )
+    val stateMatchesCounts = when (status.state) {
+        ScheduleGooglePublicationState.DELIVERING -> status.deliveringCount > 0
+        ScheduleGooglePublicationState.PENDING,
+        ScheduleGooglePublicationState.BACKOFF,
+        -> status.deliveringCount == 0 && status.pendingCount > 0
+        ScheduleGooglePublicationState.PUBLISHED -> status.publishedCount == status.totalCount
+        ScheduleGooglePublicationState.PARTIALLY_PUBLISHED ->
+            status.pendingCount == 0 && status.deliveringCount == 0 &&
+                status.publishedCount in 1 until status.totalCount
+        ScheduleGooglePublicationState.CONFLICT ->
+            status.pendingCount == 0 && status.deliveringCount == 0 &&
+                status.publishedCount == 0 && status.conflictedCount > 0
+        ScheduleGooglePublicationState.FAILED ->
+            status.pendingCount == 0 && status.deliveringCount == 0 &&
+                status.publishedCount == 0 && status.conflictedCount == 0 &&
+                status.failedCount > 0
+        ScheduleGooglePublicationState.SUPERSEDED ->
+            status.totalCount > 0 && status.supersededCount == status.totalCount &&
+                status.pendingCount + status.deliveringCount + status.publishedCount +
+                status.conflictedCount + status.failedCount == 0
+    }
+    val createdAt = outboundInstantOrNull(status.createdAt)
+    val completedAt = status.completedAt?.let(::outboundInstantOrNull)
+    val valid =
+        canonicalOutboundUuidOrNull(status.publicationId)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+            canonicalOutboundUuidOrNull(status.accountId)?.let { it != ZERO_OUTBOUND_UUID } == true &&
+            canonicalOutboundUuidOrNull(status.collectionId)?.let {
+                it != ZERO_OUTBOUND_UUID
+            } == true &&
+            canonicalOutboundUuidOrNull(status.scheduleRevisionId)?.let {
+                it != ZERO_OUTBOUND_UUID
+            } == true &&
+            status.totalCount in 0..MAX_SCHEDULE_PUBLICATION_CHANGES &&
+            counts.all { it in 0..MAX_SCHEDULE_PUBLICATION_CHANGES } &&
+            counts.sum() == status.totalCount && stateMatchesCounts && createdAt != null &&
+            (status.completedAt != null) == terminal &&
+            (status.completedAt == null || completedAt != null && completedAt >= createdAt) &&
+            (status.lastErrorCode == null || validSchedulePublicationErrorCode(status.lastErrorCode))
+    if (!valid) throw GoogleCalendarOutboundApiException.InvalidResponse()
+}
+
 private fun requireOutboundIdentity(value: String, description: String) {
     require(canonicalOutboundUuidOrNull(value)?.let { it != ZERO_OUTBOUND_UUID } == true) {
         "$description is invalid"
@@ -537,6 +955,31 @@ private fun validOutboundCapability(value: String): Boolean {
         false
     }
 }
+
+private fun validSchedulePublicationCapability(value: String): Boolean {
+    val prefix = "dw_gsa1_"
+    if (!value.startsWith(prefix)) return false
+    val payload = value.substring(prefix.length)
+    if (
+        payload.length != 43 || payload.any { character ->
+            character !in 'A'..'Z' && character !in 'a'..'z' &&
+                character !in '0'..'9' && character != '-' && character != '_'
+        }
+    ) {
+        return false
+    }
+    return try {
+        val decoded = Base64.getUrlDecoder().decode(payload)
+        decoded.size == 32 && Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(decoded) == payload
+    } catch (_: IllegalArgumentException) {
+        false
+    }
+}
+
+private fun validSchedulePublicationErrorCode(value: String): Boolean =
+    value.length in 1..MAX_SCHEDULE_ERROR_CODE_CHARS &&
+        value.all { it in 'a'..'z' || it in '0'..'9' || it == '_' }
 
 private fun validProviderPayload(
     payload: JsonObject,
@@ -907,6 +1350,10 @@ private const val MAX_CALENDAR_DESCRIPTION_BYTES = 256 * 1024
 private const val MAX_CALENDAR_DESCRIPTION_CODE_POINTS = 100_000
 private const val MAX_GOOGLE_TASK_TITLE_CODE_POINTS = 500
 private const val MAX_GOOGLE_TASK_NOTES_CODE_POINTS = 100_000
+private const val MAX_SCHEDULE_PUBLICATION_CHANGES = 10_000
+private const val MAX_SCHEDULE_COLLECTION_NAME_BYTES = 4_096
+private const val MAX_PROVIDER_BINDING_BYTES = 2_048
+private const val MAX_SCHEDULE_ERROR_CODE_CHARS = 128
 private const val MIN_CALENDAR_EVENT_ID_CHARS = 66
 private const val MAX_CALENDAR_EVENT_ID_CHARS = 73
 private const val DAYWEAVE_OWNERSHIP_PROOF_KEY = "dayweaveOwnershipProof"

@@ -13,6 +13,8 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationTarget
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
@@ -36,6 +38,10 @@ import com.greengolddog.dayweave.sync.GoogleCalendarOutboundApprovalConfirmation
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundCoordinator
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundState
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationApprovalConfirmation
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationCoordinator
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationState
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationTargetOption
 import com.greengolddog.dayweave.sync.GoogleImportConfigurationOutcome
 import com.greengolddog.dayweave.sync.ProposalApplicationApproval
 import com.greengolddog.dayweave.sync.ProposalApplicationState
@@ -62,6 +68,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         dayWeaveApplication.googleCalendarImportCoordinator
     private val googleCalendarOutboundCoordinator: GoogleCalendarOutboundCoordinator =
         dayWeaveApplication.googleCalendarOutboundCoordinator
+    private val googleSchedulePublicationCoordinator: GoogleSchedulePublicationCoordinator =
+        dayWeaveApplication.googleSchedulePublicationCoordinator
     private val energySignalManager = dayWeaveApplication.energySignalManager
     private val deviceAuthCoordinator = dayWeaveApplication.deviceAuthCoordinator
     private val canonicalAuthoringController = CanonicalAuthoringController(plannerStore)
@@ -87,6 +95,8 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         googleCalendarImportCoordinator.state
     val googleCalendarOutboundState: StateFlow<GoogleCalendarOutboundState> =
         googleCalendarOutboundCoordinator.state
+    val googleSchedulePublicationState: StateFlow<GoogleSchedulePublicationState> =
+        googleSchedulePublicationCoordinator.state
     val energySignalState: StateFlow<EnergySignalState> = energySignalManager.state
     val deviceAuthState: StateFlow<DeviceAuthUiState> = deviceAuthCoordinator.uiState
     val healthConnectPermissions: Set<String> = energySignalManager.requiredPermissions
@@ -466,11 +476,20 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
             }
             if (
                 sourceAccounts.isNotEmpty() ||
-                googleCalendarOutboundCoordinator.hasCredentialRecoveryBlocker()
+                googleCalendarOutboundCoordinator.hasCredentialRecoveryBlocker() ||
+                googleSchedulePublicationCoordinator.hasCredentialRecoveryBlocker() ||
+                plannerStore.state.value.pendingGoogleSchedulePublication != null
             ) {
                 dayWeaveApplication.enqueueCanonicalRecovery {
-                    sourceAccounts.forEach { account ->
-                        googleCalendarImportCoordinator.recoverPending(account.id)
+                    googleSchedulePublicationCoordinator.recoverPending()
+                    val scheduleAuthorityIsLive =
+                        plannerStore.state.value.pendingGoogleSchedulePublication?.stage?.let {
+                            it != GoogleSchedulePublicationStage.ACCEPTED
+                        } == true
+                    if (!scheduleAuthorityIsLive) {
+                        sourceAccounts.forEach { account ->
+                            googleCalendarImportCoordinator.recoverPending(account.id)
+                        }
                     }
                     googleCalendarOutboundCoordinator.recoverPending()
                 }
@@ -522,6 +541,64 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         if (googleCalendarOutboundCoordinator.state.value.isBusy) return false
         return dayWeaveApplication.launchCanonicalAction {
             googleCalendarOutboundCoordinator.discardExpiredRecovery()
+        }
+    }
+
+    fun googleSchedulePublishingTargets(): List<GoogleSchedulePublicationTargetOption> =
+        googleSchedulePublicationCoordinator.targets()
+
+    fun pendingGoogleScheduleDestination(): GoogleSchedulePublicationTargetOption? =
+        googleSchedulePublicationCoordinator.pendingDestinationOption()
+
+    fun prepareGoogleSchedulePublicationPreview(
+        target: GoogleSchedulePublicationTarget,
+    ): Boolean {
+        if (isCanonicalBusy() || googleSchedulePublicationCoordinator.state.value.isBusy) {
+            return false
+        }
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.preparePreview(target)
+        }
+    }
+
+    fun googleSchedulePublicationApprovalConfirmation():
+        GoogleSchedulePublicationApprovalConfirmation? =
+        googleSchedulePublicationCoordinator.approvalConfirmation()
+
+    fun approveGoogleSchedulePublication(
+        confirmation: GoogleSchedulePublicationApprovalConfirmation,
+    ): Boolean {
+        if (googleSchedulePublicationCoordinator.state.value.isBusy) return false
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.approveAndEnqueue(confirmation)
+        }
+    }
+
+    fun recoverGoogleSchedulePublication(): Boolean {
+        if (googleSchedulePublicationCoordinator.state.value.isBusy) return false
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.recoverPending()
+        }
+    }
+
+    fun replayApprovedGoogleSchedulePublication(): Boolean {
+        if (googleSchedulePublicationCoordinator.state.value.isBusy) return false
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.replayApprovedEnqueue()
+        }
+    }
+
+    fun discardExpiredGoogleSchedulePublication(): Boolean {
+        if (googleSchedulePublicationCoordinator.state.value.isBusy) return false
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.discardExpiredRecovery()
+        }
+    }
+
+    fun dismissSettledGoogleSchedulePublication(): Boolean {
+        if (googleSchedulePublicationCoordinator.state.value.isBusy) return false
+        return dayWeaveApplication.launchCanonicalAction {
+            googleSchedulePublicationCoordinator.dismissSettled()
         }
     }
 
@@ -592,12 +669,20 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun reauthorizeGoogleAccount(accountId: String) {
-        if (googleCalendarOutboundCoordinator.state.value.isBusy) return
+        if (
+            googleCalendarOutboundCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.hasCredentialRecoveryBlocker()
+        ) return
         viewModelScope.launch { googleAccountManager.reauthorize(accountId) }
     }
 
     fun restartGoogleAuthorization() {
-        if (googleCalendarOutboundCoordinator.state.value.isBusy) return
+        if (
+            googleCalendarOutboundCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.hasCredentialRecoveryBlocker()
+        ) return
         viewModelScope.launch { googleAccountManager.restartAuthorization() }
     }
 
@@ -628,7 +713,11 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun openGoogleAuthorization(candidate: String, opener: (String) -> Unit) {
-        if (googleCalendarOutboundCoordinator.state.value.isBusy) return
+        if (
+            googleCalendarOutboundCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.hasCredentialRecoveryBlocker()
+        ) return
         viewModelScope.launch {
             try {
                 if (!googleAccountManager.useAuthorizationUrlIfCurrent(candidate, opener)) {
@@ -779,9 +868,13 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
         canonicalSyncManager.state.value.isBusy || executionSyncManager.state.value.isBusy ||
             proposalApplicationManager.state.value.isBusy ||
             googleCalendarOutboundCoordinator.state.value.isBusy ||
+            googleSchedulePublicationCoordinator.state.value.isBusy ||
             plannerStore.state.value.pendingExecutionDeferIntent != null ||
             plannerStore.state.value.pendingProposalApplicationMutation != null ||
-            plannerStore.state.value.pendingGoogleCalendarOutbound != null
+            plannerStore.state.value.pendingGoogleCalendarOutbound != null ||
+            plannerStore.state.value.pendingGoogleSchedulePublication?.stage?.let {
+                it != GoogleSchedulePublicationStage.ACCEPTED
+            } == true
 
     private suspend fun requestNotificationPermissionAfterDurableTimedPause(
         before: DayWeaveUiState?,

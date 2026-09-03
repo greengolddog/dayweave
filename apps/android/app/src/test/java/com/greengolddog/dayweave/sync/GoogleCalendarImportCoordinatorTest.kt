@@ -39,6 +39,51 @@ import org.junit.Test
 
 class GoogleCalendarImportCoordinatorTest {
     @Test
+    fun schedulePublicationAuthorityBlocksImportStartAndPostSaveRace() = runBlocking {
+        val blockedTransport = FakeGoogleInboundTransport()
+        val blockedJournals = InMemoryGoogleImportJournalStore()
+        val blocked = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = blockedTransport,
+            journals = blockedJournals,
+            pipeline = FakeGoogleImportPipeline(),
+            importAllowed = { false },
+        )
+
+        assertEquals(
+            GoogleCalendarImportOutcome.RECOVERY_REQUIRED,
+            blocked.refresh(ACCOUNT_A),
+        )
+        assertTrue(blockedTransport.refreshRequestIds.isEmpty())
+        assertEquals(0, blockedTransport.statusCalls)
+        assertTrue(blockedJournals.journals.isEmpty())
+
+        var importAllowed = true
+        val racingTransport = FakeGoogleInboundTransport()
+        val racingJournals = InMemoryGoogleImportJournalStore().apply {
+            afterSave = { journal ->
+                if (!journal.isAccepted) importAllowed = false
+            }
+        }
+        val racing = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = racingTransport,
+            journals = racingJournals,
+            pipeline = FakeGoogleImportPipeline(),
+            importAllowed = { importAllowed },
+        )
+
+        assertEquals(
+            GoogleCalendarImportOutcome.RECOVERY_REQUIRED,
+            racing.refresh(ACCOUNT_A),
+        )
+        assertTrue(racingTransport.refreshRequestIds.isEmpty())
+        assertEquals(0, racingTransport.statusCalls)
+        assertEquals(1, racingJournals.journals.size)
+        assertFalse(racingJournals.journals.single().isAccepted)
+    }
+
+    @Test
     fun lostRefreshResponseSurvivesRestartAndReplaysExactRequest() = runBlocking {
         val credentials = FakeGoogleImportCredentials()
         val journals = InMemoryGoogleImportJournalStore()
@@ -1150,6 +1195,7 @@ class GoogleCalendarImportCoordinatorTest {
         retryPolicy: GoogleCalendarImportRetryPolicy = GoogleCalendarImportRetryPolicy(listOf(0)),
         newRequestId: () -> UUID = { UUID.fromString(REQUEST_ID) },
         operationAllowed: () -> Boolean = { true },
+        importAllowed: () -> Boolean = { true },
     ): GoogleCalendarImportCoordinator = GoogleCalendarImportCoordinator(
         credentialStore = credentials,
         transport = transport,
@@ -1160,6 +1206,7 @@ class GoogleCalendarImportCoordinatorTest {
         newRequestId = newRequestId,
         sleep = {},
         operationAllowed = operationAllowed,
+        importAllowed = importAllowed,
     )
 
     private fun completedTransport(generation: Long): FakeGoogleInboundTransport =
@@ -1340,6 +1387,7 @@ private class InMemoryGoogleImportJournalStore : GoogleCalendarImportJournalStor
     var removeCount = 0
     var rejectedRetirementAttempts = 0
     var rejectedRetirementCount = 0
+    var afterSave: ((GoogleCalendarImportJournal) -> Unit)? = null
 
     override fun load(nowEpochMillis: Long): GoogleCalendarImportJournalLoadResult {
         beforeLoad?.invoke()
@@ -1362,6 +1410,7 @@ private class InMemoryGoogleImportJournalStore : GoogleCalendarImportJournalStor
         }
         if (index < 0) {
             journals += journal
+            afterSave?.invoke(journal)
             return true
         }
         val existing = journals[index]
@@ -1374,6 +1423,7 @@ private class InMemoryGoogleImportJournalStore : GoogleCalendarImportJournalStor
             return false
         }
         journals[index] = journal
+        afterSave?.invoke(journal)
         return true
     }
 

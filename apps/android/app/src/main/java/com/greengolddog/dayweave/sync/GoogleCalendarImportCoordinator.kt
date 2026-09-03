@@ -221,6 +221,7 @@ class GoogleCalendarImportCoordinator(
     private val newRequestId: () -> UUID = UUID::randomUUID,
     private val sleep: suspend (Long) -> Unit = { delay(it) },
     private val operationAllowed: () -> Boolean = { true },
+    private val importAllowed: () -> Boolean = { true },
 ) {
     private val operationMutex = Mutex()
 
@@ -455,11 +456,15 @@ class GoogleCalendarImportCoordinator(
         }
     }
 
-    suspend fun refresh(accountId: String): GoogleCalendarImportOutcome =
-        refreshInternal(accountId, allowNewRequest = true)
+    suspend fun refresh(accountId: String): GoogleCalendarImportOutcome {
+        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
+        return refreshInternal(accountId, allowNewRequest = true)
+    }
 
-    suspend fun recoverPending(accountId: String): GoogleCalendarImportOutcome =
-        refreshInternal(accountId, allowNewRequest = false)
+    suspend fun recoverPending(accountId: String): GoogleCalendarImportOutcome {
+        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
+        return refreshInternal(accountId, allowNewRequest = false)
+    }
 
     private suspend fun collectionsOperation(
         accountId: String,
@@ -537,6 +542,7 @@ class GoogleCalendarImportCoordinator(
         accountId: String,
         allowNewRequest: Boolean,
     ): GoogleCalendarImportOutcome {
+        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
         val lifecycle = lifecycleGeneration.get()
         val binding = authenticatedBinding(lifecycle) ?: return bindingFailureOutcome()
         val bindingTicket = try {
@@ -676,6 +682,7 @@ class GoogleCalendarImportCoordinator(
         journal: GoogleCalendarImportJournal,
         isFreshlyPersistedFirstSend: Boolean,
     ): GoogleCalendarImportJournal? {
+        requireCurrent(lifecycle, binding)
         setState(
             lifecycle,
             stateFor(binding).copy(
@@ -766,6 +773,7 @@ class GoogleCalendarImportCoordinator(
             updateRecoveryFailure(lifecycle, binding, ACCEPTANCE_NOT_SAVED, pendingCount())
             return null
         }
+        requireCurrent(lifecycle, binding)
         setState(
             lifecycle,
             stateFor(binding).copy(
@@ -991,7 +999,7 @@ class GoogleCalendarImportCoordinator(
         val acceptedGeneration = requireNotNull(journal.acceptedRefreshGeneration)
         val currentSnapshot = credentialStore.snapshot()
         val completionAllowed = synchronized(presentationMonitor) {
-            operationAllowed() && lifecycleGeneration.get() == lifecycle &&
+            operationAllowed() && importAllowed() && lifecycleGeneration.get() == lifecycle &&
                 sameBinding(currentSnapshot, binding.snapshot)
         }
         if (!completionAllowed) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
@@ -1022,7 +1030,7 @@ class GoogleCalendarImportCoordinator(
             return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
         }
         if (
-            lifecycleGeneration.get() != lifecycle ||
+            !operationAllowed() || !importAllowed() || lifecycleGeneration.get() != lifecycle ||
             !sameBinding(credentialStore.snapshot(), binding.snapshot)
         ) {
             return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
@@ -1294,7 +1302,7 @@ class GoogleCalendarImportCoordinator(
         binding: BoundGoogleImportConfiguration,
     ) {
         if (
-            lifecycleGeneration.get() != lifecycle ||
+            !importAllowed() || lifecycleGeneration.get() != lifecycle ||
             !sameBinding(credentialStore.snapshot(), binding.snapshot)
         ) {
             throw StaleGoogleImportOperationException()

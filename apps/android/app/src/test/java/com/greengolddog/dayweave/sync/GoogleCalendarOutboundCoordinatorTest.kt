@@ -10,6 +10,7 @@ import com.greengolddog.dayweave.model.GoogleCalendarOutboundApprovalCapability
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationJournal
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
 import com.greengolddog.dayweave.network.ApiCredentialStore
@@ -43,6 +44,37 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class GoogleCalendarOutboundCoordinatorTest {
+    @Test
+    fun liveSchedulePublicationAuthorityBlocksFreshGenericOutboundAndStoreRace() = runBlocking {
+        val scheduleAuthority = GoogleSchedulePublicationJournal(
+            recoveryId = OTHER_RECOVERY_ID,
+            operationGeneration = 2,
+            configurationId = CONFIGURATION_A,
+            apiBaseUrl = API_BASE_URL,
+            accountId = ACCOUNT_ID,
+            collectionId = COLLECTION_ID,
+            expectedScheduleRevisionId = "89898989-8989-4989-8989-898989898989",
+            intentExpiresAt = "2026-09-02T12:30:00Z",
+            createdAt = NOW.toString(),
+        )
+        val store = PlannerStore(outboundState(schedulePending = scheduleAuthority))
+        val transport = FakeGoogleOutboundTransport()
+        val coordinator = coordinator(store, transport)
+
+        assertTrue(coordinator.targetsFor(ITEM_ID).isEmpty())
+        assertEquals(
+            GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
+            coordinator.preparePreview(ITEM_ID, TARGET),
+        )
+        assertNoNetworkCalls(transport)
+        assertFalse(store.replaceGoogleCalendarOutboundJournal(null, intentJournal()))
+        assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
+        assertEquals(
+            scheduleAuthority,
+            store.durableState.value?.pendingGoogleSchedulePublication,
+        )
+    }
+
     @Test
     fun preparePersistsExactIntentBeforePreviewAndPersistsPreviewBeforeConfirmation() =
         runBlocking {
@@ -949,12 +981,14 @@ class GoogleCalendarOutboundCoordinatorTest {
     private fun outboundState(
         item: CanonicalItemSnapshot = canonicalEvent(),
         pending: GoogleCalendarOutboundJournal? = null,
+        schedulePending: GoogleSchedulePublicationJournal? = null,
     ) = DayWeaveUiState(
         canonicalItems = listOf(item),
         canonicalSyncOrigin = API_BASE_URL,
         canonicalConfigurationId = CONFIGURATION_A,
         canonicalDeltaCursor = "cursor-1",
         pendingGoogleCalendarOutbound = pending,
+        pendingGoogleSchedulePublication = schedulePending,
     )
 
     private fun canonicalEvent(tentative: Boolean = false): CanonicalItemSnapshot {

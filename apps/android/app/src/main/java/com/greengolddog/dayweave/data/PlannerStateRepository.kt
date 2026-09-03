@@ -57,6 +57,10 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V14 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+            )
             PlannerSnapshotFormats.JSON_V13 -> decodeCurrentSnapshot(snapshot.payload)
             PlannerSnapshotFormats.JSON_V12 -> decodeCurrentSnapshot(
                 migrateLegacyCalendarOutboundSnapshot(snapshot.payload),
@@ -171,6 +175,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V12 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V13
@@ -180,8 +185,16 @@ class RoomPlannerStateRepository(
             // No predecessor format can mint or retain Google provider-mutation authority.
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
+        val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14
+        ) {
+            outboundHardened
+        } else {
+            // No predecessor format can retain generated-schedule provider-write authority.
+            outboundHardened.copy(pendingGoogleSchedulePublication = null)
+        }
         val notificationHardened =
-            outboundHardened.withInvalidTimedBreakNotificationAttemptAbandoned()
+            schedulePublicationHardened.withInvalidTimedBreakNotificationAttemptAbandoned()
         val hardened = notificationHardened.localScheduleCompositionProvenance?.let { provenance ->
             if (provenance.matchesState(notificationHardened)) {
                 notificationHardened
@@ -190,7 +203,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V13 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V14 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -212,12 +225,13 @@ class RoomPlannerStateRepository(
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
         validateGoogleOutboundState(retainedState)
+        validateGoogleSchedulePublicationState(retainedState)
         dao.save(
             PlannerSnapshotEntity(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V13,
+                payloadFormat = PlannerSnapshotFormats.JSON_V14,
             ),
         )
     }
@@ -254,6 +268,7 @@ class RoomPlannerStateRepository(
         requireScheduleCompositionProfileField: Boolean = true,
         requireGoogleCalendarOutboundField: Boolean = true,
         requireFirmHorizonDaysField: Boolean = true,
+        requireGoogleSchedulePublicationField: Boolean = false,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -298,11 +313,17 @@ class RoomPlannerStateRepository(
                 scheduleProfileSafeRoot
             }
         }
-        val root = if (requireGoogleCalendarOutboundField) {
+        val googleOutboundSafeRoot = if (requireGoogleCalendarOutboundField) {
             firmHorizonSafeRoot
         } else {
             // V10 and predecessors cannot gain provider-mutation authority from an injected field.
             JsonObject(firmHorizonSafeRoot - "pendingGoogleCalendarOutbound")
+        }
+        val root = if (requireGoogleSchedulePublicationField) {
+            googleOutboundSafeRoot
+        } else {
+            // V13 and predecessors cannot gain schedule-write authority from an injected field.
+            JsonObject(googleOutboundSafeRoot - "pendingGoogleSchedulePublication")
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -341,6 +362,12 @@ class RoomPlannerStateRepository(
             !root.containsKey("pendingGoogleCalendarOutbound")
         ) {
             throw SerializationException("Current Google outbound recovery is required")
+        }
+        if (
+            requireGoogleSchedulePublicationField &&
+            !root.containsKey("pendingGoogleSchedulePublication")
+        ) {
+            throw SerializationException("Current Google schedule publication recovery is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -891,6 +918,23 @@ class RoomPlannerStateRepository(
             throw error
         } catch (error: Exception) {
             throw SerializationException("Google outbound recovery is invalid", error)
+        }
+    }
+
+    /** One-shot schedule approval authority must remain inside one exact canonical binding. */
+    private fun validateGoogleSchedulePublicationState(state: DayWeaveUiState) {
+        val journal = state.pendingGoogleSchedulePublication ?: return
+        try {
+            journal.requireValidShape()
+            require(journal.isValidAt(Instant.ofEpochMilli(nowEpochMillis())))
+            require(
+                state.canonicalSyncOrigin == journal.apiBaseUrl &&
+                    state.canonicalConfigurationId == journal.configurationId,
+            ) { "Google schedule publication recovery crosses the canonical binding" }
+        } catch (error: SerializationException) {
+            throw error
+        } catch (error: Exception) {
+            throw SerializationException("Google schedule publication recovery is invalid", error)
         }
     }
 

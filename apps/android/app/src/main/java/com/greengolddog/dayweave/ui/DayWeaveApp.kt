@@ -57,6 +57,7 @@ import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
 import com.greengolddog.dayweave.model.PlanningSuggestion
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationPresentationDecision
@@ -92,6 +93,7 @@ import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorMode
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorRoute
 import com.greengolddog.dayweave.ui.authoring.CanonicalItemEditorSheet
 import com.greengolddog.dayweave.ui.authoring.GoogleCalendarOutboundReviewSheet
+import com.greengolddog.dayweave.ui.authoring.GoogleSchedulePublicationReviewSheet
 import com.greengolddog.dayweave.ui.authoring.canonicalParentOptions
 import com.greengolddog.dayweave.ui.navigation.DayWeaveNavigationBar
 import com.greengolddog.dayweave.ui.screens.AssistantScreen
@@ -105,6 +107,8 @@ import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundPhase
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationPhase
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationTargetOption
 import java.time.Instant
 import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
@@ -269,6 +273,8 @@ private fun DayWeaveRoot(
         viewModel.googleCalendarImportState.collectAsStateWithLifecycle()
     val googleCalendarOutboundState by
         viewModel.googleCalendarOutboundState.collectAsStateWithLifecycle()
+    val googleSchedulePublicationState by
+        viewModel.googleSchedulePublicationState.collectAsStateWithLifecycle()
     val energySignalState by viewModel.energySignalState.collectAsStateWithLifecycle()
     val deviceAuthState by viewModel.deviceAuthState.collectAsStateWithLifecycle()
     val timedBreakNotificationPermissionRequestDigest by
@@ -300,10 +306,14 @@ private fun DayWeaveRoot(
     val canonicalExecutionActionsEnabled =
         !canonicalSyncState.isBusy && !executionSyncState.isBusy &&
             !proposalApplicationState.isBusy && !googleCalendarOutboundState.isBusy &&
+            !googleSchedulePublicationState.isBusy &&
             state.pendingCanonicalMutation == null && state.pendingExecutionCommand == null &&
             state.pendingExecutionDeferIntent == null &&
             state.pendingProposalApplicationMutation == null &&
-            state.pendingGoogleCalendarOutbound == null
+            state.pendingGoogleCalendarOutbound == null &&
+            state.pendingGoogleSchedulePublication?.stage?.let {
+                it != GoogleSchedulePublicationStage.ACCEPTED
+            } != true
     val canonicalAuthoringActionsEnabled = canonicalExecutionActionsEnabled &&
         state.canonicalExecutionSession == null &&
         state.pendingSchedulePublication == null &&
@@ -321,6 +331,10 @@ private fun DayWeaveRoot(
         mutableStateOf<GoogleCalendarPublicationReview?>(null)
     }
     var showGooglePublicationReview by remember { mutableStateOf(false) }
+    var showGoogleSchedulePublicationReview by remember { mutableStateOf(false) }
+    var selectedGoogleScheduleTarget by remember {
+        mutableStateOf<GoogleSchedulePublicationTargetOption?>(null)
+    }
     var googleOutboundClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var plannerClockMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
     var canonicalEditorRoute by remember { mutableStateOf<CanonicalItemEditorRoute?>(null) }
@@ -370,6 +384,18 @@ private fun DayWeaveRoot(
     ) {
         if (state.pendingGoogleCalendarOutbound != null) {
             showGooglePublicationReview = true
+            while (isActive) {
+                googleOutboundClockMillis = System.currentTimeMillis()
+                delay(1_000)
+            }
+        }
+    }
+    LaunchedEffect(
+        state.pendingGoogleSchedulePublication?.recoveryId,
+        state.pendingGoogleSchedulePublication?.stage,
+    ) {
+        if (state.pendingGoogleSchedulePublication != null) {
+            showGoogleSchedulePublicationReview = true
             while (isActive) {
                 googleOutboundClockMillis = System.currentTimeMillis()
                 delay(1_000)
@@ -626,6 +652,37 @@ private fun DayWeaveRoot(
                         }
                     }
                 }
+                if (state.pendingGoogleSchedulePublication != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(Icons.Outlined.CalendarMonth, contentDescription = null)
+                            Column(
+                                modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                            ) {
+                                Text(
+                                    "Generated schedule publication saved",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    googleSchedulePublicationState.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 2,
+                                )
+                            }
+                            TextButton(onClick = { showGoogleSchedulePublicationReview = true }) {
+                                Text("View")
+                            }
+                        }
+                    }
+                }
                 val active = state.activeItem
                 val session = state.activeSession
                 AnimatedVisibility(visible = active != null && session != null) {
@@ -716,7 +773,10 @@ private fun DayWeaveRoot(
                 },
                 onRetryCanonicalAuthoring = viewModel::retryCanonicalAuthoring,
                 googleOutboundBlocked = state.pendingGoogleCalendarOutbound != null ||
-                    googleCalendarOutboundState.isBusy,
+                    googleCalendarOutboundState.isBusy ||
+                    state.pendingGoogleSchedulePublication?.stage?.let {
+                        it != GoogleSchedulePublicationStage.ACCEPTED
+                    } == true,
                 googlePublishingTargets = viewModel::googleCalendarPublishingTargets,
                 onRequestGooglePublication = { itemId, targets ->
                     if (
@@ -772,6 +832,13 @@ private fun DayWeaveRoot(
                 onDiscoverGoogleSources = viewModel::discoverGoogleSources,
                 onRefreshGoogleImport = viewModel::refreshGoogleImport,
                 onConfigureGoogleSource = viewModel::configureGoogleSource,
+                onPublishGeneratedSchedule = {
+                    selectedGoogleScheduleTarget = viewModel.googleSchedulePublishingTargets()
+                        .singleOrNull()
+                    showGoogleSchedulePublicationReview = true
+                },
+                schedulePublicationHasRecovery =
+                    state.pendingGoogleSchedulePublication != null,
                 onToggleHealthConnect = { enabled ->
                     when {
                         !enabled -> viewModel.disableHealthConnect()
@@ -1303,6 +1370,58 @@ private fun DayWeaveRoot(
                 showGooglePublicationReview = false
                 googlePublicationReview = null
                 viewModel.resetGoogleCalendarPublicationPresentation()
+            },
+        )
+    }
+
+    if (showGoogleSchedulePublicationReview) {
+        val scheduleTargets = viewModel.googleSchedulePublishingTargets()
+        val selectedScheduleTarget = selectedGoogleScheduleTarget?.takeIf {
+            it in scheduleTargets
+        } ?: scheduleTargets.singleOrNull()
+        val savedScheduleDestination = viewModel.pendingGoogleScheduleDestination()
+        GoogleSchedulePublicationReviewSheet(
+            state = googleSchedulePublicationState,
+            targets = scheduleTargets,
+            selectedTarget = selectedScheduleTarget ?: savedScheduleDestination,
+            savedDestinationDisplayName = savedScheduleDestination?.displayName,
+            approvalConfirmation =
+                viewModel.googleSchedulePublicationApprovalConfirmation(),
+            recoveryStage = state.pendingGoogleSchedulePublication?.stage,
+            canRecover = state.pendingGoogleSchedulePublication != null &&
+                (
+                    state.pendingGoogleSchedulePublication?.stage ==
+                        GoogleSchedulePublicationStage.APPROVED ||
+                        googleSchedulePublicationState.phase in setOf(
+                            GoogleSchedulePublicationPhase.PENDING,
+                            GoogleSchedulePublicationPhase.AUTH_REQUIRED,
+                            GoogleSchedulePublicationPhase.OFFLINE,
+                            GoogleSchedulePublicationPhase.RECOVERY_REQUIRED,
+                        )
+                ),
+            canDiscardExpiredRecovery = state.pendingGoogleSchedulePublication
+                ?.canDiscardExpiredAt(Instant.ofEpochMilli(googleOutboundClockMillis)) == true,
+            canDismissSettled = state.pendingGoogleSchedulePublication?.status?.isTerminal == true,
+            onTargetSelected = { selectedGoogleScheduleTarget = it },
+            onRequestPreview = viewModel::prepareGoogleSchedulePublicationPreview,
+            onApproveAndQueue = viewModel::approveGoogleSchedulePublication,
+            onRecover = { viewModel.recoverGoogleSchedulePublication() },
+            onReplayApproved = { viewModel.replayApprovedGoogleSchedulePublication() },
+            onDiscardExpiredRecovery = {
+                if (viewModel.discardExpiredGoogleSchedulePublication()) {
+                    showGoogleSchedulePublicationReview = false
+                    selectedGoogleScheduleTarget = null
+                }
+            },
+            onDismissSettled = {
+                if (viewModel.dismissSettledGoogleSchedulePublication()) {
+                    showGoogleSchedulePublicationReview = false
+                    selectedGoogleScheduleTarget = null
+                }
+            },
+            onDismissRequest = {
+                showGoogleSchedulePublicationReview = false
+                selectedGoogleScheduleTarget = null
             },
         )
     }

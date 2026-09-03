@@ -43,10 +43,10 @@ import com.greengolddog.dayweave.sync.GoogleCalendarImportState
 import com.greengolddog.dayweave.sync.GoogleImportCollectionState
 
 /**
- * Inbound-only Google Calendar and Tasks controls for the Android settings surface.
+ * Google Calendar and Tasks source controls plus an explicit generated-schedule review entry.
  *
- * The writable server role is intentionally display-only here. Every configuration callback is
- * constrained to [GoogleInboundCollectionRole], so this component cannot request outbound access.
+ * Every source-configuration callback remains constrained to [GoogleInboundCollectionRole]. The
+ * separate publication callback can only open the secure preview/approval workflow.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -62,6 +62,8 @@ fun GoogleSourcesCard(
         kind: RemoteGoogleCollectionKind,
         role: GoogleInboundCollectionRole,
     ) -> Unit,
+    onPublishGeneratedSchedule: () -> Unit = {},
+    schedulePublicationHasRecovery: Boolean = false,
     modifier: Modifier = Modifier,
     actionsEnabled: Boolean = true,
 ) {
@@ -116,6 +118,26 @@ fun GoogleSourcesCard(
                 }
             },
         )
+
+        HorizontalDivider()
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.End,
+        ) {
+            TextButton(
+                onClick = onPublishGeneratedSchedule,
+                enabled = actionsEnabled,
+                modifier = Modifier.testTag("google_publish_generated_schedule"),
+            ) {
+                Text(
+                    if (schedulePublicationHasRecovery) {
+                        "Review saved publication"
+                    } else {
+                        "Publish generated schedule"
+                    },
+                )
+            }
+        }
 
         if (accounts.isEmpty()) {
             HorizontalDivider()

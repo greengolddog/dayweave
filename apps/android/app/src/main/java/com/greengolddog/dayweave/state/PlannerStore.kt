@@ -20,6 +20,8 @@ import com.greengolddog.dayweave.model.EnergySignalSource
 import com.greengolddog.dayweave.model.ExecutionDeferAssessmentSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationJournal
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.ItemKind
@@ -3438,6 +3440,9 @@ class PlannerStore(
             current.pendingExecutionDeferIntent != null ||
             current.pendingProposalApplicationMutation != null ||
             current.pendingGoogleCalendarOutbound != null ||
+            current.pendingGoogleSchedulePublication?.stage?.let {
+                it != GoogleSchedulePublicationStage.ACCEPTED
+            } == true ||
             current.pendingCanonicalAuthoringMutations.any {
                 it.id !in preservableAuthoringIds
             } ||
@@ -3472,6 +3477,9 @@ class PlannerStore(
                     ) { "Google Calendar outbound item is no longer publishable" }
                     require(
                         current.pendingSchedulePublication == null &&
+                            current.pendingGoogleSchedulePublication?.stage?.let {
+                                it != GoogleSchedulePublicationStage.ACCEPTED
+                            } != true &&
                             current.pendingProposalApplicationMutation == null &&
                             current.pendingCanonicalMutation == null &&
                             current.pendingExecutionCommand == null &&
@@ -3543,6 +3551,102 @@ class PlannerStore(
             null
         } ?: return false
         return receipt.awaitDurable() && durableState.value?.pendingGoogleCalendarOutbound == null
+    }
+
+    /** Durably advances one exact generated-schedule publication before consequential I/O. */
+    suspend fun replaceGoogleSchedulePublicationJournal(
+        expected: GoogleSchedulePublicationJournal?,
+        replacement: GoogleSchedulePublicationJournal,
+    ): Boolean {
+        val receipt = try {
+            mutateDurably { current ->
+                require(current.pendingGoogleSchedulePublication == expected) {
+                    "Google schedule publication recovery changed"
+                }
+                if (expected == null) {
+                    require(replacement.stage == GoogleSchedulePublicationStage.INTENT)
+                    require(
+                        current.canonicalSyncOrigin == replacement.apiBaseUrl &&
+                            current.canonicalConfigurationId == replacement.configurationId,
+                    ) { "Google schedule publication crosses the canonical binding" }
+                    require(current.hasExactPublishedSchedule(replacement.expectedScheduleRevisionId)) {
+                        "The published schedule is no longer current"
+                    }
+                    require(
+                        current.pendingSchedulePublication == null &&
+                            current.pendingGoogleCalendarOutbound == null &&
+                            current.pendingProposalApplicationMutation == null &&
+                            current.pendingCanonicalMutation == null &&
+                            current.pendingExecutionCommand == null &&
+                            current.pendingExecutionDeferIntent == null,
+                    ) { "Another canonical write must finish before schedule publication" }
+                } else {
+                    require(expected.canTransitionTo(replacement)) {
+                        "Google schedule publication recovery transition is invalid"
+                    }
+                    if (
+                        replacement.stage == GoogleSchedulePublicationStage.PREVIEWED ||
+                        replacement.stage == GoogleSchedulePublicationStage.APPROVAL_ATTEMPTED
+                    ) {
+                        require(
+                            current.hasExactPublishedSchedule(
+                                replacement.expectedScheduleRevisionId,
+                            ),
+                        ) { "The published schedule changed before approval" }
+                    }
+                }
+                current.copy(pendingGoogleSchedulePublication = replacement)
+            }
+        } catch (_: IllegalArgumentException) {
+            null
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return false
+        return receipt.awaitDurable() &&
+            durableState.value?.pendingGoogleSchedulePublication == replacement
+    }
+
+    suspend fun discardExpiredGoogleSchedulePublication(
+        expected: GoogleSchedulePublicationJournal,
+        now: Instant,
+    ): Boolean {
+        if (!expected.canDiscardExpiredAt(now)) return false
+        return clearGoogleSchedulePublicationJournal(expected)
+    }
+
+    suspend fun dismissSettledGoogleSchedulePublication(
+        expected: GoogleSchedulePublicationJournal,
+    ): Boolean {
+        if (expected.stage != GoogleSchedulePublicationStage.ACCEPTED ||
+            expected.status?.isTerminal != true) {
+            return false
+        }
+        return clearGoogleSchedulePublicationJournal(expected)
+    }
+
+    private suspend fun clearGoogleSchedulePublicationJournal(
+        expected: GoogleSchedulePublicationJournal,
+    ): Boolean {
+        val receipt = try {
+            mutateDurably { current ->
+                require(current.pendingGoogleSchedulePublication == expected) {
+                    "Google schedule publication recovery changed"
+                }
+                current.copy(pendingGoogleSchedulePublication = null)
+            }
+        } catch (_: IllegalArgumentException) {
+            null
+        } catch (_: IllegalStateException) {
+            null
+        } ?: return false
+        return receipt.awaitDurable() &&
+            durableState.value?.pendingGoogleSchedulePublication == null
+    }
+
+    private fun DayWeaveUiState.hasExactPublishedSchedule(revisionId: String): Boolean {
+        val proof = publishedScheduleProof ?: return false
+        return pendingSchedulePublication == null && publishedScheduleRevision?.id == revisionId &&
+            proof.revision.id == revisionId && proof.matchesCurrentStateAndPlan(this)
     }
 
     /**
@@ -4031,6 +4135,7 @@ class PlannerStore(
             canonicalDeltaCursor = null,
             pendingSchedulePublication = null,
             pendingGoogleCalendarOutbound = null,
+            pendingGoogleSchedulePublication = null,
             pendingProposalApplicationMutation = null,
             proposalApplications = emptyMap(),
             publishedScheduleRevision = null,

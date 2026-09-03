@@ -9,6 +9,7 @@ import com.greengolddog.dayweave.health.EnergySignalManager
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.DayWeaveUiState
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.isNewestExecutionForProjection
 import com.greengolddog.dayweave.network.DeviceAuthBindingFence
 import com.greengolddog.dayweave.network.ApiBindingOperationGate
@@ -57,6 +58,7 @@ import com.greengolddog.dayweave.sync.GoogleCalendarImportCompletionPipeline
 import com.greengolddog.dayweave.sync.GoogleCalendarImportCoordinator
 import com.greengolddog.dayweave.sync.GoogleCalendarImportPersistenceReceipt
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundCoordinator
+import com.greengolddog.dayweave.sync.GoogleSchedulePublicationCoordinator
 import com.greengolddog.dayweave.sync.LocalScheduleCompositionLauncher
 import com.greengolddog.dayweave.sync.ProposalApplicationManager
 import com.greengolddog.dayweave.sync.SuggestionSyncManager
@@ -205,6 +207,9 @@ class DayWeaveApplication : Application() {
                         googleCalendarImportCoordinator.quarantineBindingState()
                         if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
                             googleCalendarOutboundCoordinator.quarantineBindingState()
+                        }
+                        if (googleSchedulePublicationCoordinatorDelegate.isInitialized()) {
+                            googleSchedulePublicationCoordinator.quarantineBindingState()
                         }
                     }
                     return quarantined
@@ -387,6 +392,11 @@ class DayWeaveApplication : Application() {
                 )
             },
             operationAllowed = privatePresentationAllowed::get,
+            importAllowed = {
+                plannerStore.state.value.pendingGoogleSchedulePublication?.stage?.let {
+                    it != GoogleSchedulePublicationStage.ACCEPTED
+                } != true
+            },
         )
     }
     val googleCalendarImportCoordinator: GoogleCalendarImportCoordinator
@@ -404,6 +414,19 @@ class DayWeaveApplication : Application() {
     }
     val googleCalendarOutboundCoordinator: GoogleCalendarOutboundCoordinator
         get() = googleCalendarOutboundCoordinatorDelegate.value
+
+    private val googleSchedulePublicationCoordinatorDelegate = lazy {
+        GoogleSchedulePublicationCoordinator(
+            plannerStore = plannerStore,
+            credentialStore = apiCredentialStore,
+            transport = OkHttpGoogleCalendarOutboundTransport(),
+            googleAccountState = { googleAccountManager.state.value },
+            googleImportState = { googleCalendarImportCoordinator.state.value },
+            operationAllowed = privatePresentationAllowed::get,
+        )
+    }
+    val googleSchedulePublicationCoordinator: GoogleSchedulePublicationCoordinator
+        get() = googleSchedulePublicationCoordinatorDelegate.value
 
     val energySignalManager: EnergySignalManager by lazy {
         EnergySignalManager(
@@ -532,6 +555,9 @@ class DayWeaveApplication : Application() {
         }
         if (googleCalendarOutboundCoordinatorDelegate.isInitialized()) {
             googleCalendarOutboundCoordinator.quarantineBindingState()
+        }
+        if (googleSchedulePublicationCoordinatorDelegate.isInitialized()) {
+            googleSchedulePublicationCoordinator.quarantineBindingState()
         }
     }
 

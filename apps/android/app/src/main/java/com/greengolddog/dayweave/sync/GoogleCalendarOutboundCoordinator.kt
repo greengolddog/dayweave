@@ -6,6 +6,7 @@ import com.greengolddog.dayweave.model.GoogleCalendarOutboundJournal
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundPreviewSnapshot
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundStage
 import com.greengolddog.dayweave.model.GoogleCalendarOutboundTarget
+import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.googleCalendarOutboundCandidate
 import com.greengolddog.dayweave.network.ApiBindingChangedException
 import com.greengolddog.dayweave.network.ApiConnectionSnapshot
@@ -169,9 +170,14 @@ class GoogleCalendarOutboundCoordinator(
     /** Returns only currently proven writable targets for this exact entity and operation. */
     fun targetsFor(itemId: String): List<GoogleCalendarOutboundTargetOption> {
         if (!operationAllowed()) return emptyList()
-        val candidate = plannerStore.durableState.value
-            ?.googleCalendarOutboundCandidate(itemId) ?: return emptyList()
-        if (plannerStore.state.value.pendingGoogleCalendarOutbound != null) return emptyList()
+        val planner = plannerStore.durableState.value ?: return emptyList()
+        val candidate = planner.googleCalendarOutboundCandidate(itemId) ?: return emptyList()
+        if (
+            planner.pendingGoogleCalendarOutbound != null ||
+            planner.pendingGoogleSchedulePublication?.stage?.let {
+                it != GoogleSchedulePublicationStage.ACCEPTED
+            } == true
+        ) return emptyList()
         val snapshot = credentialStore.snapshot()
         val accounts = googleAccountState()
         val imports = googleImportState()
@@ -252,6 +258,18 @@ class GoogleCalendarOutboundCoordinator(
             if (current.pendingGoogleCalendarOutbound != null) {
                 presentJournal(lifecycle, current.pendingGoogleCalendarOutbound)
                 return@withLock GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+            }
+            if (
+                current.pendingGoogleSchedulePublication?.stage?.let {
+                    it != GoogleSchedulePublicationStage.ACCEPTED
+                } == true
+            ) {
+                return@withLock failure(
+                    lifecycle,
+                    GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
+                    "Recover the generated-schedule publication before publishing another change.",
+                    GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED,
+                )
             }
             val candidate = current.googleCalendarOutboundCandidate(itemId)
                 ?: return@withLock failure(

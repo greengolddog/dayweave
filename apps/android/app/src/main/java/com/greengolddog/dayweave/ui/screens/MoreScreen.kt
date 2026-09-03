@@ -104,6 +104,8 @@ fun MoreScreen(
         RemoteGoogleCollectionKind,
         GoogleInboundCollectionRole,
     ) -> Unit,
+    onPublishGeneratedSchedule: () -> Unit = {},
+    schedulePublicationHasRecovery: Boolean = false,
     onToggleHealthConnect: (Boolean) -> Unit,
     onRefreshHealthConnect: () -> Unit,
     onManageHealthConnectAccess: () -> Unit,
@@ -266,6 +268,8 @@ fun MoreScreen(
                 onDiscover = onDiscoverGoogleSources,
                 onRefreshOrCheck = onRefreshGoogleImport,
                 onConfigure = onConfigureGoogleSource,
+                onPublishGeneratedSchedule = onPublishGeneratedSchedule,
+                schedulePublicationHasRecovery = schedulePublicationHasRecovery,
                 actionsEnabled = !canonicalSyncState.isBusy,
             )
         }

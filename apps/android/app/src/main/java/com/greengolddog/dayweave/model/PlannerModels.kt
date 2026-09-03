@@ -1344,6 +1344,8 @@ data class DayWeaveUiState(
     val pendingSchedulePublication: PendingSchedulePublication? = null,
     /** Exact reviewed Google Calendar/Tasks authority; retained until enqueue is accepted. */
     val pendingGoogleCalendarOutbound: GoogleCalendarOutboundJournal? = null,
+    /** Encrypted generated-schedule review, one-shot authority, and accepted status recovery. */
+    val pendingGoogleSchedulePublication: GoogleSchedulePublicationJournal? = null,
     /** Exact apply/undo request awaiting an authoritative result. */
     val pendingProposalApplicationMutation: PendingProposalApplicationMutation? = null,
     /** Content-free receipts keyed by their single proposal identifier. */

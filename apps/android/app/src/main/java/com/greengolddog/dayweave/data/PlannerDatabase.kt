@@ -54,11 +54,13 @@ object PlannerSnapshotFormats {
     const val JSON_V12 = "json-v12-configurable-firm-horizon"
     /** Generic Google outbound recovery; older labels remain Calendar-upsert-only. */
     const val JSON_V13 = "json-v13-google-outbound-recovery"
+    /** Generated-schedule Google review, approval authority, and accepted status recovery. */
+    const val JSON_V14 = "json-v14-google-schedule-publication-recovery"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 13,
+    version = 14,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -163,6 +165,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_12_13 = object : Migration(12, 13) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The SQLCipher payload gains generated-schedule publication
+     * recovery; the Room version prevents rollback to code that could ignore one-shot authority.
+     */
+    val MIGRATION_13_14 = object : Migration(13, 14) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -215,6 +225,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_10_11,
                 PlannerDatabaseMigrations.MIGRATION_11_12,
                 PlannerDatabaseMigrations.MIGRATION_12_13,
+                PlannerDatabaseMigrations.MIGRATION_13_14,
             )
             .build()
     }
