@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::proposals::Clock;
+use crate::{proposals::Clock, scheduling::truncate_to_postgres_timestamp_precision};
 
 use super::{
     IdempotencyContext, Item, ItemDomainError, ItemMutation, ItemQuery, ItemRepository,
@@ -85,7 +85,7 @@ impl ItemService {
         idempotency: IdempotencyKey,
     ) -> Result<ItemMutation, ItemServiceError> {
         validate_idempotency_key(&idempotency.key)?;
-        let now = self.clock.now();
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
         let item = Item::new(input, now)?;
         let mutation = self
             .repository
@@ -131,7 +131,7 @@ impl ItemService {
     ) -> Result<ItemMutation, ItemServiceError> {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
-        let now = self.clock.now();
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
         let mutation = self
             .repository
             .replace(
@@ -159,7 +159,7 @@ impl ItemService {
     ) -> Result<ItemMutation, ItemServiceError> {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
-        let now = self.clock.now();
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
         let mutation = self
             .repository
             .trash(
@@ -186,7 +186,7 @@ impl ItemService {
     ) -> Result<ItemMutation, ItemServiceError> {
         validate_idempotency_key(&idempotency.key)?;
         validate_revision(expected_revision)?;
-        let now = self.clock.now();
+        let now = truncate_to_postgres_timestamp_precision(self.clock.now());
         let mutation = self
             .repository
             .restore(
@@ -318,7 +318,18 @@ pub(super) fn decode_cursor(cursor: &str, expected_scope: Uuid) -> Result<u64, I
 
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone as _;
+    use serde_json::json;
+
     use super::*;
+
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
 
     #[test]
     fn cursor_is_opaque_round_trippable_and_tamper_evident() {
@@ -336,5 +347,49 @@ mod tests {
         assert!(validate_idempotency_key("offline-write-123").is_ok());
         assert!(validate_idempotency_key("short").is_err());
         assert!(validate_idempotency_key("contains spaces").is_err());
+    }
+
+    #[tokio::test]
+    async fn item_mutation_timestamps_are_canonical_microseconds() {
+        let raw_now = Utc.timestamp_opt(1_700_000_000, 123_456_789).unwrap();
+        let expected_now = Utc.timestamp_opt(1_700_000_000, 123_456_000).unwrap();
+        let service = ItemService::new(
+            Arc::new(crate::items::InMemoryItemRepository::default()),
+            Arc::new(FixedClock(raw_now)),
+        );
+        let input = serde_json::from_value(json!({
+            "id": Uuid::new_v4(),
+            "is_sensitive": false,
+            "kind": "task",
+            "status": "planned",
+            "title": "Canonical clock",
+            "notes": null,
+            "timezone_name": "UTC",
+            "duration_seconds": 60,
+            "deadline_at": null,
+            "earliest_start_at": null,
+            "recurrence": null,
+            "flexible_constraints": {},
+            "split_policy": {"type": "indivisible"},
+            "importance": 50,
+            "urgency": 50,
+            "parent_id": null,
+            "sibling_order": 0
+        }))
+        .unwrap();
+
+        let mutation = service
+            .create(
+                input,
+                IdempotencyKey {
+                    key: "clock-test".to_owned(),
+                    fingerprint: [7; 32],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mutation.item.created_at, expected_now);
+        assert_eq!(mutation.item.updated_at, expected_now);
     }
 }
