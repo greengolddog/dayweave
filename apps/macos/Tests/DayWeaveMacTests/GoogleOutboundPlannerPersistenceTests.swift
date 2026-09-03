@@ -273,7 +273,7 @@ struct GoogleOutboundPlannerPersistenceTests {
         let rewrittenObject = try #require(
             JSONSerialization.jsonObject(with: rewrittenPlaintext) as? [String: Any]
         )
-        #expect(rewrittenObject["schemaVersion"] as? Int == 20)
+        #expect(rewrittenObject["schemaVersion"] as? Int == 21)
         let rewrittenJournal = try #require(
             rewrittenObject["googleOutboundRecoveryJournal"] as? [String: Any]
         )

@@ -1228,6 +1228,187 @@ struct GoogleIntegrationAPIClientTests {
         #expect(existingWritable.first?.syncRole == .writable)
     }
 
+    @Test("generated schedule publication uses direct-root strict contract and redacts capability")
+    func generatedSchedulePublicationContract() async throws {
+        let current = Date(timeIntervalSince1970: 1_788_425_200)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let starts = formatter.string(from: current.addingTimeInterval(3_600))
+        let ends = formatter.string(from: current.addingTimeInterval(7_200))
+        let expires = formatter.string(from: current.addingTimeInterval(600))
+        let completed = formatter.string(from: current.addingTimeInterval(10))
+        let capability = Self.scheduleApprovalCapability
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 200, body: Data(
+                """
+                {
+                  "id":"\(Self.schedulePreviewID.uuidString.lowercased())",
+                  "account_id":"\(Self.accountID.uuidString.lowercased())",
+                  "collection_id":"\(Self.collectionID.uuidString.lowercased())",
+                  "collection_revision":4,
+                  "collection_display_name":"Primary calendar",
+                  "schedule_revision_id":"\(Self.scheduleRevisionID.uuidString.lowercased())",
+                  "schedule_revision_number":12,
+                  "preview_hash":"\(Self.previewHash)",
+                  "create_count":1,
+                  "update_count":0,
+                  "delete_count":0,
+                  "noop_count":0,
+                  "changes":[{
+                    "ordinal":0,
+                    "slot_id":"\(Self.scheduleSlotID.uuidString.lowercased())",
+                    "source_block_id":"\(Self.scheduleBlockID.uuidString.lowercased())",
+                    "operation":"create",
+                    "provider_resource_id":null,
+                    "provider_etag":null,
+                    "summary":"Busy",
+                    "starts_at":"\(starts)",
+                    "ends_at":"\(ends)"
+                  }],
+                  "expires_at":"\(expires)"
+                }
+                """.utf8
+            )),
+            .init(statusCode: 200, body: Data(
+                """
+                {"preview_id":"\(Self.schedulePreviewID.uuidString.lowercased())","approval_capability":"\(capability)","expires_at":"\(expires)"}
+                """.utf8
+            )),
+            .init(statusCode: 202, body: Data(
+                """
+                {"publication_id":"\(Self.schedulePublicationID.uuidString.lowercased())","replayed":false}
+                """.utf8
+            )),
+            .init(statusCode: 200, body: Data(
+                """
+                {
+                  "publication_id":"\(Self.schedulePublicationID.uuidString.lowercased())",
+                  "account_id":"\(Self.accountID.uuidString.lowercased())",
+                  "collection_id":"\(Self.collectionID.uuidString.lowercased())",
+                  "schedule_revision_id":"\(Self.scheduleRevisionID.uuidString.lowercased())",
+                  "state":"published",
+                  "total_count":1,
+                  "pending_count":0,
+                  "delivering_count":0,
+                  "published_count":1,
+                  "conflicted_count":0,
+                  "failed_count":0,
+                  "superseded_count":0,
+                  "created_at":"\(formatter.string(from: current))",
+                  "completed_at":"\(completed)",
+                  "last_error_code":null
+                }
+                """.utf8
+            ))
+        )
+        let client = makeClient(now: { current })
+        let preview = try await client.previewGoogleSchedulePublication(
+            accountID: Self.accountID,
+            request: .init(
+                collectionID: Self.collectionID,
+                expectedScheduleRevisionID: Self.scheduleRevisionID
+            )
+        )
+        #expect(preview.changes.first?.summary == "Busy")
+        let approval = try await client.approveGoogleSchedulePublication(
+            accountID: Self.accountID,
+            previewID: preview.id,
+            expectedPreviewHash: preview.previewHash
+        )
+        let accepted = try await client.enqueueGoogleSchedulePublication(
+            accountID: Self.accountID,
+            request: .init(
+                previewID: preview.id,
+                collectionID: preview.collectionID,
+                expectedScheduleRevisionID: preview.scheduleRevisionID,
+                approvalCapability: approval.approvalCapability
+            )
+        )
+        let status = try await client.googleSchedulePublicationStatus(
+            accountID: Self.accountID,
+            publicationID: accepted.publicationID
+        )
+        #expect(status.state == .published)
+
+        let requests = URLProtocolStub.storage.requests(for: Self.apiToken)
+        #expect(requests.suffix(4).map(\.url.path) == [
+            "/gateway/v1/integrations/google/accounts/\(Self.accountID.uuidString.lowercased())/schedule-publications/previews",
+            "/gateway/v1/integrations/google/accounts/\(Self.accountID.uuidString.lowercased())/schedule-publications/previews/\(Self.schedulePreviewID.uuidString.lowercased())/approve",
+            "/gateway/v1/integrations/google/accounts/\(Self.accountID.uuidString.lowercased())/schedule-publications",
+            "/gateway/v1/integrations/google/accounts/\(Self.accountID.uuidString.lowercased())/schedule-publications/\(Self.schedulePublicationID.uuidString.lowercased())",
+        ])
+        let enqueueBody = try #require(requests.last(where: {
+            $0.url.path.hasSuffix("/schedule-publications")
+        })?.jsonBody)
+        #expect(Set(enqueueBody.keys) == [
+            "preview_id", "collection_id", "expected_schedule_revision_id",
+            "approval_capability",
+        ])
+        #expect(enqueueBody["approval_capability"] as? String == capability)
+        let diagnostic = DayWeaveDiagnosticSanitizer.text(
+            "transport failed with \(capability)",
+            secrets: [],
+            maximumCharacters: 200
+        )
+        #expect(diagnostic == "transport failed with [redacted]")
+        #expect(!String(reflecting: approval).contains(capability))
+    }
+
+    @Test("generated schedule responses reject unknown and duplicate direct-root fields")
+    func generatedScheduleRejectsUnknownFields() async throws {
+        let current = Date(timeIntervalSince1970: 1_788_425_200)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 202, body: Data(
+                """
+                {"publication_id":"\(Self.schedulePublicationID.uuidString.lowercased())","replayed":false,"unknown":true}
+                """.utf8
+            ))
+        )
+        let client = makeClient(now: { current })
+        do {
+            _ = try await client.enqueueGoogleSchedulePublication(
+                accountID: Self.accountID,
+                request: .init(
+                    previewID: Self.schedulePreviewID,
+                    collectionID: Self.collectionID,
+                    expectedScheduleRevisionID: Self.scheduleRevisionID,
+                    approvalCapability: Self.scheduleApprovalCapability
+                )
+            )
+            Issue.record("An unknown schedule acceptance field was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .responseDecodingFailed)
+        }
+
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(statusCode: 202, body: Data(
+                """
+                {"publication_id":"\(Self.schedulePublicationID.uuidString.lowercased())","publication_id":"\(Self.schedulePublicationID.uuidString.lowercased())","replayed":false}
+                """.utf8
+            ))
+        )
+        do {
+            _ = try await client.enqueueGoogleSchedulePublication(
+                accountID: Self.accountID,
+                request: .init(
+                    previewID: Self.schedulePreviewID,
+                    collectionID: Self.collectionID,
+                    expectedScheduleRevisionID: Self.scheduleRevisionID,
+                    approvalCapability: Self.scheduleApprovalCapability
+                )
+            )
+            Issue.record("A duplicate schedule acceptance field was accepted")
+        } catch let error as DayWeaveAPIError {
+            #expect(error == .responseDecodingFailed)
+        }
+        _ = formatter
+    }
+
     private func makeClient(
         now: @escaping @Sendable () -> Date = Date.init
     ) -> DayWeaveAPIClient {
@@ -1300,6 +1481,28 @@ struct GoogleIntegrationAPIClientTests {
     private static let previewID = UUID(uuidString: "77777777-aaaa-4aaa-8aaa-777777777777")!
     private static let outboxID = UUID(uuidString: "88888888-bbbb-4bbb-8bbb-888888888888")!
     private static let previewHash = String(repeating: "a", count: 64)
+    private static let schedulePreviewID = UUID(
+        uuidString: "99999999-aaaa-4aaa-8aaa-999999999999"
+    )!
+    private static let scheduleRevisionID = UUID(
+        uuidString: "99999999-bbbb-4bbb-8bbb-999999999999"
+    )!
+    private static let schedulePublicationID = UUID(
+        uuidString: "99999999-cccc-4ccc-8ccc-999999999999"
+    )!
+    private static let scheduleSlotID = UUID(
+        uuidString: "99999999-dddd-4ddd-8ddd-999999999999"
+    )!
+    private static let scheduleBlockID = UUID(
+        uuidString: "99999999-eeee-4eee-8eee-999999999999"
+    )!
+    private static let scheduleApprovalCapability: String = {
+        let payload = Data([UInt8](repeating: 11, count: 32)).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "dw_gsa1_" + payload
+    }()
     private static let approvalCapability: String = {
         let payload = Data([UInt8](repeating: 7, count: 32)).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")

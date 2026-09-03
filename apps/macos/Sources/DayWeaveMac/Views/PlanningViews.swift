@@ -68,7 +68,9 @@ enum PlannerPresentation {
 
 struct CalendarDestinationView: View {
     @EnvironmentObject private var store: PlannerStore
+    @EnvironmentObject private var googleSchedulePublication: GoogleSchedulePublicationStore
     @State private var selectedDate = Date()
+    @State private var schedulePublicationIsPresented = false
 
     private var timezoneName: String { store.schedulePresentationTimezoneName }
     private var calendar: Calendar {
@@ -101,6 +103,18 @@ struct CalendarDestinationView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button {
+                    schedulePublicationIsPresented = true
+                } label: {
+                    Label(
+                        googleSchedulePublication.hasSavedPublication
+                            ? "Publication status" : "Publish to Google",
+                        systemImage: googleSchedulePublication.hasSavedPublication
+                            ? "arrow.triangle.2.circlepath" : "calendar.badge.plus"
+                    )
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("calendar.publish-google")
                 Button {
                     selectedDate = calendar.date(byAdding: .weekOfYear, value: -1, to: selectedDate) ?? selectedDate
                 } label: {
@@ -169,6 +183,9 @@ struct CalendarDestinationView: View {
             }
         }
         .navigationTitle("Calendar")
+        .sheet(isPresented: $schedulePublicationIsPresented) {
+            GoogleSchedulePublicationView()
+        }
         .onChange(of: timezoneName) { _, _ in
             selectedDate = calendar.startOfDay(for: Date())
         }

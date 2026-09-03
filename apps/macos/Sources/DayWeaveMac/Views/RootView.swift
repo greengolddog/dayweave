@@ -514,6 +514,7 @@ private struct SidebarView: View {
     @EnvironmentObject private var executionSync: ExecutionSyncStore
     @EnvironmentObject private var googleIntegration: GoogleIntegrationStore
     @EnvironmentObject private var googleOutbound: GoogleOutboundStore
+    @EnvironmentObject private var googleSchedulePublication: GoogleSchedulePublicationStore
     @State private var googleReviewIsPresented = false
 
     var body: some View {
@@ -6449,6 +6450,7 @@ struct SettingsView: View {
     @EnvironmentObject private var executionSync: ExecutionSyncStore
     @EnvironmentObject private var googleIntegration: GoogleIntegrationStore
     @EnvironmentObject private var googleOutbound: GoogleOutboundStore
+    @EnvironmentObject private var googleSchedulePublication: GoogleSchedulePublicationStore
     @EnvironmentObject private var durableAuth: DurableAuthSettingsModel
     @EnvironmentObject private var appLock: AppLockController
     @EnvironmentObject private var appearance: AppearanceController
@@ -6749,6 +6751,11 @@ struct SettingsView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
+                if googleSchedulePublication.hasSavedPublication {
+                    Text("A generated-schedule Google Calendar preview, approval, or delivery status is preserved in encrypted local recovery. Open Calendar → Publication status before replacing authentication or resetting canonical state.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
                 if googleOutbound.hasPendingRecovery {
                     Text(googleOutbound.recoveryContext?.entityKind == .task
                         ? "A Google Tasks preview or approved publication is preserved in encrypted local recovery. Recover it from the Items inspector before replacing authentication, changing the API origin, or resetting canonical state."
@@ -6783,6 +6790,7 @@ struct SettingsView: View {
                     !store.canMutatePlan
                         || executionSync.credentialReplacementIsBlocked
                         || googleOutbound.hasPendingRecovery
+                        || googleSchedulePublication.hasSavedPublication
                 )
             }
             Section("Local data") {
@@ -6979,10 +6987,12 @@ struct SettingsView: View {
             || googleIntegration.credentialTransitionInProgress
             || googleIntegration.hasPendingRecovery
             || googleOutbound.hasPendingRecovery
+            || googleSchedulePublication.hasSavedPublication
     }
 
     private var googleAuthenticationUpdateIsBlocked: Bool {
-        if googleOutbound.hasPendingRecovery { return true }
+        if googleOutbound.hasPendingRecovery
+            || googleSchedulePublication.hasSavedPublication { return true }
         guard googleCredentialTransitionIsBlocked else { return false }
         guard !googleIntegration.isBusy,
               !googleIntegration.credentialTransitionInProgress,
@@ -7004,8 +7014,9 @@ struct SettingsView: View {
     }
 
     private func allowGoogleCredentialTransition(allowSameAPIBaseRepair: Bool = false) -> Bool {
-        guard !googleOutbound.hasPendingRecovery else {
-            apiSettingsError = "Recover the saved Google publication before changing DayWeave authentication."
+        guard !googleOutbound.hasPendingRecovery,
+              !googleSchedulePublication.hasSavedPublication else {
+            apiSettingsError = "Recover or finish the saved Google publication before changing DayWeave authentication."
             return false
         }
         if allowSameAPIBaseRepair,
@@ -7121,6 +7132,7 @@ struct SettingsView: View {
                 guard replacementRequired || !bootstrap.isEmpty else { return }
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
+                googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
@@ -7155,6 +7167,7 @@ struct SettingsView: View {
                 suggestionSync.durableAuthenticationDidChange()
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
+                googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
@@ -7179,6 +7192,7 @@ struct SettingsView: View {
                 suggestionSync.durableAuthenticationDidChange()
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
+                googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 await executionSync.configurationDidChange()
                 dayWeaveBearerToken = ""
@@ -7220,6 +7234,7 @@ struct SettingsView: View {
                 suggestionSync.durableAuthenticationDidChange()
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
+                googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()
@@ -7259,6 +7274,7 @@ struct SettingsView: View {
                 suggestionSync.durableAuthenticationDidChange()
                 googleIntegration.configurationDidChange()
                 googleOutbound.configurationDidChange()
+                googleSchedulePublication.configurationDidChange()
                 canonicalSync.configurationDidChange()
                 await executionSync.configurationDidChange()
                 executionSync.startForegroundPolling()

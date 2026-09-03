@@ -22,6 +22,16 @@ protocol GoogleOutboundRecovering: AnyObject {
 extension GoogleOutboundStore: GoogleOutboundRecovering {}
 
 @MainActor
+protocol GoogleSchedulePublicationRecovering: AnyObject {
+    var hasPendingRecovery: Bool { get }
+
+    @discardableResult
+    func recoverPendingPublication() async -> Bool
+}
+
+extension GoogleSchedulePublicationStore: GoogleSchedulePublicationRecovering {}
+
+@MainActor
 protocol CanonicalServiceSynchronizing: AnyObject {
     var isConfigured: Bool { get }
 
@@ -54,6 +64,7 @@ final class DayWeaveServiceCoordinator: ObservableObject {
 
     private let proposalApplications: any ProposalApplicationRecovering
     private let googleOutbound: (any GoogleOutboundRecovering)?
+    private let googleSchedulePublication: (any GoogleSchedulePublicationRecovering)?
     private let executionSync: any ExecutionServiceSynchronizing
     private let canonicalSync: any CanonicalServiceSynchronizing
     private var activationTask: Task<Void, Never>?
@@ -62,11 +73,13 @@ final class DayWeaveServiceCoordinator: ObservableObject {
     init(
         proposalApplications: any ProposalApplicationRecovering,
         googleOutbound: (any GoogleOutboundRecovering)? = nil,
+        googleSchedulePublication: (any GoogleSchedulePublicationRecovering)? = nil,
         executionSync: any ExecutionServiceSynchronizing,
         canonicalSync: any CanonicalServiceSynchronizing
     ) {
         self.proposalApplications = proposalApplications
         self.googleOutbound = googleOutbound
+        self.googleSchedulePublication = googleSchedulePublication
         self.executionSync = executionSync
         self.canonicalSync = canonicalSync
     }
@@ -107,6 +120,10 @@ final class DayWeaveServiceCoordinator: ObservableObject {
             _ = await googleOutbound?.recoverPendingOperation()
         }
         guard !Task.isCancelled else { return false }
+        if googleSchedulePublication?.hasPendingRecovery == true {
+            _ = await googleSchedulePublication?.recoverPendingPublication()
+        }
+        guard !Task.isCancelled else { return false }
 
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
@@ -143,6 +160,11 @@ final class DayWeaveServiceCoordinator: ObservableObject {
 
         if googleOutbound?.hasPendingRecovery == true {
             _ = await googleOutbound?.recoverPendingOperation()
+            guard operationIsCurrent(generation) else { return }
+        }
+
+        if googleSchedulePublication?.hasPendingRecovery == true {
+            _ = await googleSchedulePublication?.recoverPendingPublication()
             guard operationIsCurrent(generation) else { return }
         }
 

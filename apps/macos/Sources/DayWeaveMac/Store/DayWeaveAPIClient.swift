@@ -624,7 +624,7 @@ enum DayWeaveDiagnosticSanitizer {
             with: "Bearer [redacted]"
         )
         value = replacingPattern(
-            #"\bdw_(?:en1|da1|dr1|mc1|ga1)_[A-Za-z0-9_-]{20,}\b"#,
+            #"\bdw_(?:en1|da1|dr1|mc1|ga1|gsa1)_[A-Za-z0-9_-]{20,}\b"#,
             in: value,
             with: "[redacted]"
         )
@@ -684,6 +684,31 @@ protocol GoogleOutboundTransport: Sendable {
         accountID: UUID,
         request: GoogleOutboundEnqueueRequest
     ) async throws -> GoogleOutboundAccepted
+}
+
+protocol GoogleSchedulePublicationTransport: Sendable {
+    var configurationIdentifier: String { get }
+
+    func previewGoogleSchedulePublication(
+        accountID: UUID,
+        request: GoogleSchedulePublicationPreviewRequest
+    ) async throws -> GoogleSchedulePublicationPreview
+
+    func approveGoogleSchedulePublication(
+        accountID: UUID,
+        previewID: UUID,
+        expectedPreviewHash: String
+    ) async throws -> GoogleSchedulePublicationApproval
+
+    func enqueueGoogleSchedulePublication(
+        accountID: UUID,
+        request: GoogleSchedulePublicationEnqueueRequest
+    ) async throws -> GoogleSchedulePublicationAccepted
+
+    func googleSchedulePublicationStatus(
+        accountID: UUID,
+        publicationID: UUID
+    ) async throws -> GoogleSchedulePublicationStatus
 }
 
 struct DayWeaveAPIClient: Sendable {
@@ -1171,6 +1196,106 @@ struct DayWeaveAPIClient: Sendable {
             additionalSecretsToRedact: [request.approvalCapability]
         )
         return snapshot.outbound
+    }
+
+    func previewGoogleSchedulePublication(
+        accountID: UUID,
+        request: GoogleSchedulePublicationPreviewRequest
+    ) async throws -> GoogleSchedulePublicationPreview {
+        try validateGoogleIdentity(accountID)
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let preview: GoogleSchedulePublicationPreview = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + [
+                "schedule-publications", "previews",
+            ],
+            body: try encode(request),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        let remaining = preview.expiresAt.timeIntervalSince(now())
+        guard preview.accountID == accountID,
+              preview.collectionID == request.collectionID,
+              preview.scheduleRevisionID == request.expectedScheduleRevisionID,
+              remaining >= -GoogleSchedulePublicationRecoveryJournal.maximumClockSkew,
+              remaining <= GoogleSchedulePublicationRecoveryJournal.maximumIntentLifetime else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return preview
+    }
+
+    func approveGoogleSchedulePublication(
+        accountID: UUID,
+        previewID: UUID,
+        expectedPreviewHash: String
+    ) async throws -> GoogleSchedulePublicationApproval {
+        try validateGoogleIdentity(accountID)
+        try validateGoogleIdentity(previewID)
+        let request = GoogleSchedulePublicationApprovalRequest(
+            expectedPreviewHash: expectedPreviewHash
+        )
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let approval: GoogleSchedulePublicationApproval = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + [
+                "schedule-publications", "previews",
+                previewID.uuidString.lowercased(), "approve",
+            ],
+            body: try encode(request),
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        let remaining = approval.expiresAt.timeIntervalSince(now())
+        guard approval.previewID == previewID,
+              remaining >= -GoogleSchedulePublicationRecoveryJournal.maximumClockSkew,
+              remaining <= GoogleSchedulePublicationRecoveryJournal.maximumIntentLifetime else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return approval
+    }
+
+    func enqueueGoogleSchedulePublication(
+        accountID: UUID,
+        request: GoogleSchedulePublicationEnqueueRequest
+    ) async throws -> GoogleSchedulePublicationAccepted {
+        try validateGoogleIdentity(accountID)
+        guard request.isValid else {
+            throw DayWeaveAPIError.requestEncodingFailed
+        }
+        let accepted: GoogleSchedulePublicationAccepted = try await send(
+            method: "POST",
+            pathComponents: googleAccountPath(accountID) + ["schedule-publications"],
+            body: try encode(request),
+            requiredStatusCode: 202,
+            requiresDurableAuthorization: true,
+            additionalSecretsToRedact: [request.approvalCapability]
+        )
+        return accepted
+    }
+
+    func googleSchedulePublicationStatus(
+        accountID: UUID,
+        publicationID: UUID
+    ) async throws -> GoogleSchedulePublicationStatus {
+        try validateGoogleIdentity(accountID)
+        try validateGoogleIdentity(publicationID)
+        let status: GoogleSchedulePublicationStatus = try await send(
+            method: "GET",
+            pathComponents: googleAccountPath(accountID) + [
+                "schedule-publications", publicationID.uuidString.lowercased(),
+            ],
+            requiredStatusCode: 200,
+            requiresDurableAuthorization: true
+        )
+        guard status.accountID == accountID,
+              status.publicationID == publicationID else {
+            throw DayWeaveAPIError.responseDecodingFailed
+        }
+        return status
     }
 
     private func googleAccountPath(_ accountID: UUID) -> [String] {
@@ -2626,7 +2751,8 @@ struct DayWeaveAPIClient: Sendable {
                ) {
                 throw DayWeaveAPIError.responseDecodingFailed
             }
-            if pathComponents.contains("outbound"),
+            if (pathComponents.contains("outbound")
+                || pathComponents.contains("schedule-publications")),
                !StrictJSONObjectKeyScanner.hasUniqueKeys(in: data) {
                 throw DayWeaveAPIError.responseDecodingFailed
             }
@@ -3854,6 +3980,7 @@ struct DayWeaveAPIClient: Sendable {
 
 extension DayWeaveAPIClient:
     GoogleOutboundTransport,
+    GoogleSchedulePublicationTransport,
     DayWeaveExecutionStreamTransport,
     DayWeaveItemStreamTransport,
     DayWeaveScheduleStreamTransport {}

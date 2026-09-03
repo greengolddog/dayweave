@@ -4,6 +4,7 @@ import Foundation
 /// snapshot proves that disconnection completed.
 struct GoogleDisconnectRetryJournal: Codable, Equatable, Sendable {
     static let currentVersion = 1
+    static let maximumConfigurationIdentifierBytes = 4_096
 
     let version: Int
     let accountID: UUID
@@ -140,7 +141,7 @@ struct GoogleDisconnectRetryJournal: Codable, Equatable, Sendable {
     }
 
     static func isValidConfigurationIdentifier(_ value: String) -> Bool {
-        (1...4_096).contains(value.utf8.count)
+        (1...maximumConfigurationIdentifierBytes).contains(value.utf8.count)
             && value.utf8.allSatisfy { (33...126).contains($0) }
     }
 

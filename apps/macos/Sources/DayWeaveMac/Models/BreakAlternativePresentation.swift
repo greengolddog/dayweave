@@ -94,6 +94,7 @@ enum BreakAlternativePolicy {
               planner.pendingCanonicalMutations.isEmpty,
               planner.pendingProposalApplicationMutation == nil,
               planner.googleOutboundRecoveryJournal == nil,
+              !planner.hasGoogleSchedulePublicationAuthorityFence,
               planner.pendingSchedulePublication == nil,
               planner.deferredExecutionPublicationSessionIDs.isEmpty,
               planner.canonicalPreviewFreshnessIssue == nil,

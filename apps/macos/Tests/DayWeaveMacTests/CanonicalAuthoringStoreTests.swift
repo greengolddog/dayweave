@@ -971,7 +971,7 @@ struct CanonicalAuthoringStoreTests {
             role: .user,
             text: String(
                 repeating: "x",
-                count: EncryptedPlannerPersistence.maximumPlaintextBytes - 300_000
+                count: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes - 300_000
             ),
             createdAt: createdAt
         )
@@ -986,7 +986,7 @@ struct CanonicalAuthoringStoreTests {
         #expect(store.loadState == .ready)
 
         #expect(throws: PlannerPersistenceError.snapshotTooLarge(
-            limitBytes: EncryptedPlannerPersistence.maximumPlaintextBytes
+            limitBytes: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes
         )) {
             try store.enqueueCanonicalCreate(
                 draft: .init(

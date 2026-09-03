@@ -4,6 +4,7 @@ import SwiftUI
 struct GoogleIntegrationSettingsView: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
     @EnvironmentObject private var outbound: GoogleOutboundStore
+    @EnvironmentObject private var schedulePublication: GoogleSchedulePublicationStore
     @State private var disconnectCandidate: GoogleAccount?
     @State private var resetRecoveryConfirmationPresented = false
     @State private var abandonRecoveryConfirmationPresented = false
@@ -55,6 +56,17 @@ struct GoogleIntegrationSettingsView: View {
                 .accessibilityIdentifier("google.outbound.settings-recovery")
             }
 
+            if schedulePublication.hasSavedPublication {
+                Label(
+                    "A generated-schedule Google Calendar publication is preserved in encrypted recovery. Review its status from Calendar before changing accounts or source policies.",
+                    systemImage: "calendar.badge.exclamationmark"
+                )
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("google.schedule-publication.settings-recovery")
+            }
+
             connectionActions
 
             if store.recoveryResetRequired {
@@ -65,6 +77,7 @@ struct GoogleIntegrationSettingsView: View {
                 .disabled(
                     store.isBusy || store.credentialTransitionInProgress
                         || outbound.hasPendingRecovery
+                        || schedulePublication.hasSavedPublication
                 )
                 .accessibilityIdentifier("google.recovery.reset")
             }
@@ -77,6 +90,7 @@ struct GoogleIntegrationSettingsView: View {
                 .disabled(
                     store.isBusy || store.credentialTransitionInProgress
                         || outbound.hasPendingRecovery
+                        || schedulePublication.hasSavedPublication
                 )
                 .accessibilityIdentifier("google.recovery.abandon")
             }
@@ -189,6 +203,7 @@ struct GoogleIntegrationSettingsView: View {
             .disabled(
                 store.isBusy || store.credentialTransitionInProgress
                     || outbound.hasPendingRecovery
+                    || schedulePublication.hasSavedPublication
                     || statusIsPrivacyProtected
             )
             .help("Reload connected accounts, source policies, and import status")
@@ -252,6 +267,7 @@ struct GoogleIntegrationSettingsView: View {
             .disabled(
                 store.isBusy || store.credentialTransitionInProgress
                     || outbound.hasPendingRecovery
+                    || schedulePublication.hasSavedPublication
                     || store.mutationRecoveryRequired
                     || store.disconnectRecoveryRequiresAttention
                     || store.refreshCompletionRecoveryResetRequired
@@ -325,6 +341,7 @@ struct GoogleIntegrationSettingsView: View {
         guard !store.isBusy,
               !store.credentialTransitionInProgress,
               !outbound.hasPendingRecovery,
+              !schedulePublication.hasSavedPublication,
               !store.hasPendingRecovery,
               !store.authorizationStartIsFenced,
               !store.canOpenAuthorization,
@@ -386,6 +403,7 @@ struct GoogleIntegrationSettingsView: View {
 private struct GoogleAccountSettingsCard: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
     @EnvironmentObject private var outbound: GoogleOutboundStore
+    @EnvironmentObject private var schedulePublication: GoogleSchedulePublicationStore
     @State private var sourcesAreExpanded = false
 
     let account: GoogleAccount
@@ -526,6 +544,7 @@ private struct GoogleAccountSettingsCard: View {
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
                 || outbound.hasPendingRecovery
+                || schedulePublication.hasSavedPublication
                 || store.mutationRecoveryRequired || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryResetRequired
                 || store.refreshCompletionRecoveryResetRequired
@@ -571,6 +590,7 @@ private struct GoogleAccountSettingsCard: View {
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
                 || outbound.hasPendingRecovery
+                || schedulePublication.hasSavedPublication
                 || store.mutationRecoveryRequired || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryRequiresAttention
                 || store.refreshCompletionRecoveryResetRequired
@@ -687,6 +707,7 @@ private struct GoogleAccountSettingsCard: View {
 private struct GoogleSourceSettingsRow: View {
     @EnvironmentObject private var store: GoogleIntegrationStore
     @EnvironmentObject private var outbound: GoogleOutboundStore
+    @EnvironmentObject private var schedulePublication: GoogleSchedulePublicationStore
 
     let collection: GoogleSyncCollection
     let accountOrdinal: Int
@@ -814,6 +835,7 @@ private struct GoogleSourceSettingsRow: View {
         .disabled(
             store.isBusy || store.credentialTransitionInProgress
                 || outbound.hasPendingRecovery
+                || schedulePublication.hasSavedPublication
                 || store.mutationRecoveryRequired
                 || store.hasPendingAuthorizationRecovery
                 || store.disconnectRecoveryRequiresAttention

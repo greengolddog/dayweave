@@ -63,6 +63,26 @@ enum PlannerSchedulePublicationError: LocalizedError, Equatable, Sendable {
     }
 }
 
+enum PlannerGoogleSchedulePublicationRecoveryError: LocalizedError, Equatable, Sendable {
+    case encryptedPersistenceRequired
+    case invalidJournal
+    case journalConflict
+    case currentPublishedScheduleRequired
+
+    var errorDescription: String? {
+        switch self {
+        case .encryptedPersistenceRequired:
+            "Healthy encrypted planner persistence is required before publishing a schedule to Google."
+        case .invalidJournal:
+            "The encrypted generated-schedule Google publication recovery is invalid."
+        case .journalConflict:
+            "The generated-schedule Google publication recovery changed concurrently."
+        case .currentPublishedScheduleRequired:
+            "Publish and retain the current server-generated schedule before reviewing Google Calendar changes."
+        }
+    }
+}
+
 enum PlannerScheduleReplicaError: LocalizedError, Equatable, Sendable {
     case encryptedPersistenceRequired
     case mutationFenceUnavailable
@@ -402,6 +422,10 @@ final class PlannerStore: ObservableObject {
         GoogleOutboundRecoveryJournal? {
         didSet { scheduleAutosave() }
     }
+    @Published private(set) var googleSchedulePublicationRecoveryJournal:
+        GoogleSchedulePublicationRecoveryJournal? {
+        didSet { scheduleAutosave() }
+    }
     @Published private(set) var localCaptureDiagnostics: [UUID: String] {
         didSet { scheduleAutosave() }
     }
@@ -506,6 +530,8 @@ final class PlannerStore: ObservableObject {
         pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation] = [],
         canonicalTrash: [DayWeaveCanonicalTrashEntry] = [],
         googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
+        googleSchedulePublicationRecoveryJournal:
+            GoogleSchedulePublicationRecoveryJournal? = nil,
         selectedCanonicalItemID: UUID? = nil,
         localCaptureDiagnostics: [UUID: String] = [:],
         executionState: DayWeaveExecutionDurableState = .empty,
@@ -683,6 +709,14 @@ final class PlannerStore: ObservableObject {
             : restoredSnapshot?.googleOutboundRecoveryJournal
         self.googleOutboundRecoveryJournal = initialGoogleOutboundRecoveryJournal
         if initialGoogleOutboundRecoveryJournal?.hasValidShape == false {
+            restorationError = .snapshotDecodingFailed
+        }
+        let initialGoogleSchedulePublicationRecoveryJournal = restoredSnapshot == nil
+            ? googleSchedulePublicationRecoveryJournal
+            : restoredSnapshot?.googleSchedulePublicationRecoveryJournal
+        self.googleSchedulePublicationRecoveryJournal =
+            initialGoogleSchedulePublicationRecoveryJournal
+        if initialGoogleSchedulePublicationRecoveryJournal?.hasValidShape == false {
             restorationError = .snapshotDecodingFailed
         }
         self.localCaptureDiagnostics = restoredSnapshot?.localCaptureDiagnostics
@@ -872,6 +906,11 @@ final class PlannerStore: ObservableObject {
         canPersistPlan
             && !isCanonicalSyncLocked
             && pendingExecutionDeferIntent == nil
+            && !hasGoogleSchedulePublicationAuthorityFence
+    }
+
+    var hasGoogleSchedulePublicationAuthorityFence: Bool {
+        googleSchedulePublicationRecoveryJournal.map { $0.stage != .accepted } == true
     }
 
     var hasEncryptedPersistence: Bool {
@@ -919,6 +958,7 @@ final class PlannerStore: ObservableObject {
         guard pendingSchedulePublication == nil,
               pendingProposalApplicationMutation == nil,
               googleOutboundRecoveryJournal == nil,
+              !hasGoogleSchedulePublicationAuthorityFence,
               pendingCanonicalMutations.isEmpty,
               pendingCanonicalSensitivityMutations.isEmpty,
               pendingCanonicalAuthoringMutations.isEmpty else {
@@ -993,7 +1033,8 @@ final class PlannerStore: ObservableObject {
               !isCanonicalSyncLocked,
               pendingExecutionDeferIntent == nil,
               pendingProposalApplicationMutation == nil,
-              googleOutboundRecoveryJournal == nil else { return false }
+              googleOutboundRecoveryJournal == nil,
+              !hasGoogleSchedulePublicationAuthorityFence else { return false }
         isCanonicalSyncLocked = true
         return true
     }
@@ -1006,7 +1047,8 @@ final class PlannerStore: ObservableObject {
         guard canPersistPlan,
               !isCanonicalSyncLocked,
               pendingProposalApplicationMutation == nil,
-              googleOutboundRecoveryJournal == nil else { return false }
+              googleOutboundRecoveryJournal == nil,
+              !hasGoogleSchedulePublicationAuthorityFence else { return false }
         isCanonicalSyncLocked = true
         return true
     }
@@ -2117,6 +2159,7 @@ final class PlannerStore: ObservableObject {
               pendingSchedulePublication == nil,
               pendingProposalApplicationMutation == nil,
               googleOutboundRecoveryJournal == nil,
+              !hasGoogleSchedulePublicationAuthorityFence,
               executionState.activeSession == nil,
               executionState.pendingCommand == nil else {
             throw PlannerRecurrenceMoveError.recoveryInProgress
@@ -6181,6 +6224,8 @@ final class PlannerStore: ObservableObject {
                 ?? pendingCanonicalAuthoringMutations,
             canonicalTrash: canonicalTrashOverride ?? canonicalTrash,
             googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+            googleSchedulePublicationRecoveryJournal:
+                googleSchedulePublicationRecoveryJournal,
             localCaptureDiagnostics: localCaptureDiagnostics,
             executionState: executionState
         )
@@ -6347,6 +6392,10 @@ extension PlannerStore: GoogleOutboundRecoveryStoring {
               ) else {
             throw PlannerGoogleOutboundRecoveryError.journalConflict
         }
+        if googleOutboundRecoveryJournal == nil,
+           googleSchedulePublicationRecoveryJournal != nil {
+            throw PlannerGoogleOutboundRecoveryError.journalConflict
+        }
         guard googleOutboundRecoveryJournal != journal else { return }
 
         let previous = googleOutboundRecoveryJournal
@@ -6425,6 +6474,125 @@ extension PlannerStore: GoogleOutboundRecoveryStoring {
              (.approvalAttempted, .intent), (.approvalAttempted, .previewed),
              (.approved, .intent), (.approved, .previewed),
              (.approved, .approvalAttempted):
+            return false
+        }
+    }
+}
+
+extension PlannerStore: GoogleSchedulePublicationRecoveryStoring {
+    func loadGoogleSchedulePublicationRecoveryJournal() throws
+        -> GoogleSchedulePublicationRecoveryJournal? {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.encryptedPersistenceRequired
+        }
+        guard googleSchedulePublicationRecoveryJournal?.hasValidShape != false else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.invalidJournal
+        }
+        return googleSchedulePublicationRecoveryJournal
+    }
+
+    func saveGoogleSchedulePublicationRecoveryJournal(
+        _ journal: GoogleSchedulePublicationRecoveryJournal
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.encryptedPersistenceRequired
+        }
+        guard journal.hasValidShape,
+              Self.googleSchedulePublicationTransitionIsValid(
+                  from: googleSchedulePublicationRecoveryJournal,
+                  to: journal
+              ) else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.journalConflict
+        }
+        if googleSchedulePublicationRecoveryJournal == nil {
+            guard googleOutboundRecoveryJournal == nil,
+                  let proof = publishedScheduleProof,
+                  proof.hasCurrentImmutablePlanSeal,
+                  proof.revisionID == journal.expectedScheduleRevisionID,
+                  proof.configurationIdentifier == journal.configurationIdentifier,
+                  proof.matchesPublishedPlan(blocks) else {
+                throw PlannerGoogleSchedulePublicationRecoveryError
+                    .currentPublishedScheduleRequired
+            }
+        }
+        guard googleSchedulePublicationRecoveryJournal != journal else { return }
+
+        let previous = googleSchedulePublicationRecoveryJournal
+        googleSchedulePublicationRecoveryJournal = journal
+        flushPersistence()
+        if let persistenceError {
+            googleSchedulePublicationRecoveryJournal = previous
+            throw persistenceError
+        }
+    }
+
+    func clearGoogleSchedulePublicationRecoveryJournal(
+        _ expected: GoogleSchedulePublicationRecoveryJournal
+    ) throws {
+        guard hasEncryptedPersistence, canPersistPlan else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.encryptedPersistenceRequired
+        }
+        guard expected.hasValidShape,
+              googleSchedulePublicationRecoveryJournal == expected else {
+            throw PlannerGoogleSchedulePublicationRecoveryError.journalConflict
+        }
+        googleSchedulePublicationRecoveryJournal = nil
+        flushPersistence()
+        if let persistenceError {
+            googleSchedulePublicationRecoveryJournal = expected
+            throw persistenceError
+        }
+    }
+
+    private static func googleSchedulePublicationTransitionIsValid(
+        from existing: GoogleSchedulePublicationRecoveryJournal?,
+        to replacement: GoogleSchedulePublicationRecoveryJournal
+    ) -> Bool {
+        guard replacement.hasValidShape else { return false }
+        guard let existing else { return replacement.stage == .intent }
+        guard existing.hasValidShape else { return false }
+        if existing == replacement { return true }
+        guard existing.recoveryID == replacement.recoveryID,
+              existing.operationGeneration == replacement.operationGeneration,
+              existing.configurationIdentifier == replacement.configurationIdentifier,
+              existing.accountID == replacement.accountID,
+              existing.collectionID == replacement.collectionID,
+              existing.expectedScheduleRevisionID == replacement.expectedScheduleRevisionID,
+              existing.intentExpiresAt == replacement.intentExpiresAt,
+              existing.createdAt == replacement.createdAt else {
+            return false
+        }
+
+        switch (existing.stage, replacement.stage) {
+        case (.intent, .previewed):
+            guard let preview = replacement.preview else { return false }
+            return (try? existing.recording(preview: preview)) == replacement
+        case (.previewed, .approvalAttempted):
+            return (try? existing.recordingApprovalAttempt()) == replacement
+        case (.approvalAttempted, .approved):
+            guard let preview = existing.preview,
+                  let capability = replacement.approvalCapability,
+                  let expiresAt = replacement.approvalExpiresAt else { return false }
+            return (try? existing.recording(approval: GoogleSchedulePublicationApproval(
+                previewID: preview.id,
+                approvalCapability: capability,
+                expiresAt: expiresAt
+            ))) == replacement
+        case (.approved, .accepted):
+            guard let acceptance = replacement.acceptance else { return false }
+            return (try? existing.recording(acceptance: acceptance)) == replacement
+        case (.accepted, .accepted):
+            guard let deliveryStatus = replacement.deliveryStatus else { return false }
+            return (try? existing.recording(status: deliveryStatus)) == replacement
+        case (.intent, .intent), (.previewed, .previewed),
+             (.approvalAttempted, .approvalAttempted), (.approved, .approved),
+             (.intent, .approvalAttempted), (.intent, .approved), (.intent, .accepted),
+             (.previewed, .intent), (.previewed, .approved), (.previewed, .accepted),
+             (.approvalAttempted, .intent), (.approvalAttempted, .previewed),
+             (.approvalAttempted, .accepted), (.approved, .intent),
+             (.approved, .previewed), (.approved, .approvalAttempted),
+             (.accepted, .intent), (.accepted, .previewed),
+             (.accepted, .approvalAttempted), (.accepted, .approved):
             return false
         }
     }

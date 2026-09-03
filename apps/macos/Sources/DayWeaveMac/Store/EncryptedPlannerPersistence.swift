@@ -433,11 +433,12 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     /// immutable accepted-item journal linkage. Version 19 adds the encrypted,
     /// content-free onboarding first-item identity and canonical revision, and
     /// version 20 durably upgrades legacy Google outbound recovery journals to
-    /// entity-bound version 2 records.
+    /// entity-bound version 2 records, and version 21 adds the encrypted,
+    /// schedule-revision-bound Google Calendar publication recovery journal.
     /// Legacy prose suggestions stay advisory and cannot acquire create authority during migration.
     /// Older binaries reject the newer schema instead of rewriting fields they
     /// do not understand.
-    static let currentSchemaVersion = 20
+    static let currentSchemaVersion = 21
 
     let schemaVersion: Int
     let savedAt: Date
@@ -481,6 +482,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
     let pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]?
     let canonicalTrash: [DayWeaveCanonicalTrashEntry]?
     let googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal?
+    let googleSchedulePublicationRecoveryJournal: GoogleSchedulePublicationRecoveryJournal?
     let localCaptureDiagnostics: [UUID: String]?
     let executionState: DayWeaveExecutionDurableState?
 
@@ -521,6 +523,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         pendingCanonicalAuthoringMutations: [DayWeavePendingCanonicalAuthoringMutation]? = [],
         canonicalTrash: [DayWeaveCanonicalTrashEntry]? = [],
         googleOutboundRecoveryJournal: GoogleOutboundRecoveryJournal? = nil,
+        googleSchedulePublicationRecoveryJournal: GoogleSchedulePublicationRecoveryJournal? = nil,
         localCaptureDiagnostics: [UUID: String]? = nil,
         executionState: DayWeaveExecutionDurableState? = .empty
     ) {
@@ -570,6 +573,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
         self.pendingCanonicalAuthoringMutations = pendingCanonicalAuthoringMutations
         self.canonicalTrash = canonicalTrash
         self.googleOutboundRecoveryJournal = googleOutboundRecoveryJournal
+        self.googleSchedulePublicationRecoveryJournal = googleSchedulePublicationRecoveryJournal
         self.localCaptureDiagnostics = localCaptureDiagnostics
         self.executionState = executionState
     }
@@ -657,6 +661,7 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                       configurationIdentifier: canonicalConfigurationIdentifier
                   ),
                   googleOutboundRecoveryJournal?.hasValidShape != false,
+                  googleSchedulePublicationRecoveryJournal?.hasValidShape != false,
                   localScheduleCompositionProvenance?.hasValidShape != false,
                   (onboardingFirstItemAnchor.map { anchor in
                       guard anchor.hasValidShape else { return false }
@@ -699,6 +704,51 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
                 throw .snapshotDecodingFailed
             }
             return self
+        case 20:
+            // Schema 20 predates generated-schedule Google Calendar authority.
+            // Ignore any injected newer field so migration cannot invent a
+            // reviewed preview or bearer capability.
+            return try PlannerSnapshot(
+                savedAt: savedAt,
+                destination: destination,
+                selectedBlockID: selectedBlockID,
+                selectedCanonicalItemID: selectedCanonicalItemID,
+                blocks: blocks,
+                suggestions: suggestions,
+                localSuggestionDateHighWater: localSuggestionDateHighWater,
+                assistantMessages: assistantMessages,
+                lastScheduleMessage: lastScheduleMessage,
+                protectedFreeMinutes: protectedFreeMinutes,
+                scheduleProfile: scheduleProfile,
+                freezeHours: freezeHours,
+                showCompleted: showCompleted,
+                canonicalItems: canonicalItems,
+                canonicalDeltaCursor: canonicalDeltaCursor,
+                canonicalTombstoneRevisions: canonicalTombstoneRevisions,
+                completedOccurrenceIDs: completedOccurrenceIDs,
+                pendingCanonicalMutations: pendingCanonicalMutations,
+                pendingCanonicalSensitivityMutations: pendingCanonicalSensitivityMutations,
+                recurrenceSessionOutcomes: recurrenceSessionOutcomes,
+                recurrenceOccurrenceMoves: recurrenceOccurrenceMoves,
+                pendingExecutionDeferIntent: pendingExecutionDeferIntent,
+                deferredExecutionPublicationSessionIDs:
+                    deferredExecutionPublicationSessionIDs,
+                pendingPublicationDeferredSessionIDs: pendingPublicationDeferredSessionIDs,
+                canonicalConfigurationIdentifier: canonicalConfigurationIdentifier,
+                schedulePreviewProvenance: schedulePreviewProvenance,
+                publishedScheduleProof: publishedScheduleProof,
+                onboardingFirstItemAnchor: onboardingFirstItemAnchor,
+                localScheduleCompositionProvenance: localScheduleCompositionProvenance,
+                pendingSchedulePublication: pendingSchedulePublication,
+                pendingProposalApplicationMutation: pendingProposalApplicationMutation,
+                proposalApplicationReceipts: proposalApplicationReceipts,
+                pendingCanonicalAuthoringMutations: pendingCanonicalAuthoringMutations,
+                canonicalTrash: canonicalTrash,
+                googleOutboundRecoveryJournal: googleOutboundRecoveryJournal,
+                googleSchedulePublicationRecoveryJournal: nil,
+                localCaptureDiagnostics: localCaptureDiagnostics,
+                executionState: executionState
+            ).migratedToCurrentSchema()
         case 19:
             // Journal decoding upgrades legacy calendar-only version 1 records
             // in memory. Crossing the snapshot schema boundary makes that
@@ -1554,8 +1604,68 @@ struct PlannerSnapshot: Codable, Equatable, Sendable {
 struct EncryptedPlannerPersistence: Sendable {
     static let currentEnvelopeVersion = 1
     static let cipherName = "AES.GCM.256"
-    static let maximumPlaintextBytes = 16 * 1_048_576
-    static let maximumEnvelopeBytes = 24 * 1_048_576
+
+    /// Before generated-schedule publication journals, a complete planner
+    /// snapshot could occupy 16 MiB. Keep that entire prior allowance while a
+    /// review is recoverable; otherwise a transport-valid preview could make
+    /// an already-valid planner impossible to save at the authority boundary.
+    static let legacyMaximumPlaintextBytes = 16 * 1_048_576
+
+    /// A decoded 16 MiB JSON response can require up to twice its wire size
+    /// when Foundation re-encodes JSON string contents (notably `/` on older
+    /// encoders and a literal U+2028/U+2029 as a six-byte escape). JSON syntax,
+    /// numbers, UUIDs, and ISO dates do not exceed that factor for these strict
+    /// DTOs. This remains tied to, and does not weaken, the transport cap.
+    static let maximumSchedulePublicationPreviewTransportBytes =
+        DayWeaveAPIClient.maximumResponseBytes
+    static let maximumJSONReencodingExpansionFactor = 2
+    static let maximumReencodedSchedulePublicationPreviewBytes = checkedMultiply(
+        maximumSchedulePublicationPreviewTransportBytes,
+        maximumJSONReencodingExpansionFactor
+    )
+
+    /// Outside the preview, the journal has one configuration identifier plus
+    /// fixed keys, UUIDs, bounded dates/counts, a 51-byte capability, and at
+    /// most a 100-character error code. The identifier can itself double when
+    /// JSON-escaped; the remaining 8 KiB reserve is more than twice the bound
+    /// of every other current field and the enclosing snapshot property.
+    static let maximumSchedulePublicationJournalMetadataBytes = checkedAdd(
+        checkedMultiply(
+            GoogleDisconnectRetryJournal.maximumConfigurationIdentifierBytes,
+            maximumJSONReencodingExpansionFactor
+        ),
+        8 * 1_024
+    )
+
+    static let maximumPlaintextBytes = checkedAdd(
+        checkedAdd(
+            legacyMaximumPlaintextBytes,
+            maximumReencodedSchedulePublicationPreviewBytes
+        ),
+        maximumSchedulePublicationJournalMetadataBytes
+    )
+
+    /// CryptoKit's combined AES-GCM representation is the 12-byte nonce,
+    /// ciphertext, and 16-byte tag. The envelope encoder explicitly leaves `/`
+    /// unescaped, so its Data value is exactly standard base64 (4 * ceil(n/3))
+    /// plus the deterministically derived fixed JSON framing below.
+    static let aesGCMCombinedOverheadBytes = 12 + 16
+    static let envelopeJSONFramingBytes = checkedAdd(
+        checkedAdd(
+            #"{"cipher":"","formatVersion":,"magic":"","sealedSnapshot":""}"#.utf8.count,
+            cipherName.utf8.count
+        ),
+        checkedAdd(
+            String(currentEnvelopeVersion).utf8.count,
+            EncryptedEnvelope.magic.utf8.count
+        )
+    )
+    static let maximumEnvelopeBytes = checkedAdd(
+        base64EncodedByteCount(
+            for: checkedAdd(maximumPlaintextBytes, aesGCMCombinedOverheadBytes)
+        ),
+        envelopeJSONFramingBytes
+    )
 
     let fileURL: URL
     private let keyProvider: any PlannerEncryptionKeyProviding
@@ -1647,6 +1757,9 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .authenticationFailed
         }
+        // The global maximum is needed before decoding untrusted ciphertext.
+        // A second, authority-scoped check below prevents ordinary planner
+        // snapshots from consuming publication-only headroom.
         guard plaintext.count <= Self.maximumPlaintextBytes else {
             throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
         }
@@ -1665,6 +1778,11 @@ struct EncryptedPlannerPersistence: Sendable {
             snapshot = try decoder.decode(PlannerSnapshot.self, from: plaintext)
         } catch {
             throw .snapshotDecodingFailed
+        }
+        let migrated = try snapshot.migratedToCurrentSchema()
+        let contextualLimit = Self.maximumPlaintextBytes(for: migrated)
+        guard plaintext.count <= contextualLimit else {
+            throw .snapshotTooLarge(limitBytes: contextualLimit)
         }
         return snapshot
     }
@@ -1724,7 +1842,9 @@ struct EncryptedPlannerPersistence: Sendable {
         let data: Data
         do {
             let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys]
+            // Base64 includes `/`. Keeping it literal makes the envelope-size
+            // formula above deterministic instead of probabilistic.
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
             data = try encoder.encode(envelope)
         } catch {
             throw .snapshotEncodingFailed
@@ -1755,10 +1875,45 @@ struct EncryptedPlannerPersistence: Sendable {
         } catch {
             throw .snapshotEncodingFailed
         }
-        guard plaintext.count <= Self.maximumPlaintextBytes else {
-            throw .snapshotTooLarge(limitBytes: Self.maximumPlaintextBytes)
+        let contextualLimit = maximumPlaintextBytes(for: snapshot)
+        guard plaintext.count <= contextualLimit else {
+            throw .snapshotTooLarge(limitBytes: contextualLimit)
         }
         return plaintext
+    }
+
+    /// Publication headroom is capability-scoped. An ordinary snapshot keeps
+    /// the historical 16 MiB limit. The small intent journal receives only its
+    /// bounded metadata reserve, and the 2x transport allowance is available
+    /// only after a valid journal contains the decoded preview it must recover.
+    static func maximumPlaintextBytes(for snapshot: PlannerSnapshot) -> Int {
+        guard let journal = snapshot.googleSchedulePublicationRecoveryJournal else {
+            return legacyMaximumPlaintextBytes
+        }
+        guard journal.preview != nil else {
+            return checkedAdd(
+                legacyMaximumPlaintextBytes,
+                maximumSchedulePublicationJournalMetadataBytes
+            )
+        }
+        return maximumPlaintextBytes
+    }
+
+    private static func checkedAdd(_ left: Int, _ right: Int) -> Int {
+        let (value, overflow) = left.addingReportingOverflow(right)
+        precondition(!overflow, "Planner persistence byte budget overflow")
+        return value
+    }
+
+    private static func checkedMultiply(_ left: Int, _ right: Int) -> Int {
+        let (value, overflow) = left.multipliedReportingOverflow(by: right)
+        precondition(!overflow, "Planner persistence byte budget overflow")
+        return value
+    }
+
+    private static func base64EncodedByteCount(for rawByteCount: Int) -> Int {
+        precondition(rawByteCount >= 0, "Base64 byte budget must be nonnegative")
+        return checkedMultiply(checkedAdd(rawByteCount, 2) / 3, 4)
     }
 
     private func writeEnvelopeData(_ data: Data) throws(PlannerPersistenceError) {

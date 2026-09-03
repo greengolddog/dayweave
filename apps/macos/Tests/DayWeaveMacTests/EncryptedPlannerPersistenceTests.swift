@@ -178,7 +178,7 @@ private enum EncryptedPlannerPersistenceScenarios {
             role: .user,
             text: String(
                 repeating: "x",
-                count: EncryptedPlannerPersistence.maximumPlaintextBytes + 1
+                count: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes + 1
             ),
             createdAt: base.savedAt
         )
@@ -202,9 +202,78 @@ private enum EncryptedPlannerPersistenceScenarios {
         }
         try require(
             observedError == .snapshotTooLarge(
-                limitBytes: EncryptedPlannerPersistence.maximumPlaintextBytes
+                limitBytes: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes
             ),
-            "Oversized plaintext did not fail at the save resource gate"
+            "Ordinary planner plaintext consumed publication-only headroom"
+        )
+    }
+
+    static func oversizedOrdinaryPlaintextIsRejectedOnLoad() throws {
+        let context = try makeContext()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let base = makeSnapshot()
+        let oversized = PlannerSnapshot(
+            savedAt: base.savedAt,
+            destination: base.destination,
+            selectedBlockID: base.selectedBlockID,
+            blocks: base.blocks,
+            suggestions: base.suggestions,
+            assistantMessages: [AssistantMessage(
+                id: UUID(),
+                role: .user,
+                text: String(
+                    repeating: "x",
+                    count: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes + 1
+                ),
+                createdAt: base.savedAt
+            )],
+            lastScheduleMessage: base.lastScheduleMessage,
+            protectedFreeMinutes: base.protectedFreeMinutes,
+            freezeHours: base.freezeHours,
+            showCompleted: base.showCompleted
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        encoder.outputFormatting = [.sortedKeys]
+        let plaintext = try encoder.encode(oversized)
+        try require(
+            plaintext.count > EncryptedPlannerPersistence.legacyMaximumPlaintextBytes
+                && plaintext.count <= EncryptedPlannerPersistence.maximumPlaintextBytes,
+            "Ordinary load fixture did not exercise the contextual plaintext gate"
+        )
+        let sealed = try AES.GCM.seal(
+            plaintext,
+            using: SymmetricKey(data: context.keyData),
+            authenticating: Data(
+                "DayWeave.PlannerSnapshot|1|AES.GCM.256".utf8
+            )
+        )
+        let combined = try requireValue(
+            sealed.combined,
+            "AES-GCM did not produce a combined load fixture"
+        )
+        let envelope = try JSONSerialization.data(
+            withJSONObject: [
+                "magic": "DAYWEAVE-ENCRYPTED-SNAPSHOT",
+                "formatVersion": 1,
+                "cipher": "AES.GCM.256",
+                "sealedSnapshot": combined.base64EncodedString(),
+            ],
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+        try envelope.write(to: context.fileURL)
+
+        var observedError: PlannerPersistenceError?
+        do {
+            _ = try context.persistence.load()
+        } catch {
+            observedError = error
+        }
+        try require(
+            observedError == .snapshotTooLarge(
+                limitBytes: EncryptedPlannerPersistence.legacyMaximumPlaintextBytes
+            ),
+            "Decoded ordinary planner plaintext consumed publication-only headroom"
         )
     }
 
@@ -1355,6 +1424,10 @@ final class EncryptedPlannerPersistenceTests: XCTestCase {
         try EncryptedPlannerPersistenceScenarios.oversizedPlaintextIsRejectedOnSave()
     }
 
+    func testOversizedOrdinaryPlaintextIsRejectedOnLoad() throws {
+        try EncryptedPlannerPersistenceScenarios.oversizedOrdinaryPlaintextIsRejectedOnLoad()
+    }
+
     func testPlannerStoreFlushesAndRestoresEncryptedState() throws {
         try EncryptedPlannerPersistenceScenarios.storeRestore()
     }
@@ -1460,6 +1533,11 @@ struct EncryptedPlannerPersistenceTests {
     @Test("Oversized planner plaintext is rejected before encryption")
     func oversizedPlaintext() throws {
         try EncryptedPlannerPersistenceScenarios.oversizedPlaintextIsRejectedOnSave()
+    }
+
+    @Test("Decoded ordinary plaintext cannot consume publication-only headroom")
+    func oversizedOrdinaryPlaintextLoad() throws {
+        try EncryptedPlannerPersistenceScenarios.oversizedOrdinaryPlaintextIsRejectedOnLoad()
     }
 
     @Test("Planner store flushes and restores encrypted state")

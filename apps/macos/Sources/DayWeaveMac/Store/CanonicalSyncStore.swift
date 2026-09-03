@@ -3743,7 +3743,8 @@ final class CanonicalSyncStore: ObservableObject {
         guard planner.pendingProposalApplicationMutation == nil else {
             throw LocalCompositionCoordinatorError.pendingProposalApplication
         }
-        guard planner.googleOutboundRecoveryJournal == nil else {
+        guard planner.googleOutboundRecoveryJournal == nil,
+              !planner.hasGoogleSchedulePublicationAuthorityFence else {
             throw LocalCompositionCoordinatorError.pendingGoogleRecovery
         }
         guard planner.pendingCanonicalMutations.isEmpty else {
@@ -3786,6 +3787,7 @@ final class CanonicalSyncStore: ObservableObject {
         guard planner.pendingSchedulePublication == nil,
               planner.pendingProposalApplicationMutation == nil,
               planner.googleOutboundRecoveryJournal == nil,
+              !planner.hasGoogleSchedulePublicationAuthorityFence,
               planner.pendingCanonicalMutations.isEmpty,
               planner.pendingCanonicalSensitivityMutations.isEmpty,
               planner.pendingCanonicalAuthoringMutations.isEmpty,
