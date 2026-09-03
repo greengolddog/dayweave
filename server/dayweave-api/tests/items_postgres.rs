@@ -529,7 +529,11 @@ fn new_item(
         duration_seconds: Some(3600),
         deadline_at: None,
         earliest_start_at: None,
-        recurrence: Some(json!({"type": "weekly", "weekdays": ["monday"]})),
+        recurrence: if kind == ItemKind::Goal {
+            None
+        } else {
+            Some(json!({"type": "weekly", "weekdays": ["monday"]}))
+        },
         flexible_constraints: json!({"energy": "deep"}),
         split_policy: SplitPolicy::Splittable {
             minimum_chunk_seconds: 1200,
