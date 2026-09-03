@@ -2,6 +2,7 @@ package com.greengolddog.dayweave.state
 
 import com.greengolddog.dayweave.data.PlannerStateRepository
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
+import com.greengolddog.dayweave.model.CanonicalFlexibleConstraintsDraft
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
 import com.greengolddog.dayweave.model.CanonicalPlanUpdate
@@ -21,6 +22,7 @@ import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -188,6 +190,47 @@ class OnboardingFirstItemStoreTest {
         assertNull(revisionStore.state.value.onboardingFirstItemAnchor)
     }
 
+    @Test
+    fun reviewedTaskWithQueuedChildMustRetainExplicitIndependentEffort() {
+        val store = PlannerStore(boundState())
+        requireNotNull(
+            store.enqueueOnboardingFirstItemCreate(plannedDraft(), ITEM_ID, MUTATION_ID),
+        )
+        requireNotNull(
+            store.enqueueCanonicalCreate(
+                plannedDraft().copy(parentId = ITEM_ID),
+                CHILD_ID,
+                CHILD_MUTATION_ID,
+            ),
+        )
+        assertNull(store.state.value.validatedOnboardingFirstItemCheck())
+
+        assertThrows(IllegalArgumentException::class.java) {
+            store.updateCanonicalAuthoringDraft(
+                MUTATION_ID,
+                plannedDraft().copy(title = "Still only rolled-up effort"),
+            )
+        }
+        assertEquals(
+            "First task",
+            store.canonicalAuthoringMutation(MUTATION_ID)?.draft?.title,
+        )
+
+        requireNotNull(
+            store.updateCanonicalAuthoringDraft(
+                MUTATION_ID,
+                plannedDraft().copy(
+                    title = "Independent parent work",
+                    constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                ),
+            ),
+        )
+        assertEquals(
+            OnboardingFirstItemCheck.PENDING_CREATE,
+            store.state.value.validatedOnboardingFirstItemCheck(),
+        )
+    }
+
     private suspend fun restoredStore(
         repository: PlannerStateRepository,
         scope: CoroutineScope,
@@ -273,6 +316,8 @@ class OnboardingFirstItemStoreTest {
     private companion object {
         const val ITEM_ID = "11111111-1111-4111-8111-111111111111"
         const val MUTATION_ID = "22222222-2222-4222-8222-222222222222"
+        const val CHILD_ID = "44444444-4444-4444-8444-444444444444"
+        const val CHILD_MUTATION_ID = "55555555-5555-4555-8555-555555555555"
         const val ORIGIN = "https://example.test/"
         const val CONFIGURATION_ID = "33333333-3333-4333-8333-333333333333"
         const val CREATED_AT = "2026-09-03T07:00:00Z"

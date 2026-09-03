@@ -11,6 +11,34 @@ class OnboardingReadinessProofTest {
     fun planningDemandIsStrictAndFailsClosed() {
         val task = plannedTask()
         assertTrue(task.createsPlanningDemand(ITEM_ID))
+        assertTrue(
+            task.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = false),
+            ).createsPlanningDemand(ITEM_ID),
+        )
+        assertFalse(task.createsPlanningDemand(ITEM_ID, hasChildren = true))
+        assertTrue(
+            task.copy(
+                constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+            ).createsPlanningDemand(ITEM_ID, hasChildren = true),
+        )
+        val habit = task.copy(
+            kind = ItemKind.HABIT,
+            recurrence = CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.DAILY,
+                occurrencesPerPeriod = 1,
+            ),
+        )
+        val breakItem = task.copy(kind = ItemKind.BREAK)
+        listOf(habit, breakItem).forEach { leaf ->
+            assertTrue(leaf.createsPlanningDemand(ITEM_ID))
+            assertFalse(leaf.createsPlanningDemand(ITEM_ID, hasChildren = true))
+            assertTrue(
+                leaf.copy(
+                    constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                ).createsPlanningDemand(ITEM_ID, hasChildren = true),
+            )
+        }
         assertFalse(
             task.copy(placement = CanonicalDraftPlacement.INBOX)
                 .createsPlanningDemand(ITEM_ID),
@@ -47,13 +75,14 @@ class OnboardingReadinessProofTest {
             ),
         )
         assertTrue(event.createsPlanningDemand(ITEM_ID))
+        assertTrue(event.createsPlanningDemand(ITEM_ID, hasChildren = true))
         assertFalse(
             event.copy(durationSeconds = 1_700).createsPlanningDemand(ITEM_ID),
         )
     }
 
     @Test
-    fun canonicalDemandRequiresExactActiveLeaf() {
+    fun canonicalDemandMatchesCoreOwnEffortHierarchySemantics() {
         val item = canonicalItem()
         assertTrue(item.createsPlanningDemand(listOf(item)))
         assertTrue(
@@ -83,7 +112,19 @@ class OnboardingReadinessProofTest {
             revision = 1,
             parentId = ITEM_ID,
         )
+        val taskParent = item.copy(isExecutable = false)
+        assertFalse(taskParent.createsPlanningDemand(listOf(taskParent, child)))
         assertFalse(item.createsPlanningDemand(listOf(item, child)))
+        val taskWithOwnEffort = taskParent.copy(
+            flexibleConstraintsJson = """{"has_own_effort":true}""",
+        )
+        assertTrue(taskWithOwnEffort.createsPlanningDemand(listOf(taskWithOwnEffort, child)))
+        val goalParent = goalWithOwnEffort.copy(isExecutable = false)
+        val routineParent = routineWithOwnEffort.copy(isExecutable = false)
+        assertTrue(goalParent.createsPlanningDemand(listOf(goalParent, child)))
+        assertTrue(routineParent.createsPlanningDemand(listOf(routineParent, child)))
+        val event = canonicalEvent().copy(isExecutable = false)
+        assertTrue(event.createsPlanningDemand(listOf(event, child)))
     }
 
     @Test
@@ -107,6 +148,19 @@ class OnboardingReadinessProofTest {
         assertNull(
             pending.copy(
                 pendingCanonicalAuthoringMutations = listOf(create, childCreate),
+            ).validatedOnboardingFirstItemCheck(),
+        )
+        assertEquals(
+            OnboardingFirstItemCheck.PENDING_CREATE,
+            pending.copy(
+                pendingCanonicalAuthoringMutations = listOf(
+                    create.copy(
+                        draft = plannedTask().copy(
+                            constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+                        ),
+                    ),
+                    childCreate,
+                ),
             ).validatedOnboardingFirstItemCheck(),
         )
         assertNull(
@@ -138,6 +192,15 @@ class OnboardingReadinessProofTest {
                 pendingCanonicalAuthoringMutations = listOf(childCreate),
             ).validatedOnboardingFirstItemCheck(),
         )
+        assertEquals(
+            OnboardingFirstItemCheck.CANONICAL_ITEM,
+            canonical.copy(
+                canonicalItems = listOf(
+                    item.copy(flexibleConstraintsJson = """{"has_own_effort":true}"""),
+                ),
+                pendingCanonicalAuthoringMutations = listOf(childCreate),
+            ).validatedOnboardingFirstItemCheck(),
+        )
         assertTrue(
             canonical.copy(
                 pendingCanonicalAuthoringMutations = listOf(childCreate),
@@ -150,6 +213,57 @@ class OnboardingReadinessProofTest {
                     item.revision + 1,
                 ),
             ).hasValidOnboardingFirstItemAnchorRelationship(),
+        )
+    }
+
+    @Test
+    fun queuedChildMovesAreAppliedToTheEffectiveHierarchy() {
+        val parent = canonicalItem().copy(isExecutable = false)
+        val child = canonicalItem(
+            id = CHILD_ID,
+            parentId = ITEM_ID,
+        )
+        val anchored = DayWeaveUiState(
+            canonicalItems = listOf(parent, child),
+            onboardingFirstItemAnchor = OnboardingFirstItemAnchorSnapshot(
+                ITEM_ID,
+                parent.revision,
+            ),
+        )
+        assertNull(anchored.validatedOnboardingFirstItemCheck())
+
+        val moveAway = pendingReplace(
+            item = child,
+            draft = child.toCanonicalDraft().copy(parentId = null),
+        )
+        assertEquals(
+            OnboardingFirstItemCheck.CANONICAL_ITEM,
+            anchored.copy(
+                pendingCanonicalAuthoringMutations = listOf(moveAway),
+            ).validatedOnboardingFirstItemCheck(),
+        )
+
+        val leafParent = parent.copy(isExecutable = true)
+        val rootChild = child.copy(parentId = null)
+        val moveIntoParent = pendingReplace(
+            item = rootChild,
+            draft = rootChild.toCanonicalDraft().copy(parentId = ITEM_ID),
+        )
+        assertNull(
+            anchored.copy(
+                canonicalItems = listOf(leafParent, rootChild),
+                pendingCanonicalAuthoringMutations = listOf(moveIntoParent),
+            ).validatedOnboardingFirstItemCheck(),
+        )
+        assertEquals(
+            OnboardingFirstItemCheck.CANONICAL_ITEM,
+            anchored.copy(
+                canonicalItems = listOf(
+                    leafParent.copy(flexibleConstraintsJson = """{"has_own_effort":true}"""),
+                    rootChild,
+                ),
+                pendingCanonicalAuthoringMutations = listOf(moveIntoParent),
+            ).validatedOnboardingFirstItemCheck(),
         )
     }
 
@@ -324,6 +438,19 @@ class OnboardingReadinessProofTest {
         createdAt = CREATED_AT,
     )
 
+    private fun pendingReplace(
+        item: CanonicalItemSnapshot,
+        draft: CanonicalItemDraft,
+    ): PendingCanonicalAuthoringMutation = PendingCanonicalAuthoringMutation(
+        id = CHILD_REPLACE_MUTATION_ID,
+        itemId = item.id,
+        operation = CanonicalAuthoringOperation.REPLACE,
+        draft = draft,
+        expectedRevision = item.revision,
+        baseItem = item,
+        createdAt = CREATED_AT,
+    )
+
     private fun canonicalItem(
         id: String = ITEM_ID,
         revision: Long = 1,
@@ -347,11 +474,26 @@ class OnboardingReadinessProofTest {
         updatedAt = UPDATED_AT,
     )
 
+    private fun canonicalEvent(): CanonicalItemSnapshot {
+        val timing = CanonicalEventTimingDraft(
+            startsAt = "2026-09-03T09:00:00Z",
+            endsAt = "2026-09-03T09:30:00Z",
+        )
+        return canonicalItem().copy(
+            kind = "event",
+            earliestStartAt = timing.startsAt,
+            deadlineAt = timing.endsAt,
+            flexibleConstraintsJson =
+                """{"dayweave_firm_block":${timing.toCanonicalJson("UTC")}}""",
+        )
+    }
+
     private companion object {
         const val ITEM_ID = "11111111-1111-4111-8111-111111111111"
         const val CHILD_ID = "22222222-2222-4222-8222-222222222222"
         const val MUTATION_ID = "33333333-3333-4333-8333-333333333333"
         const val CHILD_MUTATION_ID = "44444444-4444-4444-8444-444444444444"
+        const val CHILD_REPLACE_MUTATION_ID = "77777777-7777-4777-8777-777777777777"
         const val BLOCK_ID = "55555555-5555-4555-8555-555555555555"
         const val REVISION_ID = "66666666-6666-4666-8666-666666666666"
         const val CREATED_AT = "2026-09-03T07:00:00Z"

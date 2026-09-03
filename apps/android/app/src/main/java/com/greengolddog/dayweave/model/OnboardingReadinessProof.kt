@@ -49,11 +49,14 @@ enum class OnboardingFirstItemCheck {
 /**
  * Pure minimum-demand predicate for a locally reviewed create.
  *
- * Event validation already proves exact fixed timing. Other leaf kinds need a positive duration;
- * Goal and Routine additionally need an explicit `has_own_effort=true` so a container is never
- * mistaken for planning demand.
+ * Event validation already proves exact fixed timing. Goal and Routine always need explicit
+ * `has_own_effort=true`; other kinds need it only when they have children. Every non-event demand
+ * also needs a positive duration.
  */
-fun CanonicalItemDraft.createsPlanningDemand(itemId: String): Boolean = runCatching {
+fun CanonicalItemDraft.createsPlanningDemand(
+    itemId: String,
+    hasChildren: Boolean = false,
+): Boolean = runCatching {
     val value = normalized()
     value.requireValid(itemId)
     require(value.placement == CanonicalDraftPlacement.PLANNED)
@@ -62,7 +65,8 @@ fun CanonicalItemDraft.createsPlanningDemand(itemId: String): Boolean = runCatch
         ItemKind.TASK,
         ItemKind.HABIT,
         ItemKind.BREAK,
-        -> value.durationSeconds?.let { it > 0 } == true
+        -> value.durationSeconds?.let { it > 0 } == true &&
+            (!hasChildren || value.constraints.hasOwnEffort == true)
         ItemKind.GOAL,
         ItemKind.ROUTINE,
         -> value.durationSeconds?.let { it > 0 } == true &&
@@ -73,16 +77,67 @@ fun CanonicalItemDraft.createsPlanningDemand(itemId: String): Boolean = runCatch
 /** Canonical counterpart of [CanonicalItemDraft.createsPlanningDemand]. */
 fun CanonicalItemSnapshot.createsPlanningDemand(
     canonicalItems: List<CanonicalItemSnapshot>,
+    pendingAuthoringMutations: List<PendingCanonicalAuthoringMutation> = emptyList(),
+    recentlyDeleted: List<CanonicalRecentlyDeletedRecord> = emptyList(),
 ): Boolean = runCatching {
-    require(deletedAt == null && isExecutable)
+    require(deletedAt == null)
     require(status == "planned" || status == "scheduled")
-    require(canonicalItems.none { child ->
+    val hasCanonicalChildren = canonicalItems.any { child ->
         child.id != id && child.parentId == id && child.deletedAt == null
-    })
+    }
+    // The server's legacy field describes canonical leaf shape, not core planning occupancy.
+    require(isExecutable == !hasCanonicalChildren)
+    val hasChildren = hasEffectiveCanonicalChild(
+        itemId = id,
+        canonicalItems = canonicalItems,
+        pendingAuthoringMutations = pendingAuthoringMutations,
+        recentlyDeleted = recentlyDeleted,
+    )
     // The strict authoring decoder accepts Planned but not the server-owned Scheduled state.
     val reviewable = if (status == "scheduled") copy(status = "planned") else this
-    reviewable.toCanonicalDraft().createsPlanningDemand(id)
+    reviewable.toCanonicalDraft().createsPlanningDemand(id, hasChildren)
 }.getOrDefault(false)
+
+/**
+ * Materializes the hierarchy that pending authoring will produce without inventing server state.
+ * Conflicted operations do not participate in the active overlay. A bodyless restore without its
+ * retained deletion record fails closed as a possible child.
+ */
+internal fun hasEffectiveCanonicalChild(
+    itemId: String,
+    canonicalItems: List<CanonicalItemSnapshot>,
+    pendingAuthoringMutations: List<PendingCanonicalAuthoringMutation>,
+    recentlyDeleted: List<CanonicalRecentlyDeletedRecord> = emptyList(),
+): Boolean {
+    val parentById = canonicalItems.asSequence()
+        .filter { it.deletedAt == null }
+        .associateTo(mutableMapOf()) { it.id to it.parentId }
+    val deletedById = recentlyDeleted.associateBy(CanonicalRecentlyDeletedRecord::id)
+    pendingAuthoringMutations.asSequence()
+        .filter { it.disposition == CanonicalAuthoringDisposition.PENDING }
+        .forEach { mutation ->
+            when (mutation.operation) {
+                CanonicalAuthoringOperation.CREATE,
+                CanonicalAuthoringOperation.REPLACE,
+                -> {
+                    val draft = mutation.draft ?: return true
+                    parentById[mutation.itemId] = draft.parentId
+                }
+                CanonicalAuthoringOperation.TRASH -> parentById.remove(mutation.itemId)
+                CanonicalAuthoringOperation.RESTORE -> {
+                    val deleted = deletedById[mutation.itemId]
+                    val base = mutation.baseItem
+                    if (deleted == null && base == null) return true
+                    parentById[mutation.itemId] = if (deleted != null) {
+                        deleted.parentId
+                    } else {
+                        base?.parentId
+                    }
+                }
+            }
+        }
+    return parentById.any { (childId, parentId) -> childId != itemId && parentId == itemId }
+}
 
 /**
  * Returns exact first-item evidence, or null for absent, stale, conflicted, or ineligible state.
@@ -97,29 +152,27 @@ fun DayWeaveUiState.validatedOnboardingFirstItemCheck(): OnboardingFirstItemChec
                 mutation.operation == CanonicalAuthoringOperation.CREATE
         } ?: return null
         if (create.disposition != CanonicalAuthoringDisposition.PENDING) return null
-        if (create.draft?.createsPlanningDemand(anchor.itemId) != true) return null
-        return OnboardingFirstItemCheck.PENDING_CREATE.takeUnless {
-            hasPendingOnboardingChild(anchor.itemId)
-        }
+        val hasChildren = hasEffectiveCanonicalChild(
+            itemId = anchor.itemId,
+            canonicalItems = canonicalItems,
+            pendingAuthoringMutations = pendingCanonicalAuthoringMutations,
+            recentlyDeleted = canonicalRecentlyDeleted,
+        )
+        if (create.draft?.createsPlanningDemand(anchor.itemId, hasChildren) != true) return null
+        return OnboardingFirstItemCheck.PENDING_CREATE
     }
 
     val item = canonicalItems.singleOrNull {
         it.id == anchor.itemId && it.deletedAt == null
     }?.takeIf { it.revision == revision } ?: return null
     return OnboardingFirstItemCheck.CANONICAL_ITEM.takeIf {
-        item.createsPlanningDemand(canonicalItems) && !hasPendingOnboardingChild(anchor.itemId)
+        item.createsPlanningDemand(
+            canonicalItems = canonicalItems,
+            pendingAuthoringMutations = pendingCanonicalAuthoringMutations,
+            recentlyDeleted = canonicalRecentlyDeleted,
+        )
     }
 }
-
-private fun DayWeaveUiState.hasPendingOnboardingChild(itemId: String): Boolean =
-    pendingCanonicalAuthoringMutations.any { mutation ->
-        mutation.itemId != itemId &&
-            mutation.operation in setOf(
-                CanonicalAuthoringOperation.CREATE,
-                CanonicalAuthoringOperation.REPLACE,
-            ) &&
-            mutation.draft?.parentId == itemId
-    }
 
 /**
  * Persistence relationship check. Eligibility is intentionally checked separately so a stale
@@ -161,6 +214,12 @@ fun reconciledOnboardingFirstItemAnchor(
     val activeMatches = canonicalItems.filter { it.id == anchor.itemId && it.deletedAt == null }
     if (activeMatches.size > 1) return null
     val item = activeMatches.singleOrNull()
+    val hasChildren = hasEffectiveCanonicalChild(
+        itemId = anchor.itemId,
+        canonicalItems = canonicalItems,
+        pendingAuthoringMutations = pendingAuthoringMutations,
+        recentlyDeleted = recentlyDeleted,
+    )
     if (item != null) {
         if (anchor.canonicalRevision == item.revision) return anchor
         val exactReviewedMutation = pendingAuthoringMutations.any { mutation ->
@@ -174,7 +233,7 @@ fun reconciledOnboardingFirstItemAnchor(
                     )
                 } &&
                 mutation.draft?.let { draft ->
-                    draft.createsPlanningDemand(anchor.itemId) && draft.matches(item)
+                    draft.createsPlanningDemand(anchor.itemId, hasChildren) && draft.matches(item)
                 } == true
         }
         return when {
@@ -188,7 +247,7 @@ fun reconciledOnboardingFirstItemAnchor(
     val retainedCreate = pendingAuthoringMutations.any { mutation ->
         mutation.itemId == anchor.itemId &&
             mutation.operation == CanonicalAuthoringOperation.CREATE &&
-            mutation.draft?.createsPlanningDemand(anchor.itemId) == true
+            mutation.draft?.createsPlanningDemand(anchor.itemId, hasChildren) == true
     }
     return if (retainedCreate) {
         OnboardingFirstItemAnchorSnapshot(anchor.itemId, null)

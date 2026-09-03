@@ -73,6 +73,7 @@ import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.model.localScheduleCompositionStateFingerprint
 import com.greengolddog.dayweave.model.createsPlanningDemand
+import com.greengolddog.dayweave.model.hasEffectiveCanonicalChild
 import com.greengolddog.dayweave.model.reconciledOnboardingFirstItemAnchor
 import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import com.greengolddog.dayweave.model.strictLocalDayEndInstant
@@ -1743,7 +1744,15 @@ class PlannerStore(
                                 mutation.operation == CanonicalAuthoringOperation.CREATE &&
                                 !mutation.isSubmitted && mutation.syncOrigin == null &&
                                 mutation.disposition == CanonicalAuthoringDisposition.PENDING &&
-                                mutation.draft?.createsPlanningDemand(anchor.itemId) == true
+                                mutation.draft?.createsPlanningDemand(
+                                    itemId = anchor.itemId,
+                                    hasChildren = hasEffectiveCanonicalChild(
+                                        itemId = anchor.itemId,
+                                        canonicalItems = freshItems,
+                                        pendingAuthoringMutations =
+                                            current.pendingCanonicalAuthoringMutations,
+                                    ),
+                                ) == true
                         }
                 },
             )
@@ -1923,7 +1932,7 @@ class PlannerStore(
     ) { _ ->
         val normalized = draft.normalized()
         require(normalized.createsPlanningDemand(itemId)) {
-            "The onboarding item must be a planned leaf with schedulable effort"
+            "The onboarding item must have planned independent schedulable effort"
         }
         PendingCanonicalAuthoringMutation(
             id = mutationId,
@@ -2053,18 +2062,25 @@ class PlannerStore(
                 syncOrigin = null,
                 configurationId = null,
             ).also(PendingCanonicalAuthoringMutation::requireValid)
+            val prospectiveMutations = current.pendingCanonicalAuthoringMutations
+                .replaceAt(index, replacement)
             if (
                 current.onboardingFirstItemAnchor?.let { anchor ->
                     anchor.itemId == existing.itemId && anchor.canonicalRevision == null
                 } == true
             ) {
                 require(existing.operation == CanonicalAuthoringOperation.CREATE)
-                require(replacement.draft?.createsPlanningDemand(existing.itemId) == true) {
-                    "The reviewed onboarding item must remain a schedulable leaf"
+                val hasChildren = hasEffectiveCanonicalChild(
+                    itemId = existing.itemId,
+                    canonicalItems = current.canonicalItems,
+                    pendingAuthoringMutations = prospectiveMutations,
+                    recentlyDeleted = current.canonicalRecentlyDeleted,
+                )
+                require(
+                    replacement.draft?.createsPlanningDemand(existing.itemId, hasChildren) == true,
+                ) {
+                    "The reviewed onboarding item must retain independent schedulable effort"
                 }
-                require(current.pendingCanonicalAuthoringMutations.none { mutation ->
-                    mutation.id != existing.id && mutation.draft?.parentId == existing.itemId
-                }) { "The reviewed onboarding item cannot gain a queued child" }
             }
             if (current.canonicalExecutionSession != null) {
                 require(replacement.isDetachedInboxCapture()) {
@@ -2074,8 +2090,7 @@ class PlannerStore(
             validateCanonicalAuthoringCurrentState(current, replacement)
             validateCanonicalAuthoringHierarchy(current, replacement)
             current.copy(
-                pendingCanonicalAuthoringMutations = current.pendingCanonicalAuthoringMutations
-                    .replaceAt(index, replacement),
+                pendingCanonicalAuthoringMutations = prospectiveMutations,
                 publishedScheduleRevision = null,
                 publishedScheduleProof = null,
                 scheduleInputDigest = null,
@@ -2402,7 +2417,11 @@ class PlannerStore(
                 } else if (
                     responseIsSuperseded ||
                     durableExpected.operation == CanonicalAuthoringOperation.TRASH ||
-                    !response.createsPlanningDemand(activeItems)
+                    !response.createsPlanningDemand(
+                        canonicalItems = activeItems,
+                        pendingAuthoringMutations = withoutMutation,
+                        recentlyDeleted = deleted,
+                    )
                 ) {
                     null
                 } else {
@@ -4434,7 +4453,13 @@ class PlannerStore(
         val onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.let { anchor ->
             if (anchor.itemId != item.id) {
                 anchor
-            } else if (item.createsPlanningDemand(updatedCanonicalItems)) {
+            } else if (
+                item.createsPlanningDemand(
+                    canonicalItems = updatedCanonicalItems,
+                    pendingAuthoringMutations = current.pendingCanonicalAuthoringMutations,
+                    recentlyDeleted = current.canonicalRecentlyDeleted,
+                )
+            ) {
                 OnboardingFirstItemAnchorSnapshot(item.id, item.revision)
             } else {
                 null
@@ -4504,7 +4529,13 @@ class PlannerStore(
             onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.let { anchor ->
                 if (anchor.itemId != item.id) {
                     anchor
-                } else if (item.createsPlanningDemand(updatedItems)) {
+                } else if (
+                    item.createsPlanningDemand(
+                        canonicalItems = updatedItems,
+                        pendingAuthoringMutations = current.pendingCanonicalAuthoringMutations,
+                        recentlyDeleted = current.canonicalRecentlyDeleted,
+                    )
+                ) {
                     OnboardingFirstItemAnchorSnapshot(item.id, item.revision)
                 } else {
                     null
