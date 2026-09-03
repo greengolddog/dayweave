@@ -439,7 +439,10 @@ account may retain at most eight active unconsumed previews and 20,000 summed
 active change rows; the next request returns HTTP `429` without adding storage.
 Expired, unconsumed preview payloads that have no publication batch are pruned,
 including previously approved ones, while their approval audit evidence is
-retained. Consumed previews and publication history remain immutable.
+retained. Consumed previews and publication history remain immutable. The exact
+direct JSON preview must fit within 16 MiB before it is newly persisted; a
+larger projection returns HTTP `502`, matching the bounded macOS and Android
+transports instead of creating a review neither client can load.
 
 The mutation routes require a DayWeave device principal with both Google write
 authority and `schedule_read`; status requires Google read authority plus the

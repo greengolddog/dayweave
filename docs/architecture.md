@@ -169,8 +169,10 @@ unconsumed preview may be reused only after every stored child is revalidated
 against the current source state. Admission is bounded to eight active
 unconsumed previews and 20,000 active change rows per account; expired,
 unconsumed payloads without a batch are pruned while approval audit evidence is
-retained. This keeps repeated or concurrent preview requests from amplifying
-durable storage.
+retained. The direct JSON review response must serialize within 16 MiB before a
+new preview is persisted, which matches the bounded native transports and keeps
+the otherwise 10,000-change contract from producing an unusable review. This
+keeps repeated or concurrent preview requests from amplifying durable storage.
 
 An initiated create with an unknown outcome is never declared absent merely
 because time passed or repeated authenticated reads were negative. It remains

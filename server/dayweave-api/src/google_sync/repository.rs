@@ -402,6 +402,8 @@ pub(crate) enum GoogleSyncRepositoryError {
     InvalidSchedulePublication,
     #[error("too many active generated-schedule Google publication previews")]
     PreviewLimitExceeded,
+    #[error("generated-schedule Google publication preview exceeds the native response limit")]
+    SchedulePublicationPreviewTooLarge,
     #[error("Google collection cannot be configured for that role")]
     InvalidCollectionRole,
     #[error("Google collection is deleted")]

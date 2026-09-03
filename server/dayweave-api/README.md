@@ -51,7 +51,9 @@ change against the current schedule and mapping state. Each account is limited
 to eight active unconsumed previews and 20,000 active change rows; exceeding a
 limit returns HTTP `429` without storing another preview. Expired, unconsumed
 preview payloads with no publication batch are pruned while approval audit
-records are retained.
+records are retained. The exact serialized review response is capped at 16 MiB
+before a new preview is persisted, matching both native transports; an
+oversized projection fails closed as HTTP `502`.
 
 Mutation calls require Google write scope, `schedule_read`, a native-device
 principal, and the service's exact user/workspace binding. Status requires

@@ -753,6 +753,9 @@ fn map_repository_error(error: &GoogleSyncRepositoryError) -> ApiError {
         GoogleSyncRepositoryError::PreviewLimitExceeded => {
             ApiError::rate_limited("too many active generated-schedule publication previews")
         }
+        GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge => {
+            ApiError::bad_gateway("generated-schedule publication preview is too large")
+        }
         GoogleSyncRepositoryError::InvalidCollectionRole => {
             ApiError::validation("collection does not permit that sync role")
         }
@@ -958,8 +961,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn schedule_publication_errors_use_public_contract_statuses() {
+    #[tokio::test]
+    async fn schedule_publication_errors_use_public_contract_statuses() {
         assert_eq!(
             map_service_error(GoogleSyncServiceError::SchedulePublicationDisabled)
                 .into_response()
@@ -984,6 +987,16 @@ mod tests {
                 .status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+        let oversized =
+            map_repository_error(&GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge)
+                .into_response();
+        assert_eq!(oversized.status(), StatusCode::BAD_GATEWAY);
+        let oversized_body = axum::body::to_bytes(oversized.into_body(), 1024)
+            .await
+            .expect("bounded error body");
+        let oversized_body: serde_json::Value =
+            serde_json::from_slice(&oversized_body).expect("JSON error envelope");
+        assert_eq!(oversized_body["error"]["code"], "bad_gateway");
         assert_eq!(
             map_repository_error(&GoogleSyncRepositoryError::ScheduleRevisionConflict {
                 expected: Uuid::new_v4(),

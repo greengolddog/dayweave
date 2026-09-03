@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    io::{self, Write},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -59,6 +62,66 @@ const MAX_CALENDAR_PROJECTION_ENTRIES: usize = 10_000;
 const MAX_CALENDAR_PROJECTION_WINDOW_DAYS: i64 = 150;
 const MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEWS: i64 = 8;
 const MAX_ACTIVE_SCHEDULE_PUBLICATION_PREVIEW_CHANGES: i64 = 20_000;
+const MAX_SCHEDULE_PUBLICATION_PREVIEW_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+struct BoundedJsonSizeWriter {
+    written: usize,
+    limit: usize,
+    limit_exceeded: bool,
+}
+
+impl BoundedJsonSizeWriter {
+    const fn new(limit: usize) -> Self {
+        Self {
+            written: 0,
+            limit,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonSizeWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.written.checked_add(buffer.len()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON response size overflow",
+            ));
+        };
+        if next > self.limit {
+            self.limit_exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "JSON response exceeds its public limit",
+            ));
+        }
+        self.written = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_fits_limit<T: serde::Serialize>(
+    value: &T,
+    limit: usize,
+) -> Result<bool, serde_json::Error> {
+    let mut writer = BoundedJsonSizeWriter::new(limit);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(true),
+        Err(_) if writer.limit_exceeded => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn schedule_publication_preview_fits_response_limit(
+    preview: &ScheduleGooglePublicationPreview,
+    response_limit: usize,
+) -> Result<bool, serde_json::Error> {
+    serialized_json_fits_limit(preview, response_limit)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PostgresGoogleSyncRepository {
@@ -70,6 +133,199 @@ impl PostgresGoogleSyncRepository {
     #[must_use]
     pub(crate) fn new(pool: PgPool, scope: DatabaseScope) -> Self {
         Self { pool, scope }
+    }
+
+    #[allow(clippy::too_many_lines)] // Keeps preview admission and persistence in one transaction.
+    async fn create_schedule_publication_preview_with_response_limit(
+        &self,
+        spec: SchedulePublicationPreviewSpec,
+        now: DateTime<Utc>,
+        response_limit: usize,
+    ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncRepositoryError> {
+        if spec.id.is_nil()
+            || spec.source.workspace_id != self.scope.workspace_id
+            || spec.source.user_id != self.scope.user_id
+            || spec.expires_at <= now
+            || spec.expires_at > now + chrono::Duration::minutes(30)
+        {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let mut transaction = self.pool.begin().await.map_err(internal)?;
+        let current = load_schedule_publication_source_tx(
+            self,
+            &mut transaction,
+            spec.source.account_id,
+            spec.source.collection.id,
+            spec.source.schedule_revision_id,
+            now,
+        )
+        .await?;
+        if !schedule_publication_sources_match(&current, &spec.source) {
+            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
+        }
+        let validated = validate_schedule_publication_changes(&current, &spec.changes, now)?;
+        let desired_set_hash =
+            schedule_publication_desired_set_hash(&current, &spec.changes).map_err(internal)?;
+        lock_schedule_publication_preview_space_tx(
+            &mut transaction,
+            self.scope,
+            current.account_id,
+        )
+        .await?;
+        prune_expired_schedule_publication_previews_tx(
+            &mut transaction,
+            self.scope,
+            current.account_id,
+            now,
+        )
+        .await?;
+        if let Some(existing) = reusable_schedule_publication_preview_tx(
+            &mut transaction,
+            self.scope,
+            &current,
+            desired_set_hash,
+            &validated,
+            &spec.changes,
+            now,
+        )
+        .await?
+        {
+            if !schedule_publication_preview_fits_response_limit(&existing, response_limit)
+                .map_err(internal)?
+            {
+                return Err(GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge);
+            }
+            transaction.commit().await.map_err(internal)?;
+            return Ok(existing);
+        }
+        let (active_count, active_change_count): (i64, i64) = sqlx::query_as(
+            "SELECT count(*), COALESCE(sum(change_count), 0) \
+             FROM google_schedule_publication_previews \
+             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
+               AND consumed_at IS NULL \
+               AND expires_at > GREATEST($4, statement_timestamp())",
+        )
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(current.account_id)
+        .bind(now)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        if schedule_publication_preview_limit_exceeded(
+            active_count,
+            active_change_count,
+            i64::from(validated.change_count),
+        ) {
+            return Err(GoogleSyncRepositoryError::PreviewLimitExceeded);
+        }
+        let preview_hash =
+            schedule_publication_preview_hash(spec.id, &current, &spec.changes, spec.expires_at)
+                .map_err(internal)?;
+        let change_count = validated.change_count;
+        let create_count = validated.create_count;
+        let update_count = validated.update_count;
+        let delete_count = validated.delete_count;
+        let noop_count = validated.noop_count;
+        let result = ScheduleGooglePublicationPreview {
+            id: spec.id,
+            account_id: current.account_id,
+            collection_id: current.collection.id,
+            collection_revision: current.collection.revision,
+            collection_display_name: current.collection.display_name.clone(),
+            schedule_revision_id: current.schedule_revision_id,
+            schedule_revision_number: current.schedule_revision_number,
+            preview_hash: encode_hex_bytes(&preview_hash),
+            create_count,
+            update_count,
+            delete_count,
+            noop_count,
+            changes: validated.public_changes,
+            expires_at: spec.expires_at,
+        };
+        if !schedule_publication_preview_fits_response_limit(&result, response_limit)
+            .map_err(internal)?
+        {
+            return Err(GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge);
+        }
+        sqlx::query(
+            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
+             provider_account_id, collection_id, collection_revision, collection_remote_id, \
+             collection_display_name, required_scope, schedule_revision_id, \
+             schedule_revision_number, schedule_publication_hash, desired_set_hash, timezone_name, \
+             horizon_start, horizon_end, preview_hash, change_count, create_count, update_count, \
+             delete_count, noop_count, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, \
+             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
+             $22, $23, $24, $24)",
+        )
+        .bind(spec.id)
+        .bind(self.scope.workspace_id)
+        .bind(self.scope.user_id)
+        .bind(current.account_id)
+        .bind(current.collection.id)
+        .bind(u64_to_i64(current.collection.revision)?)
+        .bind(&current.collection.remote_collection_id)
+        .bind(&current.collection.display_name)
+        .bind(GOOGLE_CALENDAR_SCOPE)
+        .bind(current.schedule_revision_id)
+        .bind(u64_to_i64(current.schedule_revision_number)?)
+        .bind(current.schedule_publication_hash.as_slice())
+        .bind(desired_set_hash.as_slice())
+        .bind(&current.timezone_name)
+        .bind(current.horizon_start)
+        .bind(current.horizon_end)
+        .bind(preview_hash.as_slice())
+        .bind(u32_to_i32(change_count)?)
+        .bind(u32_to_i32(create_count)?)
+        .bind(u32_to_i32(update_count)?)
+        .bind(u32_to_i32(delete_count)?)
+        .bind(u32_to_i32(noop_count)?)
+        .bind(spec.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(internal)?;
+        for change in &spec.changes {
+            sqlx::query(
+                "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, \
+                 user_id, preview_id, provider_account_id, collection_id, schedule_revision_id, \
+                 ordinal, slot_id, source_block_id, item_id, occurrence_id, session_index, \
+                 incarnation, operation, mapping_id, remote_resource_id, expected_etag, \
+                 desired_payload_hash, intent_hash, provider_payload, review_summary, starts_at, \
+                 ends_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
+                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(self.scope.workspace_id)
+            .bind(self.scope.user_id)
+            .bind(spec.id)
+            .bind(current.account_id)
+            .bind(current.collection.id)
+            .bind(current.schedule_revision_id)
+            .bind(u32_to_i32(change.ordinal)?)
+            .bind(change.slot_id)
+            .bind(change.source_block_id)
+            .bind(change.item_id)
+            .bind(change.occurrence_id)
+            .bind(i32::from(change.session_index))
+            .bind(i64::from(change.incarnation))
+            .bind(change.operation.as_db())
+            .bind(change.mapping_id)
+            .bind(&change.remote_resource_id)
+            .bind(&change.expected_etag)
+            .bind(change.desired_payload_hash.as_slice())
+            .bind(change.intent_hash.as_slice())
+            .bind(&change.payload)
+            .bind(&change.review_summary)
+            .bind(change.starts_at)
+            .bind(change.ends_at)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(internal)?;
+        }
+        transaction.commit().await.map_err(internal)?;
+        Ok(result)
     }
 
     async fn ensure_account(
@@ -3419,176 +3675,13 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
         spec: SchedulePublicationPreviewSpec,
         now: DateTime<Utc>,
     ) -> Result<ScheduleGooglePublicationPreview, GoogleSyncRepositoryError> {
-        if spec.id.is_nil()
-            || spec.source.workspace_id != self.scope.workspace_id
-            || spec.source.user_id != self.scope.user_id
-            || spec.expires_at <= now
-            || spec.expires_at > now + chrono::Duration::minutes(30)
-        {
-            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
-        }
-        let mut transaction = self.pool.begin().await.map_err(internal)?;
-        let current = load_schedule_publication_source_tx(
-            self,
-            &mut transaction,
-            spec.source.account_id,
-            spec.source.collection.id,
-            spec.source.schedule_revision_id,
+        self.create_schedule_publication_preview_with_response_limit(
+            spec,
             now,
+            MAX_SCHEDULE_PUBLICATION_PREVIEW_RESPONSE_BYTES,
         )
-        .await?;
-        if !schedule_publication_sources_match(&current, &spec.source) {
-            return Err(GoogleSyncRepositoryError::InvalidSchedulePublication);
-        }
-        let validated = validate_schedule_publication_changes(&current, &spec.changes, now)?;
-        let desired_set_hash =
-            schedule_publication_desired_set_hash(&current, &spec.changes).map_err(internal)?;
-        lock_schedule_publication_preview_space_tx(
-            &mut transaction,
-            self.scope,
-            current.account_id,
-        )
-        .await?;
-        prune_expired_schedule_publication_previews_tx(
-            &mut transaction,
-            self.scope,
-            current.account_id,
-            now,
-        )
-        .await?;
-        if let Some(existing) = reusable_schedule_publication_preview_tx(
-            &mut transaction,
-            self.scope,
-            &current,
-            desired_set_hash,
-            &validated,
-            &spec.changes,
-            now,
-        )
-        .await?
-        {
-            transaction.commit().await.map_err(internal)?;
-            return Ok(existing);
-        }
-        let (active_count, active_change_count): (i64, i64) = sqlx::query_as(
-            "SELECT count(*), COALESCE(sum(change_count), 0) \
-             FROM google_schedule_publication_previews \
-             WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3 \
-               AND consumed_at IS NULL \
-               AND expires_at > GREATEST($4, statement_timestamp())",
-        )
-        .bind(self.scope.workspace_id)
-        .bind(self.scope.user_id)
-        .bind(current.account_id)
-        .bind(now)
-        .fetch_one(&mut *transaction)
         .await
-        .map_err(internal)?;
-        if schedule_publication_preview_limit_exceeded(
-            active_count,
-            active_change_count,
-            i64::from(validated.change_count),
-        ) {
-            return Err(GoogleSyncRepositoryError::PreviewLimitExceeded);
-        }
-        let preview_hash =
-            schedule_publication_preview_hash(spec.id, &current, &spec.changes, spec.expires_at)
-                .map_err(internal)?;
-        sqlx::query(
-            "INSERT INTO google_schedule_publication_previews (id, workspace_id, user_id, \
-             provider_account_id, collection_id, collection_revision, collection_remote_id, \
-             collection_display_name, required_scope, schedule_revision_id, \
-             schedule_revision_number, schedule_publication_hash, desired_set_hash, timezone_name, \
-             horizon_start, horizon_end, preview_hash, change_count, create_count, update_count, \
-             delete_count, noop_count, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, \
-             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, \
-             $22, $23, $24, $24)",
-        )
-        .bind(spec.id)
-        .bind(self.scope.workspace_id)
-        .bind(self.scope.user_id)
-        .bind(current.account_id)
-        .bind(current.collection.id)
-        .bind(u64_to_i64(current.collection.revision)?)
-        .bind(&current.collection.remote_collection_id)
-        .bind(&current.collection.display_name)
-        .bind(GOOGLE_CALENDAR_SCOPE)
-        .bind(current.schedule_revision_id)
-        .bind(u64_to_i64(current.schedule_revision_number)?)
-        .bind(current.schedule_publication_hash.as_slice())
-        .bind(desired_set_hash.as_slice())
-        .bind(&current.timezone_name)
-        .bind(current.horizon_start)
-        .bind(current.horizon_end)
-        .bind(preview_hash.as_slice())
-        .bind(u32_to_i32(validated.change_count)?)
-        .bind(u32_to_i32(validated.create_count)?)
-        .bind(u32_to_i32(validated.update_count)?)
-        .bind(u32_to_i32(validated.delete_count)?)
-        .bind(u32_to_i32(validated.noop_count)?)
-        .bind(spec.expires_at)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(internal)?;
-        for change in &spec.changes {
-            sqlx::query(
-                "INSERT INTO google_schedule_publication_preview_changes (id, workspace_id, \
-                 user_id, preview_id, provider_account_id, collection_id, schedule_revision_id, \
-                 ordinal, slot_id, source_block_id, item_id, occurrence_id, session_index, \
-                 incarnation, operation, mapping_id, remote_resource_id, expected_etag, \
-                 desired_payload_hash, intent_hash, provider_payload, review_summary, starts_at, \
-                 ends_at, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, \
-                 $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)",
-            )
-            .bind(Uuid::new_v4())
-            .bind(self.scope.workspace_id)
-            .bind(self.scope.user_id)
-            .bind(spec.id)
-            .bind(current.account_id)
-            .bind(current.collection.id)
-            .bind(current.schedule_revision_id)
-            .bind(u32_to_i32(change.ordinal)?)
-            .bind(change.slot_id)
-            .bind(change.source_block_id)
-            .bind(change.item_id)
-            .bind(change.occurrence_id)
-            .bind(i32::from(change.session_index))
-            .bind(i64::from(change.incarnation))
-            .bind(change.operation.as_db())
-            .bind(change.mapping_id)
-            .bind(&change.remote_resource_id)
-            .bind(&change.expected_etag)
-            .bind(change.desired_payload_hash.as_slice())
-            .bind(change.intent_hash.as_slice())
-            .bind(&change.payload)
-            .bind(&change.review_summary)
-            .bind(change.starts_at)
-            .bind(change.ends_at)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(internal)?;
-        }
-        transaction.commit().await.map_err(internal)?;
-        Ok(ScheduleGooglePublicationPreview {
-            id: spec.id,
-            account_id: current.account_id,
-            collection_id: current.collection.id,
-            collection_revision: current.collection.revision,
-            collection_display_name: current.collection.display_name,
-            schedule_revision_id: current.schedule_revision_id,
-            schedule_revision_number: current.schedule_revision_number,
-            preview_hash: encode_hex_bytes(&preview_hash),
-            create_count: validated.create_count,
-            update_count: validated.update_count,
-            delete_count: validated.delete_count,
-            noop_count: validated.noop_count,
-            changes: validated.public_changes,
-            expires_at: spec.expires_at,
-        })
     }
-
     async fn approve_schedule_publication(
         &self,
         spec: SchedulePublicationApprovalSpec,
@@ -10433,6 +10526,75 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn schedule_preview_serialization_is_bounded_to_the_native_response_limit() {
+        let timestamp: DateTime<Utc> = "2026-09-03T12:00:00Z".parse().expect("preview timestamp");
+        let preview = ScheduleGooglePublicationPreview {
+            id: Uuid::from_u128(1),
+            account_id: Uuid::from_u128(2),
+            collection_id: Uuid::from_u128(3),
+            collection_revision: 1,
+            collection_display_name: "Primary".to_owned(),
+            schedule_revision_id: Uuid::from_u128(4),
+            schedule_revision_number: 1,
+            preview_hash: "0".repeat(64),
+            create_count: 0,
+            update_count: 0,
+            delete_count: 0,
+            noop_count: 0,
+            changes: Vec::new(),
+            expires_at: timestamp,
+        };
+        let exact_size = serde_json::to_vec(&preview)
+            .expect("serialize schedule preview")
+            .len();
+
+        assert!(
+            serialized_json_fits_limit(&preview, exact_size)
+                .expect("exact-sized preview must serialize")
+        );
+        assert!(
+            !serialized_json_fits_limit(&preview, exact_size - 1)
+                .expect("oversized preview must remain a size result")
+        );
+        assert!(
+            schedule_publication_preview_fits_response_limit(
+                &preview,
+                MAX_SCHEDULE_PUBLICATION_PREVIEW_RESPONSE_BYTES,
+            )
+            .expect("small preview must serialize")
+        );
+        assert_eq!(
+            MAX_SCHEDULE_PUBLICATION_PREVIEW_RESPONSE_BYTES,
+            16 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn schedule_preview_size_check_preserves_serialization_failures() {
+        struct FailingSerialization;
+
+        impl serde::Serialize for FailingSerialization {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+
+        let error = serialized_json_fits_limit(&FailingSerialization, 1024)
+            .expect_err("non-size serialization errors must remain visible");
+
+        assert!(
+            error
+                .to_string()
+                .contains("intentional serialization failure")
+        );
+    }
+
     async fn sync_fixture(database_url: &str) -> SyncFixture {
         let database = TestDatabase::create(database_url).await;
         MIGRATOR
@@ -11365,6 +11527,134 @@ mod tests {
             )
             .await
             .expect("approval revalidation preserves elapsed Noop");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn postgres_schedule_preview_response_limit_rejects_without_persistence() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; schedule PostgreSQL test skipped");
+            return;
+        };
+        let fixture = published_schedule_fixture(&database_url, 1).await;
+        let source = fixture.source.clone();
+        let block = source.blocks[0].clone();
+        let now = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("wall clock is representable");
+
+        let rejected_id = Uuid::new_v4();
+        let fresh_error = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview_with_response_limit(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    rejected_id,
+                    &block.title,
+                    "fresh-response-limit-event",
+                    "dwsm1.v1.fresh-response-limit",
+                    now + Duration::minutes(10),
+                ),
+                now,
+                1,
+            )
+            .await
+            .expect_err("fresh preview over the response limit must fail");
+        assert_eq!(
+            fresh_error,
+            GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge
+        );
+        let rejected_counts: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND user_id = $2 AND id = $3), \
+             (SELECT count(*) FROM google_schedule_publication_preview_changes \
+               WHERE workspace_id = $1 AND user_id = $2 AND preview_id = $3)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(rejected_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("rejected fresh preview persistence counts");
+        assert_eq!(rejected_counts, (0, 0));
+
+        let stored = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    Uuid::new_v4(),
+                    &block.title,
+                    "reusable-response-limit-event",
+                    "dwsm1.v1.reusable-response-limit-a",
+                    now + Duration::minutes(10),
+                ),
+                now,
+            )
+            .await
+            .expect("baseline reusable preview");
+        let before_reuse: (i64, i64) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3), \
+             (SELECT count(*) FROM google_schedule_publication_preview_changes \
+               WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("baseline preview persistence counts");
+        assert_eq!(before_reuse, (1, 1));
+
+        let reusable_candidate_id = Uuid::new_v4();
+        let reuse_error = fixture
+            .sync
+            .repository
+            .create_schedule_publication_preview_with_response_limit(
+                schedule_preview_spec(
+                    &source,
+                    &block,
+                    reusable_candidate_id,
+                    &block.title,
+                    "reusable-response-limit-event",
+                    "dwsm1.v1.reusable-response-limit-b",
+                    now + Duration::minutes(11),
+                ),
+                now,
+                1,
+            )
+            .await
+            .expect_err("oversized reusable preview must not be returned");
+        assert_eq!(
+            reuse_error,
+            GoogleSyncRepositoryError::SchedulePublicationPreviewTooLarge
+        );
+        let after_reuse: (i64, i64, bool, bool) = sqlx::query_as(
+            "SELECT \
+             (SELECT count(*) FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3), \
+             (SELECT count(*) FROM google_schedule_publication_preview_changes \
+               WHERE workspace_id = $1 AND user_id = $2 AND provider_account_id = $3), \
+             EXISTS(SELECT 1 FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND id = $4), \
+             EXISTS(SELECT 1 FROM google_schedule_publication_previews \
+               WHERE workspace_id = $1 AND id = $5)",
+        )
+        .bind(fixture.sync.scope.workspace_id)
+        .bind(fixture.sync.scope.user_id)
+        .bind(fixture.sync.account_id)
+        .bind(stored.id)
+        .bind(reusable_candidate_id)
+        .fetch_one(&fixture.sync.database.pool)
+        .await
+        .expect("preview persistence counts after rejected reuse");
+        assert_eq!(after_reuse, (1, 1, true, false));
     }
 
     #[tokio::test]
