@@ -141,7 +141,7 @@ struct ExecutionInvalidationAPIClientTests {
                 statusCode: 200,
                 headers: ["Content-Type": "text/event-stream"],
                 body: Data(),
-                delay: 5
+                holdsOpenUntilCancelled: true
             )
         )
         let task = Task {

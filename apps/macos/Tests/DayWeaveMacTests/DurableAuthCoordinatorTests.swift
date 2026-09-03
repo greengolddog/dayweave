@@ -963,7 +963,7 @@ struct DurableAuthCoordinatorTests {
                 statusCode: 200,
                 headers: ["Content-Type": "text/event-stream"],
                 body: Data(),
-                delay: 5
+                holdsOpenUntilCancelled: true
             )
         )
         let lifetime = DurableAuthStreamLifetimeGate()
@@ -1037,7 +1037,7 @@ struct DurableAuthCoordinatorTests {
                 statusCode: 200,
                 headers: ["Content-Type": "text/event-stream"],
                 body: Data(),
-                delay: 5
+                holdsOpenUntilCancelled: true
             )
         )
         let lifetime = DurableAuthStreamLifetimeGate()

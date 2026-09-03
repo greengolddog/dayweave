@@ -985,17 +985,20 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
         let headers: [String: String]
         let body: Data
         let delay: TimeInterval
+        let holdsOpenUntilCancelled: Bool
 
         init(
             statusCode: Int,
             headers: [String: String] = [:],
             body: Data,
-            delay: TimeInterval = 0
+            delay: TimeInterval = 0,
+            holdsOpenUntilCancelled: Bool = false
         ) {
             self.statusCode = statusCode
             self.headers = headers
             self.body = body
             self.delay = delay
+            self.holdsOpenUntilCancelled = holdsOpenUntilCancelled
         }
     }
 
@@ -1152,6 +1155,9 @@ final class URLProtocolStub: URLProtocol, @unchecked Sendable {
                 headerFields: response.headers
               ) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        if response.holdsOpenUntilCancelled {
             return
         }
         let deliver: @Sendable () -> Void = { [weak self] in
