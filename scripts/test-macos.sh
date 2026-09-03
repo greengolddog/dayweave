@@ -29,7 +29,11 @@ dw_developer_dir=$(xcode-select -p)
 dw_framework_root="$dw_developer_dir/Library/Developer/Frameworks"
 dw_testing_source="$dw_framework_root/Testing.framework"
 if test ! -d "$dw_testing_source"; then
-  exec swift test --package-path "$dw_package_dir" "$@"
+  # Swift Testing otherwise schedules independent suites concurrently even when
+  # SwiftPM reports its legacy XCTest default as non-parallel. Many DayWeave
+  # integration tests intentionally share the main actor, so serialize the
+  # runner to prevent unrelated suites from starving their deterministic gates.
+  exec swift test --package-path "$dw_package_dir" --no-parallel "$@"
 fi
 
 dw_testing_copy=$(mktemp -d /tmp/dayweave-testing-frameworks.XXXXXX)
@@ -48,6 +52,7 @@ fi
 DYLD_FRAMEWORK_PATH="$dw_runtime_frameworks" \
   swift test \
     --package-path "$dw_package_dir" \
+    --no-parallel \
     -Xswiftc -F \
     -Xswiftc "$dw_testing_copy" \
     -Xlinker -F \

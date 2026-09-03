@@ -143,6 +143,10 @@ struct CanonicalItemInvalidationStoreTests {
         sync.stopForegroundItemInvalidations()
 
         let requests = URLProtocolStub.storage.requests(for: token)
+        guard requests.count >= 5 else {
+            Issue.record("The publication-repair pass did not issue its complete request sequence")
+            return
+        }
         #expect(requests.map(\.url.path) == [
             "/gateway/v1/items/delta",
             "/gateway/v1/schedule/preview",
