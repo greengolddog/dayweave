@@ -16,6 +16,7 @@ use dayweave_core::{
     ExecutionPlanningContext, ItemId, ManualPlacementViolationCode, OccurrenceId, PlanRequest,
     ScheduleBlockKind, ScheduleError, SchedulePlan, Scheduler,
 };
+use dayweave_scheduler_helper::{PlanPreflightError, preflight_plan_request};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -357,6 +358,8 @@ pub enum ComposeScheduleError {
     ItemService(#[from] ItemServiceError),
     #[error("schedule engine rejected the composed input: {0}")]
     Scheduler(#[from] ScheduleError),
+    #[error("schedule preview exceeds the scheduler work budget")]
+    SchedulerResourceLimit,
     #[error("schedule preview input could not be encoded")]
     Encoding,
     #[error("selected Google Calendar projection does not cover the requested horizon")]
@@ -379,6 +382,7 @@ impl ComposeScheduleError {
             Self::InvalidRequest(_)
                 | Self::TooManyItems
                 | Self::Scheduler(_)
+                | Self::SchedulerResourceLimit
                 | Self::AuthoritativeManualPlacementChanged(_)
         )
     }
@@ -1167,6 +1171,7 @@ fn compose_prepared_for_schema(
         plan_request,
     } = prepared;
     ignored_previous_assignments.extend(untrusted_assignments);
+    preflight_plan_request(&plan_request).map_err(map_scheduler_preflight_error)?;
     let input_digest = request_digest(
         scheduler_publication_schema,
         &timezone_name,
@@ -1213,6 +1218,16 @@ fn compose_prepared_for_schema(
         )
     })?;
     Ok(result)
+}
+
+fn map_scheduler_preflight_error(error: PlanPreflightError) -> ComposeScheduleError {
+    match error {
+        PlanPreflightError::Schedule(error) => ComposeScheduleError::Scheduler(error),
+        PlanPreflightError::InvalidRequest => ComposeScheduleError::InvalidRequest(
+            "composed schedule failed bounded scheduler preflight".to_owned(),
+        ),
+        PlanPreflightError::ResourceLimitExceeded => ComposeScheduleError::SchedulerResourceLimit,
+    }
 }
 
 fn into_canonical_item(item: Item) -> CanonicalItem {
@@ -1619,6 +1634,37 @@ mod tests {
             .into_iter()
             .next()
             .expect("expected plannable item")
+    }
+
+    #[test]
+    fn production_composition_reuses_bounded_scheduler_preflight() {
+        let mut item = canonical_item(Uuid::from_u128(500));
+        item.duration_seconds = Some(366 * 24 * 60 * 60);
+        item.deadline_at = None;
+        item.flexible_constraints = json!({});
+        item.split_policy = SplitPolicy::Splittable {
+            minimum_chunk_seconds: 60,
+            maximum_chunk_seconds: 60,
+        };
+
+        let result = std::panic::catch_unwind(|| {
+            compose_items_with_projection_for_schema(
+                vec![item],
+                preview_request(),
+                super::super::SCHEDULER_PUBLICATION_SCHEMA,
+                Vec::new(),
+                AuthoritativePlanningEvidence::default(),
+                Vec::new(),
+            )
+        });
+        assert!(
+            result.is_ok(),
+            "bounded production preflight must not panic"
+        );
+        assert!(matches!(
+            result.expect("preflight result"),
+            Err(ComposeScheduleError::SchedulerResourceLimit)
+        ));
     }
 
     fn retained_manual_state(

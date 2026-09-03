@@ -64,6 +64,15 @@ impl ApiError {
     }
 
     #[must_use]
+    pub(crate) fn scheduler_resource_limit(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "scheduler_resource_limit",
+            message,
+        )
+    }
+
+    #[must_use]
     pub fn payload_too_large(message: impl Into<String>) -> Self {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
     }

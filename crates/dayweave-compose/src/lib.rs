@@ -6,8 +6,16 @@
 //! input explicitly, then decide how and where to execute the returned
 //! [`dayweave_core::PlanRequest`].
 
+mod metadata;
 mod model;
 mod prepare;
+
+pub use metadata::{
+    CalendarContextSpec, DayWeaveFirmBlockSpec, EnergyMetadata, MAX_RECURRENCE_BYTES,
+    MAX_SCHEDULING_METADATA_BYTES, MAX_SCHEDULING_OFFSET_MINUTES, SchedulingMetadata,
+    SchedulingMetadataError, SchedulingMetadataInput, ValidatedSchedulingMetadata,
+    is_canonical_rfc3339, parse_recurrence, validate_scheduling_metadata,
+};
 
 pub use model::{
     AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,

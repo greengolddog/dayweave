@@ -647,33 +647,19 @@ fn after_completion_move_accepts_a_new_horizon_end() {
 }
 
 #[test]
-fn custom_placeholder_move_is_rejected_without_an_instance_identity() {
+fn custom_rrule_is_retained_but_not_schedulable() {
     let item = recurring_item(
         813,
         Recurrence::Custom {
             rrule: "FREQ=YEARLY;BYMONTH=9;BYMONTHDAY=1".to_owned(),
         },
     );
-    let source =
-        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap()[0];
-    let moved_start = START + Duration::days(2) + Duration::hours(9);
-    let mut destination = request(
-        item.clone(),
-        START + Duration::days(2),
-        START + Duration::days(3),
-    );
-    destination.recurrence_context.exceptions = vec![RecurrenceException {
-        item_id: item.id,
-        selector: RecurrenceExceptionSelector::Occurrence { id: source.id },
-        action: RecurrenceExceptionAction::Move {
-            start: moved_start,
-            end: moved_start + Duration::hours(1),
-            source: move_source(&item, &source),
-        },
-    }];
     assert_eq!(
-        expand_occurrences(&destination).unwrap_err(),
-        RecurrenceError::InvalidMoveSource(item.id),
+        expand_occurrences(&request(item.clone(), START, START + Duration::days(1))).unwrap_err(),
+        RecurrenceError::InvalidRule {
+            item_id: item.id,
+            message: "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available".to_owned(),
+        }
     );
 }
 
@@ -1280,4 +1266,33 @@ fn malformed_explicit_timezone_calendar_is_rejected() {
         Scheduler.plan(&input),
         Err(ScheduleError::InvalidRecurrence(_))
     ));
+}
+
+#[test]
+fn extreme_year_recurrence_offsets_return_an_error_without_panicking() {
+    let horizon_end = datetime!(9999-12-31 23:59:59 UTC);
+    let horizon_start = horizon_end
+        .checked_sub(Duration::hours(2))
+        .expect("bounded extreme horizon");
+    let mut item = recurring_item(
+        900,
+        Recurrence::EveryInterval {
+            interval: Minutes(u32::MAX),
+        },
+    );
+    item.created_at = horizon_start;
+    item.updated_at = horizon_start;
+    let mut input = request(item, horizon_start, horizon_end);
+    input.recurrence_context.calendar.days = vec![ZonedDayBoundary {
+        local_date: horizon_start.date(),
+        start: horizon_start,
+        end: horizon_end,
+    }];
+
+    let outcome = std::panic::catch_unwind(|| expand_occurrences(&input));
+    assert!(outcome.is_ok(), "extreme recurrence input must not unwind");
+    assert_eq!(
+        outcome.expect("catch result").unwrap_err(),
+        RecurrenceError::DateOutOfRange
+    );
 }

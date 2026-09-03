@@ -3,19 +3,21 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use chrono::{DateTime, Datelike as _, LocalResult, NaiveDate, Offset as _, TimeZone as _, Utc};
 use chrono_tz::Tz;
 use dayweave_core::{
-    AllocationRange, AvailabilityWindow, BreakCategory, BreakSpec, CalendarEventSpec,
-    DailyTimeWindow, DurationEstimate, EnergyLevel, FixedBlock, FixedBlockSource, GoalMeasure,
-    GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind, Minutes, OccurrenceId, PlanRequest,
-    PreviousAssignment, PreviousBlock, Priority, Qualified, QuantityTarget, Recurrence,
-    RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector,
+    AvailabilityWindow, BreakCategory, BreakSpec, DailyTimeWindow, DurationEstimate, EnergyLevel,
+    FixedBlock, FixedBlockSource, GoalSpec, HabitSpec, ItemId, ItemKind as PlanningItemKind,
+    Minutes, OccurrenceId, PlanRequest, PreviousAssignment, PreviousBlock, Priority, Qualified,
+    Recurrence, RecurrenceContext, RecurrenceExceptionAction, RecurrenceExceptionSelector,
     RecurrenceOccurrenceIdentity, RecurringTaskSpec, RoutineSpec, SchedulerConfig,
     SchedulingConstraints, SplitPolicy as PlanningSplitPolicy, WorkItem, WorkStatus,
     ZonedDayBoundary,
 };
-use serde::Deserialize;
 use time::{OffsetDateTime, UtcOffset};
 use uuid::Uuid;
 
+use crate::metadata::{
+    EnergyMetadata, MAX_RECURRENCE_BYTES, MAX_SCHEDULING_METADATA_BYTES, SchedulingMetadata,
+    SchedulingMetadataInput, validate_scheduling_metadata,
+};
 use crate::model::{
     AvailabilityInput, CanonicalItem, CanonicalItemKind, CanonicalItemStatus, CanonicalSplitPolicy,
     ComposeScheduleRequest, EnergyInput, FixedBlockInput, FixedBlockSourceInput,
@@ -42,8 +44,6 @@ pub const MAX_CALENDAR_DAYS: usize = 92;
 pub const MAX_WEIGHT: u32 = 1_000_000;
 pub const MAX_BLOCK_TITLE_CHARACTERS: usize = 500;
 const MAX_NOTES_CHARACTERS: usize = 100_000;
-const MAX_RECURRENCE_BYTES: usize = 16 * 1_024;
-const MAX_CONSTRAINT_BYTES: usize = 32 * 1_024;
 const MAX_DURATION_SECONDS: u32 = 366 * 24 * 60 * 60;
 const MAX_SIBLING_ORDER: u32 = 1_000_000;
 
@@ -534,7 +534,7 @@ fn validate_canonical_item(item: &CanonicalItem) -> Result<(), PrepareScheduleEr
     });
     let constraints_are_valid = item.flexible_constraints.is_object()
         && serde_json::to_vec(&item.flexible_constraints)
-            .is_ok_and(|encoded| encoded.len() <= MAX_CONSTRAINT_BYTES);
+            .is_ok_and(|encoded| encoded.len() <= MAX_SCHEDULING_METADATA_BYTES);
     let split_is_valid = match item.split_policy {
         CanonicalSplitPolicy::Indivisible => true,
         CanonicalSplitPolicy::Splittable {
@@ -668,28 +668,24 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
         .timezone_name
         .parse()
         .map_err(|_| "canonical item timezone is invalid".to_owned())?;
-    let metadata: SchedulingMetadata = serde_json::from_value(item.flexible_constraints.clone())
-        .map_err(|error| format!("unsupported flexible_constraints: {error}"))?;
-    let recurrence = parse_recurrence(item.recurrence.as_ref())?;
-    if let Some(context) = metadata.calendar_context.as_ref() {
-        validate_calendar_context(item, recurrence.as_ref(), &metadata, context)?;
+    let validated = validate_scheduling_metadata(SchedulingMetadataInput {
+        item_id: item.id,
+        kind: item.kind,
+        status: item.status,
+        timezone_name: &item.timezone_name,
+        duration_seconds: item.duration_seconds,
+        deadline_at: item.deadline_at,
+        earliest_start_at: item.earliest_start_at,
+        recurrence: item.recurrence.as_ref(),
+        flexible_constraints: &item.flexible_constraints,
+        split_policy: &item.split_policy,
+        parent_id: item.parent_id,
+    })
+    .map_err(|error| error.to_string())?;
+    let metadata = validated.metadata;
+    let recurrence = validated.recurrence;
+    if metadata.calendar_context.is_some() {
         return Ok(MappedScheduleItem::ContextOnly);
-    }
-    if item.kind != CanonicalItemKind::Event && metadata.calendar_event.is_some() {
-        return Err("calendar_event metadata is only valid for event items".into());
-    }
-    if metadata.dayweave_firm_block.is_some()
-        && (item.kind != CanonicalItemKind::Event
-            || item
-                .flexible_constraints
-                .as_object()
-                .is_none_or(|constraints| {
-                    constraints.len() != 1 || !constraints.contains_key("dayweave_firm_block")
-                }))
-    {
-        return Err(
-            "dayweave_firm_block is only valid as the sole metadata for an event item".into(),
-        );
     }
     let duration = item.duration_seconds.map(duration_estimate);
     let mut constraints = metadata.constraints.clone();
@@ -753,55 +749,6 @@ fn classify_item(item: &CanonicalItem, is_sensitive: bool) -> Result<MappedSched
     })))
 }
 
-fn validate_calendar_context(
-    item: &CanonicalItem,
-    recurrence: Option<&Recurrence>,
-    metadata: &SchedulingMetadata,
-    context: &CalendarContextSpec,
-) -> Result<(), String> {
-    if item.kind != CanonicalItemKind::Event {
-        return Err("calendar_context metadata is only valid for event items".into());
-    }
-    if item.parent_id.is_some() {
-        return Err("calendar_context event must be a root item".into());
-    }
-    if recurrence.is_some() {
-        return Err("calendar_context event must be one expanded occurrence".into());
-    }
-    if metadata.calendar_event.is_some()
-        || item
-            .flexible_constraints
-            .as_object()
-            .is_none_or(|constraints| {
-                constraints.len() != 1 || !constraints.contains_key("calendar_context")
-            })
-    {
-        return Err("calendar_context cannot be combined with other scheduling metadata".into());
-    }
-    let owner = if context.all_day {
-        "all-day calendar_context"
-    } else {
-        "calendar_context"
-    };
-    validate_calendar_bounds(context.start, context.end, owner)
-}
-
-fn validate_calendar_bounds(
-    start: OffsetDateTime,
-    end: OffsetDateTime,
-    owner: &str,
-) -> Result<(), String> {
-    if start >= end {
-        return Err(format!("{owner} end must follow start"));
-    }
-    if !start.nanosecond().is_multiple_of(1_000) || !end.nanosecond().is_multiple_of(1_000) {
-        return Err(format!(
-            "{owner} instants must use PostgreSQL microsecond precision"
-        ));
-    }
-    Ok(())
-}
-
 fn map_kind(
     kind: CanonicalItemKind,
     recurrence: Option<Recurrence>,
@@ -819,7 +766,9 @@ fn map_kind(
                 metadata.dayweave_firm_block.as_ref(),
             ) {
                 (Some(event), None) => event,
-                (None, Some(firm)) => firm.as_calendar_event()?,
+                (None, Some(firm)) => firm
+                    .as_calendar_event()
+                    .map_err(|error| error.to_string())?,
                 (Some(_), Some(_)) => {
                     return Err(
                         "event metadata cannot combine calendar_event and dayweave_firm_block"
@@ -832,7 +781,6 @@ fn map_kind(
                     );
                 }
             };
-            validate_calendar_bounds(event.start, event.end, "calendar_event")?;
             Ok(PlanningItemKind::CalendarEvent(event))
         }
         CanonicalItemKind::Task => Ok(recurrence.map_or(PlanningItemKind::Task, |recurrence| {
@@ -877,48 +825,6 @@ fn reject_recurrence(recurrence: Option<&Recurrence>, kind: &str) -> Result<(), 
     } else {
         Ok(())
     }
-}
-
-fn parse_recurrence(value: Option<&serde_json::Value>) -> Result<Option<Recurrence>, String> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let mut value = value.clone();
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| "recurrence must be an object".to_owned())?;
-    let recurrence_type = object
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "recurrence.type is required".to_owned())?;
-    match recurrence_type {
-        "daily" => {
-            object
-                .entry("times_per_day")
-                .or_insert_with(|| serde_json::Value::from(1));
-        }
-        "weekly" => {
-            let default = object
-                .get("weekdays")
-                .and_then(serde_json::Value::as_array)
-                .map_or(1, |days| days.len().max(1));
-            object
-                .entry("times_per_week")
-                .or_insert_with(|| serde_json::Value::from(default));
-            object
-                .entry("weekdays")
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-        }
-        "monthly" => {
-            object
-                .entry("times_per_month")
-                .or_insert_with(|| serde_json::Value::from(1));
-        }
-        _ => {}
-    }
-    serde_json::from_value(value)
-        .map(Some)
-        .map_err(|error| format!("unsupported recurrence: {error}"))
 }
 
 fn map_split_policy(
@@ -1286,121 +1192,4 @@ fn to_time_in_timezone(
 
 fn invalid<T>(message: impl Into<String>) -> Result<T, PrepareScheduleError> {
     Err(PrepareScheduleError::InvalidRequest(message.into()))
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)]
-struct SchedulingMetadata {
-    constraints: SchedulingConstraints,
-    has_own_effort: bool,
-    goal_ids: BTreeSet<Uuid>,
-    energy: Option<EnergyMetadata>,
-    tags: BTreeSet<String>,
-    calendar_event: Option<CalendarEventSpec>,
-    calendar_context: Option<CalendarContextSpec>,
-    dayweave_firm_block: Option<DayWeaveFirmBlockSpec>,
-    habit_target: Option<QuantityTarget>,
-    preserves_streak_when_paused: bool,
-    routine_ordered: bool,
-    goal_measures: Vec<GoalMeasure>,
-    goal_weekly_allocation: Option<AllocationRange>,
-    break_category: Option<BreakCategory>,
-    break_mandatory: bool,
-    break_prompt_to_resume: bool,
-    maximum_sessions: Option<u16>,
-    minimum_gap_minutes: u32,
-    maximum_split_days: Option<u16>,
-    preferred_start_minute: Option<u16>,
-}
-
-impl Default for SchedulingMetadata {
-    fn default() -> Self {
-        Self {
-            constraints: SchedulingConstraints::default(),
-            has_own_effort: false,
-            goal_ids: BTreeSet::new(),
-            energy: None,
-            tags: BTreeSet::new(),
-            calendar_event: None,
-            calendar_context: None,
-            dayweave_firm_block: None,
-            habit_target: None,
-            preserves_streak_when_paused: true,
-            routine_ordered: false,
-            goal_measures: Vec::new(),
-            goal_weekly_allocation: None,
-            break_category: None,
-            break_mandatory: false,
-            break_prompt_to_resume: true,
-            maximum_sessions: None,
-            minimum_gap_minutes: 0,
-            maximum_split_days: None,
-            preferred_start_minute: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CalendarContextSpec {
-    #[serde(with = "time::serde::rfc3339")]
-    start: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    end: OffsetDateTime,
-    all_day: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)]
-struct DayWeaveFirmBlockSpec {
-    owned: bool,
-    #[serde(with = "time::serde::rfc3339")]
-    starts_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
-    ends_at: OffsetDateTime,
-    #[serde(default)]
-    all_day: bool,
-    #[serde(default)]
-    tentative: bool,
-    #[serde(default = "default_true")]
-    busy: bool,
-}
-
-impl DayWeaveFirmBlockSpec {
-    fn as_calendar_event(&self) -> Result<CalendarEventSpec, String> {
-        if !self.owned {
-            return Err("dayweave_firm_block must be explicitly owned".into());
-        }
-        let _ = (self.tentative, self.busy);
-        validate_calendar_bounds(self.starts_at, self.ends_at, "dayweave_firm_block")?;
-        Ok(CalendarEventSpec {
-            start: self.starts_at,
-            end: self.ends_at,
-            immutable: true,
-            all_day: self.all_day,
-            source_calendar_id: None,
-        })
-    }
-}
-
-const fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum EnergyMetadata {
-    Simple(EnergyLevel),
-    Qualified(Qualified<EnergyLevel>),
-}
-
-impl EnergyMetadata {
-    fn into_qualified(self) -> Qualified<EnergyLevel> {
-        match self {
-            Self::Simple(value) => Qualified::soft(value, 100),
-            Self::Qualified(value) => value,
-        }
-    }
 }

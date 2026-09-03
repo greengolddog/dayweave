@@ -715,6 +715,15 @@ async fn tools_list_is_deterministic_schema_complete_and_scope_filtered() {
     );
     assert_eq!(submit["annotations"]["destructiveHint"], false);
     assert_eq!(submit["annotations"]["idempotentHint"], true);
+    assert!(
+        submit["inputSchema"]["properties"]["operations"]["items"]["properties"]
+            ["parameters"]["description"]
+            .as_str()
+            .is_some_and(|description| {
+                description.contains("closed DayWeave scheduling-metadata object")
+                    && description.contains("Inbox may omit recurrence")
+            })
+    );
     assert!(names.iter().all(|name| {
         !name.contains("preview") && !name.contains("apply") && !name.contains("undo")
     }));

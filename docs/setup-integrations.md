@@ -534,12 +534,31 @@ selected DayWeave item's title and notes in PostgreSQL plaintext. Production
 deployment therefore still depends on restricted database access and the
 documented database/storage encryption gate; these payloads are sensitive.
 
+Apply database migration `0023_google_task_provider_metadata.sql` before rolling
+out the matching API/worker binary. It adds a nullable, exact-shape, 4 KiB-bounded
+JSONB field on the restricted provider mapping. Complete live Google Task
+snapshots replace that content-free metadata; provider tombstones and records
+missing from a complete snapshot preserve the last live value. The field admits
+only hidden, position, completion, title/notes truncation, and legacy-marker
+sanitization evidence—never title, notes, or provider identity.
+
+Rolling the API/worker back to a binary from before migration `0023` is safe
+while leaving the nullable column and constraint in place; older binaries use
+explicit column lists and ignore it. Keep the column through the deployment
+rollback window. If schema rollback is unavoidable, first take and verify a
+PostgreSQL backup, then drop the constraint and column; this discards only
+provider-only semantic evidence and a later full Google Tasks refresh can
+rebuild it after migration `0023` is reapplied. Restore the verified backup
+instead when exact tombstoned-task evidence must be retained.
+
 Two canonical-model gaps remain explicit. Imported attendee identity,
 conference, and attachment entities have no first-class canonical tables, so
 the occurrence projection does not claim round-trip fidelity for those values.
-Google Tasks parent/order values are retained as provider metadata but are not
-silently projected into the canonical hierarchy until a conflict-aware
-hierarchy reconciliation primitive exists. Google Calendar fixed events are no
+Google Tasks parent identity remains in its existing restricted mapping column;
+order, hidden, completion timestamp/status, truncation, and legacy-marker
+sanitization semantics remain in the bounded restricted metadata column. They
+are not silently projected into canonical hierarchy or scheduling metadata
+until a conflict-aware reconciliation primitive exists. Google Calendar fixed events are no
 longer such a gap: a complete generation is consumed automatically by schedule
 preview and publication, and clients must not submit duplicate
 `google_calendar` fixed blocks when that authoritative projection is active.

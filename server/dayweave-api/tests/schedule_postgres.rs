@@ -5274,7 +5274,7 @@ async fn assert_actionable_proposal_bridge(
         "AI-created typed task",
         false,
         None,
-        json!({"preferred_period": "afternoon"}),
+        json!({"energy": "deep", "tags": ["ai-created"]}),
     ))
     .unwrap();
     create_parameters.as_object_mut().unwrap().remove("id");
@@ -5372,7 +5372,7 @@ async fn assert_actionable_proposal_bridge(
             Some(&target),
             json!({
                 "duration_seconds": 5_400,
-                "flexible_constraints": {"preferred_period": "morning"}
+                "flexible_constraints": {"energy": "low", "tags": ["morning"]}
             }),
         ),
         "typed-bridge-constraint",
@@ -5395,7 +5395,7 @@ async fn assert_actionable_proposal_bridge(
             assert_eq!(item.duration_seconds, Some(5_400));
             assert_eq!(
                 item.flexible_constraints,
-                json!({"preferred_period": "morning"})
+                json!({"energy": "low", "tags": ["morning"]})
             );
             assert_eq!(item.status, current.status);
         }

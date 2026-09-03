@@ -31,7 +31,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert_eq!(
         versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
         ]
     );
 
@@ -58,6 +58,7 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
         include_str!("../migrations/0020_execution_progress_ledger.sql"),
         include_str!("../migrations/0021_execution_defer_approval.sql"),
         include_str!("../migrations/0022_google_schedule_publication.sql"),
+        include_str!("../migrations/0023_google_task_provider_metadata.sql"),
     ]
     .join("\n");
     for table in [
@@ -143,6 +144,8 @@ fn embedded_migrations_cover_the_durable_domain_without_compile_time_database_ac
     assert!(schema.contains("FOR UPDATE"));
     assert!(schema.contains("revision.state IN ('published', 'superseded')"));
     assert!(schema.contains("timestamptz"));
+    assert!(schema.contains("ADD COLUMN google_task_metadata jsonb"));
+    assert!(schema.contains("provider_sync_mappings_google_task_metadata_shape_ck"));
     assert!(!schema.contains("timestamp without time zone"));
     assert!(schema.contains("trashed_at"));
     assert!(schema.contains("tombstoned_at"));

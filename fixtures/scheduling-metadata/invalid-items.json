@@ -1,0 +1,529 @@
+{
+  "schema": "dayweave.scheduling-metadata-fixtures/1",
+  "cases": [
+    {
+      "name": "unknown_metadata_key",
+      "expected_error_contains": "unsupported shape",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000201",
+        "kind": "task", "status": "inbox", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "future_key": true },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "zero_frequency_target",
+      "expected_error_contains": "frequency target must be greater than zero",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000202",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 0, "period": "day", "semantics": "rolling" },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "invalid_soft_weight",
+      "expected_error_contains": "soft weight must be at most",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000203",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "required_contexts": [{ "value": "desk", "strength": { "level": "soft", "weight": 1000001 } }] } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "empty_allowed_weekdays",
+      "expected_error_contains": "allowed_weekdays cannot be an empty set",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000204",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "allowed_weekdays": { "value": [], "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "self_goal_reference",
+      "expected_error_contains": "goal_ids cannot contain the item itself",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000205",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "goal_ids": ["00000000-0000-0000-0000-000000000205"] },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "self_dependency",
+      "expected_error_contains": "dependencies cannot reference the item itself",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000206",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "dependencies": [{ "item_id": "00000000-0000-0000-0000-000000000206", "relation": "finish_to_start", "minimum_lag": 0, "strength": { "level": "hard" } }] } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "habit_metadata_on_task",
+      "expected_error_contains": "habit metadata is only valid for habit items",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000207",
+        "kind": "task", "status": "inbox", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "preserves_streak_when_paused": false },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "goal_with_recurrence",
+      "expected_error_contains": "goal does not support recurrence",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000208",
+        "kind": "goal", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "weekly", "weekdays": ["monday"] },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "planned_habit_without_recurrence",
+      "expected_error_contains": "habit requires recurrence after it leaves the Inbox",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000209",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "planned_event_without_timing",
+      "expected_error_contains": "event requires timing metadata after it leaves the Inbox",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000210",
+        "kind": "event", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "event_recurrence_must_be_expanded",
+      "expected_error_contains": "event recurrence must be expanded",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000211",
+        "kind": "event", "status": "inbox", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "daily" }, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "calendar_context_with_extra_metadata",
+      "expected_error_contains": "calendar_context must be the sole",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000212",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": 3600, "deadline_at": "2026-09-03T11:00:00Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "calendar_context": { "start": "2026-09-03T10:00:00Z", "end": "2026-09-03T11:00:00Z", "all_day": false }, "tags": ["forbidden-combination"] },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "firm_block_without_ownership",
+      "expected_error_contains": "must be explicitly owned",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000213",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": 3600, "deadline_at": "2026-09-03T11:00:00Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "dayweave_firm_block": { "owned": false, "starts_at": "2026-09-03T10:00:00Z", "ends_at": "2026-09-03T11:00:00Z" } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "event_duration_mismatch",
+      "expected_error_contains": "duration_seconds must equal",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000214",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": "2026-09-03T11:00:00Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "calendar_event": { "start": "2026-09-03T10:00:00Z", "end": "2026-09-03T11:00:00Z", "immutable": true, "all_day": false, "source_calendar_id": null } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "all_day_bounds_not_local_midnight",
+      "expected_error_contains": "distinct local-midnight dates",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000215",
+        "kind": "event", "status": "scheduled", "timezone_name": "Europe/Paris",
+        "duration_seconds": 86400, "deadline_at": "2026-09-04T10:00:00Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "calendar_event": { "start": "2026-09-03T10:00:00Z", "end": "2026-09-04T10:00:00Z", "immutable": true, "all_day": true, "source_calendar_id": null } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "event_cannot_be_split",
+      "expected_error_contains": "event items must be indivisible",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000216",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": 3600, "deadline_at": "2026-09-03T11:00:00Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "calendar_event": { "start": "2026-09-03T10:00:00Z", "end": "2026-09-03T11:00:00Z", "immutable": true, "all_day": false, "source_calendar_id": null } },
+        "split_policy": { "type": "splittable", "minimum_chunk_seconds": 900, "maximum_chunk_seconds": 1800 }, "parent_id": null
+      }
+    },
+    {
+      "name": "split_extensions_on_indivisible_item",
+      "expected_error_contains": "split extension keys require",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000217",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 3600, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "minimum_gap_minutes": 15 },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "maximum_sessions_cannot_fit_duration",
+      "expected_error_contains": "maximum_sessions cannot contain",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000218",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 7200, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "maximum_sessions": 1 },
+        "split_policy": { "type": "splittable", "minimum_chunk_seconds": 900, "maximum_chunk_seconds": 3600 }, "parent_id": null
+      }
+    },
+    {
+      "name": "invalid_goal_allocation",
+      "expected_error_contains": "maximum cannot be below minimum",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000219",
+        "kind": "goal", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "goal_weekly_allocation": { "minimum": 300, "maximum": 120 } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "zero_habit_target",
+      "expected_error_contains": "habit_target requires a positive amount",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000220",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "daily" }, "flexible_constraints": { "habit_target": { "amount": 0, "unit": "pages" } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_canonical_and_metadata_earliest_start",
+      "expected_error_contains": "defined in both the canonical field and metadata",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000221",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "earliest_start": { "value": "2026-09-03T10:00:00Z", "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "preferred_start_without_duration",
+      "expected_error_contains": "requires a canonical duration",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000222",
+        "kind": "task", "status": "inbox", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "preferred_start_minute": 540 },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "reversed_occurrence_window",
+      "expected_error_contains": "occurrence_window is reserved",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000223",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "occurrence_window": { "start": "2026-09-03T11:00:00Z", "end": "2026-09-03T10:00:00Z" } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "calendar_frequency_with_rolling_anchor",
+      "expected_error_contains": "calendar frequency cannot define a rolling anchor",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000229",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 2, "period": "week", "semantics": "calendar", "weekdays": ["monday"], "minimum_spacing": 0, "anchor": "2026-09-03T10:00:00Z" },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "rolling_frequency_with_calendar_weekdays",
+      "expected_error_contains": "rolling frequency cannot select calendar weekdays",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000230",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 2, "period": "week", "semantics": "rolling", "weekdays": ["monday"], "minimum_spacing": 0, "anchor": "2026-09-03T10:00:00Z" },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "frequency_anchor_exceeds_database_precision",
+      "expected_error_contains": "frequency anchor must use PostgreSQL microsecond precision",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000231",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 2, "period": "week", "semantics": "rolling", "weekdays": [], "minimum_spacing": 0, "anchor": "2026-09-03T10:00:00.000000001Z" },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_recurrence_weekday",
+      "expected_error_contains": "recurrence.weekdays cannot contain duplicate values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000224",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "weekly", "times_per_week": 2, "weekdays": ["monday", "monday"] },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_goal_id",
+      "expected_error_contains": "goal_ids cannot contain duplicate UUID identifiers",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000225",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "goal_ids": ["00000000-0000-0000-0000-000000000299", "00000000-0000-0000-0000-000000000299"] },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_tag",
+      "expected_error_contains": "tags cannot contain duplicate values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000226",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "tags": ["focus", "focus"] },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_allowed_weekday",
+      "expected_error_contains": "allowed_weekdays.value cannot contain duplicate values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000227",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "allowed_weekdays": { "value": ["tuesday", "tuesday"], "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "duplicate_daily_window_weekday",
+      "expected_error_contains": "preferred_daily_windows[0].value.weekdays cannot contain duplicate values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000228",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "preferred_daily_windows": [{ "value": { "weekdays": ["friday", "friday"], "start_minute": 540, "end_minute": 600 }, "strength": { "level": "soft", "weight": 20 } }] } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "semantic_duplicate_goal_uuid",
+      "expected_error_contains": "goal_ids cannot contain duplicate UUID identifiers",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000232",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "goal_ids": ["aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"] },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "semantic_duplicate_dependency_item_id",
+      "expected_error_contains": "dependencies cannot contain duplicate item_id values",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000233",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "dependencies": [
+          { "item_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "relation": "finish_to_start", "minimum_lag": 0, "strength": { "level": "hard" } },
+          { "item_id": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE", "relation": "start_to_start", "minimum_lag": 5, "strength": { "level": "soft", "weight": 10 } }
+        ] } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "canonical_earliest_after_metadata_latest",
+      "expected_error_contains": "canonical earliest_start_at must precede constraints.latest_finish",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000234",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": "2026-09-04T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "latest_finish": { "value": "2026-09-03T10:00:00Z", "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "metadata_earliest_after_canonical_deadline",
+      "expected_error_contains": "constraints.earliest_start must precede canonical deadline_at",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000235",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": "2026-09-03T10:00:00Z", "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "earliest_start": { "value": "2026-09-04T10:00:00Z", "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "canonical_timestamp_exceeds_database_precision",
+      "expected_error_contains": "canonical deadline_at must use PostgreSQL microsecond precision",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000236",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": "2026-09-03T10:00:00.000000001Z", "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "fractional_event_duration_cannot_match_integral_seconds",
+      "expected_error_contains": "duration_seconds must equal",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000237",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": 1, "deadline_at": "2026-09-03T10:00:01.500000Z", "earliest_start_at": "2026-09-03T10:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": { "calendar_event": { "start": "2026-09-03T10:00:00Z", "end": "2026-09-03T10:00:01.500000Z", "immutable": true, "all_day": false, "source_calendar_id": null } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "custom_rrule_is_retained_but_not_authorable",
+      "expected_error_contains": "custom RRULE recurrence is retained for read compatibility",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000238",
+        "kind": "routine", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "custom", "rrule": "FREQ=MONTHLY;BYDAY=1MO,-1FR" },
+        "flexible_constraints": { "routine_ordered": true },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "minimum_notice_exceeds_safe_offset",
+      "expected_error_contains": "constraints.minimum_notice must be at most",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000239",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "minimum_notice": { "value": 4294967295, "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "frequency_spacing_exceeds_safe_offset",
+      "expected_error_contains": "frequency minimum_spacing must be at most",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000240",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 1, "period": "day", "semantics": "calendar", "minimum_spacing": 4294967295 },
+        "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "zero_maximum_chunk_is_rejected_without_panicking",
+      "expected_error_contains": "positive ordered chunk bounds",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000241",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 3600, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null, "flexible_constraints": { "maximum_sessions": 2 },
+        "split_policy": { "type": "splittable", "minimum_chunk_seconds": 0, "maximum_chunk_seconds": 0 }, "parent_id": null
+      }
+    },
+    {
+      "name": "metadata_timestamp_rejects_noncanonical_separator",
+      "expected_error_contains": "must use canonical RFC 3339 syntax",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000242",
+        "kind": "event", "status": "scheduled", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "calendar_event": { "start": "2026-09-03 10:00:00Z", "end": "2026-09-03T11:00:00Z", "immutable": true, "all_day": false, "source_calendar_id": null } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "recurrence_anchor_rejects_excess_fractional_digits",
+      "expected_error_contains": "must use canonical RFC 3339 syntax",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000243",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "frequency", "target": 1, "period": "day", "semantics": "rolling", "minimum_spacing": 0, "anchor": "2026-09-03T10:00:00.1234567890Z" },
+        "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "metadata_timestamp_rejects_leap_second",
+      "expected_error_contains": "must use canonical RFC 3339 syntax",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000244",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "latest_finish": { "value": "2026-12-31T23:59:60Z", "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "metadata_timestamp_rejects_offset_beyond_eighteen_hours",
+      "expected_error_contains": "must use canonical RFC 3339 syntax",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000245",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": 1800, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": { "constraints": { "earliest_start": { "value": "2026-09-03T10:00:00+18:01", "strength": { "level": "hard" } } } },
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    }
+  ]
+}

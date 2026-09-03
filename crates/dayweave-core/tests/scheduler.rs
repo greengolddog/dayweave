@@ -133,6 +133,44 @@ fn sensitivity_is_output_metadata_and_never_changes_placement() {
 }
 
 #[test]
+fn extreme_timestamp_offsets_fail_without_panicking() {
+    let horizon_end = datetime!(9999-12-31 23:59:59 UTC);
+    let horizon_start = horizon_end
+        .checked_sub(Duration::hours(2))
+        .expect("bounded extreme horizon");
+    let mut task = item(9_002, "Extreme timestamp", 30);
+    task.created_at = horizon_start;
+    task.updated_at = horizon_start;
+    task.constraints.minimum_notice = Some(Qualified::hard(Minutes(u32::MAX)));
+    task.constraints.buffers = BufferPolicy {
+        before: Minutes(u32::MAX),
+        after: Minutes(u32::MAX),
+        strength: Some(ConstraintStrength::Hard),
+    };
+    let input = PlanRequest {
+        as_of: horizon_start,
+        horizon_start,
+        horizon_end,
+        items: vec![task],
+        availability: vec![AvailabilityWindow {
+            start: horizon_start,
+            end: horizon_end,
+            contexts: BTreeSet::new(),
+            location: None,
+            energy: EnergyLevel::Deep,
+        }],
+        fixed_blocks: Vec::new(),
+        previous_assignments: Vec::new(),
+        config: SchedulerConfig::default(),
+        recurrence_context: RecurrenceContext::default(),
+    };
+
+    let outcome = std::panic::catch_unwind(|| Scheduler.plan(&input));
+    assert!(outcome.is_ok(), "extreme timestamp input must not unwind");
+    assert!(outcome.expect("catch result").is_err());
+}
+
+#[test]
 fn hard_deadline_precedes_higher_priority_work_when_capacity_is_tight() {
     let mut important = item(1, "Important but later", 60);
     important.priority = Priority {

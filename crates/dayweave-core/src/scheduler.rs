@@ -1446,7 +1446,15 @@ fn assess_manual_placement_targets(
             if let Some(notice) = &constraints.minimum_notice
                 && notice.strength.is_hard()
             {
-                let required = request.as_of + Duration::minutes(i64::from(notice.value.get()));
+                let Some(required) = request
+                    .as_of
+                    .checked_add(Duration::minutes(i64::from(notice.value.get())))
+                else {
+                    return Err(invalid_item(
+                        item.id,
+                        "minimum notice exceeds the supported timestamp range",
+                    ));
+                };
                 if interval.start < required {
                     push(
                         ManualPlacementViolationCode::MinimumNotice,
@@ -1647,19 +1655,18 @@ fn assess_manual_placement_targets(
                         .map(|block| block.end)
                         .max()
                         .expect("non-empty predecessor blocks");
-                    let lag = Duration::minutes(i64::from(dependency.minimum_lag.get()));
-                    match dependency.relation {
-                        DependencyRelation::FinishToStart => {
-                            interval.start >= predecessor_end + lag
-                        }
-                        DependencyRelation::StartToStart => {
-                            interval.start >= predecessor_start + lag
-                        }
-                        DependencyRelation::FinishToFinish => interval.end >= predecessor_end + lag,
-                        DependencyRelation::StartToFinish => {
-                            interval.end >= predecessor_start + lag
-                        }
-                    }
+                    let Some((observed, required)) = dependency_boundary(
+                        dependency,
+                        interval,
+                        predecessor_start,
+                        predecessor_end,
+                    ) else {
+                        return Err(invalid_item(
+                            item.id,
+                            "dependency lag exceeds the supported timestamp range",
+                        ));
+                    };
+                    observed >= required
                 };
                 if !satisfied {
                     push(
@@ -1738,11 +1745,15 @@ fn assess_manual_placement_targets(
                 .strength
                 .is_some_and(ConstraintStrength::is_hard)
             {
-                let expanded = Interval {
-                    start: interval.start
-                        - Duration::minutes(i64::from(constraints.buffers.before.get())),
-                    end: interval.end
-                        + Duration::minutes(i64::from(constraints.buffers.after.get())),
+                let Some(expanded) = checked_buffered_interval(
+                    interval,
+                    constraints.buffers.before,
+                    constraints.buffers.after,
+                ) else {
+                    return Err(invalid_item(
+                        item.id,
+                        "buffers exceed the supported timestamp range",
+                    ));
                 };
                 let conflicting: Vec<_> = plan
                     .blocks
@@ -2378,6 +2389,18 @@ impl PlanningState {
                     let mut size = remaining.min(maximum_session.get());
                     let granularity = request.config.slot_granularity.get();
                     let minimum = minimum_session.get().min(remaining);
+                    let session_earliest = match previous_session_end {
+                        Some(end) => {
+                            let Some(value) =
+                                end.checked_add(Duration::minutes(i64::from(minimum_gap.get())))
+                            else {
+                                session_limit_hit = true;
+                                break;
+                            };
+                            Some(value)
+                        }
+                        None => None,
+                    };
                     let mut accepted = None;
 
                     loop {
@@ -2392,9 +2415,7 @@ impl PlanningState {
                                 all_items,
                                 Minutes(size),
                                 index,
-                                previous_session_end.map(|end| {
-                                    end + Duration::minutes(i64::from(minimum_gap.get()))
-                                }),
+                                session_earliest,
                                 &used_days,
                                 *maximum_days,
                             );
@@ -2507,21 +2528,32 @@ impl PlanningState {
                 continue;
             };
             for free in free_segments(available, &self.busy) {
-                let mut start = align_up(free.start, request.config.slot_granularity);
+                let Some(mut start) = align_up(free.start, request.config.slot_granularity) else {
+                    continue;
+                };
                 if let Some(earliest) = session_earliest {
-                    start = align_up(start.max(earliest), request.config.slot_granularity);
-                }
-                while start + duration_delta <= free.end {
-                    let interval = Interval {
-                        start,
-                        end: start + duration_delta,
+                    let Some(aligned) =
+                        align_up(start.max(earliest), request.config.slot_granularity)
+                    else {
+                        continue;
                     };
+                    start = aligned;
+                }
+                while let Some(end) = start.checked_add(duration_delta) {
+                    if end > free.end {
+                        break;
+                    }
+                    let interval = Interval { start, end };
                     if maximum_days.is_some_and(|limit| {
                         !used_days.contains(&interval.start.date())
                             && used_days.len() >= usize::from(limit)
                     }) {
-                        start +=
-                            Duration::minutes(i64::from(request.config.slot_granularity.get()));
+                        let Some(next) = start.checked_add(Duration::minutes(i64::from(
+                            request.config.slot_granularity.get(),
+                        ))) else {
+                            break;
+                        };
+                        start = next;
                         continue;
                     }
                     if let Some(candidate) = self.evaluate_candidate(
@@ -2549,7 +2581,12 @@ impl PlanningState {
                             best = Some(candidate);
                         }
                     }
-                    start += Duration::minutes(i64::from(request.config.slot_granularity.get()));
+                    let Some(next) = start.checked_add(Duration::minutes(i64::from(
+                        request.config.slot_granularity.get(),
+                    ))) else {
+                        break;
+                    };
+                    start = next;
                 }
             }
         }
@@ -2642,7 +2679,9 @@ impl PlanningState {
             }
         }
         if let Some(notice) = &constraints.minimum_notice {
-            let required_start = request.as_of + Duration::minutes(i64::from(notice.value.get()));
+            let required_start = request
+                .as_of
+                .checked_add(Duration::minutes(i64::from(notice.value.get())))?;
             let shortfall = positive_minutes(required_start - interval.start);
             if !test(
                 interval.start >= required_start,
@@ -2887,25 +2926,12 @@ impl PlanningState {
                 predecessor_start = predecessor_start.min(block.start);
                 predecessor_end = predecessor_end.max(block.end);
             }
-            let lag = Duration::minutes(i64::from(dependency.minimum_lag.get()));
-            let (satisfied, shortfall) = match dependency.relation {
-                DependencyRelation::FinishToStart => (
-                    interval.start >= predecessor_end + lag,
-                    positive_minutes(predecessor_end + lag - interval.start),
-                ),
-                DependencyRelation::StartToStart => (
-                    interval.start >= predecessor_start + lag,
-                    positive_minutes(predecessor_start + lag - interval.start),
-                ),
-                DependencyRelation::FinishToFinish => (
-                    interval.end >= predecessor_end + lag,
-                    positive_minutes(predecessor_end + lag - interval.end),
-                ),
-                DependencyRelation::StartToFinish => (
-                    interval.end >= predecessor_start + lag,
-                    positive_minutes(predecessor_start + lag - interval.end),
-                ),
-            };
+            let boundary =
+                dependency_boundary(dependency, interval, predecessor_start, predecessor_end);
+            let satisfied = boundary.is_some_and(|(observed, required)| observed >= required);
+            let shortfall = boundary.map_or(u32::MAX, |(observed, required)| {
+                positive_minutes(required - observed)
+            });
             if !satisfied && dependency.strength.is_hard() {
                 return false;
             }
@@ -3017,9 +3043,26 @@ impl PlanningState {
         let Some(strength) = constraints.buffers.strength else {
             return true;
         };
-        let expanded = Interval {
-            start: interval.start - Duration::minutes(i64::from(constraints.buffers.before.get())),
-            end: interval.end + Duration::minutes(i64::from(constraints.buffers.after.get())),
+        let Some(expanded) = checked_buffered_interval(
+            interval,
+            constraints.buffers.before,
+            constraints.buffers.after,
+        ) else {
+            if strength.is_hard() {
+                return false;
+            }
+            add_penalty_violation(
+                request,
+                item.id,
+                interval,
+                strength,
+                ViolationKind::BufferCompressed,
+                u32::MAX,
+                "Preparation or decompression buffer exceeded the supported timestamp range.",
+                penalty,
+                violations,
+            );
+            return true;
         };
         let availability_interval = Interval {
             start: availability.start,
@@ -3416,13 +3459,22 @@ fn validate_manual_split_policy(
             ));
         }
         days.insert(block.start.date());
-        if let Some(previous) = index.checked_sub(1).map(|value| chronological[value])
-            && block.start < previous.end + Duration::minutes(i64::from(minimum_gap.get()))
-        {
-            return Err(invalid_item(
-                item.id,
-                "manual placement blocks violate the configured minimum gap",
-            ));
+        if let Some(previous) = index.checked_sub(1).map(|value| chronological[value]) {
+            let Some(required_start) = previous
+                .end
+                .checked_add(Duration::minutes(i64::from(minimum_gap.get())))
+            else {
+                return Err(invalid_item(
+                    item.id,
+                    "minimum gap exceeds the supported timestamp range",
+                ));
+            };
+            if block.start < required_start {
+                return Err(invalid_item(
+                    item.id,
+                    "manual placement blocks violate the configured minimum gap",
+                ));
+            }
         }
     }
     if maximum_days.is_some_and(|limit| days.len() > usize::from(limit)) {
@@ -3818,14 +3870,46 @@ fn soft_weight(request: &PlanRequest, strength: ConstraintStrength) -> u32 {
     }
 }
 
-fn align_up(value: OffsetDateTime, granularity: Minutes) -> OffsetDateTime {
+fn dependency_boundary(
+    dependency: &Dependency,
+    candidate: Interval,
+    predecessor_start: OffsetDateTime,
+    predecessor_end: OffsetDateTime,
+) -> Option<(OffsetDateTime, OffsetDateTime)> {
+    let (observed, predecessor) = match dependency.relation {
+        DependencyRelation::FinishToStart => (candidate.start, predecessor_end),
+        DependencyRelation::StartToStart => (candidate.start, predecessor_start),
+        DependencyRelation::FinishToFinish => (candidate.end, predecessor_end),
+        DependencyRelation::StartToFinish => (candidate.end, predecessor_start),
+    };
+    predecessor
+        .checked_add(Duration::minutes(i64::from(dependency.minimum_lag.get())))
+        .map(|required| (observed, required))
+}
+
+fn checked_buffered_interval(
+    interval: Interval,
+    before: Minutes,
+    after: Minutes,
+) -> Option<Interval> {
+    Some(Interval {
+        start: interval
+            .start
+            .checked_sub(Duration::minutes(i64::from(before.get())))?,
+        end: interval
+            .end
+            .checked_add(Duration::minutes(i64::from(after.get())))?,
+    })
+}
+
+fn align_up(value: OffsetDateTime, granularity: Minutes) -> Option<OffsetDateTime> {
     let step = i64::from(granularity.get()) * 60;
     let timestamp = value.unix_timestamp();
     let remainder = timestamp.rem_euclid(step);
     if remainder == 0 {
-        value
+        Some(value)
     } else {
-        value + Duration::seconds(step - remainder)
+        value.checked_add(Duration::seconds(step - remainder))
     }
 }
 
@@ -3852,7 +3936,12 @@ fn overlap_minutes(left: Interval, right: Interval) -> u32 {
 }
 
 fn monday_of(value: OffsetDateTime) -> time::Date {
-    value.date() - Duration::days(i64::from(value.weekday().number_days_from_monday()))
+    value
+        .date()
+        .checked_sub(Duration::days(i64::from(
+            value.weekday().number_days_from_monday(),
+        )))
+        .unwrap_or(time::Date::MIN)
 }
 
 fn explanation(code: ExplanationCode, message: impl Into<String>) -> PlacementExplanation {

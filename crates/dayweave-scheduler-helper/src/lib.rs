@@ -30,6 +30,32 @@ pub const SUCCESS_EXIT_CODE: u8 = 0;
 pub const REJECTED_EXIT_CODE: u8 = 2;
 pub const INTERNAL_EXIT_CODE: u8 = 70;
 
+/// Typed result of the bounded scheduler work preflight shared by the helper and server.
+#[derive(Debug)]
+pub enum PlanPreflightError {
+    /// The plan violates a core scheduler invariant.
+    Schedule(ScheduleError),
+    /// The plan shape cannot be evaluated safely.
+    InvalidRequest,
+    /// The plan would exceed a deterministic work or allocation budget.
+    ResourceLimitExceeded,
+}
+
+/// Validates one typed plan before any recurrence materialization or candidate search occurs.
+///
+/// # Errors
+///
+/// Returns a typed invariant, shape, or resource-budget rejection. Callers must run this in the
+/// same trust boundary as the in-process scheduler rather than treating helper-only validation as
+/// protection for another execution path.
+pub fn preflight_plan_request(request: &PlanRequest) -> Result<(), PlanPreflightError> {
+    limits::validate(request).map_err(|error| match error {
+        PreflightError::Schedule(error) => PlanPreflightError::Schedule(error),
+        PreflightError::InvalidRequest => PlanPreflightError::InvalidRequest,
+        PreflightError::ResourceLimit => PlanPreflightError::ResourceLimitExceeded,
+    })
+}
+
 const PROTOCOL: &str = "dayweave.scheduler.helper";
 const VERSION: u16 = 1;
 const PLAN_OPERATION: &str = "plan";
@@ -203,7 +229,7 @@ fn process(input: &[u8]) -> Result<ResponseResult, ErrorCode> {
 fn process_plan(request_value: &serde_json::Value) -> Result<ResponseResult, ErrorCode> {
     shape::validate(request_value).map_err(|()| ErrorCode::InvalidRequest)?;
     let request = PlanRequest::deserialize(request_value).map_err(|_| ErrorCode::InvalidRequest)?;
-    limits::validate(&request).map_err(map_preflight_error)?;
+    preflight_plan_request(&request).map_err(map_preflight_error)?;
     let plan = catch_unwind(AssertUnwindSafe(|| Scheduler.plan(&request)))
         .map_err(|_| ErrorCode::InternalFailure)?
         .map_err(|error| map_schedule_error(&error))?;
@@ -219,7 +245,7 @@ fn process_composition(request_value: &serde_json::Value) -> Result<ResponseResu
     }))
     .map_err(|_| ErrorCode::InternalFailure)?
     .map_err(|error| map_prepare_error(&error))?;
-    limits::validate(&prepared.plan_request).map_err(map_preflight_error)?;
+    preflight_plan_request(&prepared.plan_request).map_err(map_preflight_error)?;
     let local_input_fingerprint = local_input_fingerprint(&prepared)?;
     let plan = catch_unwind(AssertUnwindSafe(|| Scheduler.plan(&prepared.plan_request)))
         .map_err(|_| ErrorCode::InternalFailure)?
@@ -413,11 +439,11 @@ const fn map_prepare_error(error: &PrepareScheduleError) -> ErrorCode {
     }
 }
 
-fn map_preflight_error(error: PreflightError) -> ErrorCode {
+fn map_preflight_error(error: PlanPreflightError) -> ErrorCode {
     match error {
-        PreflightError::Schedule(error) => map_schedule_error(&error),
-        PreflightError::InvalidRequest => ErrorCode::InvalidRequest,
-        PreflightError::ResourceLimit => ErrorCode::ResourceLimitExceeded,
+        PlanPreflightError::Schedule(error) => map_schedule_error(&error),
+        PlanPreflightError::InvalidRequest => ErrorCode::InvalidRequest,
+        PlanPreflightError::ResourceLimitExceeded => ErrorCode::ResourceLimitExceeded,
     }
 }
 
@@ -994,6 +1020,76 @@ mod tests {
             error_code(&process_bytes(&encoded)),
             "resource_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn rejects_unbounded_minute_offsets_and_custom_rrules_before_scheduling() {
+        let cases = [
+            (
+                "/request/items/0/constraints/minimum_notice/value",
+                serde_json::json!(4_294_967_295_u32),
+                "resource_limit_exceeded",
+            ),
+            (
+                "/request/items/0/split_policy",
+                serde_json::json!({
+                    "type": "splittable",
+                    "minimum_session": 1,
+                    "maximum_session": 30,
+                    "maximum_sessions": 2,
+                    "minimum_gap": 4_294_967_295_u32,
+                    "maximum_days": null
+                }),
+                "resource_limit_exceeded",
+            ),
+            (
+                "/request/items/0/kind",
+                serde_json::json!({
+                    "type": "recurring_task",
+                    "recurrence": {
+                        "type": "every_interval",
+                        "interval": 4_294_967_295_u32
+                    }
+                }),
+                "resource_limit_exceeded",
+            ),
+            (
+                "/request/recurrence_context",
+                serde_json::json!({
+                    "minimum_spacing": {
+                        "00000000-0000-0000-0000-000000000001": 4_294_967_295_u32
+                    }
+                }),
+                "resource_limit_exceeded",
+            ),
+            (
+                "/request/items/0/kind",
+                serde_json::json!({
+                    "type": "recurring_task",
+                    "recurrence": {
+                        "type": "custom",
+                        "rrule": "FREQ=YEARLY;BYMONTH=9"
+                    }
+                }),
+                "invalid_recurrence",
+            ),
+        ];
+        for (pointer, replacement, expected) in cases {
+            let mut value: serde_json::Value = serde_json::from_slice(GOLDEN_REQUEST).unwrap();
+            if pointer.contains("minimum_notice") {
+                value["request"]["items"][0]["constraints"]["minimum_notice"] = serde_json::json!({
+                    "value": 4_294_967_295_u32,
+                    "strength": {"level": "hard"}
+                });
+            } else {
+                *value.pointer_mut(pointer).expect("fixture pointer") = replacement;
+            }
+            let outcome = std::panic::catch_unwind(|| {
+                process_bytes(&serde_json::to_vec(&value).expect("encoded request"))
+            });
+            assert!(outcome.is_ok(), "{pointer} must not unwind");
+            assert_eq!(error_code(&outcome.expect("catch result")), expected);
+        }
     }
 
     #[test]

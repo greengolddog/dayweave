@@ -521,7 +521,38 @@ is returned exactly once.
 The canonical item fields remain the source of truth for duration, deadline,
 earliest start, priority, hierarchy, recurrence, and split bounds. Optional
 advanced data lives in `flexible_constraints`. Its top-level schema is strict;
-unknown fields reject that item from the preview rather than being ignored.
+new and replacement `/v1/items` writes validate it before persistence. Unknown,
+malformed, semantically contradictory, wrong-kind, and duplicate set-shaped
+values return `422`; the preview applies the same validator to schedulable
+canonical rows, while Inbox subtrees remain retained without interpreting their
+metadata for legacy compatibility. Existing rows remain readable even when they
+contain an obsolete extension. A replacement may preserve an existing, exact
+`google_sync`-only legacy task object unchanged, but public clients cannot
+create or alter that provider evidence. New Google Tasks keep identity and
+bounded, content-free hidden/order/completion/truncation/legacy-marker semantics
+solely in the restricted provider mapping layer; none of those fields enter
+`flexible_constraints`.
+
+Canonical `earliest_start_at` and `deadline_at` values must be representable at
+PostgreSQL microsecond precision. Canonical and metadata-provided earliest/latest
+bounds are evaluated together and cross-source contradictions are rejected.
+Authoring values for those canonical fields, plus raw timestamps inside
+`recurrence` and `flexible_constraints`, use the shared native grammar: a
+four-digit year in `0001..9999`, two-digit date/time fields, uppercase `T`,
+seconds in `00..59`, an optional period plus 1–9 fractional digits, and either
+uppercase `Z` or a numeric `±HH:MM` offset no larger than `±18:00`. Leap seconds,
+alternate separators, lowercase `t`/`z`, compact offsets, and excess fractional
+digits are rejected. PostgreSQL precision still applies, so any seventh through
+ninth fractional digits must be zero. Stored raw `Item` records remain readable
+for compatibility; the stricter lexical check is applied at create and replace
+authoring boundaries.
+
+Inbox is an incomplete-capture state. A habit may omit recurrence, an event may
+omit timing, and any Inbox item may omit duration. Present fields are still
+strict, so Inbox does not permit unknown keys, wrong-kind metadata, malformed
+recurrence, or contradictory timing. Unknown task or habit durations and
+open-ended breaks also remain representable after Inbox; they are not
+schedulable demand until a usable estimate exists.
 
 Supported metadata keys are:
 
@@ -576,7 +607,13 @@ Other core constraint keys include `earliest_start`, `latest_finish`,
 `forbidden_windows`, `required_location`, `dependencies`,
 `maximum_daily_work`, and `maximum_weekly_work`. Canonical
 `earliest_start_at` and `deadline_at` become hard bounds; defining the same
-bound again in metadata rejects the item as ambiguous.
+bound again in metadata rejects the item as ambiguous. Every hard/soft wrapper
+uses `{ "value": ..., "strength": { "level": "hard" } }` or a soft
+strength with `weight` in `0..=1000000`. Empty allowed-weekday sets, empty
+windows, zero-strength buffers, nil/self references, empty tags/contexts, and
+sub-microsecond timestamps are invalid. `occurrence_window` is accepted as
+explicit `null` for decoding parity, but a non-null value is reserved for the
+recurrence materializer and must never be authored in canonical metadata.
 
 A blocking event uses this metadata (recurring Google series are expanded by
 the calendar integration before composition):
@@ -597,6 +634,16 @@ Authoritative Google projections always set `source_calendar_id` to `null`;
 provider identifiers remain in the sync mapping layer and never enter scheduling
 digest or publication evidence. The nullable field remains part of the generic
 and legacy manual-event schema for compatibility.
+
+Events are indivisible and recurrence-free because provider series are
+expanded before canonical persistence. A non-Inbox event selects exactly one
+of `calendar_event`, `calendar_context`, or `dayweave_firm_block`. Optional
+canonical `earliest_start_at`, `deadline_at`, and `duration_seconds` are useful
+for provider round trips but, when present, must exactly match the selected
+metadata interval. A present duration can match only an exact positive integral
+number of seconds; provider events with fractional-second intervals retain exact
+bounds and omit the lossy duration estimate. All-day intervals must begin and end at distinct local
+midnights in the item's IANA timezone; 23- and 25-hour DST days are valid.
 
 A retained nonblocking provider occurrence is a recurrence-free root `event`
 whose sole metadata key is the strict, identifier-free context shape below. It
@@ -620,10 +667,24 @@ projections do not emit this legacy shape.
 ## Recurrence
 
 Tasks with recurrence become recurring tasks. Habits require recurrence;
-routines may have it. Supported forms are `daily`, `weekly`, `monthly`,
-`every_interval`, `after_completion`, `frequency`, and `custom` (RFC 5545
-`rrule`). Daily/monthly counts default to one. Weekly count defaults to the
-number of selected weekdays, or one when no weekdays are selected.
+routines may have it. Authorable forms are `daily`, `weekly`, `monthly`,
+`every_interval`, `after_completion`, and `frequency`. Existing `custom` RFC
+5545 `rrule` values remain readable on raw legacy items, but create, replace,
+constraint-update, application-ready proposal, and scheduling boundaries reject
+them until a bounded RFC 5545 expander provides true per-instance identities.
+Daily/monthly counts default to one. Weekly count defaults to the number of
+selected weekdays, or one when no weekdays are selected.
+
+Frequency recurrence makes calendar-versus-rolling semantics explicit.
+Calendar frequency may select weekdays but cannot carry a rolling `anchor`;
+rolling frequency may carry an anchor but cannot select calendar weekdays.
+Targets and intervals must be positive, and anchors and canonical REST
+timestamps use PostgreSQL microsecond precision. Minute-valued recurrence,
+notice, lag, buffer, and split-gap offsets are capped at 527,040 minutes (366
+days). Recurrence is bounded to 16 KiB and scheduling metadata to 32 KiB.
+Set-shaped arrays reject duplicates after semantic parsing: alternate textual
+spellings of the same UUID are duplicates, as are multiple dependency edges to
+the same item.
 
 ```json
 {
@@ -672,14 +733,15 @@ mandatory even when the original and destination are in the same horizon.
 }
 ```
 
-Identity types are `calendar_day`, `calendar_week`, `calendar_month`,
-`rolling_minutes`, `after_completion`, `rolling_month`, and `custom`.
+Generated identity types are `calendar_day`, `calendar_week`, `calendar_month`,
+`rolling_minutes`, `after_completion`, and `rolling_month`. The `custom`
+identity variant remains decodable only for legacy compatibility and is not
+generated by current scheduling.
 Rolling identities include their exact RFC 3339 anchor. Clients must preserve
 the source timestamps and identity exactly; stale item revisions, fabricated
 UUID-v5 values, malformed identities, duplicate moves, and moves that straddle
-a planning-horizon boundary fail closed. The bounded `custom` RFC 5545
-placeholder is not movable until the calendar adapter supplies a true
-per-instance identity; clients must disable that action for `custom`.
+a planning-horizon boundary fail closed. Clients must disable scheduling and
+move actions for retained `custom` recurrence.
 
 ## Partial item rejection
 
@@ -688,3 +750,8 @@ of a rejected parent are rejected too. Valid independent items still compose.
 Malformed request-level availability, fixed blocks, recurrence context, bounds,
 or scheduler configuration fails the whole request with `422`; this prevents a
 caller from mistaking a partially interpreted request for a complete plan.
+When the typed scheduler preflight proves that recurrence materialization,
+session expansion, candidate evaluation, or related allocation would exceed its
+bounded work budget, preview and publication return the stable
+`422 scheduler_resource_limit` error. Reduce the horizon or requested work
+before retrying; an unchanged retry is deterministic.

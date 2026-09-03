@@ -310,6 +310,10 @@ pub(crate) struct RemoteItemChange {
     /// Complete provider representation used only for authenticated Calendar
     /// create recovery, with provider-assigned version/timestamp fields removed.
     pub reviewed_provider_projection: Option<Value>,
+    /// Bounded, content-free Google Tasks semantics retained only in the
+    /// restricted provider mapping. This must never be projected into public
+    /// scheduling metadata.
+    pub google_task_metadata: Option<GoogleTaskProviderMetadata>,
     pub item: Option<NewItem>,
 }
 
@@ -318,6 +322,22 @@ impl RemoteItemChange {
     pub(crate) const fn is_deleted(&self) -> bool {
         self.item.is_none()
     }
+}
+
+/// Provider-only Google Tasks semantics that do not belong in the canonical
+/// scheduling contract. Required boolean fields make a live snapshot complete;
+/// tombstones carry `None` so repository updates preserve the last live value.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub(crate) struct GoogleTaskProviderMetadata {
+    pub hidden: bool,
+    pub position: Option<String>,
+    pub completed: bool,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub title_truncated: bool,
+    pub notes_truncated: bool,
+    pub legacy_marker_stripped: bool,
 }
 
 #[derive(Clone, Debug)]

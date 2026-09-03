@@ -288,9 +288,14 @@ fn has_recurring_ancestor(
 fn validate_recurrence_context(request: &PlanRequest) -> Result<(), RecurrenceError> {
     let mut dates = BTreeSet::new();
     for day in &request.recurrence_context.calendar.days {
+        let Some(last_instant) = day.end.checked_sub(Duration::nanoseconds(1)) else {
+            return Err(RecurrenceError::InvalidZonedDay {
+                date: day.local_date,
+            });
+        };
         if day.start >= day.end
             || day.start.date() != day.local_date
-            || (day.end - Duration::nanoseconds(1)).date() != day.local_date
+            || last_instant.date() != day.local_date
         {
             return Err(RecurrenceError::InvalidZonedDay {
                 date: day.local_date,
@@ -388,9 +393,9 @@ fn validate_rule(item_id: ItemId, recurrence: &Recurrence) -> Result<(), Recurre
         } if u32::from(*target) > 7 * 24 * 60 => {
             Err(invalid("rolling weekly target exceeds minute precision"))
         }
-        Recurrence::Custom { rrule } if rrule.trim().is_empty() => {
-            Err(invalid("custom recurrence rule cannot be empty"))
-        }
+        Recurrence::Custom { .. } => Err(invalid(
+            "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available",
+        )),
         _ => Ok(()),
     }
 }
@@ -566,16 +571,12 @@ fn expand_series(
                 }
             }
         },
-        // RFC 5545 parsing belongs to the Google/calendar adapter. Retaining one
-        // stable bounded occurrence avoids silently dropping imported work.
-        Recurrence::Custom { rrule } => Ok(vec![make_occurrence(
-            item.id,
-            format!("custom:{rrule}").as_bytes(),
-            RecurrenceOccurrenceIdentity::Custom,
-            (request.horizon_start, request.horizon_end),
-            (request.horizon_start, request.horizon_end),
-            None,
-        )]),
+        // `validate_rule` rejects this before dispatch. Keep the arm fail-closed so a future
+        // internal caller cannot accidentally restore the former horizon-wide placeholder.
+        Recurrence::Custom { .. } => Err(RecurrenceError::InvalidRule {
+            item_id: item.id,
+            message: "custom RRULE recurrence is retained for read compatibility but is not schedulable until bounded RFC 5545 expansion is available".to_owned(),
+        }),
     }
 }
 
@@ -689,19 +690,30 @@ where
             let count = indexes.len();
             let day_duration = day.end - day.start;
             for (position, bucket_ordinal) in indexes.into_iter().enumerate() {
-                let start = day.start
-                    + day_duration * i32::try_from(position).unwrap_or(i32::MAX)
-                        / i32::try_from(count).unwrap_or(i32::MAX);
+                let numerator = i32::try_from(position).unwrap_or(i32::MAX);
+                let denominator = i32::try_from(count).unwrap_or(i32::MAX);
+                let start = day_duration
+                    .checked_mul(numerator)
+                    .and_then(|value| value.checked_div(denominator))
+                    .and_then(|value| day.start.checked_add(value))
+                    .unwrap_or(day.end);
                 let end = if position + 1 == count {
                     // Preserve the authoritative post-transition offset at the end of a DST day.
                     day.end
                 } else {
-                    day.start
-                        + day_duration * i32::try_from(position + 1).unwrap_or(i32::MAX)
-                            / i32::try_from(count).unwrap_or(i32::MAX)
+                    let numerator = i32::try_from(position + 1).unwrap_or(i32::MAX);
+                    day_duration
+                        .checked_mul(numerator)
+                        .and_then(|value| value.checked_div(denominator))
+                        .and_then(|value| day.start.checked_add(value))
+                        .unwrap_or(day.end)
                 };
-                let spacing_end = start + Duration::minutes(i64::from(minimum_spacing.get()));
-                let mut effective_end = end.max(spacing_end.min(day.end));
+                let spacing_end = start
+                    .checked_add(Duration::minutes(i64::from(minimum_spacing.get())))
+                    // An overflowing positive spacing value is necessarily beyond this bounded
+                    // calendar day, so clipping it to the day end preserves the intended result.
+                    .map_or(day.end, |value| value.min(day.end));
+                let mut effective_end = end.max(spacing_end);
                 if effective_end == day.end {
                     effective_end = day.end;
                 }
@@ -863,7 +875,10 @@ fn expand_rolling_months(
     let mut result = Vec::new();
     loop {
         let start_date = add_months(anchor_date, cycle)?;
-        let end_date = add_months(anchor_date, cycle + 1)?;
+        let next_cycle = cycle
+            .checked_add(1)
+            .ok_or(RecurrenceError::DateOutOfRange)?;
+        let end_date = add_months(anchor_date, next_cycle)?;
         let cycle_start = boundary_instant(start_date, days, request.horizon_start.offset())?;
         let cycle_end = boundary_instant(end_date, days, request.horizon_start.offset())?;
         if cycle_start >= request.horizon_end {
@@ -875,12 +890,20 @@ fn expand_rolling_months(
                 let start = if index == 0 {
                     cycle_start
                 } else {
-                    cycle_start + duration * i32::from(index) / i32::from(target)
+                    duration
+                        .checked_mul(i32::from(index))
+                        .and_then(|value| value.checked_div(i32::from(target)))
+                        .and_then(|value| cycle_start.checked_add(value))
+                        .ok_or(RecurrenceError::DateOutOfRange)?
                 };
                 let end = if index + 1 == target {
                     cycle_end
                 } else {
-                    cycle_start + duration * i32::from(index + 1) / i32::from(target)
+                    duration
+                        .checked_mul(i32::from(index + 1))
+                        .and_then(|value| value.checked_div(i32::from(target)))
+                        .and_then(|value| cycle_start.checked_add(value))
+                        .ok_or(RecurrenceError::DateOutOfRange)?
                 };
                 if start < request.horizon_end && request.horizon_start < end {
                     let key = format!("frequency-rolling-month:{cycle}:{index}");
@@ -902,7 +925,7 @@ fn expand_rolling_months(
                 }
             }
         }
-        cycle += 1;
+        cycle = next_cycle;
     }
     Ok(result)
 }
@@ -1131,7 +1154,10 @@ fn validated_identity_name(
     let local_day_is_plausible = |date: Date| {
         source.local_date == Some(date)
             && source.nominal_start.date() == date
-            && (source.nominal_end - Duration::nanoseconds(1)).date() == date
+            && source
+                .nominal_end
+                .checked_sub(Duration::nanoseconds(1))
+                .is_some_and(|value| value.date() == date)
     };
     match (recurrence, source.identity) {
         (
@@ -1335,16 +1361,18 @@ fn validated_identity_name(
         ) if cycle >= 0 && cycle <= i64::from(i32::MAX) && index < *target => {
             let effective_anchor = effective_rolling_anchor(request, item, *anchor);
             let start_date = add_months(effective_anchor.date(), cycle).ok()?;
-            let end_date = add_months(effective_anchor.date(), cycle + 1).ok()?;
+            let end_date = add_months(effective_anchor.date(), cycle.checked_add(1)?).ok()?;
             let nominal_dates_match = identity_anchor == effective_anchor
                 && source.nominal_start.date() >= start_date
                 && source.nominal_start.date() < end_date
-                && (source.nominal_end - Duration::nanoseconds(1)).date() < end_date
+                && source
+                    .nominal_end
+                    .checked_sub(Duration::nanoseconds(1))
+                    .is_some_and(|value| value.date() < end_date)
                 && source.local_date.is_none();
             nominal_dates_match.then(|| (format!("frequency-rolling-month:{cycle}:{index}"), None))
         }
-        // This also rejects Custom: its bounded adapter-owned placeholder has no per-instance
-        // discriminator, so moving it would suppress every future horizon.
+        // Custom rules are rejected before expansion and have no supported movable identity.
         _ => None,
     }
 }

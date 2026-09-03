@@ -43,8 +43,8 @@ use super::{
     GoogleCalendarPolicy, GoogleCollectionKind, GoogleEventDisposition, GoogleOutboundAccepted,
     GoogleOutboundApproval, GoogleOutboundPreview, GoogleSyncCollection, GoogleSyncRefreshAccepted,
     GoogleSyncRepository, GoogleSyncRepositoryError, GoogleSyncRole, GoogleSyncStatus,
-    OutboundApprovalSpec, OutboundEnqueueSpec, OutboundOperation, OutboundPreviewSpec,
-    OutboundRequest, OutboundResult, OutboundWork, PreparedOutbound,
+    GoogleTaskProviderMetadata, OutboundApprovalSpec, OutboundEnqueueSpec, OutboundOperation,
+    OutboundPreviewSpec, OutboundRequest, OutboundResult, OutboundWork, PreparedOutbound,
     PreparedSchedulePublicationChange, RejectedRemoteItem, RemoteCalendarSeriesChange,
     RemoteItemChange, ScheduleGooglePublicationAccepted, ScheduleGooglePublicationApproval,
     ScheduleGooglePublicationOperation, ScheduleGooglePublicationPreview,
@@ -2974,6 +2974,7 @@ fn normalize_event_authenticated(
             remote_payload_hash: remote_hash,
             remote_projection_hash: calendar_occurrence_projection_hash(None)?,
             reviewed_provider_projection,
+            google_task_metadata: None,
             item: None,
         });
     }
@@ -2998,10 +2999,19 @@ fn normalize_event_authenticated(
     {
         return Err(NormalizationError::Rejected("event_bounds_invalid"));
     }
-    let duration = (ends_at - starts_at)
-        .num_seconds()
-        .try_into()
-        .map_err(|_| NormalizationError::Rejected("event_duration_invalid"))?;
+    let provider_duration = ends_at - starts_at;
+    let duration_seconds = if provider_duration.subsec_nanos() == 0 {
+        Some(
+            provider_duration
+                .num_seconds()
+                .try_into()
+                .map_err(|_| NormalizationError::Rejected("event_duration_invalid"))?,
+        )
+    } else {
+        // Google accepts RFC 3339 fractional seconds while the canonical duration estimate uses
+        // whole seconds. Preserve the exact event bounds and omit a lossy estimate.
+        None
+    };
     let event_type = event.event_type.as_deref().unwrap_or("default");
     let disposition = event_disposition(collection, &event, event_type, all_day);
     if disposition == GoogleEventDisposition::Ignore {
@@ -3017,6 +3027,7 @@ fn normalize_event_authenticated(
             remote_payload_hash: remote_hash,
             remote_projection_hash: calendar_occurrence_projection_hash(None)?,
             reviewed_provider_projection,
+            google_task_metadata: None,
             item: None,
         });
     }
@@ -3078,7 +3089,7 @@ fn normalize_event_authenticated(
         title,
         notes,
         timezone_name,
-        duration_seconds: Some(duration),
+        duration_seconds,
         deadline_at: Some(ends_at),
         earliest_start_at: Some(starts_at),
         recurrence: None,
@@ -3103,6 +3114,7 @@ fn normalize_event_authenticated(
         remote_payload_hash: remote_hash,
         remote_projection_hash,
         reviewed_provider_projection,
+        google_task_metadata: None,
         item: Some(item),
     })
 }
@@ -3195,6 +3207,7 @@ fn normalize_task(
             remote_payload_hash: remote_hash,
             remote_projection_hash,
             reviewed_provider_projection: None,
+            google_task_metadata: None,
             item: None,
         });
     }
@@ -3211,24 +3224,19 @@ fn normalize_task(
     let due = task.due.as_deref().map(parse_timestamp).transpose()?;
     let provider_completed_at = parse_optional_timestamp(task.completed.as_deref())?;
     let completed = task.status.as_deref() == Some("completed") || provider_completed_at.is_some();
-    let constraints = json!({
-        "google_sync": {
-            "account_id": collection.account_id,
-            "collection_id": collection.id,
-            "remote_id": task.id,
-            "remote_parent_id": task.parent,
-            "position": task.position,
-            "hidden": task.hidden,
-            "provider_completed_at": provider_completed_at,
-            "visible": collection.visible,
-            "content_truncated": title_truncated || notes_truncated,
-            "legacy_marker_stripped": legacy_marker_stripped,
-        }
-    });
-    let remote_id = constraints["google_sync"]["remote_id"]
-        .as_str()
-        .ok_or(NormalizationError::Rejected("invalid_remote_id"))?
-        .to_owned();
+    // Provider identity and projection evidence live only in the sync mapping layer. Keeping the
+    // canonical scheduling object empty lets an imported Inbox task move into ordinary planning
+    // without carrying provider-only metadata through the public item contract.
+    let remote_id = task.id.clone();
+    let google_task_metadata = GoogleTaskProviderMetadata {
+        hidden: task.hidden,
+        position: bounded_optional(task.position.as_deref(), 1000)?,
+        completed,
+        completed_at: provider_completed_at,
+        title_truncated,
+        notes_truncated,
+        legacy_marker_stripped,
+    };
     let item = NewItem {
         id: Uuid::new_v4(),
         is_sensitive: !collection.visible,
@@ -3245,7 +3253,7 @@ fn normalize_task(
         deadline_at: due,
         earliest_start_at: None,
         recurrence: None,
-        flexible_constraints: constraints,
+        flexible_constraints: json!({}),
         split_policy: SplitPolicy::Indivisible,
         importance: 0,
         urgency: 0,
@@ -3265,6 +3273,7 @@ fn normalize_task(
         remote_payload_hash: remote_hash,
         remote_projection_hash,
         reviewed_provider_projection: None,
+        google_task_metadata: Some(google_task_metadata),
         item: Some(item),
     })
 }
@@ -7072,6 +7081,10 @@ mod tests {
             item.flexible_constraints["calendar_event"]["end"],
             "2026-08-29T09:00:00.987654Z"
         );
+        assert_eq!(
+            item.duration_seconds, None,
+            "fractional provider intervals retain exact bounds without a lossy whole-second estimate"
+        );
     }
 
     #[test]
@@ -7102,15 +7115,27 @@ mod tests {
         assert!(hidden.is_sensitive);
 
         let change = normalize_task(&tasks_collection, task).expect("task");
+        assert_eq!(
+            change.google_task_metadata,
+            Some(GoogleTaskProviderMetadata {
+                hidden: true,
+                position: Some("0001".to_owned()),
+                completed: true,
+                completed_at: Some(
+                    "2026-08-29T12:00:00Z"
+                        .parse()
+                        .expect("completion timestamp")
+                ),
+                title_truncated: false,
+                notes_truncated: false,
+                legacy_marker_stripped: false,
+            })
+        );
         let item = change.item.expect("upsert");
         assert!(!item.is_sensitive);
         assert_eq!(item.status, ItemStatus::Completed);
         assert_eq!(change.remote_parent_id.as_deref(), Some("parent-1"));
-        assert_eq!(item.flexible_constraints["google_sync"]["hidden"], true);
-        assert_eq!(
-            item.flexible_constraints["google_sync"]["provider_completed_at"],
-            "2026-08-29T12:00:00Z"
-        );
+        assert_eq!(item.flexible_constraints, json!({}));
         assert!(item.deadline_at.is_some());
     }
 
@@ -7897,6 +7922,12 @@ mod tests {
         )
         .expect("normalize");
         assert!(change.dayweave_item_id.is_none());
+        assert!(
+            change
+                .google_task_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.legacy_marker_stripped)
+        );
         let mut normalized = change.item.expect("normalized task");
         assert!(
             !serde_json::to_string(&normalized)
@@ -7946,16 +7977,19 @@ mod tests {
             },
         )
         .expect("control-obfuscated legacy marker is safely normalized");
+        assert!(
+            change
+                .google_task_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.legacy_marker_stripped)
+        );
         let item = change.item.expect("normalized task");
 
         assert_eq!(
             item.notes.as_deref(),
             Some("ordinary first line ordinary second line ordinary third line")
         );
-        assert_eq!(
-            item.flexible_constraints["google_sync"]["legacy_marker_stripped"],
-            true
-        );
+        assert_eq!(item.flexible_constraints, json!({}));
         assert!(
             !item
                 .notes
@@ -7971,6 +8005,43 @@ mod tests {
                 .chars()
                 .any(char::is_control)
         );
+    }
+
+    #[test]
+    fn task_provider_metadata_records_truncation_and_bounds_order_tokens() {
+        let mut tasks_collection = collection(GoogleSyncRole::ReadOnly, true);
+        tasks_collection.kind = GoogleCollectionKind::TaskList;
+        let task = GoogleTask {
+            id: "task_id_with_large_display_fields".to_owned(),
+            etag: Some("etag-large".to_owned()),
+            title: "t".repeat(501),
+            notes: Some("n".repeat(100_001)),
+            status: Some("needsAction".to_owned()),
+            due: None,
+            completed: None,
+            updated: None,
+            parent: None,
+            position: Some("p".repeat(1000)),
+            links: None,
+            deleted: false,
+            hidden: false,
+        };
+        let change = normalize_task(&tasks_collection, task.clone()).expect("bounded task");
+        let metadata = change.google_task_metadata.expect("provider metadata");
+        assert!(metadata.title_truncated);
+        assert!(metadata.notes_truncated);
+        assert_eq!(
+            metadata.position.as_deref(),
+            Some("p".repeat(1000).as_str())
+        );
+        assert_eq!(change.item.expect("task").flexible_constraints, json!({}));
+
+        let mut invalid = task;
+        invalid.position = Some("p".repeat(1001));
+        assert!(matches!(
+            normalize_task(&tasks_collection, invalid),
+            Err(NormalizationError::Rejected("provider_metadata_invalid"))
+        ));
     }
 
     #[test]

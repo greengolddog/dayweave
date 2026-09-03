@@ -168,6 +168,29 @@ async fn system_endpoints_are_public_and_readiness_is_honest() {
             "OpenAPI must declare the {schema} schema"
         );
     }
+    for schema in ["NewItem", "ReplaceItem"] {
+        let properties = &document["components"]["schemas"][schema]["properties"];
+        assert!(
+            properties["recurrence"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("frequency")),
+            "{schema}.recurrence must describe the strict recurrence contract"
+        );
+        assert!(
+            properties["flexible_constraints"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("semantically validated")),
+            "{schema}.flexible_constraints must describe pre-persistence validation"
+        );
+    }
+    for path in ["/v1/schedule/preview", "/v1/schedule/publish"] {
+        assert!(
+            document["paths"][path]["post"]["responses"]["422"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("scheduler_resource_limit")),
+            "{path} must document the stable scheduler preflight limit code"
+        );
+    }
     for schema in [
         "DeferAssessment",
         "DeferAssessmentEnvelope",

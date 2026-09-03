@@ -1,0 +1,384 @@
+{
+  "schema": "dayweave.scheduling-metadata-fixtures/1",
+  "cases": [
+    {
+      "name": "frequency_task_with_rich_constraints_and_split_policy",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000101",
+        "kind": "task",
+        "status": "planned",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 7200,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": {
+          "type": "frequency",
+          "target": 3,
+          "period": "week",
+          "semantics": "calendar",
+          "weekdays": ["monday", "wednesday", "friday"],
+          "minimum_spacing": 1440,
+          "anchor": null
+        },
+        "flexible_constraints": {
+          "constraints": {
+            "earliest_start": {
+              "value": "2026-09-03T08:00:00+02:00",
+              "strength": { "level": "hard" }
+            },
+            "latest_finish": {
+              "value": "2026-09-30T18:00:00+02:00",
+              "strength": { "level": "soft", "weight": 250 }
+            },
+            "minimum_notice": {
+              "value": 30,
+              "strength": { "level": "hard" }
+            },
+            "allowed_weekdays": {
+              "value": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+              "strength": { "level": "hard" }
+            },
+            "preferred_daily_windows": [
+              {
+                "value": {
+                  "weekdays": ["monday", "wednesday", "friday"],
+                  "start_minute": 540,
+                  "end_minute": 720
+                },
+                "strength": { "level": "soft", "weight": 125 }
+              }
+            ],
+            "preferred_absolute_windows": [
+              {
+                "value": {
+                  "start": "2026-09-07T09:00:00+02:00",
+                  "end": "2026-09-07T12:00:00+02:00"
+                },
+                "strength": { "level": "soft", "weight": 75 }
+              }
+            ],
+            "forbidden_windows": [
+              {
+                "value": {
+                  "start": "2026-09-09T12:00:00+02:00",
+                  "end": "2026-09-09T13:00:00+02:00"
+                },
+                "strength": { "level": "hard" }
+              }
+            ],
+            "required_contexts": [
+              {
+                "value": "computer",
+                "strength": { "level": "hard" }
+              },
+              {
+                "value": "quiet",
+                "strength": { "level": "soft", "weight": 50 }
+              }
+            ],
+            "required_location": {
+              "value": "home",
+              "strength": { "level": "soft", "weight": 40 }
+            },
+            "dependencies": [
+              {
+                "item_id": "00000000-0000-0000-0000-000000000199",
+                "relation": "finish_to_start",
+                "minimum_lag": 15,
+                "strength": { "level": "hard" }
+              }
+            ],
+            "maximum_daily_work": {
+              "value": 180,
+              "strength": { "level": "hard" }
+            },
+            "maximum_weekly_work": {
+              "value": 480,
+              "strength": { "level": "soft", "weight": 60 }
+            },
+            "buffers": {
+              "before": 10,
+              "after": 15,
+              "strength": { "level": "soft", "weight": 90 }
+            },
+            "occurrence_window": null
+          },
+          "has_own_effort": false,
+          "goal_ids": ["00000000-0000-0000-0000-000000000180"],
+          "energy": {
+            "value": "deep",
+            "strength": { "level": "hard" }
+          },
+          "tags": ["focus", "writing"],
+          "maximum_sessions": 3,
+          "minimum_gap_minutes": 30,
+          "maximum_split_days": 2
+        },
+        "split_policy": {
+          "type": "splittable",
+          "minimum_chunk_seconds": 1800,
+          "maximum_chunk_seconds": 3600
+        },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "twice_daily_habit",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000102",
+        "kind": "habit",
+        "status": "planned",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 900,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": { "type": "daily", "times_per_day": 2 },
+        "flexible_constraints": {
+          "habit_target": { "amount": 8, "unit": "glasses" },
+          "preserves_streak_when_paused": false,
+          "energy": "low",
+          "tags": ["health"]
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "completion_relative_ordered_routine",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000103",
+        "kind": "routine",
+        "status": "planned",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": null,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": { "type": "after_completion", "interval": 10080 },
+        "flexible_constraints": {
+          "routine_ordered": true,
+          "tags": ["weekly-review"]
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "measured_goal_with_weekly_allocation",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000104",
+        "kind": "goal",
+        "status": "planned",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 3600,
+        "deadline_at": "2026-12-31T22:59:59Z",
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "has_own_effort": true,
+          "goal_measures": [
+            { "name": "chapters", "target": 12, "current": 3, "unit": "chapters" }
+          ],
+          "goal_weekly_allocation": { "minimum": 120, "maximum": 300 },
+          "tags": ["long-term"]
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "prompted_movement_break",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000105",
+        "kind": "break",
+        "status": "planned",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 900,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "break_category": "movement",
+          "break_mandatory": true,
+          "break_prompt_to_resume": true,
+          "tags": ["recovery"]
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "open_ended_active_break",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000106",
+        "kind": "break",
+        "status": "in_progress",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": null,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "break_category": "rest",
+          "break_mandatory": false,
+          "break_prompt_to_resume": true
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "blocking_imported_event_with_matching_canonical_bounds",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000107",
+        "kind": "event",
+        "status": "scheduled",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 3600,
+        "deadline_at": "2026-09-03T09:00:00Z",
+        "earliest_start_at": "2026-09-03T08:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": {
+          "calendar_event": {
+            "start": "2026-09-03T10:00:00+02:00",
+            "end": "2026-09-03T11:00:00+02:00",
+            "immutable": true,
+            "all_day": false,
+            "source_calendar_id": null
+          },
+          "tags": ["meeting"]
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "dst_fall_back_all_day_calendar_context",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000108",
+        "kind": "event",
+        "status": "scheduled",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 90000,
+        "deadline_at": "2026-10-25T23:00:00Z",
+        "earliest_start_at": "2026-10-24T22:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": {
+          "calendar_context": {
+            "start": "2026-10-24T22:00:00Z",
+            "end": "2026-10-25T23:00:00Z",
+            "all_day": true
+          }
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "owned_legacy_firm_block",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000109",
+        "kind": "event",
+        "status": "scheduled",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": 3600,
+        "deadline_at": "2026-09-03T13:00:00Z",
+        "earliest_start_at": "2026-09-03T12:00:00Z",
+        "recurrence": null,
+        "flexible_constraints": {
+          "dayweave_firm_block": {
+            "owned": true,
+            "starts_at": "2026-09-03T14:00:00+02:00",
+            "ends_at": "2026-09-03T15:00:00+02:00",
+            "all_day": false,
+            "tentative": false,
+            "busy": true
+          }
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "legacy_daily_default_count",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000112",
+        "kind": "task", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "daily" }, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "legacy_weekly_default_count",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000113",
+        "kind": "habit", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "weekly", "weekdays": ["tuesday", "thursday"] },
+        "flexible_constraints": {}, "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "legacy_monthly_default_count",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000114",
+        "kind": "routine", "status": "planned", "timezone_name": "UTC",
+        "duration_seconds": null, "deadline_at": null, "earliest_start_at": null,
+        "recurrence": { "type": "monthly" }, "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" }, "parent_id": null
+      }
+    },
+    {
+      "name": "inbox_habit_may_be_incomplete",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000110",
+        "kind": "habit",
+        "status": "inbox",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": null,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "inbox_event_may_lack_timing",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000111",
+        "kind": "event",
+        "status": "inbox",
+        "timezone_name": "Europe/Paris",
+        "duration_seconds": null,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {},
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    },
+    {
+      "name": "indivisible_explicit_default_split_extensions",
+      "fields": {
+        "item_id": "00000000-0000-0000-0000-000000000115",
+        "kind": "task",
+        "status": "planned",
+        "timezone_name": "UTC",
+        "duration_seconds": 1800,
+        "deadline_at": null,
+        "earliest_start_at": null,
+        "recurrence": null,
+        "flexible_constraints": {
+          "maximum_sessions": null,
+          "minimum_gap_minutes": 0,
+          "maximum_split_days": null
+        },
+        "split_policy": { "type": "indivisible" },
+        "parent_id": null
+      }
+    }
+  ]
+}

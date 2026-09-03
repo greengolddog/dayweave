@@ -20,6 +20,7 @@ chrono-tz = "0.10"
 dayweave-compose = { path = "../../crates/dayweave-compose" }
 dayweave-core = { path = "../../crates/dayweave-core" }
 dayweave-google = { path = "../../crates/dayweave-google" }
+dayweave-scheduler-helper = { path = "../../crates/dayweave-scheduler-helper" }
 futures-util = "0.3"
 getrandom = "0.4"
 hmac = "0.12"

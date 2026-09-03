@@ -190,7 +190,9 @@ fn preview(item_id: Uuid, item_revision: u64) -> Value {
 async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
     let app = test_app();
     let valid_id = Uuid::new_v4();
-    let invalid_id = Uuid::new_v4();
+    let incomplete_id = Uuid::new_v4();
+    let mut unschedulable = task(incomplete_id, &json!({}));
+    unschedulable["duration_seconds"] = Value::Null;
     for (item, key) in [
         (
             task(
@@ -199,10 +201,7 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
             ),
             "preview-valid-item",
         ),
-        (
-            task(invalid_id, &json!({"unknown_constraint": true})),
-            "preview-invalid-item",
-        ),
+        (unschedulable, "preview-invalid-item"),
     ] {
         let response = app
             .clone()
@@ -240,13 +239,10 @@ async fn preview_is_authenticated_deterministic_and_does_not_mutate_items() {
     let first = body_json(first).await;
     assert_eq!(first["source_item_count"], 2);
     assert_eq!(first["source_item_revisions"][valid_id.to_string()], 1);
-    assert_eq!(first["source_item_revisions"][invalid_id.to_string()], 1);
+    assert_eq!(first["source_item_revisions"][incomplete_id.to_string()], 1);
     assert!(first.get("source_item_sensitivity").is_none());
-    assert_eq!(first["accepted_item_count"], 1);
-    assert_eq!(
-        first["rejected_items"][0]["item_id"],
-        invalid_id.to_string()
-    );
+    assert_eq!(first["accepted_item_count"], 2);
+    assert!(first["rejected_items"].as_array().unwrap().is_empty());
     assert_eq!(
         first["ignored_previous_assignments"][0]["item_id"],
         valid_id.to_string()

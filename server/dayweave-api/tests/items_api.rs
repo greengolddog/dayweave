@@ -59,8 +59,34 @@ async fn body_json(response: Response<Body>) -> Value {
     serde_json::from_slice(&bytes).unwrap_or(Value::Null)
 }
 
+fn scheduling_fixture(name: &str) -> Value {
+    let source = match name {
+        "valid-rich-items.json" => {
+            include_str!("../../../fixtures/scheduling-metadata/valid-rich-items.json")
+        }
+        "invalid-items.json" => {
+            include_str!("../../../fixtures/scheduling-metadata/invalid-items.json")
+        }
+        _ => panic!("unknown fixture {name}"),
+    };
+    serde_json::from_str(source).expect("shared scheduling fixture must be JSON")
+}
+
+fn new_item_from_fixture_fields(mut fields: Value, title: &str) -> Value {
+    let object = fields.as_object_mut().expect("fixture fields object");
+    let id = object.remove("item_id").expect("fixture item_id");
+    object.insert("id".to_owned(), id);
+    object.insert("is_sensitive".to_owned(), json!(false));
+    object.insert("title".to_owned(), json!(title));
+    object.insert("notes".to_owned(), Value::Null);
+    object.insert("importance".to_owned(), json!(50));
+    object.insert("urgency".to_owned(), json!(50));
+    object.insert("sibling_order".to_owned(), json!(0));
+    fields
+}
+
 fn item_body(id: Uuid, kind: &str, title: &str, parent_id: Option<Uuid>, order: u32) -> Value {
-    json!({
+    let mut item = json!({
         "id": id,
         "is_sensitive": false,
         "kind": kind,
@@ -88,7 +114,26 @@ fn item_body(id: Uuid, kind: &str, title: &str, parent_id: Option<Uuid>, order: 
         "urgency": 60,
         "parent_id": parent_id,
         "sibling_order": order
-    })
+    });
+    match kind {
+        "goal" => item["recurrence"] = Value::Null,
+        "event" => {
+            item["deadline_at"] = json!("2026-09-01T09:00:00Z");
+            item["recurrence"] = Value::Null;
+            item["flexible_constraints"] = json!({
+                "calendar_event": {
+                    "start": "2026-09-01T10:00:00+02:00",
+                    "end": "2026-09-01T11:00:00+02:00",
+                    "immutable": true,
+                    "all_day": false,
+                    "source_calendar_id": null
+                }
+            });
+            item["split_policy"] = json!({"type": "indivisible"});
+        }
+        _ => {}
+    }
+    item
 }
 
 fn replacement(
@@ -385,6 +430,45 @@ async fn strict_item_json_and_idempotency_conflicts_are_structured() {
         .unwrap();
     assert_eq!(missing_replacement.status(), StatusCode::BAD_REQUEST);
 
+    let mut noncanonical_create =
+        item_body(Uuid::new_v4(), "task", "Noncanonical timestamp", None, 0);
+    noncanonical_create["deadline_at"] = json!("2026-09-04 16:00:00Z");
+    let noncanonical_create = app
+        .clone()
+        .oneshot(request(
+            "POST",
+            "/v1/items",
+            Some(noncanonical_create),
+            true,
+            Some("strict-timestamp-create-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(noncanonical_create.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(noncanonical_create).await["error"]["code"],
+        "invalid_json"
+    );
+
+    let mut noncanonical_replace = replacement(&valid, 1, "scheduled", None);
+    noncanonical_replace["item"]["earliest_start_at"] = json!("2026-09-01 08:00:00Z");
+    let noncanonical_replace = app
+        .clone()
+        .oneshot(request(
+            "PUT",
+            &format!("/v1/items/{id}"),
+            Some(noncanonical_replace),
+            true,
+            Some("strict-timestamp-replace-001"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(noncanonical_replace.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(noncanonical_replace).await["error"]["code"],
+        "invalid_json"
+    );
+
     let mut different = valid;
     different["title"] = json!("Different content");
     let conflict = app
@@ -431,4 +515,156 @@ async fn strict_item_json_and_idempotency_conflicts_are_structured() {
         body_json(unknown_query).await["error"]["code"],
         "validation_failed"
     );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn shared_scheduling_metadata_contract_is_enforced_on_create_and_replace() {
+    let app = test_app();
+    let valid = scheduling_fixture("valid-rich-items.json");
+    assert_eq!(valid["schema"], "dayweave.scheduling-metadata-fixtures/1");
+    let mut saw_explicit_split_defaults = false;
+    for case in valid["cases"].as_array().expect("valid cases") {
+        let name = case["name"].as_str().expect("valid case name");
+        let body = new_item_from_fixture_fields(case["fields"].clone(), name);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/items",
+                Some(body),
+                true,
+                Some(&format!("valid-{name}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "{name}");
+        if name == "indivisible_explicit_default_split_extensions" {
+            saw_explicit_split_defaults = true;
+            let id = case["fields"]["item_id"]
+                .as_str()
+                .expect("fixture item UUID");
+            let mut item = new_item_from_fixture_fields(case["fields"].clone(), name);
+            item.as_object_mut().expect("item object").remove("id");
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "PUT",
+                    &format!("/v1/items/{id}"),
+                    Some(json!({"expected_revision": 1, "item": item})),
+                    true,
+                    Some("valid-indivisible-explicit-default-split-extensions-replace"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "replace {name}");
+        }
+    }
+    assert!(
+        saw_explicit_split_defaults,
+        "shared fixtures must exercise semantic split defaults through create and replace"
+    );
+
+    let invalid = scheduling_fixture("invalid-items.json");
+    assert_eq!(invalid["schema"], "dayweave.scheduling-metadata-fixtures/1");
+    for case in invalid["cases"].as_array().expect("invalid cases") {
+        let name = case["name"].as_str().expect("invalid case name");
+        let expected = case["expected_error_contains"]
+            .as_str()
+            .expect("expected error fragment");
+        let invalid_body = new_item_from_fixture_fields(case["fields"].clone(), name);
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/items",
+                Some(invalid_body.clone()),
+                true,
+                Some(&format!("invalid-create-{name}")),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let error = body_json(response).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "create {name}: {error}"
+        );
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected)),
+            "create {name}: expected {expected:?}, got {error}"
+        );
+
+        let id = invalid_body["id"].clone();
+        let seed = json!({
+            "id": id,
+            "is_sensitive": false,
+            "kind": "task",
+            "status": "inbox",
+            "title": format!("seed-{name}"),
+            "notes": null,
+            "timezone_name": "UTC",
+            "duration_seconds": null,
+            "deadline_at": null,
+            "earliest_start_at": null,
+            "recurrence": null,
+            "flexible_constraints": {},
+            "split_policy": {"type": "indivisible"},
+            "importance": 0,
+            "urgency": 0,
+            "parent_id": null,
+            "sibling_order": 0
+        });
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v1/items",
+                Some(seed),
+                true,
+                Some(&format!("invalid-seed-{name}")),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "seed {name}");
+
+        let mut replacement = invalid_body;
+        replacement.as_object_mut().unwrap().remove("id");
+        let id = id.as_str().expect("fixture UUID");
+        let response = app
+            .clone()
+            .oneshot(request(
+                "PUT",
+                &format!("/v1/items/{id}"),
+                Some(json!({"expected_revision": 1, "item": replacement})),
+                true,
+                Some(&format!("invalid-replace-{name}")),
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        let error = body_json(response).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "replace {name}: {error}"
+        );
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains(expected)),
+            "replace {name}: expected {expected:?}, got {error}"
+        );
+
+        // Check the public error remains useful without reflecting item content.
+        let response = app
+            .clone()
+            .oneshot(request("GET", &format!("/v1/items/{id}"), None, true, None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

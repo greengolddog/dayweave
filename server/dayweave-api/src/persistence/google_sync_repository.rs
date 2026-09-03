@@ -1930,6 +1930,7 @@ impl GoogleSyncRepository for PostgresGoogleSyncRepository {
                 remote_payload_hash: mapping_hash(mapping, "remote_payload_hash")?,
                 remote_projection_hash: mapping_hash(mapping, "remote_projection_hash")?,
                 reviewed_provider_projection: None,
+                google_task_metadata: None,
                 item: None,
             };
             counts.add(
@@ -8483,6 +8484,7 @@ async fn apply_calendar_series_metadata_tx(
                     remote_payload_hash: change.remote_payload_hash,
                     remote_projection_hash: change.remote_projection_hash,
                     reviewed_provider_projection: change.reviewed_provider_projection.clone(),
+                    google_task_metadata: None,
                     item: None,
                 };
                 if recover_dayweave_mapping(transaction, scope, claim, &recovery, true, now)
@@ -9163,16 +9165,19 @@ async fn apply_remote_upsert(
     }
     if ownership == "dayweave" {
         if change.remote_etag.is_none() {
+            let google_task_metadata = google_task_metadata_json(&change)?;
             sqlx::query(
                 "UPDATE provider_sync_mappings SET remote_updated_at = $2, remote_parent_id = $3, \
                  remote_payload_hash = $4, remote_projection_hash = $5, sync_state = 'conflict', \
-                 conflict_metadata = $6, updated_at = $7 WHERE id = $1",
+                 google_task_metadata = COALESCE($6, google_task_metadata), \
+                 conflict_metadata = $7, updated_at = $8 WHERE id = $1",
             )
             .bind(mapping_id)
             .bind(change.remote_updated_at)
             .bind(&change.remote_parent_id)
             .bind(change.remote_payload_hash.as_slice())
             .bind(change.remote_projection_hash.as_slice())
+            .bind(google_task_metadata)
             .bind(json!({"reason": "provider_etag_missing"}))
             .bind(now)
             .execute(&mut **transaction)
@@ -9247,6 +9252,7 @@ async fn apply_remote_upsert(
         return Ok(ImportOutcome::Conflict);
     }
     let Some(local_id) = local_id else {
+        let google_task_metadata = google_task_metadata_json(&change)?;
         insert_imported_item(transaction, scope, &candidate).await?;
         record_import_mutation(
             transaction,
@@ -9264,7 +9270,8 @@ async fn apply_remote_upsert(
             "UPDATE provider_sync_mappings SET local_entity_id = $2, local_revision = $3, \
              remote_etag = $4, remote_updated_at = $5, remote_payload_hash = $6, \
              remote_projection_hash = $7, remote_parent_id = $8, sync_state = 'synced', \
-             conflict_metadata = NULL, updated_at = $9 \
+             google_task_metadata = COALESCE($9, google_task_metadata), \
+             conflict_metadata = NULL, updated_at = $10 \
              WHERE id = $1",
         )
         .bind(mapping_id)
@@ -9275,6 +9282,7 @@ async fn apply_remote_upsert(
         .bind(change.remote_payload_hash.as_slice())
         .bind(change.remote_projection_hash.as_slice())
         .bind(change.remote_parent_id)
+        .bind(google_task_metadata)
         .bind(now)
         .execute(&mut **transaction)
         .await
@@ -9654,12 +9662,14 @@ async fn insert_mapping(
     conflict: Option<Value>,
     now: DateTime<Utc>,
 ) -> Result<(), GoogleSyncRepositoryError> {
+    let google_task_metadata = google_task_metadata_json(change)?;
     sqlx::query(
         "INSERT INTO provider_sync_mappings (id, workspace_id, provider_account_id, collection_id, \
          entity_kind, local_entity_id, remote_resource_id, remote_etag, remote_updated_at, \
          remote_parent_id, remote_payload_hash, remote_projection_hash, local_revision, sync_state, \
-         ownership, conflict_metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, 'item', \
-         $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)",
+         ownership, google_task_metadata, conflict_metadata, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'item', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+         $15, $16, $17, $17)",
     )
     .bind(Uuid::new_v4())
     .bind(scope.workspace_id)
@@ -9675,6 +9685,7 @@ async fn insert_mapping(
     .bind(local_revision)
     .bind(state)
     .bind(ownership)
+    .bind(google_task_metadata)
     .bind(conflict)
     .bind(now)
     .execute(&mut **transaction)
@@ -9692,10 +9703,12 @@ async fn update_mapping_remote(
     conflict: Option<Value>,
     now: DateTime<Utc>,
 ) -> Result<(), GoogleSyncRepositoryError> {
+    let google_task_metadata = google_task_metadata_json(change)?;
     sqlx::query(
         "UPDATE provider_sync_mappings SET remote_etag = $2, remote_updated_at = $3, \
          remote_parent_id = $4, remote_payload_hash = $5, remote_projection_hash = $6, \
-         local_revision = $7, sync_state = $8, conflict_metadata = $9, updated_at = $10 WHERE id = $1",
+         google_task_metadata = COALESCE($7, google_task_metadata), local_revision = $8, \
+         sync_state = $9, conflict_metadata = $10, updated_at = $11 WHERE id = $1",
     )
     .bind(mapping_id)
     .bind(&change.remote_etag)
@@ -9703,6 +9716,7 @@ async fn update_mapping_remote(
     .bind(&change.remote_parent_id)
     .bind(change.remote_payload_hash.as_slice())
     .bind(change.remote_projection_hash.as_slice())
+    .bind(google_task_metadata)
     .bind(local_revision)
     .bind(state)
     .bind(conflict)
@@ -10294,6 +10308,17 @@ fn internal<T>(_error: T) -> GoogleSyncRepositoryError {
     GoogleSyncRepositoryError::Internal
 }
 
+fn google_task_metadata_json(
+    change: &RemoteItemChange,
+) -> Result<Option<Value>, GoogleSyncRepositoryError> {
+    change
+        .google_task_metadata
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(internal)
+}
+
 fn u64_to_i64(value: u64) -> Result<i64, GoogleSyncRepositoryError> {
     i64::try_from(value).map_err(internal)
 }
@@ -10339,7 +10364,10 @@ mod tests {
             AuthorizationCompletion, CallbackClaim, EncryptedCredentials, GoogleOAuthRepository,
             NewOAuthSession, OAuthIdempotency, SealedSecret,
         },
-        google_sync::{CalendarProjectionWindow, OutboundOperation, RejectedRemoteItem},
+        google_sync::{
+            CalendarProjectionWindow, GoogleTaskProviderMetadata, OutboundOperation,
+            RejectedRemoteItem,
+        },
         items::{ItemKind, ItemService, NewItem},
         persistence::{
             MIGRATOR, PostgresExecutionRepository, PostgresGoogleOAuthRepository,
@@ -13651,7 +13679,11 @@ mod tests {
                 deadline_at: Some(now + Duration::hours(1)),
                 earliest_start_at: Some(now),
                 recurrence: None,
-                flexible_constraints: json!({"dayweave_firm_block": {"owned": true}}),
+                flexible_constraints: json!({"dayweave_firm_block": {
+                    "owned": true,
+                    "starts_at": now,
+                    "ends_at": now + Duration::hours(1)
+                }}),
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
@@ -13710,6 +13742,7 @@ mod tests {
             remote_payload_hash: [hash_marker; 32],
             remote_projection_hash: [hash_marker.wrapping_add(1); 32],
             reviewed_provider_projection: None,
+            google_task_metadata: None,
             item: Some(NewItem {
                 id: Uuid::new_v4(),
                 is_sensitive: sensitive,
@@ -13888,6 +13921,7 @@ mod tests {
                 remote_payload_hash: [1; 32],
                 remote_projection_hash: [2; 32],
                 reviewed_provider_projection: None,
+                google_task_metadata: None,
                 item: Some(NewItem {
                     id: Uuid::new_v4(),
                     is_sensitive: false,
@@ -14574,6 +14608,7 @@ mod tests {
             remote_payload_hash: [31; 32],
             remote_projection_hash: [91; 32],
             reviewed_provider_projection: Some(reviewed.clone()),
+            google_task_metadata: None,
             item: None,
         };
         let ignored_echo = fixture
@@ -15044,6 +15079,7 @@ mod tests {
             remote_payload_hash: markerless_hash,
             remote_projection_hash: [75; 32],
             reviewed_provider_projection: None,
+            google_task_metadata: None,
             item: None,
         };
         let markerless_projection = repository
@@ -15109,6 +15145,7 @@ mod tests {
                         remote_payload_hash: marked_hash,
                         remote_projection_hash: [78; 32],
                         reviewed_provider_projection: Some(json!({"id": remote_id})),
+                        google_task_metadata: None,
                         item: None,
                     }],
                 ),
@@ -15240,6 +15277,7 @@ mod tests {
                         remote_payload_hash: active_tombstone_hash,
                         remote_projection_hash: [84; 32],
                         reviewed_provider_projection: None,
+                        google_task_metadata: None,
                         item: None,
                     }],
                 ),
@@ -17515,6 +17553,215 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn postgres_task_metadata_replaces_live_and_survives_both_tombstone_paths() {
+        let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
+            eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; task metadata test skipped");
+            return;
+        };
+        let fixture = sync_fixture(&database_url).await;
+        let discovered = fixture
+            .repository
+            .replace_discovered(
+                fixture.account_id,
+                None,
+                GoogleCollectionKind::TaskList,
+                vec![DiscoveredCollection {
+                    kind: GoogleCollectionKind::TaskList,
+                    remote_id: "provider-metadata-tasks".to_owned(),
+                    display_name: "Provider metadata tasks".to_owned(),
+                    provider_access_role: None,
+                    provider_primary: false,
+                    provider_selected: true,
+                    provider_hidden: false,
+                    provider_deleted: false,
+                }],
+                fixture.now,
+            )
+            .await
+            .expect("task-list discovery");
+        let discovered = discovered
+            .iter()
+            .find(|collection| collection.kind == GoogleCollectionKind::TaskList)
+            .expect("task list");
+        let task_list = fixture
+            .repository
+            .configure_collection(
+                fixture.account_id,
+                discovered.id,
+                discovered.revision,
+                true,
+                true,
+                GoogleSyncRole::Writable,
+                GoogleCalendarPolicy::default(),
+                fixture.now,
+            )
+            .await
+            .expect("configured task list");
+        let remote_id = "provider-metadata-task";
+        let first_metadata = GoogleTaskProviderMetadata {
+            hidden: false,
+            position: Some("0001".to_owned()),
+            completed: false,
+            completed_at: None,
+            title_truncated: false,
+            notes_truncated: false,
+            legacy_marker_stripped: false,
+        };
+        let first_expected = serde_json::to_value(&first_metadata).expect("initial metadata JSON");
+        let mut first = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            remote_id,
+            "First provider task",
+            ItemStatus::Inbox,
+            [141; 32],
+        );
+        first.google_task_metadata = Some(first_metadata);
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(&fixture.claim, first, fixture.now)
+                .await
+                .expect("initial metadata import"),
+            ImportOutcome::Created
+        );
+        assert_eq!(
+            stored_task_metadata(
+                &fixture.database.pool,
+                fixture.scope.workspace_id,
+                task_list.id,
+                remote_id,
+            )
+            .await,
+            Some(first_expected)
+        );
+
+        let live_metadata = GoogleTaskProviderMetadata {
+            hidden: true,
+            position: Some("0002".to_owned()),
+            completed: true,
+            completed_at: Some(fixture.now + Duration::seconds(1)),
+            title_truncated: true,
+            notes_truncated: true,
+            legacy_marker_stripped: true,
+        };
+        let expected = serde_json::to_value(&live_metadata).expect("metadata JSON");
+        let mut live = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            remote_id,
+            "Updated provider task",
+            ItemStatus::Completed,
+            [142; 32],
+        );
+        live.google_task_metadata = Some(live_metadata.clone());
+        assert_eq!(
+            fixture
+                .repository
+                .apply_remote_item(&fixture.claim, live, fixture.now + Duration::seconds(1))
+                .await
+                .expect("live metadata replacement"),
+            ImportOutcome::Updated
+        );
+        assert_eq!(
+            stored_task_metadata(
+                &fixture.database.pool,
+                fixture.scope.workspace_id,
+                task_list.id,
+                remote_id,
+            )
+            .await,
+            Some(expected.clone())
+        );
+        let mut forbidden_content = expected.clone();
+        forbidden_content
+            .as_object_mut()
+            .expect("metadata object")
+            .insert(
+                "title".to_owned(),
+                Value::String("must not persist".to_owned()),
+            );
+        let rejected = sqlx::query(
+            "UPDATE provider_sync_mappings SET google_task_metadata = $2 WHERE workspace_id = $1",
+        )
+        .bind(fixture.scope.workspace_id)
+        .bind(forbidden_content)
+        .execute(&fixture.database.pool)
+        .await;
+        assert!(
+            rejected.is_err(),
+            "mapping constraint must reject provider content fields"
+        );
+
+        fixture
+            .repository
+            .sweep_full_snapshot(
+                &fixture.claim,
+                task_list.id,
+                task_list.revision,
+                &[],
+                fixture.now + Duration::seconds(2),
+            )
+            .await
+            .expect("missing-snapshot tombstone");
+        assert_eq!(
+            stored_task_metadata(
+                &fixture.database.pool,
+                fixture.scope.workspace_id,
+                task_list.id,
+                remote_id,
+            )
+            .await,
+            Some(expected.clone())
+        );
+
+        let mut restored = remote_task(
+            fixture.account_id,
+            task_list.id,
+            task_list.revision,
+            remote_id,
+            "Restored provider task",
+            ItemStatus::Inbox,
+            [143; 32],
+        );
+        restored.google_task_metadata = Some(live_metadata);
+        fixture
+            .repository
+            .apply_remote_item(&fixture.claim, restored, fixture.now + Duration::seconds(3))
+            .await
+            .expect("restored task");
+        fixture
+            .repository
+            .apply_remote_item(
+                &fixture.claim,
+                remote_tombstone(
+                    fixture.account_id,
+                    task_list.id,
+                    task_list.revision,
+                    remote_id,
+                    [144; 32],
+                ),
+                fixture.now + Duration::seconds(4),
+            )
+            .await
+            .expect("explicit task tombstone");
+        assert_eq!(
+            stored_task_metadata(
+                &fixture.database.pool,
+                fixture.scope.workspace_id,
+                task_list.id,
+                remote_id,
+            )
+            .await,
+            Some(expected)
+        );
+        fixture.database.destroy().await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn postgres_inbound_task_close_respects_active_and_paused_execution_leases() {
         let Ok(database_url) = std::env::var("DAYWEAVE_TEST_DATABASE_URL") else {
             eprintln!("DAYWEAVE_TEST_DATABASE_URL is unset; inbound execution guard test skipped");
@@ -19347,7 +19594,11 @@ mod tests {
                 deadline_at: Some(now + Duration::hours(1)),
                 earliest_start_at: Some(now),
                 recurrence: None,
-                flexible_constraints: json!({"dayweave_firm_block": {"owned": true}}),
+                flexible_constraints: json!({"dayweave_firm_block": {
+                    "owned": true,
+                    "starts_at": now,
+                    "ends_at": now + Duration::hours(1)
+                }}),
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
@@ -19704,7 +19955,11 @@ mod tests {
                 deadline_at: Some(now + Duration::hours(2)),
                 earliest_start_at: Some(now + Duration::hours(1)),
                 recurrence: None,
-                flexible_constraints: json!({"dayweave_firm_block": {"owned": true}}),
+                flexible_constraints: json!({"dayweave_firm_block": {
+                    "owned": true,
+                    "starts_at": now + Duration::hours(1),
+                    "ends_at": now + Duration::hours(2)
+                }}),
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
@@ -20504,6 +20759,7 @@ mod tests {
             remote_payload_hash: hash,
             remote_projection_hash: hash,
             reviewed_provider_projection: None,
+            google_task_metadata: None,
             item: Some(NewItem {
                 id: Uuid::new_v4(),
                 is_sensitive: false,
@@ -20516,7 +20772,13 @@ mod tests {
                 deadline_at: Some("2026-08-29T11:00:00Z".parse().expect("end")),
                 earliest_start_at: Some("2026-08-29T10:00:00Z".parse().expect("start")),
                 recurrence: None,
-                flexible_constraints: json!({"google_sync": {"remote_id": remote_id}}),
+                flexible_constraints: json!({"calendar_event": {
+                    "start": "2026-08-29T10:00:00Z",
+                    "end": "2026-08-29T11:00:00Z",
+                    "immutable": true,
+                    "all_day": false,
+                    "source_calendar_id": null
+                }}),
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
@@ -20547,6 +20809,15 @@ mod tests {
             remote_payload_hash: hash,
             remote_projection_hash: hash,
             reviewed_provider_projection: None,
+            google_task_metadata: Some(GoogleTaskProviderMetadata {
+                hidden: false,
+                position: Some(format!("{:04}", hash[0])),
+                completed: status == ItemStatus::Completed,
+                completed_at: None,
+                title_truncated: false,
+                notes_truncated: false,
+                legacy_marker_stripped: false,
+            }),
             item: Some(NewItem {
                 id: Uuid::new_v4(),
                 is_sensitive: false,
@@ -20559,7 +20830,7 @@ mod tests {
                 deadline_at: None,
                 earliest_start_at: None,
                 recurrence: None,
-                flexible_constraints: json!({"google_sync": {"remote_id": remote_id}}),
+                flexible_constraints: json!({}),
                 split_policy: SplitPolicy::Indivisible,
                 importance: 0,
                 urgency: 0,
@@ -20567,6 +20838,24 @@ mod tests {
                 sibling_order: 0,
             }),
         }
+    }
+
+    async fn stored_task_metadata(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        collection_id: Uuid,
+        remote_id: &str,
+    ) -> Option<Value> {
+        sqlx::query_scalar::<_, Option<Value>>(
+            "SELECT google_task_metadata FROM provider_sync_mappings \
+             WHERE workspace_id = $1 AND collection_id = $2 AND remote_resource_id = $3",
+        )
+        .bind(workspace_id)
+        .bind(collection_id)
+        .bind(remote_id)
+        .fetch_one(pool)
+        .await
+        .expect("stored provider metadata")
     }
 
     fn remote_tombstone(
@@ -20588,6 +20877,7 @@ mod tests {
             remote_payload_hash: hash,
             remote_projection_hash: hash,
             reviewed_provider_projection: None,
+            google_task_metadata: None,
             item: None,
         }
     }

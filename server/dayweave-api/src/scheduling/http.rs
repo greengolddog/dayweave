@@ -258,7 +258,7 @@ pub struct PublishScheduleRequest {
         (status = 400, description = "Malformed preview JSON", body = crate::error::ErrorEnvelope),
         (status = 401, description = "Missing or invalid token", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Schedule request exceeds 16 MiB", body = crate::error::ErrorEnvelope),
-        (status = 422, description = "Invalid horizon, timezone, bounds, metadata, or scheduling input", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid horizon, timezone, bounds, metadata, or scheduling input; scheduler preflight exhaustion uses scheduler_resource_limit", body = crate::error::ErrorEnvelope),
         (status = 503, description = "Required Google Calendar projection is incomplete or temporarily unavailable", body = crate::error::ErrorEnvelope),
         (status = 500, description = "Canonical item storage or encoding failure", body = crate::error::ErrorEnvelope)
     )
@@ -324,7 +324,7 @@ pub(crate) async fn list_retained_manual_placements(
         (status = 403, description = "Missing schedule_publish or principal scope mismatch", body = crate::error::ErrorEnvelope),
         (status = 409, description = "schedule_publication_stale or schedule_publication_idempotency_conflict", body = crate::error::ErrorEnvelope),
         (status = 413, description = "Schedule request exceeds 16 MiB", body = crate::error::ErrorEnvelope),
-        (status = 422, description = "Invalid digest, horizon, timezone, bounds, metadata, or scheduling input", body = crate::error::ErrorEnvelope),
+        (status = 422, description = "Invalid digest, horizon, timezone, bounds, metadata, or scheduling input; scheduler preflight exhaustion uses scheduler_resource_limit", body = crate::error::ErrorEnvelope),
         (status = 503, description = "Durable publication is not configured or Google Calendar projection evidence is temporarily unavailable", body = crate::error::ErrorEnvelope)
     )
 )]
@@ -471,6 +471,9 @@ fn map_publication_error(error: SchedulePublicationError) -> ApiError {
 
 fn map_compose_error(error: &ComposeScheduleError) -> ApiError {
     match error {
+        ComposeScheduleError::SchedulerResourceLimit => ApiError::scheduler_resource_limit(
+            "Schedule preview exceeds the bounded scheduler work budget",
+        ),
         ComposeScheduleError::CalendarProjectionIncomplete => ApiError::unavailable(
             "Selected Google Calendar data is not ready for this scheduling horizon; refresh sync and retry",
         ),
@@ -500,4 +503,31 @@ fn map_publish_compose_error(error: &ComposeScheduleError) -> ApiError {
         );
     }
     map_compose_error(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn scheduler_preflight_limit_has_a_stable_client_error() {
+        let response =
+            map_compose_error(&ComposeScheduleError::SchedulerResourceLimit).into_response();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("bounded error envelope");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("JSON error envelope");
+        assert_eq!(body["error"]["code"], "scheduler_resource_limit");
+        assert_eq!(
+            body["error"]["message"],
+            "Schedule preview exceeds the bounded scheduler work budget"
+        );
+        assert!(body["error"].get("details").is_none());
+    }
 }

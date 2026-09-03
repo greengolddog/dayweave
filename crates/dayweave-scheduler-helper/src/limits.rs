@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
 
+use dayweave_compose::MAX_SCHEDULING_OFFSET_MINUTES;
 use dayweave_core::{
     ConstraintStrength, ItemId, ItemKind, PlanRequest, Recurrence, RecurrenceExceptionAction,
     RecurrenceExceptionSelector, RecurrenceOccurrenceIdentity, RecurrencePeriod,
@@ -94,6 +95,13 @@ fn validate_shape(request: &PlanRequest) -> Result<(), PreflightError> {
     if context_entries > MAX_RECURRENCE_CONTEXT_ENTRIES {
         return Err(PreflightError::ResourceLimit);
     }
+    if context
+        .minimum_spacing
+        .values()
+        .any(|spacing| spacing.get() > MAX_SCHEDULING_OFFSET_MINUTES)
+    {
+        return Err(PreflightError::ResourceLimit);
+    }
 
     let mut fixed_ids = BTreeSet::new();
     for block in &request.fixed_blocks {
@@ -118,6 +126,14 @@ fn validate_items(request: &PlanRequest) -> Result<(), PreflightError> {
         }
         if !item_weights_are_bounded(item) {
             return Err(PreflightError::ResourceLimit);
+        }
+        if !item_temporal_offsets_are_bounded(item) {
+            return Err(PreflightError::ResourceLimit);
+        }
+        if matches!(recurrence_of(item), Some(Recurrence::Custom { .. })) {
+            return Err(PreflightError::Schedule(ScheduleError::InvalidRecurrence(
+                "custom RRULE recurrence has no bounded scheduler expansion".to_owned(),
+            )));
         }
         constraint_entries = constraint_entries
             .checked_add(constraint_entry_count(item)?)
@@ -1329,6 +1345,40 @@ fn item_weights_are_bounded(item: &WorkItem) -> bool {
     strengths.extend(constraints.buffers.strength);
     strengths.extend(item.energy.iter().map(|value| value.strength));
     strengths.into_iter().all(strength_is_bounded)
+}
+
+fn item_temporal_offsets_are_bounded(item: &WorkItem) -> bool {
+    let constraints = &item.constraints;
+    let scalar_offsets_are_bounded = constraints
+        .minimum_notice
+        .as_ref()
+        .is_none_or(|value| value.value.get() <= MAX_SCHEDULING_OFFSET_MINUTES)
+        && constraints
+            .dependencies
+            .iter()
+            .all(|dependency| dependency.minimum_lag.get() <= MAX_SCHEDULING_OFFSET_MINUTES)
+        && constraints.buffers.before.get() <= MAX_SCHEDULING_OFFSET_MINUTES
+        && constraints.buffers.after.get() <= MAX_SCHEDULING_OFFSET_MINUTES;
+    let split_offset_is_bounded = match item.split_policy {
+        SplitPolicy::Indivisible => true,
+        SplitPolicy::Splittable { minimum_gap, .. } => {
+            minimum_gap.get() <= MAX_SCHEDULING_OFFSET_MINUTES
+        }
+    };
+    let recurrence_offsets_are_bounded =
+        recurrence_of(item).is_none_or(|recurrence| match recurrence {
+            Recurrence::EveryInterval { interval } | Recurrence::AfterCompletion { interval } => {
+                interval.get() <= MAX_SCHEDULING_OFFSET_MINUTES
+            }
+            Recurrence::Frequency {
+                minimum_spacing, ..
+            } => minimum_spacing.get() <= MAX_SCHEDULING_OFFSET_MINUTES,
+            Recurrence::Daily { .. }
+            | Recurrence::Weekly { .. }
+            | Recurrence::Monthly { .. }
+            | Recurrence::Custom { .. } => true,
+        });
+    scalar_offsets_are_bounded && split_offset_is_bounded && recurrence_offsets_are_bounded
 }
 
 const fn strength_is_bounded(strength: ConstraintStrength) -> bool {
