@@ -20,6 +20,17 @@ struct OnboardingFirstItemAnchorTests {
         )
 
         #expect(plannedTask.createsPlanningDemand(itemID: itemID))
+        #expect(!plannedTask.createsPlanningDemand(
+            itemID: itemID,
+            hasActiveChildren: true
+        ))
+
+        var parentWithOwnEffort = plannedTask
+        parentWithOwnEffort.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        #expect(parentWithOwnEffort.createsPlanningDemand(
+            itemID: itemID,
+            hasActiveChildren: true
+        ))
 
         var inbox = plannedTask
         inbox.status = .inbox
@@ -42,18 +53,48 @@ struct OnboardingFirstItemAnchorTests {
 
     @Test("canonical container demand still requires explicitly reviewed own effort")
     func testCanonicalPlanningDemandPredicateMatchesDraft() throws {
-        var item = try Self.canonicalItem(id: UUID(), revision: 1)
-        #expect(item.createsPlanningDemand)
+        var leaf = try Self.canonicalItem(id: UUID(), revision: 1)
+        #expect(leaf.createsPlanningDemand)
 
-        item.kind = .goal
-        item.flexibleConstraints = .object(["has_own_effort": .bool(false)])
-        #expect(!item.createsPlanningDemand)
-        item.flexibleConstraints = .object(["has_own_effort": .bool(true)])
-        #expect(item.createsPlanningDemand)
+        var goalLeaf = leaf
+        goalLeaf.kind = .goal
+        goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(false)])
+        #expect(!goalLeaf.createsPlanningDemand)
+        goalLeaf.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        #expect(goalLeaf.createsPlanningDemand)
 
-        item.kind = .routine
-        item.flexibleConstraints = .object([:])
-        #expect(!item.createsPlanningDemand)
+        let parent = try Self.canonicalItem(
+            id: UUID(),
+            revision: 2,
+            isExecutable: false
+        )
+        var child = try Self.canonicalItem(id: UUID(), revision: 1)
+        child.parentID = parent.id
+        #expect(!parent.createsPlanningDemand(canonicalItems: [parent, child]))
+
+        for kind in [
+            DayWeaveCanonicalItemKind.task,
+            .habit,
+            .breakTime,
+            .goal,
+            .routine,
+        ] {
+            var independentParent = parent
+            independentParent.kind = kind
+            independentParent.flexibleConstraints = .object([
+                "has_own_effort": .bool(true),
+            ])
+            #expect(independentParent.createsPlanningDemand(
+                canonicalItems: [independentParent, child]
+            ))
+        }
+
+        var eventParent = parent
+        eventParent.kind = .event
+        #expect(eventParent.createsPlanningDemand(canonicalItems: [eventParent, child]))
+
+        leaf = try Self.canonicalItem(id: UUID(), revision: 3, isExecutable: false)
+        #expect(!leaf.createsPlanningDemand(canonicalItems: [leaf]))
     }
 
     @Test("prepared create and anchor commit together and promote on exact response")
@@ -154,6 +195,66 @@ struct OnboardingFirstItemAnchorTests {
         #expect(canonicalAnchor.hasExactPublishedPlanProof(
             canonicalItems: [item],
             pendingAuthoringMutations: [],
+            publishedScheduleProof: proof
+        ))
+
+        let parentItem = try Self.canonicalItem(
+            id: itemID,
+            revision: 3,
+            isExecutable: false
+        )
+        var child = try Self.canonicalItem(id: UUID(), revision: 1)
+        child.parentID = itemID
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [parentItem, child],
+            pendingAuthoringMutations: [],
+            publishedScheduleProof: proof
+        ))
+
+        var childDraft = Self.plannedDraft(title: "Pending child")
+        childDraft.parentID = itemID
+        let pendingChild = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: child.id,
+            operation: .create,
+            draft: childDraft,
+            createdAt: Self.now
+        )
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [item],
+            pendingAuthoringMutations: [pendingChild],
+            publishedScheduleProof: proof
+        ))
+
+        let movingChild = try Self.canonicalItem(id: UUID(), revision: 4)
+        var movedDraft = Self.plannedDraft(title: movingChild.title)
+        movedDraft.parentID = itemID
+        let pendingMove = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: movingChild.id,
+            operation: .replace,
+            draft: movedDraft,
+            expectedRevision: movingChild.revision,
+            baseItem: movingChild,
+            createdAt: Self.now
+        )
+        #expect(!canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [item, movingChild],
+            pendingAuthoringMutations: [pendingMove],
+            publishedScheduleProof: proof
+        ))
+
+        var ownEffortItem = parentItem
+        ownEffortItem.flexibleConstraints = .object(["has_own_effort": .bool(true)])
+        #expect(canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [ownEffortItem, child],
+            pendingAuthoringMutations: [pendingChild],
+            publishedScheduleProof: proof
+        ))
+
+        var eventItem = parentItem
+        eventItem.kind = .event
+        #expect(canonicalAnchor.hasExactPublishedPlanProof(
+            canonicalItems: [eventItem, child],
+            pendingAuthoringMutations: [pendingChild],
             publishedScheduleProof: proof
         ))
 
@@ -364,7 +465,8 @@ struct OnboardingFirstItemAnchorTests {
     private static func canonicalItem(
         id: UUID,
         revision: UInt64,
-        title: String = "First planned task"
+        title: String = "First planned task",
+        isExecutable: Bool = true
     ) throws -> DayWeaveCanonicalItem {
         let data = Data(#"""
         {
@@ -373,7 +475,7 @@ struct OnboardingFirstItemAnchorTests {
           "timezone_name":"UTC","duration_seconds":1800,"deadline_at":null,
           "earliest_start_at":null,"recurrence":null,"flexible_constraints":{},
           "split_policy":{"type":"indivisible"},"importance":50,"urgency":50,
-          "parent_id":null,"sibling_order":0,"is_executable":true,
+          "parent_id":null,"sibling_order":0,"is_executable":\#(isExecutable),
           "revision":\#(revision),"created_at":"2027-01-15T10:00:00Z",
           "updated_at":"2027-01-15T10:00:00Z","completed_at":null,"deleted_at":null
         }

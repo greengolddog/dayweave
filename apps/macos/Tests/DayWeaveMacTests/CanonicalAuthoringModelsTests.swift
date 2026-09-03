@@ -20,6 +20,34 @@ struct CanonicalAuthoringModelsTests {
         #expect(draft.status == .inbox)
     }
 
+    @Test("preferred local start requires a same-day duration")
+    func preferredStartMinuteValidation() {
+        let itemID = UUID()
+        var draft = DayWeaveCanonicalItemDraft(
+            title: "Afternoon focus",
+            timezoneName: "Europe/Paris",
+            durationSeconds: 3_600,
+            flexibleConstraints: .object([
+                "preferred_start_minute": .number(JSONNumber(UInt64(13 * 60))),
+            ])
+        )
+        #expect(draft.validationIssue(itemID: itemID) == nil)
+
+        draft.durationSeconds = nil
+        #expect(draft.validationIssue(itemID: itemID)?.contains("requires a duration") == true)
+
+        draft.durationSeconds = 7_201
+        draft.flexibleConstraints = .object([
+            "preferred_start_minute": .number(JSONNumber(UInt64(22 * 60))),
+        ])
+        #expect(draft.validationIssue(itemID: itemID)?.contains("same day") == true)
+
+        draft.flexibleConstraints = .object([
+            "preferred_start_minute": .number(JSONNumber(UInt64(1_440))),
+        ])
+        #expect(draft.validationIssue(itemID: itemID)?.contains("read-only") == true)
+    }
+
     @Test("habit recurrence and split bounds are validated locally")
     func recurrenceAndSplitValidation() {
         let itemID = UUID()
@@ -86,8 +114,8 @@ struct CanonicalAuthoringModelsTests {
     @Test("calendar events require strict ordered RFC3339 timing metadata")
     func calendarEventTimingValidation() {
         let validConstraints = calendarEvent(
-            start: "2026-09-01T10:00:00.000000001+02:00",
-            end: "2026-09-01T08:30:00.000000002Z"
+            start: "2026-09-01T10:00:00.000001+02:00",
+            end: "2026-09-01T08:30:00.000002Z"
         )
         let valid = DayWeaveCanonicalItemDraft(
             kind: .event,
@@ -97,6 +125,13 @@ struct CanonicalAuthoringModelsTests {
             flexibleConstraints: validConstraints
         )
         #expect(valid.validationIssue(itemID: UUID()) == nil)
+
+        var fractionalDuration = valid
+        fractionalDuration.durationSeconds = 1_800
+        #expect(
+            fractionalDuration.validationIssue(itemID: UUID())
+                == "Event duration must equal its timing interval."
+        )
 
         let malformedBounds = [
             ("2026-02-30T10:00:00Z", "2026-03-01T11:00:00Z"),
@@ -116,7 +151,7 @@ struct CanonicalAuthoringModelsTests {
             start: "2026-09-01T10:00:00.000000002Z",
             end: "2026-09-01T10:00:00.000000001Z"
         ).supportsCanonicalAuthoringConstraints)
-        #expect(calendarEvent(
+        #expect(!calendarEvent(
             start: "2026-09-01T10:00:00.000000001Z",
             end: "2026-09-01T10:00:00.000000002Z"
         ).supportsCanonicalAuthoringConstraints)
@@ -148,7 +183,7 @@ struct CanonicalAuthoringModelsTests {
         )
         #expect(
             misplaced.validationIssue(itemID: itemID)
-                == "Calendar event timing metadata is only valid for event items."
+                == "Calendar event metadata is only valid for event items."
         )
     }
 
@@ -182,7 +217,7 @@ struct CanonicalAuthoringModelsTests {
             allDay: true
         )
         #expect(
-            fractionalMidnight.validationIssue(itemID: UUID())?.contains("local midnight") == true
+            fractionalMidnight.validationIssue(itemID: UUID())?.contains("read-only") == true
         )
 
         var alias = valid
@@ -256,19 +291,420 @@ struct CanonicalAuthoringModelsTests {
             "target": .number(JSONNumber(UInt64(2))),
             "period": .string("week"),
             "semantics": .string("rolling"),
-            "weekdays": .array([.string("monday"), .string("friday")]),
+            "weekdays": .array([]),
             "minimum_spacing": .number(JSONNumber(UInt64(90))),
             "anchor": .string("2026-08-30T12:00:00Z"),
+        ])
+        let excessiveInterval = JSONValue.object([
+            "type": .string("every_interval"),
+            "interval": .number(JSONNumber(UInt64(
+                DayWeaveCanonicalItemDraft.maximumSchedulingOffsetMinutes + 1
+            ))),
         ])
 
         #expect(!tooLarge.supportsCanonicalAuthoringRecurrence)
         #expect(!invalidWeekday.supportsCanonicalAuthoringRecurrence)
         #expect(!invalidFrequency.supportsCanonicalAuthoringRecurrence)
         #expect(validFrequency.supportsCanonicalAuthoringRecurrence)
+        #expect(!excessiveInterval.supportsCanonicalAuthoringRecurrence)
         #expect(!JSONValue.object([
             "type": .string("custom"),
             "rrule": .string("FREQ=DAILY"),
         ]).supportsCanonicalAuthoringRecurrence)
+    }
+
+    @Test("qualified scheduling constraints validate strict composer shapes")
+    func richSchedulingConstraintValidation() {
+        let constraints = JSONValue.object([
+            "constraints": .object([
+                "earliest_start": .object([
+                    "value": .string("2026-09-03T08:00:00+02:00"),
+                    "strength": .object(["level": .string("hard")]),
+                ]),
+                "latest_finish": .object([
+                    "value": .string("2026-09-30T18:00:00+02:00"),
+                    "strength": .object([
+                        "level": .string("soft"),
+                        "weight": .number(JSONNumber(UInt64(250))),
+                    ]),
+                ]),
+                "allowed_weekdays": .object([
+                    "value": .array([.string("monday"), .string("friday")]),
+                    "strength": .object(["level": .string("hard")]),
+                ]),
+                "preferred_daily_windows": .array([.object([
+                    "value": .object([
+                        "weekdays": .array([.string("monday")]),
+                        "start_minute": .number(JSONNumber(UInt64(540))),
+                        "end_minute": .number(JSONNumber(UInt64(720))),
+                    ]),
+                    "strength": .object([
+                        "level": .string("soft"),
+                        "weight": .number(JSONNumber(UInt64(75))),
+                    ]),
+                ])]),
+                "buffers": .object([
+                    "before": .number(JSONNumber(UInt64(10))),
+                    "after": .number(JSONNumber(UInt64(15))),
+                    "strength": .object(["level": .string("hard")]),
+                ]),
+                "occurrence_window": .null,
+            ]),
+            "energy": .object([
+                "value": .string("deep"),
+                "strength": .object(["level": .string("hard")]),
+            ]),
+            "tags": .array([.string("focus"), .string("writing")]),
+        ])
+        #expect(constraints.supportsCanonicalAuthoringConstraints)
+
+        guard case var .object(root) = constraints,
+              case var .object(nested)? = root["constraints"] else {
+            Issue.record("Expected constraint fixture")
+            return
+        }
+        nested["dependencies"] = .array([.object([
+            "item_id": .string("00000000-0000-0000-0000-000000000199"),
+            "relation": .string("finish_to_start"),
+            "minimum_lag": .number(JSONNumber(UInt64(15))),
+            "strength": .object(["level": .string("hard")]),
+        ])])
+        root["constraints"] = .object(nested)
+        #expect(!JSONValue.object(root).supportsCanonicalAuthoringConstraints)
+
+        nested.removeValue(forKey: "dependencies")
+        nested["earliest_start"] = .object([
+            "value": .string("2026-09-30T19:00:00+02:00"),
+            "strength": .object(["level": .string("hard")]),
+        ])
+        root["constraints"] = .object(nested)
+        #expect(!JSONValue.object(root).supportsCanonicalAuthoringConstraints)
+    }
+
+    @Test("Rust default spellings and inactive buffers remain writable")
+    func rustDefaultConstraintSpellings() {
+        let defaults = JSONValue.object([
+            "constraints": .object([
+                "earliest_start": .null,
+                "latest_finish": .null,
+                "minimum_notice": .null,
+                "allowed_weekdays": .null,
+                "preferred_daily_windows": .array([]),
+                "preferred_absolute_windows": .array([]),
+                "forbidden_windows": .array([]),
+                "required_contexts": .array([]),
+                "required_location": .null,
+                "dependencies": .array([]),
+                "maximum_daily_work": .null,
+                "maximum_weekly_work": .null,
+                "buffers": .object([
+                    "before": .number(JSONNumber(UInt64(0))),
+                    "after": .number(JSONNumber(UInt64(0))),
+                    "strength": .null,
+                ]),
+                "occurrence_window": .null,
+            ]),
+            "goal_ids": .array([]),
+        ])
+        let firmDefaults = JSONValue.object([
+            "dayweave_firm_block": .object([
+                "owned": .bool(true),
+                "starts_at": .string("2026-09-01T10:00:00Z"),
+                "ends_at": .string("2026-09-01T11:00:00Z"),
+            ]),
+        ])
+
+        #expect(defaults.supportsCanonicalAuthoringConstraints)
+        #expect(firmDefaults.supportsCanonicalAuthoringConstraints)
+
+        let wrongKindNullEvent = DayWeaveCanonicalItemDraft(
+            kind: .task,
+            title: "Not an event",
+            timezoneName: "UTC",
+            flexibleConstraints: .object(["calendar_event": .null])
+        )
+        #expect(
+            wrongKindNullEvent.validationIssue(itemID: UUID())
+                == "Calendar event metadata is only valid for event items."
+        )
+    }
+
+    @Test("canonical JSON byte limits do not count escaped slashes")
+    func canonicalJSONByteCountUsesUnescapedSlashes() throws {
+        let slashTag = String(repeating: "/", count: 20_000)
+        let constraints = JSONValue.object([
+            "tags": .array([.string(slashTag)]),
+        ])
+        let ordinaryCount = try JSONEncoder().encode(constraints).count
+        let canonicalEncoder = JSONEncoder()
+        canonicalEncoder.outputFormatting = [.withoutEscapingSlashes]
+        let canonicalCount = try canonicalEncoder.encode(constraints).count
+        let draft = DayWeaveCanonicalItemDraft(
+            title: "Slash-preserving tag",
+            timezoneName: "UTC",
+            flexibleConstraints: constraints
+        )
+
+        #expect(ordinaryCount > DayWeaveCanonicalItemDraft.maximumConstraintBytes)
+        #expect(canonicalCount <= DayWeaveCanonicalItemDraft.maximumConstraintBytes)
+        #expect(draft.validationIssue(itemID: UUID()) == nil)
+    }
+
+    @Test("partial Inbox event timing fails closed while empty capture stays valid")
+    func partialInboxEventTimingFailsClosed() {
+        let itemID = UUID()
+        var event = DayWeaveCanonicalItemDraft(
+            kind: .event,
+            status: .inbox,
+            title: "Appointment details later",
+            timezoneName: "UTC"
+        )
+        #expect(event.validationIssue(itemID: itemID) == nil)
+
+        event.durationSeconds = 900
+        #expect(event.validationIssue(itemID: itemID)?.contains("Incomplete Inbox") == true)
+        event.durationSeconds = nil
+        event.earliestStartAt = Date(timeIntervalSince1970: 1_788_278_400)
+        #expect(event.validationIssue(itemID: itemID)?.contains("Incomplete Inbox") == true)
+    }
+
+    @Test("Planned unknown-duration work remains valid but does not create demand")
+    func plannedUnknownDurationItemsRemainValid() {
+        let itemID = UUID()
+        let recurrence = JSONValue.object([
+            "type": .string("daily"),
+            "times_per_day": .number(JSONNumber(UInt64(1))),
+        ])
+        let drafts = [
+            DayWeaveCanonicalItemDraft(
+                kind: .task,
+                status: .planned,
+                title: "Estimate later",
+                timezoneName: "UTC"
+            ),
+            DayWeaveCanonicalItemDraft(
+                kind: .habit,
+                status: .planned,
+                title: "Habit estimate later",
+                timezoneName: "UTC",
+                recurrence: recurrence
+            ),
+            DayWeaveCanonicalItemDraft(
+                kind: .breakTime,
+                status: .planned,
+                title: "Open-ended break",
+                timezoneName: "UTC"
+            ),
+            DayWeaveCanonicalItemDraft(
+                kind: .goal,
+                status: .planned,
+                title: "Goal effort estimate later",
+                timezoneName: "UTC",
+                flexibleConstraints: .object(["has_own_effort": .bool(true)])
+            ),
+            DayWeaveCanonicalItemDraft(
+                kind: .routine,
+                status: .planned,
+                title: "Routine effort estimate later",
+                timezoneName: "UTC",
+                flexibleConstraints: .object(["has_own_effort": .bool(true)])
+            ),
+        ]
+
+        for draft in drafts {
+            #expect(draft.validationIssue(itemID: itemID) == nil)
+            #expect(!draft.createsPlanningDemand(itemID: itemID))
+        }
+    }
+
+    @Test("RFC3339 normalization retains every PostgreSQL microsecond")
+    func exactMicrosecondInstantNormalization() throws {
+        let instant = try #require(CanonicalRFC3339Instant(
+            "2026-09-01T10:00:00.123456+02:00"
+        ))
+        #expect(instant.canonicalUTCString == "2026-09-01T08:00:00.123456Z")
+        #expect(CanonicalRFC3339Instant("2026-09-01t08:00:00.123456z") == nil)
+        #expect(CanonicalRFC3339Instant("2026-09-01T08:00:00+18:01") == nil)
+        #expect(CanonicalRFC3339Instant("2026-09-01T08:00:00-18:00") != nil)
+        #expect(CanonicalRFC3339Instant("2026-09-01T08:00:00.1234560000Z") == nil)
+        #expect(
+            CanonicalRFC3339Instant(date: instant.dateAtMicrosecondPrecision)?.canonicalUTCString
+                == "2026-09-01T08:00:00.123456Z"
+        )
+        #expect(
+            CanonicalRFC3339Instant("9999-12-30T10:00:00.000001Z")?.exactlyRepresentableDate
+                == nil
+        )
+    }
+
+    @Test("Inbox may retain incomplete semantics while supplied kind metadata is strict")
+    func inboxCompletenessAndKindScope() {
+        let habit = DayWeaveCanonicalItemDraft(
+            kind: .habit,
+            status: .inbox,
+            title: "Maybe start a habit",
+            timezoneName: "UTC"
+        )
+        let event = DayWeaveCanonicalItemDraft(
+            kind: .event,
+            status: .inbox,
+            title: "Appointment details later",
+            timezoneName: "UTC"
+        )
+        #expect(habit.validationIssue(itemID: UUID()) == nil)
+        #expect(event.validationIssue(itemID: UUID()) == nil)
+
+        var misplaced = habit
+        misplaced.kind = .task
+        misplaced.flexibleConstraints = .object([
+            "habit_target": .object([
+                "amount": .number(JSONNumber(UInt64(1))),
+                "unit": .string("times"),
+            ]),
+        ])
+        #expect(misplaced.validationIssue(itemID: UUID())?.contains("Habit metadata") == true)
+    }
+
+    @Test("every shared valid metadata fixture has an explicit native authoring classification")
+    func sharedValidFixtureClassifications() throws {
+        let fixtures = try Self.fixtureCases(named: "valid-rich-items.json")
+        let expectedNames: Set<String> = [
+            "frequency_task_with_rich_constraints_and_split_policy",
+            "twice_daily_habit",
+            "completion_relative_ordered_routine",
+            "measured_goal_with_weekly_allocation",
+            "prompted_movement_break",
+            "open_ended_active_break",
+            "blocking_imported_event_with_matching_canonical_bounds",
+            "dst_fall_back_all_day_calendar_context",
+            "owned_legacy_firm_block",
+            "legacy_daily_default_count",
+            "legacy_weekly_default_count",
+            "legacy_monthly_default_count",
+            "inbox_habit_may_be_incomplete",
+            "inbox_event_may_lack_timing",
+            "indivisible_explicit_default_split_extensions",
+        ]
+        let intentionallyReadOnly: Set<String> = [
+            // Structural goal/dependency authority needs graph-aware item pickers.
+            "frequency_task_with_rich_constraints_and_split_policy",
+            // Active/scheduled rows are visible lifecycle records, not editable drafts.
+            "open_ended_active_break",
+            "blocking_imported_event_with_matching_canonical_bounds",
+            "dst_fall_back_all_day_calendar_context",
+            "owned_legacy_firm_block",
+        ]
+
+        #expect(fixtures.count == 15)
+        #expect(Set(fixtures.map(\.name)) == expectedNames)
+        for fixture in fixtures {
+            let (itemID, draft) = try Self.draft(from: fixture)
+            let state = CanonicalItemEditorState(itemID: itemID, draft: draft)
+            if intentionallyReadOnly.contains(fixture.name) {
+                #expect(state.readOnlyDiagnostic != nil, "Expected read-only: \(fixture.name)")
+                #expect(state.draft == draft, "Read-only fixture changed: \(fixture.name)")
+            } else {
+                #expect(
+                    draft.validationIssue(itemID: itemID) == nil,
+                    "Expected server-valid native draft: \(fixture.name)"
+                )
+                #expect(
+                    state.readOnlyDiagnostic == nil,
+                    "Unexpected read-only fixture: \(fixture.name)"
+                )
+                #expect(
+                    state.draft.validationIssue(itemID: itemID) == nil,
+                    "Editor emitted an invalid fixture: \(fixture.name)"
+                )
+            }
+        }
+    }
+
+    @Test("every shared invalid metadata fixture fails closed in native authoring")
+    func sharedInvalidFixtureClassifications() throws {
+        let fixtures = try Self.fixtureCases(named: "invalid-items.json")
+        let expectedNames: Set<String> = [
+            "unknown_metadata_key", "zero_frequency_target", "invalid_soft_weight",
+            "empty_allowed_weekdays", "self_goal_reference", "self_dependency",
+            "habit_metadata_on_task", "goal_with_recurrence",
+            "planned_habit_without_recurrence", "planned_event_without_timing",
+            "event_recurrence_must_be_expanded", "calendar_context_with_extra_metadata",
+            "firm_block_without_ownership", "event_duration_mismatch",
+            "all_day_bounds_not_local_midnight", "event_cannot_be_split",
+            "split_extensions_on_indivisible_item", "maximum_sessions_cannot_fit_duration",
+            "invalid_goal_allocation", "zero_habit_target",
+            "duplicate_canonical_and_metadata_earliest_start",
+            "preferred_start_without_duration", "reversed_occurrence_window",
+            "calendar_frequency_with_rolling_anchor",
+            "rolling_frequency_with_calendar_weekdays",
+            "frequency_anchor_exceeds_database_precision", "duplicate_recurrence_weekday",
+            "duplicate_goal_id", "duplicate_tag", "duplicate_allowed_weekday",
+            "duplicate_daily_window_weekday", "semantic_duplicate_goal_uuid",
+            "semantic_duplicate_dependency_item_id",
+            "canonical_earliest_after_metadata_latest",
+            "metadata_earliest_after_canonical_deadline",
+            "canonical_timestamp_exceeds_database_precision",
+            "fractional_event_duration_cannot_match_integral_seconds",
+            "custom_rrule_is_retained_but_not_authorable",
+            "minimum_notice_exceeds_safe_offset", "frequency_spacing_exceeds_safe_offset",
+            "zero_maximum_chunk_is_rejected_without_panicking",
+            "metadata_timestamp_rejects_noncanonical_separator",
+            "recurrence_anchor_rejects_excess_fractional_digits",
+            "metadata_timestamp_rejects_leap_second",
+            "metadata_timestamp_rejects_offset_beyond_eighteen_hours",
+        ]
+
+        #expect(fixtures.count == 45)
+        #expect(Set(fixtures.map(\.name)) == expectedNames)
+        for fixture in fixtures {
+            do {
+                let (itemID, draft) = try Self.draft(from: fixture)
+                #expect(
+                    draft.validationIssue(itemID: itemID) != nil,
+                    "Invalid fixture was accepted: \(fixture.name)"
+                )
+            } catch FixtureError.unrepresentableInstant {
+                #expect(
+                    fixture.name == "canonical_timestamp_exceeds_database_precision",
+                    "Unexpected unrepresentable instant: \(fixture.name)"
+                )
+            }
+        }
+    }
+
+    @Test("rich pending mutations retain their version-one Codable wire shape")
+    func richPendingMutationCodableCompatibility() throws {
+        let draft = DayWeaveCanonicalItemDraft(
+            kind: .habit,
+            status: .planned,
+            title: "Hydrate",
+            timezoneName: "Europe/Paris",
+            durationSeconds: 900,
+            recurrence: .object([
+                "type": .string("after_completion"),
+                "interval": .number(JSONNumber(UInt64(240))),
+            ]),
+            flexibleConstraints: .object([
+                "habit_target": .object([
+                    "amount": .number(JSONNumber(UInt64(8))),
+                    "unit": .string("glasses"),
+                ]),
+                "preserves_streak_when_paused": .bool(false),
+                "tags": .array([.string("health")]),
+            ])
+        )
+        let mutation = DayWeavePendingCanonicalAuthoringMutation(
+            itemID: UUID(),
+            operation: .create,
+            draft: draft
+        )
+        let decoded = try JSONDecoder().decode(
+            DayWeavePendingCanonicalAuthoringMutation.self,
+            from: JSONEncoder().encode(mutation)
+        )
+        #expect(decoded == mutation)
+        #expect(decoded.version == 1)
+        #expect(decoded.isValid)
     }
 
     @Test("authoring status is limited to Inbox and Planned")
@@ -342,10 +778,190 @@ struct CanonicalAuthoringModelsTests {
             ]),
         ])
     }
+
+    private struct SchedulingFixtureCase {
+        let name: String
+        let fields: [String: JSONValue]
+    }
+
+    private enum FixtureError: Error {
+        case invalidDocument
+        case invalidField(String)
+        case unrepresentableInstant
+    }
+
+    private static func fixtureCases(named fileName: String) throws
+        -> [SchedulingFixtureCase] {
+        var repository = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { repository.deleteLastPathComponent() }
+        let data = try Data(contentsOf: repository
+            .appendingPathComponent("fixtures/scheduling-metadata")
+            .appendingPathComponent(fileName))
+        let root = try JSONDecoder().decode(JSONValue.self, from: data)
+        guard case let .object(document) = root,
+              document["schema"] == .string("dayweave.scheduling-metadata-fixtures/1"),
+              case let .array(entries)? = document["cases"] else {
+            throw FixtureError.invalidDocument
+        }
+        return try entries.map { entry in
+            guard case let .object(value) = entry,
+                  case let .string(name)? = value["name"],
+                  case let .object(fields)? = value["fields"] else {
+                throw FixtureError.invalidDocument
+            }
+            return .init(name: name, fields: fields)
+        }
+    }
+
+    private static func draft(from fixture: SchedulingFixtureCase) throws
+        -> (UUID, DayWeaveCanonicalItemDraft) {
+        let fields = fixture.fields
+        guard case let .string(itemIDRaw)? = fields["item_id"],
+              let itemID = UUID(uuidString: itemIDRaw),
+              case let .string(kindRaw)? = fields["kind"],
+              case let .string(statusRaw)? = fields["status"],
+              case let .string(timezoneName)? = fields["timezone_name"],
+              let kind = canonicalKind(kindRaw),
+              let status = canonicalStatus(statusRaw),
+              let duration = try optionalUnsigned(fields["duration_seconds"]),
+              let deadline = try optionalInstant(fields["deadline_at"]),
+              let earliestStart = try optionalInstant(fields["earliest_start_at"]),
+              let recurrence = optionalJSON(fields["recurrence"]),
+              let flexibleConstraints = fields["flexible_constraints"],
+              let splitPolicy = splitPolicy(fields["split_policy"]),
+              let parentID = try optionalUUID(fields["parent_id"]) else {
+            throw FixtureError.invalidField(fixture.name)
+        }
+        return (itemID, DayWeaveCanonicalItemDraft(
+            kind: kind,
+            status: status,
+            title: fixture.name,
+            timezoneName: timezoneName,
+            durationSeconds: duration,
+            deadlineAt: deadline,
+            earliestStartAt: earliestStart,
+            recurrence: recurrence,
+            flexibleConstraints: flexibleConstraints,
+            splitPolicy: splitPolicy,
+            parentID: parentID
+        ))
+    }
+
+    private static func canonicalKind(_ value: String) -> DayWeaveCanonicalItemKind? {
+        switch value {
+        case "event": .event
+        case "task": .task
+        case "habit": .habit
+        case "routine": .routine
+        case "goal": .goal
+        case "break": .breakTime
+        default: nil
+        }
+    }
+
+    private static func canonicalStatus(_ value: String) -> DayWeaveCanonicalItemStatus? {
+        switch value {
+        case "inbox": .inbox
+        case "planned": .planned
+        case "scheduled": .scheduled
+        case "in_progress": .inProgress
+        case "paused": .paused
+        case "completed": .completed
+        case "skipped": .skipped
+        case "cancelled": .cancelled
+        default: nil
+        }
+    }
+
+    private static func optionalUnsigned(_ value: JSONValue?) throws -> UInt32?? {
+        guard let value, value != .null else { return .some(nil) }
+        guard case let .number(number) = value,
+              let result = number.exactUInt32 else { return nil }
+        return .some(result)
+    }
+
+    private static func optionalInstant(_ value: JSONValue?) throws -> Date?? {
+        guard let value, value != .null else { return .some(nil) }
+        guard case let .string(raw) = value,
+              let instant = CanonicalRFC3339Instant(raw),
+              instant.hasPostgresPrecision else {
+            throw FixtureError.unrepresentableInstant
+        }
+        guard let date = instant.exactlyRepresentableDate else {
+            throw FixtureError.unrepresentableInstant
+        }
+        return .some(date)
+    }
+
+    private static func optionalUUID(_ value: JSONValue?) throws -> UUID?? {
+        guard let value, value != .null else { return .some(nil) }
+        guard case let .string(raw) = value, let result = UUID(uuidString: raw) else {
+            return nil
+        }
+        return .some(result)
+    }
+
+    private static func optionalJSON(_ value: JSONValue?) -> JSONValue?? {
+        guard let value, value != .null else { return .some(nil) }
+        return .some(value)
+    }
+
+    private static func splitPolicy(_ value: JSONValue?) -> DayWeaveSplitPolicy? {
+        guard case let .object(fields)? = value,
+              case let .string(type)? = fields["type"] else { return nil }
+        switch type {
+        case "indivisible":
+            return Set(fields.keys) == ["type"] ? .indivisible : nil
+        case "splittable":
+            guard Set(fields.keys) == [
+                "type", "minimum_chunk_seconds", "maximum_chunk_seconds",
+            ],
+            case let .number(minimum)? = fields["minimum_chunk_seconds"],
+            case let .number(maximum)? = fields["maximum_chunk_seconds"],
+            let minimumValue = minimum.exactUInt32,
+            let maximumValue = maximum.exactUInt32 else { return nil }
+            return .splittable(
+                minimumChunkSeconds: minimumValue,
+                maximumChunkSeconds: maximumValue
+            )
+        default:
+            return nil
+        }
+    }
 }
 
 @Suite("Canonical Inbox presentation")
 struct CanonicalInboxPresentationTests {
+    @Test("partial Inbox events are visible but cannot be replaced lossily")
+    func partialInboxEventIsReadOnly() throws {
+        let partial = try decodeItem(
+            id: UUID(),
+            revision: 1,
+            deleted: false,
+            kind: "event",
+            durationJSON: "900"
+        )
+        let empty = try decodeItem(
+            id: UUID(),
+            revision: 1,
+            deleted: false,
+            kind: "event"
+        )
+        let presentation = CanonicalInboxPresentation.build(
+            activeItems: [partial, empty],
+            pendingMutations: [],
+            trashEntries: []
+        )
+        let rows = Dictionary(uniqueKeysWithValues: presentation.inbox.map { ($0.itemID, $0) })
+        let partialRow = try #require(rows[partial.id])
+        let emptyRow = try #require(rows[empty.id])
+
+        #expect(!partial.supportsCanonicalAuthoringReplacement)
+        #expect(empty.supportsCanonicalAuthoringReplacement)
+        #expect(partialRow.isReadOnly)
+        #expect(!emptyRow.isReadOnly)
+    }
+
     @Test("pending hierarchy is flattened iteratively without a depth limit")
     func deepHierarchy() throws {
         let count = 5_000
@@ -606,7 +1222,11 @@ struct CanonicalInboxPresentationTests {
         revision: UInt64,
         deleted: Bool,
         status: String = "inbox",
-        flexibleConstraintsJSON: String = "{}"
+        flexibleConstraintsJSON: String = "{}",
+        kind: String = "task",
+        durationJSON: String = "null",
+        deadlineJSON: String = "null",
+        earliestStartJSON: String = "null"
     ) throws -> DayWeaveCanonicalItem {
         let deletedAt = deleted
             ? ",\"deleted_at\":\"2026-08-30T10:00:00Z\""
@@ -615,9 +1235,10 @@ struct CanonicalInboxPresentationTests {
             ? "\"2026-08-30T09:30:00Z\""
             : "null"
         let json = """
-        {"id":"\(id.uuidString.lowercased())","is_sensitive":true,"kind":"task",
+        {"id":"\(id.uuidString.lowercased())","is_sensitive":true,"kind":"\(kind)",
         "status":"\(status)","title":"Lifecycle task","notes":null,"timezone_name":"Europe/Madrid",
-        "duration_seconds":null,"deadline_at":null,"earliest_start_at":null,"recurrence":null,
+        "duration_seconds":\(durationJSON),"deadline_at":\(deadlineJSON),
+        "earliest_start_at":\(earliestStartJSON),"recurrence":null,
         "flexible_constraints":\(flexibleConstraintsJSON),"split_policy":{"type":"indivisible"},"importance":50,
         "urgency":50,"parent_id":null,"sibling_order":0,"is_executable":false,"revision":\(revision),
         "created_at":"2026-08-30T09:00:00Z","updated_at":"2026-08-30T10:00:00Z",

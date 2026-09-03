@@ -936,12 +936,16 @@ struct DayWeaveOnboardingFirstItemAnchor: Equatable, Codable, Sendable {
         guard hasValidShape,
               let canonicalRevision,
               !pendingAuthoringMutations.contains(where: { $0.itemID == itemID }),
-              canonicalItems.contains(where: {
+              let item = canonicalItems.first(where: {
                   $0.id == itemID
                       && $0.revision == canonicalRevision
                       && $0.deletedAt == nil
-                      && $0.isExecutable
               }),
+              item.createsPlanningDemand(
+                  canonicalItems: canonicalItems,
+                  hasPendingChildren: pendingAuthoringMutations
+                      .containsPendingCanonicalChild(of: itemID)
+              ),
               let publishedScheduleProof,
               publishedScheduleProof.hasCurrentImmutablePlanSeal else { return false }
         return publishedScheduleProof.publishedBlocks.contains {

@@ -3934,20 +3934,22 @@ struct DayWeaveAPIClient: Sendable {
     }
 
     private static func parseDate(_ value: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: value) {
-            return date
-        }
-        let wholeSeconds = ISO8601DateFormatter()
-        wholeSeconds.formatOptions = [.withInternetDateTime]
-        return wholeSeconds.date(from: value)
+        guard let instant = CanonicalRFC3339Instant(value),
+              instant.hasPostgresPrecision else { return nil }
+        return instant.exactlyRepresentableDate
     }
 
-    private static func format(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+    private static func format(_ date: Date) throws -> String {
+        guard let instant = CanonicalRFC3339Instant(date: date) else {
+            throw EncodingError.invalidValue(
+                date,
+                .init(
+                    codingPath: [],
+                    debugDescription: "Date is outside the canonical RFC 3339 range"
+                )
+            )
+        }
+        return instant.canonicalUTCString
     }
 
     private static func normalizedHeaders(_ response: HTTPURLResponse) -> [String: String] {

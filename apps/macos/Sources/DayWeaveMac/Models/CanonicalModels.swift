@@ -182,6 +182,12 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
     /// marker prevents a restart from accidentally upgrading that item to
     /// writable.
     let hasNonRoundTrippableJSONNumber: Bool
+    /// Exact server timestamp text that passed the canonical/PostgreSQL wire
+    /// contract but cannot be represented by Foundation `Date` without
+    /// changing its microsecond. These internal cache fields keep the row
+    /// visible while permanently fencing full-item mutation.
+    let retainedUnrepresentableDeadlineAt: String?
+    let retainedUnrepresentableEarliestStartAt: String?
     /// Future server fields are retained in the encrypted cache and make the
     /// item read-only until this client understands how to round-trip them.
     let unsupportedFields: [String: JSONValue]
@@ -203,6 +209,15 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         case completedAt = "completed_at"
         case deletedAt = "deleted_at"
         case hasNonRoundTrippableJSONNumber = "_dayweave_non_roundtrippable_json_number"
+        case retainedUnrepresentableDeadlineAt =
+            "_dayweave_unrepresentable_deadline_at"
+        case retainedUnrepresentableEarliestStartAt =
+            "_dayweave_unrepresentable_earliest_start_at"
+    }
+
+    private struct DecodedOptionalCanonicalDate {
+        let date: Date?
+        let retainedUnrepresentableWireValue: String?
     }
 
     init(from decoder: any Decoder) throws {
@@ -219,8 +234,16 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         notes = try container.decodeIfPresent(String.self, forKey: .notes)
         timezoneName = try container.decode(String.self, forKey: .timezoneName)
         durationSeconds = try container.decodeIfPresent(UInt32.self, forKey: .durationSeconds)
-        deadlineAt = try container.decodeIfPresent(Date.self, forKey: .deadlineAt)
-        earliestStartAt = try container.decodeIfPresent(Date.self, forKey: .earliestStartAt)
+        let decodedDeadline = try Self.decodeOptionalCanonicalDate(
+            from: container,
+            forKey: .deadlineAt
+        )
+        let decodedEarliestStart = try Self.decodeOptionalCanonicalDate(
+            from: container,
+            forKey: .earliestStartAt
+        )
+        deadlineAt = decodedDeadline.date
+        earliestStartAt = decodedEarliestStart.date
         recurrence = try container.decodeIfPresent(JSONValue.self, forKey: .recurrence)
         flexibleConstraints = try container.decode(JSONValue.self, forKey: .flexibleConstraints)
         splitPolicy = try container.decode(DayWeaveSplitPolicy.self, forKey: .splitPolicy)
@@ -238,6 +261,24 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             Bool.self,
             forKey: .hasNonRoundTrippableJSONNumber
         ) ?? false
+        retainedUnrepresentableDeadlineAt = try Self.retainedTimestampMarker(
+            decoded: decodedDeadline,
+            persisted: container.decodeIfPresent(
+                String.self,
+                forKey: .retainedUnrepresentableDeadlineAt
+            ),
+            key: .retainedUnrepresentableDeadlineAt,
+            in: container
+        )
+        retainedUnrepresentableEarliestStartAt = try Self.retainedTimestampMarker(
+            decoded: decodedEarliestStart,
+            persisted: container.decodeIfPresent(
+                String.self,
+                forKey: .retainedUnrepresentableEarliestStartAt
+            ),
+            key: .retainedUnrepresentableEarliestStartAt,
+            in: container
+        )
         let known = Set(CodingKeys.allCases.map(\.rawValue))
         let dynamic = try decoder.container(keyedBy: DynamicCodingKey.self)
         var future: [String: JSONValue] = [:]
@@ -289,6 +330,14 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
             hasNonRoundTrippableJSONNumber,
             forKey: .hasNonRoundTrippableJSONNumber
         )
+        try container.encodeIfPresent(
+            retainedUnrepresentableDeadlineAt,
+            forKey: .retainedUnrepresentableDeadlineAt
+        )
+        try container.encodeIfPresent(
+            retainedUnrepresentableEarliestStartAt,
+            forKey: .retainedUnrepresentableEarliestStartAt
+        )
         var dynamic = encoder.container(keyedBy: DynamicCodingKey.self)
         for (key, value) in unsupportedFields {
             try dynamic.encode(value, forKey: .init(key))
@@ -303,10 +352,73 @@ struct DayWeaveCanonicalItem: Codable, Equatable, Identifiable, Sendable {
         // normalize server timestamp strings or an arbitrary JSON number on
         // that path. Such items remain readable and cached, but read-only.
         guard deadlineAt == nil, earliestStartAt == nil,
+              retainedUnrepresentableDeadlineAt == nil,
+              retainedUnrepresentableEarliestStartAt == nil,
               !hasNonRoundTrippableJSONNumber,
               recurrence?.supportsLosslessRoundTrip ?? true,
               flexibleConstraints.supportsLosslessRoundTrip else { return false }
         return true
+    }
+
+    var retainedUnrepresentableTimestampDiagnostic: String? {
+        var fields: [String] = []
+        if let retainedUnrepresentableEarliestStartAt {
+            fields.append("earliest start (\(retainedUnrepresentableEarliestStartAt))")
+        }
+        if let retainedUnrepresentableDeadlineAt {
+            fields.append("deadline (\(retainedUnrepresentableDeadlineAt))")
+        }
+        guard !fields.isEmpty else { return nil }
+        return "This item's exact canonical \(fields.joined(separator: " and ")) cannot be represented safely by this Mac. The exact value is retained, and the item remains read-only."
+    }
+
+    private static func decodeOptionalCanonicalDate(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) throws -> DecodedOptionalCanonicalDate {
+        guard container.contains(key), try !container.decodeNil(forKey: key) else {
+            return .init(date: nil, retainedUnrepresentableWireValue: nil)
+        }
+        if let wireValue = try? container.decode(String.self, forKey: key) {
+            guard let instant = CanonicalRFC3339Instant(wireValue),
+                  instant.hasPostgresPrecision else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "Expected a canonical PostgreSQL-precision RFC 3339 timestamp"
+                )
+            }
+            if let date = instant.exactlyRepresentableDate {
+                return .init(date: date, retainedUnrepresentableWireValue: nil)
+            }
+            return .init(date: nil, retainedUnrepresentableWireValue: wireValue)
+        }
+        return .init(
+            date: try container.decode(Date.self, forKey: key),
+            retainedUnrepresentableWireValue: nil
+        )
+    }
+
+    private static func retainedTimestampMarker(
+        decoded: DecodedOptionalCanonicalDate,
+        persisted: String?,
+        key: CodingKeys,
+        in container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> String? {
+        if let persisted {
+            guard let instant = CanonicalRFC3339Instant(persisted),
+                  instant.hasPostgresPrecision,
+                  instant.exactlyRepresentableDate == nil,
+                  decoded.date == nil,
+                  decoded.retainedUnrepresentableWireValue.map({ $0 == persisted }) ?? true else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: key,
+                    in: container,
+                    debugDescription: "Invalid retained unrepresentable canonical timestamp marker"
+                )
+            }
+        }
+        return decoded.retainedUnrepresentableWireValue ?? persisted
     }
 }
 
@@ -503,6 +615,10 @@ private extension DayWeaveCanonicalItem {
         total = total.saturatingAdding(title.utf8.count)
         total = total.saturatingAdding(notes?.utf8.count ?? 0)
         total = total.saturatingAdding(timezoneName.utf8.count)
+        total = total.saturatingAdding(retainedUnrepresentableDeadlineAt?.utf8.count ?? 0)
+        total = total.saturatingAdding(
+            retainedUnrepresentableEarliestStartAt?.utf8.count ?? 0
+        )
         total = total.saturatingAdding(recurrence?.retainedByteEstimate ?? 0)
         total = total.saturatingAdding(flexibleConstraints.retainedByteEstimate)
         if case let .unknown(raw) = splitPolicy {
@@ -1413,9 +1529,16 @@ extension JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            try container.encode(formatter.string(from: date))
+            guard let instant = CanonicalRFC3339Instant(date: date) else {
+                throw EncodingError.invalidValue(
+                    date,
+                    .init(
+                        codingPath: encoder.codingPath,
+                        debugDescription: "Date is outside the canonical RFC 3339 range"
+                    )
+                )
+            }
+            try container.encode(instant.canonicalUTCString)
         }
         encoder.outputFormatting = [.sortedKeys]
         return encoder

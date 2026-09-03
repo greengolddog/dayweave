@@ -320,6 +320,9 @@ struct DayWeaveAPIClientTests {
             .init(statusCode: 200, body: Data("{\"item\":\(Self.canonicalItemObject(revision: 2, status: "paused", deadlineAt: "null", recurrence: "null"))}".utf8))
         )
         let client = makeClient(token: Self.apiToken)
+        let preciseDeadline = try #require(CanonicalRFC3339Instant(
+            "2026-09-01T17:00:00.123456Z"
+        )).dateAtMicrosecondPrecision
         let fields = DayWeaveCanonicalItemFields(
             kind: .task,
             status: .scheduled,
@@ -327,7 +330,7 @@ struct DayWeaveAPIClientTests {
             notes: "Keep exact constraints",
             timezoneName: "Europe/Madrid",
             durationSeconds: 3_600,
-            deadlineAt: Self.date("2026-09-01T17:00:00Z"),
+            deadlineAt: preciseDeadline,
             recurrence: .object([
                 "type": .string("weekly"),
                 "times_per_week": .number(2),
@@ -365,6 +368,10 @@ struct DayWeaveAPIClientTests {
         #expect(create["is_sensitive"] as? Bool == false)
         #expect(create["fields"] == nil)
         #expect((create["duration_seconds"] as? NSNumber)?.uint32Value == 3_600)
+        #expect(
+            String(data: try #require(requests[0].body), encoding: .utf8)?
+                .contains(#""deadline_at":"2026-09-01T17:00:00.123456Z""#) == true
+        )
         #expect((create["recurrence"] as? [String: Any])?["type"] as? String == "weekly")
         #expect((create["split_policy"] as? [String: Any])?["type"] as? String == "splittable")
         let replace = try #require(requests[1].jsonBody)
@@ -375,11 +382,15 @@ struct DayWeaveAPIClientTests {
 
     @Test("canonical list carries exact filters and decodes items")
     func testCanonicalListCarriesExactFiltersAndDecodesItems() async throws {
+        let responseItem = Self.canonicalItemObject(
+            revision: 9,
+            deadlineAt: "\"2026-09-01T17:00:00.123456Z\""
+        )
         URLProtocolStub.storage.enqueue(
             key: Self.apiToken,
             .init(
                 statusCode: 200,
-                body: Data("{\"items\":[\(Self.canonicalItemObject(revision: 9))]}".utf8)
+                body: Data("{\"items\":[\(responseItem)]}".utf8)
             )
         )
         let client = makeClient(token: Self.apiToken)
@@ -395,6 +406,10 @@ struct DayWeaveAPIClientTests {
         #expect(item.id == Self.itemID)
         #expect(item.revision == 9)
         #expect(item.title == "Canonical deep work")
+        #expect(
+            item.deadlineAt.flatMap(CanonicalRFC3339Instant.init(date:))?.canonicalUTCString
+                == "2026-09-01T17:00:00.123456Z"
+        )
 
         let request = try #require(URLProtocolStub.storage.requests(for: Self.apiToken).first)
         #expect(request.method == "GET")
@@ -406,6 +421,90 @@ struct DayWeaveAPIClientTests {
         #expect(request.body == nil)
         #expect(request.headers["Authorization"] == "Bearer \(Self.apiToken)")
         #expect(request.headers["Accept"] == "application/json")
+    }
+
+    @Test("canonical lists retain Date-unrepresentable bounds as durable read-only rows")
+    func testCanonicalListRetainsUnrepresentableBounds() async throws {
+        let retainedDeadline = "9999-12-30T10:00:00.000001Z"
+        let retainedEarliestStart = "9999-12-29T10:00:00.000001Z"
+        let secondID = UUID(uuidString: "eeeeeeee-2222-4333-8444-ffffffffffff")!
+        let distant = Self.canonicalItemObject(
+            revision: 9,
+            deadlineAt: "\"\(retainedDeadline)\""
+        ).replacingOccurrences(
+            of: "\"earliest_start_at\":null",
+            with: "\"earliest_start_at\":\"\(retainedEarliestStart)\""
+        )
+        let ordinary = Self.canonicalItemObject(revision: 10, deadlineAt: "null")
+            .replacingOccurrences(
+                of: Self.itemID.uuidString.lowercased(),
+                with: secondID.uuidString.lowercased()
+            )
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(distant),\(ordinary)]}".utf8)
+            )
+        )
+
+        let items = try await makeClient(token: Self.apiToken).listCanonicalItems()
+
+        #expect(items.count == 2)
+        let retained = try #require(items.first { $0.id == Self.itemID })
+        #expect(retained.title == "Canonical deep work")
+        #expect(retained.deadlineAt == nil)
+        #expect(retained.earliestStartAt == nil)
+        #expect(retained.retainedUnrepresentableDeadlineAt == retainedDeadline)
+        #expect(retained.retainedUnrepresentableEarliestStartAt == retainedEarliestStart)
+        #expect(!retained.supportsCanonicalAuthoringReplacement)
+        #expect(!retained.supportsLosslessReplacement)
+        let readOnlyDiagnostic = try #require(
+            retained.retainedUnrepresentableTimestampDiagnostic
+        )
+        #expect(readOnlyDiagnostic.contains(retainedEarliestStart))
+        #expect(readOnlyDiagnostic.contains(retainedDeadline))
+        #expect(items.contains { $0.id == secondID })
+
+        let cacheEncoder = JSONEncoder()
+        cacheEncoder.dateEncodingStrategy = .millisecondsSince1970
+        let cached = try cacheEncoder.encode(retained)
+        let cachedObject = try #require(
+            JSONSerialization.jsonObject(with: cached) as? [String: Any]
+        )
+        #expect(cachedObject["deadline_at"] == nil)
+        #expect(
+            cachedObject["_dayweave_unrepresentable_deadline_at"] as? String
+                == retainedDeadline
+        )
+        #expect(
+            cachedObject["_dayweave_unrepresentable_earliest_start_at"] as? String
+                == retainedEarliestStart
+        )
+        let cacheDecoder = JSONDecoder()
+        cacheDecoder.dateDecodingStrategy = .millisecondsSince1970
+        let restored = try cacheDecoder.decode(DayWeaveCanonicalItem.self, from: cached)
+        #expect(restored == retained)
+        #expect(!restored.supportsCanonicalAuthoringReplacement)
+    }
+
+    @Test("canonical item bounds remain strict when their wire instant is malformed")
+    func testCanonicalListRejectsMalformedCanonicalBounds() async {
+        let malformed = Self.canonicalItemObject(
+            revision: 9,
+            deadlineAt: #""9999-12-30T10:00:00.0000001Z""#
+        )
+        URLProtocolStub.storage.enqueue(
+            key: Self.apiToken,
+            .init(
+                statusCode: 200,
+                body: Data("{\"items\":[\(malformed)]}".utf8)
+            )
+        )
+
+        await #expect(throws: DayWeaveAPIError.responseDecodingFailed) {
+            _ = try await makeClient(token: Self.apiToken).listCanonicalItems()
+        }
     }
 
     @Test("canonical get validates the requested active identity")

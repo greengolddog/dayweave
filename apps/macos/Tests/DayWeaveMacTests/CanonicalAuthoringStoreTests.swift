@@ -157,6 +157,71 @@ struct CanonicalAuthoringStoreTests {
         #expect(restarted.blocks.isEmpty)
     }
 
+    @Test("rich typed scheduling metadata remains durable across an encrypted restart")
+    func richSchedulingMetadataRestartRoundTrip() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID(uuidString: "aa100000-0000-4000-8000-000000000002")!
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let draft = DayWeaveCanonicalItemDraft(
+            kind: .habit,
+            status: .planned,
+            title: "Practice pronunciation",
+            timezoneName: "Europe/Paris",
+            durationSeconds: 1_800,
+            recurrence: .object([
+                "type": .string("weekly"),
+                "times_per_week": .number(JSONNumber(UInt64(3))),
+                "weekdays": .array([
+                    .string("monday"), .string("wednesday"), .string("friday"),
+                ]),
+            ]),
+            flexibleConstraints: .object([
+                "constraints": .object([
+                    "allowed_weekdays": .object([
+                        "value": .array([
+                            .string("monday"), .string("wednesday"), .string("friday"),
+                        ]),
+                        "strength": .object(["level": .string("hard")]),
+                    ]),
+                ]),
+                "energy": .object([
+                    "value": .string("deep"),
+                    "strength": .object([
+                        "level": .string("soft"),
+                        "weight": .number(JSONNumber(UInt64(250))),
+                    ]),
+                ]),
+                "tags": .array([.string("language"), .string("focus")]),
+                "habit_target": .object([
+                    "amount": .number(JSONNumber(UInt64(3))),
+                    "unit": .string("sessions"),
+                ]),
+                "preserves_streak_when_paused": .bool(true),
+                "preferred_start_minute": .number(JSONNumber(UInt64(600))),
+                "maximum_sessions": .number(JSONNumber(UInt64(2))),
+                "minimum_gap_minutes": .number(JSONNumber(UInt64(15))),
+                "maximum_split_days": .number(JSONNumber(UInt64(2))),
+            ]),
+            splitPolicy: .splittable(
+                minimumChunkSeconds: 900,
+                maximumChunkSeconds: 900
+            )
+        )
+        let store = PlannerStore(
+            persistence: context.persistence,
+            restoreFromPersistence: false,
+            now: { now }
+        )
+
+        let mutation = try store.enqueueCanonicalCreate(itemID: itemID, draft: draft)
+        let restarted = PlannerStore(persistence: context.persistence)
+
+        #expect(mutation.draft == draft)
+        #expect(restarted.pendingCanonicalAuthoringMutations == [mutation])
+        #expect(restarted.pendingCanonicalAuthoringMutations.first?.draft == draft)
+    }
+
     @Test("submitted authoring is immutable and sync transitions require the owned fence")
     func submittedMutationFenceAndRestart() throws {
         let context = try Self.makePersistence()
@@ -262,6 +327,31 @@ struct CanonicalAuthoringStoreTests {
         #expect(store.canonicalItem(id: itemID) == restored)
         #expect(store.canonicalTrash.isEmpty)
         #expect(store.pendingCanonicalAuthoringMutations.isEmpty)
+    }
+
+    @Test("opaque canonical rows can still be moved to Recently Deleted")
+    func unsupportedCanonicalItemCanBeTrashed() throws {
+        let context = try Self.makePersistence()
+        defer { try? FileManager.default.removeItem(at: context.directory) }
+        let itemID = UUID()
+        let opaque = try Self.item(
+            id: itemID,
+            revision: 7,
+            deleted: false,
+            flexibleConstraintsJSON: #"{"future_rule":{"version":2}}"#
+        )
+        let store = PlannerStore(
+            canonicalItems: [opaque],
+            canonicalConfigurationIdentifier: Self.configurationIdentifier,
+            persistence: context.persistence,
+            restoreFromPersistence: false
+        )
+
+        #expect(!opaque.supportsCanonicalAuthoringReplacement)
+        let mutation = try store.enqueueCanonicalTrash(itemID: itemID)
+        #expect(mutation.operation == .trash)
+        #expect(mutation.expectedRevision == 7)
+        #expect(mutation.baseItem == opaque)
     }
 
     @Test("leaf-only deletion rejects either ordering with a child restore")
@@ -1818,6 +1908,7 @@ struct CanonicalAuthoringStoreTests {
                     "target": .number(JSONNumber(UInt64(2))),
                     "period": .string("week"),
                     "semantics": .string("calendar"),
+                    "anchor": .string("2027-01-15T08:00:00Z"),
                 ])
             )
         )
@@ -1859,7 +1950,8 @@ struct CanonicalAuthoringStoreTests {
         title: String = "Canonical authoring item",
         notes: String = "Retained notes",
         parentID: UUID? = nil,
-        isSensitive: Bool = false
+        isSensitive: Bool = false,
+        flexibleConstraintsJSON: String = #"{"energy":"deep"}"#
     ) throws -> DayWeaveCanonicalItem {
         let deletedAt = deleted ? #""2027-01-15T12:00:00Z""# : "null"
         let parent = parentID.map { "\"\($0.uuidString.lowercased())\"" } ?? "null"
@@ -1869,7 +1961,7 @@ struct CanonicalAuthoringStoreTests {
           "kind":"task","status":"inbox","title":"\#(title)",
           "notes":"\#(notes)","timezone_name":"UTC","duration_seconds":1800,
           "deadline_at":null,"earliest_start_at":null,"recurrence":null,
-          "flexible_constraints":{"energy":"deep"},
+          "flexible_constraints":\#(flexibleConstraintsJSON),
           "split_policy":{"type":"indivisible"},"importance":50,"urgency":50,
           "parent_id":\#(parent),"sibling_order":0,"is_executable":true,
           "revision":\#(revision),"created_at":"2027-01-15T10:00:00Z",

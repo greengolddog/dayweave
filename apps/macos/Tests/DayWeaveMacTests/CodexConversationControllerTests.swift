@@ -424,28 +424,34 @@ struct CodexConversationControllerTests {
         {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T09:00:00Z","ends_at":"2026-09-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
         """
         let items = [
-            Self.itemJSON(kind: "event", duration: "3600", constraints: eventConstraints),
-            Self.itemJSON(kind: "task"),
-            Self.itemJSON(
+            ("event", Self.itemJSON(
+                kind: "event",
+                duration: "3600",
+                deadline: "\"2026-09-01T10:00:00Z\"",
+                earliestStart: "\"2026-09-01T09:00:00Z\"",
+                constraints: eventConstraints
+            )),
+            ("task", Self.itemJSON(kind: "task")),
+            ("habit", Self.itemJSON(
                 kind: "habit",
                 recurrence: "{\"type\":\"weekly\",\"times_per_week\":3,\"weekdays\":[\"monday\",\"wednesday\",\"friday\"]}"
-            ),
-            Self.itemJSON(
+            )),
+            ("routine", Self.itemJSON(
                 kind: "routine",
                 constraints: "{\"has_own_effort\":false}"
-            ),
-            Self.itemJSON(
+            )),
+            ("goal", Self.itemJSON(
                 kind: "goal",
                 constraints: "{\"has_own_effort\":false}"
-            ),
-            Self.itemJSON(kind: "break"),
+            )),
+            ("break", Self.itemJSON(kind: "break")),
         ]
-        for item in items {
+        for (kind, item) in items {
             let single = CodexProposalEnvelopeParser.parse(
                 Self.envelope([Self.suggestionJSON(summary: "Editable", item: item)])
             )
-            #expect(!single.containedInvalidEnvelope)
-            #expect(single.drafts.count == 1)
+            #expect(!single.containedInvalidEnvelope, "Failed kind: \(kind)")
+            #expect(single.drafts.count == 1, "Failed kind: \(kind)")
         }
     }
 
@@ -505,12 +511,13 @@ struct CodexConversationControllerTests {
             Self.itemJSON(timezone: "PST"),
             Self.itemJSON(deadline: "\"2026-02-30T12:00:00Z\""),
             Self.itemJSON(deadline: "\"2026-09-01T12:00:00+0200\""),
+            Self.itemJSON(deadline: "\"2026-09-01T12:00:00+18:01\""),
             Self.itemJSON(duration: "1800.0"),
             Self.itemJSON(importance: "true"),
             Self.itemJSON(title: "Unsafe\\u202Etitle"),
             Self.itemJSON(notes: "\"Unsafe\\nnotes\""),
             Self.itemJSON(
-                recurrence: "{\"type\":\"frequency\",\"target\":2,\"period\":\"week\",\"semantics\":\"calendar\"}"
+                recurrence: "{\"type\":\"frequency\",\"target\":2,\"period\":\"week\",\"semantics\":\"calendar\",\"anchor\":\"2026-09-01T09:00:00Z\"}"
             ),
             Self.itemJSON(
                 kind: "event",
@@ -528,7 +535,7 @@ struct CodexConversationControllerTests {
     }
 
     @Test("Codex drafts cannot hide semantics outside the typed review surface")
-    func testHiddenReviewFieldsAreDenied() {
+    func testHiddenReviewFieldsAreDenied() throws {
         let ordinaryFirmBlock = """
         {"dayweave_firm_block":{"owned":true,"starts_at":"2026-09-01T09:00:00Z","ends_at":"2026-09-01T10:00:00Z","all_day":false,"tentative":false,"busy":true}}
         """
@@ -611,7 +618,10 @@ struct CodexConversationControllerTests {
             ),
         ]))
         #expect(!nilDurationEvent.containedInvalidEnvelope)
-        #expect(nilDurationEvent.drafts.count == 1)
+        let nilDurationDraft = try #require(nilDurationEvent.drafts.first?.canonicalDraft)
+        #expect(nilDurationDraft.durationSeconds == nil)
+        #expect(nilDurationDraft.earliestStartAt == nil)
+        #expect(nilDurationDraft.deadlineAt == nil)
     }
 
     @Test("the item-draft envelope is bounded, trailing, and hidden while streaming")

@@ -135,7 +135,10 @@ struct CanonicalItemEditorView: View {
                     planningSection
                     if state.kind == .event { eventSection }
                     if state.supportsRecurrence { recurrenceSection }
-                    constraintsSection
+                    if state.kind != .event || state.hasEventFlexibleMetadata {
+                        constraintsSection
+                    }
+                    if state.kind != .event { kindMetadataSection }
                     hierarchySection
                 }
                 .padding(20)
@@ -234,7 +237,7 @@ struct CanonicalItemEditorView: View {
 
                 Picker("Ready state", selection: $state.readyStatus) {
                     Text("Inbox — decide later").tag(DayWeaveCanonicalItemStatus.inbox)
-                    Text("Planned — ready to compose").tag(DayWeaveCanonicalItemStatus.planned)
+                    Text("Planned — prepare for scheduling").tag(DayWeaveCanonicalItemStatus.planned)
                 }
                 .accessibilityIdentifier("canonical-editor.status")
             }
@@ -278,26 +281,36 @@ struct CanonicalItemEditorView: View {
                 }
             }
 
-            Toggle("Earliest start", isOn: $state.hasEarliestStart)
-            if state.hasEarliestStart {
-                DatePicker(
-                    "May start after",
-                    selection: $state.earliestStart,
-                    displayedComponents: [.date, .hourAndMinute]
-                )
-                .environment(\.timeZone, editorTimeZone)
-                .accessibilityIdentifier("canonical-editor.earliest")
-            }
+            if state.kind != .event {
+                Toggle("Earliest start", isOn: $state.hasEarliestStart)
+                if state.hasEarliestStart {
+                    DatePicker(
+                        "May start after",
+                        selection: $state.earliestStart,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .environment(\.timeZone, editorTimeZone)
+                    .accessibilityIdentifier("canonical-editor.earliest")
+                    strengthEditor(
+                        strength: $state.earliestStartStrength,
+                        softWeight: $state.earliestStartSoftWeight
+                    )
+                }
 
-            Toggle("Deadline", isOn: $state.hasDeadline)
-            if state.hasDeadline {
-                DatePicker(
-                    "Finish by",
-                    selection: $state.deadline,
-                    displayedComponents: [.date, .hourAndMinute]
-                )
-                .environment(\.timeZone, editorTimeZone)
-                .accessibilityIdentifier("canonical-editor.deadline")
+                Toggle("Deadline", isOn: $state.hasDeadline)
+                if state.hasDeadline {
+                    DatePicker(
+                        "Finish by",
+                        selection: $state.deadline,
+                        displayedComponents: [.date, .hourAndMinute]
+                    )
+                    .environment(\.timeZone, editorTimeZone)
+                    .accessibilityIdentifier("canonical-editor.deadline")
+                    strengthEditor(
+                        strength: $state.deadlineStrength,
+                        softWeight: $state.deadlineSoftWeight
+                    )
+                }
             }
 
             TextField("IANA timezone", text: timezoneName)
@@ -311,28 +324,70 @@ struct CanonicalItemEditorView: View {
 
     private var eventSection: some View {
         CanonicalEditorSection(title: "Event time", symbol: "calendar") {
-            Toggle("All-day event", isOn: eventIsAllDay)
-            DatePicker(
-                "Starts",
-                selection: eventStart,
-                displayedComponents: state.eventIsAllDay ? [.date] : [.date, .hourAndMinute]
-            )
-            .environment(\.timeZone, editorTimeZone)
-            .accessibilityIdentifier("canonical-editor.event.start")
-            DatePicker(
-                "Ends",
-                selection: eventEnd,
-                displayedComponents: state.eventIsAllDay ? [.date] : [.date, .hourAndMinute]
-            )
-            .environment(\.timeZone, editorTimeZone)
-            .accessibilityIdentifier("canonical-editor.event.end")
-            Label("This owned event reserves a fixed time range.", systemImage: "pin.fill")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Toggle("Publish as tentative", isOn: $state.eventIsTentative)
-                .accessibilityIdentifier("canonical-editor.event.tentative")
-            Toggle("Show as busy", isOn: $state.eventIsBusy)
-                .accessibilityIdentifier("canonical-editor.event.busy")
+            if let metadata = state.eventFlexibleMetadataPresentation {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Flexible metadata is retained", systemImage: "archivebox")
+                        .font(.subheadline.weight(.semibold))
+                    Text(metadata.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    DisclosureGroup("Retained metadata details") {
+                        Text(metadata.details)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 4)
+                    }
+                    Button(role: .destructive) {
+                        state.clearEventFlexibleMetadata()
+                    } label: {
+                        Label("Clear flexible metadata", systemImage: "trash")
+                    }
+                    .accessibilityIdentifier("canonical-editor.event.clear-flexible-metadata")
+                    Text(
+                        "Owned timing must be this event's only scheduling metadata. "
+                            + "Clear these details explicitly before adding fixed bounds."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("canonical-editor.event.retained-flexible-metadata")
+            }
+            Toggle("Set an exact event time", isOn: eventTimingEnabled)
+                .disabled(state.hasEventFlexibleMetadata)
+                .accessibilityIdentifier("canonical-editor.event.timing-enabled")
+            if state.hasEventTiming {
+                Toggle("All-day event", isOn: eventIsAllDay)
+                DatePicker(
+                    "Starts",
+                    selection: eventStart,
+                    displayedComponents: state.eventIsAllDay ? [.date] : [.date, .hourAndMinute]
+                )
+                .environment(\.timeZone, editorTimeZone)
+                .accessibilityIdentifier("canonical-editor.event.start")
+                DatePicker(
+                    "Ends",
+                    selection: eventEnd,
+                    displayedComponents: state.eventIsAllDay ? [.date] : [.date, .hourAndMinute]
+                )
+                .environment(\.timeZone, editorTimeZone)
+                .accessibilityIdentifier("canonical-editor.event.end")
+                Label("This owned event reserves a fixed time range.", systemImage: "pin.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Toggle("Publish as tentative", isOn: $state.eventIsTentative)
+                    .accessibilityIdentifier("canonical-editor.event.tentative")
+                Toggle("Publish as busy to connected calendars", isOn: $state.eventIsBusy)
+                    .accessibilityIdentifier("canonical-editor.event.busy")
+                Text("DayWeave always reserves this owned interval; Busy only controls calendar publication.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("Inbox events can stay incomplete. Planned events require exact timing.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Text("Calendar-linked events are read-only here and must be changed in their source calendar.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -341,45 +396,111 @@ struct CanonicalItemEditorView: View {
 
     private var recurrenceSection: some View {
         CanonicalEditorSection(title: "Recurrence", symbol: "repeat") {
-            Picker("Repeats", selection: $state.recurrence) {
-                ForEach(CanonicalItemEditorRecurrence.allCases) { option in
-                    Text(option.title).tag(option)
+            if state.recurrence == .custom {
+                LabeledContent("Repeats", value: "Custom RRULE (read-only)")
+            } else {
+                Picker("Repeats", selection: $state.recurrence) {
+                    ForEach(CanonicalItemEditorRecurrence.authorableCases) { option in
+                        Text(option.title).tag(option)
+                    }
                 }
+                .accessibilityIdentifier("canonical-editor.recurrence")
             }
-            .accessibilityIdentifier("canonical-editor.recurrence")
 
             switch state.recurrence {
             case .none:
                 Text(state.kind == .habit
-                    ? "Habits need a repeat rule before they can be saved."
+                    ? (state.readyStatus == .planned
+                        ? "Planned habits need a repeat rule before they can be saved."
+                        : "Inbox habits can stay without a repeat rule until you are ready to plan them.")
                     : "This item is scheduled once.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             case .daily:
-                Stepper(value: recurrenceCount, in: 1...64) {
+                Stepper(value: recurrenceCount, in: 1...Int(UInt16.max)) {
                     Text("\(state.recurrenceCount) time\(state.recurrenceCount == 1 ? "" : "s") per day")
                 }
             case .weekly:
-                Stepper(value: recurrenceCount, in: 1...64) {
+                Stepper(value: recurrenceCount, in: 1...Int(UInt16.max)) {
                     Text("\(state.recurrenceCount) time\(state.recurrenceCount == 1 ? "" : "s") per week")
                 }
                 weekdayPicker
             case .monthly:
-                Stepper(value: recurrenceCount, in: 1...64) {
+                Stepper(value: recurrenceCount, in: 1...Int(UInt16.max)) {
                     Text("\(state.recurrenceCount) time\(state.recurrenceCount == 1 ? "" : "s") per month")
                 }
             case .everyInterval, .afterCompletion:
-                Stepper(value: intervalMinutes, in: 1...5_256_000, step: 15) {
+                Stepper(
+                    value: intervalMinutes,
+                    in: 1...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                    step: 15
+                ) {
                     LabeledContent(
                         "Interval",
-                        value: CanonicalItemEditorState.durationDescription(
-                            state.recurrenceIntervalMinutes * 60
+                        value: CanonicalItemEditorState.minuteDescription(
+                            state.recurrenceIntervalMinutes
                         )
                     )
                 }
                 Text(state.recurrence == .afterCompletion
                     ? "The next occurrence is anchored to completion."
                     : "Occurrences use a rolling interval in minutes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .frequency:
+                Stepper(value: recurrenceCount, in: 1...Int(UInt16.max)) {
+                    LabeledContent("Target", value: String(state.recurrenceCount))
+                }
+                HStack {
+                    Picker("Period", selection: $state.recurrencePeriod) {
+                        ForEach(CanonicalItemEditorRecurrencePeriod.allCases) { period in
+                            Text(period.title).tag(period)
+                        }
+                    }
+                    Picker("Semantics", selection: $state.recurrenceSemantics) {
+                        ForEach(CanonicalItemEditorRecurrenceSemantics.allCases) { semantics in
+                            Text(semantics.title).tag(semantics)
+                        }
+                    }
+                    .onChange(of: state.recurrenceSemantics) { _, semantics in
+                        if semantics == .calendar {
+                            state.hasRecurrenceAnchor = false
+                        } else {
+                            state.weekdays = []
+                        }
+                    }
+                }
+                if state.recurrenceSemantics == .calendar { weekdayPicker }
+                Stepper(
+                    value: frequencySpacingMinutes,
+                    in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                    step: 15
+                ) {
+                    LabeledContent(
+                        "Minimum spacing",
+                        value: state.recurrenceMinimumSpacingMinutes == 0
+                            ? "No minimum"
+                            : CanonicalItemEditorState.minuteDescription(
+                                state.recurrenceMinimumSpacingMinutes
+                            )
+                    )
+                }
+                if state.recurrenceSemantics == .rolling {
+                    Toggle("Use a rolling anchor", isOn: $state.hasRecurrenceAnchor)
+                    if state.hasRecurrenceAnchor {
+                        DatePicker(
+                            "Anchor",
+                            selection: $state.recurrenceAnchor,
+                            displayedComponents: [.date, .hourAndMinute]
+                        )
+                        .environment(\.timeZone, editorTimeZone)
+                    }
+                }
+            case .custom:
+                Text(state.customRecurrenceRule)
+                    .textSelection(.enabled)
+                    .accessibilityIdentifier("canonical-editor.recurrence.rrule")
+                Text("This rule is preserved exactly but cannot be edited until DayWeave can expand it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -408,14 +529,209 @@ struct CanonicalItemEditorView: View {
 
     private var constraintsSection: some View {
         CanonicalEditorSection(title: "Flexible constraints", symbol: "slider.horizontal.3") {
-            if state.kind != .event {
-                Picker("Energy", selection: $state.energy) {
-                    ForEach(CanonicalItemEditorEnergy.allCases) { energy in
-                        Text(energy.title).tag(energy)
-                    }
+            if state.kind == .event {
+                Text(
+                    "These retained Inbox details remain part of the event until you clear "
+                        + "them explicitly in Event time."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Picker("Energy", selection: $state.energy) {
+                ForEach(CanonicalItemEditorEnergy.allCases) { energy in
+                    Text(energy.title).tag(energy)
                 }
-                .accessibilityIdentifier("canonical-editor.energy")
+            }
+            .accessibilityIdentifier("canonical-editor.energy")
+            if state.energy != .unspecified {
+                strengthEditor(
+                    strength: $state.energyStrength,
+                    softWeight: $state.energySoftWeight
+                )
+            }
 
+            editorListHeader("Tags") {
+                state.tags.append(.init())
+            }
+            .accessibilityIdentifier("canonical-editor.tags.add")
+            ForEach($state.tags) { $tag in
+                HStack {
+                    TextField("Tag", text: $tag.value)
+                        .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("canonical-editor.tags.value")
+                    Button(role: .destructive) {
+                        state.tags.removeAll { $0.id == tag.id }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Remove tag")
+                }
+            }
+
+            DisclosureGroup("Timing and capability rules") {
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle(
+                        "Prefer a start time",
+                        isOn: $state.hasPreferredStartMinute
+                    )
+                    if state.hasPreferredStartMinute {
+                        Stepper(
+                            value: preferredStartMinute,
+                            in: 0...1_439,
+                            step: 15
+                        ) {
+                            LabeledContent(
+                                "Preferred start",
+                                value: minuteOfDayLabel(state.preferredStartMinute)
+                            )
+                        }
+                        .accessibilityIdentifier("canonical-editor.preferred-start-minute")
+                        Text("The complete item must still fit within that local day.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Toggle("Minimum notice", isOn: $state.hasMinimumNotice)
+                    if state.hasMinimumNotice {
+                        Stepper(
+                            value: minimumNoticeMinutes,
+                            in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes)
+                        ) {
+                            LabeledContent(
+                                "Notice",
+                                value: CanonicalItemEditorState.minuteDescription(
+                                    state.minimumNoticeMinutes
+                                )
+                            )
+                        }
+                        strengthEditor(
+                            strength: $state.minimumNoticeStrength,
+                            softWeight: $state.minimumNoticeSoftWeight
+                        )
+                    }
+
+                    Toggle("Restrict weekdays", isOn: $state.hasAllowedWeekdays)
+                    if state.hasAllowedWeekdays {
+                        weekdaySetPicker(selection: $state.allowedWeekdays)
+                        strengthEditor(
+                            strength: $state.allowedWeekdaysStrength,
+                            softWeight: $state.allowedWeekdaysSoftWeight
+                        )
+                    }
+
+                    editorListHeader("Preferred daily windows") {
+                        state.preferredDailyWindows.append(.init())
+                    }
+                    ForEach($state.preferredDailyWindows) { $window in
+                        dailyWindowEditor(window: $window) {
+                            state.preferredDailyWindows.removeAll { $0.id == window.id }
+                        }
+                    }
+
+                    editorListHeader("Preferred absolute windows") {
+                        state.preferredAbsoluteWindows.append(.init(
+                            start: Date(),
+                            end: Date().addingTimeInterval(3_600)
+                        ))
+                    }
+                    ForEach($state.preferredAbsoluteWindows) { $window in
+                        absoluteWindowEditor(window: $window) {
+                            state.preferredAbsoluteWindows.removeAll { $0.id == window.id }
+                        }
+                    }
+
+                    editorListHeader("Forbidden windows") {
+                        state.forbiddenWindows.append(.init(
+                            start: Date(),
+                            end: Date().addingTimeInterval(3_600),
+                            strength: .hard
+                        ))
+                    }
+                    ForEach($state.forbiddenWindows) { $window in
+                        absoluteWindowEditor(window: $window) {
+                            state.forbiddenWindows.removeAll { $0.id == window.id }
+                        }
+                    }
+
+                    editorListHeader("Required contexts") {
+                        state.requiredContexts.append(.init())
+                    }
+                    ForEach($state.requiredContexts) { $context in
+                        HStack {
+                            TextField("Context", text: $context.value)
+                                .textFieldStyle(.roundedBorder)
+                            Button(role: .destructive) {
+                                state.requiredContexts.removeAll { $0.id == context.id }
+                            } label: {
+                                Image(systemName: "minus.circle")
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        strengthEditor(
+                            strength: $context.strength,
+                            softWeight: $context.softWeight
+                        )
+                    }
+
+                    Toggle("Require a location", isOn: $state.hasRequiredLocation)
+                    if state.hasRequiredLocation {
+                        TextField("Location", text: $state.requiredLocation)
+                            .textFieldStyle(.roundedBorder)
+                        strengthEditor(
+                            strength: $state.requiredLocationStrength,
+                            softWeight: $state.requiredLocationSoftWeight
+                        )
+                    }
+
+                    Toggle("Configure buffers", isOn: $state.hasBuffers)
+                    if state.hasBuffers {
+                        HStack {
+                            Stepper(
+                                "Before: \(state.bufferBeforeMinutes)m",
+                                value: bufferBeforeMinutes,
+                                in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                                step: 5
+                            )
+                            Stepper(
+                                "After: \(state.bufferAfterMinutes)m",
+                                value: bufferAfterMinutes,
+                                in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                                step: 5
+                            )
+                        }
+                        Toggle("Enforce buffer policy", isOn: $state.bufferHasStrength)
+                        if state.bufferHasStrength {
+                            strengthEditor(
+                                strength: $state.bufferStrength,
+                                softWeight: $state.bufferSoftWeight
+                            )
+                        } else {
+                            Text("Inactive server policy retained; these values do not reserve buffer time.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    qualifiedMinuteCap(
+                        title: "Daily work cap",
+                        enabled: $state.hasMaximumDailyWork,
+                        minutes: maximumDailyWorkMinutes,
+                        strength: $state.maximumDailyWorkStrength,
+                        softWeight: $state.maximumDailyWorkSoftWeight
+                    )
+                    qualifiedMinuteCap(
+                        title: "Weekly work cap",
+                        enabled: $state.hasMaximumWeeklyWork,
+                        minutes: maximumWeeklyWorkMinutes,
+                        strength: $state.maximumWeeklyWorkStrength,
+                        softWeight: $state.maximumWeeklyWorkSoftWeight
+                    )
+                }
+                .padding(.top, 8)
+            }
+
+            if state.kind != .event {
                 Toggle("Allow splitting across sessions", isOn: $state.isSplittable)
                     .accessibilityIdentifier("canonical-editor.split.enabled")
                 if state.isSplittable {
@@ -435,7 +751,94 @@ struct CanonicalItemEditorView: View {
                             )
                         )
                     }
+                    Toggle("Limit session count", isOn: $state.hasMaximumSessions)
+                    if state.hasMaximumSessions {
+                        Stepper(value: maximumSessions, in: 1...Int(UInt16.max)) {
+                            LabeledContent(
+                                "Maximum sessions",
+                                value: String(state.maximumSessions)
+                            )
+                        }
+                    }
+                    Stepper(
+                        value: minimumGapMinutes,
+                        in: 0...Int(CanonicalItemEditorState.maximumSchedulingOffsetMinutes),
+                        step: 5
+                    ) {
+                        LabeledContent("Minimum gap", value: "\(state.minimumGapMinutes)m")
+                    }
+                    Toggle("Limit split days", isOn: $state.hasMaximumSplitDays)
+                    if state.hasMaximumSplitDays {
+                        Stepper(value: maximumSplitDays, in: 1...Int(UInt16.max)) {
+                            LabeledContent("Maximum days", value: String(state.maximumSplitDays))
+                        }
+                    }
                 }
+            }
+        }
+    }
+
+    private var kindMetadataSection: some View {
+        CanonicalEditorSection(title: "Type details", symbol: "list.bullet.clipboard") {
+            switch state.kind {
+            case .habit:
+                Toggle("Track a quantity target", isOn: $state.hasHabitTarget)
+                if state.hasHabitTarget {
+                    Stepper(value: habitTargetAmount, in: 1...Int(UInt32.max)) {
+                        LabeledContent("Target", value: String(state.habitTargetAmount))
+                    }
+                    TextField("Target unit", text: $state.habitTargetUnit)
+                        .textFieldStyle(.roundedBorder)
+                }
+                Toggle("Preserve streak while paused", isOn: $state.preservesStreakWhenPaused)
+            case .routine:
+                Toggle("Run subtasks in sibling order", isOn: $state.routineOrdered)
+                Text("Ordered routines complete each child before the next sibling starts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case .goal:
+                editorListHeader("Measures") {
+                    state.goalMeasures.append(.init())
+                }
+                ForEach($state.goalMeasures) { $measure in
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            TextField("Measure name", text: $measure.name)
+                            TextField("Unit", text: $measure.unit)
+                            Button(role: .destructive) {
+                                state.goalMeasures.removeAll { $0.id == measure.id }
+                            } label: { Image(systemName: "minus.circle") }
+                                .buttonStyle(.plain)
+                        }
+                        HStack {
+                            TextField("Current", value: $measure.current, format: .number)
+                            TextField("Target", value: $measure.target, format: .number)
+                        }
+                    }
+                }
+                Toggle("Set weekly allocation", isOn: $state.hasGoalWeeklyAllocation)
+                if state.hasGoalWeeklyAllocation {
+                    Stepper(value: goalWeeklyMinimumMinutes, in: 0...Int(UInt32.max), step: 15) {
+                        LabeledContent("Minimum", value: "\(state.goalWeeklyMinimumMinutes)m")
+                    }
+                    Toggle("Set a maximum", isOn: $state.hasGoalWeeklyMaximum)
+                    if state.hasGoalWeeklyMaximum {
+                        Stepper(value: goalWeeklyMaximumMinutes, in: 0...Int(UInt32.max), step: 15) {
+                            LabeledContent("Maximum", value: "\(state.goalWeeklyMaximumMinutes)m")
+                        }
+                    }
+                }
+            case .breakTime:
+                Picker("Category", selection: $state.breakCategory) {
+                    ForEach(CanonicalItemEditorBreakCategory.allCases) { category in
+                        Text(category.title).tag(category)
+                    }
+                }
+                Toggle("Mandatory break", isOn: $state.breakMandatory)
+                Toggle("Prompt me to resume", isOn: $state.breakPromptToResume)
+            case .task, .event, .unknown:
+                Text("No additional type-specific settings.")
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -601,6 +1004,159 @@ struct CanonicalItemEditorView: View {
         .accessibilityIdentifier("canonical-editor.\(title.lowercased())")
     }
 
+    @ViewBuilder
+    private func strengthEditor(
+        strength: Binding<CanonicalItemEditorConstraintStrength>,
+        softWeight: Binding<UInt32>
+    ) -> some View {
+        HStack {
+            Picker("Strength", selection: strength) {
+                ForEach(CanonicalItemEditorConstraintStrength.allCases) { value in
+                    Text(value.title).tag(value)
+                }
+            }
+            .pickerStyle(.segmented)
+            if strength.wrappedValue == .soft {
+                Stepper(
+                    "Weight \(softWeight.wrappedValue)",
+                    value: intBinding(softWeight),
+                    in: 0...Int(CanonicalItemEditorState.maximumSoftWeight)
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func editorListHeader(_ title: String, add: @escaping () -> Void) -> some View {
+        HStack {
+            Text(title).font(.subheadline.weight(.semibold))
+            Spacer()
+            Button(action: add) {
+                Label("Add", systemImage: "plus.circle")
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    @ViewBuilder
+    private func weekdaySetPicker(
+        selection: Binding<Set<CanonicalItemEditorWeekday>>
+    ) -> some View {
+        HStack(spacing: 6) {
+            ForEach(CanonicalItemEditorWeekday.allCases) { weekday in
+                Button(weekday.shortTitle) {
+                    if selection.wrappedValue.contains(weekday) {
+                        selection.wrappedValue.remove(weekday)
+                    } else {
+                        selection.wrappedValue.insert(weekday)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .tint(selection.wrappedValue.contains(weekday) ? .accentColor : .secondary)
+                .help(weekday.title)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dailyWindowEditor(
+        window: Binding<CanonicalItemEditorDailyWindow>,
+        remove: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Stepper(
+                    "Start \(minuteOfDayLabel(window.wrappedValue.startMinute))",
+                    value: uint16Binding(window.startMinute),
+                    in: 0...1_439,
+                    step: 15
+                )
+                Stepper(
+                    "End \(minuteOfDayLabel(window.wrappedValue.endMinute))",
+                    value: uint16Binding(window.endMinute),
+                    in: 0...1_440,
+                    step: 15
+                )
+                Button(role: .destructive, action: remove) {
+                    Image(systemName: "minus.circle")
+                }
+                .buttonStyle(.plain)
+            }
+            weekdaySetPicker(selection: window.weekdays)
+            Text("No selected weekdays means every day.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            strengthEditor(strength: window.strength, softWeight: window.softWeight)
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func absoluteWindowEditor(
+        window: Binding<CanonicalItemEditorAbsoluteWindow>,
+        remove: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                DatePicker(
+                    "Starts",
+                    selection: window.start,
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                DatePicker(
+                    "Ends",
+                    selection: window.end,
+                    displayedComponents: [.date, .hourAndMinute]
+                )
+                Button(role: .destructive, action: remove) {
+                    Image(systemName: "minus.circle")
+                }
+                .buttonStyle(.plain)
+            }
+            .environment(\.timeZone, editorTimeZone)
+            strengthEditor(strength: window.strength, softWeight: window.softWeight)
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private func qualifiedMinuteCap(
+        title: String,
+        enabled: Binding<Bool>,
+        minutes: Binding<Int>,
+        strength: Binding<CanonicalItemEditorConstraintStrength>,
+        softWeight: Binding<UInt32>
+    ) -> some View {
+        Toggle(title, isOn: enabled)
+        if enabled.wrappedValue {
+            Stepper(value: minutes, in: 0...Int(UInt32.max), step: 15) {
+                LabeledContent(title, value: "\(minutes.wrappedValue)m")
+            }
+            strengthEditor(strength: strength, softWeight: softWeight)
+        }
+    }
+
+    private func intBinding(_ value: Binding<UInt32>) -> Binding<Int> {
+        Binding(
+            get: { Int(value.wrappedValue) },
+            set: { value.wrappedValue = UInt32(max(0, min(Int(UInt32.max), $0))) }
+        )
+    }
+
+    private func uint16Binding(_ value: Binding<UInt16>) -> Binding<Int> {
+        Binding(
+            get: { Int(value.wrappedValue) },
+            set: { value.wrappedValue = UInt16(max(0, min(Int(UInt16.max), $0))) }
+        )
+    }
+
+    private func minuteOfDayLabel(_ minute: UInt16) -> String {
+        if minute == 1_440 { return "24:00" }
+        return String(format: "%02d:%02d", minute / 60, minute % 60)
+    }
+
     private var durationMinutes: Binding<Int> {
         secondsBinding(\CanonicalItemEditorState.durationSeconds)
     }
@@ -631,7 +1187,9 @@ struct CanonicalItemEditorView: View {
     private var recurrenceCount: Binding<Int> {
         Binding(
             get: { Int(state.recurrenceCount) },
-            set: { state.recurrenceCount = UInt32(max(1, min(64, $0))) }
+            set: {
+                state.recurrenceCount = UInt32(max(1, min(Int(UInt16.max), $0)))
+            }
         )
     }
 
@@ -647,6 +1205,67 @@ struct CanonicalItemEditorView: View {
         )
     }
 
+    private var frequencySpacingMinutes: Binding<Int> {
+        intBinding($state.recurrenceMinimumSpacingMinutes)
+    }
+
+    private var minimumNoticeMinutes: Binding<Int> {
+        intBinding($state.minimumNoticeMinutes)
+    }
+
+    private var preferredStartMinute: Binding<Int> {
+        Binding(
+            get: { Int(state.preferredStartMinute) },
+            set: { state.preferredStartMinute = UInt16(max(0, min(1_439, $0))) }
+        )
+    }
+
+    private var bufferBeforeMinutes: Binding<Int> {
+        intBinding($state.bufferBeforeMinutes)
+    }
+
+    private var bufferAfterMinutes: Binding<Int> {
+        intBinding($state.bufferAfterMinutes)
+    }
+
+    private var maximumDailyWorkMinutes: Binding<Int> {
+        intBinding($state.maximumDailyWorkMinutes)
+    }
+
+    private var maximumWeeklyWorkMinutes: Binding<Int> {
+        intBinding($state.maximumWeeklyWorkMinutes)
+    }
+
+    private var minimumGapMinutes: Binding<Int> {
+        intBinding($state.minimumGapMinutes)
+    }
+
+    private var goalWeeklyMinimumMinutes: Binding<Int> {
+        intBinding($state.goalWeeklyMinimumMinutes)
+    }
+
+    private var goalWeeklyMaximumMinutes: Binding<Int> {
+        intBinding($state.goalWeeklyMaximumMinutes)
+    }
+
+    private var habitTargetAmount: Binding<Int> {
+        intBinding($state.habitTargetAmount)
+    }
+
+    private var maximumSessions: Binding<Int> {
+        Binding(
+            get: { Int(state.maximumSessions) },
+            set: { state.maximumSessions = UInt16(max(1, min(Int(UInt16.max), $0))) }
+        )
+    }
+
+    private var maximumSplitDays: Binding<Int> {
+        Binding(
+            get: { Int(state.maximumSplitDays) },
+            set: { state.maximumSplitDays = UInt16(max(1, min(Int(UInt16.max), $0))) }
+        )
+    }
+
     private var siblingOrder: Binding<Int> {
         Binding(
             get: { Int(state.siblingOrder) },
@@ -658,6 +1277,13 @@ struct CanonicalItemEditorView: View {
         Binding(
             get: { state.timezoneName },
             set: { state.setTimezoneName($0) }
+        )
+    }
+
+    private var eventTimingEnabled: Binding<Bool> {
+        Binding(
+            get: { state.hasEventTiming },
+            set: { state.setEventTimingEnabled($0) }
         )
     }
 

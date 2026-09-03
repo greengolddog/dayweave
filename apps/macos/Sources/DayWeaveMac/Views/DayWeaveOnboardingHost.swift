@@ -392,7 +392,11 @@ struct DayWeaveOnboardingHost: View {
             guard mutation.operation == .create,
                   mutation.disposition == .pending,
                   let draft = mutation.draft,
-                  draft.createsPlanningDemand(itemID: mutation.itemID) else {
+                  draft.createsPlanningDemand(
+                      itemID: mutation.itemID,
+                      hasActiveChildren: store.pendingCanonicalAuthoringMutations
+                          .containsPendingCanonicalChild(of: mutation.itemID)
+                  ) else {
                 return nil
             }
             return mutation
@@ -419,7 +423,11 @@ struct DayWeaveOnboardingHost: View {
     }
 
     private func canonicalItemCreatesPlanningDemand(_ item: DayWeaveCanonicalItem) -> Bool {
-        item.createsPlanningDemand
+        item.createsPlanningDemand(
+            canonicalItems: store.canonicalItems,
+            hasPendingChildren: store.pendingCanonicalAuthoringMutations
+                .containsPendingCanonicalChild(of: item.id)
+        )
     }
 
     private func reviewOrCreateFirstItem() {

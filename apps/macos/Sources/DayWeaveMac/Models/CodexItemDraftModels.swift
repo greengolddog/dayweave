@@ -477,100 +477,16 @@ struct CodexProposalEnvelopeParser {
 /// A strict RFC 3339 instant parser for model-supplied canonical fields.
 /// Foundation's formatter accepts impossible calendar dates and offset forms.
 private struct CodexRFC3339Instant {
-    private static let secondsFromYearOneToUnixEpoch: Int64 = 62_135_596_800
-
     let date: Date
     let isWholeMinute: Bool
 
     init?(_ value: String) {
-        let bytes = Array(value.utf8)
-        guard bytes.count >= 20,
-              bytes[4] == 0x2D, bytes[7] == 0x2D,
-              bytes[10] == 0x54,
-              bytes[13] == 0x3A, bytes[16] == 0x3A,
-              let year = Self.decimal(bytes, 0..<4),
-              let month = Self.decimal(bytes, 5..<7),
-              let day = Self.decimal(bytes, 8..<10),
-              let hour = Self.decimal(bytes, 11..<13),
-              let minute = Self.decimal(bytes, 14..<16),
-              let second = Self.decimal(bytes, 17..<19),
-              (1...9_999).contains(year),
-              (1...12).contains(month),
-              (1...Self.daysInMonth(month, year: year)).contains(day),
-              (0...23).contains(hour),
-              (0...59).contains(minute),
-              (0...59).contains(second) else { return nil }
-
-        var cursor = 19
-        var fraction = 0.0
-        if cursor < bytes.count, bytes[cursor] == 0x2E {
-            cursor += 1
-            let fractionStart = cursor
-            var place = 0.1
-            while cursor < bytes.count, Self.isDigit(bytes[cursor]) {
-                guard cursor - fractionStart < 9 else { return nil }
-                fraction += Double(bytes[cursor] - 0x30) * place
-                place /= 10
-                cursor += 1
-            }
-            guard cursor > fractionStart else { return nil }
+        guard let instant = CanonicalRFC3339Instant(value),
+              instant.hasPostgresPrecision,
+              let exactlyRepresentableDate = instant.exactlyRepresentableDate else {
+            return nil
         }
-
-        let offsetSeconds: Int
-        if cursor + 1 == bytes.count, bytes[cursor] == 0x5A {
-            offsetSeconds = 0
-        } else {
-            guard cursor + 6 == bytes.count,
-                  bytes[cursor] == 0x2B || bytes[cursor] == 0x2D,
-                  bytes[cursor + 3] == 0x3A,
-                  let offsetHour = Self.decimal(bytes, (cursor + 1)..<(cursor + 3)),
-                  let offsetMinute = Self.decimal(bytes, (cursor + 4)..<(cursor + 6)),
-                  (0...23).contains(offsetHour),
-                  (0...59).contains(offsetMinute) else { return nil }
-            let magnitude = offsetHour * 3_600 + offsetMinute * 60
-            offsetSeconds = bytes[cursor] == 0x2D ? -magnitude : magnitude
-        }
-
-        let priorYear = Int64(year - 1)
-        var elapsedDays = priorYear * 365
-            + priorYear / 4
-            - priorYear / 100
-            + priorYear / 400
-        let daysBeforeMonth = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
-        elapsedDays += Int64(daysBeforeMonth[month - 1])
-        if month > 2, Self.isLeapYear(year) { elapsedDays += 1 }
-        elapsedDays += Int64(day - 1)
-        let wholeSeconds = elapsedDays * 86_400
-            + Int64(hour * 3_600 + minute * 60 + second - offsetSeconds)
-        let timestamp = TimeInterval(wholeSeconds - Self.secondsFromYearOneToUnixEpoch)
-            + fraction
-        guard timestamp.isFinite else { return nil }
-        date = Date(timeIntervalSince1970: timestamp)
-        isWholeMinute = second == 0 && fraction == 0
-    }
-
-    private static func decimal(_ bytes: [UInt8], _ range: Range<Int>) -> Int? {
-        var result = 0
-        for index in range {
-            guard index < bytes.count, isDigit(bytes[index]) else { return nil }
-            result = result * 10 + Int(bytes[index] - 0x30)
-        }
-        return result
-    }
-
-    private static func daysInMonth(_ month: Int, year: Int) -> Int {
-        switch month {
-        case 2: isLeapYear(year) ? 29 : 28
-        case 4, 6, 9, 11: 30
-        default: 31
-        }
-    }
-
-    private static func isLeapYear(_ year: Int) -> Bool {
-        year.isMultiple(of: 400) || (year.isMultiple(of: 4) && !year.isMultiple(of: 100))
-    }
-
-    private static func isDigit(_ byte: UInt8) -> Bool {
-        (0x30...0x39).contains(byte)
+        date = exactlyRepresentableDate
+        isWholeMinute = instant.microsecondsSinceUnixEpoch.isMultiple(of: 60_000_000)
     }
 }

@@ -236,6 +236,9 @@ struct CanonicalCapturedInboxView: View {
         if mutation?.hasBeenSubmitted == true || mutation?.configurationIdentifier != nil {
             return "This exact queued request is bound for synchronization and cannot be edited until recovery finishes."
         }
+        if let diagnostic = item?.retainedUnrepresentableTimestampDiagnostic {
+            return diagnostic
+        }
         if let item, !item.supportsCanonicalAuthoringReplacement {
             return "This item contains fields that the typed editor cannot replace safely."
         }
@@ -473,7 +476,10 @@ private struct CanonicalCapturedInboxRow: View {
             Button("Edit…", action: edit)
                 .disabled(!canMutate || row.isReadOnly)
             Button("Move to Recently Deleted", role: .destructive, action: trash)
-                .disabled(!canMutate || row.isReadOnly)
+                // Trash carries only canonical identity/revision. It does not
+                // reconstruct opaque item fields, so unsupported rows remain
+                // safely removable while ordinary mutation fences still hold.
+                .disabled(!canMutate)
         case .localCreate, .pendingReplace:
             if let duplicateConflictedDraft {
                 Button(
