@@ -158,7 +158,9 @@ internal fun PlanningProfileEditorDialog(
         title = { Text("Planning profile") },
         text = {
             Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
+                modifier = Modifier
+                    .testTag("planning_profile_scroll")
+                    .verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(

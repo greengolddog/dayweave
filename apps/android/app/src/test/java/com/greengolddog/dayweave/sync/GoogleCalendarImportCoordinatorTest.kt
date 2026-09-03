@@ -23,12 +23,16 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -427,6 +431,310 @@ class GoogleCalendarImportCoordinatorTest {
     }
 
     @Test
+    fun quarantineCancelsSuspendedCollectionTransportAndPreventsLatePresentation() = runBlocking {
+        val transportEntered = CompletableDeferred<Unit>()
+        val transportCancelled = CompletableDeferred<Unit>()
+        val lateResponse = CompletableDeferred<RemoteGoogleCollections>()
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, _ ->
+                transportEntered.complete(Unit)
+                try {
+                    lateResponse.await()
+                } finally {
+                    transportCancelled.complete(Unit)
+                }
+            }
+        }
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = InMemoryGoogleImportJournalStore(),
+            pipeline = FakeGoogleImportPipeline(),
+        )
+
+        val load = async(Dispatchers.Default) { coordinator.loadCollections(ACCOUNT_A) }
+        withTimeout(3_000) { transportEntered.await() }
+
+        coordinator.quarantineBindingState()
+
+        withTimeout(3_000) { transportCancelled.await() }
+        withTimeout(3_000) { load.join() }
+        assertTrue(load.isCancelled)
+        assertTrue(
+            lateResponse.complete(
+                RemoteGoogleCollections(
+                    listOf(
+                        collection(
+                            accountId = ACCOUNT_A,
+                            id = COLLECTION_A,
+                            displayName = "Private late calendar",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        assertEquals(1, transport.collectionsCalls)
+        assertEquals(GoogleCalendarImportPhase.READY, coordinator.state.value.phase)
+        assertTrue(coordinator.state.value.accounts.isEmpty())
+        assertNull(coordinator.state.value.activeAccountId)
+        assertFalse(coordinator.state.value.toString().contains("Private late calendar"))
+    }
+
+    @Test
+    fun quarantineCancelsEveryAdmittedJobIncludingOneQueuedBehindImportMutex() = runBlocking {
+        val credentials = FakeGoogleImportCredentials()
+        val firstTransportEntered = CompletableDeferred<Unit>()
+        val firstTransportCancelled = CompletableDeferred<Unit>()
+        val firstResponse = CompletableDeferred<RemoteGoogleCollections>()
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, _ ->
+                firstTransportEntered.complete(Unit)
+                try {
+                    firstResponse.await()
+                } finally {
+                    firstTransportCancelled.complete(Unit)
+                }
+            }
+        }
+        val coordinator = coordinator(
+            credentials = credentials,
+            transport = transport,
+            journals = InMemoryGoogleImportJournalStore(),
+            pipeline = FakeGoogleImportPipeline(),
+        )
+        val first = async(Dispatchers.Default) { coordinator.loadCollections(ACCOUNT_A) }
+        withTimeout(3_000) { firstTransportEntered.await() }
+
+        val queuedOperationPassedAdmission = CompletableDeferred<Unit>()
+        credentials.onSnapshot = { queuedOperationPassedAdmission.complete(Unit) }
+        val queued = async(Dispatchers.Default) { coordinator.discoverCollections(ACCOUNT_B) }
+        withTimeout(3_000) { queuedOperationPassedAdmission.await() }
+        credentials.onSnapshot = null
+
+        coordinator.quarantineBindingState()
+
+        withTimeout(3_000) { firstTransportCancelled.await() }
+        withTimeout(3_000) {
+            first.join()
+            queued.join()
+        }
+        assertTrue(first.isCancelled)
+        assertTrue(queued.isCancelled)
+        assertEquals(1, transport.collectionsCalls)
+        assertEquals(0, transport.discoverCalls)
+        assertTrue(firstResponse.complete(RemoteGoogleCollections(emptyList())))
+        assertTrue(coordinator.state.value.accounts.isEmpty())
+        assertNull(coordinator.state.value.activeAccountId)
+    }
+
+    @Test
+    fun quarantineCancelsSuspendedRefreshTransportAndRetainsExactPreparedJournal() = runBlocking {
+        val journals = InMemoryGoogleImportJournalStore()
+        val transportEntered = CompletableDeferred<Unit>()
+        val transportCancelled = CompletableDeferred<Unit>()
+        val lateAcceptance = CompletableDeferred<RemoteGoogleSyncRefreshAccepted>()
+        val transport = FakeGoogleInboundTransport().apply {
+            onRefresh = { _, _, _ ->
+                transportEntered.complete(Unit)
+                try {
+                    lateAcceptance.await()
+                } finally {
+                    transportCancelled.complete(Unit)
+                }
+            }
+        }
+        val pipeline = FakeGoogleImportPipeline()
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = journals,
+            pipeline = pipeline,
+        )
+
+        val refresh = async(Dispatchers.Default) { coordinator.refresh(ACCOUNT_A) }
+        withTimeout(3_000) { transportEntered.await() }
+        val prepared = journals.journals.single()
+        assertFalse(prepared.isAccepted)
+
+        coordinator.quarantineBindingState()
+
+        withTimeout(3_000) { transportCancelled.await() }
+        withTimeout(3_000) { refresh.join() }
+        assertTrue(refresh.isCancelled)
+        assertTrue(
+            lateAcceptance.complete(
+                accepted(ACCOUNT_A, UUID.fromString(REQUEST_ID), 19),
+            ),
+        )
+        assertEquals(listOf(prepared), journals.journals)
+        assertEquals(0, journals.removeCount)
+        assertTrue(pipeline.inputs.isEmpty())
+        assertEquals(GoogleCalendarImportPhase.RECOVERY_REQUIRED, coordinator.state.value.phase)
+        assertEquals(1, coordinator.state.value.pendingRecoveryCount)
+        assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+        assertTrue(coordinator.state.value.accounts.isEmpty())
+        assertNull(coordinator.state.value.activeAccountId)
+    }
+
+    @Test
+    fun cancellationIgnoringRefreshCannotRecordAcceptanceAfterQuarantine() = runBlocking {
+        val journals = InMemoryGoogleImportJournalStore()
+        val transportEntered = CompletableDeferred<Unit>()
+        val cancellationObserved = CompletableDeferred<Unit>()
+        val releaseIgnoringTransport = CompletableDeferred<Unit>()
+        val transport = FakeGoogleInboundTransport().apply {
+            onRefresh = { _, accountId, requestId ->
+                transportEntered.complete(Unit)
+                try {
+                    releaseIgnoringTransport.await()
+                } catch (_: CancellationException) {
+                    cancellationObserved.complete(Unit)
+                    withContext(NonCancellable) { releaseIgnoringTransport.await() }
+                }
+                accepted(accountId, requestId, 20)
+            }
+        }
+        val pipeline = FakeGoogleImportPipeline()
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = journals,
+            pipeline = pipeline,
+        )
+
+        val refresh = async(Dispatchers.Default) { coordinator.refresh(ACCOUNT_A) }
+        withTimeout(3_000) { transportEntered.await() }
+        val prepared = journals.journals.single()
+
+        coordinator.quarantineBindingState()
+        withTimeout(3_000) { cancellationObserved.await() }
+        releaseIgnoringTransport.complete(Unit)
+
+        withTimeout(3_000) { refresh.join() }
+        assertTrue(refresh.isCancelled)
+        assertEquals(listOf(prepared), journals.journals)
+        assertFalse(journals.journals.single().isAccepted)
+        assertEquals(0, journals.removeCount)
+        assertTrue(pipeline.inputs.isEmpty())
+        assertEquals(1, coordinator.state.value.pendingRecoveryCount)
+        assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+        assertTrue(coordinator.state.value.accounts.isEmpty())
+    }
+
+    @Test
+    fun quarantineWinsCheckToAcceptanceCasAndLeavesPreparedRecoveryAccurate() = runBlocking {
+        val journals = InMemoryGoogleImportJournalStore()
+        val checkToCasReached = CountDownLatch(1)
+        val releaseCheckToCas = CountDownLatch(1)
+        val blockAcceptedTimestamp = AtomicBoolean(false)
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = FakeGoogleInboundTransport().apply {
+                onRefresh = { _, accountId, requestId ->
+                    blockAcceptedTimestamp.set(true)
+                    accepted(accountId, requestId, 21)
+                }
+            },
+            journals = journals,
+            pipeline = FakeGoogleImportPipeline(),
+            nowEpochMillis = {
+                if (blockAcceptedTimestamp.compareAndSet(true, false)) {
+                    checkToCasReached.countDown()
+                    check(releaseCheckToCas.await(5, TimeUnit.SECONDS))
+                }
+                NOW.toEpochMilli()
+            },
+        )
+
+        val refresh = async(Dispatchers.Default) { coordinator.refresh(ACCOUNT_A) }
+        try {
+            assertTrue(checkToCasReached.await(5, TimeUnit.SECONDS))
+            val prepared = journals.journals.single()
+            assertFalse(prepared.isAccepted)
+
+            coordinator.quarantineBindingState()
+
+            assertEquals(listOf(prepared), journals.journals)
+            assertEquals(GoogleCalendarImportPhase.RECOVERY_REQUIRED, coordinator.state.value.phase)
+            assertEquals(1, coordinator.state.value.pendingRecoveryCount)
+            assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+        } finally {
+            releaseCheckToCas.countDown()
+        }
+        withTimeout(5_000) { refresh.join() }
+        assertTrue(refresh.isCancelled)
+        assertFalse(journals.journals.single().isAccepted)
+    }
+
+    @Test
+    fun quarantineRedactsAndCancelsBeforeWaitingForBlockedJournalMutation() = runBlocking {
+        val journals = InMemoryGoogleImportJournalStore()
+        val preparedSaveEntered = CountDownLatch(1)
+        val releasePreparedSave = CountDownLatch(1)
+        val blockExactlyOnePreparedSave = AtomicBoolean(true)
+        journals.beforeSave = { journal ->
+            if (!journal.isAccepted && blockExactlyOnePreparedSave.compareAndSet(true, false)) {
+                preparedSaveEntered.countDown()
+                check(releasePreparedSave.await(5, TimeUnit.SECONDS))
+            }
+        }
+        val transport = FakeGoogleInboundTransport().apply {
+            onCollections = { _, accountId ->
+                RemoteGoogleCollections(
+                    listOf(
+                        collection(
+                            accountId = accountId,
+                            id = COLLECTION_A,
+                            displayName = "Private state before blocked save",
+                        ),
+                    ),
+                )
+            }
+        }
+        val coordinator = coordinator(
+            credentials = FakeGoogleImportCredentials(),
+            transport = transport,
+            journals = journals,
+            pipeline = FakeGoogleImportPipeline(),
+        )
+        assertEquals(
+            GoogleImportCollectionsOutcome.LOADED,
+            coordinator.loadCollections(ACCOUNT_A),
+        )
+        assertTrue(coordinator.state.value.accounts.isNotEmpty())
+
+        val refresh = async(Dispatchers.Default) { coordinator.refresh(ACCOUNT_A) }
+        assertTrue(preparedSaveEntered.await(5, TimeUnit.SECONDS))
+        val quarantine = async(Dispatchers.Default) { coordinator.quarantineBindingState() }
+
+        try {
+            withTimeout(3_000) {
+                while (coordinator.state.value.accounts.isNotEmpty()) yield()
+                while (!refresh.isCancelled) yield()
+            }
+            assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+            assertNull(coordinator.state.value.activeAccountId)
+            assertFalse(quarantine.isCompleted)
+            assertTrue(journals.journals.isEmpty())
+        } finally {
+            releasePreparedSave.countDown()
+        }
+
+        withTimeout(5_000) { quarantine.await() }
+        withTimeout(5_000) { refresh.join() }
+        val durableWinner = journals.journals.single()
+        assertFalse(durableWinner.isAccepted)
+        assertEquals(REQUEST_ID, durableWinner.requestId)
+        assertTrue(refresh.isCancelled)
+        assertTrue(transport.refreshRequestIds.isEmpty())
+        assertEquals(GoogleCalendarImportPhase.RECOVERY_REQUIRED, coordinator.state.value.phase)
+        assertEquals(1, coordinator.state.value.pendingRecoveryCount)
+        assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+        assertTrue(coordinator.state.value.accounts.isEmpty())
+        assertNull(coordinator.state.value.activeAccountId)
+    }
+
+    @Test
     fun privacyLockAfterIdleStatusValidationStopsCanonicalPipelineAndRetainsJournal() = runBlocking {
         val credentials = FakeGoogleImportCredentials()
         val journals = InMemoryGoogleImportJournalStore()
@@ -464,10 +772,8 @@ class GoogleCalendarImportCoordinatorTest {
             releaseStatusPublication.countDown()
         }
 
-        assertEquals(
-            GoogleCalendarImportOutcome.RECOVERY_REQUIRED,
-            withTimeout(5_000) { refresh.await() },
-        )
+        withTimeout(5_000) { refresh.join() }
+        assertTrue(refresh.isCancelled)
         assertTrue(pipeline.inputs.isEmpty())
         assertEquals(14L, journals.journals.single().acceptedRefreshGeneration)
         assertEquals(0, journals.removeCount)
@@ -1433,7 +1739,87 @@ class GoogleCalendarImportCoordinatorTest {
         }
 
     @Test
-    fun quarantineCannotBeOverwrittenByStatePublicationAlreadyWaitingOnJournalIo() = runBlocking {
+    fun quarantineRedactsBeforeSlowRecoveryReadAndClosesAdmissionUntilSummaryIsCurrent() =
+        runBlocking {
+            val credentials = FakeGoogleImportCredentials()
+            val journals = InMemoryGoogleImportJournalStore().apply {
+                this.journals += preparedJournal()
+            }
+            val transport = FakeGoogleInboundTransport().apply {
+                onCollections = { _, accountId ->
+                    RemoteGoogleCollections(
+                        listOf(
+                            collection(
+                                accountId = accountId,
+                                id = COLLECTION_A,
+                                displayName = "Private cached calendar",
+                            ),
+                        ),
+                    )
+                }
+            }
+            val coordinator = coordinator(
+                credentials = credentials,
+                transport = transport,
+                journals = journals,
+                pipeline = FakeGoogleImportPipeline(),
+            )
+            assertEquals(
+                GoogleImportCollectionsOutcome.LOADED,
+                coordinator.loadCollections(ACCOUNT_A),
+            )
+            assertEquals(
+                "Private cached calendar",
+                coordinator.state.value.accounts[ACCOUNT_A]
+                    ?.collections?.single()?.displayName,
+            )
+
+            val redactedBeforeCredentialRead = AtomicBoolean(false)
+            credentials.onSnapshot = {
+                val stateAtFirstIo = coordinator.state.value
+                redactedBeforeCredentialRead.set(
+                    stateAtFirstIo.accounts.isEmpty() &&
+                        stateAtFirstIo.activeAccountId == null &&
+                        stateAtFirstIo.pendingRecoveryAccountIds.isEmpty(),
+                )
+            }
+            val summaryReadEntered = CountDownLatch(1)
+            val releaseSummaryRead = CountDownLatch(1)
+            val blockExactlyOneLoad = AtomicBoolean(true)
+            journals.beforeLoad = {
+                if (blockExactlyOneLoad.compareAndSet(true, false)) {
+                    summaryReadEntered.countDown()
+                    check(releaseSummaryRead.await(5, TimeUnit.SECONDS))
+                }
+            }
+            val quarantine = async(Dispatchers.Default) { coordinator.quarantineBindingState() }
+
+            try {
+                assertTrue(summaryReadEntered.await(5, TimeUnit.SECONDS))
+                assertTrue(redactedBeforeCredentialRead.get())
+                assertTrue(coordinator.state.value.accounts.isEmpty())
+                assertNull(coordinator.state.value.activeAccountId)
+                assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+                assertEquals(
+                    GoogleImportCollectionsOutcome.RECOVERY_REQUIRED,
+                    coordinator.discoverCollections(ACCOUNT_B),
+                )
+                assertEquals(0, transport.discoverCalls)
+            } finally {
+                credentials.onSnapshot = null
+                releaseSummaryRead.countDown()
+            }
+
+            withTimeout(5_000) { quarantine.await() }
+            assertEquals(GoogleCalendarImportPhase.RECOVERY_REQUIRED, coordinator.state.value.phase)
+            assertEquals(1, coordinator.state.value.pendingRecoveryCount)
+            assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
+            assertTrue(coordinator.state.value.accounts.isEmpty())
+            assertNull(coordinator.state.value.activeAccountId)
+        }
+
+    @Test
+    fun quarantineCancelsStatePublicationAlreadyWaitingOnJournalIo() = runBlocking {
         val journals = InMemoryGoogleImportJournalStore().apply {
             this.journals += preparedJournal()
         }
@@ -1486,10 +1872,8 @@ class GoogleCalendarImportCoordinatorTest {
             releaseStalePublication.countDown()
         }
 
-        assertEquals(
-            GoogleImportCollectionsOutcome.RECOVERY_REQUIRED,
-            withTimeout(5_000) { staleOperation.await() },
-        )
+        withTimeout(5_000) { staleOperation.join() }
+        assertTrue(staleOperation.isCancelled)
         assertEquals(1, coordinator.state.value.pendingRecoveryCount)
         assertTrue(coordinator.state.value.pendingRecoveryAccountIds.isEmpty())
         assertTrue(coordinator.state.value.accounts.isEmpty())
@@ -1726,6 +2110,7 @@ class GoogleCalendarImportCoordinatorTest {
         pipeline: FakeGoogleImportPipeline,
         retryPolicy: GoogleCalendarImportRetryPolicy = GoogleCalendarImportRetryPolicy(listOf(0)),
         newRequestId: () -> UUID = { UUID.fromString(REQUEST_ID) },
+        nowEpochMillis: () -> Long = { NOW.toEpochMilli() },
         operationAllowed: () -> Boolean = { true },
         importAllowed: () -> Boolean = { true },
     ): GoogleCalendarImportCoordinator = GoogleCalendarImportCoordinator(
@@ -1734,7 +2119,7 @@ class GoogleCalendarImportCoordinatorTest {
         journalStore = journals,
         completionPipeline = pipeline,
         retryPolicy = retryPolicy,
-        nowEpochMillis = { NOW.toEpochMilli() },
+        nowEpochMillis = nowEpochMillis,
         newRequestId = newRequestId,
         sleep = {},
         operationAllowed = operationAllowed,
@@ -1885,13 +2270,18 @@ private class FakeGoogleImportCredentials(
 ) : ApiCredentialStore {
     var enabled: Boolean = true
     var baseUrl: String = GoogleCalendarImportCoordinatorTest.API_BASE_URL
+    @Volatile
+    var onSnapshot: (() -> Unit)? = null
 
-    override fun snapshot(): ApiConnectionSnapshot = ApiConnectionSnapshot(
-        baseUrl = baseUrl,
-        hasBearerToken = enabled,
-        lastSuccessfulSyncEpochMillis = null,
-        configurationId = configurationId,
-    )
+    override fun snapshot(): ApiConnectionSnapshot {
+        onSnapshot?.invoke()
+        return ApiConnectionSnapshot(
+            baseUrl = baseUrl,
+            hasBearerToken = enabled,
+            lastSuccessfulSyncEpochMillis = null,
+            configurationId = configurationId,
+        )
+    }
 
     override fun authenticatedConfiguration(): AuthenticatedApiConfiguration? =
         if (enabled) {
@@ -1918,6 +2308,7 @@ private class FakeGoogleImportCredentials(
 private class InMemoryGoogleImportJournalStore : GoogleCalendarImportJournalStore {
     val journals = mutableListOf<GoogleCalendarImportJournal>()
     var beforeLoad: (() -> Unit)? = null
+    var beforeSave: ((GoogleCalendarImportJournal) -> Unit)? = null
     var corrupt = false
     var failAcceptedSave = false
     var failRemove = false
@@ -1941,6 +2332,7 @@ private class InMemoryGoogleImportJournalStore : GoogleCalendarImportJournalStor
         journal: GoogleCalendarImportJournal,
         nowEpochMillis: Long,
     ): Boolean {
+        beforeSave?.invoke(journal)
         if (corrupt || failAcceptedSave && journal.isAccepted || !journal.isValidAt(nowEpochMillis)) {
             return false
         }

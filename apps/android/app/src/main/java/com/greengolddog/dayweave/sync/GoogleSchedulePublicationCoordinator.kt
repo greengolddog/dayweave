@@ -22,6 +22,9 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -118,13 +121,18 @@ class GoogleSchedulePublicationCoordinator(
     private val presentationMonitor = Any()
     private val lifecycleGeneration = AtomicLong(1)
     private val operationSequence = AtomicLong(0)
+    private val activeOperationJobs = mutableSetOf<Job>()
     private val mutableState = MutableStateFlow(initialState())
     val state: StateFlow<GoogleSchedulePublicationState> = mutableState.asStateFlow()
 
     fun quarantineBindingState() {
-        synchronized(presentationMonitor) {
+        val jobsToCancel = synchronized(presentationMonitor) {
             lifecycleGeneration.updateAndGet(Math::incrementExact)
             mutableState.value = initialState()
+            activeOperationJobs.toList().also { activeOperationJobs.clear() }
+        }
+        jobsToCancel.forEach { job ->
+            job.cancel(SchedulePublicationPrivacyBoundaryCancellationException())
         }
     }
 
@@ -212,10 +220,9 @@ class GoogleSchedulePublicationCoordinator(
     suspend fun preparePreview(
         requestedTarget: GoogleSchedulePublicationTarget,
     ): GoogleSchedulePublicationOutcome = withBoundOperation { lifecycle, binding ->
-        operationMutex.withLock {
             requireCurrent(lifecycle, binding)
             val planner = plannerStore.durableState.value
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleSchedulePublicationPhase.RECOVERY_REQUIRED,
                     "Encrypted planner state is not ready.",
@@ -223,18 +230,18 @@ class GoogleSchedulePublicationCoordinator(
                 )
             planner.pendingGoogleSchedulePublication?.let {
                 presentJournal(lifecycle, it)
-                return@withLock GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+                return@withBoundOperation GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
             }
             val revision = planner.publishedScheduleRevision?.takeIf {
                 planner.hasCurrentPublishedSchedule()
-            } ?: return@withLock failure(
+            } ?: return@withBoundOperation failure(
                 lifecycle,
                 GoogleSchedulePublicationPhase.ERROR,
                 "Publish the current generated schedule in DayWeave before sending it to Google.",
                 GoogleSchedulePublicationOutcome.FAILED,
             )
             val target = requireCurrentTarget(requestedTarget, binding.configurationId)
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleSchedulePublicationPhase.ERROR,
                     "That writable calendar is no longer available. Refresh Google sources.",
@@ -291,13 +298,11 @@ class GoogleSchedulePublicationCoordinator(
             }
             presentJournal(lifecycle, previewed)
             GoogleSchedulePublicationOutcome.PREVIEW_READY
-        }
     }
 
     suspend fun approveAndEnqueue(
         confirmation: GoogleSchedulePublicationApprovalConfirmation,
     ): GoogleSchedulePublicationOutcome = withBoundOperation { lifecycle, binding ->
-        operationMutex.withLock {
             requireCurrent(lifecycle, binding)
             val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
                 ?: throw SchedulePublicationRecoveryChangedException()
@@ -313,7 +318,7 @@ class GoogleSchedulePublicationCoordinator(
                 !now().isBefore(Instant.parse(preview.expiresAt)) ||
                 !sourceAndTargetRemainCurrent(journal)
             ) {
-                return@withLock failure(
+                return@withBoundOperation failure(
                     lifecycle,
                     GoogleSchedulePublicationPhase.RECOVERY_REQUIRED,
                     "The schedule, destination, or preview changed. Nothing was approved.",
@@ -364,23 +369,21 @@ class GoogleSchedulePublicationCoordinator(
                 throw SchedulePublicationRecoveryChangedException()
             }
             enqueueApproved(lifecycle, binding, approved)
-        }
     }
 
     suspend fun recoverPending(): GoogleSchedulePublicationOutcome =
         withBoundOperation { lifecycle, binding ->
-            operationMutex.withLock {
                 requireCurrent(lifecycle, binding)
                 val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
                     ?: run {
                         setState(lifecycle, readyState(binding))
-                        return@withLock GoogleSchedulePublicationOutcome.STATUS_UPDATED
+                        return@withBoundOperation GoogleSchedulePublicationOutcome.STATUS_UPDATED
                     }
                 if (
                     journal.configurationId != binding.configurationId ||
                     journal.apiBaseUrl != binding.apiBaseUrl || !journal.isValidAt(now())
                 ) {
-                    return@withLock failure(
+                    return@withBoundOperation failure(
                         lifecycle,
                         GoogleSchedulePublicationPhase.RECOVERY_REQUIRED,
                         "This saved publication belongs to another DayWeave API connection.",
@@ -393,7 +396,7 @@ class GoogleSchedulePublicationCoordinator(
                     !now().isBefore(journal.authorityExpiresAt())
                 ) {
                     presentJournal(lifecycle, journal)
-                    return@withLock GoogleSchedulePublicationOutcome.EXPIRED
+                    return@withBoundOperation GoogleSchedulePublicationOutcome.EXPIRED
                 }
                 when (journal.stage) {
                     GoogleSchedulePublicationStage.INTENT -> recoverPreview(lifecycle, binding, journal)
@@ -415,13 +418,11 @@ class GoogleSchedulePublicationCoordinator(
                     GoogleSchedulePublicationStage.ACCEPTED ->
                         refreshAcceptedStatus(lifecycle, binding, journal)
                 }
-            }
         }
 
     /** Replays one already-approved exact enqueue after the user confirms that external effect. */
     suspend fun replayApprovedEnqueue(): GoogleSchedulePublicationOutcome =
         withBoundOperation { lifecycle, binding ->
-            operationMutex.withLock {
                 requireCurrent(lifecycle, binding)
                 val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
                     ?: throw SchedulePublicationRecoveryChangedException()
@@ -431,10 +432,9 @@ class GoogleSchedulePublicationCoordinator(
                     journal.apiBaseUrl != binding.apiBaseUrl || !journal.isValidAt(now())
                 ) {
                     presentJournal(lifecycle, journal)
-                    return@withLock GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+                    return@withBoundOperation GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
                 }
                 enqueueApproved(lifecycle, binding, journal)
-            }
         }
 
     suspend fun refreshStatus(): GoogleSchedulePublicationOutcome = recoverPending()
@@ -442,39 +442,45 @@ class GoogleSchedulePublicationCoordinator(
     suspend fun discardExpiredRecovery(): Boolean {
         val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
-        return operationMutex.withLock {
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
+        return try {
+            withActiveOperation(lifecycle) {
+                val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
+                    ?: return@withActiveOperation true
+                val currentTime = now()
+                requireCurrentLifecycle(lifecycle)
+                if (!plannerStore.discardExpiredGoogleSchedulePublication(journal, currentTime)) {
+                    return@withActiveOperation false
+                }
+                requireCurrentLifecycle(lifecycle)
+                setState(lifecycle, initialState())
+                true
             }
-            val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
-                ?: return@withLock true
-            val currentTime = now()
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
-            }
-            if (!plannerStore.discardExpiredGoogleSchedulePublication(journal, currentTime)) {
-                return@withLock false
-            }
-            setState(lifecycle, initialState())
-            true
+        } catch (_: StaleSchedulePublicationOperationException) {
+            false
+        } catch (error: CancellationException) {
+            if (error.isPrivacyBoundaryCancellation()) false else throw error
         }
     }
 
     suspend fun dismissSettled(): Boolean {
         val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
-        return operationMutex.withLock {
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
+        return try {
+            withActiveOperation(lifecycle) {
+                val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
+                    ?: return@withActiveOperation true
+                requireCurrentLifecycle(lifecycle)
+                if (!plannerStore.dismissSettledGoogleSchedulePublication(journal)) {
+                    return@withActiveOperation false
+                }
+                requireCurrentLifecycle(lifecycle)
+                setState(lifecycle, initialState())
+                true
             }
-            val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
-                ?: return@withLock true
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
-            }
-            if (!plannerStore.dismissSettledGoogleSchedulePublication(journal)) return@withLock false
-            setState(lifecycle, initialState())
-            true
+        } catch (_: StaleSchedulePublicationOperationException) {
+            false
+        } catch (error: CancellationException) {
+            if (error.isPrivacyBoundaryCancellation()) false else throw error
         }
     }
 
@@ -746,27 +752,68 @@ class GoogleSchedulePublicationCoordinator(
         ) -> GoogleSchedulePublicationOutcome,
     ): GoogleSchedulePublicationOutcome {
         val lifecycle = lifecycleGeneration.get()
-        val binding = authenticatedBinding(lifecycle) ?: return bindingFailureOutcome()
-        val ticket = try {
-            binding.configuration.beginBindingOperation()
-        } catch (_: ApiBindingChangedException) {
-            quarantineBindingState()
-            return GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
-        }
         return try {
-            operation(lifecycle, binding)
-        } catch (error: CancellationException) {
-            retainRecoveryAfterFailure(lifecycle, binding, error)
-            throw error
-        } catch (_: ApiBindingChangedException) {
-            quarantineBindingState()
-            GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+            withActiveOperation(lifecycle) {
+                val binding = authenticatedBinding(lifecycle)
+                    ?: return@withActiveOperation bindingFailureOutcome()
+                val ticket = try {
+                    binding.configuration.beginBindingOperation()
+                } catch (_: ApiBindingChangedException) {
+                    quarantineBindingState()
+                    return@withActiveOperation GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+                }
+                try {
+                    operation(lifecycle, binding)
+                } catch (error: CancellationException) {
+                    if (!error.isPrivacyBoundaryCancellation()) {
+                        retainRecoveryAfterFailure(lifecycle, binding, error)
+                    }
+                    throw error
+                } catch (_: ApiBindingChangedException) {
+                    quarantineBindingState()
+                    GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+                } catch (_: StaleSchedulePublicationOperationException) {
+                    GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+                } catch (error: Exception) {
+                    retainRecoveryAfterFailure(lifecycle, binding, error)
+                } finally {
+                    ticket.release()
+                }
+            }
         } catch (_: StaleSchedulePublicationOperationException) {
             GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
-        } catch (error: Exception) {
-            retainRecoveryAfterFailure(lifecycle, binding, error)
+        } catch (error: CancellationException) {
+            if (error.isPrivacyBoundaryCancellation()) {
+                GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED
+            } else {
+                throw error
+            }
+        }
+    }
+
+    /** Admission and quarantine share one monitor, including callers waiting for the mutation lane. */
+    private suspend fun <T> withActiveOperation(
+        lifecycle: Long,
+        operation: suspend () -> T,
+    ): T = coroutineScope {
+        val operationJob = currentCoroutineContext()[Job]
+            ?: throw IllegalStateException("Schedule publication operation has no coroutine job")
+        val registered = synchronized(presentationMonitor) {
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                false
+            } else {
+                activeOperationJobs += operationJob
+                true
+            }
+        }
+        if (!registered) throw StaleSchedulePublicationOperationException()
+        try {
+            operationMutex.withLock {
+                requireCurrentLifecycle(lifecycle)
+                operation()
+            }
         } finally {
-            ticket.release()
+            synchronized(presentationMonitor) { activeOperationJobs -= operationJob }
         }
     }
 
@@ -802,6 +849,12 @@ class GoogleSchedulePublicationCoordinator(
             !operationAllowed() || lifecycleGeneration.get() != lifecycle ||
             !sameBinding(credentialStore.snapshot(), binding.snapshot)
         ) throw StaleSchedulePublicationOperationException()
+    }
+
+    private fun requireCurrentLifecycle(lifecycle: Long) {
+        if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+            throw StaleSchedulePublicationOperationException()
+        }
     }
 
     private fun setState(lifecycle: Long, next: GoogleSchedulePublicationState) {
@@ -921,8 +974,17 @@ class GoogleSchedulePublicationCoordinator(
     private class StaleSchedulePublicationOperationException : IOException()
     private class InvalidSchedulePublicationResponseException : IOException()
     private class SchedulePublicationRecoveryChangedException : IOException()
+    private class SchedulePublicationPrivacyBoundaryCancellationException :
+        CancellationException(PRIVACY_BOUNDARY_CANCELLATION_MESSAGE)
 
     private companion object {
+        const val PRIVACY_BOUNDARY_CANCELLATION_MESSAGE =
+            "Google schedule publication cancelled at privacy boundary"
+
+        fun CancellationException.isPrivacyBoundaryCancellation(): Boolean =
+            this is SchedulePublicationPrivacyBoundaryCancellationException ||
+                cause is SchedulePublicationPrivacyBoundaryCancellationException
+
         fun sameBinding(left: ApiConnectionSnapshot, right: ApiConnectionSnapshot): Boolean =
             left.baseUrl == right.baseUrl && left.hasBearerToken == right.hasBearerToken &&
                 left.configurationId == right.configurationId

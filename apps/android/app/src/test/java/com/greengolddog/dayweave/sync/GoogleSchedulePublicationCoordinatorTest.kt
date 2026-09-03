@@ -25,17 +25,22 @@ import com.greengolddog.dayweave.ui.authoring.googleScheduleRecoveryRequiresConf
 import java.time.Instant
 import java.util.Base64
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import com.greengolddog.dayweave.state.PlannerLoadState
 import org.junit.Assert.assertEquals
@@ -223,6 +228,123 @@ class GoogleSchedulePublicationCoordinatorTest {
         } finally {
             scope.cancel()
         }
+    }
+
+    @Test
+    fun privacyQuarantineCancelsSuspendedPreviewJobAndRejectsItsLateResponse() = runBlocking {
+        val transportJob = CompletableDeferred<Job>()
+        val cancellationReachedTransport = CompletableDeferred<Unit>()
+        val releaseLateResponse = CompletableDeferred<Unit>()
+        val neverReturns = CompletableDeferred<RemoteScheduleGooglePublicationPreview>()
+        val store = PlannerStore(publishedState())
+        var operationAllowed = true
+        val transport = FakeSchedulePublicationTransport().apply {
+            onPreview = {
+                transportJob.complete(
+                    requireNotNull(currentCoroutineContext()[Job]),
+                )
+                try {
+                    neverReturns.await()
+                } catch (_: CancellationException) {
+                    cancellationReachedTransport.complete(Unit)
+                    withContext(NonCancellable) {
+                        releaseLateResponse.await()
+                        validPreview()
+                    }
+                }
+            }
+        }
+        val coordinator = coordinator(
+            store,
+            transport,
+            operationAllowed = { operationAllowed },
+        )
+        val operation = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.preparePreview(PUBLICATION_TARGET)
+        }
+        val admittedJob = withTimeout(3_000) { transportJob.await() }
+        val durableIntent = requireNotNull(
+            store.durableState.value?.pendingGoogleSchedulePublication,
+        )
+        assertEquals(GoogleSchedulePublicationStage.INTENT, durableIntent.stage)
+
+        operationAllowed = false
+        coordinator.quarantineBindingState()
+
+        assertFalse(admittedJob.isActive)
+        assertTrue(admittedJob.isCancelled)
+        withTimeout(3_000) { cancellationReachedTransport.await() }
+        assertEquals(
+            GoogleSchedulePublicationPhase.PRIVACY_PROTECTED,
+            coordinator.state.value.phase,
+        )
+
+        releaseLateResponse.complete(Unit)
+        assertEquals(
+            GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED,
+            withTimeout(3_000) { operation.await() },
+        )
+        assertEquals(durableIntent, store.durableState.value?.pendingGoogleSchedulePublication)
+        assertNull(store.durableState.value?.pendingGoogleSchedulePublication?.preview)
+        assertNull(coordinator.state.value.preview)
+        assertEquals(1, transport.previewCalls)
+        assertEquals(0, transport.approvalCalls)
+        assertEquals(0, transport.enqueueCalls)
+        assertEquals(0, transport.statusCalls)
+    }
+
+    @Test
+    fun privacyQuarantineCancelsQueuedRecoveryBeforeNonCooperativeHolderReturns() = runBlocking {
+        val previewEntered = CompletableDeferred<Unit>()
+        val releaseLateResponse = CompletableDeferred<Unit>()
+        val store = PlannerStore(publishedState())
+        var operationAllowed = true
+        val transport = FakeSchedulePublicationTransport().apply {
+            onPreview = {
+                withContext(NonCancellable) {
+                    previewEntered.complete(Unit)
+                    releaseLateResponse.await()
+                    validPreview()
+                }
+            }
+        }
+        val coordinator = coordinator(
+            store,
+            transport,
+            operationAllowed = { operationAllowed },
+        )
+        val holder = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.preparePreview(PUBLICATION_TARGET)
+        }
+        withTimeout(3_000) { previewEntered.await() }
+        val durableIntent = requireNotNull(
+            store.durableState.value?.pendingGoogleSchedulePublication,
+        )
+        val queued = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.recoverPending()
+        }
+
+        operationAllowed = false
+        coordinator.quarantineBindingState()
+
+        assertEquals(
+            GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED,
+            withTimeout(3_000) { queued.await() },
+        )
+        assertFalse(holder.isCompleted)
+        assertEquals(durableIntent, store.durableState.value?.pendingGoogleSchedulePublication)
+
+        releaseLateResponse.complete(Unit)
+        assertEquals(
+            GoogleSchedulePublicationOutcome.RECOVERY_REQUIRED,
+            withTimeout(3_000) { holder.await() },
+        )
+        assertEquals(durableIntent, store.durableState.value?.pendingGoogleSchedulePublication)
+        assertEquals(
+            GoogleSchedulePublicationPhase.PRIVACY_PROTECTED,
+            coordinator.state.value.phase,
+        )
+        assertEquals(1, transport.previewCalls)
     }
 
     @Test

@@ -21,8 +21,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
@@ -43,6 +45,7 @@ class GoogleAccountManagerTest {
             accountsResult = accounts(account(label = "Private owner"))
             accountsStarted = responseStarted
             accountsGate = releaseResponse
+            ignoreAccountsCancellation = true
         }
         val manager = manager(credentials, transport, presentationAllowed::get)
 
@@ -50,16 +53,21 @@ class GoogleAccountManagerTest {
         withTimeout(3_000) { responseStarted.await() }
         presentationAllowed.set(false)
         manager.quarantineBindingState()
+        assertTrue(refresh.isCancelled)
+        assertFalse(refresh.isCompleted)
+        assertFalse(releaseResponse.isCompleted)
         presentationAllowed.set(true)
         releaseResponse.complete(Unit)
-        withTimeout(3_000) { refresh.await() }
+        withTimeout(3_000) { refresh.join() }
 
         assertTrue(manager.state.value.accounts.isEmpty())
         assertNull(manager.state.value.authorization)
+        assertNull(manager.state.value.configurationId)
         assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
 
         transport.accountsStarted = null
         transport.accountsGate = null
+        transport.ignoreAccountsCancellation = false
         manager.refresh()
         assertEquals("Private owner", manager.state.value.accounts.single().label)
     }
@@ -83,11 +91,15 @@ class GoogleAccountManagerTest {
 
         val authorization = async { manager.connectNew() }
         withTimeout(3_000) { authorizationStarted.await() }
+        val savedBeforeBoundary = requireNotNull(journals.journal)
         presentationAllowed.set(false)
         manager.quarantineBindingState()
+        withTimeout(3_000) { authorization.join() }
+        assertTrue(authorization.isCancelled)
+        assertFalse(releaseAuthorization.isCompleted)
+        assertEquals(savedBeforeBoundary, journals.journal)
         presentationAllowed.set(true)
         releaseAuthorization.complete(Unit)
-        withTimeout(3_000) { authorization.await() }
 
         assertTrue(manager.state.value.accounts.isEmpty())
         assertNull(manager.state.value.authorization)
@@ -98,6 +110,220 @@ class GoogleAccountManagerTest {
         manager.restartAuthorization()
         assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
         assertEquals(2, transport.authorizationRequests.size)
+    }
+
+    @Test
+    fun privacyBoundaryRejectsCancellationIgnoringAuthorizationResultWithoutLateJournalWrite() =
+        runBlocking {
+            val presentationAllowed = AtomicBoolean(true)
+            val authorizationStarted = CompletableDeferred<Unit>()
+            val releaseAuthorization = CompletableDeferred<Unit>()
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val transport = FakeGoogleAccountsTransport().apply {
+                this.authorizationStarted = authorizationStarted
+                authorizationGate = releaseAuthorization
+                ignoreAuthorizationCancellation = true
+            }
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                presentationAllowed::get,
+                journalStore = journals,
+            )
+
+            val authorization = async { manager.connectNew() }
+            withTimeout(3_000) { authorizationStarted.await() }
+            val exactSavedRequest = requireNotNull(journals.journal)
+
+            presentationAllowed.set(false)
+            manager.quarantineBindingState()
+
+            assertTrue(authorization.isCancelled)
+            assertFalse(authorization.isCompleted)
+            assertEquals(0, journals.updateCalls)
+            presentationAllowed.set(true)
+            releaseAuthorization.complete(Unit)
+            withTimeout(3_000) { authorization.join() }
+
+            assertTrue(authorization.isCancelled)
+            assertEquals(exactSavedRequest, journals.journal)
+            assertEquals(0, journals.updateCalls)
+            assertTrue(manager.state.value.accounts.isEmpty())
+            assertNull(manager.state.value.authorization)
+            assertNull(manager.state.value.configurationId)
+            assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+
+            transport.authorizationStarted = null
+            transport.authorizationGate = null
+            transport.ignoreAuthorizationCancellation = false
+            manager.restartAuthorization()
+
+            assertEquals(2, transport.authorizationRequests.size)
+            assertEquals(1, journals.updateCalls)
+            assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        }
+
+    @Test
+    fun privacyBoundaryCancelsBothRunningAndQueuedAdmittedJobsBeforeQueuedJournalMutation() =
+        runBlocking {
+            val presentationAllowed = AtomicBoolean(true)
+            val accountsStarted = CompletableDeferred<Unit>()
+            val accountsGate = CompletableDeferred<Unit>()
+            val journals = InMemoryGoogleAuthorizationJournalStore()
+            val transport = FakeGoogleAccountsTransport().apply {
+                accountsResult = accounts(account())
+                this.accountsStarted = accountsStarted
+                this.accountsGate = accountsGate
+            }
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                presentationAllowed::get,
+                journalStore = journals,
+            )
+
+            val running = async { manager.refresh() }
+            withTimeout(3_000) { accountsStarted.await() }
+            val queued = async(start = CoroutineStart.UNDISPATCHED) { manager.connectNew() }
+
+            presentationAllowed.set(false)
+            manager.quarantineBindingState()
+            withTimeout(3_000) {
+                running.join()
+                queued.join()
+            }
+
+            assertTrue(running.isCancelled)
+            assertTrue(queued.isCancelled)
+            assertTrue(transport.authorizationRequests.isEmpty())
+            assertEquals(0, journals.saveCalls)
+            assertNull(journals.journal)
+            assertTrue(manager.state.value.accounts.isEmpty())
+            assertNull(manager.state.value.configurationId)
+            assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+        }
+
+    @Test
+    fun privacyBoundaryReturnsWhileExactJournalMutationIsBlockedAndRetainsRecovery() =
+        runBlocking {
+            val presentationAllowed = AtomicBoolean(true)
+            val mutationEntered = CountDownLatch(1)
+            val releaseMutation = CountDownLatch(1)
+            val journals = InMemoryGoogleAuthorizationJournalStore().apply {
+                updateHook = {
+                    mutationEntered.countDown()
+                    check(releaseMutation.await(3, TimeUnit.SECONDS))
+                }
+            }
+            val transport = FakeGoogleAccountsTransport()
+            val manager = manager(
+                FakeGoogleCredentials(),
+                transport,
+                presentationAllowed::get,
+                journalStore = journals,
+            )
+
+            val authorization = async(Dispatchers.Default) { manager.connectNew() }
+            assertTrue(mutationEntered.await(3, TimeUnit.SECONDS))
+            presentationAllowed.set(false)
+            val quarantine = async(Dispatchers.Default) { manager.quarantineBindingState() }
+            try {
+                // AtomicFile/fsync work must not own the presentation monitor: redaction and
+                // cancellation linearize even while this exact durable CAS is still blocked.
+                withTimeout(3_000) { quarantine.await() }
+                assertTrue(authorization.isCancelled)
+                assertFalse(authorization.isCompleted)
+                assertTrue(manager.state.value.accounts.isEmpty())
+                assertNull(manager.state.value.authorization)
+                assertNull(manager.state.value.configurationId)
+                assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+            } finally {
+                releaseMutation.countDown()
+            }
+            withTimeout(3_000) { authorization.join() }
+
+            val retained = requireNotNull(journals.journal)
+            assertEquals(
+                Instant.parse(transport.authorizationResult.expiresAt).toEpochMilli(),
+                retained.expiresAtEpochMillis,
+            )
+            assertFalse(retained.browserOpened)
+
+            // A boundary-crossing exact update is conservative, restartable recovery state.
+            presentationAllowed.set(true)
+            manager.restartAuthorization()
+            assertEquals(2, transport.authorizationRequests.size)
+            assertEquals(GoogleAccountPhase.AWAITING_BROWSER, manager.state.value.phase)
+        }
+
+    @Test
+    fun privacyBoundaryDoesNotWaitForBlockedBrowserConsumer() = runBlocking {
+        val presentationAllowed = AtomicBoolean(true)
+        val consumerEntered = CountDownLatch(1)
+        val releaseConsumer = CountDownLatch(1)
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val manager = manager(
+            FakeGoogleCredentials(),
+            FakeGoogleAccountsTransport(),
+            presentationAllowed::get,
+            journalStore = journals,
+        )
+        manager.connectNew()
+        val authorizationUrl = requireNotNull(manager.state.value.authorization).url
+
+        val handoff = async(Dispatchers.Default) {
+            manager.useAuthorizationUrlIfCurrent(authorizationUrl) {
+                consumerEntered.countDown()
+                check(releaseConsumer.await(3, TimeUnit.SECONDS))
+            }
+        }
+        assertTrue(consumerEntered.await(3, TimeUnit.SECONDS))
+        presentationAllowed.set(false)
+        val quarantine = async(Dispatchers.Default) { manager.quarantineBindingState() }
+        try {
+            withTimeout(3_000) { quarantine.await() }
+            assertTrue(handoff.isCancelled)
+            assertFalse(handoff.isCompleted)
+            assertNull(manager.state.value.authorization)
+            assertNull(manager.state.value.configurationId)
+            assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+            assertTrue(requireNotNull(journals.journal).browserOpened)
+        } finally {
+            releaseConsumer.countDown()
+        }
+        withTimeout(3_000) { handoff.join() }
+        assertTrue(handoff.isCancelled)
+    }
+
+    @Test
+    fun browserConsumerCanReenterPrivacyBoundaryWithoutDeadlockOrLatePresentation() = runBlocking {
+        val presentationAllowed = AtomicBoolean(true)
+        val callbackReturned = AtomicBoolean(false)
+        val journals = InMemoryGoogleAuthorizationJournalStore()
+        val manager = manager(
+            FakeGoogleCredentials(),
+            FakeGoogleAccountsTransport(),
+            presentationAllowed::get,
+            journalStore = journals,
+        )
+        manager.connectNew()
+        val authorizationUrl = requireNotNull(manager.state.value.authorization).url
+
+        val handoff = async(Dispatchers.Default) {
+            manager.useAuthorizationUrlIfCurrent(authorizationUrl) {
+                presentationAllowed.set(false)
+                manager.quarantineBindingState()
+                callbackReturned.set(true)
+            }
+        }
+        withTimeout(3_000) { handoff.join() }
+
+        assertTrue(callbackReturned.get())
+        assertTrue(handoff.isCancelled)
+        assertNull(manager.state.value.authorization)
+        assertNull(manager.state.value.configurationId)
+        assertEquals(GoogleAccountPhase.NOT_CONFIGURED, manager.state.value.phase)
+        assertTrue(requireNotNull(journals.journal).browserOpened)
     }
 
     @Test
@@ -118,9 +344,11 @@ class GoogleAccountManagerTest {
         withTimeout(3_000) { mutationStarted.await() }
         presentationAllowed.set(false)
         manager.quarantineBindingState()
+        withTimeout(3_000) { mutation.join() }
+        assertTrue(mutation.isCancelled)
+        assertFalse(releaseMutation.isCompleted)
         presentationAllowed.set(true)
         releaseMutation.complete(Unit)
-        withTimeout(3_000) { mutation.await() }
 
         assertEquals(1, transport.accountsCalls)
         assertTrue(manager.state.value.accounts.isEmpty())
@@ -206,7 +434,8 @@ class GoogleAccountManagerTest {
         releaseWriter.complete(Unit)
 
         assertTrue(withTimeout(3_000) { fence.await() })
-        withTimeout(3_000) { refresh.await() }
+        withTimeout(3_000) { refresh.join() }
+        assertTrue(refresh.isCancelled)
         assertEquals(0, transport.accountsCalls)
         assertTrue(manager.state.value.accounts.isEmpty())
         assertNull(manager.state.value.authorization)
@@ -1824,8 +2053,10 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
     var accountsHook: (() -> Unit)? = null
     var accountsStarted: CompletableDeferred<Unit>? = null
     var accountsGate: CompletableDeferred<Unit>? = null
+    var ignoreAccountsCancellation = false
     var authorizationStarted: CompletableDeferred<Unit>? = null
     var authorizationGate: CompletableDeferred<Unit>? = null
+    var ignoreAuthorizationCancellation = false
     var pauseStarted: CompletableDeferred<Unit>? = null
     var pauseGate: CompletableDeferred<Unit>? = null
     var accountsCalls = 0
@@ -1839,7 +2070,7 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
     ): RemoteGoogleAccounts {
         accountsCalls += 1
         accountsStarted?.complete(Unit)
-        accountsGate?.await()
+        awaitGate(accountsGate, ignoreAccountsCancellation)
         accountsHook?.invoke()
         accountsError?.let { throw it }
         return accountsResult
@@ -1853,7 +2084,7 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         authorizationRequests += request
         authorizationIdempotencyKeys += idempotencyKey
         authorizationStarted?.complete(Unit)
-        authorizationGate?.await()
+        awaitGate(authorizationGate, ignoreAuthorizationCancellation)
         authorizationError?.let { throw it }
         return authorizationResult
     }
@@ -1881,6 +2112,19 @@ private class FakeGoogleAccountsTransport : GoogleAccountsTransport {
         disconnectCalls += 1
         disconnectError?.let { throw it }
         return accountsResult.accounts.single()
+    }
+
+    private suspend fun awaitGate(
+        gate: CompletableDeferred<Unit>?,
+        ignoreCancellation: Boolean,
+    ) {
+        if (gate == null) return
+        try {
+            gate.await()
+        } catch (error: CancellationException) {
+            if (!ignoreCancellation) throw error
+            withContext(NonCancellable) { gate.await() }
+        }
     }
 
     companion object {
@@ -1911,7 +2155,9 @@ private class InMemoryGoogleAuthorizationJournalStore : GoogleAuthorizationJourn
     var failClear = false
     var saveHook: (() -> Unit)? = null
     var loadHook: (() -> Unit)? = null
+    var updateHook: (() -> Unit)? = null
     var saveCalls = 0
+    var updateCalls = 0
 
     override fun load(nowEpochMillis: Long): GoogleAuthorizationJournalLoadResult {
         loadHook?.also { loadHook = null }?.invoke()
@@ -1946,6 +2192,8 @@ private class InMemoryGoogleAuthorizationJournalStore : GoogleAuthorizationJourn
         replacement: GoogleAuthorizationJournal,
         nowEpochMillis: Long,
     ): Boolean {
+        updateCalls += 1
+        updateHook?.also { updateHook = null }?.invoke()
         if (failUpdate || journal != expected || !replacement.isValidAt(nowEpochMillis)) return false
         journal = replacement
         return true

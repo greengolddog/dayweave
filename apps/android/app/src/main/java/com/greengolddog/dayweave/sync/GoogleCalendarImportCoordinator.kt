@@ -22,6 +22,8 @@ import java.time.format.DateTimeParseException
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -235,11 +237,15 @@ class GoogleCalendarImportCoordinator(
     private val operationMutex = Mutex()
 
     /**
-     * Serializes only lifecycle generation changes and in-memory presentation publication.
-     * Credential and journal reads must finish before this monitor is entered.
+     * Serializes only lifecycle admission and presentation publication. No credential or journal
+     * I/O is performed while this monitor is held, so privacy redaction never waits for disk.
      */
     private val presentationMonitor = Any()
+    /** Serializes journal mutation CAS operations and quarantine's authoritative recovery read. */
+    private val journalMutationMonitor = Any()
     private val lifecycleGeneration = AtomicLong(1)
+    private val admittedOperationJobs = mutableMapOf<Job, Int>()
+    private var quarantineSummaryRefreshGeneration: Long? = null
     private val mutableState = MutableStateFlow(stateAfterQuarantine(credentialStore.snapshot()))
     val state: StateFlow<GoogleCalendarImportState> = mutableState.asStateFlow()
 
@@ -248,12 +254,37 @@ class GoogleCalendarImportCoordinator(
      * Durable journals stay intact and remain bound to the credential generation that created them.
      */
     fun quarantineBindingState() {
-        val quarantined = stateAfterQuarantine(credentialStore.snapshot())
-        synchronized(presentationMonitor) {
-            lifecycleGeneration.updateAndGet { current ->
+        val fence = synchronized(presentationMonitor) {
+            val generation = lifecycleGeneration.updateAndGet { current ->
                 Math.addExact(current, 1L)
             }
-            mutableState.value = quarantined
+            quarantineSummaryRefreshGeneration = generation
+            val admittedJobs = admittedOperationJobs.keys.toList()
+            mutableState.value = stateBeforeQuarantineRecoveryRead(mutableState.value)
+            QuarantineFence(generation, admittedJobs)
+        }
+        fence.admittedJobs.forEach { job ->
+            job.cancel(CancellationException(PRIVACY_BOUNDARY_CANCELLATION))
+        }
+
+        // The generation fence, redaction, and cancellation above must happen before either read.
+        // Admission remains closed while this non-identifying recovery summary is refreshed.
+        val refreshed = try {
+            synchronized(journalMutationMonitor) {
+                val snapshot = credentialStore.snapshot()
+                stateAfterQuarantine(snapshot, journalStore.load(safeNow()))
+            }
+        } catch (_: Exception) {
+            stateWhenQuarantineRecoveryReadFails(mutableState.value)
+        }
+        synchronized(presentationMonitor) {
+            if (
+                lifecycleGeneration.get() == fence.generation &&
+                quarantineSummaryRefreshGeneration == fence.generation
+            ) {
+                mutableState.value = refreshed
+                quarantineSummaryRefreshGeneration = null
+            }
         }
     }
 
@@ -269,23 +300,35 @@ class GoogleCalendarImportCoordinator(
      * credential destruction flow. Ordinary binding changes must call [hasCredentialRecoveryBlocker]
      * and leave these records untouched.
      */
-    suspend fun abandonPendingForConfirmedLocalDestruction(): Boolean = operationMutex.withLock {
-        val abandoned = journalStore.abandonAllForConfirmedLocalDestruction(safeNow())
-        if (abandoned) {
-            quarantineBindingState()
-        } else {
-            val lifecycle = lifecycleGeneration.get()
-            val snapshot = credentialStore.snapshot()
-            setState(
-                lifecycle,
-                initialState(snapshot).copy(
-                    phase = GoogleCalendarImportPhase.RECOVERY_REQUIRED,
-                    message = JOURNAL_ABANDONMENT_FAILED,
-                    pendingRecoveryCount = pendingCount(),
-                ),
-            )
+    suspend fun abandonPendingForConfirmedLocalDestruction(): Boolean {
+        val lifecycle = synchronized(presentationMonitor) {
+            lifecycleGeneration.get().takeIf {
+                quarantineSummaryRefreshGeneration == null && operationAllowed()
+            }
+        } ?: return false
+        return operationMutex.withLock {
+            val abandonedAt = safeNow()
+            val abandoned = mutateJournalIfCurrent(
+                lifecycle = lifecycle,
+                requireImportPermission = false,
+            ) {
+                journalStore.abandonAllForConfirmedLocalDestruction(abandonedAt)
+            }
+            if (abandoned) {
+                quarantineBindingState()
+            } else {
+                val snapshot = credentialStore.snapshot()
+                setState(
+                    lifecycle,
+                    initialState(snapshot).copy(
+                        phase = GoogleCalendarImportPhase.RECOVERY_REQUIRED,
+                        message = JOURNAL_ABANDONMENT_FAILED,
+                        pendingRecoveryCount = pendingCount(),
+                    ),
+                )
+            }
+            abandoned
         }
-        abandoned
     }
 
     suspend fun loadCollections(accountId: String): GoogleImportCollectionsOutcome =
@@ -300,8 +343,27 @@ class GoogleCalendarImportCoordinator(
         request: ConfigureGoogleCollectionRequest,
         hasCalendarWriteScope: Boolean,
         hasTasksWriteScope: Boolean,
+    ): GoogleImportConfigurationOutcome = withAdmittedImportOperation(
+        denied = GoogleImportConfigurationOutcome.RECOVERY_REQUIRED,
+    ) { lifecycle ->
+        configureCollectionAdmitted(
+            lifecycle = lifecycle,
+            accountId = accountId,
+            collectionId = collectionId,
+            request = request,
+            hasCalendarWriteScope = hasCalendarWriteScope,
+            hasTasksWriteScope = hasTasksWriteScope,
+        )
+    }
+
+    private suspend fun configureCollectionAdmitted(
+        lifecycle: Long,
+        accountId: String,
+        collectionId: String,
+        request: ConfigureGoogleCollectionRequest,
+        hasCalendarWriteScope: Boolean,
+        hasTasksWriteScope: Boolean,
     ): GoogleImportConfigurationOutcome {
-        val lifecycle = lifecycleGeneration.get()
         val binding = authenticatedBinding(lifecycle)
             ?: return configurationBindingFailure()
         val bindingTicket = try {
@@ -478,21 +540,26 @@ class GoogleCalendarImportCoordinator(
         }
     }
 
-    suspend fun refresh(accountId: String): GoogleCalendarImportOutcome {
-        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
-        return refreshInternal(accountId, allowNewRequest = true)
-    }
+    suspend fun refresh(accountId: String): GoogleCalendarImportOutcome =
+        refreshInternal(accountId, allowNewRequest = true)
 
-    suspend fun recoverPending(accountId: String): GoogleCalendarImportOutcome {
-        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
-        return refreshInternal(accountId, allowNewRequest = false)
-    }
+    suspend fun recoverPending(accountId: String): GoogleCalendarImportOutcome =
+        refreshInternal(accountId, allowNewRequest = false)
 
     private suspend fun collectionsOperation(
         accountId: String,
         discover: Boolean,
+    ): GoogleImportCollectionsOutcome = withAdmittedImportOperation(
+        denied = GoogleImportCollectionsOutcome.RECOVERY_REQUIRED,
+    ) { lifecycle ->
+        collectionsOperationAdmitted(lifecycle, accountId, discover)
+    }
+
+    private suspend fun collectionsOperationAdmitted(
+        lifecycle: Long,
+        accountId: String,
+        discover: Boolean,
     ): GoogleImportCollectionsOutcome {
-        val lifecycle = lifecycleGeneration.get()
         val binding = authenticatedBinding(lifecycle) ?: return collectionsBindingFailure()
         val bindingTicket = try {
             binding.configuration.beginBindingOperation()
@@ -525,6 +592,7 @@ class GoogleCalendarImportCoordinator(
                         activeAccountId = accountId,
                     ),
                 )
+                requireCurrent(lifecycle, binding)
                 val remote = if (discover) {
                     transport.discover(binding.configuration, accountId)
                 } else {
@@ -563,9 +631,17 @@ class GoogleCalendarImportCoordinator(
     private suspend fun refreshInternal(
         accountId: String,
         allowNewRequest: Boolean,
+    ): GoogleCalendarImportOutcome = withAdmittedImportOperation(
+        denied = GoogleCalendarImportOutcome.RECOVERY_REQUIRED,
+    ) { lifecycle ->
+        refreshInternalAdmitted(lifecycle, accountId, allowNewRequest)
+    }
+
+    private suspend fun refreshInternalAdmitted(
+        lifecycle: Long,
+        accountId: String,
+        allowNewRequest: Boolean,
     ): GoogleCalendarImportOutcome {
-        if (!importAllowed()) return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
-        val lifecycle = lifecycleGeneration.get()
         val binding = authenticatedBinding(lifecycle) ?: return bindingFailureOutcome()
         val bindingTicket = try {
             binding.configuration.beginBindingOperation()
@@ -638,7 +714,10 @@ class GoogleCalendarImportCoordinator(
                             pendingRecoveryCount = loaded.journals.size,
                         ),
                     )
-                    if (!journalStore.save(journal, preparedAt)) {
+                    if (!mutateJournalIfCurrent(lifecycle) {
+                            journalStore.save(journal, preparedAt)
+                        }
+                    ) {
                         updateRecoveryFailure(lifecycle, binding, JOURNAL_NOT_SAVED)
                         return@withLock GoogleCalendarImportOutcome.RECOVERY_REQUIRED
                     }
@@ -715,6 +794,7 @@ class GoogleCalendarImportCoordinator(
                 pendingRecoveryCount = pendingCount(),
             ),
         )
+        requireCurrent(lifecycle, binding)
         val accepted = try {
             transport.refresh(
                 configuration = binding.configuration,
@@ -730,7 +810,10 @@ class GoogleCalendarImportCoordinator(
                 isFreshlyPersistedFirstSend &&
                 kind.isDefinitivePreAcceptanceRejection()
             ) {
-                val retired = journalStore.retireRejectedPreparedExact(journal, safeNow())
+                val retiredAt = safeNow()
+                val retired = mutateJournalIfCurrent(lifecycle) {
+                    journalStore.retireRejectedPreparedExact(journal, retiredAt)
+                }
                 if (retired) {
                     setState(
                         lifecycle,
@@ -791,7 +874,10 @@ class GoogleCalendarImportCoordinator(
             refreshGeneration = accepted.refreshGeneration,
             recordedAtEpochMillis = recordedAt,
         )
-        if (!journalStore.save(acceptedJournal, recordedAt)) {
+        if (!mutateJournalIfCurrent(lifecycle) {
+                journalStore.save(acceptedJournal, recordedAt)
+            }
+        ) {
             updateRecoveryFailure(lifecycle, binding, ACCEPTANCE_NOT_SAVED, pendingCount())
             return null
         }
@@ -833,6 +919,7 @@ class GoogleCalendarImportCoordinator(
                     pendingRecoveryCount = pendingCount(),
                 ),
             )
+            requireCurrent(lifecycle, binding)
             val status = try {
                 transport.syncStatus(binding.configuration, journal.accountId)
             } catch (error: CancellationException) {
@@ -964,7 +1051,10 @@ class GoogleCalendarImportCoordinator(
                 pendingRecoveryCount = pendingCount(),
             ),
         )
-        if (!journalStore.restartAcceptedExact(terminal, replacement, restartedAt)) {
+        if (!mutateJournalIfCurrent(lifecycle) {
+                journalStore.restartAcceptedExact(terminal, replacement, restartedAt)
+            }
+        ) {
             updateRecoveryFailure(lifecycle, binding, TERMINAL_RESTART_NOT_SAVED, pendingCount())
             return GoogleCalendarImportOutcome.RECOVERY_REQUIRED
         }
@@ -1066,7 +1156,10 @@ class GoogleCalendarImportCoordinator(
         return try {
             operationMutex.withLock {
                 requireCurrent(lifecycle, currentBinding)
-                val removed = journalStore.removeExact(journal, safeNow())
+                val removedAt = safeNow()
+                val removed = mutateJournalIfCurrent(lifecycle) {
+                    journalStore.removeExact(journal, removedAt)
+                }
                 if (!removed) {
                     updateRecoveryFailure(
                         lifecycle,
@@ -1293,6 +1386,74 @@ class GoogleCalendarImportCoordinator(
         )
     }
 
+    /**
+     * Admits the caller Job under the same monitor that advances the privacy generation.
+     * Consequently quarantine observes every operation that could subsequently reach transport,
+     * including operations queued on [operationMutex]. Cancelling the Job also cancels the
+     * cancellable OkHttp bridge used by the production transport.
+     */
+    private suspend fun <T> withAdmittedImportOperation(
+        denied: T,
+        operation: suspend (Long) -> T,
+    ): T {
+        val operationJob = currentCoroutineContext()[Job] ?: return denied
+        val lifecycle = synchronized(presentationMonitor) {
+            if (
+                !operationJob.isActive || !operationAllowed() || !importAllowed() ||
+                quarantineSummaryRefreshGeneration != null
+            ) {
+                null
+            } else {
+                admittedOperationJobs[operationJob] =
+                    Math.addExact(admittedOperationJobs[operationJob] ?: 0, 1)
+                lifecycleGeneration.get()
+            }
+        } ?: return denied
+        return try {
+            operation(lifecycle)
+        } finally {
+            synchronized(presentationMonitor) {
+                val remaining = (admittedOperationJobs[operationJob] ?: 1) - 1
+                if (remaining <= 0) {
+                    admittedOperationJobs.remove(operationJob)
+                } else {
+                    admittedOperationJobs[operationJob] = remaining
+                }
+            }
+        }
+    }
+
+    /**
+     * Serializes every durable journal CAS with quarantine's authoritative post-fence read.
+     * Generation/gate checks briefly use [presentationMonitor] only before and after store I/O;
+     * the store call itself never holds the privacy monitor. Thus a mutation that crossed the
+     * boundary may finish its exact recovery-safe CAS, but its stale caller cannot continue and
+     * quarantine's later serialized read necessarily observes the durable result.
+     *
+     * Lock order is journal monitor, then a brief presentation check. Quarantine never nests the
+     * two monitors, which prevents an inverse lock cycle while keeping redaction immediate.
+     */
+    private fun mutateJournalIfCurrent(
+        lifecycle: Long,
+        requireImportPermission: Boolean = true,
+        mutation: () -> Boolean,
+    ): Boolean = synchronized(journalMutationMonitor) journalMutation@{
+        val admitted = synchronized(presentationMonitor) {
+            lifecycleGeneration.get() == lifecycle &&
+                quarantineSummaryRefreshGeneration == null &&
+                operationAllowed() && (!requireImportPermission || importAllowed())
+        }
+        if (!admitted) return@journalMutation false
+
+        val mutated = mutation()
+        val remainsCurrent = synchronized(presentationMonitor) {
+            lifecycleGeneration.get() == lifecycle &&
+                quarantineSummaryRefreshGeneration == null &&
+                operationAllowed() && (!requireImportPermission || importAllowed())
+        }
+        mutated && remainsCurrent
+    }
+
     private fun authenticatedBinding(lifecycle: Long): BoundGoogleImportConfiguration? {
         if (!operationAllowed()) return null
         val snapshot = credentialStore.snapshot()
@@ -1411,9 +1572,45 @@ class GoogleCalendarImportCoordinator(
         setState(lifecycle, stateAfterQuarantine(credentialStore.snapshot()))
     }
 
-    private fun stateAfterQuarantine(snapshot: ApiConnectionSnapshot): GoogleCalendarImportState {
+    private fun stateBeforeQuarantineRecoveryRead(
+        previous: GoogleCalendarImportState,
+    ): GoogleCalendarImportState {
+        val hasKnownRecovery = previous.pendingRecoveryCount > 0
+        return GoogleCalendarImportState(
+            phase = if (hasKnownRecovery) {
+                GoogleCalendarImportPhase.RECOVERY_REQUIRED
+            } else {
+                GoogleCalendarImportPhase.NOT_CONFIGURED
+            },
+            message = if (hasKnownRecovery) REFRESH_CHECK_LATER else NOT_CONFIGURED,
+            pendingRecoveryCount = previous.pendingRecoveryCount,
+        )
+    }
+
+    private fun stateWhenQuarantineRecoveryReadFails(
+        redacted: GoogleCalendarImportState,
+    ): GoogleCalendarImportState = redacted.copy(
+        phase = GoogleCalendarImportPhase.RECOVERY_REQUIRED,
+        message = JOURNAL_UNREADABLE,
+        isBusy = false,
+        accounts = emptyMap(),
+        activeAccountId = null,
+        acceptedRefreshGeneration = null,
+        pollAttempt = 0,
+        pendingRecoveryCount = redacted.pendingRecoveryCount.coerceAtLeast(1),
+        pendingRecoveryAccountIds = emptySet(),
+        configurationId = null,
+    )
+
+    private fun stateAfterQuarantine(snapshot: ApiConnectionSnapshot): GoogleCalendarImportState =
+        stateAfterQuarantine(snapshot, journalStore.load(safeNow()))
+
+    private fun stateAfterQuarantine(
+        snapshot: ApiConnectionSnapshot,
+        loaded: GoogleCalendarImportJournalLoadResult,
+    ): GoogleCalendarImportState {
         val initial = initialState(snapshot)
-        return when (val loaded = journalStore.load(safeNow())) {
+        return when (loaded) {
             is GoogleCalendarImportJournalLoadResult.Loaded -> if (loaded.journals.isEmpty()) {
                 initial
             } else {
@@ -1627,6 +1824,11 @@ class GoogleCalendarImportCoordinator(
         val accountIds: Set<String>,
     )
 
+    private data class QuarantineFence(
+        val generation: Long,
+        val admittedJobs: List<Job>,
+    )
+
     private class StaleGoogleImportOperationException : IOException(
         "Google import binding changed",
     )
@@ -1757,6 +1959,8 @@ class GoogleCalendarImportCoordinator(
         const val ACCEPTANCE_NOT_SAVED =
             "Google may have accepted the import; the exact request remains saved for replay."
         const val NO_PENDING_REFRESH = "No saved Google import is waiting for this account."
+        const val PRIVACY_BOUNDARY_CANCELLATION =
+            "Google Calendar import stopped at the privacy boundary."
 
         fun initialState(snapshot: ApiConnectionSnapshot): GoogleCalendarImportState =
             if (snapshot.hasBearerToken && snapshot.configurationId != null) {

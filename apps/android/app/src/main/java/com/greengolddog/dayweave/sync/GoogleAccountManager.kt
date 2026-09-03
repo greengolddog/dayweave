@@ -14,6 +14,8 @@ import java.net.URI
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -129,8 +131,12 @@ class GoogleAccountManager(
         UnavailableGoogleAuthorizationJournalStore,
 ) {
     private val operationMutex = Mutex()
+    /** Serializes exact journal transitions without ever blocking the presentation fence on I/O. */
+    private val journalMutationFence = Any()
     private val presentationFence = Any()
     private var presentationGeneration = 0L
+    /** Jobs are retained only for the exact duration of an admitted manager operation. */
+    private val activeOperationJobs = mutableMapOf<Job, Int>()
     private val mutableState = MutableStateFlow(
         initialState(
             credentialStore.snapshot().takeIf { operationAllowed() } ?: QUARANTINED_SNAPSHOT,
@@ -140,36 +146,53 @@ class GoogleAccountManager(
 
     /** Content-free synchronous admission signal for other process-wide mutation lanes. */
     fun hasAuthorizationRecoveryBlocker(): Boolean = try {
-        val observedAt = now().toEpochMilli()
-        when (val loaded = authorizationJournalStore.load(observedAt)) {
-            GoogleAuthorizationJournalLoadResult.Empty -> false
-            is GoogleAuthorizationJournalLoadResult.Loaded,
-            is GoogleAuthorizationJournalLoadResult.Corrupt,
-            is GoogleAuthorizationJournalLoadResult.Expired,
-            -> true
-            is GoogleAuthorizationJournalLoadResult.Retirable -> {
-                !authorizationJournalStore.removeExact(loaded.journal, observedAt) ||
-                    authorizationJournalStore.load(observedAt) !=
-                    GoogleAuthorizationJournalLoadResult.Empty
+        synchronized(journalMutationFence) {
+            val observedAt = now().toEpochMilli()
+            when (val loaded = authorizationJournalStore.load(observedAt)) {
+                GoogleAuthorizationJournalLoadResult.Empty -> false
+                is GoogleAuthorizationJournalLoadResult.Loaded,
+                is GoogleAuthorizationJournalLoadResult.Corrupt,
+                is GoogleAuthorizationJournalLoadResult.Expired,
+                -> true
+                is GoogleAuthorizationJournalLoadResult.Retirable -> {
+                    !authorizationJournalStore.removeExact(loaded.journal, observedAt) ||
+                        authorizationJournalStore.load(observedAt) !=
+                        GoogleAuthorizationJournalLoadResult.Empty
+                }
             }
         }
     } catch (_: RuntimeException) {
         true
     }
 
-    /** Atomically invalidates in-flight presentation work and drops all private provider data. */
+    /**
+     * Atomically closes admission, invalidates presentation work, and requests cancellation of
+     * every operation admitted before this privacy boundary. The durable OAuth journal is
+     * deliberately retained: cancellation can make the provider outcome ambiguous, so only an
+     * exact retry or an explicit recovery action may retire it.
+     */
     internal fun quarantineBindingState() {
-        invalidatePresentationState(QUARANTINED_SNAPSHOT)
+        val jobsToCancel = synchronized(presentationFence) {
+            invalidatePresentationStateLocked(QUARANTINED_SNAPSHOT)
+            activeOperationJobs.keys.toList().also { activeOperationJobs.clear() }
+        }
+        jobsToCancel.forEach { job ->
+            job.cancel(
+                CancellationException(
+                    "Google account operation cancelled at the private presentation boundary",
+                ),
+            )
+        }
     }
 
     suspend fun refresh() {
-        val presentation = beginPresentationOperation() ?: return
-        operationMutex.withLock {
+        withPresentationOperation { presentation ->
+            operationMutex.withLock {
         if (!presentationOperationCurrent(presentation)) return@withLock
         val binding = credentialStore.snapshot()
         // Resolve the no-backup OAuth record before touching encrypted credentials. A lost or
         // foreign API binding must still be able to surface a content-free explicit discard path.
-        val journalResolution = resolveAuthorizationJournal(binding)
+        val journalResolution = resolveAuthorizationJournal(binding, presentation)
         val configuration = try {
             credentialStore.authenticatedConfiguration()
         } catch (_: RuntimeException) {
@@ -243,6 +266,7 @@ class GoogleAccountManager(
         ))) return@withLock
         try {
             val response = transport.accounts(configuration)
+            if (!operationStillCurrent(binding, presentation)) return@withLock
             var mapped = mapState(
                 response = response,
                 authorization = retainedAuthorization,
@@ -291,6 +315,7 @@ class GoogleAccountManager(
         } finally {
             bindingTicket.release()
         }
+            }
         }
     }
 
@@ -346,47 +371,54 @@ class GoogleAccountManager(
     suspend fun resetUnreadableAuthorizationRecovery(
         confirmation: GoogleAuthorizationRecoveryResetConfirmation,
     ) {
-        val presentation = beginPresentationOperation(confirmation.presentationGeneration) ?: return
-        operationMutex.withLock {
-            val current = presentationState(presentation) ?: return@withLock
-            val binding = credentialStore.snapshot()
-            if (
-                !current.authorizationRecoveryResetRequired || current.isBusy ||
-                binding != confirmation.binding ||
-                current.configurationId != binding.configurationId
-            ) {
-                return@withLock
-            }
-            val observedAt = try {
-                now().toEpochMilli()
-            } catch (_: RuntimeException) {
-                return@withLock
-            }
-            val reset = try {
-                val loaded = authorizationJournalStore.load(observedAt)
-                loaded is GoogleAuthorizationJournalLoadResult.Corrupt &&
-                    loaded.artifactIdentity == confirmation.expectedCorruptArtifact &&
-                    authorizationRecoveryDestructionAllowed(presentation, confirmation.binding) &&
-                    authorizationJournalStore.clearCorruptExact(
-                        confirmation.expectedCorruptArtifact,
-                        observedAt,
-                    ) &&
-                    authorizationJournalStore.load(observedAt) ==
-                    GoogleAuthorizationJournalLoadResult.Empty
-            } catch (_: RuntimeException) {
-                false
-            }
-            if (reset) {
-                invalidatePresentationState(binding)
-            } else {
-                publishPresentationState(
-                    presentation,
-                    current.copy(
-                        phase = GoogleAccountPhase.ERROR,
-                        isBusy = false,
-                        message = "The saved Google authorization recovery could not be reset",
-                    ),
-                )
+        withPresentationOperation(confirmation.presentationGeneration) { presentation ->
+            operationMutex.withLock {
+                val current = presentationState(presentation) ?: return@withLock
+                val binding = credentialStore.snapshot()
+                if (
+                    !current.authorizationRecoveryResetRequired || current.isBusy ||
+                    binding != confirmation.binding ||
+                    current.configurationId != binding.configurationId
+                ) {
+                    return@withLock
+                }
+                val observedAt = try {
+                    now().toEpochMilli()
+                } catch (_: RuntimeException) {
+                    return@withLock
+                }
+                val reset = try {
+                    val loaded = authorizationJournalStore.load(observedAt)
+                    loaded is GoogleAuthorizationJournalLoadResult.Corrupt &&
+                        loaded.artifactIdentity == confirmation.expectedCorruptArtifact &&
+                        mutateAuthorizationJournalIfCurrent(
+                            presentation,
+                            confirmation.binding,
+                        ) {
+                            authorizationJournalStore.clearCorruptExact(
+                                confirmation.expectedCorruptArtifact,
+                                observedAt,
+                            )
+                        }.let { result ->
+                            result.attempted && result.applied && result.currentAfter
+                        } &&
+                        authorizationJournalStore.load(observedAt) ==
+                        GoogleAuthorizationJournalLoadResult.Empty
+                } catch (_: RuntimeException) {
+                    false
+                }
+                if (reset) {
+                    invalidatePresentationStateIfCurrent(presentation, binding)
+                } else {
+                    publishPresentationState(
+                        presentation,
+                        current.copy(
+                            phase = GoogleAccountPhase.ERROR,
+                            isBusy = false,
+                            message = "The saved Google authorization recovery could not be reset",
+                        ),
+                    )
+                }
             }
         }
     }
@@ -458,10 +490,8 @@ class GoogleAccountManager(
      */
     suspend fun discardAuthorizationRecovery(
         confirmation: GoogleAuthorizationRecoveryDiscardConfirmation,
-    ): Boolean {
-        val presentation = beginPresentationOperation(confirmation.presentationGeneration)
-            ?: return false
-        return operationMutex.withLock {
+    ): Boolean = withPresentationOperation(confirmation.presentationGeneration) { presentation ->
+        operationMutex.withLock {
             val current = presentationState(presentation) ?: return@withLock false
             val binding = credentialStore.snapshot()
             if (
@@ -485,14 +515,17 @@ class GoogleAccountManager(
                     confirmation.expectedJournal == null &&
                         loaded is GoogleAuthorizationJournalLoadResult.Corrupt &&
                         loaded.artifactIdentity == confirmation.expectedCorruptArtifact &&
-                        authorizationRecoveryDestructionAllowed(
+                        mutateAuthorizationJournalIfCurrent(
                             presentation,
                             confirmation.binding,
-                        ) &&
-                        authorizationJournalStore.clearCorruptExact(
-                            confirmation.expectedCorruptArtifact,
-                            observedAt,
-                        )
+                        ) {
+                            authorizationJournalStore.clearCorruptExact(
+                                confirmation.expectedCorruptArtifact,
+                                observedAt,
+                            )
+                        }.let { result ->
+                            result.attempted && result.applied && result.currentAfter
+                        }
                 confirmation.expectedJournal != null -> {
                     val currentJournal = when (loaded) {
                         is GoogleAuthorizationJournalLoadResult.Loaded -> loaded.journal
@@ -503,14 +536,17 @@ class GoogleAccountManager(
                         -> null
                     }
                     currentJournal == confirmation.expectedJournal &&
-                        authorizationRecoveryDestructionAllowed(
+                        mutateAuthorizationJournalIfCurrent(
                             presentation,
                             confirmation.binding,
-                        ) &&
-                        authorizationJournalStore.removeExact(
-                            confirmation.expectedJournal,
-                            observedAt,
-                        )
+                        ) {
+                            authorizationJournalStore.removeExact(
+                                confirmation.expectedJournal,
+                                observedAt,
+                            )
+                        }.let { result ->
+                            result.attempted && result.applied && result.currentAfter
+                        }
                 }
                 else -> false
             }
@@ -521,10 +557,9 @@ class GoogleAccountManager(
                 false
             }
             if (!verifiedEmpty) return@withLock false
-            invalidatePresentationState(binding)
-            true
+            invalidatePresentationStateIfCurrent(presentation, binding)
         }
-    }
+    } ?: false
 
     /**
      * Destructive credential-removal fence used only after the owner confirmed local teardown.
@@ -537,12 +572,12 @@ class GoogleAccountManager(
             } catch (_: RuntimeException) {
                 return@withLock false
             }
-            if (!authorizationJournalStore.clearForConfirmedReset(observedAt)) {
-                return@withLock false
+            val clearedAndEmpty = synchronized(journalMutationFence) {
+                authorizationJournalStore.clearForConfirmedReset(observedAt) &&
+                    authorizationJournalStore.load(observedAt) ==
+                    GoogleAuthorizationJournalLoadResult.Empty
             }
-            if (authorizationJournalStore.load(observedAt) !=
-                GoogleAuthorizationJournalLoadResult.Empty
-            ) {
+            if (!clearedAndEmpty) {
                 return@withLock false
             }
             invalidatePresentationState(credentialStore.snapshot())
@@ -581,9 +616,8 @@ class GoogleAccountManager(
     suspend fun useAuthorizationUrlIfCurrent(
         candidate: String,
         consumer: (String) -> Unit,
-    ): Boolean {
-        val presentation = beginPresentationOperation() ?: return false
-        return operationMutex.withLock {
+    ): Boolean = withPresentationOperation { presentation ->
+        operationMutex.withLock {
         val current = presentationState(presentation) ?: return@withLock false
         val binding = credentialStore.snapshot()
         val configuration = try {
@@ -697,12 +731,15 @@ class GoogleAccountManager(
             // the server-created journal interval. Both values remain strictly before expiry.
             val durableOpenedAt = handoffEpochMillis.coerceAtLeast(journal.createdAtEpochMillis)
             val openedJournal = journal.recordingBrowserOpened(durableOpenedAt)
-            if (!authorizationJournalStore.updateExact(
+            val markerResult = mutateAuthorizationJournalIfCurrent(presentation, binding) {
+                authorizationJournalStore.updateExact(
                     expected = journal,
                     replacement = openedJournal,
                     nowEpochMillis = handoffEpochMillis,
                 )
-            ) {
+            }
+            if (!markerResult.attempted || !markerResult.currentAfter) return@withLock false
+            if (!markerResult.applied) {
                 publishPresentationState(
                     presentation,
                     current.copy(
@@ -717,14 +754,13 @@ class GoogleAccountManager(
                 )
                 return@withLock false
             }
-            val opened = consumeDurablyOpenedAuthorizationIfCurrent(
+            val opened = reserveDurablyOpenedAuthorizationIfCurrent(
                 presentation,
                 candidate = candidate,
                 binding = binding,
                 currentBinding = credentialStore.snapshot(),
                 expectedConfigurationId = current.configurationId,
                 openedJournal = openedJournal,
-                consumer = consumer,
             )
             if (!opened) {
                 publishPresentationState(
@@ -740,12 +776,13 @@ class GoogleAccountManager(
                     ),
                 )
             }
+            if (opened) consumer(candidate)
             opened
         } finally {
             bindingTicket?.release()
         }
         }
-    }
+    } ?: false
 
     /** Serializes the only credential update/clear path with all Google requests and URL use. */
     suspend fun <T> withConfigurationChangeLock(change: suspend () -> T): T =
@@ -762,8 +799,8 @@ class GoogleAccountManager(
         }
 
     suspend fun browserOpenFailed() {
-        val presentation = beginPresentationOperation() ?: return
-        operationMutex.withLock {
+        withPresentationOperation { presentation ->
+            operationMutex.withLock {
         val current = presentationState(presentation) ?: return@withLock
         val binding = credentialStore.snapshot()
         if (!binding.hasBearerToken || current.configurationId != binding.configurationId) {
@@ -786,6 +823,7 @@ class GoogleAccountManager(
                 ),
             )
         }
+            }
         }
     }
 
@@ -805,8 +843,8 @@ class GoogleAccountManager(
             }
             else -> error("Unsupported Google authorization service")
         }
-        val presentation = beginPresentationOperation() ?: return
-        operationMutex.withLock {
+        withPresentationOperation { presentation ->
+            operationMutex.withLock {
             if (!presentationOperationCurrent(presentation)) return@withLock
             val binding = credentialStore.snapshot()
             val configuration = try {
@@ -850,7 +888,7 @@ class GoogleAccountManager(
                 )
                 return@withLock
             }
-            val resolution = resolveAuthorizationJournal(binding)
+            val resolution = resolveAuthorizationJournal(binding, presentation)
             if (resolution is AuthorizationJournalResolution.Blocked) {
                 publishPresentationState(
                     presentation,
@@ -1051,7 +1089,11 @@ class GoogleAccountManager(
                     )
                     return@withLock
                 }
-                if (!authorizationJournalStore.saveIfAbsent(journal, createdAt)) {
+                val saveResult = mutateAuthorizationJournalIfCurrent(presentation, binding) {
+                    authorizationJournalStore.saveIfAbsent(journal, createdAt)
+                }
+                if (!saveResult.attempted || !saveResult.currentAfter) return@withLock
+                if (!saveResult.applied) {
                     publishPresentationState(
                         presentation,
                         previous.copy(
@@ -1097,6 +1139,7 @@ class GoogleAccountManager(
                     idempotencyKey = journal.idempotencyKey,
                     request = journal.request,
                 )
+                if (!operationStillCurrent(binding, presentation)) return@withLock
                 val expiresAt = Instant.parse(started.expiresAt)
                 val responseObservedAt = now()
                 require(
@@ -1105,12 +1148,15 @@ class GoogleAccountManager(
                 )
                 validateGoogleAuthorizationUrl(started.authorizationUrl)
                 val updatedJournal = journal.recordingServerExpiry(expiresAt.toEpochMilli())
-                if (!authorizationJournalStore.updateExact(
+                val updateResult = mutateAuthorizationJournalIfCurrent(presentation, binding) {
+                    authorizationJournalStore.updateExact(
                         expected = journal,
                         replacement = updatedJournal,
                         nowEpochMillis = responseObservedAt.toEpochMilli(),
                     )
-                ) {
+                }
+                if (!updateResult.attempted || !updateResult.currentAfter) return@withLock
+                if (!updateResult.applied) {
                     publishOperationState(
                         binding,
                         presentation,
@@ -1178,6 +1224,7 @@ class GoogleAccountManager(
             } finally {
                 bindingTicket.release()
             }
+            }
         }
     }
 
@@ -1190,8 +1237,8 @@ class GoogleAccountManager(
             GoogleAccountSummary,
         ) -> RemoteGoogleAccount,
     ) {
-        val presentation = beginPresentationOperation() ?: return
-        operationMutex.withLock {
+        withPresentationOperation { presentation ->
+            operationMutex.withLock {
         if (!presentationOperationCurrent(presentation)) return@withLock
         val binding = credentialStore.snapshot()
         val configuration = try {
@@ -1223,7 +1270,7 @@ class GoogleAccountManager(
         try {
         if (!operationStillCurrent(binding, presentation)) return@withLock
         val previous = stateForBinding(binding, presentation) ?: return@withLock
-        when (val authorizationJournal = resolveAuthorizationJournal(binding)) {
+        when (val authorizationJournal = resolveAuthorizationJournal(binding, presentation)) {
             AuthorizationJournalResolution.None -> Unit
             is AuthorizationJournalResolution.Available -> {
                 publishPresentationState(
@@ -1380,6 +1427,7 @@ class GoogleAccountManager(
         } finally {
             bindingTicket.release()
         }
+            }
         }
     }
 
@@ -1437,6 +1485,7 @@ class GoogleAccountManager(
 
     private fun resolveAuthorizationJournal(
         binding: ApiConnectionSnapshot,
+        presentation: Long,
     ): AuthorizationJournalResolution {
         return try {
             val observedAt = now().toEpochMilli()
@@ -1453,8 +1502,11 @@ class GoogleAccountManager(
                         belongsToCurrentConfiguration = loaded.journal.belongsTo(binding),
                     )
                 is GoogleAuthorizationJournalLoadResult.Retirable -> {
+                    val retirement = mutateAuthorizationJournalIfCurrent(presentation, binding) {
+                        authorizationJournalStore.removeExact(loaded.journal, observedAt)
+                    }
                     if (
-                        authorizationJournalStore.removeExact(loaded.journal, observedAt) &&
+                        retirement.attempted && retirement.applied && retirement.currentAfter &&
                         authorizationJournalStore.load(observedAt) ==
                         GoogleAuthorizationJournalLoadResult.Empty
                     ) {
@@ -1875,20 +1927,103 @@ class GoogleAccountManager(
         before.baseUrl == after.baseUrl && before.configurationId == after.configurationId &&
             before.hasBearerToken == after.hasBearerToken
 
-    /** Final privacy/generation/binding fence immediately before an explicit destructive clear. */
-    private fun authorizationRecoveryDestructionAllowed(
-        presentation: Long,
-        expectedBinding: ApiConnectionSnapshot,
-    ): Boolean = credentialStore.snapshot() == expectedBinding &&
-        presentationOperationCurrent(presentation)
+    private data class PresentationOperationAdmission(
+        val generation: Long,
+        val job: Job,
+    )
 
-    private fun beginPresentationOperation(expectedGeneration: Long? = null): Long? =
+    /**
+     * Registers the caller Job under the same monitor used by quarantine. Thus an operation is
+     * either visible to that boundary and synchronously cancelled, or observes the closed gate and
+     * never starts. Ref-counting keeps nested manager calls from releasing their caller too early.
+     */
+    private suspend fun beginPresentationOperation(
+        expectedGeneration: Long? = null,
+    ): PresentationOperationAdmission? {
+        val job = currentCoroutineContext()[Job] ?: return null
+        return synchronized(presentationFence) {
+            val generation = presentationGeneration
+            if (
+                !job.isActive || !operationAllowed() ||
+                expectedGeneration != null && expectedGeneration != generation
+            ) {
+                return@synchronized null
+            }
+            activeOperationJobs[job] = Math.addExact(activeOperationJobs[job] ?: 0, 1)
+            PresentationOperationAdmission(generation = generation, job = job)
+        }
+    }
+
+    private fun finishPresentationOperation(admission: PresentationOperationAdmission) {
         synchronized(presentationFence) {
-            presentationGeneration.takeIf { generation ->
-                operationAllowed() &&
-                    (expectedGeneration == null || expectedGeneration == generation)
+            val retained = activeOperationJobs[admission.job] ?: return@synchronized
+            if (retained == 1) {
+                activeOperationJobs.remove(admission.job)
+            } else {
+                activeOperationJobs[admission.job] = retained - 1
             }
         }
+    }
+
+    private suspend fun <T> withPresentationOperation(
+        expectedGeneration: Long? = null,
+        operation: suspend (Long) -> T,
+    ): T? {
+        val admission = beginPresentationOperation(expectedGeneration) ?: return null
+        return try {
+            operation(admission.generation)
+        } finally {
+            finishPresentationOperation(admission)
+        }
+    }
+
+    private data class JournalMutationResult(
+        val attempted: Boolean,
+        val applied: Boolean,
+        val currentAfter: Boolean,
+    ) {
+        companion object {
+            val NOT_ATTEMPTED = JournalMutationResult(
+                attempted = false,
+                applied = false,
+                currentAfter = false,
+            )
+        }
+    }
+
+    /**
+     * The presentation checks bracket, but never contain, the exact durable CAS. If quarantine
+     * linearizes during disk I/O, the CAS is allowed to finish because each transition is itself
+     * recovery-safe (persist-before-send, exact advancement, or explicitly confirmed exact
+     * destruction); [JournalMutationResult.currentAfter] then prevents the stale caller from
+     * sending, presenting, or performing another transition. Lock order is journal then brief
+     * presentation checks; quarantine never acquires the journal fence.
+     */
+    private fun mutateAuthorizationJournalIfCurrent(
+        presentation: Long,
+        expectedBinding: ApiConnectionSnapshot,
+        mutation: () -> Boolean,
+    ): JournalMutationResult = synchronized(journalMutationFence) journalMutation@{
+        val bindingBefore = credentialStore.snapshot()
+        val admitted = synchronized(presentationFence) {
+            operationAllowed() && presentationGeneration == presentation &&
+                sameBinding(expectedBinding, bindingBefore)
+        }
+        if (!admitted) return@journalMutation JournalMutationResult.NOT_ATTEMPTED
+
+        val applied = mutation()
+
+        val bindingAfter = credentialStore.snapshot()
+        val currentAfter = synchronized(presentationFence) {
+            operationAllowed() && presentationGeneration == presentation &&
+                sameBinding(expectedBinding, bindingAfter)
+        }
+        JournalMutationResult(
+            attempted = true,
+            applied = applied,
+            currentAfter = currentAfter,
+        )
+    }
 
     private fun presentationOperationCurrent(generation: Long): Boolean =
         synchronized(presentationFence) {
@@ -1951,6 +2086,17 @@ class GoogleAccountManager(
             invalidatePresentationStateLocked(snapshot)
         }
 
+    private fun invalidatePresentationStateIfCurrent(
+        presentation: Long,
+        snapshot: ApiConnectionSnapshot,
+    ): Boolean = synchronized(presentationFence) {
+        if (!operationAllowed() || presentationGeneration != presentation) {
+            return@synchronized false
+        }
+        invalidatePresentationStateLocked(snapshot)
+        true
+    }
+
     private fun invalidatePresentationStateLocked(snapshot: ApiConnectionSnapshot) {
         presentationGeneration += 1
         val visibleSnapshot = snapshot.takeIf { operationAllowed() } ?: QUARANTINED_SNAPSHOT
@@ -1984,16 +2130,24 @@ class GoogleAccountManager(
         trusted
     }
 
-    /** Final fence check and synchronous handoff after the opened marker is durable. */
-    private fun consumeDurablyOpenedAuthorizationIfCurrent(
+    /**
+     * Atomically consumes the one-use URL after its opened marker is durable. This state transition
+     * is the browser-handoff linearization point: a privacy boundary before it rejects the launch;
+     * a boundary after it treats the launch as potentially committed and relies on the durable
+     * opened marker to forbid an unsafe replay. The caller invokes the browser consumer immediately
+     * afterward, outside [presentationFence], so an arbitrary or reentrant callback can never delay
+     * generation invalidation, redaction, or operation cancellation.
+     */
+    private fun reserveDurablyOpenedAuthorizationIfCurrent(
         presentation: Long,
         candidate: String,
         binding: ApiConnectionSnapshot,
         currentBinding: ApiConnectionSnapshot,
         expectedConfigurationId: String?,
         openedJournal: GoogleAuthorizationJournal,
-        consumer: (String) -> Unit,
-    ): Boolean = synchronized(presentationFence) {
+    ): Boolean {
+        val recovery = openedJournal.toRecovery(true)
+        return synchronized(presentationFence) {
         if (
             !operationAllowed() || !authorizationMutationAllowed(
                 openedJournal.action,
@@ -2014,14 +2168,14 @@ class GoogleAccountManager(
         mutableState.value = current.copy(
             phase = GoogleAccountPhase.AUTHORIZATION_RECOVERY,
             authorization = null,
-            authorizationRecovery = openedJournal.toRecovery(true),
+            authorizationRecovery = recovery,
             authorizationRecoveryResetRequired = false,
             isBusy = false,
             message =
                 "Google browser handoff is recorded · return and refresh to verify the grant",
         )
-        consumer(candidate)
         true
+        }
     }
 
     private fun configurationMatchesBinding(

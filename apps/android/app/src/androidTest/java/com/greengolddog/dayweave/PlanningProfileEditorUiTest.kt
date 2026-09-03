@@ -9,12 +9,14 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextContains
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
-import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performSemanticsAction
 import androidx.compose.ui.test.performTextReplacement
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -81,22 +83,17 @@ class PlanningProfileEditorUiTest {
         )
         showEditor(currentProfile = rich, onSave = savedProfile::set)
 
-        composeRule.onNodeWithTag("planning_timezone")
-            .performScrollTo()
-            .assertTextContains("Europe/Paris")
-        composeRule.onNodeWithTag("planning_sleep_start")
-            .performScrollTo()
-            .assertTextContains("23:00")
-        composeRule.onNodeWithTag("planning_availability_monday_enabled")
-            .performScrollTo()
-            .assertIsEnabled()
-        composeRule.onNodeWithTag("planning_protected_monday_enabled")
-            .performScrollTo()
-            .assertIsEnabled()
+        scrollTo("planning_timezone")
+        composeRule.onNodeWithTag("planning_timezone").assertTextContains("Europe/Paris")
+        scrollTo("planning_sleep_start")
+        composeRule.onNodeWithTag("planning_sleep_start").assertTextContains("23:00")
+        scrollTo("planning_availability_monday_enabled")
+        composeRule.onNodeWithTag("planning_availability_monday_enabled").assertIsEnabled()
+        scrollTo("planning_protected_monday_enabled")
+        composeRule.onNodeWithTag("planning_protected_monday_enabled").assertIsEnabled()
 
         replaceText("planning_timezone", "UTC")
         composeRule.onNodeWithTag("save_planning_profile")
-            .performScrollTo()
             .assertIsEnabled()
             .performClick()
 
@@ -111,9 +108,12 @@ class PlanningProfileEditorUiTest {
 
         composeRule.onNodeWithTag("planning_weekly_schedule").performClick()
 
-        composeRule.onNodeWithTag("planning_timezone").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("planning_availability_monday").performScrollTo().assertIsDisplayed()
-        composeRule.onNodeWithTag("planning_protected_sunday").performScrollTo().assertIsDisplayed()
+        scrollTo("planning_timezone")
+        composeRule.onNodeWithTag("planning_timezone").assertIsDisplayed()
+        scrollTo("planning_availability_monday")
+        composeRule.onNodeWithTag("planning_availability_monday").assertIsDisplayed()
+        scrollTo("planning_protected_sunday")
+        composeRule.onNodeWithTag("planning_protected_sunday").assertIsDisplayed()
         composeRule.onNodeWithTag("save_planning_profile").assertIsEnabled()
     }
 
@@ -123,9 +123,8 @@ class PlanningProfileEditorUiTest {
         showEditor(onSave = savedProfile::set)
 
         replaceText("planning_end_hour", "06")
-        composeRule.onNodeWithText("End must be later than start.")
-            .performScrollTo()
-            .assertIsDisplayed()
+        scrollToText("End must be later than start.")
+        composeRule.onNodeWithText("End must be later than start.").assertIsDisplayed()
         composeRule.onNodeWithTag("save_planning_profile").assertIsNotEnabled()
         assertNull(savedProfile.get())
 
@@ -173,8 +172,8 @@ class PlanningProfileEditorUiTest {
             onSave = savedProfile::set,
         )
 
+        scrollTo("reset_planning_profile")
         composeRule.onNodeWithTag("reset_planning_profile")
-            .performScrollTo()
             .assertIsEnabled()
             .performClick()
         composeRule.onNodeWithTag("planning_start_hour").assertTextContains("07")
@@ -202,8 +201,8 @@ class PlanningProfileEditorUiTest {
         showEditor(editBlockedMessage = BLOCKED_MESSAGE)
 
         assertEveryMutableControlIsDisabled()
+        scrollTo("planning_profile_status")
         composeRule.onNodeWithTag("planning_profile_status")
-            .performScrollTo()
             .assertTextContains(BLOCKED_MESSAGE)
             .assertIsDisplayed()
         composeRule.onNodeWithText("Cancel").assertIsEnabled()
@@ -220,8 +219,8 @@ class PlanningProfileEditorUiTest {
         )
 
         assertEveryMutableControlIsDisabled()
+        scrollTo("planning_profile_status")
         composeRule.onNodeWithTag("planning_profile_status")
-            .performScrollTo()
             .assertTextContains(SAVING_MESSAGE)
             .assertIsDisplayed()
         composeRule.onNodeWithText("Cancel").assertIsNotEnabled()
@@ -250,9 +249,19 @@ class PlanningProfileEditorUiTest {
     }
 
     private fun replaceText(tag: String, value: String) {
+        scrollTo(tag)
         composeRule.onNodeWithTag(tag)
-            .performScrollTo()
             .performTextReplacement(value)
+    }
+
+    private fun scrollTo(tag: String) {
+        composeRule.onNodeWithTag("planning_profile_scroll")
+            .performScrollToNode(hasTestTag(tag))
+    }
+
+    private fun scrollToText(text: String) {
+        composeRule.onNodeWithTag("planning_profile_scroll")
+            .performScrollToNode(hasText(text))
     }
 
     private fun assertEveryMutableControlIsDisabled() {

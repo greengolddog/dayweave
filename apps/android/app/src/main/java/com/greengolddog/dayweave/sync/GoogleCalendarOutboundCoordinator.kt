@@ -25,6 +25,9 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -116,13 +119,18 @@ class GoogleCalendarOutboundCoordinator(
     private val presentationMonitor = Any()
     private val lifecycleGeneration = AtomicLong(1)
     private val operationSequence = AtomicLong(0)
+    private val activeOperationJobs = mutableSetOf<Job>()
     private val mutableState = MutableStateFlow(initialState())
     val state: StateFlow<GoogleCalendarOutboundState> = mutableState.asStateFlow()
 
     fun quarantineBindingState() {
-        synchronized(presentationMonitor) {
+        val jobsToCancel = synchronized(presentationMonitor) {
             lifecycleGeneration.updateAndGet(Math::incrementExact)
             mutableState.value = initialState()
+            activeOperationJobs.toList().also { activeOperationJobs.clear() }
+        }
+        jobsToCancel.forEach { job ->
+            job.cancel(GoogleOutboundPrivacyBoundaryCancellationException())
         }
     }
 
@@ -253,10 +261,9 @@ class GoogleCalendarOutboundCoordinator(
         itemId: String,
         requestedTarget: GoogleCalendarOutboundTarget,
     ): GoogleCalendarOutboundOutcome = withBoundOperation { lifecycle, binding ->
-        operationMutex.withLock {
             requireCurrent(lifecycle, binding)
             val current = plannerStore.durableState.value
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                     "Encrypted planner state is not ready for Google publication.",
@@ -264,10 +271,10 @@ class GoogleCalendarOutboundCoordinator(
                 )
             if (current.pendingGoogleCalendarOutbound != null) {
                 presentJournal(lifecycle, current.pendingGoogleCalendarOutbound)
-                return@withLock GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+                return@withBoundOperation GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
             }
             if (current.pendingGoogleSchedulePublication != null) {
-                return@withLock failure(
+                return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                     "Recover the generated-schedule publication before publishing another change.",
@@ -275,7 +282,7 @@ class GoogleCalendarOutboundCoordinator(
                 )
             }
             val candidate = current.googleCalendarOutboundCandidate(itemId)
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.ERROR,
                     "Only a supported synced app-authored event or task can be published.",
@@ -286,7 +293,7 @@ class GoogleCalendarOutboundCoordinator(
                 expectedConfigurationId = binding.configurationId,
                 expectedCandidate = candidate,
             )
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.ERROR,
                     "That Google publication destination is no longer available. Refresh Google sources.",
@@ -320,7 +327,7 @@ class GoogleCalendarOutboundCoordinator(
                 ),
             )
             if (!plannerStore.replaceGoogleCalendarOutboundJournal(null, journal)) {
-                return@withLock failure(
+                return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                     "The encrypted Google publication intent could not be saved.",
@@ -351,16 +358,14 @@ class GoogleCalendarOutboundCoordinator(
             requireCurrent(lifecycle, binding)
             presentJournal(lifecycle, previewed)
             GoogleCalendarOutboundOutcome.PREVIEW_READY
-        }
     }
 
     suspend fun approveAndEnqueue(
         confirmation: GoogleCalendarOutboundApprovalConfirmation,
     ): GoogleCalendarOutboundOutcome = withBoundOperation { lifecycle, binding ->
-        operationMutex.withLock {
             requireCurrent(lifecycle, binding)
             val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
-                ?: return@withLock failure(
+                ?: return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                     "The encrypted Google publication preview is unavailable.",
@@ -379,7 +384,7 @@ class GoogleCalendarOutboundCoordinator(
                 !now().isBefore(Instant.parse(preview.expiresAt)) ||
                 !candidateAndTargetRemainCurrent(journal)
             ) {
-                return@withLock failure(
+                return@withBoundOperation failure(
                     lifecycle,
                     GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                     "The item, destination, or preview changed. Nothing was approved.",
@@ -417,25 +422,23 @@ class GoogleCalendarOutboundCoordinator(
             }
             requireCurrent(lifecycle, binding)
             enqueueApproved(lifecycle, binding, approved)
-        }
     }
 
     /** Replays preview or enqueue only. A recovered preview is never approved automatically. */
     suspend fun recoverPending(): GoogleCalendarOutboundOutcome =
         withBoundOperation { lifecycle, binding ->
-            operationMutex.withLock {
                 requireCurrent(lifecycle, binding)
                 val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
                     ?: run {
                         setState(lifecycle, readyState(binding))
-                        return@withLock GoogleCalendarOutboundOutcome.RECOVERED
+                        return@withBoundOperation GoogleCalendarOutboundOutcome.RECOVERED
                     }
                 if (
                     journal.configurationId != binding.configurationId ||
                     journal.apiBaseUrl != binding.apiBaseUrl ||
                     !journal.isValidAt(now())
                 ) {
-                    return@withLock failure(
+                    return@withBoundOperation failure(
                         lifecycle,
                         GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                         "The saved Google publication belongs to another API connection.",
@@ -447,12 +450,12 @@ class GoogleCalendarOutboundCoordinator(
                     !now().isBefore(journal.authorityExpiresAt())
                 ) {
                     presentJournal(lifecycle, journal)
-                    return@withLock GoogleCalendarOutboundOutcome.EXPIRED
+                    return@withBoundOperation GoogleCalendarOutboundOutcome.EXPIRED
                 }
                 when (journal.stage) {
                     GoogleCalendarOutboundStage.INTENT -> {
                         val recoveredTarget = currentCandidateAndTarget(journal)?.second
-                            ?: return@withLock failure(
+                            ?: return@withBoundOperation failure(
                                 lifecycle,
                                 GoogleCalendarOutboundPhase.RECOVERY_REQUIRED,
                                 "The saved item or Publish destination changed. Nothing was sent.",
@@ -468,6 +471,7 @@ class GoogleCalendarOutboundCoordinator(
                                 configurationId = binding.configurationId,
                             ),
                         )
+                        requireCurrent(lifecycle, binding)
                         val remote = transport.preview(
                             configuration = binding.configuration,
                             accountId = journal.accountId,
@@ -503,27 +507,28 @@ class GoogleCalendarOutboundCoordinator(
                     GoogleCalendarOutboundStage.APPROVED ->
                         enqueueApproved(lifecycle, binding, journal)
                 }
-            }
         }
 
     suspend fun discardExpiredRecovery(): Boolean {
         val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
-        return operationMutex.withLock {
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
+        return try {
+            withActiveOperation(lifecycle) {
+                val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
+                    ?: return@withActiveOperation true
+                val currentTime = now()
+                requireCurrentLifecycle(lifecycle)
+                if (!plannerStore.discardExpiredGoogleCalendarOutbound(journal, currentTime)) {
+                    return@withActiveOperation false
+                }
+                requireCurrentLifecycle(lifecycle)
+                setState(lifecycle, initialState())
+                true
             }
-            val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
-                ?: return@withLock true
-            val currentTime = now()
-            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
-                return@withLock false
-            }
-            if (!plannerStore.discardExpiredGoogleCalendarOutbound(journal, currentTime)) {
-                return@withLock false
-            }
-            setState(lifecycle, initialState())
-            true
+        } catch (_: StaleGoogleOutboundOperationException) {
+            false
+        } catch (error: CancellationException) {
+            if (error.isPrivacyBoundaryCancellation()) false else throw error
         }
     }
 
@@ -543,6 +548,7 @@ class GoogleCalendarOutboundCoordinator(
                 configurationId = binding.configurationId,
             ),
         )
+        requireCurrent(lifecycle, binding)
         val accepted = transport.enqueue(
             configuration = binding.configuration,
             accountId = journal.accountId,
@@ -722,27 +728,68 @@ class GoogleCalendarOutboundCoordinator(
         ) -> GoogleCalendarOutboundOutcome,
     ): GoogleCalendarOutboundOutcome {
         val lifecycle = lifecycleGeneration.get()
-        val binding = authenticatedBinding(lifecycle) ?: return bindingFailureOutcome()
-        val ticket = try {
-            binding.configuration.beginBindingOperation()
-        } catch (_: ApiBindingChangedException) {
-            quarantineBindingState()
-            return GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
-        }
         return try {
-            operation(lifecycle, binding)
-        } catch (error: CancellationException) {
-            retainRecoveryAfterFailure(lifecycle, binding, error)
-            throw error
-        } catch (_: ApiBindingChangedException) {
-            quarantineBindingState()
-            GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+            withActiveOperation(lifecycle) {
+                val binding = authenticatedBinding(lifecycle)
+                    ?: return@withActiveOperation bindingFailureOutcome()
+                val ticket = try {
+                    binding.configuration.beginBindingOperation()
+                } catch (_: ApiBindingChangedException) {
+                    quarantineBindingState()
+                    return@withActiveOperation GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+                }
+                try {
+                    operation(lifecycle, binding)
+                } catch (error: CancellationException) {
+                    if (!error.isPrivacyBoundaryCancellation()) {
+                        retainRecoveryAfterFailure(lifecycle, binding, error)
+                    }
+                    throw error
+                } catch (_: ApiBindingChangedException) {
+                    quarantineBindingState()
+                    GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+                } catch (_: StaleGoogleOutboundOperationException) {
+                    GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+                } catch (error: Exception) {
+                    retainRecoveryAfterFailure(lifecycle, binding, error)
+                } finally {
+                    ticket.release()
+                }
+            }
         } catch (_: StaleGoogleOutboundOperationException) {
             GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
-        } catch (error: Exception) {
-            retainRecoveryAfterFailure(lifecycle, binding, error)
+        } catch (error: CancellationException) {
+            if (error.isPrivacyBoundaryCancellation()) {
+                GoogleCalendarOutboundOutcome.RECOVERY_REQUIRED
+            } else {
+                throw error
+            }
+        }
+    }
+
+    /** Admission and quarantine share one monitor, including callers waiting for the mutation lane. */
+    private suspend fun <T> withActiveOperation(
+        lifecycle: Long,
+        operation: suspend () -> T,
+    ): T = coroutineScope {
+        val operationJob = currentCoroutineContext()[Job]
+            ?: throw IllegalStateException("Google outbound operation has no coroutine job")
+        val registered = synchronized(presentationMonitor) {
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                false
+            } else {
+                activeOperationJobs += operationJob
+                true
+            }
+        }
+        if (!registered) throw StaleGoogleOutboundOperationException()
+        try {
+            operationMutex.withLock {
+                requireCurrentLifecycle(lifecycle)
+                operation()
+            }
         } finally {
-            ticket.release()
+            synchronized(presentationMonitor) { activeOperationJobs -= operationJob }
         }
     }
 
@@ -789,6 +836,12 @@ class GoogleCalendarOutboundCoordinator(
             !operationAllowed() || lifecycleGeneration.get() != lifecycle ||
             !sameBinding(credentialStore.snapshot(), binding.snapshot)
         ) {
+            throw StaleGoogleOutboundOperationException()
+        }
+    }
+
+    private fun requireCurrentLifecycle(lifecycle: Long) {
+        if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
             throw StaleGoogleOutboundOperationException()
         }
     }
@@ -931,7 +984,17 @@ class GoogleCalendarOutboundCoordinator(
         "Google outbound recovery changed",
     )
 
+    private class GoogleOutboundPrivacyBoundaryCancellationException :
+        CancellationException(PRIVACY_BOUNDARY_CANCELLATION_MESSAGE)
+
     private companion object {
+        const val PRIVACY_BOUNDARY_CANCELLATION_MESSAGE =
+            "Google Calendar outbound operation cancelled at privacy boundary"
+
+        fun CancellationException.isPrivacyBoundaryCancellation(): Boolean =
+            this is GoogleOutboundPrivacyBoundaryCancellationException ||
+                cause is GoogleOutboundPrivacyBoundaryCancellationException
+
         fun GoogleAccountSummary.hasWriteScopeFor(
             entityKind: GoogleCalendarOutboundEntityKind,
         ): Boolean = status == "active" && syncEnabled && when (entityKind) {
