@@ -11,7 +11,7 @@ description = "Private sync, integration, and Suggestions Inbox API for DayWeave
 workspace = true
 
 [dependencies]
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["json", "macros"] }
 base64 = "0.22"
