@@ -74,6 +74,50 @@ class PlanningProfileEditorUiTest {
     }
 
     @Test
+    fun richProfileShowsTimezoneSleepWeekdaysAndPersistsAnExactEdit() {
+        val savedProfile = AtomicReference<ScheduleCompositionProfileSnapshot?>()
+        val rich = requireNotNull(
+            ScheduleCompositionProfileSnapshot().upgradedToWeeklySchedule("Europe/Paris"),
+        )
+        showEditor(currentProfile = rich, onSave = savedProfile::set)
+
+        composeRule.onNodeWithTag("planning_timezone")
+            .performScrollTo()
+            .assertTextContains("Europe/Paris")
+        composeRule.onNodeWithTag("planning_sleep_start")
+            .performScrollTo()
+            .assertTextContains("23:00")
+        composeRule.onNodeWithTag("planning_availability_monday_enabled")
+            .performScrollTo()
+            .assertIsEnabled()
+        composeRule.onNodeWithTag("planning_protected_monday_enabled")
+            .performScrollTo()
+            .assertIsEnabled()
+
+        replaceText("planning_timezone", "UTC")
+        composeRule.onNodeWithTag("save_planning_profile")
+            .performScrollTo()
+            .assertIsEnabled()
+            .performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(rich.copy(timezoneName = "UTC"), savedProfile.get())
+        }
+    }
+
+    @Test
+    fun legacyProfileCanOptIntoWeeklyEditingWithoutImplicitlySaving() {
+        showEditor()
+
+        composeRule.onNodeWithTag("planning_weekly_schedule").performClick()
+
+        composeRule.onNodeWithTag("planning_timezone").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("planning_availability_monday").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("planning_protected_sunday").performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag("save_planning_profile").assertIsEnabled()
+    }
+
+    @Test
     fun invalidDraftGatesSaveAndValidDraftReturnsExactProfile() {
         val savedProfile = AtomicReference<ScheduleCompositionProfileSnapshot?>()
         showEditor(onSave = savedProfile::set)
@@ -213,6 +257,7 @@ class PlanningProfileEditorUiTest {
 
     private fun assertEveryMutableControlIsDisabled() {
         listOf(
+            "planning_weekly_schedule",
             "planning_start_hour",
             "planning_start_minute",
             "planning_end_hour",

@@ -14,6 +14,8 @@ import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.serialization.EncodeDefault
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
@@ -759,6 +761,7 @@ data class LocalScheduleCompositionProvenanceSnapshot(
 
 /** Encrypted scheduling policy used by both remote and bundled deterministic composition. */
 @Serializable
+@OptIn(ExperimentalSerializationApi::class)
 data class ScheduleCompositionProfileSnapshot(
     val firmHorizonDays: Int = DEFAULT_FIRM_HORIZON_DAYS,
     val dayStartMinute: Int = 7 * 60,
@@ -766,19 +769,128 @@ data class ScheduleCompositionProfileSnapshot(
     val slotGranularityMinutes: Int = 5,
     val stabilityWeight: Int = 4,
     val defaultSoftWeight: Int = 100,
+    /**
+     * Null rich fields are the lossless compatibility representation for profiles written before
+     * weekday schedules existed. Composition then uses [dayStartMinute]/[dayEndMinute] and the
+     * caller's device zone exactly as older builds did. Rich profiles must set all four fields.
+     */
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val timezoneName: String? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val availability: List<ScheduleAvailabilityDay>? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val sleep: ScheduleSleepInterval? = null,
+    @EncodeDefault(EncodeDefault.Mode.NEVER)
+    val protectedTime: List<ScheduleProtectedDay>? = null,
 ) {
-    fun hasValidShape(): Boolean =
-        firmHorizonDays in MIN_FIRM_HORIZON_DAYS..MAX_FIRM_HORIZON_DAYS &&
+    val usesWeeklySchedule: Boolean
+        get() = timezoneName != null
+
+    fun hasValidShape(): Boolean {
+        val hasValidLegacyFields =
+            firmHorizonDays in MIN_FIRM_HORIZON_DAYS..MAX_FIRM_HORIZON_DAYS &&
             dayStartMinute in 0 until MINUTES_PER_DAY &&
             dayEndMinute in 1..MINUTES_PER_DAY && dayEndMinute > dayStartMinute &&
             slotGranularityMinutes in 1..60 &&
             stabilityWeight in 0..1_000_000 &&
             defaultSoftWeight in 0..1_000_000
+        if (!hasValidLegacyFields) return false
+
+        val richFields = listOf(timezoneName, availability, sleep, protectedTime)
+        if (richFields.all { it == null }) return true
+        if (richFields.any { it == null }) return false
+
+        val exactTimezone = requireNotNull(timezoneName)
+        val exactAvailability = requireNotNull(availability)
+        val exactSleep = requireNotNull(sleep)
+        val exactProtected = requireNotNull(protectedTime)
+        if (
+            exactTimezone != exactTimezone.normalizedScheduleTimeZoneName() ||
+            !exactTimezone.isKnownScheduleTimeZone() ||
+            !exactSleep.hasValidShape()
+        ) {
+            return false
+        }
+        if (exactAvailability.map(ScheduleAvailabilityDay::weekday) != ScheduleWeekday.entries) {
+            return false
+        }
+        if (exactProtected.map(ScheduleProtectedDay::weekday) != ScheduleWeekday.entries) {
+            return false
+        }
+        if (exactAvailability.any { !it.hasValidShape() } || exactProtected.any { !it.hasValidShape() }) {
+            return false
+        }
+        val allWorkWindows = exactAvailability.flatMap(ScheduleAvailabilityDay::windows)
+        if (
+            dayStartMinute != (
+                allWorkWindows.minOfOrNull(ScheduleLocalTimeWindow::startMinute)
+                    ?: exactSleep.endMinute
+                ) ||
+            dayEndMinute != (
+                allWorkWindows.maxOfOrNull(ScheduleLocalTimeWindow::endMinute)
+                    ?: exactSleep.startMinute
+                )
+        ) {
+            return false
+        }
+        val protectedByDay = exactProtected.associateBy(ScheduleProtectedDay::weekday)
+        return exactAvailability.all { day ->
+            val protectedWindows = requireNotNull(protectedByDay[day.weekday]).windows
+            day.windows.all { window ->
+                window.isInsideWakingTime(exactSleep) &&
+                    protectedWindows.none { protected -> window.overlaps(protected) }
+            }
+        } && exactProtected.all { day ->
+            day.windows.all { it.isInsideWakingTime(exactSleep) }
+        }
+    }
+
+    /** Upgrades a representable legacy profile without changing its usable work window. */
+    fun upgradedToWeeklySchedule(
+        timezoneName: String = currentScheduleTimeZoneName(),
+    ): ScheduleCompositionProfileSnapshot? {
+        if (usesWeeklySchedule) return takeIf(ScheduleCompositionProfileSnapshot::hasValidShape)
+        if (dayEndMinute >= MINUTES_PER_DAY) return null
+        val normalizedTimezone = timezoneName.normalizedScheduleTimeZoneName()
+        if (!normalizedTimezone.isKnownScheduleTimeZone()) return null
+        val wakeMinute = minOf(6 * 60, dayStartMinute)
+        val sleepStartMinute = maxOf(23 * 60, dayEndMinute)
+        if (sleepStartMinute >= MINUTES_PER_DAY || sleepStartMinute <= wakeMinute) return null
+        val workWindow = ScheduleLocalTimeWindow(dayStartMinute, dayEndMinute)
+        val sleepInterval = ScheduleSleepInterval(sleepStartMinute, wakeMinute)
+        val protectedStart = maxOf(dayEndMinute, sleepStartMinute - DEFAULT_PROTECTED_MINUTES)
+        val protectedWindow = ScheduleLocalTimeWindow(protectedStart, sleepStartMinute)
+            .takeIf(ScheduleLocalTimeWindow::hasValidShape)
+        return copy(
+            timezoneName = normalizedTimezone,
+            availability = ScheduleWeekday.entries.map { weekday ->
+                ScheduleAvailabilityDay(weekday, isEnabled = true, windows = listOf(workWindow))
+            },
+            sleep = sleepInterval,
+            protectedTime = ScheduleWeekday.entries.map { weekday ->
+                ScheduleProtectedDay(
+                    weekday = weekday,
+                    isEnabled = protectedWindow != null,
+                    windows = listOfNotNull(protectedWindow),
+                )
+            },
+        ).takeIf(ScheduleCompositionProfileSnapshot::hasValidShape)
+    }
+
+    private fun ScheduleLocalTimeWindow.isInsideWakingTime(
+        sleep: ScheduleSleepInterval,
+    ): Boolean = startMinute >= sleep.endMinute && endMinute <= sleep.startMinute
+
+    private fun ScheduleLocalTimeWindow.overlaps(other: ScheduleLocalTimeWindow): Boolean =
+        startMinute < other.endMinute && other.startMinute < endMinute
 
     companion object {
         const val DEFAULT_FIRM_HORIZON_DAYS = 7
         const val MIN_FIRM_HORIZON_DAYS = 1
         const val MAX_FIRM_HORIZON_DAYS = 30
+        const val MAX_PROTECTED_MINUTES_PER_DAY = 8 * 60
+        const val MAX_TIMEZONE_NAME_BYTES = 255
+        private const val DEFAULT_PROTECTED_MINUTES = 90
         private const val MINUTES_PER_DAY = 24 * 60
     }
 }
@@ -1613,7 +1725,7 @@ data class DayWeaveUiState(
         val provenance = localScheduleCompositionProvenance ?: return null
         if (!provenance.matchesState(this)) return null
         val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return null
-        if (zone != currentZone) return null
+        if (zone != scheduleCompositionProfile.effectivePlanningZone(currentZone)) return null
         val start = runCatching { Instant.parse(provenance.horizonStart) }.getOrNull() ?: return null
         val end = runCatching { Instant.parse(provenance.horizonEnd) }.getOrNull() ?: return null
         if (reference < start || reference >= end) return null
@@ -1771,7 +1883,9 @@ data class DayWeaveUiState(
     ): Boolean {
         if (pendingSchedulePublication != null) return false
         if (canonicalSyncOrigin == null) return true
-        return isPublishedScheduleDisplayCurrent(reference, currentZone, requireSameZone = true)
+        val effectiveZone = scheduleCompositionProfile.effectivePlanningZone(currentZone)
+            ?: return false
+        return isPublishedScheduleDisplayCurrent(reference, effectiveZone, requireSameZone = true)
     }
 
     /**
@@ -1819,13 +1933,19 @@ data class DayWeaveUiState(
         val provenance = localScheduleCompositionProvenance ?: return false
         if (!provenance.matchesState(this)) return false
         val zone = runCatching { ZoneId.of(provenance.timezoneName) }.getOrNull() ?: return false
-        if (zone != currentZone) return false
+        if (zone != scheduleCompositionProfile.effectivePlanningZone(currentZone)) return false
         val horizonStart = runCatching { Instant.parse(provenance.horizonStart) }.getOrNull()
             ?: return false
         val horizonEnd = runCatching { Instant.parse(provenance.horizonEnd) }.getOrNull()
             ?: return false
         return reference >= horizonStart && reference < horizonEnd
     }
+
+    private fun ScheduleCompositionProfileSnapshot.effectivePlanningZone(
+        fallback: ZoneId,
+    ): ZoneId? = timezoneName?.let { raw ->
+        runCatching { ZoneId.of(raw) }.getOrNull()
+    } ?: fallback
 
     /** Exact publication authority for one unchanged canonical server block. */
     fun hasPublishedExecutionAuthority(block: ScheduleItem): Boolean {

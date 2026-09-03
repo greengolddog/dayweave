@@ -1619,6 +1619,37 @@ class CanonicalSyncManagerTest {
     }
 
     @Test
+    fun weeklyProfileOverridesDeviceZoneAndSendsSleepAndProtectedBlocks() = runBlocking {
+        val profile = requireNotNull(
+            ScheduleCompositionProfileSnapshot().upgradedToWeeklySchedule("Europe/Paris"),
+        )
+        val plannerStore = PlannerStore(DayWeaveUiState(scheduleCompositionProfile = profile))
+        val transport = FakeCanonicalTransport().apply {
+            pages[null] = RemoteItemDeltaPage(
+                listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                "cursor-weekly-profile",
+                false,
+            )
+            previewResult = preview()
+        }
+
+        val outcome = manager(
+            plannerStore = plannerStore,
+            transport = transport,
+            zoneProvider = { ZoneId.of("America/Los_Angeles") },
+        ).refreshAndCompose()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
+        val request = transport.previewRequests.single()
+        assertEquals("Europe/Paris", request.timezoneName)
+        assertEquals(7, request.availability.size)
+        assertEquals(15, request.fixedBlocks.size)
+        assertEquals(8, request.fixedBlocks.count { it.source == "sleep" })
+        assertEquals(7, request.fixedBlocks.count { it.source == "protected_time" })
+        assertTrue(request.fixedBlocks.all { it.isSensitive })
+    }
+
+    @Test
     fun protectedMinutesSubtractExactSubminuteBusyRangesBeforeConservativeRounding() = runBlocking {
         data class Case(
             val name: String,
@@ -5086,6 +5117,37 @@ class CanonicalSyncManagerTest {
             assertTrue(transport.previewRequests.isEmpty())
             assertTrue(transport.publicationRequests.isEmpty())
         }
+
+    @Test
+    fun localCompositionKeepsConfiguredProfileZoneAcrossDeviceZoneFence() = runBlocking {
+        val weekly = requireNotNull(
+            ScheduleCompositionProfileSnapshot().upgradedToWeeklySchedule("Europe/Paris"),
+        )
+        val initial = localCompositionReadyState().copy(scheduleCompositionProfile = weekly)
+        val plannerStore = PlannerStore(initial)
+        var captured: SchedulePreviewRequest? = null
+        val composer = LocalScheduleComposer { _, request ->
+            captured = request
+            emptyLocalComposition(request)
+        }
+
+        val outcome = manager(
+            plannerStore = plannerStore,
+            transport = FakeCanonicalTransport(),
+            zoneProvider = { ZoneId.of("America/Los_Angeles") },
+            localScheduleComposer = composer,
+        ).composeLocally()
+
+        assertEquals(CanonicalRefreshOutcome.SUCCESS, outcome)
+        assertEquals("Europe/Paris", captured?.timezoneName)
+        assertEquals(15, captured?.fixedBlocks?.size)
+        assertTrue(
+            plannerStore.state.value.isScheduleDisplayCurrent(
+                clock,
+                ZoneId.of("America/Los_Angeles"),
+            ),
+        )
+    }
 
     @Test
     fun localAdapterRequestFailuresUseFixedProtocolOutcomeWithoutMutationOrNetwork() = runBlocking {

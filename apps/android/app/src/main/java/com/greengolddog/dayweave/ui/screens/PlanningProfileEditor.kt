@@ -22,6 +22,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -42,6 +43,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
+import com.greengolddog.dayweave.model.ScheduleWeekday
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateState
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
@@ -69,13 +71,29 @@ internal fun PlanningProfileCard(
             headlineContent = { Text("Planning profile") },
             supportingContent = {
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (profile.usesWeeklySchedule) {
+                        val workWindows = requireNotNull(profile.availability)
+                            .sumOf { it.windows.size }
+                        val protectedWindows = requireNotNull(profile.protectedTime)
+                            .sumOf { it.windows.size }
+                        Text("${profile.timezoneName} · $workWindows weekly work windows")
+                        Text(
+                            "Sleep ${formatPlanningClockMinute(requireNotNull(profile.sleep).startMinute)}–" +
+                                formatPlanningClockMinute(profile.sleep.endMinute) +
+                                " · $protectedWindows protected windows",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Text(
+                            "${formatPlanningProfileMinute(profile.dayStartMinute)}–" +
+                                "${formatPlanningProfileMinute(profile.dayEndMinute)} · " +
+                                "${profile.slotGranularityMinutes}-minute slots",
+                        )
+                    }
                     Text(
-                        "${formatPlanningProfileMinute(profile.dayStartMinute)}–" +
-                            "${formatPlanningProfileMinute(profile.dayEndMinute)} · " +
-                            "${profile.slotGranularityMinutes}-minute slots",
-                    )
-                    Text(
-                        "Stability ${profile.stabilityWeight} · " +
+                        "${profile.slotGranularityMinutes}-minute slots · " +
+                            "stability ${profile.stabilityWeight} · " +
                             "soft constraints ${profile.defaultSoftWeight}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -144,38 +162,139 @@ internal fun PlanningProfileEditorDialog(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    "Set the daily usable window and how many local calendar days belong to " +
-                        "the rolling firm plan. The scheduler keeps hard commitments fixed.",
+                    "Choose where time belongs in your week. Sleep and protected time stay " +
+                        "visible as fixed blocks; work is placed only inside availability.",
                     style = MaterialTheme.typography.bodyMedium,
                 )
-                TimeInputRow(
-                    label = "Start",
-                    hour = form.startHour,
-                    minute = form.startMinute,
-                    error = validation.startError,
-                    enabled = enabled,
-                    tagPrefix = "planning_start",
-                    onHourChange = {
-                        form = form.copy(startHour = sanitizePlanningTimePart(it))
-                    },
-                    onMinuteChange = {
-                        form = form.copy(startMinute = sanitizePlanningTimePart(it))
-                    },
-                )
-                TimeInputRow(
-                    label = "End",
-                    hour = form.endHour,
-                    minute = form.endMinute,
-                    error = validation.endError,
-                    enabled = enabled,
-                    tagPrefix = "planning_end",
-                    onHourChange = {
-                        form = form.copy(endHour = sanitizePlanningTimePart(it))
-                    },
-                    onMinuteChange = {
-                        form = form.copy(endMinute = sanitizePlanningTimePart(it))
-                    },
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Weekly schedule", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            if (form.useWeeklySchedule) {
+                                "Timezone, sleep, multiple daily windows, and protected time"
+                            } else {
+                                "One daily window in the current device timezone"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Switch(
+                        checked = form.useWeeklySchedule,
+                        onCheckedChange = { form = form.copy(useWeeklySchedule = it) },
+                        enabled = enabled,
+                        modifier = Modifier
+                            .testTag("planning_weekly_schedule")
+                            .semantics { contentDescription = "Use weekly schedule" },
+                    )
+                }
+                if (form.useWeeklySchedule) {
+                    OutlinedTextField(
+                        value = form.timezoneName,
+                        onValueChange = { form = form.copy(timezoneName = it.take(255)) },
+                        label = { Text("IANA timezone") },
+                        supportingText = {
+                            Text(validation.timezoneError ?: "Example: Europe/Paris")
+                        },
+                        singleLine = true,
+                        enabled = enabled,
+                        isError = validation.timezoneError != null,
+                        modifier = Modifier.fillMaxWidth().testTag("planning_timezone"),
+                    )
+                    ClockWindowInput(
+                        label = "Overnight sleep",
+                        start = form.sleepStart,
+                        end = form.sleepEnd,
+                        error = validation.sleepError,
+                        enabled = enabled,
+                        tagPrefix = "planning_sleep",
+                        onStartChange = {
+                            form = form.copy(sleepStart = sanitizePlanningClock(it))
+                        },
+                        onEndChange = {
+                            form = form.copy(sleepEnd = sanitizePlanningClock(it))
+                        },
+                    )
+                    Text("Availability", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Add up to eight non-overlapping windows on each enabled day.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    form.availabilityDays.forEachIndexed { index, day ->
+                        PlanningDayWindowEditor(
+                            day = day,
+                            enabled = enabled,
+                            tagPrefix = "planning_availability",
+                            emptyDayWindow = PlanningWindowForm("09:00", "17:00"),
+                            onChange = { replacement ->
+                                form = form.copy(
+                                    availabilityDays = form.availabilityDays.replaceAt(
+                                        index,
+                                        replacement,
+                                    ),
+                                )
+                            },
+                        )
+                    }
+                    HorizontalDivider()
+                    Text("Protected free time", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Protected windows remain visible and cannot be used for planned work.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    form.protectedDays.forEachIndexed { index, day ->
+                        PlanningDayWindowEditor(
+                            day = day,
+                            enabled = enabled,
+                            tagPrefix = "planning_protected",
+                            emptyDayWindow = PlanningWindowForm("21:30", "22:30"),
+                            onChange = { replacement ->
+                                form = form.copy(
+                                    protectedDays = form.protectedDays.replaceAt(
+                                        index,
+                                        replacement,
+                                    ),
+                                )
+                            },
+                        )
+                    }
+                    validation.weeklyScheduleError?.let { FormError(it) }
+                } else {
+                    TimeInputRow(
+                        label = "Start",
+                        hour = form.startHour,
+                        minute = form.startMinute,
+                        error = validation.startError,
+                        enabled = enabled,
+                        tagPrefix = "planning_start",
+                        onHourChange = {
+                            form = form.copy(startHour = sanitizePlanningTimePart(it))
+                        },
+                        onMinuteChange = {
+                            form = form.copy(startMinute = sanitizePlanningTimePart(it))
+                        },
+                    )
+                    TimeInputRow(
+                        label = "End",
+                        hour = form.endHour,
+                        minute = form.endMinute,
+                        error = validation.endError,
+                        enabled = enabled,
+                        tagPrefix = "planning_end",
+                        onHourChange = {
+                            form = form.copy(endHour = sanitizePlanningTimePart(it))
+                        },
+                        onMinuteChange = {
+                            form = form.copy(endMinute = sanitizePlanningTimePart(it))
+                        },
+                    )
+                }
                 Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -355,6 +474,215 @@ private fun TimeInputRow(
         error?.let { FormError(it) }
     }
 }
+
+@Composable
+private fun ClockWindowInput(
+    label: String,
+    start: String,
+    end: String,
+    error: String?,
+    enabled: Boolean,
+    tagPrefix: String,
+    onStartChange: (String) -> Unit,
+    onEndChange: (String) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, style = MaterialTheme.typography.titleSmall)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            OutlinedTextField(
+                value = start,
+                onValueChange = onStartChange,
+                label = { Text("Start") },
+                supportingText = { Text("HH:mm") },
+                singleLine = true,
+                enabled = enabled,
+                isError = error != null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("${tagPrefix}_start")
+                    .semantics { contentDescription = "$label start, HH:mm" },
+            )
+            OutlinedTextField(
+                value = end,
+                onValueChange = onEndChange,
+                label = { Text("End") },
+                supportingText = { Text("HH:mm") },
+                singleLine = true,
+                enabled = enabled,
+                isError = error != null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("${tagPrefix}_end")
+                    .semantics { contentDescription = "$label end, HH:mm" },
+            )
+        }
+        error?.let { FormError(it) }
+    }
+}
+
+@Composable
+private fun PlanningDayWindowEditor(
+    day: PlanningDayForm,
+    enabled: Boolean,
+    tagPrefix: String,
+    emptyDayWindow: PlanningWindowForm,
+    onChange: (PlanningDayForm) -> Unit,
+) {
+    val dayTag = day.weekday.name.lowercase()
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("${tagPrefix}_$dayTag")
+            .padding(vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(day.weekday.displayName(), style = MaterialTheme.typography.titleSmall)
+            Switch(
+                checked = day.isEnabled,
+                onCheckedChange = { checked ->
+                    onChange(
+                        day.copy(
+                            isEnabled = checked,
+                            windows = if (checked) {
+                                day.windows.ifEmpty { listOf(emptyDayWindow) }
+                            } else {
+                                emptyList()
+                            },
+                        ),
+                    )
+                },
+                enabled = enabled,
+                modifier = Modifier
+                    .testTag("${tagPrefix}_${dayTag}_enabled")
+                    .semantics {
+                        contentDescription =
+                            "${day.weekday.displayName()} ${tagPrefix.windowKindLabel()} enabled"
+                    },
+            )
+        }
+        if (day.isEnabled) {
+            day.windows.forEachIndexed { index, window ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = window.start,
+                        onValueChange = { raw ->
+                            onChange(
+                                day.copy(
+                                    windows = day.windows.replaceAt(
+                                        index,
+                                        window.copy(start = sanitizePlanningClock(raw)),
+                                    ),
+                                ),
+                            )
+                        },
+                        label = { Text("Start") },
+                        singleLine = true,
+                        enabled = enabled,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("${tagPrefix}_${dayTag}_${index}_start")
+                            .semantics {
+                                contentDescription = day.windowContentDescription(
+                                    tagPrefix,
+                                    index,
+                                    "start",
+                                )
+                            },
+                    )
+                    OutlinedTextField(
+                        value = window.end,
+                        onValueChange = { raw ->
+                            onChange(
+                                day.copy(
+                                    windows = day.windows.replaceAt(
+                                        index,
+                                        window.copy(end = sanitizePlanningClock(raw)),
+                                    ),
+                                ),
+                            )
+                        },
+                        label = { Text("End") },
+                        singleLine = true,
+                        enabled = enabled,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("${tagPrefix}_${dayTag}_${index}_end")
+                            .semantics {
+                                contentDescription = day.windowContentDescription(
+                                    tagPrefix,
+                                    index,
+                                    "end",
+                                )
+                            },
+                    )
+                    TextButton(
+                        onClick = {
+                            val remaining = day.windows.filterIndexed { at, _ -> at != index }
+                            onChange(day.copy(isEnabled = remaining.isNotEmpty(), windows = remaining))
+                        },
+                        enabled = enabled,
+                        modifier = Modifier
+                            .testTag("${tagPrefix}_${dayTag}_${index}_remove")
+                            .semantics {
+                                contentDescription = day.windowContentDescription(
+                                    tagPrefix,
+                                    index,
+                                    "remove",
+                                )
+                            },
+                    ) {
+                        Text("Remove")
+                    }
+                }
+            }
+            TextButton(
+                onClick = { onChange(day.copy(windows = day.windows + emptyDayWindow)) },
+                enabled = enabled && day.windows.size < 8,
+                modifier = Modifier
+                    .testTag("${tagPrefix}_${dayTag}_add")
+                    .semantics {
+                        contentDescription =
+                            "Add ${day.weekday.displayName()} ${tagPrefix.windowKindLabel()} window"
+                    },
+            ) {
+                Text("Add window")
+            }
+        }
+    }
+}
+
+private fun ScheduleWeekday.displayName(): String =
+    name.lowercase().replaceFirstChar { it.uppercase() }
+
+private fun String.windowKindLabel(): String =
+    if (endsWith("protected")) "protected-time" else "availability"
+
+private fun PlanningDayForm.windowContentDescription(
+    tagPrefix: String,
+    index: Int,
+    action: String,
+): String =
+    "${weekday.displayName()} ${tagPrefix.windowKindLabel()} window ${index + 1} $action"
+
+private fun <T> List<T>.replaceAt(index: Int, replacement: T): List<T> =
+    mapIndexed { current, value -> if (current == index) replacement else value }
 
 @Composable
 private fun WeightInput(

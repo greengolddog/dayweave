@@ -3,6 +3,7 @@ package com.greengolddog.dayweave.ui.screens
 import com.greengolddog.dayweave.model.ActiveSession
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
+import com.greengolddog.dayweave.model.ScheduleWeekday
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
 import java.util.UUID
 import org.junit.Assert.assertEquals
@@ -12,6 +13,69 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PlanningProfileFormTest {
+    @Test
+    fun weeklyDraftBuildsTimezoneSleepMultipleWindowsAndProtectedTime() {
+        val baseline = PlanningProfileForm.from(ScheduleCompositionProfileSnapshot())
+        val mondayWork = baseline.availabilityDays.first().copy(
+            windows = listOf(
+                PlanningWindowForm("07:00", "10:00"),
+                PlanningWindowForm("11:00", "22:00"),
+            ),
+        )
+        val mondayProtected = baseline.protectedDays.first().copy(
+            isEnabled = true,
+            windows = listOf(
+                PlanningWindowForm("10:00", "11:00"),
+                PlanningWindowForm("22:00", "23:00"),
+            ),
+        )
+        val form = baseline.copy(
+            useWeeklySchedule = true,
+            timezoneName = "GMT",
+            availabilityDays = baseline.availabilityDays.map {
+                if (it.weekday == ScheduleWeekday.MONDAY) mondayWork else it
+            },
+            protectedDays = baseline.protectedDays.map {
+                if (it.weekday == ScheduleWeekday.MONDAY) mondayProtected else it
+            },
+        )
+
+        val validation = form.validate()
+
+        assertTrue(validation.isValid)
+        val profile = requireNotNull(validation.profile)
+        assertEquals("UTC", profile.timezoneName)
+        assertEquals(2, profile.availability?.first()?.windows?.size)
+        assertEquals(2, profile.protectedTime?.first()?.windows?.size)
+        assertEquals(23 * 60, profile.sleep?.startMinute)
+        assertEquals(6 * 60, profile.sleep?.endMinute)
+    }
+
+    @Test
+    fun weeklyDraftExplainsInvalidTimezoneSleepAndOverlaps() {
+        val baseline = PlanningProfileForm.from(ScheduleCompositionProfileSnapshot())
+            .copy(useWeeklySchedule = true)
+        val invalidTimezone = baseline.copy(timezoneName = "Not/A_Timezone").validate()
+        assertFalse(invalidTimezone.isValid)
+        assertTrue(requireNotNull(invalidTimezone.timezoneError).contains("IANA"))
+
+        val invalidSleep = baseline.copy(sleepStart = "06:00", sleepEnd = "23:00").validate()
+        assertFalse(invalidSleep.isValid)
+        assertTrue(requireNotNull(invalidSleep.sleepError).contains("overnight"))
+
+        val mondayProtected = baseline.protectedDays.first().copy(
+            isEnabled = true,
+            windows = listOf(PlanningWindowForm("09:00", "10:00")),
+        )
+        val overlap = baseline.copy(
+            protectedDays = baseline.protectedDays.map {
+                if (it.weekday == ScheduleWeekday.MONDAY) mondayProtected else it
+            },
+        ).validate()
+        assertFalse(overlap.isValid)
+        assertTrue(requireNotNull(overlap.weeklyScheduleError).contains("non-overlapping"))
+    }
+
     @Test
     fun profileRoundTripsThroughExplicit24HourFieldsIncludingEndOfDay() {
         val profile = ScheduleCompositionProfileSnapshot(
