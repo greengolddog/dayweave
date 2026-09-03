@@ -6,6 +6,12 @@ Last normalized: 2026-08-29
 
 This file preserves the answers from the product-discovery conversation so that they can be reread while building DayWeave. The original assistant question text was not written into the repository, so every question below is a faithful **reconstructed paraphrase**. The answers and decisions are authoritative; the prompt wording is not claimed to be verbatim.
 
+Repository-visibility amendment: after the numbered discovery answers, the owner made the
+repository public. That later decision supersedes the earlier private-repository assumption for
+all security and delivery work. No credentials, signing material, private endpoints, personal
+calendar data, or other secrets may be committed; public source files must always be treated as
+world-readable.
+
 The conversation briefly reused question numbers 164 and 165 before returning to 161. This ledger normalizes that numbering into one sequence from 1 through 238. The earlier “until created” response is retained under delivery scope, and the later yes/no answers are retained under their applicable numbered decisions.
 
 ## 1–14 — product, platforms, and experience
