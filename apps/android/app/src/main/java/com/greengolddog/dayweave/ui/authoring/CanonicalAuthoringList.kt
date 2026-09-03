@@ -524,7 +524,10 @@ private fun CanonicalAuthoringCard(
                     when (row.source) {
                         CanonicalAuthoringRowSource.CANONICAL -> OutlinedButton(
                             onClick = onTrash,
-                            enabled = actionsEnabled && !row.isReadOnly,
+                            // Opaque scheduling metadata prevents lossy replacement, not deletion.
+                            // A canonical row has no pending per-item mutation; the screen fence is
+                            // still represented by actionsEnabled.
+                            enabled = actionsEnabled && row.canTrash,
                         ) {
                             Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
                             Text("Delete")

@@ -4963,7 +4963,14 @@ class CanonicalSyncManagerTest {
             val plannerStore = PlannerStore(DayWeaveUiState())
             val transport = FakeCanonicalTransport().apply {
                 pages[null] = RemoteItemDeltaPage(
-                    listOf(RemoteItemDeltaChange(type = "upsert", item = remoteItem())),
+                    listOf(
+                        RemoteItemDeltaChange(
+                            type = "upsert",
+                            item = remoteItem().copy(
+                                flexibleConstraints = buildJsonObject { put("energy", "deep") },
+                            ),
+                        ),
+                    ),
                     "cursor-1",
                     false,
                 )

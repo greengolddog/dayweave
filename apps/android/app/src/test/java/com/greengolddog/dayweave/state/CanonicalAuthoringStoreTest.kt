@@ -112,6 +112,89 @@ class CanonicalAuthoringStoreTest {
     }
 
     @Test
+    fun durableStoreRejectsUnsupportedReplacementBasesButKeepsTrashAvailable() {
+        val supported = canonicalItem(ITEM_ID)
+        val provider = supported.copy(
+            kind = "event",
+            durationSeconds = 3_600,
+            earliestStartAt = "2026-09-03T08:00:00Z",
+            deadlineAt = "2026-09-03T09:00:00Z",
+            flexibleConstraintsJson = """
+                {"calendar_event":{
+                  "start":"2026-09-03T08:00:00Z",
+                  "end":"2026-09-03T09:00:00Z",
+                  "immutable":true,
+                  "all_day":false,
+                  "source_calendar_id":null
+                }}
+            """.trimIndent(),
+            splitPolicyJson = """{"type":"indivisible"}""",
+        )
+        val unsupported = listOf(
+            supported.copy(
+                recurrenceJson = """{"type":"custom","rrule":"FREQ=DAILY"}""",
+            ),
+            provider,
+            supported.copy(flexibleConstraintsJson = """{"future_metadata":true}"""),
+            supported.copy(
+                flexibleConstraintsJson =
+                    """{"goal_ids":["aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"]}""",
+            ),
+            supported.copy(status = "scheduled"),
+        )
+
+        unsupported.forEachIndexed { index, base ->
+            val store = PlannerStore(boundState(base), nowEpochMillis = { NOW_MILLIS })
+            assertThrows(IllegalArgumentException::class.java) {
+                store.enqueueCanonicalReplace(
+                    base.id,
+                    taskDraft().copy(title = "Must not replace unsupported base"),
+                    stableUuid("unsupported-replace-$index"),
+                )
+            }
+            assertTrue(store.state.value.pendingCanonicalAuthoringMutations.isEmpty())
+
+            val trash = store.enqueueCanonicalTrash(
+                base.id,
+                stableUuid("unsupported-trash-$index"),
+            )
+            assertNotNull(trash)
+            assertEquals(
+                com.greengolddog.dayweave.model.CanonicalAuthoringOperation.TRASH,
+                trash?.mutation?.operation,
+            )
+        }
+
+        val deletedAt = NOW
+        val deletedProvider = provider.copy(
+            revision = 8,
+            isExecutable = false,
+            updatedAt = deletedAt,
+            deletedAt = deletedAt,
+        )
+        val restoreStore = PlannerStore(
+            boundState().copy(
+                canonicalRecentlyDeleted = listOf(
+                    CanonicalRecentlyDeletedRecord(
+                        id = deletedProvider.id,
+                        revision = deletedProvider.revision,
+                        deletedAt = deletedAt,
+                        lastKnownItem = deletedProvider,
+                        retentionAnchorAt = deletedAt,
+                    ),
+                ),
+            ),
+            nowEpochMillis = { NOW_MILLIS },
+        )
+        assertNotNull(
+            restoreStore.enqueueCanonicalRestore(
+                deletedProvider.id,
+                stableUuid("unsupported-restore"),
+            ),
+        )
+    }
+
+    @Test
     fun conflictedDraftCopiesToDetachedSensitiveInboxWithoutDestroyingOriginal() {
         val parent = canonicalItem(PARENT_ID).copy(isSensitive = true)
         val store = PlannerStore(boundState(parent), nowEpochMillis = { NOW_MILLIS })

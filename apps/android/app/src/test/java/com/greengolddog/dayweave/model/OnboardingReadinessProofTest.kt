@@ -18,6 +18,19 @@ class OnboardingReadinessProofTest {
         assertFalse(task.copy(durationSeconds = null).createsPlanningDemand(ITEM_ID))
         assertFalse(task.copy(kind = ItemKind.GOAL).createsPlanningDemand(ITEM_ID))
         assertFalse(task.copy(kind = ItemKind.ROUTINE).createsPlanningDemand(ITEM_ID))
+        val goalWithOwnEffort = task.copy(
+            kind = ItemKind.GOAL,
+            constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+        )
+        val routineWithOwnEffort = task.copy(
+            kind = ItemKind.ROUTINE,
+            constraints = CanonicalFlexibleConstraintsDraft(hasOwnEffort = true),
+        )
+        assertTrue(goalWithOwnEffort.createsPlanningDemand(ITEM_ID))
+        assertTrue(routineWithOwnEffort.createsPlanningDemand(ITEM_ID))
+        assertFalse(
+            goalWithOwnEffort.copy(durationSeconds = null).createsPlanningDemand(ITEM_ID),
+        )
         assertFalse(task.copy(title = " ").createsPlanningDemand(ITEM_ID))
 
         val event = CanonicalItemDraft(
@@ -50,6 +63,20 @@ class OnboardingReadinessProofTest {
         )
         assertFalse(item.copy(isExecutable = false).createsPlanningDemand(listOf(item)))
         assertFalse(item.copy(deletedAt = UPDATED_AT).createsPlanningDemand(listOf(item)))
+        val goalWithOwnEffort = item.copy(
+            kind = "goal",
+            flexibleConstraintsJson = """{"has_own_effort":true}""",
+        )
+        val routineWithOwnEffort = item.copy(
+            kind = "routine",
+            flexibleConstraintsJson = """{"has_own_effort":true}""",
+        )
+        assertTrue(goalWithOwnEffort.createsPlanningDemand(listOf(goalWithOwnEffort)))
+        assertTrue(routineWithOwnEffort.createsPlanningDemand(listOf(routineWithOwnEffort)))
+        assertFalse(
+            goalWithOwnEffort.copy(flexibleConstraintsJson = "{}")
+                .createsPlanningDemand(listOf(goalWithOwnEffort.copy(flexibleConstraintsJson = "{}"))),
+        )
 
         val child = canonicalItem(
             id = CHILD_ID,

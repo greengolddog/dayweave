@@ -94,7 +94,86 @@ class CanonicalAuthoringPresentationTest {
         assertEquals(CanonicalAuthoringRowSource.PENDING_REPLACE, row.source)
         assertEquals(CanonicalAuthoringSyncState.QUEUED, row.syncState)
         assertFalse(row.isReadOnly)
+        assertFalse(row.canTrash)
         assertEquals(REPLACE_MUTATION_ID, row.mutationId)
+    }
+
+    @Test
+    fun graphAuthorityMetadataRemainsVisibleWithClearReadOnlyDiagnostic() {
+        val item = item(PARENT_ID, "Linked task", "inbox").copy(
+            flexibleConstraintsJson =
+                """{"goal_ids":["$CHILD_ID"]}""",
+        )
+
+        val presentation = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(item)),
+        )
+
+        val row = presentation.inbox.single()
+        assertEquals("Linked task", row.title)
+        assertTrue(row.isReadOnly)
+        assertTrue(row.canTrash)
+        assertTrue(row.diagnostic.orEmpty().contains("read-only"))
+    }
+
+    @Test
+    fun providerEventMetadataStaysVisibleAndReadOnly() {
+        val providerEvent = item(PARENT_ID, "Imported meeting", "inbox").copy(
+            kind = "event",
+            flexibleConstraintsJson = """
+                {
+                  "calendar_event": {
+                    "start": "2026-09-03T10:00:00Z",
+                    "end": "2026-09-03T11:00:00Z",
+                    "immutable": true,
+                    "all_day": false,
+                    "source_calendar_id": "primary"
+                  }
+                }
+            """.trimIndent(),
+        )
+
+        val row = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(providerEvent)),
+        ).inbox.single()
+
+        assertEquals("Imported meeting", row.title)
+        assertTrue(row.isReadOnly)
+        assertTrue(row.canTrash)
+        assertTrue(row.diagnostic.orEmpty().contains("Provider-managed"))
+    }
+
+    @Test
+    fun partialInboxEventFailsClosedButCanStillBeTrashed() {
+        val partial = item(PARENT_ID, "Unresolved meeting", "inbox").copy(
+            kind = "event",
+            durationSeconds = 1_800,
+        )
+
+        val row = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(partial)),
+        ).inbox.single()
+
+        assertTrue(row.isReadOnly)
+        assertTrue(row.canTrash)
+        assertTrue(row.diagnostic.orEmpty().contains("partial fixed timing"))
+    }
+
+    @Test
+    fun customRruleIsVisibleRetainedAndReadOnly() {
+        val custom = item(PARENT_ID, "Legacy recurrence", "inbox").copy(
+            recurrenceJson =
+                """{"type":"custom","rrule":"FREQ=MONTHLY;BYDAY=1MO,-1FR"}""",
+        )
+
+        val row = CanonicalAuthoringPresentation.build(
+            DayWeaveUiState(canonicalItems = listOf(custom)),
+        ).inbox.single()
+
+        assertEquals("FREQ=MONTHLY;BYDAY=1MO,-1FR", row.draft?.recurrence?.rrule)
+        assertTrue(row.isReadOnly)
+        assertTrue(row.canTrash)
+        assertTrue(row.diagnostic.orEmpty().contains("Custom RRULE"))
     }
 
     private fun item(

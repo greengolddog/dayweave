@@ -49,9 +49,9 @@ enum class OnboardingFirstItemCheck {
 /**
  * Pure minimum-demand predicate for a locally reviewed create.
  *
- * Android cannot author the macOS `has_own_effort` container constraint yet, so Goal and Routine
- * deliberately fail closed. Event validation already proves exact fixed timing; other supported
- * leaf kinds need a positive duration.
+ * Event validation already proves exact fixed timing. Other leaf kinds need a positive duration;
+ * Goal and Routine additionally need an explicit `has_own_effort=true` so a container is never
+ * mistaken for planning demand.
  */
 fun CanonicalItemDraft.createsPlanningDemand(itemId: String): Boolean = runCatching {
     val value = normalized()
@@ -65,7 +65,8 @@ fun CanonicalItemDraft.createsPlanningDemand(itemId: String): Boolean = runCatch
         -> value.durationSeconds?.let { it > 0 } == true
         ItemKind.GOAL,
         ItemKind.ROUTINE,
-        -> false
+        -> value.durationSeconds?.let { it > 0 } == true &&
+            value.constraints.hasOwnEffort == true
     }
 }.getOrDefault(false)
 

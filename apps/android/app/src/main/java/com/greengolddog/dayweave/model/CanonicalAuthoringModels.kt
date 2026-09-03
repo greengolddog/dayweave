@@ -3,7 +3,9 @@ package com.greengolddog.dayweave.model
 import java.net.URI
 import java.time.Duration
 import java.time.Instant
+import java.time.LocalDateTime
 import java.time.ZoneId
+import java.time.ZoneOffset
 import java.util.UUID
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -18,6 +20,9 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
+/** Matches `dayweave_compose::MAX_SCHEDULING_OFFSET_MINUTES`. */
+internal const val MAX_SCHEDULING_OFFSET_MINUTES = 527_040L
+
 @Serializable
 enum class CanonicalDraftPlacement(val wireValue: String) {
     INBOX("inbox"),
@@ -31,6 +36,21 @@ enum class CanonicalRecurrenceKind(val wireValue: String) {
     MONTHLY("monthly"),
     EVERY_INTERVAL("every_interval"),
     AFTER_COMPLETION("after_completion"),
+    FREQUENCY("frequency"),
+    CUSTOM("custom"),
+}
+
+@Serializable
+enum class CanonicalRecurrencePeriod(val wireValue: String) {
+    DAY("day"),
+    WEEK("week"),
+    MONTH("month"),
+}
+
+@Serializable
+enum class CanonicalRecurrenceSemantics(val wireValue: String) {
+    CALENDAR("calendar"),
+    ROLLING("rolling"),
 }
 
 @Serializable
@@ -51,6 +71,11 @@ data class CanonicalRecurrenceDraft(
     val occurrencesPerPeriod: Int? = null,
     val weekdays: List<CanonicalWeekday> = emptyList(),
     val intervalSeconds: Long? = null,
+    val period: CanonicalRecurrencePeriod? = null,
+    val semantics: CanonicalRecurrenceSemantics? = null,
+    val minimumSpacingMinutes: Long? = null,
+    val anchorAt: String? = null,
+    val rrule: String? = null,
 ) {
     fun requireValid() {
         require(weekdays.distinct().size == weekdays.size) { "Recurrence weekdays repeat" }
@@ -59,23 +84,74 @@ data class CanonicalRecurrenceDraft(
             CanonicalRecurrenceKind.MONTHLY,
             -> require(
                 occurrencesPerPeriod?.let { it in 1..UShort.MAX_VALUE.toInt() } == true &&
-                    weekdays.isEmpty() && intervalSeconds == null,
+                    weekdays.isEmpty() && intervalSeconds == null && period == null &&
+                    semantics == null && minimumSpacingMinutes == null && anchorAt == null &&
+                    rrule == null,
             ) { "Daily and monthly recurrence require only a positive frequency" }
 
             CanonicalRecurrenceKind.WEEKLY -> require(
                 occurrencesPerPeriod?.let { it in 1..UShort.MAX_VALUE.toInt() } == true &&
-                    weekdays.isNotEmpty() && intervalSeconds == null,
-            ) { "Weekly recurrence requires a frequency and distinct weekdays" }
+                    intervalSeconds == null && period == null && semantics == null &&
+                    minimumSpacingMinutes == null && anchorAt == null && rrule == null,
+            ) { "Weekly recurrence requires a frequency and optional distinct weekdays" }
 
             CanonicalRecurrenceKind.EVERY_INTERVAL,
             CanonicalRecurrenceKind.AFTER_COMPLETION,
             -> require(
                 occurrencesPerPeriod == null && weekdays.isEmpty() &&
                     intervalSeconds?.let {
-                        it in SECONDS_PER_MINUTE..MAX_INTERVAL_SECONDS &&
-                            it % SECONDS_PER_MINUTE == 0L
-                    } == true,
-            ) { "Interval recurrence requires only a positive whole-minute interval" }
+                        it % SECONDS_PER_MINUTE == 0L &&
+                            it / SECONDS_PER_MINUTE in 1..MAX_SCHEDULING_OFFSET_MINUTES
+                    } == true && period == null && semantics == null &&
+                    minimumSpacingMinutes == null && anchorAt == null && rrule == null,
+            ) {
+                "Interval recurrence requires a positive whole-minute interval of at most " +
+                    "$MAX_SCHEDULING_OFFSET_MINUTES minutes"
+            }
+
+            CanonicalRecurrenceKind.FREQUENCY -> {
+                val target = requireNotNull(occurrencesPerPeriod) {
+                    "Frequency recurrence requires a target"
+                }
+                require(target in 1..UShort.MAX_VALUE.toInt())
+                val frequencyPeriod = requireNotNull(period) {
+                    "Frequency recurrence requires a period"
+                }
+                val frequencySemantics = requireNotNull(semantics) {
+                    "Frequency recurrence requires calendar or rolling semantics"
+                }
+                require(intervalSeconds == null)
+                require(rrule == null)
+                require(
+                    minimumSpacingMinutes?.let { it in 0..MAX_SCHEDULING_OFFSET_MINUTES } != false,
+                ) {
+                    "Frequency minimum spacing must be at most " +
+                        "$MAX_SCHEDULING_OFFSET_MINUTES minutes"
+                }
+                anchorAt?.let { requireCanonicalInstant(it, "recurrence anchor") }
+                require(
+                    frequencySemantics == CanonicalRecurrenceSemantics.ROLLING || anchorAt == null,
+                ) { "Calendar frequency recurrence cannot carry a rolling anchor" }
+                if (frequencySemantics == CanonicalRecurrenceSemantics.ROLLING) {
+                    require(weekdays.isEmpty()) {
+                        "Rolling frequency recurrence cannot restrict weekdays"
+                    }
+                    val rollingLimit = when (frequencyPeriod) {
+                        CanonicalRecurrencePeriod.DAY -> MINUTES_PER_DAY
+                        CanonicalRecurrencePeriod.WEEK -> 7 * MINUTES_PER_DAY
+                        CanonicalRecurrencePeriod.MONTH -> UShort.MAX_VALUE.toInt()
+                    }
+                    require(target <= rollingLimit) {
+                        "Rolling frequency exceeds minute precision"
+                    }
+                }
+            }
+
+            CanonicalRecurrenceKind.CUSTOM -> require(
+                occurrencesPerPeriod == null && weekdays.isEmpty() && intervalSeconds == null &&
+                    period == null && semantics == null && minimumSpacingMinutes == null &&
+                    anchorAt == null && !rrule.isNullOrBlank(),
+            ) { "Custom recurrence requires only a non-empty RRULE" }
         }
     }
 
@@ -98,13 +174,25 @@ data class CanonicalRecurrenceDraft(
                 CanonicalRecurrenceKind.EVERY_INTERVAL,
                 CanonicalRecurrenceKind.AFTER_COMPLETION,
                 -> put("interval", requireNotNull(intervalSeconds) / SECONDS_PER_MINUTE)
+                CanonicalRecurrenceKind.FREQUENCY -> {
+                    put("target", requireNotNull(occurrencesPerPeriod))
+                    put("period", requireNotNull(period).wireValue)
+                    put("semantics", requireNotNull(semantics).wireValue)
+                    put(
+                        "weekdays",
+                        JsonArray(weekdays.map { JsonPrimitive(it.wireValue) }),
+                    )
+                    put("minimum_spacing", minimumSpacingMinutes ?: 0)
+                    if (anchorAt == null) put("anchor", JsonNull) else put("anchor", anchorAt)
+                }
+                CanonicalRecurrenceKind.CUSTOM -> put("rrule", requireNotNull(rrule))
             }
         }
     }
 
     private companion object {
         const val SECONDS_PER_MINUTE = 60L
-        const val MAX_INTERVAL_SECONDS = 366L * 24L * 60L * 60L
+        const val MINUTES_PER_DAY = 24 * 60
     }
 }
 
@@ -150,28 +238,485 @@ data class CanonicalSplitDraft(
     }
 }
 
+@Serializable
+enum class CanonicalConstraintLevel(val wireValue: String) {
+    HARD("hard"),
+    SOFT("soft"),
+}
+
+/** Constraint priority in the exact shape consumed by the Rust scheduler. */
+@Serializable
+data class CanonicalConstraintStrengthDraft(
+    val level: CanonicalConstraintLevel,
+    val weight: Long? = null,
+) {
+    fun requireValid() {
+        when (level) {
+            CanonicalConstraintLevel.HARD -> require(weight == null) {
+                "Hard constraints cannot carry a soft weight"
+            }
+            CanonicalConstraintLevel.SOFT -> require(weight in 0..MAX_SOFT_WEIGHT) {
+                "Soft constraint weight must be between zero and $MAX_SOFT_WEIGHT"
+            }
+        }
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            put("level", level.wireValue)
+            if (level == CanonicalConstraintLevel.SOFT) put("weight", requireNotNull(weight))
+        }
+    }
+
+    companion object {
+        const val MAX_SOFT_WEIGHT = 1_000_000L
+
+        fun hard() = CanonicalConstraintStrengthDraft(CanonicalConstraintLevel.HARD)
+        fun soft(weight: Long = 100) =
+            CanonicalConstraintStrengthDraft(CanonicalConstraintLevel.SOFT, weight)
+    }
+}
+
+@Serializable
+data class CanonicalQualifiedInstantDraft(
+    val value: String,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun requireValid(description: String) {
+        requireCanonicalInstant(value, description)
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(description: String): JsonObject {
+        requireValid(description)
+        return qualifiedJson(JsonPrimitive(value), strength)
+    }
+}
+
+@Serializable
+data class CanonicalQualifiedMinutesDraft(
+    val value: Long,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun requireValid(
+        description: String,
+        allowZero: Boolean = true,
+        maximum: Long = MAX_UNSIGNED_INT,
+    ) {
+        require(value in (if (allowZero) 0L else 1L)..maximum) {
+            "$description must be at most $maximum minutes"
+        }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(
+        description: String,
+        allowZero: Boolean = true,
+        maximum: Long = MAX_UNSIGNED_INT,
+    ): JsonObject {
+        requireValid(description, allowZero, maximum)
+        return qualifiedJson(JsonPrimitive(value), strength)
+    }
+
+    private companion object {
+        const val MAX_UNSIGNED_INT = 4_294_967_295L
+    }
+}
+
+@Serializable
+data class CanonicalQualifiedWeekdaysDraft(
+    val value: List<CanonicalWeekday>,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun normalized() = copy(value = value.sortedBy(CanonicalWeekday.entries::indexOf))
+
+    fun requireValid() {
+        require(value.isNotEmpty() && value.distinct().size == value.size) {
+            "Allowed weekdays must be non-empty and distinct"
+        }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return qualifiedJson(
+            JsonArray(value.map { JsonPrimitive(it.wireValue) }),
+            strength,
+        )
+    }
+}
+
+@Serializable
+data class CanonicalDailyWindowDraft(
+    val weekdays: List<CanonicalWeekday> = emptyList(),
+    val startMinute: Int,
+    val endMinute: Int,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun normalized() = copy(weekdays = weekdays.sortedBy(CanonicalWeekday.entries::indexOf))
+
+    fun requireValid() {
+        require(weekdays.distinct().size == weekdays.size)
+        require(startMinute in 0..1_439 && endMinute in 1..1_440 && startMinute != endMinute) {
+            "Daily windows require distinct valid minute-of-day bounds"
+        }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        val value = buildJsonObject {
+            put("weekdays", JsonArray(weekdays.map { JsonPrimitive(it.wireValue) }))
+            put("start_minute", startMinute)
+            put("end_minute", endMinute)
+        }
+        return qualifiedJson(value, strength)
+    }
+}
+
+@Serializable
+data class CanonicalAbsoluteWindowDraft(
+    val startsAt: String,
+    val endsAt: String,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun requireValid(description: String) {
+        val start = requireCanonicalInstant(startsAt, "$description start")
+        val end = requireCanonicalInstant(endsAt, "$description end")
+        require(start < end) { "$description end must follow its start" }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(description: String): JsonObject {
+        requireValid(description)
+        val value = buildJsonObject {
+            put("start", startsAt)
+            put("end", endsAt)
+        }
+        return qualifiedJson(value, strength)
+    }
+}
+
+@Serializable
+data class CanonicalQualifiedStringDraft(
+    val value: String,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun normalized() = this
+
+    fun requireValid(description: String) {
+        require(value.isNotBlank()) {
+            "$description must be non-empty"
+        }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(description: String): JsonObject {
+        requireValid(description)
+        return qualifiedJson(JsonPrimitive(value), strength)
+    }
+}
+
+@Serializable
+enum class CanonicalDependencyRelation(val wireValue: String) {
+    FINISH_TO_START("finish_to_start"),
+    START_TO_START("start_to_start"),
+    FINISH_TO_FINISH("finish_to_finish"),
+    START_TO_FINISH("start_to_finish"),
+}
+
+@Serializable
+data class CanonicalDependencyDraft(
+    val itemId: String,
+    val relation: CanonicalDependencyRelation,
+    val minimumLagMinutes: Long = 0,
+    val strength: CanonicalConstraintStrengthDraft,
+) {
+    fun requireValid() {
+        requireNonNilUuid(itemId, "dependency")
+        require(minimumLagMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES) {
+            "Dependency minimum lag must be at most " +
+                "$MAX_SCHEDULING_OFFSET_MINUTES minutes"
+        }
+        strength.requireValid()
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            put("item_id", itemId)
+            put("relation", relation.wireValue)
+            put("minimum_lag", minimumLagMinutes)
+            put("strength", strength.toCanonicalJson())
+        }
+    }
+}
+
+@Serializable
+data class CanonicalBufferPolicyDraft(
+    val beforeMinutes: Long,
+    val afterMinutes: Long,
+    val strength: CanonicalConstraintStrengthDraft?,
+) {
+    fun requireValid() {
+        require(
+            beforeMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES &&
+                afterMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES,
+        ) {
+            "Buffers must be at most $MAX_SCHEDULING_OFFSET_MINUTES minutes"
+        }
+        require(strength == null || beforeMinutes > 0 || afterMinutes > 0) {
+            "A qualified buffer needs non-zero preparation or decompression time"
+        }
+        strength?.requireValid()
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            put("before", beforeMinutes)
+            put("after", afterMinutes)
+            if (strength == null) put("strength", JsonNull) else put("strength", strength.toCanonicalJson())
+        }
+    }
+}
+
+/** The typed `constraints` object nested in canonical flexible metadata. */
+@Serializable
+data class CanonicalSchedulingConstraintsDraft(
+    val earliestStart: CanonicalQualifiedInstantDraft? = null,
+    val latestFinish: CanonicalQualifiedInstantDraft? = null,
+    val minimumNotice: CanonicalQualifiedMinutesDraft? = null,
+    val allowedWeekdays: CanonicalQualifiedWeekdaysDraft? = null,
+    val preferredDailyWindows: List<CanonicalDailyWindowDraft> = emptyList(),
+    val preferredAbsoluteWindows: List<CanonicalAbsoluteWindowDraft> = emptyList(),
+    val forbiddenWindows: List<CanonicalAbsoluteWindowDraft> = emptyList(),
+    val requiredContexts: List<CanonicalQualifiedStringDraft> = emptyList(),
+    val requiredLocation: CanonicalQualifiedStringDraft? = null,
+    val dependencies: List<CanonicalDependencyDraft> = emptyList(),
+    val maximumDailyWork: CanonicalQualifiedMinutesDraft? = null,
+    val maximumWeeklyWork: CanonicalQualifiedMinutesDraft? = null,
+    val buffers: CanonicalBufferPolicyDraft? = null,
+    /** System-owned when non-null; only the core's explicit null placeholder round-trips here. */
+    val includesNullOccurrenceWindow: Boolean = false,
+) {
+    fun normalized() = copy(
+        allowedWeekdays = allowedWeekdays?.normalized(),
+        preferredDailyWindows = preferredDailyWindows.map(CanonicalDailyWindowDraft::normalized),
+        requiredContexts = requiredContexts.map(CanonicalQualifiedStringDraft::normalized),
+        requiredLocation = requiredLocation?.normalized(),
+    )
+
+    fun requireValid() {
+        earliestStart?.requireValid("constraint earliest start")
+        latestFinish?.requireValid("constraint latest finish")
+        minimumNotice?.requireValid(
+            "Minimum notice",
+            maximum = MAX_SCHEDULING_OFFSET_MINUTES,
+        )
+        allowedWeekdays?.requireValid()
+        preferredDailyWindows.forEach { it.requireValid() }
+        preferredAbsoluteWindows.forEach { it.requireValid("preferred absolute window") }
+        forbiddenWindows.forEach { it.requireValid("forbidden window") }
+        requiredContexts.forEach { it.requireValid("required context") }
+        requiredLocation?.requireValid("required location")
+        require(
+            dependencies.map { UUID.fromString(it.itemId) }.distinct().size == dependencies.size,
+        ) {
+            "Dependencies must identify distinct items"
+        }
+        dependencies.forEach(CanonicalDependencyDraft::requireValid)
+        maximumDailyWork?.requireValid("maximum daily work")
+        maximumWeeklyWork?.requireValid("maximum weekly work")
+        buffers?.requireValid()
+        val earliest = earliestStart?.value?.let {
+            requireCanonicalInstant(it, "constraint earliest start")
+        }
+        val latest = latestFinish?.value?.let {
+            requireCanonicalInstant(it, "constraint latest finish")
+        }
+        require(earliest == null || latest == null || earliest < latest) {
+            "Constraint earliest start must precede latest finish"
+        }
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            earliestStart?.let { put("earliest_start", it.toCanonicalJson("constraint earliest start")) }
+            latestFinish?.let { put("latest_finish", it.toCanonicalJson("constraint latest finish")) }
+            minimumNotice?.let {
+                put(
+                    "minimum_notice",
+                    it.toCanonicalJson(
+                        "Minimum notice",
+                        maximum = MAX_SCHEDULING_OFFSET_MINUTES,
+                    ),
+                )
+            }
+            allowedWeekdays?.let { put("allowed_weekdays", it.toCanonicalJson()) }
+            if (preferredDailyWindows.isNotEmpty()) {
+                put("preferred_daily_windows", JsonArray(preferredDailyWindows.map { it.toCanonicalJson() }))
+            }
+            if (preferredAbsoluteWindows.isNotEmpty()) {
+                put(
+                    "preferred_absolute_windows",
+                    JsonArray(preferredAbsoluteWindows.map {
+                        it.toCanonicalJson("preferred absolute window")
+                    }),
+                )
+            }
+            if (forbiddenWindows.isNotEmpty()) {
+                put(
+                    "forbidden_windows",
+                    JsonArray(forbiddenWindows.map { it.toCanonicalJson("forbidden window") }),
+                )
+            }
+            if (requiredContexts.isNotEmpty()) {
+                put(
+                    "required_contexts",
+                    JsonArray(requiredContexts.map { it.toCanonicalJson("required context") }),
+                )
+            }
+            requiredLocation?.let {
+                put("required_location", it.toCanonicalJson("required location"))
+            }
+            if (dependencies.isNotEmpty()) {
+                put("dependencies", JsonArray(dependencies.map { it.toCanonicalJson() }))
+            }
+            maximumDailyWork?.let {
+                put("maximum_daily_work", it.toCanonicalJson("maximum daily work"))
+            }
+            maximumWeeklyWork?.let {
+                put("maximum_weekly_work", it.toCanonicalJson("maximum weekly work"))
+            }
+            buffers?.let { put("buffers", it.toCanonicalJson()) }
+            if (includesNullOccurrenceWindow) put("occurrence_window", JsonNull)
+        }
+    }
+}
+
+@Serializable
+data class CanonicalHabitTargetDraft(val amount: Long, val unit: String) {
+    fun normalized() = this
+
+    fun requireValid() {
+        require(amount in 1..4_294_967_295L)
+        require(unit.isNotBlank())
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject { put("amount", amount); put("unit", unit) }
+    }
+}
+
+@Serializable
+data class CanonicalGoalMeasureDraft(
+    val name: String,
+    val target: Long,
+    val current: Long,
+    val unit: String,
+) {
+    fun normalized() = this
+
+    fun requireValid() {
+        require(name.isNotBlank())
+        require(unit.isNotBlank())
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            put("name", name)
+            put("target", target)
+            put("current", current)
+            put("unit", unit)
+        }
+    }
+}
+
+@Serializable
+data class CanonicalWeeklyAllocationDraft(
+    val minimumMinutes: Long,
+    val maximumMinutes: Long? = null,
+) {
+    fun requireValid() {
+        require(minimumMinutes in 0..4_294_967_295L)
+        require(maximumMinutes == null || maximumMinutes in minimumMinutes..4_294_967_295L)
+    }
+
+    fun toCanonicalJson(): JsonObject {
+        requireValid()
+        return buildJsonObject {
+            put("minimum", minimumMinutes)
+            if (maximumMinutes == null) {
+                put("maximum", JsonNull)
+            } else {
+                put("maximum", maximumMinutes)
+            }
+        }
+    }
+}
+
+@Serializable
+enum class CanonicalBreakCategory(val wireValue: String) {
+    REST("rest"),
+    MEAL("meal"),
+    MOVEMENT("movement"),
+    POMODORO("pomodoro"),
+    DECOMPRESSION("decompression"),
+    OTHER("other"),
+}
+
+private fun qualifiedJson(
+    value: JsonElement,
+    strength: CanonicalConstraintStrengthDraft,
+): JsonObject = buildJsonObject {
+    put("value", value)
+    put("strength", strength.toCanonicalJson())
+}
+
 /** Common scheduling restrictions kept typed instead of retaining an unreviewable JSON blob. */
 @Serializable
 data class CanonicalFlexibleConstraintsDraft(
     val energy: EnergyLevel? = null,
     val tags: List<String> = emptyList(),
     val preferredStartMinute: Int? = null,
-    val minimumGapMinutes: Int = 0,
+    val minimumGapMinutes: Long = 0,
     val maximumSessions: Int? = null,
+    val maximumSplitDays: Int? = null,
+    val energyStrength: CanonicalConstraintStrengthDraft? = null,
+    val scheduling: CanonicalSchedulingConstraintsDraft? = null,
+    val hasOwnEffort: Boolean? = null,
+    val goalIds: List<String> = emptyList(),
+    val habitTarget: CanonicalHabitTargetDraft? = null,
+    val preservesStreakWhenPaused: Boolean? = null,
+    val routineOrdered: Boolean? = null,
+    val goalMeasures: List<CanonicalGoalMeasureDraft>? = null,
+    val goalWeeklyAllocation: CanonicalWeeklyAllocationDraft? = null,
+    val breakCategory: CanonicalBreakCategory? = null,
+    val breakMandatory: Boolean? = null,
+    val breakPromptToResume: Boolean? = null,
 ) {
     fun normalized(): CanonicalFlexibleConstraintsDraft = copy(
-        tags = tags.map(String::trim).sorted(),
+        tags = tags.sorted(),
+        scheduling = scheduling?.normalized(),
+        goalIds = goalIds.sorted(),
+        habitTarget = habitTarget?.normalized(),
+        goalMeasures = goalMeasures?.map(CanonicalGoalMeasureDraft::normalized),
     )
 
     fun requireValid(
         durationSeconds: Long? = null,
         eventTiming: CanonicalEventTimingDraft? = null,
     ) {
-        require(tags.size <= MAX_TAGS && tags.distinct().size == tags.size) {
-            "Constraint tags must be distinct and bounded"
+        require(tags.distinct().size == tags.size) {
+            "Constraint tags must be distinct"
         }
-        require(tags.all { it.isNotEmpty() && it.codePointCount(0, it.length) <= MAX_TAG_CHARS }) {
-            "Constraint tags must be non-empty and bounded"
+        require(tags.all { it.isNotBlank() }) {
+            "Constraint tags must be non-empty"
         }
         preferredStartMinute?.let { preferred ->
             require(preferred in 0 until MINUTES_PER_DAY)
@@ -183,12 +728,34 @@ data class CanonicalFlexibleConstraintsDraft(
                 "A preferred start and duration must finish within the same day"
             }
         }
-        require(minimumGapMinutes in 0..MAX_GAP_MINUTES)
+        require(minimumGapMinutes in 0..MAX_SCHEDULING_OFFSET_MINUTES) {
+            "Minimum gap must be at most $MAX_SCHEDULING_OFFSET_MINUTES minutes"
+        }
         require(maximumSessions == null || maximumSessions in 1..UShort.MAX_VALUE.toInt())
+        require(maximumSplitDays == null || maximumSplitDays in 1..UShort.MAX_VALUE.toInt())
+        require(energy != null || energyStrength == null) {
+            "An energy strength requires an energy level"
+        }
+        energyStrength?.requireValid()
+        scheduling?.requireValid()
+        val parsedGoalIds = goalIds.map { requireNonNilUuid(it, "goal reference") }
+        require(parsedGoalIds.distinct().size == parsedGoalIds.size) {
+            "Goal references must identify distinct items"
+        }
+        habitTarget?.requireValid()
+        goalMeasures?.forEach(CanonicalGoalMeasureDraft::requireValid)
+        goalWeeklyAllocation?.requireValid()
         if (eventTiming != null) {
             require(
                 energy == null && tags.isEmpty() && preferredStartMinute == null &&
-                    minimumGapMinutes == 0 && maximumSessions == null,
+                    minimumGapMinutes == 0L && maximumSessions == null &&
+                    maximumSplitDays == null && energyStrength == null && scheduling == null &&
+                    hasOwnEffort == null && habitTarget == null &&
+                    goalIds.isEmpty() &&
+                    preservesStreakWhenPaused == null && routineOrdered == null &&
+                    goalMeasures == null && goalWeeklyAllocation == null &&
+                    breakCategory == null && breakMandatory == null &&
+                    breakPromptToResume == null,
             ) { "A DayWeave firm block must be the event's sole metadata" }
         }
     }
@@ -201,13 +768,39 @@ data class CanonicalFlexibleConstraintsDraft(
         requireValid(durationSeconds, eventTiming)
         eventTiming?.requireValid(timezoneName)
         return buildJsonObject {
-            energy?.let { put("energy", it.name.lowercase()) }
+            energy?.let { level ->
+                val strength = energyStrength
+                if (strength == null) {
+                    put("energy", level.name.lowercase())
+                } else {
+                    put(
+                        "energy",
+                        qualifiedJson(JsonPrimitive(level.name.lowercase()), strength),
+                    )
+                }
+            }
             if (tags.isNotEmpty()) {
                 put("tags", JsonArray(tags.map { JsonPrimitive(it) }))
             }
+            scheduling?.let { put("constraints", it.toCanonicalJson()) }
+            hasOwnEffort?.let { put("has_own_effort", it) }
+            if (goalIds.isNotEmpty()) {
+                put("goal_ids", JsonArray(goalIds.map(::JsonPrimitive)))
+            }
+            habitTarget?.let { put("habit_target", it.toCanonicalJson()) }
+            preservesStreakWhenPaused?.let { put("preserves_streak_when_paused", it) }
+            routineOrdered?.let { put("routine_ordered", it) }
+            goalMeasures?.let { measures ->
+                put("goal_measures", JsonArray(measures.map { it.toCanonicalJson() }))
+            }
+            goalWeeklyAllocation?.let { put("goal_weekly_allocation", it.toCanonicalJson()) }
+            breakCategory?.let { put("break_category", it.wireValue) }
+            breakMandatory?.let { put("break_mandatory", it) }
+            breakPromptToResume?.let { put("break_prompt_to_resume", it) }
             preferredStartMinute?.let { put("preferred_start_minute", it) }
             if (minimumGapMinutes > 0) put("minimum_gap_minutes", minimumGapMinutes)
             maximumSessions?.let { put("maximum_sessions", it) }
+            maximumSplitDays?.let { put("maximum_split_days", it) }
             eventTiming?.let { timing ->
                 put("dayweave_firm_block", timing.toCanonicalJson(timezoneName))
             }
@@ -217,9 +810,6 @@ data class CanonicalFlexibleConstraintsDraft(
     private companion object {
         const val SECONDS_PER_MINUTE = 60L
         const val MINUTES_PER_DAY = 24 * 60
-        const val MAX_TAGS = 100
-        const val MAX_TAG_CHARS = 100
-        const val MAX_GAP_MINUTES = 366 * 24 * 60
     }
 }
 
@@ -236,7 +826,6 @@ data class CanonicalEventTimingDraft(
         val start = requireCanonicalInstant(startsAt, "firm block start")
         val end = requireCanonicalInstant(endsAt, "firm block end")
         require(end > start) { "Event end must follow its start" }
-        require(Duration.between(start, end).seconds <= CanonicalItemDraft.MAX_DURATION_SECONDS)
         if (allDay) {
             val zone = requireCanonicalTimezoneName(requireNotNull(timezoneName) {
                 "All-day event validation requires the canonical item timezone"
@@ -312,7 +901,30 @@ data class CanonicalItemDraft(
         require(earliest == null || deadline == null || earliest < deadline)
         value.recurrence?.requireValid()
         value.constraints.requireValid(value.durationSeconds, value.eventTiming)
+        require(
+            value.constraints.goalIds.isEmpty() &&
+                value.constraints.scheduling?.dependencies.orEmpty().isEmpty(),
+        ) {
+            "Goal links and dependencies are read-only until safe graph editing is available"
+        }
         value.split.requireValid(value.durationSeconds)
+        require(value.split.kind == CanonicalSplitKind.SPLITTABLE ||
+            value.constraints.maximumSessions == null &&
+            value.constraints.minimumGapMinutes == 0L &&
+            value.constraints.maximumSplitDays == null) {
+            "Session, gap, and day limits require a splittable item"
+        }
+        if (value.split.kind == CanonicalSplitKind.SPLITTABLE) {
+            val maximumSessions = value.constraints.maximumSessions
+            val duration = value.durationSeconds
+            val maximumChunk = value.split.maximumChunkSeconds
+            if (maximumSessions != null && duration != null && maximumChunk != null) {
+                val requiredSessions = (duration + maximumChunk - 1) / maximumChunk
+                require(requiredSessions <= maximumSessions.toLong()) {
+                    "Maximum sessions cannot contain the duration within maximum chunks"
+                }
+            }
+        }
         require(value.importance in 0..100 && value.urgency in 0..100)
         require(value.siblingOrder in 0..MAX_SIBLING_ORDER)
         value.parentId?.let {
@@ -320,29 +932,106 @@ data class CanonicalItemDraft(
             require(it != itemId) { "An item cannot be its own parent" }
         }
         when (value.kind) {
-            ItemKind.HABIT -> require(value.recurrence != null) { "Habits require recurrence" }
+            ItemKind.HABIT -> {
+                require(
+                    value.constraints.routineOrdered == null &&
+                        value.constraints.goalMeasures == null &&
+                        value.constraints.goalWeeklyAllocation == null &&
+                        value.constraints.breakCategory == null &&
+                        value.constraints.breakMandatory == null &&
+                        value.constraints.breakPromptToResume == null,
+                ) { "Habit metadata cannot describe another item kind" }
+                if (value.placement == CanonicalDraftPlacement.PLANNED) {
+                    require(value.recurrence != null) { "Planned habits require recurrence" }
+                }
+            }
+            ItemKind.ROUTINE -> require(
+                value.constraints.habitTarget == null &&
+                    value.constraints.preservesStreakWhenPaused == null &&
+                    value.constraints.goalMeasures == null &&
+                    value.constraints.goalWeeklyAllocation == null &&
+                    value.constraints.breakCategory == null &&
+                    value.constraints.breakMandatory == null &&
+                    value.constraints.breakPromptToResume == null,
+            ) { "Routine metadata cannot describe another item kind" }
+            ItemKind.GOAL -> require(
+                value.constraints.habitTarget == null &&
+                    value.constraints.preservesStreakWhenPaused == null &&
+                    value.constraints.routineOrdered == null &&
+                    value.constraints.breakCategory == null &&
+                    value.constraints.breakMandatory == null &&
+                    value.constraints.breakPromptToResume == null,
+            ) { "Goal metadata cannot describe another item kind" }
+            ItemKind.BREAK -> require(
+                value.constraints.habitTarget == null &&
+                    value.constraints.preservesStreakWhenPaused == null &&
+                    value.constraints.routineOrdered == null &&
+                    value.constraints.goalMeasures == null &&
+                    value.constraints.goalWeeklyAllocation == null,
+            ) { "Break metadata cannot describe another item kind" }
+            ItemKind.TASK -> require(
+                value.constraints.habitTarget == null &&
+                    value.constraints.preservesStreakWhenPaused == null &&
+                    value.constraints.routineOrdered == null &&
+                    value.constraints.goalMeasures == null &&
+                    value.constraints.goalWeeklyAllocation == null &&
+                    value.constraints.breakCategory == null &&
+                    value.constraints.breakMandatory == null &&
+                    value.constraints.breakPromptToResume == null,
+            ) { "Task metadata cannot describe another item kind" }
             ItemKind.EVENT,
-            ItemKind.GOAL,
-            ItemKind.BREAK,
             -> require(value.recurrence == null) { "This item type cannot recur" }
-            ItemKind.TASK,
-            ItemKind.ROUTINE,
-            -> Unit
+        }
+        if (value.kind in setOf(ItemKind.GOAL, ItemKind.BREAK)) {
+            require(value.recurrence == null) { "This item type cannot recur" }
+        }
+        val richConstraints = value.constraints.scheduling
+        require(value.earliestStartAt == null || richConstraints?.earliestStart == null) {
+            "Earliest start cannot be defined in both canonical and flexible fields"
+        }
+        require(value.deadlineAt == null || richConstraints?.latestFinish == null) {
+            "Deadline cannot be defined in both canonical and flexible fields"
+        }
+        val effectiveEarliest = earliest ?: richConstraints?.earliestStart?.value?.let {
+            requireCanonicalInstant(it, "constraint earliest start")
+        }
+        val effectiveLatest = deadline ?: richConstraints?.latestFinish?.value?.let {
+            requireCanonicalInstant(it, "constraint latest finish")
+        }
+        require(effectiveEarliest == null || effectiveLatest == null || effectiveEarliest < effectiveLatest) {
+            "Earliest start must precede latest finish"
         }
         if (value.kind == ItemKind.EVENT) {
-            val timing = requireNotNull(value.eventTiming) { "Events require fixed timing" }
-            timing.requireValid(value.timezoneName)
-            val exactDuration = Duration.between(
-                requireCanonicalInstant(timing.startsAt, "firm block start"),
-                requireCanonicalInstant(timing.endsAt, "firm block end"),
-            ).seconds
-            require(value.durationSeconds == exactDuration) {
-                "Event duration must match its fixed timing"
+            val timing = value.eventTiming
+            if (value.placement == CanonicalDraftPlacement.PLANNED) {
+                requireNotNull(timing) {
+                    "Event requires timing metadata after it leaves the Inbox"
+                }
             }
-            require(
-                earliest == requireCanonicalInstant(timing.startsAt, "firm block start") &&
-                    deadline == requireCanonicalInstant(timing.endsAt, "firm block end"),
-            ) { "Event timing must match its hard scheduling bounds" }
+            timing?.let {
+                it.requireValid(value.timezoneName)
+                val timingDuration = Duration.between(
+                    requireCanonicalInstant(it.startsAt, "firm block start"),
+                    requireCanonicalInstant(it.endsAt, "firm block end"),
+                )
+                require(
+                    value.durationSeconds == null ||
+                        timingDuration.nano == 0 && value.durationSeconds == timingDuration.seconds,
+                ) {
+                    "Event duration, when supplied, must match its fixed timing"
+                }
+                require(
+                    (earliest == null ||
+                        earliest == requireCanonicalInstant(it.startsAt, "firm block start")) &&
+                        (deadline == null ||
+                            deadline == requireCanonicalInstant(it.endsAt, "firm block end")),
+                ) { "Event timing must match any supplied hard scheduling bounds" }
+            }
+            if (timing == null) {
+                require(value.durationSeconds == null && earliest == null && deadline == null) {
+                    "Incomplete Inbox events cannot carry partial fixed timing"
+                }
+            }
             require(value.split.kind == CanonicalSplitKind.INDIVISIBLE)
         } else {
             require(value.eventTiming == null) { "Only events can have fixed event timing" }
@@ -360,11 +1049,19 @@ data class CanonicalItemDraft(
         )
     }
 
+    internal fun requireValidCanonicalRead(itemId: String) = requireValid(itemId)
+
     fun matches(item: CanonicalItemSnapshot): Boolean {
         val value = normalized()
         return runCatching {
             value.requireValid(item.id)
             item.requireCanonicalAuthoringShape()
+            val decodedConstraints = decodeCanonicalConstraints(
+                item.flexibleConstraintsJson,
+                value.kind,
+                value.timezoneName,
+                value.durationSeconds,
+            )
             item.deletedAt == null &&
                 item.kind == value.kind.name.lowercase() &&
                 item.status == value.placement.wireValue &&
@@ -375,19 +1072,17 @@ data class CanonicalItemDraft(
                 item.durationSeconds == value.durationSeconds &&
                 sameInstant(item.deadlineAt, value.deadlineAt) &&
                 sameInstant(item.earliestStartAt, value.earliestStartAt) &&
-                canonicalJson(item.recurrenceJson) == value.recurrence?.toCanonicalJson() &&
-                canonicalJson(item.flexibleConstraintsJson) ==
-                value.constraints.toCanonicalJson(
-                    value.eventTiming,
-                    value.durationSeconds,
-                    value.timezoneName,
-                ) &&
-                canonicalJson(item.splitPolicyJson) ==
-                value.split.toCanonicalJson(value.durationSeconds) &&
+                normalizedRecurrenceJson(item.recurrenceJson) ==
+                value.recurrence?.toCanonicalJson() &&
+                decodedConstraints.first == value.constraints &&
+                decodedConstraints.second == value.eventTiming &&
+                decodeCanonicalSplit(item.splitPolicyJson) == value.split &&
                 item.importance == value.importance && item.urgency == value.urgency &&
                 item.parentId == value.parentId && item.siblingOrder == value.siblingOrder
         }.getOrDefault(false)
     }
+
+    internal fun matchesCanonicalRead(item: CanonicalItemSnapshot): Boolean = matches(item)
 
     companion object {
         const val CURRENT_VERSION = 1
@@ -405,13 +1100,14 @@ data class CanonicalItemDraft(
             else -> STRICT_JSON.encodeToString(JsonElement.serializer(), value).toByteArray().size
         }
 
-        private fun canonicalJson(raw: String?): JsonElement? = raw?.let {
-            STRICT_JSON.parseToJsonElement(it)
+        private fun normalizedRecurrenceJson(raw: String?): JsonElement? = raw?.let {
+            decodeCanonicalRecurrence(it).toCanonicalJson()
         }
 
         private fun sameInstant(left: String?, right: String?): Boolean = when {
             left == null || right == null -> left == right
-            else -> Instant.parse(left) == Instant.parse(right)
+            else -> requireCanonicalInstant(left, "canonical instant") ==
+                requireCanonicalInstant(right, "draft instant")
         }
     }
 }
@@ -482,7 +1178,9 @@ data class PendingCanonicalAuthoringMutation(
                 expectedRevision != null && baseItem?.id == itemId &&
                     baseItem.revision == expectedRevision && baseItem.deletedAt == null &&
                     draft != null,
-            )
+            ).also {
+                requireNotNull(baseItem).requireCanonicalReplacementSupport()
+            }
             CanonicalAuthoringOperation.TRASH -> require(
                 draft == null && expectedRevision != null &&
                     (baseItem == null || baseItem.id == itemId &&
@@ -496,6 +1194,9 @@ data class PendingCanonicalAuthoringMutation(
         }
         require(expectedRevision == null || expectedRevision > 0)
         draft?.requireValid(itemId)
+        require(draft?.recurrence?.kind != CanonicalRecurrenceKind.CUSTOM) {
+            "Custom RRULE recurrence is retained for read compatibility but is read-only on Android"
+        }
         baseItem?.requireCanonicalAuthoringShape()
         require(
             canonicalAuthoringMutationBytes(this) <=
@@ -567,6 +1268,7 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
     val splitValue = decodeCanonicalSplit(splitPolicyJson)
     val constraintsValue = decodeCanonicalConstraints(
         flexibleConstraintsJson,
+        kindValue,
         timezoneName,
         durationSeconds,
     )
@@ -589,9 +1291,27 @@ fun CanonicalItemSnapshot.toCanonicalDraft(): CanonicalItemDraft {
         siblingOrder = siblingOrder,
         eventTiming = constraintsValue.second,
     ).also {
-        it.requireValid(id)
-        require(it.matches(this)) { "Canonical item contains unsupported authoring fields" }
+        it.requireValidCanonicalRead(id)
+        require(it.matchesCanonicalRead(this)) {
+            "Canonical item contains unsupported authoring fields"
+        }
     }
+}
+
+/**
+ * Proves that replacing this canonical row cannot silently discard server-owned or unsupported
+ * state. Destructive identity-only operations deliberately do not use this fence: an unsupported
+ * row must remain trashable (and an exact tombstone restorable).
+ */
+internal fun CanonicalItemSnapshot.requireCanonicalReplacementSupport(): CanonicalItemDraft {
+    val roundTripped = toCanonicalDraft()
+    require(roundTripped.recurrence?.kind != CanonicalRecurrenceKind.CUSTOM) {
+        "Custom RRULE recurrence is retained for read compatibility but is read-only on Android"
+    }
+    require(roundTripped.matches(this)) {
+        "Canonical item cannot be replaced without losing unsupported authoring fields"
+    }
+    return roundTripped
 }
 
 private fun decodeCanonicalRecurrence(raw: String): CanonicalRecurrenceDraft {
@@ -599,31 +1319,79 @@ private fun decodeCanonicalRecurrence(raw: String): CanonicalRecurrenceDraft {
         ?: throw IllegalArgumentException("Unsupported recurrence")
     val type = (objectValue["type"] as? JsonPrimitive)?.content
     val result = when (type) {
-        "daily" -> CanonicalRecurrenceDraft(
-            CanonicalRecurrenceKind.DAILY,
-            occurrencesPerPeriod = objectValue.exactInt("times_per_day"),
-        )
-        "weekly" -> CanonicalRecurrenceDraft(
-            CanonicalRecurrenceKind.WEEKLY,
-            occurrencesPerPeriod = objectValue.exactInt("times_per_week"),
-            weekdays = (objectValue["weekdays"] as? JsonArray)?.map { element ->
-                val value = (element as? JsonPrimitive)?.content
-                CanonicalWeekday.entries.singleOrNull { it.wireValue == value }
-                    ?: throw IllegalArgumentException("Unsupported recurrence weekday")
-            } ?: throw IllegalArgumentException("Unsupported weekly recurrence"),
-        )
-        "monthly" -> CanonicalRecurrenceDraft(
-            CanonicalRecurrenceKind.MONTHLY,
-            occurrencesPerPeriod = objectValue.exactInt("times_per_month"),
-        )
-        "every_interval", "after_completion" -> CanonicalRecurrenceDraft(
-            if (type == "every_interval") CanonicalRecurrenceKind.EVERY_INTERVAL
-            else CanonicalRecurrenceKind.AFTER_COMPLETION,
-            intervalSeconds = Math.multiplyExact(objectValue.exactLong("interval"), 60L),
-        )
+        "daily" -> {
+            objectValue.requireOnlyKeys("type", "times_per_day")
+            CanonicalRecurrenceDraft(
+                CanonicalRecurrenceKind.DAILY,
+                occurrencesPerPeriod = objectValue.optionalInt("times_per_day") ?: 1,
+            )
+        }
+        "weekly" -> {
+            objectValue.requireOnlyKeys("type", "times_per_week", "weekdays")
+            val weekdays = if (objectValue.containsKey("weekdays")) {
+                objectValue.exactWeekdays("weekdays")
+            } else {
+                emptyList()
+            }
+            CanonicalRecurrenceDraft(
+                CanonicalRecurrenceKind.WEEKLY,
+                occurrencesPerPeriod = objectValue.optionalInt("times_per_week")
+                    ?: weekdays.size.coerceAtLeast(1),
+                weekdays = weekdays,
+            )
+        }
+        "monthly" -> {
+            objectValue.requireOnlyKeys("type", "times_per_month")
+            CanonicalRecurrenceDraft(
+                CanonicalRecurrenceKind.MONTHLY,
+                occurrencesPerPeriod = objectValue.optionalInt("times_per_month") ?: 1,
+            )
+        }
+        "every_interval", "after_completion" -> {
+            objectValue.requireOnlyKeys("type", "interval")
+            CanonicalRecurrenceDraft(
+                if (type == "every_interval") CanonicalRecurrenceKind.EVERY_INTERVAL
+                else CanonicalRecurrenceKind.AFTER_COMPLETION,
+                intervalSeconds = Math.multiplyExact(objectValue.exactLong("interval"), 60L),
+            )
+        }
+        "frequency" -> {
+            objectValue.requireOnlyKeys(
+                "type", "target", "period", "semantics", "weekdays", "minimum_spacing", "anchor",
+            )
+            CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.FREQUENCY,
+                occurrencesPerPeriod = objectValue.exactInt("target"),
+                period = objectValue.exactEnum("period", CanonicalRecurrencePeriod.entries) {
+                    it.wireValue
+                },
+                semantics = objectValue.exactEnum(
+                    "semantics",
+                    CanonicalRecurrenceSemantics.entries,
+                ) { it.wireValue },
+                weekdays = if (objectValue.containsKey("weekdays")) {
+                    objectValue.exactWeekdays("weekdays")
+                } else {
+                    emptyList()
+                },
+                minimumSpacingMinutes = if (objectValue.containsKey("minimum_spacing")) {
+                    objectValue.exactLong("minimum_spacing")
+                } else {
+                    0
+                },
+                anchorAt = objectValue.optionalExactString("anchor"),
+            )
+        }
+        "custom" -> {
+            objectValue.requireOnlyKeys("type", "rrule")
+            CanonicalRecurrenceDraft(
+                kind = CanonicalRecurrenceKind.CUSTOM,
+                rrule = objectValue.exactString("rrule"),
+            )
+        }
         else -> throw IllegalArgumentException("Unsupported recurrence")
     }
-    require(result.toCanonicalJson() == objectValue) { "Recurrence contains unsupported fields" }
+    result.requireValid()
     return result
 }
 
@@ -631,12 +1399,22 @@ private fun decodeCanonicalSplit(raw: String): CanonicalSplitDraft {
     val objectValue = AUTHORING_JSON.parseToJsonElement(raw) as? JsonObject
         ?: throw IllegalArgumentException("Unsupported split policy")
     val result = when ((objectValue["type"] as? JsonPrimitive)?.content) {
-        "indivisible" -> CanonicalSplitDraft()
-        "splittable" -> CanonicalSplitDraft(
-            kind = CanonicalSplitKind.SPLITTABLE,
-            minimumChunkSeconds = objectValue.exactLong("minimum_chunk_seconds"),
-            maximumChunkSeconds = objectValue.exactLong("maximum_chunk_seconds"),
-        )
+        "indivisible" -> {
+            objectValue.requireOnlyKeys("type")
+            CanonicalSplitDraft()
+        }
+        "splittable" -> {
+            objectValue.requireOnlyKeys(
+                "type",
+                "minimum_chunk_seconds",
+                "maximum_chunk_seconds",
+            )
+            CanonicalSplitDraft(
+                kind = CanonicalSplitKind.SPLITTABLE,
+                minimumChunkSeconds = objectValue.exactLong("minimum_chunk_seconds"),
+                maximumChunkSeconds = objectValue.exactLong("maximum_chunk_seconds"),
+            )
+        }
         else -> throw IllegalArgumentException("Unsupported split policy")
     }
     return result
@@ -644,46 +1422,333 @@ private fun decodeCanonicalSplit(raw: String): CanonicalSplitDraft {
 
 private fun decodeCanonicalConstraints(
     raw: String,
+    kind: ItemKind,
     timezoneName: String,
     durationSeconds: Long?,
 ): Pair<CanonicalFlexibleConstraintsDraft, CanonicalEventTimingDraft?> {
     val objectValue = AUTHORING_JSON.parseToJsonElement(raw) as? JsonObject
         ?: throw IllegalArgumentException("Unsupported constraints")
+    for (key in listOf("calendar_event", "calendar_context")) {
+        require(objectValue[key] == null || objectValue[key] == JsonNull) {
+            "Provider-managed calendar event metadata is read-only on Android"
+        }
+    }
     val knownKeys = setOf(
         "energy", "tags", "preferred_start_minute", "minimum_gap_minutes",
-        "maximum_sessions", "dayweave_firm_block",
+        "maximum_sessions", "maximum_split_days", "constraints", "has_own_effort", "goal_ids",
+        "habit_target", "preserves_streak_when_paused", "routine_ordered",
+        "goal_measures", "goal_weekly_allocation", "break_category", "break_mandatory",
+        "break_prompt_to_resume", "calendar_event", "calendar_context", "dayweave_firm_block",
     )
     require(objectValue.keys.all { it in knownKeys }) { "Constraints contain unsupported fields" }
-    val energy = (objectValue["energy"] as? JsonPrimitive)?.content?.let { value ->
-        EnergyLevel.entries.singleOrNull { it.name.equals(value, ignoreCase = true) }
-            ?: throw IllegalArgumentException("Unsupported energy constraint")
+    objectValue.requireKindMetadataKeys(kind)
+    var energyStrength: CanonicalConstraintStrengthDraft? = null
+    val energy = when (val element = objectValue["energy"]) {
+        null, JsonNull -> null
+        else -> {
+            val value = when (element) {
+                is JsonPrimitive -> element.takeIf(JsonPrimitive::isString)?.content
+                is JsonObject -> {
+                    element.requireOnlyKeys("value", "strength")
+                    energyStrength = decodeConstraintStrength(element.exactObject("strength"))
+                    element.exactString("value")
+                }
+                else -> null
+            } ?: throw IllegalArgumentException("Unsupported energy constraint")
+            EnergyLevel.entries.singleOrNull { it.name.lowercase() == value }
+                ?: throw IllegalArgumentException("Unsupported energy constraint")
+        }
     }
-    val tags = (objectValue["tags"] as? JsonArray)?.map {
-        (it as? JsonPrimitive)?.content
-            ?: throw IllegalArgumentException("Unsupported tag constraint")
-    }.orEmpty()
-    val event = (objectValue["dayweave_firm_block"] as? JsonObject)?.let { block ->
-        require((block["owned"] as? JsonPrimitive)?.content == "true")
+    val tags = objectValue.arrayOrEmpty("tags").mapIndexed { index, element ->
+        element.exactArrayString("tags[$index]")
+    }
+    val event = objectValue.nullableObject("dayweave_firm_block")?.let { block ->
+        block.requireOnlyKeys(
+            "owned",
+            "starts_at",
+            "ends_at",
+            "all_day",
+            "tentative",
+            "busy",
+        )
+        require(block.exactBoolean("owned")) {
+            "A locally owned firm block must set owned to true"
+        }
         CanonicalEventTimingDraft(
             startsAt = block.exactString("starts_at"),
             endsAt = block.exactString("ends_at"),
-            allDay = block.exactBoolean("all_day"),
-            tentative = block.exactBoolean("tentative"),
-            busy = block.exactBoolean("busy"),
-        ).also { require(it.toCanonicalJson(timezoneName) == block) }
+            allDay = block.defaultBoolean("all_day", false),
+            tentative = block.defaultBoolean("tentative", false),
+            busy = block.defaultBoolean("busy", true),
+        ).also { it.requireValid(timezoneName) }
+    }
+    if (event != null) {
+        require(objectValue.keys == setOf("dayweave_firm_block")) {
+            "A DayWeave firm block must be the event's sole metadata"
+        }
+    }
+    val goalMeasures = objectValue.arrayWhenPresent("goal_measures")?.mapIndexed { index, element ->
+        val measure = element as? JsonObject
+            ?: throw IllegalArgumentException("goal_measures[$index] must be an object")
+        measure.requireOnlyKeys("name", "target", "current", "unit")
+        CanonicalGoalMeasureDraft(
+            name = measure.exactString("name"),
+            target = measure.exactLong("target"),
+            current = measure.exactLong("current"),
+            unit = measure.exactString("unit"),
+        )
     }
     val constraints = CanonicalFlexibleConstraintsDraft(
         energy = energy,
         tags = tags,
-        preferredStartMinute = objectValue.optionalInt("preferred_start_minute"),
-        minimumGapMinutes = objectValue.optionalInt("minimum_gap_minutes") ?: 0,
-        maximumSessions = objectValue.optionalInt("maximum_sessions"),
+        preferredStartMinute = objectValue.nullableInt("preferred_start_minute"),
+        minimumGapMinutes = objectValue.defaultLong("minimum_gap_minutes", 0),
+        maximumSessions = objectValue.nullableInt("maximum_sessions"),
+        maximumSplitDays = objectValue.nullableInt("maximum_split_days"),
+        energyStrength = energyStrength,
+        scheduling = objectValue.objectWhenPresent("constraints")?.let(
+            ::decodeSchedulingConstraints,
+        ),
+        hasOwnEffort = objectValue.optionalBoolean("has_own_effort"),
+        goalIds = objectValue.arrayOrEmpty("goal_ids").mapIndexed { index, element ->
+            element.exactArrayString("goal_ids[$index]")
+        },
+        habitTarget = objectValue.nullableObject("habit_target")?.let { target ->
+            target.requireOnlyKeys("amount", "unit")
+            CanonicalHabitTargetDraft(
+                amount = target.exactLong("amount"),
+                unit = target.exactString("unit"),
+            )
+        },
+        preservesStreakWhenPaused = objectValue.optionalBoolean("preserves_streak_when_paused"),
+        routineOrdered = objectValue.optionalBoolean("routine_ordered"),
+        goalMeasures = goalMeasures,
+        goalWeeklyAllocation = objectValue.nullableObject("goal_weekly_allocation")?.let { allocation ->
+            allocation.requireOnlyKeys("minimum", "maximum")
+            CanonicalWeeklyAllocationDraft(
+                minimumMinutes = allocation.exactLong("minimum"),
+                maximumMinutes = allocation.optionalExactLong("maximum"),
+            )
+        },
+        breakCategory = objectValue.nullableString("break_category")?.let { value ->
+            CanonicalBreakCategory.entries.singleOrNull { it.wireValue == value }
+                ?: throw IllegalArgumentException("Unsupported break category")
+        },
+        breakMandatory = objectValue.optionalBoolean("break_mandatory"),
+        breakPromptToResume = objectValue.optionalBoolean("break_prompt_to_resume"),
     ).normalized()
-    require(
-        constraints.toCanonicalJson(event, durationSeconds, timezoneName) == objectValue,
-    )
+    constraints.requireValid(durationSeconds, event)
     return constraints to event
 }
+
+private fun decodeSchedulingConstraints(value: JsonObject): CanonicalSchedulingConstraintsDraft {
+    val knownKeys = setOf(
+        "earliest_start", "latest_finish", "minimum_notice", "allowed_weekdays",
+        "preferred_daily_windows", "preferred_absolute_windows", "forbidden_windows",
+        "required_contexts", "required_location", "maximum_daily_work",
+        "maximum_weekly_work", "buffers", "dependencies", "occurrence_window",
+    )
+    require(value.keys.all { it in knownKeys }) {
+        "Scheduling constraints contain unsupported fields"
+    }
+    fun qualifiedInstant(key: String, description: String) =
+        value.nullableObject(key)?.let { wrapper ->
+            wrapper.requireOnlyKeys("value", "strength")
+            CanonicalQualifiedInstantDraft(
+                value = wrapper.exactString("value"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also { it.requireValid(description) }
+        }
+    fun qualifiedMinutes(key: String, description: String) =
+        value.nullableObject(key)?.let { wrapper ->
+            wrapper.requireOnlyKeys("value", "strength")
+            CanonicalQualifiedMinutesDraft(
+                value = wrapper.exactLong("value"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also { it.requireValid(description) }
+        }
+    fun absoluteWindows(key: String, description: String) =
+        value.arrayOrEmpty(key).mapIndexed { index, element ->
+            val wrapper = element as? JsonObject
+                ?: throw IllegalArgumentException("$key[$index] must be an object")
+            wrapper.requireOnlyKeys("value", "strength")
+            val window = wrapper.exactObject("value")
+            window.requireOnlyKeys("start", "end")
+            CanonicalAbsoluteWindowDraft(
+                startsAt = window.exactString("start"),
+                endsAt = window.exactString("end"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also { it.requireValid(description) }
+        }
+
+    val result = CanonicalSchedulingConstraintsDraft(
+        earliestStart = qualifiedInstant("earliest_start", "constraint earliest start"),
+        latestFinish = qualifiedInstant("latest_finish", "constraint latest finish"),
+        minimumNotice = qualifiedMinutes("minimum_notice", "minimum notice"),
+        allowedWeekdays = value.nullableObject("allowed_weekdays")?.let { wrapper ->
+            wrapper.requireOnlyKeys("value", "strength")
+            CanonicalQualifiedWeekdaysDraft(
+                value = wrapper.exactWeekdays("value"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also(CanonicalQualifiedWeekdaysDraft::requireValid)
+        },
+        preferredDailyWindows =
+            value.arrayOrEmpty("preferred_daily_windows").mapIndexed { index, element ->
+                val wrapper = element as? JsonObject
+                    ?: throw IllegalArgumentException(
+                        "preferred_daily_windows[$index] must be an object",
+                    )
+                wrapper.requireOnlyKeys("value", "strength")
+                val window = wrapper.exactObject("value")
+                window.requireOnlyKeys("weekdays", "start_minute", "end_minute")
+                CanonicalDailyWindowDraft(
+                    weekdays = window.exactWeekdays("weekdays"),
+                    startMinute = window.exactInt("start_minute"),
+                    endMinute = window.exactInt("end_minute"),
+                    strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+                ).also(CanonicalDailyWindowDraft::requireValid)
+            },
+        preferredAbsoluteWindows = absoluteWindows(
+            "preferred_absolute_windows",
+            "preferred absolute window",
+        ),
+        forbiddenWindows = absoluteWindows("forbidden_windows", "forbidden window"),
+        requiredContexts = value.arrayOrEmpty("required_contexts").mapIndexed { index, element ->
+            val wrapper = element as? JsonObject
+                ?: throw IllegalArgumentException("required_contexts[$index] must be an object")
+            wrapper.requireOnlyKeys("value", "strength")
+            CanonicalQualifiedStringDraft(
+                value = wrapper.exactString("value"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also { it.requireValid("required context") }
+        },
+        requiredLocation = value.nullableObject("required_location")?.let { wrapper ->
+            wrapper.requireOnlyKeys("value", "strength")
+            CanonicalQualifiedStringDraft(
+                value = wrapper.exactString("value"),
+                strength = decodeConstraintStrength(wrapper.exactObject("strength")),
+            ).also { it.requireValid("required location") }
+        },
+        dependencies = value.arrayOrEmpty("dependencies").mapIndexed { index, element ->
+            val dependency = element as? JsonObject
+                ?: throw IllegalArgumentException("dependencies[$index] must be an object")
+            dependency.requireOnlyKeys("item_id", "relation", "minimum_lag", "strength")
+            CanonicalDependencyDraft(
+                itemId = dependency.exactString("item_id"),
+                relation = dependency.exactEnum(
+                    "relation",
+                    CanonicalDependencyRelation.entries,
+                ) { it.wireValue },
+                minimumLagMinutes = dependency.exactLong("minimum_lag"),
+                strength = decodeConstraintStrength(dependency.exactObject("strength")),
+            ).also(CanonicalDependencyDraft::requireValid)
+        },
+        maximumDailyWork = qualifiedMinutes(
+            "maximum_daily_work",
+            "maximum daily work",
+        ),
+        maximumWeeklyWork = qualifiedMinutes(
+            "maximum_weekly_work",
+            "maximum weekly work",
+        ),
+        buffers = value.objectWhenPresent("buffers")?.let { buffer ->
+            buffer.requireOnlyKeys("before", "after", "strength")
+            CanonicalBufferPolicyDraft(
+                beforeMinutes = buffer.exactLong("before"),
+                afterMinutes = buffer.exactLong("after"),
+                strength = buffer.nullableObject("strength")?.let(::decodeConstraintStrength),
+            ).also(CanonicalBufferPolicyDraft::requireValid)
+        },
+        includesNullOccurrenceWindow = value.containsKey("occurrence_window").also { present ->
+            if (present) require(value["occurrence_window"] == JsonNull) {
+                "A materialized occurrence window is system-owned and read-only"
+            }
+        },
+    ).normalized()
+    result.requireValid()
+    return result
+}
+
+private fun decodeConstraintStrength(value: JsonObject): CanonicalConstraintStrengthDraft {
+    val level = value.exactEnum("level", CanonicalConstraintLevel.entries) { it.wireValue }
+    when (level) {
+        CanonicalConstraintLevel.HARD -> value.requireOnlyKeys("level")
+        CanonicalConstraintLevel.SOFT -> value.requireOnlyKeys("level", "weight")
+    }
+    return CanonicalConstraintStrengthDraft(
+        level = level,
+        weight = if (level == CanonicalConstraintLevel.SOFT) value.exactLong("weight") else null,
+    ).also(CanonicalConstraintStrengthDraft::requireValid)
+}
+
+private fun JsonObject.requireKindMetadataKeys(kind: ItemKind) {
+    fun rejectUnless(expected: ItemKind, vararg keys: String) {
+        require(kind == expected || keys.none(::containsKey)) {
+            "${keys.joinToString()} metadata is only valid for ${expected.name.lowercase()} items"
+        }
+    }
+    rejectUnless(ItemKind.EVENT, "calendar_event", "calendar_context", "dayweave_firm_block")
+    rejectUnless(ItemKind.HABIT, "habit_target", "preserves_streak_when_paused")
+    rejectUnless(ItemKind.ROUTINE, "routine_ordered")
+    rejectUnless(ItemKind.GOAL, "goal_measures", "goal_weekly_allocation")
+    rejectUnless(
+        ItemKind.BREAK,
+        "break_category",
+        "break_mandatory",
+        "break_prompt_to_resume",
+    )
+}
+
+private fun JsonElement.exactArrayString(description: String): String =
+    (this as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+        ?: throw IllegalArgumentException("$description must be a string")
+
+private fun JsonObject.arrayOrEmpty(key: String): JsonArray = when (val value = this[key]) {
+    null -> JsonArray(emptyList())
+    is JsonArray -> value
+    else -> throw IllegalArgumentException("$key must be an array")
+}
+
+private fun JsonObject.arrayWhenPresent(key: String): JsonArray? = when (val value = this[key]) {
+    null -> null
+    is JsonArray -> value
+    else -> throw IllegalArgumentException("$key must be an array")
+}
+
+/** A defaulted concrete Rust field may be omitted, but cannot be explicitly null. */
+private fun JsonObject.objectWhenPresent(key: String): JsonObject? = when (val value = this[key]) {
+    null -> null
+    is JsonObject -> value
+    else -> throw IllegalArgumentException("$key must be an object")
+}
+
+/** A Rust `Option<T>` accepts both an omitted key and explicit JSON null. */
+private fun JsonObject.nullableObject(key: String): JsonObject? = when (val value = this[key]) {
+    null, JsonNull -> null
+    is JsonObject -> value
+    else -> throw IllegalArgumentException("$key must be an object or null")
+}
+
+private fun JsonObject.nullableString(key: String): String? = when (val value = this[key]) {
+    null, JsonNull -> null
+    else -> (value as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+        ?: throw IllegalArgumentException("$key must be a string or null")
+}
+
+private fun JsonObject.nullableInt(key: String): Int? = when (val value = this[key]) {
+    null, JsonNull -> null
+    else -> (value as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull
+        ?: throw IllegalArgumentException("$key must be an integer or null")
+}
+
+private fun JsonObject.defaultLong(key: String, default: Long): Long = when (val value = this[key]) {
+    null -> default
+    else -> (value as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.longOrNull
+        ?: throw IllegalArgumentException("$key must be an integer")
+}
+
+private fun JsonObject.defaultBoolean(key: String, default: Boolean): Boolean =
+    if (containsKey(key)) exactBoolean(key) else default
 
 private fun JsonObject.exactString(key: String): String =
     (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.content
@@ -692,6 +1757,42 @@ private fun JsonObject.exactString(key: String): String =
 private fun JsonObject.exactBoolean(key: String): Boolean =
     (this[key] as? JsonPrimitive)?.takeUnless { it.isString }?.booleanOrNull
         ?: throw IllegalArgumentException("$key must be a Boolean")
+
+private fun JsonObject.optionalBoolean(key: String): Boolean? = when (this[key]) {
+    null -> null
+    else -> exactBoolean(key)
+}
+
+private fun JsonObject.exactObject(key: String): JsonObject = this[key] as? JsonObject
+    ?: throw IllegalArgumentException("$key must be an object")
+
+private fun JsonObject.requireOnlyKeys(vararg keys: String) {
+    require(this.keys.all { it in keys }) { "Object contains unsupported fields" }
+}
+
+private fun JsonObject.exactWeekdays(key: String): List<CanonicalWeekday> =
+    (this[key] as? JsonArray)?.map { element ->
+        val value = (element as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+            ?: throw IllegalArgumentException("$key must contain weekday strings")
+        CanonicalWeekday.entries.singleOrNull { it.wireValue == value }
+            ?: throw IllegalArgumentException("Unsupported recurrence weekday")
+    } ?: throw IllegalArgumentException("$key must be an array")
+
+private fun <T> JsonObject.exactEnum(
+    key: String,
+    values: Iterable<T>,
+    wireValue: (T) -> String,
+): T {
+    val value = exactString(key)
+    return values.singleOrNull { wireValue(it) == value }
+        ?: throw IllegalArgumentException("Unsupported $key")
+}
+
+private fun JsonObject.optionalExactString(key: String): String? = when (val value = this[key]) {
+    null, JsonNull -> null
+    else -> (value as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+        ?: throw IllegalArgumentException("$key must be a string or null")
+}
 
 private fun JsonObject.exactInt(key: String): Int = optionalInt(key)
     ?: throw IllegalArgumentException("$key must be an integer")
@@ -710,6 +1811,12 @@ private fun JsonObject.exactLong(key: String): Long {
         ?: throw IllegalArgumentException("$key must be an integer")
 }
 
+private fun JsonObject.optionalExactLong(key: String): Long? = when (val value = this[key]) {
+    null, JsonNull -> null
+    else -> (value as? JsonPrimitive)?.takeUnless { it.isString }?.longOrNull
+        ?: throw IllegalArgumentException("$key must be an integer or null")
+}
+
 internal fun requireCanonicalUuid(value: String, description: String) {
     val parsed = runCatching { UUID.fromString(value) }.getOrNull()
     require(parsed != null && parsed != UUID(0L, 0L) && parsed.toString() == value) {
@@ -717,13 +1824,65 @@ internal fun requireCanonicalUuid(value: String, description: String) {
     }
 }
 
+private fun requireNonNilUuid(value: String, description: String): UUID {
+    val parsed = runCatching { UUID.fromString(value) }.getOrNull()
+    require(UUID_PATTERN.matches(value) && parsed != null && parsed != UUID(0L, 0L)) {
+        "Invalid $description identifier"
+    }
+    return parsed
+}
+
 internal fun requireCanonicalInstant(value: String, description: String): Instant {
-    val instant = Instant.parse(value)
+    val match = RFC3339_INSTANT_PATTERN.matchEntire(value)
+    require(match != null) {
+        "$description must be a strict RFC 3339 instant"
+    }
+    val groups = match.groupValues
+    val fraction = groups[3]
+    val normalizedLocal = buildString {
+        append(groups[1])
+        append('T')
+        append(groups[2])
+        if (fraction.isNotEmpty()) {
+            append('.')
+            append(fraction.take(9))
+        }
+    }
+    val local = runCatching { LocalDateTime.parse(normalizedLocal) }.getOrElse {
+        throw IllegalArgumentException("$description must be a strict RFC 3339 instant", it)
+    }
+    require(local.year in 1..9_999) { "$description has an unsupported RFC 3339 year" }
+    val offsetSeconds = if (groups[4] == "Z") {
+        0L
+    } else {
+        val offsetHours = groups[7].toInt()
+        val offsetMinutes = groups[8].toInt()
+        require(
+            offsetMinutes <= 59 &&
+                (offsetHours < 18 || offsetHours == 18 && offsetMinutes == 0),
+        ) {
+            "$description has an invalid RFC 3339 offset"
+        }
+        (offsetHours * 60L + offsetMinutes) * 60L * if (groups[6] == "-") -1L else 1L
+    }
+    val instant = runCatching {
+        local.toInstant(ZoneOffset.UTC).minusSeconds(offsetSeconds)
+    }.getOrElse {
+        throw IllegalArgumentException("$description is outside the supported instant range", it)
+    }
     require(instant.nano % 1_000 == 0) {
         "$description must use PostgreSQL microsecond precision"
     }
     return instant
 }
+
+private val UUID_PATTERN =
+    "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+        .toRegex()
+
+private val RFC3339_INSTANT_PATTERN =
+    ("^(\\d{4}-\\d{2}-\\d{2})T(\\d{2}:\\d{2}:\\d{2})" +
+        "(?:\\.(\\d{1,9}))?((Z)|([+-])(\\d{2}):(\\d{2}))$").toRegex()
 
 /**
  * Android's `ZoneId` parser also accepts fixed offsets and Java-only legacy identifiers that the

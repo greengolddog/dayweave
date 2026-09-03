@@ -5,6 +5,7 @@ import com.greengolddog.dayweave.model.CanonicalAuthoringOperation
 import com.greengolddog.dayweave.model.CanonicalDraftPlacement
 import com.greengolddog.dayweave.model.CanonicalItemDraft
 import com.greengolddog.dayweave.model.CanonicalItemSnapshot
+import com.greengolddog.dayweave.model.CanonicalRecurrenceKind
 import com.greengolddog.dayweave.model.DayWeaveUiState
 import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
@@ -49,7 +50,12 @@ internal data class CanonicalAuthoringRow(
     val isReadOnly: Boolean,
     val hasMissingParent: Boolean,
     val hasHierarchyCycle: Boolean,
-)
+) {
+    /** Opaque metadata blocks replacement, but a stable unfenced canonical row remains trashable. */
+    val canTrash: Boolean
+        get() = source == CanonicalAuthoringRowSource.CANONICAL && mutationId == null &&
+            syncState == CanonicalAuthoringSyncState.SYNCED
+}
 
 internal data class CanonicalAuthoringPresentation(
     val inbox: List<CanonicalAuthoringRow>,
@@ -229,6 +235,7 @@ private data class AuthoringNode(
     val draft: CanonicalItemDraft?,
     val revision: Long?,
     val unsupported: Boolean,
+    val unsupportedDiagnostic: String?,
 ) {
     fun toRow(
         depth: Int,
@@ -258,7 +265,7 @@ private data class AuthoringNode(
             source = source,
             syncState = mutation?.syncState() ?: CanonicalAuthoringSyncState.SYNCED,
             mutationId = mutation?.id,
-            diagnostic = mutation?.diagnostic,
+            diagnostic = mutation?.diagnostic ?: unsupportedDiagnostic,
             draft = draft,
             revision = revision,
             isReadOnly = unsupported || mutation?.isSubmitted == true ||
@@ -279,7 +286,12 @@ private data class AuthoringNode(
                 mutation.operation == CanonicalAuthoringOperation.CREATE ||
                     mutation.operation == CanonicalAuthoringOperation.REPLACE
             }
-            val decoded = pendingDraft ?: runCatching(item::toCanonicalDraft).getOrNull()
+            val decodedAttempt = if (pendingDraft == null) {
+                runCatching(item::toCanonicalDraft)
+            } else {
+                Result.success(pendingDraft)
+            }
+            val decoded = decodedAttempt.getOrNull()
             return AuthoringNode(
                 itemId = item.id,
                 title = decoded?.title ?: item.title,
@@ -292,7 +304,17 @@ private data class AuthoringNode(
                 mutation = mutation,
                 draft = decoded,
                 revision = item.revision,
-                unsupported = decoded == null,
+                unsupported = decoded == null ||
+                    decoded.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM,
+                unsupportedDiagnostic = if (
+                    decoded?.recurrence?.kind == CanonicalRecurrenceKind.CUSTOM
+                ) {
+                    "Custom RRULE recurrence is retained but read-only until bounded expansion is available."
+                } else {
+                    decodedAttempt.exceptionOrNull()?.message
+                        ?.takeIf(String::isNotBlank)
+                        ?: if (decoded == null) "This scheduling metadata is read-only." else null
+                },
             )
         }
 
@@ -312,6 +334,7 @@ private data class AuthoringNode(
             draft = draft,
             revision = null,
             unsupported = false,
+            unsupportedDiagnostic = null,
         )
     }
 }
