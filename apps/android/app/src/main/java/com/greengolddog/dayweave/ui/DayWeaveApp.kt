@@ -56,10 +56,13 @@ import androidx.compose.ui.unit.dp
 import com.greengolddog.dayweave.model.AppDestination
 import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.MoveLaterPlacementMode
+import com.greengolddog.dayweave.model.OnboardingFirstItemCheck
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.GoogleSchedulePublicationStage
 import com.greengolddog.dayweave.model.assessMoveLater
 import com.greengolddog.dayweave.model.authoritativeTimedBreakNotificationIdentity
+import com.greengolddog.dayweave.model.toCanonicalDraft
+import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationPresentationDecision
 import com.greengolddog.dayweave.notifications.TimedBreakNotificationSystemState
 import com.greengolddog.dayweave.notifications.TimedBreakReminderEnableAction
@@ -71,6 +74,10 @@ import com.greengolddog.dayweave.notifications.timedBreakNotificationPresentatio
 import com.greengolddog.dayweave.notifications.timedBreakNotificationRouteStateAvailable
 import com.greengolddog.dayweave.notifications.timedBreakReminderEnableAction
 import com.greengolddog.dayweave.notifications.reconcileTimedBreakNotificationAuthorization
+import com.greengolddog.dayweave.onboarding.OnboardingController
+import com.greengolddog.dayweave.onboarding.OnboardingControllerState
+import com.greengolddog.dayweave.onboarding.OnboardingRuntimePrivacyState
+import com.greengolddog.dayweave.onboarding.OnboardingStep
 import com.greengolddog.dayweave.health.EnergyProviderAvailability
 import com.greengolddog.dayweave.health.HealthConnectIntents
 import com.greengolddog.dayweave.security.AppLockController
@@ -78,6 +85,7 @@ import com.greengolddog.dayweave.security.AppLockState
 import com.greengolddog.dayweave.security.AppLockTimeout
 import com.greengolddog.dayweave.state.DayWeaveViewModel
 import com.greengolddog.dayweave.state.PlannerLoadState
+import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdatePhase
 import com.greengolddog.dayweave.ui.components.ActiveSessionBar
 import com.greengolddog.dayweave.ui.components.ApiConnectionDialog
 import com.greengolddog.dayweave.ui.components.AppLockedScreen
@@ -100,15 +108,31 @@ import com.greengolddog.dayweave.ui.screens.AssistantScreen
 import com.greengolddog.dayweave.ui.screens.CalendarScreen
 import com.greengolddog.dayweave.ui.screens.InboxScreen
 import com.greengolddog.dayweave.ui.screens.MoreScreen
+import com.greengolddog.dayweave.ui.screens.PlanningProfileEditorDialog
+import com.greengolddog.dayweave.ui.screens.planningProfileEditBlockedMessage
 import com.greengolddog.dayweave.ui.screens.TodayScreen
+import com.greengolddog.dayweave.ui.onboarding.DayWeaveOnboardingShell
+import com.greengolddog.dayweave.ui.onboarding.OnboardingCallbacks
+import com.greengolddog.dayweave.ui.onboarding.OnboardingCheckState
+import com.greengolddog.dayweave.ui.onboarding.OnboardingReadiness
+import com.greengolddog.dayweave.ui.onboarding.OnboardingRecoveryUiState
+import com.greengolddog.dayweave.ui.onboarding.OnboardingUiState
+import com.greengolddog.dayweave.ui.onboarding.apiOnboardingCheck
+import com.greengolddog.dayweave.ui.onboarding.firstItemOnboardingCheck
+import com.greengolddog.dayweave.ui.onboarding.firstPlanOnboardingCheck
+import com.greengolddog.dayweave.ui.onboarding.googleOnboardingCheck
+import com.greengolddog.dayweave.ui.onboarding.profileOnboardingCheck
 import com.greengolddog.dayweave.ui.theme.DayWeaveTheme
 import com.greengolddog.dayweave.sync.SuggestionSyncPhase
 import com.greengolddog.dayweave.sync.CanonicalSyncPhase
 import com.greengolddog.dayweave.sync.GoogleAccountSummary
+import com.greengolddog.dayweave.sync.GoogleAccountPhase
+import com.greengolddog.dayweave.sync.GoogleCalendarImportPhase
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundPhase
 import com.greengolddog.dayweave.sync.GoogleCalendarOutboundTargetOption
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationPhase
 import com.greengolddog.dayweave.sync.GoogleSchedulePublicationTargetOption
+import com.greengolddog.dayweave.network.DeviceAuthPhase
 import java.time.Instant
 import java.time.ZoneId
 import kotlinx.coroutines.CancellationException
@@ -116,6 +140,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.flow.StateFlow
 
 @Composable
 fun DayWeaveApp(
@@ -125,6 +150,12 @@ fun DayWeaveApp(
     onSetAppLockTimeout: (AppLockTimeout) -> Unit,
     onLockNow: () -> Unit,
     onOpenDeviceSecuritySettings: () -> Unit,
+    onboardingController: OnboardingController,
+    onboardingRuntimePrivacyState: StateFlow<OnboardingRuntimePrivacyState>,
+    onAcknowledgeOnboardingPrivacy: () -> Boolean,
+    onRecoverOnboardingCheckpoint: (
+        com.greengolddog.dayweave.onboarding.OnboardingCorruptArtifactIdentity,
+    ) -> Boolean,
     timedBreakNotificationRouteDigest: String? = null,
     onTimedBreakNotificationRouteConsumed: (String) -> Boolean = { true },
     onRequestTimedBreakNotificationPermission: () -> Unit = {},
@@ -133,6 +164,9 @@ fun DayWeaveApp(
     onEnableTimedBreakReminders: () -> Unit = {},
 ) {
     val appLockState by appLockController.state.collectAsStateWithLifecycle()
+    val onboardingState = onboardingController.states.collectAsStateWithLifecycle().value
+    val runtimePrivacyState =
+        onboardingRuntimePrivacyState.collectAsStateWithLifecycle().value
     AppLockPresentationGate(
         appLockState = appLockState,
         lockedContent = {
@@ -145,21 +179,155 @@ fun DayWeaveApp(
             }
         },
         unlockedContent = {
-            UnlockedDayWeaveApp(
-                appLockState = appLockState,
-                onSetAppLockEnabled = onSetAppLockEnabled,
-                onSetAppLockTimeout = onSetAppLockTimeout,
-                onLockNow = onLockNow,
-                onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
-                timedBreakNotificationRouteDigest = timedBreakNotificationRouteDigest,
-                onTimedBreakNotificationRouteConsumed = onTimedBreakNotificationRouteConsumed,
-                onRequestTimedBreakNotificationPermission =
-                    onRequestTimedBreakNotificationPermission,
-                timedBreakNotificationSystemState = timedBreakNotificationSystemState,
-                onEnableTimedBreakReminders = onEnableTimedBreakReminders,
-            )
+            val setup = onboardingState
+            when {
+                setup is OnboardingControllerState.RecoveryRequired -> {
+                    OpaqueOnboardingPresentation(
+                        state = OnboardingUiState(
+                            recovery = OnboardingRecoveryUiState.CORRUPT,
+                        ),
+                        callbacks = OnboardingCallbacks(
+                            onResetProgressAfterWarning = {
+                                onRecoverOnboardingCheckpoint(setup.artifactIdentity)
+                            },
+                        ),
+                    )
+                }
+                setup is OnboardingControllerState.Active && !setup.privacyAcknowledged -> {
+                    OpaqueOnboardingPresentation(
+                        state = OnboardingUiState(
+                            step = OnboardingStep.WELCOME,
+                            privacyAcknowledged = false,
+                        ),
+                        callbacks = OnboardingCallbacks(
+                            onPrivacyAcknowledgementChanged = { acknowledged ->
+                                if (acknowledged) onAcknowledgeOnboardingPrivacy()
+                            },
+                        ),
+                    )
+                }
+                shouldMountPrivatePlannerSubtree(setup, runtimePrivacyState) -> {
+                    UnlockedDayWeaveApp(
+                        appLockState = appLockState,
+                        onSetAppLockEnabled = onSetAppLockEnabled,
+                        onSetAppLockTimeout = onSetAppLockTimeout,
+                        onLockNow = onLockNow,
+                        onOpenDeviceSecuritySettings = onOpenDeviceSecuritySettings,
+                        timedBreakNotificationRouteDigest = timedBreakNotificationRouteDigest,
+                        onTimedBreakNotificationRouteConsumed =
+                            onTimedBreakNotificationRouteConsumed,
+                        onRequestTimedBreakNotificationPermission =
+                            onRequestTimedBreakNotificationPermission,
+                        timedBreakNotificationSystemState = timedBreakNotificationSystemState,
+                        onEnableTimedBreakReminders = onEnableTimedBreakReminders,
+                        onboardingController = onboardingController,
+                    )
+                }
+                setup is OnboardingControllerState.Active -> {
+                    PrivatePresentationWaitingScreen()
+                }
+            }
         },
     )
+}
+
+internal fun shouldMountPrivatePlannerSubtree(
+    setup: OnboardingControllerState?,
+    runtimePrivacyState: OnboardingRuntimePrivacyState?,
+): Boolean = setup is OnboardingControllerState.Active &&
+    setup.privacyAcknowledged &&
+    setup.privacyReleaseCompleted &&
+    runtimePrivacyState?.privatePresentationAllowed == true
+
+internal fun onboardingFirstItemEditorRoute(
+    durableState: com.greengolddog.dayweave.model.DayWeaveUiState?,
+): CanonicalItemEditorRoute? {
+    durableState ?: return CanonicalItemEditorRoute.create()
+    val anchor = durableState.onboardingFirstItemAnchor
+        ?: return CanonicalItemEditorRoute.create()
+    return when (durableState.validatedOnboardingFirstItemCheck()) {
+        OnboardingFirstItemCheck.PENDING_CREATE -> {
+            val mutation = durableState.pendingCanonicalAuthoringMutations.singleOrNull {
+                it.itemId == anchor.itemId &&
+                    it.operation ==
+                    com.greengolddog.dayweave.model.CanonicalAuthoringOperation.CREATE
+            }?.takeUnless { it.isSubmitted } ?: return null
+            CanonicalItemEditorRoute(
+                itemId = anchor.itemId,
+                initialDraft = requireNotNull(mutation.draft),
+                mode = CanonicalItemEditorMode.UPDATE_PENDING,
+                mutationId = mutation.id,
+            )
+        }
+        OnboardingFirstItemCheck.CANONICAL_ITEM -> {
+            val item = durableState.canonicalItems.singleOrNull {
+                it.id == anchor.itemId && it.revision == anchor.canonicalRevision &&
+                    it.deletedAt == null
+            } ?: return null
+            val draft = runCatching {
+                (if (item.status == "scheduled") item.copy(status = "planned") else item)
+                    .toCanonicalDraft()
+            }.getOrNull() ?: return null
+            CanonicalItemEditorRoute(
+                itemId = item.id,
+                initialDraft = draft,
+                mode = CanonicalItemEditorMode.REPLACE,
+            )
+        }
+        null -> CanonicalItemEditorRoute.create()
+    }
+}
+
+/** Re-reads every authoritative flow at the click boundary instead of trusting a Compose frame. */
+private fun DayWeaveViewModel.currentOnboardingReadiness(
+    profileReviewed: Boolean,
+): OnboardingReadiness {
+    val canonical = canonicalSyncState.value
+    val execution = executionSyncState.value
+    val effectiveCanonical = if (
+        execution.phase in setOf(
+            CanonicalSyncPhase.AUTH_REQUIRED,
+            CanonicalSyncPhase.SYNCING,
+            CanonicalSyncPhase.OFFLINE,
+            CanonicalSyncPhase.ERROR,
+        )
+    ) {
+        canonical.copy(phase = execution.phase, message = execution.message)
+    } else {
+        canonical
+    }
+    return OnboardingReadiness(
+        api = apiOnboardingCheck(deviceAuthState.value, effectiveCanonical),
+        google = googleOnboardingCheck(
+            googleAccountState.value,
+            googleCalendarImportState.value,
+        ),
+        profile = profileOnboardingCheck(
+            current = state.value,
+            durable = durableState.value,
+            update = scheduleCompositionProfileUpdateState.value,
+            profileReviewed = profileReviewed,
+        ),
+        firstItem = firstItemOnboardingCheck(durableState.value),
+        firstPlan = firstPlanOnboardingCheck(durableState.value),
+    )
+}
+
+@Composable
+private fun OpaqueOnboardingPresentation(
+    state: OnboardingUiState,
+    callbacks: OnboardingCallbacks,
+) {
+    DayWeaveTheme(useDynamicColor = false) {
+        DayWeaveOnboardingShell(state = state, callbacks = callbacks)
+    }
+}
+
+@Composable
+private fun PrivatePresentationWaitingScreen() {
+    DayWeaveTheme(useDynamicColor = false) {
+        PlannerRestoreScreen(message = "Securing your private workspace…")
+    }
 }
 
 /** Keeps every unlocked subtree, including any open Dialog window, below one lock boundary. */
@@ -184,6 +352,7 @@ private fun UnlockedDayWeaveApp(
     onRequestTimedBreakNotificationPermission: () -> Unit,
     timedBreakNotificationSystemState: TimedBreakNotificationSystemState,
     onEnableTimedBreakReminders: () -> Unit,
+    onboardingController: OnboardingController,
     viewModel: DayWeaveViewModel = viewModel(),
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -205,6 +374,7 @@ private fun UnlockedDayWeaveApp(
                     onRequestTimedBreakNotificationPermission,
                 timedBreakNotificationSystemState = timedBreakNotificationSystemState,
                 onEnableTimedBreakReminders = onEnableTimedBreakReminders,
+                onboardingController = onboardingController,
             )
             PlannerLoadState.PERSISTENCE_FAILED -> PlannerPersistenceFailureScreen()
         }
@@ -212,7 +382,7 @@ private fun UnlockedDayWeaveApp(
 }
 
 @Composable
-private fun PlannerRestoreScreen() {
+private fun PlannerRestoreScreen(message: String = "Opening your encrypted plan…") {
     Column(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -220,7 +390,7 @@ private fun PlannerRestoreScreen() {
     ) {
         CircularProgressIndicator()
         Text(
-            text = "Opening your encrypted plan…",
+            text = message,
             modifier = Modifier.padding(top = 16.dp),
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -259,6 +429,7 @@ private fun DayWeaveRoot(
     onRequestTimedBreakNotificationPermission: () -> Unit,
     timedBreakNotificationSystemState: TimedBreakNotificationSystemState,
     onEnableTimedBreakReminders: () -> Unit,
+    onboardingController: OnboardingController,
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -325,6 +496,7 @@ private fun DayWeaveRoot(
     var showPauseChooser by remember { mutableStateOf(false) }
     var moveLaterTargetId by remember { mutableStateOf<String?>(null) }
     var showApiConnection by remember { mutableStateOf(false) }
+    var showOnboardingProfileEditor by remember { mutableStateOf(false) }
     var editingSuggestion by remember { mutableStateOf<PlanningSuggestion?>(null) }
     var disconnectingGoogleAccount by remember { mutableStateOf<GoogleAccountSummary?>(null) }
     var googlePublicationReview by remember {
@@ -356,6 +528,26 @@ private fun DayWeaveRoot(
         nowEpochMillis = System.currentTimeMillis(),
         sdkInt = Build.VERSION.SDK_INT,
         systemState = timedBreakNotificationSystemState,
+    )
+    val observedOnboardingState =
+        onboardingController.states.collectAsStateWithLifecycle().value
+    val activeOnboardingState = (observedOnboardingState as? OnboardingControllerState.Active)
+        ?.takeIf { !it.completed && !it.setupDeferredForSession }
+    val deferredOnboardingState = (observedOnboardingState as? OnboardingControllerState.Active)
+        ?.takeIf { !it.completed && it.setupDeferredForSession }
+    val onboardingReadiness = OnboardingReadiness(
+        api = apiOnboardingCheck(deviceAuthState, effectiveCanonicalSyncState),
+        google = googleOnboardingCheck(googleAccountState, googleCalendarImportState),
+        profile = profileOnboardingCheck(
+            current = state,
+            durable = durableState,
+            update = scheduleCompositionProfileUpdateState,
+            profileReviewed =
+                (observedOnboardingState as? OnboardingControllerState.Active)
+                    ?.profileReviewed == true,
+        ),
+        firstItem = firstItemOnboardingCheck(durableState),
+        firstPlan = firstPlanOnboardingCheck(durableState),
     )
     val plannerClockZone = ZoneId.systemDefault()
     val plannerClockReference = Instant.ofEpochMilli(plannerClockMillis)
@@ -461,7 +653,72 @@ private fun DayWeaveRoot(
         }
     }
 
-    Scaffold(
+    LaunchedEffect(
+        scheduleCompositionProfileUpdateState.phase,
+        showOnboardingProfileEditor,
+    ) {
+        if (
+            showOnboardingProfileEditor &&
+            scheduleCompositionProfileUpdateState.phase ==
+            ScheduleCompositionProfileUpdatePhase.SAVED &&
+            onboardingController.markProfileReviewed()
+        ) {
+            showOnboardingProfileEditor = false
+            viewModel.acknowledgeScheduleCompositionProfileUpdate()
+        }
+    }
+
+    if (activeOnboardingState != null) {
+        val onboardingUiState = OnboardingUiState(
+            step = activeOnboardingState.currentStep,
+            privacyAcknowledged = true,
+            readiness = onboardingReadiness,
+        )
+        DayWeaveOnboardingShell(
+            state = onboardingUiState,
+            callbacks = OnboardingCallbacks(
+                onConnectThisPhone = { showApiConnection = true },
+                onChooseGoogleResources = {
+                    viewModel.navigate(AppDestination.MORE)
+                    onboardingController.deferSetupForSession()
+                },
+                onReviewWeekProfile = { showOnboardingProfileEditor = true },
+                onOpenNotificationSettings = onEnableTimedBreakReminders,
+                onCreateFirstItem = {
+                    canonicalEditorRoute = onboardingFirstItemEditorRoute(durableState)
+                    if (canonicalEditorRoute == null) viewModel.recompose()
+                },
+                onComposeFirstPlan = viewModel::recompose,
+                onBack = { onboardingController.back() },
+                onSetUpLater = { onboardingController.deferSetupForSession() },
+                onContinue = {
+                    val current = onboardingController.state as?
+                        OnboardingControllerState.Active
+                    if (current != null) {
+                        val currentReadiness = viewModel.currentOnboardingReadiness(
+                            profileReviewed = current.profileReviewed,
+                        )
+                        val prerequisiteReady = current.currentStep == OnboardingStep.WELCOME ||
+                            currentReadiness.checkFor(current.currentStep) ==
+                            OnboardingCheckState.READY
+                        onboardingController.advance(prerequisiteReady)
+                    }
+                },
+                onFinish = {
+                    val current = onboardingController.state as?
+                        OnboardingControllerState.Active
+                    if (current != null) {
+                        onboardingController.complete(
+                            viewModel.currentOnboardingReadiness(
+                                profileReviewed = current.profileReviewed,
+                            ).allReady,
+                        )
+                    }
+                },
+            ),
+        )
+    } else {
+        Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background,
         topBar = {
@@ -531,6 +788,34 @@ private fun DayWeaveRoot(
         },
         bottomBar = {
             Column {
+                if (deferredOnboardingState != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    "Finish setting up DayWeave",
+                                    style = MaterialTheme.typography.titleSmall,
+                                )
+                                Text(
+                                    "Your private workspace is available; guided setup will " +
+                                        "resume at the same step.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            TextButton(onClick = { onboardingController.resumeSetup() }) {
+                                Text("Resume")
+                            }
+                        }
+                    }
+                }
                 if (timedBreakReminderEnableAction != TimedBreakReminderEnableAction.NONE) {
                     Surface(
                         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -712,8 +997,8 @@ private fun DayWeaveRoot(
                 }
             }
         },
-    ) { innerPadding ->
-        when (state.destination) {
+        ) { innerPadding ->
+            when (state.destination) {
             AppDestination.TODAY -> TodayScreen(
                 state = state,
                 syncState = effectiveCanonicalSyncState,
@@ -886,7 +1171,26 @@ private fun DayWeaveRoot(
                 onSetCanonicalItemSensitive = viewModel::setCanonicalItemSensitive,
                 modifier = Modifier.padding(innerPadding),
             )
+            }
         }
+    }
+
+    if (showOnboardingProfileEditor) {
+        PlanningProfileEditorDialog(
+            currentProfile = state.scheduleCompositionProfile,
+            editBlockedMessage = planningProfileEditBlockedMessage(
+                state = state,
+                canonicalActionBusy = effectiveCanonicalSyncState.isBusy,
+            ),
+            updateState = scheduleCompositionProfileUpdateState,
+            onSave = viewModel::updateScheduleCompositionProfile,
+            onDismiss = {
+                if (!scheduleCompositionProfileUpdateState.isSaving) {
+                    showOnboardingProfileEditor = false
+                    viewModel.acknowledgeScheduleCompositionProfileUpdate()
+                }
+            },
+        )
     }
 
     if (showQuickCapture) {
@@ -912,7 +1216,13 @@ private fun DayWeaveRoot(
                 val saved = when (route.mode) {
                     CanonicalItemEditorMode.CREATE -> route.sourceInboxId?.let { inboxId ->
                         viewModel.convertInboxDraft(inboxId, route.itemId, draft)
-                    } ?: viewModel.createCanonicalItem(route.itemId, draft)
+                    } ?: if (
+                        activeOnboardingState?.currentStep == OnboardingStep.FIRST_ITEM
+                    ) {
+                        viewModel.createOnboardingFirstItem(route.itemId, draft)
+                    } else {
+                        viewModel.createCanonicalItem(route.itemId, draft)
+                    }
                     CanonicalItemEditorMode.REPLACE ->
                         viewModel.replaceCanonicalItem(route.itemId, draft)
                     CanonicalItemEditorMode.UPDATE_PENDING ->

@@ -507,16 +507,22 @@ class GoogleCalendarOutboundCoordinator(
         }
 
     suspend fun discardExpiredRecovery(): Boolean {
+        val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
         return operationMutex.withLock {
-            val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
-                ?: return@withLock true
-            if (!plannerStore.discardExpiredGoogleCalendarOutbound(journal, now())) {
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
                 return@withLock false
             }
-            synchronized(presentationMonitor) {
-                mutableState.value = initialState()
+            val journal = plannerStore.durableState.value?.pendingGoogleCalendarOutbound
+                ?: return@withLock true
+            val currentTime = now()
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                return@withLock false
             }
+            if (!plannerStore.discardExpiredGoogleCalendarOutbound(journal, currentTime)) {
+                return@withLock false
+            }
+            setState(lifecycle, initialState())
             true
         }
     }

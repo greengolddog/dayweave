@@ -85,13 +85,31 @@ class SuggestionWorkRequestTest {
         assertTrue(result.outputData.keyValueMap.isEmpty())
     }
 
+    @Test
+    fun oldQueuedWorkerIsASuccessfulNoOpBeforePrivacyAcknowledgement() = runBlocking {
+        var refreshCalls = 0
+        val worker = worker(workAllowed = false) {
+            refreshCalls += 1
+            SuggestionRefreshOutcome.SUCCESS
+        }
+
+        assertEquals(ListenableWorker.Result.success(), worker.doWork())
+        assertEquals(0, refreshCalls)
+    }
+
     private fun worker(
+        workAllowed: Boolean = true,
         refresh: suspend () -> SuggestionRefreshOutcome,
     ): SuggestionRefreshWorker {
         val context = RuntimeEnvironment.getApplication()
         return TestListenableWorkerBuilder
             .from(context, SuggestionRefreshWorker::class.java)
-            .setWorkerFactory(RefreshWorkerFactory(refresh))
+            .setWorkerFactory(
+                RefreshWorkerFactory(
+                    workAllowed = workAllowed,
+                    refresh = refresh,
+                ),
+            )
             .build()
     }
 }
@@ -105,7 +123,7 @@ class SuggestionWorkManagerPolicyTest {
     }
 
     @Test
-    fun realUniqueWorkKeepsStartupReplacesConfigurationAndAwaitsCancellation() = runBlocking {
+    fun realUniqueWorkReplacesEveryImmediateGenerationAndAwaitsCancellation() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val workerStarted = CompletableDeferred<Unit>()
         val keepWorkerRunning = CompletableDeferred<Unit>()
@@ -138,19 +156,18 @@ class SuggestionWorkManagerPolicyTest {
         )
 
         backend.enqueueStartupRefresh(SuggestionSyncWorkPolicy())
-        assertEquals(
-            firstId,
-            activeWork(workManager, WorkManagerSuggestionSyncBackend.IMMEDIATE_WORK_NAME)
-                .single()
-                .id,
-        )
+        val startupReplacement = activeWork(
+            workManager,
+            WorkManagerSuggestionSyncBackend.IMMEDIATE_WORK_NAME,
+        ).single()
+        assertTrue(startupReplacement.id != firstId)
 
         backend.replaceConfigurationRefresh(SuggestionSyncWorkPolicy())
         val replacement = activeWork(
             workManager,
             WorkManagerSuggestionSyncBackend.IMMEDIATE_WORK_NAME,
         ).single()
-        assertTrue(replacement.id != firstId)
+        assertTrue(replacement.id != startupReplacement.id)
 
         backend.cancelAllAndAwait()
         assertTrue(
@@ -166,6 +183,7 @@ class SuggestionWorkManagerPolicyTest {
 }
 
 private class RefreshWorkerFactory(
+    private val workAllowed: Boolean = true,
     private val refresh: suspend () -> SuggestionRefreshOutcome,
 ) : WorkerFactory() {
     override fun createWorker(
@@ -173,7 +191,12 @@ private class RefreshWorkerFactory(
         workerClassName: String,
         workerParameters: WorkerParameters,
     ): ListenableWorker? = if (workerClassName == SuggestionRefreshWorker::class.java.name) {
-        SuggestionRefreshWorker(appContext, workerParameters, refresh)
+        SuggestionRefreshWorker(
+            appContext = appContext,
+            workerParameters = workerParameters,
+            refresh = refresh,
+            workAllowed = { workAllowed },
+        )
     } else {
         null
     }

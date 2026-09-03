@@ -29,6 +29,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flowOf
@@ -188,6 +189,47 @@ class TimedBreakNotificationsTest {
             assertEquals(2, backend.ensures)
             assertEquals(1, backend.cancels)
         }
+
+    @Test
+    fun consentReleaseAwaitsStaleCancellationAndForcesSameDigestReconciliation() = runBlocking {
+        val backend = AwaitedCancelBackend()
+        val coordinator = TimedBreakNotificationCoordinator(backend)
+        val state = timedBreakState()
+        assertTrue(coordinator.reconcile(state))
+
+        val cancellation = async(Dispatchers.Default) {
+            coordinator.cancelBeforeConsentRelease()
+        }
+        withTimeout(3_000) { backend.cancelEntered.await() }
+        assertFalse(cancellation.isCompleted)
+
+        // A bootstrap reconcile racing the barrier waits on the same coordinator mutex. Once the
+        // stale exact-tag work is gone, the old digest is deliberately not treated as memoized.
+        val reconciliation = async(start = CoroutineStart.UNDISPATCHED) {
+            coordinator.reconcile(state)
+        }
+        assertFalse(reconciliation.isCompleted)
+
+        backend.allowCancel.complete(Unit)
+        assertTrue(withTimeout(3_000) { cancellation.await() })
+        assertTrue(withTimeout(3_000) { reconciliation.await() })
+        assertEquals(2, backend.ensures)
+        assertEquals(1, backend.cancels)
+    }
+
+    @Test
+    fun failedConsentReleaseCancellationStillInvalidatesMemoizedDigest() = runBlocking {
+        val backend = RecordingBackend(failCancelAttempts = 1)
+        val coordinator = TimedBreakNotificationCoordinator(backend)
+        val state = timedBreakState()
+        assertTrue(coordinator.reconcile(state))
+
+        assertFalse(coordinator.cancelBeforeConsentRelease())
+        assertTrue(coordinator.reconcile(state))
+
+        assertEquals(2, backend.ensures.size)
+        assertEquals(1, backend.fullCancels)
+    }
 
     @Test
     fun partialCancellationFailureInvalidatesMemoSoUnchangedDigestIsReenqueued() = runBlocking {
@@ -452,6 +494,21 @@ class TimedBreakNotificationsTest {
                 runAttemptCount = 0,
             ) { error("invalid input must not reach delivery") }.doWork(),
         )
+    }
+
+    @Test
+    fun oldQueuedWorkerCannotReadOrNotifyBeforePrivacyAcknowledgement() = runBlocking {
+        var deliveryCalls = 0
+        val result = worker(
+            runAttemptCount = 0,
+            workAllowed = false,
+        ) {
+            deliveryCalls += 1
+            TimedBreakDeliveryCompletion.SUCCESS
+        }.doWork()
+
+        assertEquals(ListenableWorker.Result.success(), result)
+        assertEquals(0, deliveryCalls)
     }
 
     @Test
@@ -1161,6 +1218,7 @@ class TimedBreakNotificationsTest {
     private fun worker(
         digest: String = DIGEST_A,
         runAttemptCount: Int,
+        workAllowed: Boolean = true,
         delivery: suspend (String) -> TimedBreakDeliveryCompletion,
     ): TimedBreakEndedWorker {
         val context = RuntimeEnvironment.getApplication() as Context
@@ -1172,7 +1230,12 @@ class TimedBreakNotificationsTest {
                     .build(),
             )
             .setRunAttemptCount(runAttemptCount)
-            .setWorkerFactory(TimedBreakWorkerFactory(delivery))
+            .setWorkerFactory(
+                TimedBreakWorkerFactory(
+                    workAllowed = workAllowed,
+                    delivery = delivery,
+                ),
+            )
             .build()
     }
 }
@@ -1220,7 +1283,7 @@ class TimedBreakWorkManagerPolicyTest {
     }
 
     @Test
-    fun realTestDriverRunningWorkIsCancelledAndAwaited() = runBlocking {
+    fun consentBarrierCancelsRunningExactWorkSoItCannotSuppressFreshEnsure() = runBlocking {
         val context = RuntimeEnvironment.getApplication() as Context
         val workerStarted = CompletableDeferred<Unit>()
         val keepWorkerRunning = CompletableDeferred<Unit>()
@@ -1250,10 +1313,15 @@ class TimedBreakWorkManagerPolicyTest {
             requireNotNull(workManager.getWorkInfoById(work.id).get()).state,
         )
 
-        backend.cancelWorkAndNotification()
+        backend.cancelStaleWorkBeforeConsentRelease()
 
         assertTrue(activeTimedBreakWork(workManager).isEmpty())
+        backend.ensure(identity, clearDisplayedBeforeSchedule = true)
+        val replacement = activeTimedBreakWork(workManager).single()
+        assertNotEquals(work.id, replacement.id)
+
         keepWorkerRunning.complete(Unit)
+        backend.cancelWorkAndNotification()
         Unit
     }
 
@@ -1264,6 +1332,7 @@ class TimedBreakWorkManagerPolicyTest {
 }
 
 private class TimedBreakWorkerFactory(
+    private val workAllowed: Boolean = true,
     private val delivery: suspend (String) -> TimedBreakDeliveryCompletion,
 ) : WorkerFactory() {
     override fun createWorker(
@@ -1271,7 +1340,12 @@ private class TimedBreakWorkerFactory(
         workerClassName: String,
         workerParameters: WorkerParameters,
     ): ListenableWorker? = if (workerClassName == TimedBreakEndedWorker::class.java.name) {
-        TimedBreakEndedWorker(appContext, workerParameters, delivery)
+        TimedBreakEndedWorker(
+            appContext = appContext,
+            workerParameters = workerParameters,
+            delivery = delivery,
+            workAllowed = { workAllowed },
+        )
     } else {
         null
     }

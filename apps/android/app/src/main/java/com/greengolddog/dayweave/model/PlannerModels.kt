@@ -1466,6 +1466,8 @@ data class DayWeaveUiState(
     val publishedScheduleRevision: PublishedScheduleRevisionSnapshot? = null,
     /** Exact, encrypted publication authority. Legacy revision receipts are not actionable. */
     val publishedScheduleProof: PublishedScheduleProofSnapshot? = null,
+    /** Content-free identity of the exact item reviewed during onboarding. */
+    val onboardingFirstItemAnchor: OnboardingFirstItemAnchorSnapshot? = null,
     val scheduleInputDigest: String? = null,
     /** Display-only evidence for a bundled-core composition; never publication authority. */
     val localScheduleCompositionProvenance: LocalScheduleCompositionProvenanceSnapshot? = null,

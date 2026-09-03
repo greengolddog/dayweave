@@ -299,6 +299,13 @@ class DayWeaveViewModel(application: Application) : AndroidViewModel(application
     suspend fun createCanonicalItem(itemId: String, draft: CanonicalItemDraft): Boolean =
         canonicalAuthoringAction { canonicalAuthoringController.create(draft, itemId) }
 
+    suspend fun createOnboardingFirstItem(
+        itemId: String,
+        draft: CanonicalItemDraft,
+    ): Boolean = canonicalAuthoringAction {
+        canonicalAuthoringController.createForOnboarding(draft, itemId)
+    }
+
     suspend fun convertInboxDraft(
         inboxId: String,
         itemId: String,

@@ -8,7 +8,11 @@ import com.greengolddog.dayweave.network.AuthenticatedApiConfiguration
 import com.greengolddog.dayweave.network.RemoteSuggestion
 import com.greengolddog.dayweave.network.SuggestionsTransport
 import com.greengolddog.dayweave.state.PlannerStore
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -71,6 +75,30 @@ class SuggestionSyncWorkTest {
     }
 
     @Test
+    fun consentReleaseCancellationIsAwaitedBeforeStartupBootstrap() = runBlocking {
+        val backend = AwaitedConsentReleaseWorkBackend()
+        val coordinator = SuggestionSyncSchedulingCoordinator(
+            credentialStore = SchedulingCredentialStore(configured = true),
+            backend = backend,
+        )
+
+        val cancellation = async(Dispatchers.Default) {
+            coordinator.cancelBeforeConsentRelease()
+        }
+        withTimeout(3_000) { backend.cancelEntered.await() }
+        assertFalse(cancellation.isCompleted)
+
+        backend.allowCancellation.complete(Unit)
+        withTimeout(3_000) { cancellation.await() }
+        coordinator.onAppStart()
+
+        assertEquals(
+            listOf("cancel-start", "cancel-finished", "periodic", "startup"),
+            backend.events,
+        )
+    }
+
+    @Test
     fun forgetCancelsAndAwaitsBeforeAControlStorePartiallyFailsToClear() = runBlocking {
         val events = mutableListOf<String>()
         val credentials = SchedulingCredentialStore(
@@ -130,7 +158,7 @@ class SuggestionSyncWorkTest {
             WorkManagerSuggestionSyncBackend.PERIODIC_EXISTING_WORK_POLICY,
         )
         assertEquals(
-            ExistingWorkPolicy.KEEP,
+            ExistingWorkPolicy.REPLACE,
             WorkManagerSuggestionSyncBackend.STARTUP_IMMEDIATE_EXISTING_WORK_POLICY,
         )
         assertEquals(
@@ -154,6 +182,35 @@ class SuggestionSyncWorkTest {
             }
             assertEquals(expected, outcome.toWorkerCompletion())
         }
+    }
+}
+
+private class AwaitedConsentReleaseWorkBackend : SuggestionSyncWorkBackend {
+    val cancelEntered = CompletableDeferred<Unit>()
+    val allowCancellation = CompletableDeferred<Unit>()
+    val events = mutableListOf<String>()
+
+    override fun ensurePeriodic(policy: SuggestionSyncWorkPolicy) {
+        events += "periodic"
+    }
+
+    override fun enqueueStartupRefresh(policy: SuggestionSyncWorkPolicy) {
+        events += "startup"
+    }
+
+    override fun replaceConfigurationRefresh(policy: SuggestionSyncWorkPolicy) {
+        events += "configuration"
+    }
+
+    override fun cancelAll() {
+        events += "cancel"
+    }
+
+    override suspend fun cancelAllAndAwait() {
+        events += "cancel-start"
+        cancelEntered.complete(Unit)
+        allowCancellation.await()
+        events += "cancel-finished"
     }
 }
 

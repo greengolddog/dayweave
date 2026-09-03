@@ -28,7 +28,7 @@ class GoogleSchedulePublicationPersistenceTest {
         )
 
         assertEquals(journal, repository.load()?.pendingGoogleSchedulePublication)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
 
         val current = requireNotNull(dao.snapshot)
         assertTrue(
@@ -38,7 +38,7 @@ class GoogleSchedulePublicationPersistenceTest {
         dao.snapshot = current.copy(payloadFormat = PlannerSnapshotFormats.JSON_V13)
 
         assertNull(repository.load()?.pendingGoogleSchedulePublication)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
     }
 
     @Test

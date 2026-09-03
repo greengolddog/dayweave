@@ -14,12 +14,15 @@ class OnboardingControllerTest {
         assertFalse(controller.advance())
         assertEquals(OnboardingStep.WELCOME, controller.active().currentStep)
         assertTrue(controller.acknowledgePrivacy())
+        assertFalse(controller.advance())
+        assertTrue(controller.completePrivacyRelease())
         assertTrue(controller.advance())
 
         assertEquals(OnboardingStep.API, controller.active().currentStep)
         assertTrue(controller.active().privacyAcknowledged)
+        assertTrue(controller.active().privacyReleaseCompleted)
         assertEquals(controller.state, controller.states.value)
-        assertEquals(2, store.savedTransitions.size)
+        assertEquals(3, store.savedTransitions.size)
     }
 
     @Test
@@ -44,6 +47,7 @@ class OnboardingControllerTest {
     fun advanceBackAndFurthestFollowTheFixedHierarchy() {
         val controller = OnboardingController(FakeCheckpointStore())
         assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
         assertTrue(controller.advance())
         assertFalse(controller.advance())
         assertEquals(OnboardingStep.API, controller.active().currentStep)
@@ -68,9 +72,14 @@ class OnboardingControllerTest {
     fun completionIsPossibleOnlyAtTheExactReadyCheckpoint() {
         val controller = OnboardingController(FakeCheckpointStore())
         assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
         assertFalse(controller.complete())
 
         OnboardingStep.entries.drop(1).forEach { expected ->
+            if (controller.active().currentStep == OnboardingStep.PROFILE) {
+                assertFalse(controller.advance(prerequisiteReady = true))
+                assertTrue(controller.markProfileReviewed())
+            }
             assertTrue(
                 controller.advance(
                     prerequisiteReady = controller.active().currentStep != OnboardingStep.WELCOME,
@@ -100,6 +109,7 @@ class OnboardingControllerTest {
 
         store.writesSucceed = true
         assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
         assertTrue(controller.advance())
         val atApi = controller.state
         store.writesSucceed = false
@@ -110,6 +120,8 @@ class OnboardingControllerTest {
             currentStep = OnboardingStep.READY,
             furthestStep = OnboardingStep.READY,
             privacyAcknowledged = true,
+            privacyReleaseCompleted = true,
+            profileReviewed = true,
         )
         val completionStore = FakeCheckpointStore(
             OnboardingCheckpointLoadResult.Loaded(ready),
@@ -124,6 +136,7 @@ class OnboardingControllerTest {
         val store = FakeCheckpointStore()
         val controller = OnboardingController(store)
         assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
         val durableBeforeDeferral = store.result
         val saveCount = store.savedTransitions.size
 
@@ -142,6 +155,27 @@ class OnboardingControllerTest {
         assertTrue(controller.resumeSetup())
         assertTrue(controller.advance())
         assertEquals(OnboardingStep.API, controller.active().currentStep)
+    }
+
+    @Test
+    fun profileReviewIsAnExplicitDurableGate() {
+        val store = FakeCheckpointStore()
+        val controller = OnboardingController(store)
+        assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
+        assertTrue(controller.advance())
+        assertTrue(controller.advance(prerequisiteReady = true))
+        assertTrue(controller.advance(prerequisiteReady = true))
+        assertEquals(OnboardingStep.PROFILE, controller.active().currentStep)
+
+        assertFalse(controller.advance(prerequisiteReady = true))
+        assertTrue(controller.markProfileReviewed())
+        assertTrue(controller.active().profileReviewed)
+
+        val restarted = OnboardingController(store)
+        assertTrue(restarted.active().profileReviewed)
+        assertTrue(restarted.advance(prerequisiteReady = true))
+        assertEquals(OnboardingStep.NOTIFICATIONS, restarted.active().currentStep)
     }
 
     @Test
@@ -190,6 +224,11 @@ class OnboardingControllerTest {
                     furthestStep = OnboardingStep.WELCOME,
                     privacyAcknowledged = true,
                 )
+            }.isFailure,
+        )
+        assertTrue(
+            runCatching {
+                OnboardingCheckpoint(privacyReleaseCompleted = true)
             }.isFailure,
         )
         assertTrue(

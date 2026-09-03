@@ -6,6 +6,7 @@ import android.os.SystemClock
 import android.util.Log
 import com.greengolddog.dayweave.data.EncryptedRoomPlannerStateRepository
 import com.greengolddog.dayweave.health.EnergySignalManager
+import com.greengolddog.dayweave.health.EnergySignalGenerationFence
 import com.greengolddog.dayweave.health.HealthConnectEnergyProvider
 import com.greengolddog.dayweave.model.CanonicalAuthoringDisposition
 import com.greengolddog.dayweave.model.DayWeaveUiState
@@ -33,6 +34,12 @@ import com.greengolddog.dayweave.notifications.WorkManagerTimedBreakNotification
 import com.greengolddog.dayweave.notifications.cancelTimedBreakNotificationAndRestoreOnFailure
 import com.greengolddog.dayweave.notifications.ensureTimedBreakNotificationChannel
 import com.greengolddog.dayweave.notifications.reconcileTimedBreakNotificationStates
+import com.greengolddog.dayweave.onboarding.AtomicFileOnboardingCheckpointStore
+import com.greengolddog.dayweave.onboarding.OnboardingConsentBootstrap
+import com.greengolddog.dayweave.onboarding.OnboardingController
+import com.greengolddog.dayweave.onboarding.OnboardingControllerState
+import com.greengolddog.dayweave.onboarding.OnboardingCorruptArtifactIdentity
+import com.greengolddog.dayweave.onboarding.OnboardingRuntimeGate
 import com.greengolddog.dayweave.security.AppAuthenticationProcessFence
 import com.greengolddog.dayweave.security.AppLockController
 import com.greengolddog.dayweave.security.AtomicFileAppLockSettingsStore
@@ -71,9 +78,12 @@ import com.greengolddog.dayweave.sync.WorkManagerSuggestionSyncBackend
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileUpdateCoordinator
 import com.greengolddog.dayweave.state.ScheduleCompositionProfileDraftMemory
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.flow.first
@@ -86,6 +96,23 @@ class DayWeaveApplication : Application() {
     private val canonicalActionGate = CanonicalActionGate()
     private val privatePresentationAllowed = AtomicBoolean(false)
     private val assistantForegroundActive = AtomicBoolean(false)
+    private val energySignalGenerationFence = ApplicationEnergySignalGenerationFence()
+    private val consentBoundaryReconciliationActive = AtomicBoolean(false)
+    val onboardingController: OnboardingController by lazy {
+        OnboardingController(AtomicFileOnboardingCheckpointStore(this))
+    }
+    private val onboardingRuntimeGate: OnboardingRuntimeGate by lazy {
+        OnboardingRuntimeGate(
+            privacyAcknowledged =
+                (onboardingController.state as? OnboardingControllerState.Active)
+                    ?.let { it.privacyAcknowledged && it.privacyReleaseCompleted } == true,
+        )
+    }
+    val onboardingRuntimePrivacyState
+        get() = onboardingRuntimeGate.state
+    private val onboardingConsentBootstrap by lazy {
+        OnboardingConsentBootstrap(::launchConsentDependentServices)
+    }
     private val googleAuthorizationJournalStore by lazy {
         AtomicGoogleAuthorizationJournalStore(this)
     }
@@ -559,17 +586,24 @@ class DayWeaveApplication : Application() {
         )
     }.getOrDefault(true)
 
-    val energySignalManager: EnergySignalManager by lazy {
+    private val energySignalManagerDelegate = lazy {
         EnergySignalManager(
             provider = HealthConnectEnergyProvider(this),
             plannerStore = plannerStore,
+            generationFence = energySignalGenerationFence,
         )
+    }
+    val energySignalManager: EnergySignalManager
+        get() = energySignalManagerDelegate.value
+
+    private val suggestionSyncWorkBackend by lazy {
+        WorkManagerSuggestionSyncBackend(this)
     }
 
     val suggestionSyncSchedulingCoordinator: SuggestionSyncSchedulingCoordinator by lazy {
         SuggestionSyncSchedulingCoordinator(
             credentialStore = apiCredentialStore,
-            backend = WorkManagerSuggestionSyncBackend(this),
+            backend = suggestionSyncWorkBackend,
         )
     }
 
@@ -601,6 +635,78 @@ class DayWeaveApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         ensureTimedBreakNotificationChannel(this)
+        if (onboardingRuntimeGate.backgroundWorkAllowed()) {
+            onboardingConsentBootstrap.launchIfAllowed(onboardingRuntimeGate)
+        } else {
+            scheduleOnboardingConsentBoundaryReconciliation()
+        }
+    }
+
+    private fun scheduleOnboardingConsentBoundaryReconciliation() {
+        if (!consentBoundaryReconciliationActive.compareAndSet(false, true)) return
+        persistenceScope.launch {
+            try {
+                while (!reconcileOnboardingConsentBoundaryOnce()) {
+                    delay(CONSENT_BOUNDARY_RETRY_DELAY_MILLIS)
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } finally {
+                consentBoundaryReconciliationActive.set(false)
+                val releaseStillNeeded =
+                    (onboardingController.state as? OnboardingControllerState.Active)
+                        ?.privacyAcknowledged == true &&
+                    !onboardingRuntimeGate.backgroundWorkAllowed()
+                if (releaseStillNeeded) {
+                    scheduleOnboardingConsentBoundaryReconciliation()
+                }
+            }
+        }
+    }
+
+    private suspend fun reconcileOnboardingConsentBoundaryOnce(): Boolean {
+        if (onboardingRuntimeGate.backgroundWorkAllowed()) return true
+
+        onboardingRuntimeGate.setDurablePrivacyAcknowledgement(false)
+        closePrivatePresentationBoundary()
+        return try {
+            // This credential-free backend fence must not initialize the auth envelope merely to
+            // cancel OS work on an unacknowledged launch.
+            suggestionSyncWorkBackend.cancelAllAndAwait()
+            if (!timedBreakNotificationCoordinator.cancelBeforeConsentRelease()) return false
+            if (!clearPreConsentTimedBreakRoutes()) return false
+
+            var active = onboardingController.state as? OnboardingControllerState.Active
+                ?: return true
+            if (!active.privacyAcknowledged) return true
+            if (!active.privacyReleaseCompleted) {
+                if (!onboardingController.completePrivacyRelease()) return false
+                active = onboardingController.state as? OnboardingControllerState.Active
+                    ?: return false
+            }
+            if (!active.privacyAcknowledged || !active.privacyReleaseCompleted) return false
+            onboardingRuntimeGate.setDurablePrivacyAcknowledgement(true)
+            onboardingConsentBootstrap.launchIfAllowed(onboardingRuntimeGate)
+            reconcilePrivatePresentationBoundary()
+            true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            // Opening the process-local gate is not itself success. If bootstrap throws, close it
+            // again so the retry cannot short-circuit while consent-dependent services are absent.
+            onboardingRuntimeGate.setDurablePrivacyAcknowledgement(false)
+            closePrivatePresentationBoundary()
+            false
+        }
+    }
+
+    private fun clearPreConsentTimedBreakRoutes(): Boolean {
+        if (!timedBreakNotificationRoutes.revokeIssued()) return false
+        val pending = timedBreakNotificationRoutes.pendingDigest.value ?: return true
+        return timedBreakNotificationRoutes.consume(pending)
+    }
+
+    private fun launchConsentDependentServices() {
         persistenceScope.launch {
             reconcileTimedBreakNotificationStates(
                 durableStates = merge(
@@ -621,9 +727,39 @@ class DayWeaveApplication : Application() {
         }
     }
 
+    /** Releases private state and network work only after the checkpoint write was verified. */
+    fun acknowledgeOnboardingPrivacy(): Boolean {
+        if (!onboardingController.acknowledgePrivacy()) return false
+        val active = onboardingController.state as? OnboardingControllerState.Active
+            ?: return false
+        if (!active.privacyAcknowledged) return false
+        if (onboardingRuntimeGate.backgroundWorkAllowed()) return true
+        scheduleOnboardingConsentBoundaryReconciliation()
+        return true
+    }
+
+    /** Exact corrupt-checkpoint recovery never touches planner, credential, or provider stores. */
+    fun recoverOnboardingCheckpoint(
+        expected: OnboardingCorruptArtifactIdentity,
+    ): Boolean {
+        if (!onboardingController.recoverCorruptExact(expected)) return false
+        onboardingRuntimeGate.setDurablePrivacyAcknowledgement(false)
+        closePrivatePresentationBoundary()
+        scheduleOnboardingConsentBoundaryReconciliation()
+        return true
+    }
+
+    fun onboardingBackgroundWorkAllowed(): Boolean =
+        onboardingRuntimeGate.backgroundWorkAllowed()
+
     /** Canonical actions outlive a transient screen/ViewModel so responses are always reconciled. */
     fun launchCanonicalAction(action: suspend () -> Unit): Boolean {
-        if (hasGoogleAuthorizationRecoveryBlocker()) return false
+        if (
+            !onboardingRuntimeGate.backgroundWorkAllowed() ||
+            hasGoogleAuthorizationRecoveryBlocker()
+        ) {
+            return false
+        }
         if (!canonicalActionGate.tryEnter()) return false
         persistenceScope.launch {
             try {
@@ -662,7 +798,13 @@ class DayWeaveApplication : Application() {
         confirmed: Boolean,
         operation: suspend () -> Unit,
     ): Boolean {
-        if (!confirmed || !canonicalActionGate.tryEnter()) return false
+        if (
+            !confirmed ||
+            !onboardingRuntimeGate.privatePresentationAllowed() ||
+            !canonicalActionGate.tryEnter()
+        ) {
+            return false
+        }
         persistenceScope.launch {
             try {
                 operation()
@@ -710,6 +852,7 @@ class DayWeaveApplication : Application() {
 
     /** Queues mandatory recovery behind any active canonical mutation instead of dropping it. */
     fun enqueueCanonicalRecovery(action: suspend () -> Unit) {
+        if (!onboardingRuntimeGate.backgroundWorkAllowed()) return
         persistenceScope.launch {
             canonicalActionGate.enter()
             try {
@@ -722,20 +865,33 @@ class DayWeaveApplication : Application() {
 
     /** Starts the only device-local composition and retains it across transient recomposition. */
     fun launchLocalScheduleComposition(): Boolean =
-        !hasGoogleAuthorizationRecoveryBlocker() && localScheduleCompositionLauncher.launch()
+        onboardingRuntimeGate.privatePresentationAllowed() &&
+            !hasGoogleAuthorizationRecoveryBlocker() &&
+            localScheduleCompositionLauncher.launch()
 
     /** Invalidates even non-preemptible JNI output before requesting coroutine cancellation. */
     fun cancelLocalScheduleComposition() = localScheduleCompositionLauncher.cancel()
 
     fun setLocalScheduleCompositionForegroundActive(active: Boolean) =
-        localScheduleCompositionLauncher.setForegroundActive(active)
+        localScheduleCompositionLauncher.setForegroundActive(
+            active && onboardingRuntimeGate.foregroundProviderWorkAllowed(),
+        )
 
     internal suspend fun cancelAndDrainLocalScheduleComposition() =
         localScheduleCompositionLauncher.cancelAndDrain()
 
     /** Clears memory-only proposal review content whenever locked UI becomes authoritative. */
     fun onAppPrivacyBoundaryLocked() {
+        onboardingRuntimeGate.setAppUnlocked(false)
+        closePrivatePresentationBoundary()
+    }
+
+    private fun closePrivatePresentationBoundary() {
+        energySignalGenerationFence.close()
         privatePresentationAllowed.set(false)
+        if (energySignalManagerDelegate.isInitialized()) {
+            energySignalManager.quarantineForPrivacyBoundary()
+        }
         if (googleAccountManagerDelegate.isInitialized()) {
             googleAccountManager.quarantineBindingState()
         }
@@ -769,45 +925,57 @@ class DayWeaveApplication : Application() {
 
     /** Re-enables private provider reads only after the lock controller exposes unlocked UI. */
     fun onAppPrivacyBoundaryUnlocked() {
+        onboardingRuntimeGate.setAppUnlocked(true)
+        reconcilePrivatePresentationBoundary()
+    }
+
+    /** Opens the assistant gate only while the unlocked activity is STARTED. */
+    fun onAppForegroundAssistantActive() {
+        assistantForegroundActive.set(true)
+        onboardingRuntimeGate.setActivityStarted(true)
+        reconcilePrivatePresentationBoundary()
+    }
+
+    /** AI inference is foreground-only even when delayed app locking is disabled. */
+    fun onAppForegroundAssistantInactive() {
+        assistantForegroundActive.set(false)
+        onboardingRuntimeGate.setActivityStarted(false)
+        closePrivatePresentationBoundary()
+    }
+
+    private fun reconcilePrivatePresentationBoundary() {
+        if (!onboardingRuntimeGate.privatePresentationAllowed()) {
+            closePrivatePresentationBoundary()
+            return
+        }
+        energySignalGenerationFence.open()
         privatePresentationAllowed.set(true)
         if (assistantForegroundActive.get() && assistantManagerDelegate.isInitialized()) {
             assistantManager.restoreForegroundState()
         }
     }
 
-    /** Opens the assistant gate only while the unlocked activity is STARTED. */
-    fun onAppForegroundAssistantActive() {
-        assistantForegroundActive.set(true)
-        if (privatePresentationAllowed.get() && assistantManagerDelegate.isInitialized()) {
-            assistantManager.restoreForegroundState()
-        }
-    }
-
-    /** AI inference is foreground-only even when delayed app locking is disabled. */
-    fun onAppForegroundAssistantInactive() {
-        assistantForegroundActive.set(false)
-        if (assistantManagerDelegate.isInitialized()) {
-            assistantManager.cancelForPrivacyBoundary()
-        }
-    }
-
     /** Collected only by the unlocked STARTED UI; cancellation closes the response body. */
     suspend fun runForegroundExecutionInvalidations() {
+        if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         executionInvalidationManager.runForegroundActivation()
     }
 
     /** Includes the 30-second delta fallback and runs only in the unlocked STARTED UI. */
     suspend fun runForegroundCanonicalItemInvalidations() {
+        if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         canonicalItemInvalidationManager.runForegroundActivation()
     }
 
     /** Includes an immediate authoritative GET and 30-second fallback while unlocked. */
     suspend fun runForegroundScheduleInvalidations() {
+        if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         scheduleInvalidationManager.runForegroundActivation()
     }
 
     /** Startup recovery installs the immutable head without creating a competing publication. */
     suspend fun recoverCurrentPublishedSchedule(): CanonicalRefreshOutcome? {
+        if (!onboardingRuntimeGate.backgroundWorkAllowed()) return null
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
@@ -826,6 +994,7 @@ class DayWeaveApplication : Application() {
 
     /** Reconciles an old/remote lease both before and after replacing today's composition. */
     suspend fun refreshCanonicalState(): CanonicalRefreshOutcome? {
+        if (!onboardingRuntimeGate.backgroundWorkAllowed()) return null
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return null
         proposalApplicationManager.recoverPending()
         if (plannerStore.state.value.pendingProposalApplicationMutation != null) return null
@@ -837,6 +1006,7 @@ class DayWeaveApplication : Application() {
 
     /** Foreground polling promotes a newly observed eligible terminal fact without periodic churn. */
     suspend fun refreshForegroundExecution() {
+        if (!onboardingRuntimeGate.foregroundProviderWorkAllowed()) return
         if (googleAccountManager.hasAuthorizationRecoveryBlocker()) return
         refreshForegroundExecutionSequence(
             executionRefresh = executionSyncManager::refresh,
@@ -862,6 +1032,7 @@ class DayWeaveApplication : Application() {
 
     private companion object {
         const val LOG_TAG = "DayWeavePersistence"
+        const val CONSENT_BOUNDARY_RETRY_DELAY_MILLIS = 5_000L
         val CANONICAL_TERMINAL_EXECUTION_STATUSES = setOf("completed", "skipped")
     }
 }
@@ -919,6 +1090,37 @@ private val EXECUTION_REFRESH_SUCCESSES = setOf(
     ExecutionSyncOutcome.SUCCESS,
     ExecutionSyncOutcome.RECOVERED_COMMAND,
 )
+
+/** Odd generations are open; every close/reopen gives stale provider callbacks a new token. */
+internal class ApplicationEnergySignalGenerationFence : EnergySignalGenerationFence {
+    private val generation = AtomicLong(CLOSED_GENERATION)
+
+    override fun captureGeneration(): Long = generation.get()
+
+    override fun isCurrent(generation: Long): Boolean =
+        generation % 2L == OPEN_REMAINDER && this.generation.get() == generation
+
+    fun open() {
+        while (true) {
+            val current = generation.get()
+            if (current % 2L == OPEN_REMAINDER) return
+            if (generation.compareAndSet(current, current + 1L)) return
+        }
+    }
+
+    fun close() {
+        while (true) {
+            val current = generation.get()
+            if (current % 2L != OPEN_REMAINDER) return
+            if (generation.compareAndSet(current, current + 1L)) return
+        }
+    }
+
+    private companion object {
+        const val CLOSED_GENERATION = 0L
+        const val OPEN_REMAINDER = 1L
+    }
+}
 
 /** The narrow import-repair exception is bound to one account and credential generation. */
 internal fun blocksGoogleAuthorizationForImportRecovery(

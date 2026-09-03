@@ -81,6 +81,9 @@ internal interface TimedBreakNotificationWorkBackend {
         clearDisplayedBeforeSchedule: Boolean,
     )
     suspend fun cancelWorkAndNotification()
+
+    /** Awaited scheduler/side-effect fence for work inherited from before consent was released. */
+    suspend fun cancelStaleWorkBeforeConsentRelease() = cancelWorkAndNotification()
 }
 
 /**
@@ -143,6 +146,30 @@ internal class TimedBreakNotificationCoordinator(
             initialized = false
             scheduledDigest = null
             false
+        }
+    }
+
+    /**
+     * Cancels work inherited from the closed privacy boundary and forgets every memoized digest.
+     * This must finish before the application opens its runtime consent gate. Keeping the
+     * coordinator uninitialized forces the first post-consent durable state to reconcile even
+     * when it has the same digest as a job that was RUNNING during acknowledgement.
+     */
+    suspend fun cancelBeforeConsentRelease(): Boolean = mutex.withLock {
+        initialized = false
+        scheduledDigest = null
+        try {
+            backend.cancelStaleWorkBeforeConsentRelease()
+            true
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            false
+        } finally {
+            // Cancellation can partially mutate WorkManager before throwing. Never let that
+            // ambiguous generation become authoritative through coordinator memoization.
+            initialized = false
+            scheduledDigest = null
         }
     }
 }
@@ -501,22 +528,30 @@ class TimedBreakEndedWorker(
     workerParameters: WorkerParameters,
 ) : CoroutineWorker(appContext, workerParameters) {
     private var deliveryOverride: (suspend (String) -> TimedBreakDeliveryCompletion)? = null
+    private var workAllowedOverride: (() -> Boolean)? = null
 
     internal constructor(
         appContext: Context,
         workerParameters: WorkerParameters,
         delivery: suspend (String) -> TimedBreakDeliveryCompletion,
+        workAllowed: () -> Boolean = { true },
     ) : this(appContext, workerParameters) {
         deliveryOverride = delivery
+        workAllowedOverride = workAllowed
     }
 
     override suspend fun doWork(): Result {
         val digest = inputData.getString(INPUT_IDENTITY_DIGEST)
         if (!isTimedBreakNotificationDigest(digest)) return Result.failure()
+        val application = applicationContext as? DayWeaveApplication
+        val workAllowed = workAllowedOverride?.invoke()
+            ?: application?.onboardingBackgroundWorkAllowed() == true
+        // A job from a pre-onboarding installation cannot read planner state or post an alert.
+        // Successful acknowledgement reconciles the canonical notification job again.
+        if (!workAllowed) return Result.success()
         val completion = try {
             deliveryOverride?.invoke(requireNotNull(digest)) ?: run {
-                val application = applicationContext as? DayWeaveApplication
-                    ?: return Result.success()
+                application ?: return Result.success()
                 TimedBreakNotificationDelivery(
                     stateAccess = PlannerTimedBreakNotificationStateAccess(
                         application.plannerStore,

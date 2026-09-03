@@ -56,11 +56,13 @@ object PlannerSnapshotFormats {
     const val JSON_V13 = "json-v13-google-outbound-recovery"
     /** Generated-schedule Google review, approval authority, and accepted status recovery. */
     const val JSON_V14 = "json-v14-google-schedule-publication-recovery"
+    /** Encrypted, content-free exact first-item anchor; predecessor labels cannot mint one. */
+    const val JSON_V15 = "json-v15-onboarding-first-item-anchor"
 }
 
 @Database(
     entities = [PlannerSnapshotEntity::class],
-    version = 14,
+    version = 15,
     exportSchema = true,
 )
 abstract class PlannerDatabase : RoomDatabase() {
@@ -173,6 +175,14 @@ object PlannerDatabaseMigrations {
     val MIGRATION_13_14 = object : Migration(13, 14) {
         override fun migrate(db: SupportSQLiteDatabase) = Unit
     }
+
+    /**
+     * No plaintext columns change. The encrypted payload gains exact onboarding item identity;
+     * the Room version prevents rollback to code that cannot enforce its review boundary.
+     */
+    val MIGRATION_14_15 = object : Migration(14, 15) {
+        override fun migrate(db: SupportSQLiteDatabase) = Unit
+    }
 }
 
 object PlannerDatabaseFactory {
@@ -226,6 +236,7 @@ object PlannerDatabaseFactory {
                 PlannerDatabaseMigrations.MIGRATION_11_12,
                 PlannerDatabaseMigrations.MIGRATION_12_13,
                 PlannerDatabaseMigrations.MIGRATION_13_14,
+                PlannerDatabaseMigrations.MIGRATION_14_15,
             )
             .build()
     }

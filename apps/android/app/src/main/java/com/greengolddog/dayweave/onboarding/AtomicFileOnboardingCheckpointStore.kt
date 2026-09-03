@@ -15,11 +15,11 @@ import java.security.MessageDigest
 /**
  * Strict onboarding checkpoint stored beneath Android's no-backup directory.
  *
- * The fixed binary payload has exactly five semantic fields: version, current step, furthest step,
- * privacy acknowledgement, and completion. Unlike an open JSON/object decoder, unknown or
- * duplicate keys cannot be represented. The exact length check rejects every expanded/trailing
- * shape. AtomicFile provides rollback for a torn write, while read-back verification prevents a
- * transition from becoming visible to its controller before it is durable and decodable.
+ * The fixed binary payload has exactly seven semantic fields: version, current step, furthest step,
+ * privacy acknowledgement, completion, privacy-release completion, and profile review. Unlike an
+ * open JSON/object decoder, unknown or duplicate keys cannot be represented. The exact length
+ * check rejects every expanded/trailing shape. AtomicFile provides rollback for a torn write,
+ * while read-back verification prevents a transition from becoming visible before it is durable.
  */
 class AtomicFileOnboardingCheckpointStore(
     noBackupDirectory: File,
@@ -72,22 +72,42 @@ class AtomicFileOnboardingCheckpointStore(
 
         val checkpoint = try {
             DataInputStream(BufferedInputStream(atomicFile.openRead())).use { input ->
-                if (recordFile.length() != ENCODED_RECORD_BYTES) return@use null
+                val encodedLength = recordFile.length()
+                if (encodedLength !in SUPPORTED_RECORD_BYTES) return@use null
                 if (input.readInt() != RECORD_MAGIC) return@use null
-                val version = input.readInt()
+                val encodedVersion = input.readInt()
+                val expectedLength = when (encodedVersion) {
+                    LEGACY_VERSION_1 -> LEGACY_VERSION_1_RECORD_BYTES
+                    OnboardingCheckpoint.CURRENT_VERSION -> ENCODED_RECORD_BYTES
+                    else -> return@use null
+                }
+                if (encodedLength != expectedLength) return@use null
                 val currentStep = OnboardingStep.fromWireValue(input.readUnsignedByte())
                     ?: return@use null
                 val furthestStep = OnboardingStep.fromWireValue(input.readUnsignedByte())
                     ?: return@use null
                 val privacyAcknowledged = input.readStrictBoolean() ?: return@use null
                 val completed = input.readStrictBoolean() ?: return@use null
+                // V1 could not prove its process-local cleanup barrier survived a crash. Migrating
+                // it closed forces one idempotent cleanup before any private work can resume.
+                val privacyReleaseCompleted = if (encodedVersion == LEGACY_VERSION_1) {
+                    false
+                } else {
+                    input.readStrictBoolean() ?: return@use null
+                }
+                val profileReviewed = if (encodedVersion == LEGACY_VERSION_1) {
+                    false
+                } else {
+                    input.readStrictBoolean() ?: return@use null
+                }
                 if (input.read() != -1) return@use null
                 runCatching {
                     OnboardingCheckpoint(
-                        version = version,
                         currentStep = currentStep,
                         furthestStep = furthestStep,
                         privacyAcknowledged = privacyAcknowledged,
+                        privacyReleaseCompleted = privacyReleaseCompleted,
+                        profileReviewed = profileReviewed,
                         completed = completed,
                     )
                 }.getOrNull()
@@ -118,6 +138,8 @@ class AtomicFileOnboardingCheckpointStore(
             data.writeByte(checkpoint.furthestStep.wireValue)
             data.writeByte(if (checkpoint.privacyAcknowledged) 1 else 0)
             data.writeByte(if (checkpoint.completed) 1 else 0)
+            data.writeByte(if (checkpoint.privacyReleaseCompleted) 1 else 0)
+            data.writeByte(if (checkpoint.profileReviewed) 1 else 0)
             data.flush()
             started.fd.sync()
             atomicFile.finishWrite(started)
@@ -178,9 +200,13 @@ class AtomicFileOnboardingCheckpointStore(
         const val RECORD_FILE_NAME = "dayweave_onboarding_checkpoint.bin"
         const val RECORD_MAGIC = 0x44574F4E
         const val MAX_RECORD_BYTES = 2_048L
-        const val ENCODED_RECORD_BYTES = 12L
+        const val ENCODED_RECORD_BYTES = 14L
+        internal const val LEGACY_VERSION_1_RECORD_BYTES = 12L
         val RECORD_ARTIFACT_SUFFIXES = listOf("", ".bak", ".new")
 
+        private const val LEGACY_VERSION_1 = 1
+        private val SUPPORTED_RECORD_BYTES =
+            setOf(LEGACY_VERSION_1_RECORD_BYTES, ENCODED_RECORD_BYTES)
         private const val MAX_FINGERPRINT_BYTES = MAX_RECORD_BYTES.toInt() + 1
         private const val FINGERPRINT_BUFFER_BYTES = 512
         private val FINGERPRINT_READ_FAILURE_MARKER = byteArrayOf(0x7f)

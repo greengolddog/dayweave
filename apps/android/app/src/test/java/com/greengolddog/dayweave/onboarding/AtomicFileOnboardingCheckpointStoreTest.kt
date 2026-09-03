@@ -52,12 +52,14 @@ class AtomicFileOnboardingCheckpointStoreTest {
     fun exactClosedCheckpointRoundTripsAcrossStoreInstances() {
         val acknowledged = OnboardingCheckpoint.fresh().copy(privacyAcknowledged = true)
         assertTrue(store.saveIfCurrent(OnboardingCheckpoint.fresh(), acknowledged))
+        val released = acknowledged.copy(privacyReleaseCompleted = true)
+        assertTrue(store.saveIfCurrent(acknowledged, released))
 
-        val api = acknowledged.copy(
+        val api = released.copy(
             currentStep = OnboardingStep.API,
             furthestStep = OnboardingStep.API,
         )
-        assertTrue(store.saveIfCurrent(acknowledged, api))
+        assertTrue(store.saveIfCurrent(released, api))
 
         assertEquals(AtomicFileOnboardingCheckpointStore.ENCODED_RECORD_BYTES, store.recordFile.length())
         assertEquals(
@@ -70,8 +72,15 @@ class AtomicFileOnboardingCheckpointStoreTest {
     fun everyStepAndExactReadyCompletionPersistThroughTheAtomicStore() {
         val controller = OnboardingController(store)
         assertTrue(controller.acknowledgePrivacy())
+        assertTrue(controller.completePrivacyRelease())
         assertTrue(controller.advance())
         OnboardingStep.entries.drop(2).forEach { expected ->
+            if (
+                (controller.state as OnboardingControllerState.Active).currentStep ==
+                OnboardingStep.PROFILE
+            ) {
+                assertTrue(controller.markProfileReviewed())
+            }
             assertTrue(controller.advance(prerequisiteReady = true))
             assertEquals(expected, (controller.state as OnboardingControllerState.Active).currentStep)
         }
@@ -117,6 +126,62 @@ class AtomicFileOnboardingCheckpointStoreTest {
     }
 
     @Test
+    fun legacyV1AcknowledgementMigratesClosedUntilCleanupIsDurablySealed() {
+        DataOutputStream(store.recordFile.outputStream()).use { output ->
+            writeRawRecord(
+                output = output,
+                version = 1,
+                currentStep = OnboardingStep.API.wireValue,
+                furthestStep = OnboardingStep.API.wireValue,
+                privacy = 1,
+            )
+        }
+
+        val migrated = (store.load() as OnboardingCheckpointLoadResult.Loaded).checkpoint
+        assertEquals(OnboardingCheckpoint.CURRENT_VERSION, migrated.version)
+        assertTrue(migrated.privacyAcknowledged)
+        assertFalse(migrated.privacyReleaseCompleted)
+        assertFalse(
+            store.saveIfCurrent(
+                migrated,
+                migrated.copy(
+                    currentStep = OnboardingStep.GOOGLE,
+                    furthestStep = OnboardingStep.GOOGLE,
+                ),
+            ),
+        )
+
+        val released = migrated.copy(privacyReleaseCompleted = true)
+        assertTrue(store.saveIfCurrent(migrated, released))
+        assertEquals(AtomicFileOnboardingCheckpointStore.ENCODED_RECORD_BYTES, store.recordFile.length())
+        assertEquals(OnboardingCheckpointLoadResult.Loaded(released), store.load())
+    }
+
+    @Test
+    fun legacyCompletedCheckpointCanSealReleaseWithoutLosingCompletion() {
+        DataOutputStream(store.recordFile.outputStream()).use { output ->
+            writeRawRecord(
+                output = output,
+                version = 1,
+                currentStep = OnboardingStep.READY.wireValue,
+                furthestStep = OnboardingStep.READY.wireValue,
+                privacy = 1,
+                completed = 1,
+            )
+        }
+
+        val controller = OnboardingController(store)
+        val migrated = controller.state as OnboardingControllerState.Active
+        assertTrue(migrated.completed)
+        assertFalse(migrated.privacyReleaseCompleted)
+        assertTrue(controller.completePrivacyRelease())
+        val released = controller.state as OnboardingControllerState.Active
+        assertTrue(released.completed)
+        assertTrue(released.privacyReleaseCompleted)
+        assertFalse(released.profileReviewed)
+    }
+
+    @Test
     fun unfinishedInitialNewArtifactIsCorruptRatherThanAFirstInstall() {
         val newArtifact = File(store.recordFile.path + ".new")
         newArtifact.writeBytes(byteArrayOf(0x44, 0x57))
@@ -150,6 +215,10 @@ class AtomicFileOnboardingCheckpointStoreTest {
             },
             { writeRawRecord(it, privacy = 2) },
             { writeRawRecord(it, completed = 2) },
+            { writeRawRecord(it, privacyRelease = 2) },
+            { writeRawRecord(it, profileReviewed = 2) },
+            { writeRawRecord(it, privacy = 0, privacyRelease = 1) },
+            { writeRawRecord(it, privacy = 1, privacyRelease = 1, profileReviewed = 1) },
             {
                 writeRawRecord(
                     it,
@@ -243,6 +312,8 @@ class AtomicFileOnboardingCheckpointStoreTest {
         furthestStep: Int = OnboardingStep.WELCOME.wireValue,
         privacy: Int = 0,
         completed: Int = 0,
+        privacyRelease: Int = 0,
+        profileReviewed: Int = 0,
         trailingByte: Int? = null,
     ) {
         output.writeInt(magic)
@@ -251,6 +322,10 @@ class AtomicFileOnboardingCheckpointStoreTest {
         output.writeByte(furthestStep)
         output.writeByte(privacy)
         output.writeByte(completed)
+        if (version != 1) {
+            output.writeByte(privacyRelease)
+            output.writeByte(profileReviewed)
+        }
         trailingByte?.let(output::writeByte)
     }
 }

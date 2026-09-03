@@ -115,7 +115,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.localScheduleCompositionProvenance)
             assertEquals(ScheduleCompositionProfileSnapshot(), restored.scheduleCompositionProfile)
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -224,7 +224,7 @@ class PlannerStateRepositoryTest {
                         original.pendingSchedulePublication?.request?.bodyJson,
                         restored.pendingSchedulePublication?.request?.bodyJson,
                     )
-                    assertEquals(PlannerSnapshotFormats.JSON_V14, rewritten.payloadFormat)
+                    assertEquals(PlannerSnapshotFormats.JSON_V15, rewritten.payloadFormat)
                     assertEquals(
                         JsonPrimitive(7),
                         rewrittenRoot.getValue("scheduleCompositionProfile")
@@ -298,7 +298,7 @@ class PlannerStateRepositoryTest {
                 ZoneId.of("America/Havana"),
             ),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -331,7 +331,7 @@ class PlannerStateRepositoryTest {
                 ZoneId.of("UTC"),
             ),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -354,7 +354,7 @@ class PlannerStateRepositoryTest {
                         ZoneId.of("UTC"),
                     ),
                 )
-                assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+                assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
             }
     }
 
@@ -378,7 +378,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(null, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
             assertTrue(
                 requireNotNull(dao.snapshot).payload.contains(
                     "\"pendingGoogleCalendarOutbound\":null",
@@ -443,7 +443,7 @@ class PlannerStateRepositoryTest {
                         GoogleCalendarOutboundOperation.UPSERT,
                         restoredJournal.operation,
                     )
-                    assertEquals(PlannerSnapshotFormats.JSON_V14, rewritten.payloadFormat)
+                    assertEquals(PlannerSnapshotFormats.JSON_V15, rewritten.payloadFormat)
                     assertEquals(JsonPrimitive(2), rewrittenJournal["schemaVersion"])
                     assertEquals(
                         JsonPrimitive("calendar_event"),
@@ -561,7 +561,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(journal, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -585,7 +585,7 @@ class PlannerStateRepositoryTest {
             val restored = requireNotNull(repository.load())
 
             assertEquals(journal, restored.pendingGoogleCalendarOutbound)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -766,7 +766,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
             assertTrue(requireNotNull(dao.snapshot).payload.contains(
                 "\"lastBreakEndNotificationAttemptDigest\":null",
             ))
@@ -797,7 +797,7 @@ class PlannerStateRepositoryTest {
             assertEquals(null, restored.lastConsumedBreakEndNotificationDigest)
             assertEquals(null, restored.lastRejectedBreakEndNotificationDigest)
             assertEquals(null, restored.acknowledgedBreakEndDigest)
-            assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+            assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         }
     }
 
@@ -875,7 +875,7 @@ class PlannerStateRepositoryTest {
 
         assertFalse(restored.schedule.single().isSensitive)
         assertFalse(restored.canonicalItems.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertEquals(11L, dao.snapshot?.updatedAtEpochMillis)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
     }
@@ -913,7 +913,7 @@ class PlannerStateRepositoryTest {
         assertTrue(restored.schedule.single().isSensitive)
         assertTrue(restored.canonicalItems.single().isSensitive)
         assertTrue(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":true"))
     }
 
@@ -966,7 +966,7 @@ class PlannerStateRepositoryTest {
         assertEquals(deferred, retained.session)
         assertFalse(retained.requiresCanonicalItemProjection)
         assertEquals(deferred.endedAt, retained.recordedAt)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveStart\":"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"moveEnd\":"))
     }
@@ -1179,7 +1179,7 @@ class PlannerStateRepositoryTest {
             state.pendingSchedulePublication,
             restored.pendingSchedulePublication,
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
 
         val digest = "sha256:${"a".repeat(64)}"
         val tampered = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -1208,7 +1208,7 @@ class PlannerStateRepositoryTest {
             requireNotNull(restored.publishedScheduleProof)
                 .matches(restored.schedule.single()),
         )
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
 
         dao.snapshot = requireNotNull(dao.snapshot).copy(
             payload = requireNotNull(dao.snapshot).payload.replaceFirst(
@@ -1361,7 +1361,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertEquals(null, restored.publishedScheduleProof)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"publishedScheduleProof\":null"))
     }
 
@@ -1431,7 +1431,7 @@ class PlannerStateRepositoryTest {
 
         assertEquals(null, restored.pendingProposalApplicationMutation)
         assertTrue(restored.proposalApplications.isEmpty())
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
     }
 
     @Test
@@ -1539,7 +1539,7 @@ class PlannerStateRepositoryTest {
 
         assertTrue(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
         assertFalse(restored.inbox.single().isSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":true"))
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"isSensitive\":false"))
         assertTrue(requireNotNull(repository.load()).pendingCanonicalMutation?.targetIsSensitive == true)
@@ -1563,7 +1563,7 @@ class PlannerStateRepositoryTest {
         val restored = requireNotNull(repository.load())
 
         assertFalse(requireNotNull(restored.pendingCanonicalMutation).targetIsSensitive)
-        assertEquals(PlannerSnapshotFormats.JSON_V14, dao.snapshot?.payloadFormat)
+        assertEquals(PlannerSnapshotFormats.JSON_V15, dao.snapshot?.payloadFormat)
         assertTrue(requireNotNull(dao.snapshot).payload.contains("\"targetIsSensitive\":false"))
     }
 

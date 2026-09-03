@@ -9,10 +9,11 @@ import com.greengolddog.dayweave.model.ProposalApplicationMutationKind
 import com.greengolddog.dayweave.model.ProposalApplicationStatusSnapshot
 import com.greengolddog.dayweave.model.ScheduleCompositionProfileSnapshot
 import com.greengolddog.dayweave.model.canonicalTrashItemBytes
+import com.greengolddog.dayweave.model.hasValidOnboardingFirstItemAnchorRelationship
 import com.greengolddog.dayweave.model.requireCanonicalAuthoringJournalBudget
 import com.greengolddog.dayweave.model.withCanonicalTrashRetention
-import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.model.withInvalidTimedBreakNotificationAttemptAbandoned
+import com.greengolddog.dayweave.model.withPendingSensitivityHardened
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
 import com.greengolddog.dayweave.network.validateProposalApplyHttpRequest
 import com.greengolddog.dayweave.network.validateProposalUndoHttpRequest
@@ -57,6 +58,11 @@ class RoomPlannerStateRepository(
 ) : PlannerStateRepository {
     override suspend fun load(): DayWeaveUiState? = dao.load()?.let { snapshot ->
         val decoded = when (snapshot.payloadFormat) {
+            PlannerSnapshotFormats.JSON_V15 -> decodeCurrentSnapshot(
+                payload = snapshot.payload,
+                requireGoogleSchedulePublicationField = true,
+                requireOnboardingFirstItemAnchorField = true,
+            )
             PlannerSnapshotFormats.JSON_V14 -> decodeCurrentSnapshot(
                 payload = snapshot.payload,
                 requireGoogleSchedulePublicationField = true,
@@ -175,6 +181,7 @@ class RoomPlannerStateRepository(
             else -> error("Unsupported planner snapshot format")
         }
         val outboundHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V11 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V12 ||
@@ -186,6 +193,7 @@ class RoomPlannerStateRepository(
             decoded.copy(pendingGoogleCalendarOutbound = null)
         }
         val schedulePublicationHardened = if (
+            snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V15 ||
             snapshot.payloadFormat == PlannerSnapshotFormats.JSON_V14
         ) {
             outboundHardened
@@ -203,7 +211,7 @@ class RoomPlannerStateRepository(
             }
         } ?: notificationHardened
         if (
-            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V14 ||
+            snapshot.payloadFormat != PlannerSnapshotFormats.JSON_V15 ||
             SNAPSHOT_JSON.encodeToString(hardened) != snapshot.payload
         ) {
             save(hardened)
@@ -224,6 +232,7 @@ class RoomPlannerStateRepository(
         validateSchedulePublicationState(retainedState)
         validateProposalApplicationState(retainedState)
         validateCanonicalAuthoringState(retainedState, referenceEpochMillis)
+        validateOnboardingFirstItemAnchor(retainedState)
         validateGoogleOutboundState(retainedState)
         validateGoogleSchedulePublicationState(retainedState)
         dao.save(
@@ -231,7 +240,7 @@ class RoomPlannerStateRepository(
                 singletonId = 1,
                 payload = SNAPSHOT_JSON.encodeToString(retainedState),
                 updatedAtEpochMillis = referenceEpochMillis,
-                payloadFormat = PlannerSnapshotFormats.JSON_V14,
+                payloadFormat = PlannerSnapshotFormats.JSON_V15,
             ),
         )
     }
@@ -269,6 +278,7 @@ class RoomPlannerStateRepository(
         requireGoogleCalendarOutboundField: Boolean = true,
         requireFirmHorizonDaysField: Boolean = true,
         requireGoogleSchedulePublicationField: Boolean = false,
+        requireOnboardingFirstItemAnchorField: Boolean = false,
     ): DayWeaveUiState {
         val parsedRoot = SNAPSHOT_JSON.parseToJsonElement(payload).jsonObject
         val publicationSafeRoot = if (requirePublicationProofField) {
@@ -319,11 +329,18 @@ class RoomPlannerStateRepository(
             // V10 and predecessors cannot gain provider-mutation authority from an injected field.
             JsonObject(firmHorizonSafeRoot - "pendingGoogleCalendarOutbound")
         }
-        val root = if (requireGoogleSchedulePublicationField) {
+        val googleSchedulePublicationSafeRoot = if (requireGoogleSchedulePublicationField) {
             googleOutboundSafeRoot
         } else {
             // V13 and predecessors cannot gain schedule-write authority from an injected field.
             JsonObject(googleOutboundSafeRoot - "pendingGoogleSchedulePublication")
+        }
+        val root = if (requireOnboardingFirstItemAnchorField) {
+            googleSchedulePublicationSafeRoot
+        } else {
+            // V14 and predecessors cannot designate an arbitrary existing item as reviewed by
+            // injecting a field that only the V15 binary understands.
+            JsonObject(googleSchedulePublicationSafeRoot - "onboardingFirstItemAnchor")
         }
         if (!root.containsKey("pendingSchedulePublication") ||
             !root.containsKey("publishedScheduleRevision")) {
@@ -368,6 +385,12 @@ class RoomPlannerStateRepository(
             !root.containsKey("pendingGoogleSchedulePublication")
         ) {
             throw SerializationException("Current Google schedule publication recovery is required")
+        }
+        if (
+            requireOnboardingFirstItemAnchorField &&
+            !root.containsKey("onboardingFirstItemAnchor")
+        ) {
+            throw SerializationException("Current onboarding first-item anchor is required")
         }
         if (
             requireProposalApplicationFields &&
@@ -418,6 +441,7 @@ class RoomPlannerStateRepository(
                 validateSchedulePublicationState(it)
                 validateProposalApplicationState(it)
                 validateCanonicalAuthoringState(it, referenceEpochMillis)
+                validateOnboardingFirstItemAnchor(it)
                 validateGoogleOutboundState(it)
             }
     }
@@ -441,6 +465,7 @@ class RoomPlannerStateRepository(
                 "publishedScheduleProof",
                 "localScheduleCompositionProvenance",
                 "scheduleCompositionProfile",
+                "onboardingFirstItemAnchor",
             ),
         )
         requireExplicitSensitivity(root, "schedule")
@@ -490,6 +515,7 @@ class RoomPlannerStateRepository(
                     "publishedScheduleProof",
                     "localScheduleCompositionProvenance",
                     "scheduleCompositionProfile",
+                    "onboardingFirstItemAnchor",
                 ),
         )
         if (requireExistingSensitivity) {
@@ -659,6 +685,14 @@ class RoomPlannerStateRepository(
                 }
                 current = parentById[current]
             }
+        }
+    }
+
+    private fun validateOnboardingFirstItemAnchor(state: DayWeaveUiState) {
+        if (!state.hasValidOnboardingFirstItemAnchorRelationship()) {
+            throw SerializationException(
+                "Onboarding first-item anchor does not match its exact encrypted evidence",
+            )
         }
     }
 

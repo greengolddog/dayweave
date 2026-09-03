@@ -440,23 +440,40 @@ class GoogleSchedulePublicationCoordinator(
     suspend fun refreshStatus(): GoogleSchedulePublicationOutcome = recoverPending()
 
     suspend fun discardExpiredRecovery(): Boolean {
+        val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
         return operationMutex.withLock {
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                return@withLock false
+            }
             val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
                 ?: return@withLock true
-            if (!plannerStore.discardExpiredGoogleSchedulePublication(journal, now())) return@withLock false
-            mutableState.value = initialState()
+            val currentTime = now()
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                return@withLock false
+            }
+            if (!plannerStore.discardExpiredGoogleSchedulePublication(journal, currentTime)) {
+                return@withLock false
+            }
+            setState(lifecycle, initialState())
             true
         }
     }
 
     suspend fun dismissSettled(): Boolean {
+        val lifecycle = lifecycleGeneration.get()
         if (!operationAllowed()) return false
         return operationMutex.withLock {
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                return@withLock false
+            }
             val journal = plannerStore.durableState.value?.pendingGoogleSchedulePublication
                 ?: return@withLock true
+            if (!operationAllowed() || lifecycleGeneration.get() != lifecycle) {
+                return@withLock false
+            }
             if (!plannerStore.dismissSettledGoogleSchedulePublication(journal)) return@withLock false
-            mutableState.value = initialState()
+            setState(lifecycle, initialState())
             true
         }
     }

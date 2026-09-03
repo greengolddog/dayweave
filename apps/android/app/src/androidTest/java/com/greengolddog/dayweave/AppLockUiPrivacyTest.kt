@@ -24,8 +24,15 @@ import com.greengolddog.dayweave.security.AppLockSettingsLoadResult
 import com.greengolddog.dayweave.security.AppLockSettingsStore
 import com.greengolddog.dayweave.security.AppUnlockAvailability
 import com.greengolddog.dayweave.security.MonotonicClock
+import com.greengolddog.dayweave.onboarding.OnboardingCheckpoint
+import com.greengolddog.dayweave.onboarding.OnboardingCheckpointLoadResult
+import com.greengolddog.dayweave.onboarding.OnboardingCheckpointStore
+import com.greengolddog.dayweave.onboarding.OnboardingController
+import com.greengolddog.dayweave.onboarding.OnboardingCorruptArtifactIdentity
+import com.greengolddog.dayweave.onboarding.OnboardingRuntimePrivacyState
 import com.greengolddog.dayweave.ui.AppLockPresentationGate
 import com.greengolddog.dayweave.ui.DayWeaveApp
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -41,6 +48,7 @@ class AppLockUiPrivacyTest {
             settingsStore = LockedSettingsStore,
             clock = MonotonicClock { 0L },
         )
+        val onboardingController = OnboardingController(FreshOnboardingStore())
 
         composeRule.setContent {
             DayWeaveApp(
@@ -50,6 +58,16 @@ class AppLockUiPrivacyTest {
                 onSetAppLockTimeout = {},
                 onLockNow = {},
                 onOpenDeviceSecuritySettings = {},
+                onboardingController = onboardingController,
+                onboardingRuntimePrivacyState = MutableStateFlow(
+                    OnboardingRuntimePrivacyState(
+                        privacyAcknowledged = false,
+                        appUnlocked = false,
+                        activityStarted = false,
+                    ),
+                ),
+                onAcknowledgeOnboardingPrivacy = { false },
+                onRecoverOnboardingCheckpoint = { false },
             )
         }
 
@@ -117,5 +135,24 @@ class AppLockUiPrivacyTest {
         )
 
         override fun save(settings: AppLockSettings): Boolean = true
+    }
+
+    private class FreshOnboardingStore : OnboardingCheckpointStore {
+        private var checkpoint = OnboardingCheckpoint.fresh()
+
+        override fun load(): OnboardingCheckpointLoadResult =
+            OnboardingCheckpointLoadResult.Loaded(checkpoint)
+
+        override fun saveIfCurrent(
+            expected: OnboardingCheckpoint,
+            replacement: OnboardingCheckpoint,
+        ): Boolean {
+            if (checkpoint != expected) return false
+            checkpoint = replacement
+            return true
+        }
+
+        override fun resetCorruptExact(expected: OnboardingCorruptArtifactIdentity): Boolean =
+            false
     }
 }

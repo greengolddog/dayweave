@@ -11,6 +11,8 @@ import com.greengolddog.dayweave.model.ItemKind
 import com.greengolddog.dayweave.model.InboxItem
 import com.greengolddog.dayweave.model.InboxSource
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
+import com.greengolddog.dayweave.model.OnboardingFirstItemCheck
+import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import com.greengolddog.dayweave.model.toCanonicalDraft
 import java.time.ZoneId
 import kotlinx.coroutines.runBlocking
@@ -20,6 +22,24 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CanonicalAuthoringControllerTest {
+    @Test
+    fun onboardingCreateDurablyDesignatesOnlyTheReviewedPlanningItem() = runBlocking {
+        val store = PlannerStore(DayWeaveUiState())
+        val controller = CanonicalAuthoringController(store)
+        val planned = draft("First scheduled task").copy(
+            placement = CanonicalDraftPlacement.PLANNED,
+            durationSeconds = 1_800,
+        )
+
+        assertTrue(controller.createForOnboarding(planned, ITEM_ID))
+
+        assertEquals(ITEM_ID, store.durableState.value?.onboardingFirstItemAnchor?.itemId)
+        assertEquals(
+            OnboardingFirstItemCheck.PENDING_CREATE,
+            store.durableState.value?.validatedOnboardingFirstItemCheck(),
+        )
+    }
+
     @Test
     fun titleOnlyCaptureUsesCanonicalJournalAndLeavesLegacyInboxVisibleStateAlone() = runBlocking {
         val store = PlannerStore(DayWeaveUiState())

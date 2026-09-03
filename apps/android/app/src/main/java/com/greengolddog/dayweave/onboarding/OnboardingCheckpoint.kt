@@ -34,6 +34,10 @@ data class OnboardingCheckpoint(
     val currentStep: OnboardingStep = OnboardingStep.WELCOME,
     val furthestStep: OnboardingStep = OnboardingStep.WELCOME,
     val privacyAcknowledged: Boolean = false,
+    /** True only after stale pre-consent OS work and notification routes were durably fenced. */
+    val privacyReleaseCompleted: Boolean = false,
+    /** Content-free proof that the user explicitly saved the week profile during setup. */
+    val profileReviewed: Boolean = false,
     val completed: Boolean = false,
 ) {
     init {
@@ -44,7 +48,14 @@ data class OnboardingCheckpoint(
         if (!privacyAcknowledged) {
             require(currentStep == OnboardingStep.WELCOME)
             require(furthestStep == OnboardingStep.WELCOME)
+            require(!privacyReleaseCompleted)
+            require(!profileReviewed)
             require(!completed)
+        }
+        require(!privacyReleaseCompleted || privacyAcknowledged)
+        if (profileReviewed) {
+            require(privacyReleaseCompleted)
+            require(furthestStep.ordinal >= OnboardingStep.PROFILE.ordinal)
         }
         if (completed) {
             require(privacyAcknowledged)
@@ -54,7 +65,7 @@ data class OnboardingCheckpoint(
     }
 
     companion object {
-        const val CURRENT_VERSION = 1
+        const val CURRENT_VERSION = 2
 
         fun fresh(): OnboardingCheckpoint = OnboardingCheckpoint()
     }
@@ -101,12 +112,30 @@ internal fun OnboardingCheckpoint.isPermittedReplacementOf(
     expected: OnboardingCheckpoint,
 ): Boolean {
     if (this == expected) return true
-    if (version != expected.version || expected.completed) return false
+    if (version != expected.version) return false
+
+    // The cleanup barrier is deliberately its own crash-durable transition. It remains legal for
+    // a migrated, already-completed V1 checkpoint so startup can close that historical gap before
+    // mounting private state.
+    val completedPrivacyRelease =
+        expected.privacyAcknowledged &&
+            !expected.privacyReleaseCompleted &&
+            this == expected.copy(privacyReleaseCompleted = true)
+    if (completedPrivacyRelease) return true
+
+    val reviewedProfile =
+        expected.privacyReleaseCompleted &&
+            !expected.profileReviewed &&
+            expected.currentStep == OnboardingStep.PROFILE &&
+            this == expected.copy(profileReviewed = true)
+    if (reviewedProfile) return true
+    if (expected.completed) return false
 
     val acknowledgedPrivacy =
         expected.currentStep == OnboardingStep.WELCOME &&
             expected.furthestStep == OnboardingStep.WELCOME &&
             !expected.privacyAcknowledged &&
+            !expected.privacyReleaseCompleted &&
             !expected.completed &&
             this == expected.copy(privacyAcknowledged = true)
     if (acknowledgedPrivacy) return true
@@ -114,6 +143,8 @@ internal fun OnboardingCheckpoint.isPermittedReplacementOf(
     val next = expected.currentStep.next()
     val advanced =
         expected.privacyAcknowledged &&
+            expected.privacyReleaseCompleted &&
+            (expected.currentStep != OnboardingStep.PROFILE || expected.profileReviewed) &&
             next != null &&
             this == expected.copy(
                 currentStep = next,
@@ -122,10 +153,13 @@ internal fun OnboardingCheckpoint.isPermittedReplacementOf(
     if (advanced) return true
 
     val previous = expected.currentStep.previous()
-    val movedBack = previous != null && this == expected.copy(currentStep = previous)
+    val movedBack = expected.privacyReleaseCompleted &&
+        previous != null && this == expected.copy(currentStep = previous)
     if (movedBack) return true
 
     return expected.privacyAcknowledged &&
+        expected.privacyReleaseCompleted &&
+        expected.profileReviewed &&
         expected.currentStep == OnboardingStep.READY &&
         expected.furthestStep == OnboardingStep.READY &&
         this == expected.copy(completed = true)

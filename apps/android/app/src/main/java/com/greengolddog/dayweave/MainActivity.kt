@@ -93,6 +93,7 @@ class MainActivity : FragmentActivity() {
         }
         enableEdgeToEdge()
         setContent {
+            val dayWeaveApplication = application as DayWeaveApplication
             val timedBreakRouteDigest =
                 timedBreakNotificationRoutes.pendingDigest.collectAsStateWithLifecycle().value
             val timedBreakSystemState =
@@ -113,6 +114,7 @@ class MainActivity : FragmentActivity() {
                 onSetAppLockTimeout = appLockController::updateTimeout,
                 onLockNow = {
                     appUnlockCoordinator.cancelAuthentication()
+                    dayWeaveApplication.onAppPrivacyBoundaryLocked()
                     appLockController.lockNow()
                 },
                 onOpenDeviceSecuritySettings = ::openDeviceSecuritySettings,
@@ -124,6 +126,13 @@ class MainActivity : FragmentActivity() {
                     ::requestTimedBreakNotificationPermission,
                 timedBreakNotificationSystemState = timedBreakSystemState,
                 onEnableTimedBreakReminders = ::enableTimedBreakReminders,
+                onboardingController = dayWeaveApplication.onboardingController,
+                onboardingRuntimePrivacyState =
+                    dayWeaveApplication.onboardingRuntimePrivacyState,
+                onAcknowledgeOnboardingPrivacy =
+                    dayWeaveApplication::acknowledgeOnboardingPrivacy,
+                onRecoverOnboardingCheckpoint =
+                    dayWeaveApplication::recoverOnboardingCheckpoint,
             )
         }
     }
@@ -146,10 +155,15 @@ class MainActivity : FragmentActivity() {
         val stateBeforeForeground = appLockController.state.value
         appLockController.onForegrounded()
         appUnlockCoordinator.refreshAvailability()
-        (application as DayWeaveApplication).onAppForegroundAssistantActive()
-        if (!appLockController.state.value.isLocked) {
-            (application as DayWeaveApplication).onAppPrivacyBoundaryUnlocked()
+        val dayWeaveApplication = application as DayWeaveApplication
+        if (appLockController.state.value.isLocked) {
+            dayWeaveApplication.onAppPrivacyBoundaryLocked()
+        } else {
+            dayWeaveApplication.onAppPrivacyBoundaryUnlocked()
         }
+        // Project the authoritative lock result before opening the STARTED activity bit. A
+        // foreground timeout can lock synchronously in onForegrounded().
+        dayWeaveApplication.onAppForegroundAssistantActive()
         autoPromptPending = shouldAutoPromptOnStart(
             stateBeforeForeground = stateBeforeForeground,
             stateAfterForeground = appLockController.state.value,
@@ -177,8 +191,10 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onStop() {
+        // Close the foreground/private-provider gate for every stopped Activity instance,
+        // including configuration replacement. The new instance reopens it from onStart only.
+        (application as DayWeaveApplication).onAppForegroundAssistantInactive()
         if (!isChangingConfigurations) {
-            (application as DayWeaveApplication).onAppForegroundAssistantInactive()
             autoPromptPending = false
             backgroundLockJob?.cancel()
             backgroundLockJob = null

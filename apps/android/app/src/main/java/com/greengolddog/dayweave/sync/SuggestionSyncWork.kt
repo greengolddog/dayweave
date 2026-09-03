@@ -55,6 +55,12 @@ class SuggestionSyncSchedulingCoordinator(
 
     suspend fun cancelBeforeCredentialClear() = backend.cancelAllAndAwait()
 
+    /**
+     * Removes pre-consent WorkManager generations while the runtime privacy gate is still closed.
+     * The caller must await this fence before opening the gate and launching startup bootstrap.
+     */
+    suspend fun cancelBeforeConsentRelease() = backend.cancelAllAndAwait()
+
     private fun reconcileAndRefresh(configurationChanged: Boolean) {
         val connection = credentialStore.snapshot()
         if (connection.baseUrl != null && connection.hasBearerToken) {
@@ -195,7 +201,10 @@ class WorkManagerSuggestionSyncBackend(
         internal const val IMMEDIATE_WORK_NAME = "dayweave-suggestion-refresh-immediate-v1"
         internal const val WORK_TAG = "dayweave-suggestion-refresh"
         internal val PERIODIC_EXISTING_WORK_POLICY = ExistingPeriodicWorkPolicy.UPDATE
-        internal val STARTUP_IMMEDIATE_EXISTING_WORK_POLICY = ExistingWorkPolicy.KEEP
+        // A legacy RUNNING worker can already have observed a closed consent gate and be on its
+        // way to a successful no-op. KEEP would let that stale generation suppress the first real
+        // post-consent refresh, so every startup publishes a fresh authoritative generation.
+        internal val STARTUP_IMMEDIATE_EXISTING_WORK_POLICY = ExistingWorkPolicy.REPLACE
         internal val CONFIGURATION_IMMEDIATE_EXISTING_WORK_POLICY = ExistingWorkPolicy.REPLACE
     }
 }
@@ -263,20 +272,28 @@ class SuggestionRefreshWorker(
     workerParameters: WorkerParameters,
 ) : CoroutineWorker(appContext, workerParameters) {
     private var refreshOverride: (suspend () -> SuggestionRefreshOutcome)? = null
+    private var workAllowedOverride: (() -> Boolean)? = null
 
     internal constructor(
         appContext: Context,
         workerParameters: WorkerParameters,
         refresh: suspend () -> SuggestionRefreshOutcome,
+        workAllowed: () -> Boolean = { true },
     ) : this(appContext, workerParameters) {
         refreshOverride = refresh
+        workAllowedOverride = workAllowed
     }
 
     override suspend fun doWork(): Result {
+        val application = applicationContext as? DayWeaveApplication
+        val workAllowed = workAllowedOverride?.invoke()
+            ?: application?.onboardingBackgroundWorkAllowed() == true
+        // Old queued work can survive an app update. Treat a closed privacy gate as a completed
+        // no-op; durable acknowledgement will schedule a fresh run through normal bootstrap.
+        if (!workAllowed) return Result.success()
         val completion = try {
             val outcome = refreshOverride?.invoke() ?: run {
-                val application = applicationContext as? DayWeaveApplication
-                    ?: return Result.failure()
+                application ?: return Result.failure()
                 application.suggestionSyncManager.refresh()
             }
             outcome.toWorkerCompletion()

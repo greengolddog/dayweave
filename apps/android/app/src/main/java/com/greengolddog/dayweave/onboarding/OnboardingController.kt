@@ -13,6 +13,8 @@ sealed interface OnboardingControllerState {
         val currentStep: OnboardingStep get() = checkpoint.currentStep
         val furthestStep: OnboardingStep get() = checkpoint.furthestStep
         val privacyAcknowledged: Boolean get() = checkpoint.privacyAcknowledged
+        val privacyReleaseCompleted: Boolean get() = checkpoint.privacyReleaseCompleted
+        val profileReviewed: Boolean get() = checkpoint.profileReviewed
         val completed: Boolean get() = checkpoint.completed
     }
 
@@ -56,10 +58,44 @@ class OnboardingController(
         return persist(active, active.checkpoint.copy(privacyAcknowledged = true))
     }
 
+    /**
+     * Seals the separately executed pre-consent cleanup barrier. This transition is intentionally
+     * available for migrated completed checkpoints and is the only durable evidence the runtime
+     * may use to release private work after a process restart.
+     */
+    @Synchronized
+    fun completePrivacyRelease(): Boolean {
+        val active = state as? OnboardingControllerState.Active ?: return false
+        if (!active.privacyAcknowledged) return false
+        if (active.privacyReleaseCompleted) return true
+        return persist(active, active.checkpoint.copy(privacyReleaseCompleted = true))
+    }
+
+    /** Records only the explicit review action; the profile values stay in encrypted planner data. */
+    @Synchronized
+    fun markProfileReviewed(): Boolean {
+        val active = transitionableState() ?: return false
+        if (active.profileReviewed) return true
+        if (
+            !active.privacyReleaseCompleted ||
+            active.currentStep != OnboardingStep.PROFILE
+        ) {
+            return false
+        }
+        return persist(active, active.checkpoint.copy(profileReviewed = true))
+    }
+
     @Synchronized
     fun advance(prerequisiteReady: Boolean = false): Boolean {
         val active = transitionableState() ?: return false
-        if (!active.privacyAcknowledged || active.completed) return false
+        if (
+            !active.privacyAcknowledged ||
+            !active.privacyReleaseCompleted ||
+            (active.currentStep == OnboardingStep.PROFILE && !active.profileReviewed) ||
+            active.completed
+        ) {
+            return false
+        }
         if (active.currentStep != OnboardingStep.WELCOME && !prerequisiteReady) return false
         val next = active.currentStep.next() ?: return false
         return persist(
@@ -108,6 +144,8 @@ class OnboardingController(
         if (
             !allPrerequisitesReady ||
             !active.privacyAcknowledged ||
+            !active.privacyReleaseCompleted ||
+            !active.profileReviewed ||
             active.currentStep != OnboardingStep.READY ||
             active.furthestStep != OnboardingStep.READY
         ) {

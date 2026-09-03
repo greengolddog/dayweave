@@ -33,6 +33,7 @@ import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.runBlocking
@@ -1103,6 +1104,57 @@ class GoogleCalendarOutboundCoordinatorTest {
         assertTrue(coordinator.discardExpiredRecovery())
         assertNull(store.durableState.value?.pendingGoogleCalendarOutbound)
         assertNoNetworkCalls(transport)
+    }
+
+    @Test
+    fun queuedExpiredDiscardCannotCrossLifecycleQuarantine() = runBlocking {
+        var clock = NOW
+        var operationAllowed = true
+        val previewEntered = CompletableDeferred<Unit>()
+        val neverReturns = CompletableDeferred<RemoteGoogleOutboundPreview>()
+        val store = PlannerStore(outboundState())
+        val transport = FakeGoogleOutboundTransport().apply {
+            onPreview = {
+                previewEntered.complete(Unit)
+                neverReturns.await()
+            }
+        }
+        val coordinator = coordinator(
+            store = store,
+            transport = transport,
+            now = { clock },
+            operationAllowed = { operationAllowed },
+        )
+        val holding = async { coordinator.preparePreview(ITEM_ID, TARGET) }
+
+        try {
+            withTimeout(3_000) { previewEntered.await() }
+            val journalBeforeQuarantine = requireNotNull(
+                store.durableState.value?.pendingGoogleCalendarOutbound,
+            )
+            assertEquals(GoogleCalendarOutboundStage.INTENT, journalBeforeQuarantine.stage)
+            clock = Instant.parse("2026-09-02T12:35:00Z")
+            val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+                coordinator.discardExpiredRecovery()
+            }
+
+            operationAllowed = false
+            coordinator.quarantineBindingState()
+            operationAllowed = true
+            holding.cancelAndJoin()
+
+            assertFalse(withTimeout(3_000) { waiting.await() })
+            assertEquals(
+                journalBeforeQuarantine,
+                store.durableState.value?.pendingGoogleCalendarOutbound,
+            )
+            assertEquals(
+                GoogleCalendarOutboundPhase.PRIVACY_PROTECTED,
+                coordinator.state.value.phase,
+            )
+        } finally {
+            holding.cancelAndJoin()
+        }
     }
 
     @Test

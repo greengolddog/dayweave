@@ -39,6 +39,14 @@ internal class CanonicalAuthoringController(
         plannerStore.enqueueCanonicalCreate(draft, itemId)
     }).awaitDurable()
 
+    suspend fun createForOnboarding(
+        draft: CanonicalItemDraft,
+        itemId: String,
+    ): Boolean = plannerStore.enqueueOnboardingFirstItemCreate(
+        draft = draft,
+        itemId = itemId,
+    ).awaitDurable()
+
     suspend fun convertInboxDraft(
         inboxId: String,
         itemId: String,

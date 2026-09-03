@@ -312,6 +312,99 @@ class GoogleSchedulePublicationCoordinatorTest {
     }
 
     @Test
+    fun queuedExpiredDiscardCannotCrossLifecycleQuarantine() = runBlocking {
+        var clock = NOW
+        var operationAllowed = true
+        val previewEntered = CompletableDeferred<Unit>()
+        val neverReturns = CompletableDeferred<RemoteScheduleGooglePublicationPreview>()
+        val store = PlannerStore(publishedState())
+        val transport = FakeSchedulePublicationTransport().apply {
+            onPreview = {
+                previewEntered.complete(Unit)
+                neverReturns.await()
+            }
+        }
+        val coordinator = coordinator(
+            store,
+            transport,
+            now = { clock },
+            operationAllowed = { operationAllowed },
+        )
+        val holding = async { coordinator.preparePreview(PUBLICATION_TARGET) }
+
+        try {
+            withTimeout(3_000) { previewEntered.await() }
+            val journalBeforeQuarantine = requireNotNull(
+                store.durableState.value?.pendingGoogleSchedulePublication,
+            )
+            assertEquals(GoogleSchedulePublicationStage.INTENT, journalBeforeQuarantine.stage)
+            clock = Instant.parse("2026-09-03T13:00:00Z")
+            val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+                coordinator.discardExpiredRecovery()
+            }
+
+            operationAllowed = false
+            coordinator.quarantineBindingState()
+            operationAllowed = true
+            holding.cancelAndJoin()
+
+            assertFalse(withTimeout(3_000) { waiting.await() })
+            assertEquals(
+                journalBeforeQuarantine,
+                store.durableState.value?.pendingGoogleSchedulePublication,
+            )
+            assertEquals(
+                GoogleSchedulePublicationPhase.PRIVACY_PROTECTED,
+                coordinator.state.value.phase,
+            )
+        } finally {
+            holding.cancelAndJoin()
+        }
+    }
+
+    @Test
+    fun queuedSettledDismissCannotCrossLifecycleQuarantine() = runBlocking {
+        var operationAllowed = true
+        val statusEntered = CompletableDeferred<Unit>()
+        val neverReturns = CompletableDeferred<RemoteScheduleGooglePublicationStatus>()
+        val settled = settledJournal()
+        val store = PlannerStore(boundState(settled))
+        val transport = FakeSchedulePublicationTransport().apply {
+            onStatus = { _, _ ->
+                statusEntered.complete(Unit)
+                neverReturns.await()
+            }
+        }
+        val coordinator = coordinator(
+            store,
+            transport,
+            operationAllowed = { operationAllowed },
+        )
+        val holding = async { coordinator.recoverPending() }
+
+        try {
+            withTimeout(3_000) { statusEntered.await() }
+            val waiting = async(start = CoroutineStart.UNDISPATCHED) {
+                coordinator.dismissSettled()
+            }
+
+            operationAllowed = false
+            coordinator.quarantineBindingState()
+            operationAllowed = true
+            holding.cancelAndJoin()
+
+            assertFalse(withTimeout(3_000) { waiting.await() })
+            assertEquals(settled, store.durableState.value?.pendingGoogleSchedulePublication)
+            assertEquals(
+                GoogleSchedulePublicationPhase.PRIVACY_PROTECTED,
+                coordinator.state.value.phase,
+            )
+        } finally {
+            holding.cancelAndJoin()
+        }
+    }
+
+    @Test
     fun unknownOneShotApprovalIsNeverRetriedByRecovery() = runBlocking {
         val store = PlannerStore(boundState(attemptedJournal()))
         val transport = FakeSchedulePublicationTransport()
@@ -450,6 +543,30 @@ class GoogleSchedulePublicationCoordinatorTest {
             "2026-09-03T12:15:00Z",
         ),
     )
+
+    private fun settledJournal() = approvedJournal()
+        .recordingAcceptance(
+            RemoteScheduleGooglePublicationAccepted(PUBLICATION_ID, replayed = false),
+        )
+        .recordingStatus(
+            RemoteScheduleGooglePublicationStatus(
+                publicationId = PUBLICATION_ID,
+                accountId = ACCOUNT_ID,
+                collectionId = COLLECTION_ID,
+                scheduleRevisionId = SCHEDULE_REVISION_ID,
+                state = ScheduleGooglePublicationState.PUBLISHED,
+                totalCount = 1,
+                pendingCount = 0,
+                deliveringCount = 0,
+                publishedCount = 1,
+                conflictedCount = 0,
+                failedCount = 0,
+                supersededCount = 0,
+                createdAt = "2026-09-03T12:06:00Z",
+                completedAt = "2026-09-03T12:07:00Z",
+                lastErrorCode = null,
+            ),
+        )
 
     private fun validPreview() = RemoteScheduleGooglePublicationPreview(
         id = PREVIEW_ID,

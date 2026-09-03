@@ -29,6 +29,7 @@ import com.greengolddog.dayweave.model.ItemStatus
 import com.greengolddog.dayweave.model.LocalScheduleCompositionProvenanceSnapshot
 import com.greengolddog.dayweave.model.ManualEnergyCheckIn
 import com.greengolddog.dayweave.model.MoveLaterApprovalEnvelope
+import com.greengolddog.dayweave.model.OnboardingFirstItemAnchorSnapshot
 import com.greengolddog.dayweave.model.PlanningSuggestion
 import com.greengolddog.dayweave.model.PendingCanonicalMutation
 import com.greengolddog.dayweave.model.PendingCanonicalAuthoringMutation
@@ -71,6 +72,9 @@ import com.greengolddog.dayweave.model.isTimedBreakNotificationDigest
 import com.greengolddog.dayweave.model.isCoveredBy
 import com.greengolddog.dayweave.model.isRepresentableMoveLaterSource
 import com.greengolddog.dayweave.model.localScheduleCompositionStateFingerprint
+import com.greengolddog.dayweave.model.createsPlanningDemand
+import com.greengolddog.dayweave.model.reconciledOnboardingFirstItemAnchor
+import com.greengolddog.dayweave.model.validatedOnboardingFirstItemCheck
 import com.greengolddog.dayweave.model.strictLocalDayEndInstant
 import com.greengolddog.dayweave.model.strictLocalDayStartInstant
 import com.greengolddog.dayweave.network.requireScheduleInputDigest
@@ -156,6 +160,7 @@ private data class CanonicalAuthoringRefreshOverlay(
     val items: List<CanonicalItemSnapshot>,
     val mutations: List<PendingCanonicalAuthoringMutation>,
     val deleted: List<CanonicalRecentlyDeletedRecord>,
+    val onboardingFirstItemAnchor: OnboardingFirstItemAnchorSnapshot?,
 )
 
 /**
@@ -1148,6 +1153,7 @@ class PlannerStore(
                 canonicalItems = authoringOverlay.items,
                 pendingCanonicalAuthoringMutations = authoringOverlay.mutations,
                 canonicalRecentlyDeleted = authoringOverlay.deleted,
+                onboardingFirstItemAnchor = authoringOverlay.onboardingFirstItemAnchor,
                 canonicalSyncOrigin = update.syncOrigin,
                 canonicalConfigurationId = update.configurationId,
                 canonicalDeltaCursor = update.deltaCursor,
@@ -1730,6 +1736,16 @@ class PlannerStore(
                 items = freshItems.sortedCanonicalItems(),
                 mutations = current.pendingCanonicalAuthoringMutations,
                 deleted = emptyList(),
+                onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeIf { anchor ->
+                    anchor.canonicalRevision == null &&
+                        current.pendingCanonicalAuthoringMutations.any { mutation ->
+                            mutation.itemId == anchor.itemId &&
+                                mutation.operation == CanonicalAuthoringOperation.CREATE &&
+                                !mutation.isSubmitted && mutation.syncOrigin == null &&
+                                mutation.disposition == CanonicalAuthoringDisposition.PENDING &&
+                                mutation.draft?.createsPlanningDemand(anchor.itemId) == true
+                        }
+                },
             )
         }
         val freshById = freshItems.associateBy(CanonicalItemSnapshot::id)
@@ -1798,7 +1814,18 @@ class PlannerStore(
             canonicalRecentlyDeleted = deleted,
         )
         validateCanonicalAuthoringOverlay(overlayState)
-        return CanonicalAuthoringRefreshOverlay(mergedItems, mutations, deleted)
+        return CanonicalAuthoringRefreshOverlay(
+            items = mergedItems,
+            mutations = mutations,
+            deleted = deleted,
+            onboardingFirstItemAnchor = reconciledOnboardingFirstItemAnchor(
+                anchor = current.onboardingFirstItemAnchor,
+                canonicalItems = mergedItems,
+                pendingAuthoringMutations = mutations,
+                recentlyDeleted = deleted,
+                authoritativeMissing = true,
+            ),
+        )
     }
 
     private fun List<CanonicalItemSnapshot>.sortedCanonicalItems(): List<CanonicalItemSnapshot> =
@@ -1879,6 +1906,30 @@ class PlannerStore(
             itemId = itemId,
             operation = CanonicalAuthoringOperation.CREATE,
             draft = draft.normalized(),
+            createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
+        )
+    }
+
+    /** Saves the reviewed first item and its content-free onboarding anchor in one generation. */
+    fun enqueueOnboardingFirstItemCreate(
+        draft: CanonicalItemDraft,
+        itemId: String = UUID.randomUUID().toString(),
+        mutationId: String = UUID.randomUUID().toString(),
+    ): CanonicalAuthoringTransition? = enqueueCanonicalAuthoring(
+        itemId = itemId,
+        mutationId = mutationId,
+        operation = CanonicalAuthoringOperation.CREATE,
+        designateOnboardingFirstItem = true,
+    ) { _ ->
+        val normalized = draft.normalized()
+        require(normalized.createsPlanningDemand(itemId)) {
+            "The onboarding item must be a planned leaf with schedulable effort"
+        }
+        PendingCanonicalAuthoringMutation(
+            id = mutationId,
+            itemId = itemId,
+            operation = CanonicalAuthoringOperation.CREATE,
+            draft = normalized,
             createdAt = Instant.ofEpochMilli(nowEpochMillis()).toString(),
         )
     }
@@ -2002,6 +2053,19 @@ class PlannerStore(
                 syncOrigin = null,
                 configurationId = null,
             ).also(PendingCanonicalAuthoringMutation::requireValid)
+            if (
+                current.onboardingFirstItemAnchor?.let { anchor ->
+                    anchor.itemId == existing.itemId && anchor.canonicalRevision == null
+                } == true
+            ) {
+                require(existing.operation == CanonicalAuthoringOperation.CREATE)
+                require(replacement.draft?.createsPlanningDemand(existing.itemId) == true) {
+                    "The reviewed onboarding item must remain a schedulable leaf"
+                }
+                require(current.pendingCanonicalAuthoringMutations.none { mutation ->
+                    mutation.id != existing.id && mutation.draft?.parentId == existing.itemId
+                }) { "The reviewed onboarding item cannot gain a queued child" }
+            }
             if (current.canonicalExecutionSession != null) {
                 require(replacement.isDetachedInboxCapture()) {
                     "Only a detached Inbox capture is editable during active execution"
@@ -2070,6 +2134,7 @@ class PlannerStore(
         mutationId: String,
         operation: CanonicalAuthoringOperation,
         consumeInboxId: String? = null,
+        designateOnboardingFirstItem: Boolean = false,
         makeMutation: (DayWeaveUiState) -> PendingCanonicalAuthoringMutation,
     ): CanonicalAuthoringTransition? {
         requireCanonicalUuid(itemId, "canonical authoring item")
@@ -2086,6 +2151,16 @@ class PlannerStore(
             require(current.pendingCanonicalAuthoringMutations.none { it.itemId == itemId }) {
                 "This canonical item already has a queued operation"
             }
+            if (designateOnboardingFirstItem) {
+                require(operation == CanonicalAuthoringOperation.CREATE)
+                require(consumeInboxId == null)
+                require(
+                    current.onboardingFirstItemAnchor == null ||
+                        current.validatedOnboardingFirstItemCheck() == null,
+                ) {
+                    "The current onboarding first item is still valid"
+                }
+            }
             val mutation = makeMutation(current)
             require(mutation.operation == operation && mutation.id == mutationId &&
                 mutation.itemId == itemId)
@@ -2097,6 +2172,9 @@ class PlannerStore(
             }
             validateCanonicalAuthoringCurrentState(current, mutation)
             validateCanonicalAuthoringHierarchy(current, mutation)
+            if (designateOnboardingFirstItem) {
+                require(mutation.draft?.createsPlanningDemand(itemId) == true)
+            }
             current.copy(
                 inbox = if (consumeInboxId == null) {
                     current.inbox
@@ -2106,6 +2184,11 @@ class PlannerStore(
                 },
                 pendingCanonicalAuthoringMutations =
                     current.pendingCanonicalAuthoringMutations + mutation,
+                onboardingFirstItemAnchor = if (designateOnboardingFirstItem) {
+                    OnboardingFirstItemAnchorSnapshot(itemId)
+                } else {
+                    current.onboardingFirstItemAnchor
+                },
                 publishedScheduleRevision = null,
                 publishedScheduleProof = null,
                 scheduleInputDigest = null,
@@ -2223,7 +2306,17 @@ class PlannerStore(
                 "An unresolved submitted mutation cannot be discarded"
             }
             val remaining = current.pendingCanonicalAuthoringMutations.filterNot { it.id == id }
-            val candidate = current.copy(pendingCanonicalAuthoringMutations = remaining)
+            val clearsPendingOnboardingAnchor =
+                current.onboardingFirstItemAnchor?.let { anchor ->
+                    anchor.canonicalRevision == null && anchor.itemId == existing.itemId &&
+                        existing.operation == CanonicalAuthoringOperation.CREATE
+                } == true
+            val candidate = current.copy(
+                pendingCanonicalAuthoringMutations = remaining,
+                onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeUnless {
+                    clearsPendingOnboardingAnchor
+                },
+            )
             validateCanonicalAuthoringOverlay(candidate)
             candidate
         }
@@ -2303,10 +2396,24 @@ class PlannerStore(
                 CanonicalAuthoringOperation.RESTORE,
                 -> current.canonicalRecentlyDeleted.filterNot { it.id == response.id }
             }
+            val onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.let { anchor ->
+                if (anchor.itemId != response.id) {
+                    anchor
+                } else if (
+                    responseIsSuperseded ||
+                    durableExpected.operation == CanonicalAuthoringOperation.TRASH ||
+                    !response.createsPlanningDemand(activeItems)
+                ) {
+                    null
+                } else {
+                    OnboardingFirstItemAnchorSnapshot(response.id, response.revision)
+                }
+            }
             current.copy(
                 canonicalItems = activeItems,
                 canonicalRecentlyDeleted = deleted,
                 pendingCanonicalAuthoringMutations = withoutMutation,
+                onboardingFirstItemAnchor = onboardingFirstItemAnchor,
                 schedule = current.schedule.filterNot { it.id in removedBlockIds },
                 activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
                 publishedScheduleRevision = null,
@@ -2402,6 +2509,9 @@ class PlannerStore(
                 canonicalRecentlyDeleted = current.canonicalRecentlyDeleted
                     .upsertRecentlyDeleted(retained),
                 pendingCanonicalAuthoringMutations = updatedMutations,
+                onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeUnless {
+                    it.itemId == record.id
+                },
                 schedule = current.schedule.filterNot { it.id in removedBlockIds },
                 activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
                 publishedScheduleRevision = null,
@@ -2940,6 +3050,9 @@ class PlannerStore(
             .toSet()
         current.copy(
             canonicalItems = current.canonicalItems.filterNot { it.id == pending.itemId },
+            onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.takeUnless {
+                it.itemId == pending.itemId
+            },
             schedule = current.schedule.filterNot { it.canonicalItemId == pending.itemId },
             activeSession = current.activeSession?.takeUnless { it.itemId in removedBlockIds },
             publishedScheduleRevision = null,
@@ -4124,11 +4237,19 @@ class PlannerStore(
             .map(ScheduleItem::id)
             .toSet()
         val preservedCreates = current.preservableUnboundCanonicalCreates()
+        val preservedOnboardingFirstItemAnchor = reconciledOnboardingFirstItemAnchor(
+            anchor = current.onboardingFirstItemAnchor,
+            canonicalItems = emptyList(),
+            pendingAuthoringMutations = preservedCreates,
+            recentlyDeleted = emptyList(),
+            authoritativeMissing = true,
+        )
         current.copy(
             suggestions = current.suggestions.filter { it.remoteRevision == null },
             inbox = current.inbox.filter { it.source != InboxSource.EXTERNAL_PROPOSAL },
             canonicalItems = emptyList(),
             pendingCanonicalAuthoringMutations = preservedCreates,
+            onboardingFirstItemAnchor = preservedOnboardingFirstItemAnchor,
             canonicalRecentlyDeleted = emptyList(),
             canonicalSyncOrigin = null,
             canonicalConfigurationId = null,
@@ -4307,10 +4428,21 @@ class PlannerStore(
                 current.schedule.firstOrNull { it.id == session.itemId }?.canonicalItemId == item.id
             }
         }
+        val updatedCanonicalItems = current.canonicalItems.map {
+            if (it.id == item.id) item else it
+        }
+        val onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.let { anchor ->
+            if (anchor.itemId != item.id) {
+                anchor
+            } else if (item.createsPlanningDemand(updatedCanonicalItems)) {
+                OnboardingFirstItemAnchorSnapshot(item.id, item.revision)
+            } else {
+                null
+            }
+        }
         current.copy(
-            canonicalItems = current.canonicalItems.map {
-                if (it.id == item.id) item else it
-            },
+            canonicalItems = updatedCanonicalItems,
+            onboardingFirstItemAnchor = onboardingFirstItemAnchor,
             schedule = updatedSchedule,
             activeSession = activeSession,
             publishedScheduleRevision = null,
@@ -4369,6 +4501,15 @@ class PlannerStore(
         }
         current.copy(
             canonicalItems = updatedItems,
+            onboardingFirstItemAnchor = current.onboardingFirstItemAnchor?.let { anchor ->
+                if (anchor.itemId != item.id) {
+                    anchor
+                } else if (item.createsPlanningDemand(updatedItems)) {
+                    OnboardingFirstItemAnchorSnapshot(item.id, item.revision)
+                } else {
+                    null
+                }
+            },
             schedule = updatedSchedule,
             publishedScheduleRevision = null,
             publishedScheduleProof = null,
